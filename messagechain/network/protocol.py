@@ -3,6 +3,8 @@ P2P network protocol for MessageChain.
 
 Defines message types and serialization for node-to-node communication.
 Uses JSON over TCP with length-prefixed framing.
+
+New in v2: header sync and batch block download messages for IBD.
 """
 
 import json
@@ -20,6 +22,12 @@ class MessageType(Enum):
     RESPONSE_BLOCK = "response_block"
     REQUEST_CHAIN_HEIGHT = "request_chain_height"
     RESPONSE_CHAIN_HEIGHT = "response_chain_height"
+
+    # IBD / Sync messages (headers-first)
+    REQUEST_HEADERS = "request_headers"
+    RESPONSE_HEADERS = "response_headers"
+    REQUEST_BLOCKS_BATCH = "request_blocks_batch"
+    RESPONSE_BLOCKS_BATCH = "response_blocks_batch"
 
 
 @dataclass
