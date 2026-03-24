@@ -6,7 +6,8 @@ Plug-and-play blockchain node. Start it up, give it a wallet ID, and it runs
 in the background — processing transactions, producing blocks, and depositing
 fees into your wallet.
 
-Now with persistent storage (--data-dir) and IBD sync.
+Now with persistent storage (--data-dir), IBD sync, peer banning,
+rate limiting, and inv/getdata transaction relay.
 
 Usage:
     python server.py
@@ -21,9 +22,11 @@ import json
 import logging
 import struct
 import time
+from collections import OrderedDict
 
 from messagechain.config import (
     DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK, INITIAL_ENTITY_GRANT,
+    SEEN_TX_CACHE_SIZE,
 )
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.blockchain import Blockchain
@@ -38,6 +41,11 @@ from messagechain.network.protocol import (
 )
 from messagechain.network.peer import Peer
 from messagechain.network.sync import ChainSyncer
+from messagechain.network.ban import (
+    PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
+    OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
+)
+from messagechain.network.ratelimit import PeerRateLimiter
 
 import hashlib
 from messagechain.config import HASH_ALGO
@@ -78,6 +86,21 @@ class Server:
 
         # IBD / sync
         self.syncer = ChainSyncer(self.blockchain, self._get_peer_writer)
+
+        # Network protection
+        self.ban_manager = PeerBanManager()
+        self.rate_limiter = PeerRateLimiter()
+
+        # inv/getdata: track recently seen tx hashes
+        self._seen_txs: OrderedDict = OrderedDict()
+
+    def _track_seen_tx(self, tx_hash_hex: str):
+        if tx_hash_hex in self._seen_txs:
+            self._seen_txs.move_to_end(tx_hash_hex)
+            return
+        if len(self._seen_txs) >= SEEN_TX_CACHE_SIZE:
+            self._seen_txs.popitem(last=False)
+        self._seen_txs[tx_hash_hex] = True
 
     def _get_peer_writer(self, address: str):
         peer = self.peers.get(address)
@@ -192,6 +215,20 @@ class Server:
         elif method == "get_sync_status":
             return {"ok": True, "result": self.syncer.get_sync_status()}
 
+        elif method == "get_banned_peers":
+            return {"ok": True, "result": {"banned": self.ban_manager.get_banned_peers()}}
+
+        elif method == "ban_peer":
+            addr = request["params"].get("address", "")
+            reason = request["params"].get("reason", "manual_rpc")
+            self.ban_manager.manual_ban(addr, reason=reason)
+            return {"ok": True, "result": {"message": f"Banned {addr}"}}
+
+        elif method == "unban_peer":
+            addr = request["params"].get("address", "")
+            self.ban_manager.manual_unban(addr)
+            return {"ok": True, "result": {"message": f"Unbanned {addr}"}}
+
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
@@ -228,8 +265,10 @@ class Server:
                 return {"ok": False, "error": reason}
             self.mempool.add_transaction(tx)
 
-            # Gossip to peers
-            asyncio.create_task(self._broadcast_tx(tx))
+            # Relay via inv (not full tx flood)
+            tx_hash_hex = tx.tx_hash.hex()
+            self._track_seen_tx(tx_hash_hex)
+            asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
 
             return {
                 "ok": True,
@@ -292,9 +331,6 @@ class Server:
                 proposer_id=self.wallet_id,
             )
 
-            # Note: In production, the server would hold a validator signing key.
-            # For the prototype, blocks without proposer signatures are accepted
-            # during bootstrap (no registered validators).
             block = Block(header=header, transactions=txs)
             block.block_hash = block._compute_hash()
 
@@ -319,6 +355,10 @@ class Server:
             await asyncio.sleep(10)
             await self.syncer.check_sync_stale()
 
+            # Cleanup expired bans and stale rate limit buckets
+            self.ban_manager.cleanup_expired()
+            self.rate_limiter.cleanup_stale()
+
             if not self.syncer.is_syncing:
                 # Ask peers for their height
                 for addr, peer in list(self.peers.items()):
@@ -338,8 +378,26 @@ class Server:
 
     # ── P2P Network ─────────────────────────────────────────────────
 
+    def _msg_category(self, msg_type: MessageType) -> str:
+        """Map message type to rate limit category."""
+        if msg_type in (MessageType.ANNOUNCE_TX, MessageType.INV, MessageType.GETDATA):
+            return "tx"
+        if msg_type in (MessageType.REQUEST_BLOCKS_BATCH,):
+            return "block_req"
+        if msg_type == MessageType.REQUEST_HEADERS:
+            return "headers_req"
+        return "general"
+
     async def _handle_p2p_connection(self, reader, writer):
         addr = writer.get_extra_info("peername")
+        address = f"{addr[0]}:{addr[1]}"
+
+        # Reject banned peers
+        if self.ban_manager.is_banned(address):
+            logger.info(f"Rejected banned peer {address}")
+            writer.close()
+            return
+
         peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
         try:
             while self._running:
@@ -351,11 +409,15 @@ class Server:
             pass
         finally:
             peer.is_connected = False
+            self.rate_limiter.remove_peer(address)
             writer.close()
 
     async def _connect_to_peer(self, host: str, port: int):
         addr = f"{host}:{port}"
         if addr in self.peers and self.peers[addr].is_connected:
+            return
+        if self.ban_manager.is_banned(addr):
+            logger.debug(f"Skipping banned peer {addr}")
             return
         try:
             reader, writer = await asyncio.open_connection(host, port)
@@ -383,6 +445,19 @@ class Server:
 
     async def _handle_p2p_message(self, msg: NetworkMessage, peer: Peer):
         peer.touch()
+        address = peer.address
+
+        # Ban check
+        if self.ban_manager.is_banned(address):
+            peer.is_connected = False
+            return
+
+        # Rate limit check
+        category = self._msg_category(msg.msg_type)
+        if not self.rate_limiter.check(address, category):
+            self.ban_manager.record_offense(address, OFFENSE_RATE_LIMIT, f"rate_limit:{category}")
+            logger.debug(f"Rate limited {address} on {category}")
+            return
 
         if msg.msg_type == MessageType.HANDSHAKE:
             peer.entity_id = msg.sender_id
@@ -394,17 +469,32 @@ class Server:
             if peer_height > self.blockchain.height and not self.syncer.is_syncing:
                 asyncio.create_task(self.syncer.start_sync())
 
+        elif msg.msg_type == MessageType.INV:
+            await self._handle_inv(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.GETDATA:
+            await self._handle_getdata(msg.payload, peer)
+
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
             tx = MessageTransaction.deserialize(msg.payload)
-            valid, _ = self.blockchain.validate_transaction(tx)
+            tx_hash_hex = tx.tx_hash.hex()
+            if tx_hash_hex in self._seen_txs:
+                return
+            valid, reason = self.blockchain.validate_transaction(tx)
             if valid:
+                self._track_seen_tx(tx_hash_hex)
                 self.mempool.add_transaction(tx)
+                await self._relay_tx_inv([tx_hash_hex], exclude=address)
+            else:
+                self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
 
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
             block = Block.deserialize(msg.payload)
-            success, _ = self.blockchain.add_block(block)
+            success, reason = self.blockchain.add_block(block)
             if success:
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
+            else:
+                self.ban_manager.record_offense(address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}")
 
         elif msg.msg_type == MessageType.REQUEST_CHAIN_HEIGHT:
             latest = self.blockchain.get_latest_block()
@@ -440,6 +530,78 @@ class Server:
                 msg.payload.get("blocks", []), peer.address
             )
 
+    # ── inv/getdata relay ──────────────────────────────────────────
+
+    async def _handle_inv(self, payload: dict, peer: Peer):
+        """Handle INV message: peer announces tx hashes they have."""
+        tx_hashes = payload.get("tx_hashes", [])
+        if len(tx_hashes) > 500:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "inv_too_large"
+            )
+            return
+
+        needed = []
+        for h in tx_hashes:
+            if h not in self._seen_txs:
+                tx_hash_bytes = bytes.fromhex(h)
+                if tx_hash_bytes not in self.mempool.pending:
+                    needed.append(h)
+            peer.known_txs.add(h)
+
+        if needed:
+            getdata = NetworkMessage(
+                msg_type=MessageType.GETDATA,
+                payload={"tx_hashes": needed},
+                sender_id=self.wallet_id.hex() if self.wallet_id else "",
+            )
+            if peer.writer:
+                await write_message(peer.writer, getdata)
+
+    async def _handle_getdata(self, payload: dict, peer: Peer):
+        """Handle GETDATA message: peer requests full transactions by hash."""
+        tx_hashes = payload.get("tx_hashes", [])
+        if len(tx_hashes) > 500:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "getdata_too_large"
+            )
+            return
+
+        for h in tx_hashes:
+            tx_hash_bytes = bytes.fromhex(h)
+            tx = self.mempool.pending.get(tx_hash_bytes)
+            if tx:
+                msg = NetworkMessage(
+                    msg_type=MessageType.ANNOUNCE_TX,
+                    payload=tx.serialize(),
+                    sender_id=self.wallet_id.hex() if self.wallet_id else "",
+                )
+                if peer.writer:
+                    await write_message(peer.writer, msg)
+                peer.known_txs.add(h)
+
+    async def _relay_tx_inv(self, tx_hash_hexes: list[str], exclude: str = ""):
+        """Relay transaction hashes via INV to peers that don't know them yet."""
+        for addr, peer in self.peers.items():
+            if addr == exclude or not peer.is_connected or not peer.writer:
+                continue
+            new_hashes = [h for h in tx_hash_hexes if h not in peer.known_txs]
+            if not new_hashes:
+                continue
+            inv = NetworkMessage(
+                msg_type=MessageType.INV,
+                payload={"tx_hashes": new_hashes},
+                sender_id=self.wallet_id.hex() if self.wallet_id else "",
+            )
+            try:
+                await write_message(peer.writer, inv)
+                for h in new_hashes:
+                    peer.known_txs.add(h)
+            except Exception:
+                peer.is_connected = False
+
+    # ── Existing helpers ──────────────────────────────────────────
+
     async def _serve_headers(self, payload: dict, peer: Peer):
         """Serve headers to a syncing peer."""
         start_height = payload.get("start_height", 0)
@@ -474,10 +636,6 @@ class Server:
         )
         if peer.writer:
             await write_message(peer.writer, response)
-
-    async def _broadcast_tx(self, tx: MessageTransaction):
-        msg = NetworkMessage(MessageType.ANNOUNCE_TX, tx.serialize())
-        await self._broadcast(msg)
 
     async def _broadcast_block(self, block: Block):
         msg = NetworkMessage(MessageType.ANNOUNCE_BLOCK, block.serialize())

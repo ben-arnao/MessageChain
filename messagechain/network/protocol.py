@@ -23,6 +23,10 @@ class MessageType(Enum):
     REQUEST_CHAIN_HEIGHT = "request_chain_height"
     RESPONSE_CHAIN_HEIGHT = "response_chain_height"
 
+    # inv/getdata transaction relay (BTC-style)
+    INV = "inv"              # announce tx/block hashes we have
+    GETDATA = "getdata"      # request full tx/block by hash
+
     # IBD / Sync messages (headers-first)
     REQUEST_HEADERS = "request_headers"
     RESPONSE_HEADERS = "response_headers"
