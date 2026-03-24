@@ -1,14 +1,19 @@
 """
 Biometric identity system for MessageChain.
 
+Core principle: your biometric data IS your private key.
+
 Each entity is uniquely identified by a combination of three biometric factors:
-DNA, fingerprint, and iris scan. The entity ID is derived from all three,
-ensuring one-person-one-identity on the chain.
+DNA, fingerprint, and iris scan. The hashed biometric data directly serves as
+the cryptographic seed — there is no separate private key. Your body is your key.
+
+If someone tries to register with biometrics that already exist on the chain,
+they are rejected. One person = one entity = one wallet. Period.
 
 In production, biometric data never leaves the local device. The hash is computed
-locally, and only the derived entity ID and quantum-resistant public key go on-chain.
+locally, the keypair derived from it, and only the public key goes on-chain.
 The biometric type used for a given message is metadata indicating which factor
-authenticated the user locally.
+authenticated the user locally to unlock signing.
 """
 
 import hashlib
@@ -40,13 +45,13 @@ class Entity:
     """
     A unique participant in the MessageChain network.
 
-    Each entity has:
-    - A unique ID derived from their biometric combination
-    - A quantum-resistant keypair derived from their identity
-    - The ability to sign messages using any of their three biometric types
+    The biometric hash IS the private key. The keypair is derived directly
+    from it. Same biometrics = same entity ID = same wallet = same keys.
+    There is no separate key management — your body is your credential.
     """
     entity_id: bytes
     keypair: KeyPair
+    _biometric_seed: bytes  # the combined biometric hash (THIS is the private key)
     _dna_hash: bytes
     _fingerprint_hash: bytes
     _iris_hash: bytes
@@ -57,7 +62,7 @@ class Entity:
         Create an entity from raw biometric data.
 
         In production, raw data would come from biometric sensors.
-        For the prototype, any bytes work (simulating sensor output).
+        The hashed biometrics serve directly as the cryptographic private key.
         """
         h = hashlib.new
         dna_hash = h(HASH_ALGO, dna_data).digest()
@@ -66,13 +71,15 @@ class Entity:
 
         entity_id = derive_entity_id(dna_hash, fingerprint_hash, iris_hash)
 
-        # Keypair is deterministically derived from entity_id
-        # This means the same person always gets the same keys
-        keypair = KeyPair.generate(entity_id)
+        # The biometric hash IS the private key — no separate key derivation.
+        # Your body is your key. Same biometrics always produce the same keypair.
+        biometric_seed = entity_id  # deterministic: same person = same seed = same keys
+        keypair = KeyPair.generate(biometric_seed)
 
         return cls(
             entity_id=entity_id,
             keypair=keypair,
+            _biometric_seed=biometric_seed,
             _dna_hash=dna_hash,
             _fingerprint_hash=fingerprint_hash,
             _iris_hash=iris_hash,
@@ -91,6 +98,7 @@ class Entity:
         Verify that the provided biometric matches this entity.
 
         This simulates local biometric authentication before allowing a signature.
+        In production, this happens on the local device — the chain never sees raw biometrics.
         """
         bio_hash = hashlib.new(HASH_ALGO, bio_data).digest()
         if bio_type == BiometricType.DNA:

@@ -1,15 +1,19 @@
 """
 Blockchain state machine for MessageChain.
 
-Maintains the canonical chain, validates blocks and transactions,
-and tracks all state (balances, nonces, public keys).
+Core invariants:
+- One entity per person (duplicate biometrics rejected)
+- Every transaction is timestamped
+- Fees follow BTC-style bidding (set by user, collected by proposer)
+- Supply inflates via block rewards to offset natural loss
+- Base layer is minimal — L2 handles everything else
 """
 
 import hashlib
-from messagechain.config import HASH_ALGO, GENESIS_SUPPLY, GENESIS_ALLOCATION, MAX_TXS_PER_BLOCK
+from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, INITIAL_ENTITY_GRANT
 from messagechain.core.block import Block, compute_merkle_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
-from messagechain.economics.deflation import SupplyTracker
+from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
 
 
@@ -25,7 +29,7 @@ class Blockchain:
         self.supply = SupplyTracker()
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
-        self.entity_message_count: dict[bytes, int] = {}  # for stats
+        self.entity_message_count: dict[bytes, int] = {}
 
     def initialize_genesis(self, genesis_entity) -> Block:
         """Create the genesis block and initialize chain state."""
@@ -35,24 +39,26 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
-
-        # Distribute initial supply: genesis entity gets an allocation,
-        # rest stays in a "reserve" that gets distributed to new entities
-        self.supply.initialize_balance(genesis_entity.entity_id, GENESIS_ALLOCATION)
-        # The unallocated supply still counts toward total_supply for deflation math
-        # but isn't spendable until allocated to entities
+        self.supply.initialize_balance(genesis_entity.entity_id, INITIAL_ENTITY_GRANT)
 
         return genesis_block
 
-    def register_entity(self, entity) -> bool:
-        """Register a new entity on the chain (receive initial allocation)."""
+    def register_entity(self, entity) -> tuple[bool, str]:
+        """
+        Register a new entity on the chain.
+
+        ENFORCES: one entity per person. If the entity_id (derived from
+        biometrics) already exists, registration is REJECTED. This is the
+        core uniqueness guarantee — duplicate biometrics cannot create
+        a second wallet.
+        """
         if entity.entity_id in self.public_keys:
-            return False  # already registered
+            return False, "Entity already exists — duplicate biometrics rejected"
 
         self.public_keys[entity.entity_id] = entity.public_key
         self.nonces[entity.entity_id] = 0
-        self.supply.initialize_balance(entity.entity_id, GENESIS_ALLOCATION)
-        return True
+        self.supply.initialize_balance(entity.entity_id, INITIAL_ENTITY_GRANT)
+        return True, "Entity registered"
 
     def get_latest_block(self) -> Block | None:
         return self.chain[-1] if self.chain else None
@@ -70,23 +76,22 @@ class Blockchain:
         """Validate a transaction against current chain state."""
         # Check entity is registered
         if tx.entity_id not in self.public_keys:
-            return False, "Unknown entity"
+            return False, "Unknown entity — must register first"
 
-        # Check nonce
+        # Check nonce (replay protection)
         expected_nonce = self.nonces.get(tx.entity_id, 0)
         if tx.nonce != expected_nonce:
             return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
 
-        # Check balance
-        if not self.supply.can_afford(tx.entity_id):
-            return False, "Insufficient balance"
+        # Check timestamp is present and reasonable
+        if tx.timestamp <= 0:
+            return False, "Transaction must have a valid timestamp"
 
-        # Check burn amount matches current cost
-        expected_burn = self.supply.calculate_burn_cost()
-        if tx.burn_amount < expected_burn:
-            return False, f"Burn amount too low: need {expected_burn}"
+        # Check can afford fee
+        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
+            return False, f"Insufficient balance for fee of {tx.fee}"
 
-        # Verify signature
+        # Verify quantum-resistant signature
         public_key = self.public_keys[tx.entity_id]
         if not verify_transaction(tx, public_key):
             return False, "Invalid signature"
@@ -136,9 +141,8 @@ class Blockchain:
         return True, "Valid"
 
     def add_block(self, block: Block) -> tuple[bool, str]:
-        """Validate and append a block to the chain, updating state."""
+        """Validate and append a block, updating state (fees + inflation)."""
         if self.height == 0:
-            # Genesis block - just append
             self.chain.append(block)
             return True, "Genesis block added"
 
@@ -146,16 +150,21 @@ class Blockchain:
         if not valid:
             return False, reason
 
-        # Apply state changes
+        proposer_id = block.header.proposer_id
+
+        # Apply transaction state changes: fees go to proposer
         for tx in block.transactions:
-            self.supply.execute_burn(tx.entity_id, tx.burn_amount)
+            self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
             self.nonces[tx.entity_id] = tx.nonce + 1
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
 
+        # Mint block reward (inflation) — new tokens to proposer
+        reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
+
         self.chain.append(block)
-        return True, "Block added"
+        return True, f"Block added (reward: {reward}, fees: {sum(tx.fee for tx in block.transactions)})"
 
     def get_entity_stats(self, entity_id: bytes) -> dict:
         return {
@@ -171,5 +180,5 @@ class Blockchain:
             "height": self.height,
             "latest_block_hash": self.chain[-1].block_hash.hex() if self.chain else None,
             "registered_entities": len(self.public_keys),
-            **self.supply.get_supply_stats(),
+            **self.supply.get_supply_stats(self.height),
         }
