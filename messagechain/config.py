@@ -31,3 +31,11 @@ DEFAULT_PORT = 9333
 SEED_NODES = [("127.0.0.1", 9333)]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 5  # seconds
+
+# Peer banning
+BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
+BAN_DURATION = 86400      # ban length in seconds (24 hours)
+
+# inv/getdata relay
+INV_BATCH_SIZE = 500      # max tx hashes per INV message
+SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
