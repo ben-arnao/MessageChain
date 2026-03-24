@@ -96,6 +96,7 @@ class ProofOfStake:
         proposer_entity,
         transactions: list[MessageTransaction],
         prev_block: Block,
+        state_root: bytes = b"\x00" * 32,
     ) -> Block:
         """Create a new block as the selected proposer."""
         txs = transactions[:MAX_TXS_PER_BLOCK]
@@ -109,6 +110,7 @@ class ProofOfStake:
             merkle_root=merkle_root,
             timestamp=time.time(),
             proposer_id=proposer_entity.entity_id,
+            state_root=state_root,
         )
 
         # Proposer signs the block header

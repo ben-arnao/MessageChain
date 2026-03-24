@@ -36,6 +36,13 @@ HANDSHAKE_TIMEOUT = 5  # seconds
 BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
 BAN_DURATION = 86400      # ban length in seconds (24 hours)
 
+# Mempool
+MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
+MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
+
 # inv/getdata relay
 INV_BATCH_SIZE = 500      # max tx hashes per INV message
 SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
+
+# Key rotation
+KEY_ROTATION_FEE = 10     # fee required for key rotation transaction
