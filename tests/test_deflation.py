@@ -1,55 +1,55 @@
-"""Tests for deflationary token economics."""
+"""Tests for inflationary token economics."""
 
 import unittest
-from messagechain.economics.deflation import SupplyTracker
-from messagechain.config import GENESIS_SUPPLY, BURN_RATE, MIN_BURN
+from messagechain.economics.inflation import SupplyTracker
+from messagechain.config import GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE
 
 
-class TestDeflation(unittest.TestCase):
+class TestInflation(unittest.TestCase):
     def setUp(self):
         self.tracker = SupplyTracker()
         self.entity_id = b"\x01" * 32
+        self.proposer_id = b"\x02" * 32
         self.tracker.initialize_balance(self.entity_id, 10000)
+        self.tracker.initialize_balance(self.proposer_id, 0)
 
     def test_initial_state(self):
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY)
-        self.assertEqual(self.tracker.total_burned, 0)
+        self.assertEqual(self.tracker.total_minted, 0)
 
-    def test_burn_cost_proportional_to_supply(self):
-        cost = self.tracker.calculate_burn_cost()
-        expected = max(MIN_BURN, int(GENESIS_SUPPLY * BURN_RATE))
-        self.assertEqual(cost, expected)
+    def test_block_reward_minting(self):
+        reward = self.tracker.mint_block_reward(self.proposer_id, block_height=1)
+        self.assertEqual(reward, BLOCK_REWARD)
+        self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY + BLOCK_REWARD)
+        self.assertEqual(self.tracker.get_balance(self.proposer_id), BLOCK_REWARD)
 
-    def test_burn_decreases_supply(self):
-        cost = self.tracker.calculate_burn_cost()
-        self.tracker.execute_burn(self.entity_id, cost)
-        self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY - cost)
-        self.assertEqual(self.tracker.total_burned, cost)
+    def test_supply_increases_over_blocks(self):
+        """Supply should increase with each block (inflation)."""
+        for i in range(10):
+            self.tracker.mint_block_reward(self.proposer_id, block_height=i)
+        self.assertGreater(self.tracker.total_supply, GENESIS_SUPPLY)
 
-    def test_supply_strictly_decreasing(self):
-        """Each burn reduces total supply."""
-        prev_supply = self.tracker.total_supply
-        for _ in range(10):
-            cost = self.tracker.calculate_burn_cost()
-            self.tracker.execute_burn(self.entity_id, cost)
-            self.assertLess(self.tracker.total_supply, prev_supply)
-            prev_supply = self.tracker.total_supply
+    def test_halving_reduces_reward(self):
+        reward_early = self.tracker.calculate_block_reward(0)
+        reward_after_halving = self.tracker.calculate_block_reward(HALVING_INTERVAL)
+        self.assertEqual(reward_after_halving, reward_early // 2)
 
-    def test_burn_cost_decreases_over_time(self):
-        """As supply shrinks, absolute burn cost decreases."""
-        costs = []
-        for _ in range(100):
-            cost = self.tracker.calculate_burn_cost()
-            costs.append(cost)
-            self.tracker.execute_burn(self.entity_id, cost)
-        # Cost should be non-increasing
-        for i in range(1, len(costs)):
-            self.assertLessEqual(costs[i], costs[i - 1])
+    def test_reward_never_reaches_zero(self):
+        """Even after many halvings, reward stays at least 1."""
+        reward = self.tracker.calculate_block_reward(HALVING_INTERVAL * 100)
+        self.assertGreaterEqual(reward, 1)
 
-    def test_insufficient_balance(self):
-        poor_entity = b"\x02" * 32
-        self.tracker.initialize_balance(poor_entity, 0)
-        self.assertFalse(self.tracker.can_afford(poor_entity))
+    def test_fee_payment(self):
+        self.assertTrue(self.tracker.pay_fee(self.entity_id, self.proposer_id, 100))
+        self.assertEqual(self.tracker.get_balance(self.entity_id), 9900)
+        self.assertEqual(self.tracker.get_balance(self.proposer_id), 100)
+        self.assertEqual(self.tracker.total_fees_collected, 100)
+
+    def test_fee_below_minimum_rejected(self):
+        self.assertFalse(self.tracker.pay_fee(self.entity_id, self.proposer_id, 0))
+
+    def test_fee_exceeding_balance_rejected(self):
+        self.assertFalse(self.tracker.pay_fee(self.entity_id, self.proposer_id, 999999))
 
     def test_staking(self):
         self.assertTrue(self.tracker.stake(self.entity_id, 500))
@@ -63,10 +63,11 @@ class TestDeflation(unittest.TestCase):
         self.assertEqual(self.tracker.get_balance(other), 100)
 
     def test_supply_stats(self):
-        stats = self.tracker.get_supply_stats()
+        stats = self.tracker.get_supply_stats(current_block_height=5)
         self.assertIn("total_supply", stats)
-        self.assertIn("deflation_pct", stats)
-        self.assertIn("projected_supply_after_1000_msgs", stats)
+        self.assertIn("inflation_pct", stats)
+        self.assertIn("current_block_reward", stats)
+        self.assertIn("next_halving_block", stats)
 
 
 if __name__ == "__main__":

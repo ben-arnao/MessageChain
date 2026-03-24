@@ -2,25 +2,25 @@
 MessageTransaction - the fundamental unit of data on MessageChain.
 
 Each transaction represents one message posted by one entity. It contains:
-- The message content (up to MAX_MESSAGE_LENGTH chars)
+- The message content (up to MAX_MESSAGE_WORDS words)
 - The entity who posted it
-- Which biometric type was used to authenticate
+- Which biometric type was used to authenticate locally
 - A quantum-resistant signature
-- The token burn amount
+- A user-set fee (BTC-style bidding: higher fee = higher block priority)
+- A timestamp
 
 The base layer stores raw message bytes with no content interpretation.
-L2 / third-party protocols can define message structure and semantics.
+L2 / third-party protocols can define message structure, chain messages
+together, link messages to threads, etc.
 """
 
 import hashlib
 import struct
 import time
-import json
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MAX_MESSAGE_LENGTH
+from messagechain.config import HASH_ALGO, MAX_MESSAGE_WORDS, MIN_FEE
 from messagechain.identity.biometrics import BiometricType, Entity
 from messagechain.crypto.keys import Signature, verify_signature
-from messagechain.economics.deflation import SupplyTracker
 
 
 @dataclass
@@ -30,7 +30,7 @@ class MessageTransaction:
     biometric_type: BiometricType
     timestamp: float
     nonce: int  # per-entity tx counter (replay protection)
-    burn_amount: int
+    fee: int  # user-set fee (higher = more likely to be included in next block)
     signature: Signature
     tx_hash: bytes = b""
 
@@ -46,11 +46,17 @@ class MessageTransaction:
             + self.biometric_type.value.encode()
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.nonce)
-            + struct.pack(">Q", self.burn_amount)
+            + struct.pack(">Q", self.fee)
         )
 
     def _compute_hash(self) -> bytes:
         return hashlib.new(HASH_ALGO, self._signable_data()).digest()
+
+    @property
+    def word_count(self) -> int:
+        """Count words in the message."""
+        text = self.message.decode("utf-8", errors="replace")
+        return len(text.split())
 
     def serialize(self) -> dict:
         return {
@@ -59,7 +65,7 @@ class MessageTransaction:
             "biometric_type": self.biometric_type.value,
             "timestamp": self.timestamp,
             "nonce": self.nonce,
-            "burn_amount": self.burn_amount,
+            "fee": self.fee,
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
@@ -73,28 +79,38 @@ class MessageTransaction:
             biometric_type=BiometricType(data["biometric_type"]),
             timestamp=data["timestamp"],
             nonce=data["nonce"],
-            burn_amount=data["burn_amount"],
+            fee=data["fee"],
             signature=sig,
         )
         tx.tx_hash = bytes.fromhex(data["tx_hash"])
         return tx
 
 
+def _validate_message_length(message: str) -> bool:
+    """Check message is within the word limit."""
+    return len(message.split()) <= MAX_MESSAGE_WORDS
+
+
 def create_transaction(
     entity: Entity,
     message: str,
     bio_type: BiometricType,
-    supply_tracker: SupplyTracker,
+    fee: int,
     nonce: int,
 ) -> MessageTransaction:
-    """Create and sign a new message transaction."""
-    msg_bytes = message.encode("utf-8")
-    if len(msg_bytes) > MAX_MESSAGE_LENGTH:
-        raise ValueError(f"Message exceeds {MAX_MESSAGE_LENGTH} bytes")
+    """
+    Create and sign a new message transaction.
 
-    burn_amount = supply_tracker.calculate_burn_cost()
-    if not supply_tracker.can_afford(entity.entity_id):
-        raise ValueError(f"Insufficient balance. Need {burn_amount} tokens")
+    The fee is set by the user — higher fee means higher priority for
+    block inclusion (BTC-style fee bidding).
+    """
+    if not _validate_message_length(message):
+        raise ValueError(f"Message exceeds {MAX_MESSAGE_WORDS} words")
+
+    if fee < MIN_FEE:
+        raise ValueError(f"Fee must be at least {MIN_FEE}")
+
+    msg_bytes = message.encode("utf-8")
 
     tx = MessageTransaction(
         entity_id=entity.entity_id,
@@ -102,11 +118,11 @@ def create_transaction(
         biometric_type=bio_type,
         timestamp=time.time(),
         nonce=nonce,
-        burn_amount=burn_amount,
+        fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )
 
-    # Sign the transaction data
+    # Sign the transaction data with quantum-resistant signature
     msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
     tx.signature = entity.keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
@@ -115,12 +131,10 @@ def create_transaction(
 
 
 def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
-    """Verify a transaction's signature and basic validity."""
-    if len(tx.message) > MAX_MESSAGE_LENGTH:
+    """Verify a transaction's quantum-resistant signature."""
+    if tx.word_count > MAX_MESSAGE_WORDS:
         return False
-
-    if tx.burn_amount < 1:
+    if tx.fee < MIN_FEE:
         return False
-
     msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
     return verify_signature(msg_hash, tx.signature, public_key)

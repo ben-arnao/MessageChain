@@ -1,13 +1,15 @@
 """Global configuration constants for the MessageChain protocol."""
 
 # Message constraints
-MAX_MESSAGE_LENGTH = 256  # max characters per message
+MAX_MESSAGE_WORDS = 100  # max words per message (L2 splits long messages across txs)
 
-# Token economics
+# Token economics — inflationary to offset natural loss (deaths, lost keys)
 GENESIS_SUPPLY = 1_000_000
-BURN_RATE = 0.0001  # fraction of supply burned per message
-MIN_BURN = 1  # minimum tokens burned per message
-GENESIS_ALLOCATION = 1000  # tokens granted to genesis entity
+INITIAL_ENTITY_GRANT = 1000  # tokens granted when entity registers
+BLOCK_REWARD = 50  # new tokens minted per block (paid to proposer)
+ANNUAL_INFLATION_RATE = 0.02  # 2% target annual inflation
+HALVING_INTERVAL = 210_000  # blocks between reward halvings (like BTC)
+MIN_FEE = 1  # minimum transaction fee
 
 # Block parameters
 BLOCK_TIME_TARGET = 10  # seconds between blocks

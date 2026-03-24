@@ -11,6 +11,7 @@ class TestEntity(unittest.TestCase):
         self.assertEqual(len(entity.entity_id), 32)  # SHA3-256
 
     def test_deterministic_id(self):
+        """Same biometrics = same entity = same wallet = same keys."""
         e1 = Entity.create(b"dna", b"finger", b"iris")
         e2 = Entity.create(b"dna", b"finger", b"iris")
         self.assertEqual(e1.entity_id, e2.entity_id)
@@ -20,6 +21,14 @@ class TestEntity(unittest.TestCase):
         e1 = Entity.create(b"dna-a", b"finger", b"iris")
         e2 = Entity.create(b"dna-b", b"finger", b"iris")
         self.assertNotEqual(e1.entity_id, e2.entity_id)
+
+    def test_biometric_is_private_key(self):
+        """Biometric hash directly serves as the crypto seed."""
+        e1 = Entity.create(b"my-dna", b"my-finger", b"my-iris")
+        e2 = Entity.create(b"my-dna", b"my-finger", b"my-iris")
+        # Same biometrics produce identical keypairs
+        self.assertEqual(e1._biometric_seed, e2._biometric_seed)
+        self.assertEqual(e1.public_key, e2.public_key)
 
     def test_biometric_verification(self):
         entity = Entity.create(b"my-dna", b"my-finger", b"my-iris")
@@ -33,6 +42,7 @@ class TestEntity(unittest.TestCase):
         e1 = Entity.create(b"dna", b"finger", b"iris")
         e2 = Entity.create(b"dna", b"finger", b"iris")
         self.assertEqual(e1.public_key, e2.public_key)
+        self.assertEqual(e1.entity_id, e2.entity_id)
 
 
 if __name__ == "__main__":
