@@ -4,6 +4,11 @@ P2P Node for MessageChain.
 Each node runs a TCP server, connects to peers, and participates in
 block production and transaction gossip. Fully decentralized - no
 special nodes or central coordination.
+
+Now supports:
+- Persistent storage (survives restarts)
+- Fork choice (handles competing chain tips)
+- IBD (Initial Block Download) for new nodes joining the network
 """
 
 import asyncio
@@ -20,6 +25,7 @@ from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message
 )
 from messagechain.network.peer import Peer
+from messagechain.network.sync import ChainSyncer
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +34,27 @@ class Node:
     """A full MessageChain network node."""
 
     def __init__(self, entity: Entity, port: int = DEFAULT_PORT,
-                 seed_nodes: list[tuple[str, int]] | None = None):
+                 seed_nodes: list[tuple[str, int]] | None = None,
+                 db=None):
         self.entity = entity
         self.port = port
         self.seed_nodes = seed_nodes or SEED_NODES
-        self.blockchain = Blockchain()
+        self.blockchain = Blockchain(db=db)
         self.mempool = Mempool()
         self.consensus = ProofOfStake()
         self.peers: dict[str, Peer] = {}
         self._server = None
         self._running = False
+
+        # IBD / sync
+        self.syncer = ChainSyncer(self.blockchain, self._get_peer_writer)
+
+    def _get_peer_writer(self, address: str):
+        """Get writer for a peer by address. Used by ChainSyncer."""
+        peer = self.peers.get(address)
+        if peer and peer.is_connected and peer.writer:
+            return (peer.writer, peer)
+        return None
 
     async def start(self):
         """Start the node: initialize chain, start server, connect to peers."""
@@ -48,6 +65,8 @@ class Node:
         if self.blockchain.height == 0:
             genesis = self.blockchain.initialize_genesis(self.entity)
             logger.info(f"Genesis block created: {genesis.block_hash.hex()[:16]}")
+        else:
+            logger.info(f"Loaded chain from storage: height={self.blockchain.height}")
 
         # Start TCP server
         self._server = await asyncio.start_server(
@@ -63,6 +82,9 @@ class Node:
 
         # Start block production loop
         asyncio.create_task(self._block_production_loop())
+
+        # Start sync check loop
+        asyncio.create_task(self._sync_loop())
 
     async def stop(self):
         self._running = False
@@ -101,12 +123,14 @@ class Node:
             self.peers[addr] = peer
             peer.touch()
 
-            # Send handshake
+            # Send handshake with our chain height (for sync)
+            latest = self.blockchain.get_latest_block()
             handshake = NetworkMessage(
                 msg_type=MessageType.HANDSHAKE,
                 payload={
                     "port": self.port,
                     "chain_height": self.blockchain.height,
+                    "best_block_hash": latest.block_hash.hex() if latest else "",
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -131,6 +155,15 @@ class Node:
             self.peers[peer.address] = peer
             logger.info(f"Handshake from {peer.address} (entity: {msg.sender_id[:16]})")
 
+            # Track peer's chain height for sync decisions
+            peer_height = msg.payload.get("chain_height", 0)
+            best_hash = msg.payload.get("best_block_hash", "")
+            self.syncer.update_peer_height(peer.address, peer_height, best_hash)
+
+            # If peer is ahead, initiate sync
+            if peer_height > self.blockchain.height and not self.syncer.is_syncing:
+                asyncio.create_task(self.syncer.start_sync())
+
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
             tx = MessageTransaction.deserialize(msg.payload)
             valid, reason = self.blockchain.validate_transaction(tx)
@@ -144,24 +177,116 @@ class Node:
             if success:
                 # Remove included txs from mempool
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
-                logger.info(f"Added block #{block.header.block_number}")
+                logger.info(f"Added block #{block.header.block_number} ({reason})")
                 # Gossip to other peers
                 await self._broadcast(msg, exclude=peer.address)
 
         elif msg.msg_type == MessageType.REQUEST_CHAIN_HEIGHT:
+            latest = self.blockchain.get_latest_block()
             response = NetworkMessage(
                 msg_type=MessageType.RESPONSE_CHAIN_HEIGHT,
-                payload={"height": self.blockchain.height},
+                payload={
+                    "height": self.blockchain.height,
+                    "best_block_hash": latest.block_hash.hex() if latest else "",
+                },
                 sender_id=self.entity.entity_id_hex,
             )
             if peer.writer:
                 await write_message(peer.writer, response)
+
+        elif msg.msg_type == MessageType.RESPONSE_CHAIN_HEIGHT:
+            height = msg.payload.get("height", 0)
+            best_hash = msg.payload.get("best_block_hash", "")
+            self.syncer.update_peer_height(peer.address, height, best_hash)
 
         elif msg.msg_type == MessageType.PEER_LIST:
             for p_info in msg.payload.get("peers", []):
                 addr = f"{p_info['host']}:{p_info['port']}"
                 if addr not in self.peers and len(self.peers) < MAX_PEERS:
                     asyncio.create_task(self._connect_to_peer(p_info["host"], p_info["port"]))
+
+        # ── IBD / Sync Protocol Messages ──────────────────────────
+
+        elif msg.msg_type == MessageType.REQUEST_HEADERS:
+            await self._handle_request_headers(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.RESPONSE_HEADERS:
+            await self.syncer.handle_headers_response(
+                msg.payload.get("headers", []), peer.address
+            )
+
+        elif msg.msg_type == MessageType.REQUEST_BLOCKS_BATCH:
+            await self._handle_request_blocks_batch(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.RESPONSE_BLOCKS_BATCH:
+            await self.syncer.handle_blocks_response(
+                msg.payload.get("blocks", []), peer.address
+            )
+
+        elif msg.msg_type == MessageType.REQUEST_BLOCK:
+            await self._handle_request_block(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.RESPONSE_BLOCK:
+            block_data = msg.payload.get("block")
+            if block_data:
+                block = Block.deserialize(block_data)
+                self.blockchain.add_block(block)
+
+    async def _handle_request_headers(self, payload: dict, peer: Peer):
+        """Serve headers to a syncing peer."""
+        start_height = payload.get("start_height", 0)
+        count = min(payload.get("count", 100), 500)  # cap at 500
+
+        headers = []
+        for i in range(start_height, start_height + count):
+            block = self.blockchain.get_block(i)
+            if block is None:
+                break
+            headers.append({
+                **block.header.serialize(),
+                "block_hash": block.block_hash.hex(),
+            })
+
+        response = NetworkMessage(
+            msg_type=MessageType.RESPONSE_HEADERS,
+            payload={"headers": headers},
+            sender_id=self.entity.entity_id_hex,
+        )
+        if peer.writer:
+            await write_message(peer.writer, response)
+
+    async def _handle_request_blocks_batch(self, payload: dict, peer: Peer):
+        """Serve full blocks to a syncing peer."""
+        block_hashes = payload.get("block_hashes", [])
+        blocks = []
+        for hash_hex in block_hashes[:50]:  # cap at 50 blocks per batch
+            block = self.blockchain.get_block_by_hash(bytes.fromhex(hash_hex))
+            if block:
+                blocks.append(block.serialize())
+
+        response = NetworkMessage(
+            msg_type=MessageType.RESPONSE_BLOCKS_BATCH,
+            payload={"blocks": blocks},
+            sender_id=self.entity.entity_id_hex,
+        )
+        if peer.writer:
+            await write_message(peer.writer, response)
+
+    async def _handle_request_block(self, payload: dict, peer: Peer):
+        """Serve a single block by hash or number."""
+        block = None
+        if "block_hash" in payload:
+            block = self.blockchain.get_block_by_hash(bytes.fromhex(payload["block_hash"]))
+        elif "block_number" in payload:
+            block = self.blockchain.get_block(payload["block_number"])
+
+        response = NetworkMessage(
+            msg_type=MessageType.RESPONSE_BLOCK,
+            payload={"block": block.serialize() if block else None},
+            sender_id=self.entity.entity_id_hex,
+        )
+        if peer.writer:
+            await write_message(peer.writer, response)
 
     async def _broadcast(self, msg: NetworkMessage, exclude: str = ""):
         """Broadcast a message to all connected peers."""
@@ -185,6 +310,10 @@ class Node:
         """Periodically propose blocks if selected as proposer."""
         while self._running:
             await asyncio.sleep(BLOCK_TIME_TARGET)
+
+            # Don't produce blocks while syncing
+            if self.syncer.is_syncing:
+                continue
 
             if self.mempool.size == 0:
                 continue
@@ -215,6 +344,32 @@ class Node:
                     sender_id=self.entity.entity_id_hex,
                 )
                 await self._broadcast(msg)
+
+    async def _sync_loop(self):
+        """Periodically check if we need to sync and handle stale syncs."""
+        while self._running:
+            await asyncio.sleep(10)
+
+            # Check for stale sync
+            await self.syncer.check_sync_stale()
+
+            # Periodically ask peers for their height
+            if not self.syncer.is_syncing:
+                for addr, peer in list(self.peers.items()):
+                    if peer.is_connected and peer.writer:
+                        try:
+                            msg = NetworkMessage(
+                                msg_type=MessageType.REQUEST_CHAIN_HEIGHT,
+                                payload={},
+                                sender_id=self.entity.entity_id_hex,
+                            )
+                            await write_message(peer.writer, msg)
+                        except Exception:
+                            pass
+
+                # Start sync if needed
+                if self.syncer.needs_sync():
+                    await self.syncer.start_sync()
 
     def submit_transaction(self, tx: MessageTransaction) -> tuple[bool, str]:
         """Submit a transaction to this node (local API)."""
