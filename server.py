@@ -757,6 +757,15 @@ async def run(args):
         fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
         iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
         entity = Entity.create(dna, fingerprint, iris)
+
+        # Advance WOTS+ keypair past all previously-used one-time signing keys.
+        # Without this, restarting the server would reuse WOTS+ leaves, which
+        # catastrophically compromises the one-time signature scheme.
+        leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
+        if leaves_used > 0:
+            entity.keypair.advance_to_leaf(leaves_used)
+            logger.info(f"Advanced keypair past {leaves_used} used WOTS+ leaves")
+
         server.set_wallet_entity(entity)
         print(f"Authenticated as: {entity.entity_id_hex[:16]}...")
     elif args.wallet:

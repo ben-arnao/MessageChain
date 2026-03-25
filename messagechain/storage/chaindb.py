@@ -371,6 +371,7 @@ class ChainDB:
             "nonces": self.get_all_nonces(),
             "public_keys": self.get_all_public_keys(),
             "message_counts": self.get_all_message_counts(),
+            "proposer_sig_counts": self.get_all_proposer_sig_counts(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -384,6 +385,7 @@ class ChainDB:
         conn.execute("DELETE FROM nonces")
         conn.execute("DELETE FROM public_keys")
         conn.execute("DELETE FROM message_counts")
+        conn.execute("DELETE FROM proposer_sig_counts")
 
         for eid, bal in snapshot["balances"].items():
             conn.execute("INSERT INTO balances (entity_id, balance) VALUES (?, ?)", (eid, bal))
@@ -395,6 +397,8 @@ class ChainDB:
             conn.execute("INSERT INTO public_keys (entity_id, public_key) VALUES (?, ?)", (eid, pk))
         for eid, cnt in snapshot["message_counts"].items():
             conn.execute("INSERT INTO message_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
+        for eid, cnt in snapshot.get("proposer_sig_counts", {}).items():
+            conn.execute("INSERT INTO proposer_sig_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
 
         conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
         conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))

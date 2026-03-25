@@ -145,6 +145,8 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
+        # Genesis block was signed — track the WOTS+ leaf consumed
+        self.proposer_sig_counts[genesis_entity.entity_id] = 1
 
         # Track as chain tip
         self.fork_choice.add_tip(genesis_block.block_hash, 0, 0)
