@@ -33,6 +33,11 @@ from messagechain.network.protocol import (
 )
 from messagechain.network.peer import Peer
 from messagechain.network.sync import ChainSyncer
+from messagechain.consensus.attestation import Attestation, verify_attestation
+from messagechain.consensus.slashing import (
+    SlashTransaction, verify_slashing_evidence, verify_attestation_slashing_evidence,
+    SlashingEvidence, AttestationSlashingEvidence,
+)
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
     OFFENSE_INVALID_HEADERS, OFFENSE_UNREQUESTED_DATA,
@@ -312,6 +317,12 @@ class Node:
                 block = Block.deserialize(block_data)
                 self.blockchain.add_block(block)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
+            await self._handle_announce_attestation(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
+            await self._handle_announce_slash(msg.payload, peer)
+
     def _msg_category(self, msg_type: MessageType) -> str:
         """Map message type to rate limit category."""
         if msg_type in (MessageType.ANNOUNCE_TX, MessageType.INV, MessageType.GETDATA):
@@ -394,6 +405,78 @@ class Node:
                     peer.known_txs.add(h)
             except Exception:
                 peer.is_connected = False
+
+    # ── Attestation and slash handlers ─────────────────────────────
+
+    async def _handle_announce_attestation(self, payload: dict, peer: Peer):
+        """Handle an incoming attestation gossip message.
+
+        Validates the attestation signature and records it in the finality
+        tracker. Then relays to other peers.
+        """
+        try:
+            att = Attestation.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_attestation_data"
+            )
+            return
+
+        # Verify the attesting validator is known
+        if att.validator_id not in self.blockchain.public_keys:
+            return
+
+        # Verify signature
+        pk = self.blockchain.public_keys[att.validator_id]
+        if not verify_attestation(att, pk):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
+            )
+            return
+
+        # Record in finality tracker
+        validator_stake = self.blockchain.supply.get_staked(att.validator_id)
+        total_stake = sum(self.blockchain.supply.staked.values())
+        self.blockchain.finality.add_attestation(att, validator_stake, total_stake)
+
+        logger.debug(f"Received attestation from {att.validator_id.hex()[:16]} for block #{att.block_number}")
+
+        # Relay to other peers
+        relay_msg = NetworkMessage(
+            msg_type=MessageType.ANNOUNCE_ATTESTATION,
+            payload=payload,
+            sender_id=self.entity.entity_id_hex,
+        )
+        await self._broadcast(relay_msg, exclude=peer.address)
+
+    async def _handle_announce_slash(self, payload: dict, peer: Peer):
+        """Handle incoming slashing evidence gossip.
+
+        Validates the evidence and submits it as a slash transaction if valid.
+        """
+        try:
+            slash_tx = SlashTransaction.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_slash_data"
+            )
+            return
+
+        # Validate the slash transaction
+        valid, reason = self.blockchain.validate_slash_transaction(slash_tx)
+        if not valid:
+            logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
+            return
+
+        logger.info(f"Received valid slashing evidence against {slash_tx.evidence.offender_id.hex()[:16]}")
+
+        # Relay to other peers
+        relay_msg = NetworkMessage(
+            msg_type=MessageType.ANNOUNCE_SLASH,
+            payload=payload,
+            sender_id=self.entity.entity_id_hex,
+        )
+        await self._broadcast(relay_msg, exclude=peer.address)
 
     # ── Existing handlers ─────────────────────────────────────────
 

@@ -36,11 +36,21 @@ from messagechain.core.mempool import Mempool
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature, KeyPair, Signature
+from messagechain.core.staking import (
+    StakeTransaction, UnstakeTransaction,
+    create_stake_transaction, create_unstake_transaction,
+    verify_stake_transaction, verify_unstake_transaction,
+)
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
 from messagechain.network.peer import Peer
 from messagechain.network.sync import ChainSyncer
+from messagechain.consensus.attestation import Attestation, verify_attestation
+from messagechain.consensus.slashing import (
+    SlashTransaction as SlashTx, verify_slashing_evidence, verify_attestation_slashing_evidence,
+    SlashingEvidence, AttestationSlashingEvidence,
+)
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
@@ -130,8 +140,16 @@ class Server:
         """Start P2P server, RPC server, and block production."""
         # Initialize genesis if fresh chain
         if self.blockchain.height == 0:
-            # Create a bootstrap entity for genesis block
-            bootstrap = Entity.create(b"genesis-dna", b"genesis-finger", b"genesis-iris")
+            # Create a bootstrap entity with random biometrics for the genesis block.
+            # SECURITY: Using os.urandom ensures each network has a unique,
+            # unguessable genesis entity. Hardcoded biometric strings would allow
+            # anyone reading the source to derive the genesis keypair.
+            import os
+            bootstrap = Entity.create(
+                os.urandom(32),  # random DNA data
+                os.urandom(32),  # random fingerprint data
+                os.urandom(32),  # random iris data
+            )
             self.blockchain.initialize_genesis(bootstrap)
             logger.info(f"Genesis block created")
         else:
@@ -305,28 +323,44 @@ class Server:
             return {"ok": False, "error": str(e)}
 
     def _rpc_stake(self, params: dict) -> dict:
-        """Stake tokens for validation. Requires a signature to authenticate."""
-        try:
-            entity_id = bytes.fromhex(params["entity_id"])
-            amount = int(params["amount"])
+        """Accept a signed stake transaction from a client.
 
-            # Authenticate: caller must sign "stake" + amount with their key
+        Stake operations are now proper on-chain transactions with nonce-based
+        replay protection, included in blocks just like message transactions.
+        This ensures all nodes agree on validator stake state.
+        """
+        try:
+            tx = StakeTransaction.deserialize(params["transaction"])
+            entity_id = tx.entity_id
+
             if entity_id not in self.blockchain.public_keys:
                 return {"ok": False, "error": "Unknown entity"}
-            if "signature" not in params:
-                return {"ok": False, "error": "Signature required — stake must be authenticated"}
-            sig = Signature.deserialize(params["signature"])
-            msg = entity_id + b"stake" + struct.pack(">Q", amount)
-            msg_hash = _hash(msg)
-            public_key = self.blockchain.public_keys[entity_id]
-            if not verify_signature(msg_hash, sig, public_key):
-                return {"ok": False, "error": "Invalid signature — authentication failed"}
 
-            if not self.blockchain.supply.stake(entity_id, amount):
-                return {"ok": False, "error": "Insufficient balance for staking"}
-            self.consensus.register_validator(entity_id, amount)
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_stake_transaction(tx, public_key):
+                return {"ok": False, "error": "Invalid stake transaction signature"}
+
+            # Validate nonce
+            expected_nonce = self.blockchain.nonces.get(entity_id, 0)
+            if tx.nonce != expected_nonce:
+                return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
+
+            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
+                return {"ok": False, "error": "Insufficient balance for staking + fee"}
+
+            # Apply stake (will be included in next block via mempool in future)
+            # For now, apply directly but with proper nonce tracking
+            self.blockchain.supply.stake(entity_id, tx.amount)
+            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
+            self.blockchain.nonces[entity_id] = tx.nonce + 1
+            self.consensus.register_validator(entity_id, tx.amount)
+
+            if self.blockchain.db is not None:
+                self.blockchain._persist_state()
+
             return {"ok": True, "result": {
-                "entity_id": params["entity_id"],
+                "entity_id": entity_id.hex(),
+                "tx_hash": tx.tx_hash.hex(),
                 "staked": self.blockchain.supply.get_staked(entity_id),
                 "balance": self.blockchain.supply.get_balance(entity_id),
             }}
@@ -334,32 +368,50 @@ class Server:
             return {"ok": False, "error": str(e)}
 
     def _rpc_unstake(self, params: dict) -> dict:
-        """Unstake tokens. Requires a signature to authenticate."""
-        try:
-            entity_id = bytes.fromhex(params["entity_id"])
-            amount = int(params["amount"])
+        """Accept a signed unstake transaction from a client.
 
-            # Authenticate: caller must sign "unstake" + amount with their key
+        Unstake operations are now proper on-chain transactions with nonce-based
+        replay protection.
+        """
+        try:
+            tx = UnstakeTransaction.deserialize(params["transaction"])
+            entity_id = tx.entity_id
+
             if entity_id not in self.blockchain.public_keys:
                 return {"ok": False, "error": "Unknown entity"}
-            if "signature" not in params:
-                return {"ok": False, "error": "Signature required — unstake must be authenticated"}
-            sig = Signature.deserialize(params["signature"])
-            msg = entity_id + b"unstake" + struct.pack(">Q", amount)
-            msg_hash = _hash(msg)
-            public_key = self.blockchain.public_keys[entity_id]
-            if not verify_signature(msg_hash, sig, public_key):
-                return {"ok": False, "error": "Invalid signature — authentication failed"}
 
-            if not self.blockchain.supply.unstake(entity_id, amount):
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_unstake_transaction(tx, public_key):
+                return {"ok": False, "error": "Invalid unstake transaction signature"}
+
+            # Validate nonce
+            expected_nonce = self.blockchain.nonces.get(entity_id, 0)
+            if tx.nonce != expected_nonce:
+                return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
+
+            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
+                return {"ok": False, "error": "Insufficient balance for fee"}
+
+            if self.blockchain.supply.get_staked(entity_id) < tx.amount:
                 return {"ok": False, "error": "Insufficient staked amount"}
+
+            # Apply unstake with proper nonce tracking
+            self.blockchain.supply.unstake(entity_id, tx.amount)
+            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
+            self.blockchain.nonces[entity_id] = tx.nonce + 1
+
             remaining = self.blockchain.supply.get_staked(entity_id)
             if remaining == 0:
                 self.consensus.remove_validator(entity_id)
             else:
                 self.consensus.stakes[entity_id] = remaining
+
+            if self.blockchain.db is not None:
+                self.blockchain._persist_state()
+
             return {"ok": True, "result": {
-                "entity_id": params["entity_id"],
+                "entity_id": entity_id.hex(),
+                "tx_hash": tx.tx_hash.hex(),
                 "staked": remaining,
                 "balance": self.blockchain.supply.get_balance(entity_id),
             }}
@@ -590,6 +642,12 @@ class Server:
             best_hash = msg.payload.get("best_block_hash", "")
             self.syncer.update_peer_height(peer.address, height, best_hash)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
+            await self._handle_announce_attestation(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
+            await self._handle_announce_slash(msg.payload, peer)
+
         # ── Sync messages ──
         elif msg.msg_type == MessageType.REQUEST_HEADERS:
             await self._serve_headers(msg.payload, peer)
@@ -606,6 +664,57 @@ class Server:
             await self.syncer.handle_blocks_response(
                 msg.payload.get("blocks", []), peer.address
             )
+
+    # ── Attestation and slash handlers ──────────────────────────────
+
+    async def _handle_announce_attestation(self, payload: dict, peer: Peer):
+        """Handle an incoming attestation gossip message."""
+        try:
+            att = Attestation.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_attestation_data"
+            )
+            return
+
+        if att.validator_id not in self.blockchain.public_keys:
+            return
+
+        pk = self.blockchain.public_keys[att.validator_id]
+        if not verify_attestation(att, pk):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
+            )
+            return
+
+        validator_stake = self.blockchain.supply.get_staked(att.validator_id)
+        total_stake = sum(self.blockchain.supply.staked.values())
+        self.blockchain.finality.add_attestation(att, validator_stake, total_stake)
+
+        logger.debug(f"Received attestation from {att.validator_id.hex()[:16]}")
+
+        relay_msg = NetworkMessage(MessageType.ANNOUNCE_ATTESTATION, payload)
+        await self._broadcast(relay_msg)
+
+    async def _handle_announce_slash(self, payload: dict, peer: Peer):
+        """Handle incoming slashing evidence gossip."""
+        try:
+            slash_tx = SlashTx.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_slash_data"
+            )
+            return
+
+        valid, reason = self.blockchain.validate_slash_transaction(slash_tx)
+        if not valid:
+            logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
+            return
+
+        logger.info(f"Received valid slashing evidence against {slash_tx.evidence.offender_id.hex()[:16]}")
+
+        relay_msg = NetworkMessage(MessageType.ANNOUNCE_SLASH, payload)
+        await self._broadcast(relay_msg)
 
     # ── inv/getdata relay ──────────────────────────────────────────
 

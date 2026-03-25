@@ -71,7 +71,14 @@ class SlashingEvidence:
             header_a=BlockHeader.deserialize(data["header_a"]),
             header_b=BlockHeader.deserialize(data["header_b"]),
         )
-        ev.evidence_hash = bytes.fromhex(data["evidence_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = ev._compute_hash()
+        declared_hash = bytes.fromhex(data["evidence_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"SlashingEvidence hash mismatch: declared {data['evidence_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return ev
 
 
@@ -118,7 +125,14 @@ class AttestationSlashingEvidence:
             attestation_a=Attestation.deserialize(data["attestation_a"]),
             attestation_b=Attestation.deserialize(data["attestation_b"]),
         )
-        ev.evidence_hash = bytes.fromhex(data["evidence_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = ev._compute_hash()
+        declared_hash = bytes.fromhex(data["evidence_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"AttestationSlashingEvidence hash mismatch: declared {data['evidence_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return ev
 
 
@@ -215,7 +229,14 @@ class SlashTransaction:
             fee=data["fee"],
             signature=sig,
         )
-        tx.tx_hash = bytes.fromhex(data["tx_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = tx._compute_hash()
+        declared_hash = bytes.fromhex(data["tx_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"SlashTransaction hash mismatch: declared {data['tx_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return tx
 
 

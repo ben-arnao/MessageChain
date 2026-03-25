@@ -123,11 +123,8 @@ def find_common_ancestor(
 
         # Check if a's current hash is in b's history
         if a_hash in b_hashes:
-            # a_hash is the ancestor, trim b's list
-            while chain_b_blocks and chain_b_blocks[0].header.prev_hash != a_hash:
-                # We need to find where a_hash appears
-                pass
-            # Simpler: rebuild b's list from ancestor
+            # a_hash is the ancestor — rebuild b's list to only include
+            # blocks after the ancestor, connected by prev_hash linkage
             trimmed = []
             for blk in chain_b_blocks:
                 if blk.header.prev_hash == a_hash or (trimmed and trimmed[-1].block_hash == blk.header.prev_hash):
@@ -135,6 +132,7 @@ def find_common_ancestor(
             return a_hash, chain_a_blocks, trimmed
 
         if b_hash in a_hashes:
+            # b_hash is the ancestor — rebuild a's list similarly
             trimmed = []
             for blk in chain_a_blocks:
                 if blk.header.prev_hash == b_hash or (trimmed and trimmed[-1].block_hash == blk.header.prev_hash):

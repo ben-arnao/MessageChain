@@ -77,7 +77,14 @@ class KeyRotationTransaction:
             fee=data["fee"],
             signature=sig,
         )
-        tx.tx_hash = bytes.fromhex(data["tx_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = tx._compute_hash()
+        declared_hash = bytes.fromhex(data["tx_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"KeyRotation tx hash mismatch: declared {data['tx_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return tx
 
 

@@ -59,6 +59,8 @@ class Blockchain:
         self.entity_message_count: dict[bytes, int] = {}
         self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
+        self.attestation_sig_counts: dict[bytes, int] = {}  # entity_id -> attestation signatures made
+        self.slash_sig_counts: dict[bytes, int] = {}  # entity_id -> slash submission signatures made
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
@@ -463,16 +465,24 @@ class Blockchain:
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
-        # Apply slash transactions
+        # Apply slash transactions — each consumes a WOTS+ leaf from the submitter
         for stx in block.slash_transactions:
             self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
+            self.slash_sig_counts[stx.submitter_id] = (
+                self.slash_sig_counts.get(stx.submitter_id, 0) + 1
+            )
         self.supply.mint_block_reward(proposer_id, block.header.block_number)
-        # Track proposer's block signature count
+        # Track proposer's block signature count (WOTS+ leaf consumed)
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1
         )
+        # Track attestation signatures (each consumes a WOTS+ leaf from the validator)
+        for att in block.attestations:
+            self.attestation_sig_counts[att.validator_id] = (
+                self.attestation_sig_counts.get(att.validator_id, 0) + 1
+            )
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
@@ -531,13 +541,23 @@ class Blockchain:
             self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
+            # Track slash submitter's signature (WOTS+ leaf consumed)
+            self.slash_sig_counts[stx.submitter_id] = (
+                self.slash_sig_counts.get(stx.submitter_id, 0) + 1
+            )
 
         reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
 
-        # Track proposer's block signature count (for WOTS+ leaf management)
+        # Track proposer's block signature count (WOTS+ leaf consumed)
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1
         )
+
+        # Track attestation signatures (each consumes a WOTS+ leaf from the validator)
+        for att in block.attestations:
+            self.attestation_sig_counts[att.validator_id] = (
+                self.attestation_sig_counts.get(att.validator_id, 0) + 1
+            )
 
         # Verify state_root commitment (skip for legacy blocks with zero state_root)
         if block.header.state_root != b"\x00" * 32:
@@ -721,6 +741,9 @@ class Blockchain:
         self.nonces = {}
         self.entity_message_count = {}
         self.proposer_sig_counts = {}
+        self.attestation_sig_counts = {}
+        self.slash_sig_counts = {}
+        self.key_rotation_counts = {}
         self.public_keys = {}
         self.slashed_validators = set()
 
@@ -738,6 +761,9 @@ class Blockchain:
             "public_keys": dict(self.public_keys),
             "message_counts": dict(self.entity_message_count),
             "proposer_sig_counts": dict(self.proposer_sig_counts),
+            "attestation_sig_counts": dict(self.attestation_sig_counts),
+            "slash_sig_counts": dict(self.slash_sig_counts),
+            "key_rotation_counts": dict(self.key_rotation_counts),
             "total_supply": self.supply.total_supply,
             "total_minted": self.supply.total_minted,
             "total_fees_collected": self.supply.total_fees_collected,
@@ -756,10 +782,20 @@ class Blockchain:
         self.public_keys = snapshot["public_keys"]
         self.entity_message_count = snapshot["message_counts"]
         self.proposer_sig_counts = snapshot.get("proposer_sig_counts", {})
+        self.attestation_sig_counts = snapshot.get("attestation_sig_counts", {})
+        self.slash_sig_counts = snapshot.get("slash_sig_counts", {})
+        self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
         self.slashed_validators = snapshot.get("slashed_validators", set())
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
-        """Total WOTS+ leaves consumed by this entity (tx nonce + block sigs).
+        """Total WOTS+ leaves consumed by this entity across ALL signature types.
+
+        Counts:
+        - Message transaction signatures (nonce tracks these)
+        - Block proposer signatures
+        - Attestation signatures
+        - Slash submission signatures
+        - Key rotation signatures (rotation_count tracks these)
 
         Used to safely advance a keypair past already-used one-time keys
         when reconstructing from biometrics (e.g., on server restart).
@@ -767,6 +803,9 @@ class Blockchain:
         return (
             self.nonces.get(entity_id, 0)
             + self.proposer_sig_counts.get(entity_id, 0)
+            + self.attestation_sig_counts.get(entity_id, 0)
+            + self.slash_sig_counts.get(entity_id, 0)
+            + self.key_rotation_counts.get(entity_id, 0)
         )
 
     def get_entity_stats(self, entity_id: bytes) -> dict:
