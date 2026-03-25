@@ -15,6 +15,9 @@ class TestStateRoot(unittest.TestCase):
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob)
+        # Fund test entities so they can pay fees
+        self.chain.supply.balances[self.alice.entity_id] = 10000
+        self.chain.supply.balances[self.bob.entity_id] = 10000
         self.consensus = ProofOfStake()
 
     def test_state_root_deterministic(self):

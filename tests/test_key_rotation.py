@@ -21,6 +21,9 @@ class TestKeyRotation(unittest.TestCase):
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob)
+        # Fund test entities so they can pay fees
+        self.chain.supply.balances[self.alice.entity_id] = 10000
+        self.chain.supply.balances[self.bob.entity_id] = 10000
 
     def test_derive_rotated_keypair_deterministic(self):
         """Same biometrics + same rotation number = same new keys."""

@@ -44,6 +44,9 @@ def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity
     chain = Blockchain(db=db)
     chain.initialize_genesis(alice)
     chain.register_entity(bob)
+    # Fund test entities so they can pay fees
+    chain.supply.balances[alice.entity_id] = 10000
+    chain.supply.balances[bob.entity_id] = 10000
 
     pos = ProofOfStake()
 
@@ -292,6 +295,8 @@ class TestForkCommonAncestor:
         chain = Blockchain()
         chain.initialize_genesis(alice)
         chain.register_entity(bob)
+        chain.supply.balances[alice.entity_id] = 10000
+        chain.supply.balances[bob.entity_id] = 10000
 
         pos = ProofOfStake()
         parent = chain.get_latest_block()
@@ -342,6 +347,7 @@ class TestChainReorg:
 
         bob = make_entity("bob-orphan")
         chain.register_entity(bob)
+        chain.supply.balances[bob.entity_id] = 10000
         tx = create_transaction(bob, "orphan", BiometricType.DNA, fee=2, nonce=0)
         block = pos.create_block(alice, [tx], fake_parent)
 
@@ -356,6 +362,8 @@ class TestChainReorg:
         chain = Blockchain()
         chain.initialize_genesis(alice)
         chain.register_entity(bob)
+        chain.supply.balances[alice.entity_id] = 10000
+        chain.supply.balances[bob.entity_id] = 10000
 
         pos = ProofOfStake()
         parent = chain.get_latest_block()
@@ -491,6 +499,8 @@ class TestIntegration:
             chain = Blockchain(db=db)
             chain.initialize_genesis(alice)
             chain.register_entity(bob)
+            chain.supply.balances[alice.entity_id] = 10000
+            chain.supply.balances[bob.entity_id] = 10000
 
             pos = ProofOfStake()
             for i in range(5):
