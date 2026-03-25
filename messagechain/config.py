@@ -60,3 +60,10 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 
 # Finality
 FINALITY_THRESHOLD = 0.67     # 2/3 of stake must attest for justification
+
+# Governance — on-chain voting for protocol/codebase changes
+GOVERNANCE_VOTING_WINDOW = 60_480     # blocks (~7 days at 10s/block)
+GOVERNANCE_APPROVAL_THRESHOLD = 0.50  # >50% of participating balance must approve
+GOVERNANCE_PROPOSAL_FEE = 10          # fee to create a proposal (spam deterrent)
+GOVERNANCE_VOTE_FEE = 1               # fee to cast a vote
+GOVERNANCE_DELEGATE_FEE = 1           # fee to delegate/revoke voting power
