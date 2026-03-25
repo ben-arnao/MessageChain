@@ -6,7 +6,7 @@ import os
 import tempfile
 import time
 
-import pytest
+import unittest
 
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.blockchain import Blockchain
@@ -69,7 +69,7 @@ def make_temp_db() -> tuple[ChainDB, str]:
 # PERSISTENT STORAGE TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestChainDB:
+class TestChainDB(unittest.TestCase):
     """Test SQLite-backed persistent storage."""
 
     def test_store_and_retrieve_block(self):
@@ -176,7 +176,7 @@ class TestChainDB:
             os.unlink(path)
 
 
-class TestPersistentBlockchain:
+class TestPersistentBlockchain(unittest.TestCase):
     """Test Blockchain with SQLite persistence."""
 
     def test_persist_and_reload_chain(self):
@@ -224,7 +224,7 @@ class TestPersistentBlockchain:
 # FORK CHOICE TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestForkChoice:
+class TestForkChoice(unittest.TestCase):
     """Test fork choice rule (heaviest stake wins)."""
 
     def test_single_tip(self):
@@ -285,7 +285,7 @@ class TestForkChoice:
         assert weight == 500
 
 
-class TestForkCommonAncestor:
+class TestForkCommonAncestor(unittest.TestCase):
     """Test finding common ancestors between forking chains."""
 
     def test_find_ancestor_simple_fork(self):
@@ -324,7 +324,7 @@ class TestForkCommonAncestor:
         assert apply_[0].block_hash == block_b.block_hash
 
 
-class TestChainReorg:
+class TestChainReorg(unittest.TestCase):
     """Test chain reorganization."""
 
     def test_duplicate_block_rejected(self):
@@ -364,23 +364,30 @@ class TestChainReorg:
         chain.register_entity(bob)
         chain.supply.balances[alice.entity_id] = 10000
         chain.supply.balances[bob.entity_id] = 10000
+        # Give alice stake so main chain blocks have weight > 1,
+        # ensuring the longer main chain is strictly heavier than the fork.
+        chain.supply.staked[alice.entity_id] = 1000
 
         pos = ProofOfStake()
-        parent = chain.get_latest_block()
+        genesis = chain.get_latest_block()
 
-        # Add block to main chain
-        tx1 = create_transaction(bob, "main chain", BiometricType.DNA, fee=2, nonce=0)
-        block1 = pos.create_block(alice, [tx1], parent)
+        # Build main chain 2 blocks deep so it's strictly better than a 1-block fork
+        tx1 = create_transaction(bob, "main chain 1", BiometricType.DNA, fee=2, nonce=0)
+        block1 = pos.create_block(alice, [tx1], genesis)
         chain.add_block(block1)
 
-        # Create competing fork block from same parent
-        tx2 = create_transaction(bob, "fork chain", BiometricType.DNA, fee=3, nonce=0)
-        block2 = pos.create_block(alice, [tx2], parent)
+        tx2 = create_transaction(bob, "main chain 2", BiometricType.DNA, fee=2, nonce=1)
+        block2 = pos.create_block(alice, [tx2], block1)
+        chain.add_block(block2)
 
-        success, reason = chain.add_block(block2)
+        # Create competing fork block from genesis (shorter fork, won't trigger reorg)
+        tx_fork = create_transaction(bob, "fork chain", BiometricType.DNA, fee=2, nonce=0)
+        block_fork = pos.create_block(alice, [tx_fork], genesis)
+
+        success, reason = chain.add_block(block_fork)
         assert success
         # Block should be findable by hash
-        assert chain.get_block_by_hash(block2.block_hash) is not None
+        assert chain.get_block_by_hash(block_fork.block_hash) is not None
 
     def test_chain_info_shows_tips(self):
         chain, _ = make_chain_with_blocks(2)
@@ -393,7 +400,7 @@ class TestChainReorg:
 # IBD / SYNC TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestChainSyncer:
+class TestChainSyncer(unittest.TestCase):
     """Test the IBD sync state machine."""
 
     def test_initial_state(self):
@@ -457,7 +464,7 @@ class TestChainSyncer:
         assert syncer.state == SyncState.COMPLETE
 
 
-class TestSyncProtocol:
+class TestSyncProtocol(unittest.TestCase):
     """Test the sync protocol message types exist and work."""
 
     def test_new_message_types_exist(self):
@@ -486,7 +493,7 @@ class TestSyncProtocol:
 # INTEGRATION TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestIntegration:
+class TestIntegration(unittest.TestCase):
     """End-to-end tests combining storage + fork choice + sync."""
 
     def test_full_lifecycle_with_persistence(self):
@@ -553,4 +560,4 @@ class TestIntegration:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    unittest.main()
