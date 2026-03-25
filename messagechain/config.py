@@ -2,16 +2,16 @@
 
 # Message constraints
 MAX_MESSAGE_WORDS = 100  # max words per message (L2 splits long messages across txs)
-MAX_MESSAGE_BYTES = 10_000  # max message size in bytes (prevents single-word megabyte abuse)
+MAX_MESSAGE_BYTES = 1_024  # max message size in bytes (~1KB, fits 100 words with Unicode room)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
-# Target: ~2% annual inflation that diminishes over time via halvings.
+# Target: ~1% annual inflation that diminishes over time via halvings.
 # At BLOCK_TIME_TARGET=10s, ~3,153,600 blocks/year.
-# Year 1: 10 tokens/block * 3,153,600 = 31,536,000 minted against 1B supply = ~3.15%
-# Year 2+: halving every 6,307,200 blocks (~2 years) gradually reduces rate.
+# Year 1: 3 tokens/block * 3,153,600 = 9,460,800 minted against 1B supply = ~0.95%
+# Halving every ~4 years gradually reduces rate while keeping inflation meaningful.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
-BLOCK_REWARD = 10  # new tokens minted per block (paid to proposer)
-HALVING_INTERVAL = 6_307_200  # blocks between reward halvings (~2 years at 10s blocks)
+BLOCK_REWARD = 3  # new tokens minted per block (paid to proposer)
+HALVING_INTERVAL = 12_614_400  # blocks between reward halvings (~4 years at 10s blocks)
 MIN_FEE = 1  # minimum transaction fee
 
 # Timestamp tolerance
