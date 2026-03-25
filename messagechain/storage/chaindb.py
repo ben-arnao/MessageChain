@@ -93,6 +93,12 @@ class ChainDB:
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS slashed_validators (
+                entity_id BLOB PRIMARY KEY,
+                slashed_at_block INTEGER NOT NULL,
+                evidence_hash BLOB NOT NULL
+            );
         """)
         conn.commit()
 
@@ -315,6 +321,23 @@ class ChainDB:
             "INSERT OR REPLACE INTO supply_meta (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+    # ── Slashed Validators ─────────────────────────────────────────
+
+    def add_slashed_validator(self, entity_id: bytes, block_number: int, evidence_hash: bytes):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO slashed_validators (entity_id, slashed_at_block, evidence_hash) VALUES (?, ?, ?)",
+            (entity_id, block_number, evidence_hash),
+        )
+        self._conn.commit()
+
+    def is_slashed(self, entity_id: bytes) -> bool:
+        cur = self._conn.execute("SELECT 1 FROM slashed_validators WHERE entity_id = ?", (entity_id,))
+        return cur.fetchone() is not None
+
+    def get_all_slashed(self) -> set[bytes]:
+        cur = self._conn.execute("SELECT entity_id FROM slashed_validators")
+        return {bytes(row[0]) for row in cur.fetchall()}
 
     # ── Batch Operations (for state snapshots / reorgs) ──────────
 

@@ -20,6 +20,7 @@ ensuring permanent (diminishing) issuance to replace lost tokens.
 import math
 from messagechain.config import (
     GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE,
+    SLASH_FINDER_REWARD_PCT,
 )
 
 
@@ -96,6 +97,30 @@ class SupplyTracker:
         self.balances[from_id] -= amount
         self.balances[to_id] = self.balances.get(to_id, 0) + amount
         return True
+
+    def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:
+        """
+        Slash a validator: burn their entire stake, pay finder a reward.
+
+        Returns (total_slashed, finder_reward).
+        """
+        slashed_amount = self.staked.get(offender_id, 0)
+        if slashed_amount == 0:
+            return 0, 0
+
+        finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
+        burned = slashed_amount - finder_reward
+
+        # Remove all stake
+        self.staked[offender_id] = 0
+
+        # Pay finder
+        self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward
+
+        # Burn the rest — permanently removed from supply
+        self.total_supply -= burned
+
+        return slashed_amount, finder_reward
 
     def get_supply_stats(self, current_block_height: int = 0) -> dict:
         return {

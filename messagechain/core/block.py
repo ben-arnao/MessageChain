@@ -140,6 +140,7 @@ class Block:
     header: BlockHeader
     transactions: list[MessageTransaction]
     validator_signatures: list[tuple[bytes, Signature]] = field(default_factory=list)
+    slash_transactions: list = field(default_factory=list)  # list[SlashTransaction]
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -150,7 +151,7 @@ class Block:
         return _hash(self.header.signable_data())
 
     def serialize(self) -> dict:
-        return {
+        result = {
             "header": self.header.serialize(),
             "transactions": [tx.serialize() for tx in self.transactions],
             "validator_signatures": [
@@ -159,6 +160,9 @@ class Block:
             ],
             "block_hash": self.block_hash.hex(),
         }
+        if self.slash_transactions:
+            result["slash_transactions"] = [tx.serialize() for tx in self.slash_transactions]
+        return result
 
     @classmethod
     def deserialize(cls, data: dict) -> "Block":
@@ -168,7 +172,13 @@ class Block:
             (bytes.fromhex(vs["entity_id"]), Signature.deserialize(vs["signature"]))
             for vs in data.get("validator_signatures", [])
         ]
-        block = cls(header=header, transactions=txs, validator_signatures=val_sigs)
+        # Lazy import to avoid circular dependency
+        slash_txs = []
+        if data.get("slash_transactions"):
+            from messagechain.consensus.slashing import SlashTransaction
+            slash_txs = [SlashTransaction.deserialize(s) for s in data["slash_transactions"]]
+        block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
+                    slash_transactions=slash_txs)
         block.block_hash = bytes.fromhex(data["block_hash"])
         return block
 

@@ -27,6 +27,9 @@ class MessageType(Enum):
     INV = "inv"              # announce tx/block hashes we have
     GETDATA = "getdata"      # request full tx/block by hash
 
+    # Slashing evidence relay
+    ANNOUNCE_SLASH = "announce_slash"
+
     # IBD / Sync messages (headers-first)
     REQUEST_HEADERS = "request_headers"
     RESPONSE_HEADERS = "response_headers"

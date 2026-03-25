@@ -53,3 +53,7 @@ SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
 
 # Key rotation
 KEY_ROTATION_FEE = 10     # fee required for key rotation transaction
+
+# Slashing
+SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
+SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter

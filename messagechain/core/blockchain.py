@@ -22,6 +22,9 @@ from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
 )
+from messagechain.consensus.slashing import (
+    SlashTransaction, verify_slashing_evidence,
+)
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
 from messagechain.consensus.fork_choice import (
@@ -51,6 +54,7 @@ class Blockchain:
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
         self.entity_message_count: dict[bytes, int] = {}
         self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
+        self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self.fork_choice = ForkChoice()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
 
@@ -77,6 +81,10 @@ class Blockchain:
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
+
+        # Restore slashed validators
+        if hasattr(self.db, 'get_all_slashed'):
+            self.slashed_validators = self.db.get_all_slashed()
 
         # Rebuild in-memory chain from best tip
         best_tip = self.db.get_best_tip()
@@ -115,6 +123,10 @@ class Blockchain:
         self.db.set_supply_meta("total_supply", self.supply.total_supply)
         self.db.set_supply_meta("total_minted", self.supply.total_minted)
         self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
+        # Persist slashed validators
+        if hasattr(self.db, 'add_slashed_validator'):
+            for eid in self.slashed_validators:
+                self.db.add_slashed_validator(eid, self.height, b"")
         self.db.flush_state()
 
     def initialize_genesis(self, genesis_entity) -> Block:
@@ -247,6 +259,59 @@ class Blockchain:
 
         return True, "Key rotated successfully"
 
+    def validate_slash_transaction(self, tx: SlashTransaction) -> tuple[bool, str]:
+        """Validate a slash transaction against current chain state."""
+        if tx.submitter_id not in self.public_keys:
+            return False, "Unknown submitter — must register first"
+
+        if tx.evidence.offender_id not in self.public_keys:
+            return False, "Unknown offender"
+
+        if tx.evidence.offender_id in self.slashed_validators:
+            return False, "Validator already slashed"
+
+        if self.supply.get_staked(tx.evidence.offender_id) == 0:
+            return False, "Offender has no stake to slash"
+
+        if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
+            return False, "Submitter cannot afford fee"
+
+        # Verify the evidence itself (two valid conflicting signatures)
+        offender_pk = self.public_keys[tx.evidence.offender_id]
+        valid, reason = verify_slashing_evidence(tx.evidence, offender_pk)
+        if not valid:
+            return False, f"Invalid evidence: {reason}"
+
+        # Verify submitter's signature on the slash transaction
+        submitter_pk = self.public_keys[tx.submitter_id]
+        msg_hash = _hash(tx._signable_data())
+        if not verify_signature(msg_hash, tx.signature, submitter_pk):
+            return False, "Invalid submitter signature"
+
+        return True, "Valid"
+
+    def apply_slash_transaction(self, tx: SlashTransaction, proposer_id: bytes) -> tuple[bool, str]:
+        """Validate and apply a slash transaction."""
+        valid, reason = self.validate_slash_transaction(tx)
+        if not valid:
+            return False, reason
+
+        # Pay fee to proposer
+        self.supply.pay_fee(tx.submitter_id, proposer_id, tx.fee)
+
+        # Slash the offender
+        slashed, finder_reward = self.supply.slash_validator(
+            tx.evidence.offender_id, tx.submitter_id
+        )
+        self.slashed_validators.add(tx.evidence.offender_id)
+
+        logger.info(
+            f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
+            f"burned={slashed - finder_reward}, finder_reward={finder_reward}"
+        )
+
+        return True, f"Validator slashed (total={slashed}, reward={finder_reward})"
+
     def compute_current_state_root(self) -> bytes:
         """Compute a Merkle commitment to the current account state."""
         return compute_state_root(
@@ -322,6 +387,11 @@ class Blockchain:
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
+        # Apply slash transactions
+        for stx in block.slash_transactions:
+            self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
+            self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
+            self.slashed_validators.add(stx.evidence.offender_id)
         self.supply.mint_block_reward(proposer_id, block.header.block_number)
 
     def add_block(self, block: Block) -> tuple[bool, str]:
@@ -368,6 +438,15 @@ class Blockchain:
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
+
+        # Apply slash transactions
+        for stx in block.slash_transactions:
+            valid, reason = self.validate_slash_transaction(stx)
+            if not valid:
+                return False, f"Invalid slash tx: {reason}"
+            self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
+            self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
+            self.slashed_validators.add(stx.evidence.offender_id)
 
         reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
 
@@ -542,6 +621,7 @@ class Blockchain:
         self.nonces = {}
         self.entity_message_count = {}
         self.public_keys = {}
+        self.slashed_validators = set()
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -560,6 +640,7 @@ class Blockchain:
             "total_minted": self.supply.total_minted,
             "total_fees_collected": self.supply.total_fees_collected,
             "chain_length": len(self.chain),
+            "slashed_validators": set(self.slashed_validators),
         }
 
     def _restore_memory_snapshot(self, snapshot: dict):
@@ -572,6 +653,7 @@ class Blockchain:
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
         self.entity_message_count = snapshot["message_counts"]
+        self.slashed_validators = snapshot.get("slashed_validators", set())
 
     def get_entity_stats(self, entity_id: bytes) -> dict:
         return {
