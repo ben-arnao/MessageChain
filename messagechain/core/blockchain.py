@@ -23,7 +23,11 @@ from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
 )
 from messagechain.consensus.slashing import (
-    SlashTransaction, verify_slashing_evidence,
+    SlashTransaction, SlashingEvidence, AttestationSlashingEvidence,
+    verify_slashing_evidence, verify_attestation_slashing_evidence,
+)
+from messagechain.consensus.attestation import (
+    Attestation, FinalityTracker, verify_attestation,
 )
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
@@ -57,6 +61,7 @@ class Blockchain:
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self.fork_choice = ForkChoice()
+        self.finality = FinalityTracker()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
 
         # If db exists, try to load persisted state
@@ -290,7 +295,10 @@ class Blockchain:
 
         # Verify the evidence itself (two valid conflicting signatures)
         offender_pk = self.public_keys[tx.evidence.offender_id]
-        valid, reason = verify_slashing_evidence(tx.evidence, offender_pk)
+        if isinstance(tx.evidence, AttestationSlashingEvidence):
+            valid, reason = verify_attestation_slashing_evidence(tx.evidence, offender_pk)
+        else:
+            valid, reason = verify_slashing_evidence(tx.evidence, offender_pk)
         if not valid:
             return False, f"Invalid evidence: {reason}"
 
@@ -331,6 +339,55 @@ class Blockchain:
             self.nonces,
             self.supply.staked,
         )
+
+    def _validate_attestations(self, block: Block) -> tuple[bool, str]:
+        """Validate all attestations included in a block.
+
+        Each attestation must:
+        1. Be from a registered entity
+        2. Reference the parent block (block carries attestations for its parent)
+        3. Have a valid signature
+        4. Not be a duplicate (same validator attesting twice in same block)
+        """
+        seen_validators = set()
+        for att in block.attestations:
+            # Must reference the parent block
+            if att.block_hash != block.header.prev_hash:
+                return False, f"Attestation references wrong block: expected parent {block.header.prev_hash.hex()[:16]}"
+            if att.block_number != block.header.block_number - 1:
+                return False, "Attestation references wrong block height"
+
+            # Must be from a registered entity
+            if att.validator_id not in self.public_keys:
+                return False, f"Attestation from unknown entity {att.validator_id.hex()[:16]}"
+
+            # No duplicate attestations from same validator in one block
+            if att.validator_id in seen_validators:
+                return False, f"Duplicate attestation from {att.validator_id.hex()[:16]}"
+            seen_validators.add(att.validator_id)
+
+            # Verify signature
+            pk = self.public_keys[att.validator_id]
+            if not verify_attestation(att, pk):
+                return False, f"Invalid attestation signature from {att.validator_id.hex()[:16]}"
+
+        return True, "Attestations valid"
+
+    def _process_attestations(self, block: Block, stakes: dict[bytes, int]):
+        """Process attestations in a block, updating finality tracker.
+
+        When a block accumulates 2/3+ of stake in attestations, it becomes
+        finalized and can never be reverted by a reorg.
+        """
+        total_stake = sum(stakes.values())
+        for att in block.attestations:
+            validator_stake = stakes.get(att.validator_id, 0)
+            justified = self.finality.add_attestation(att, validator_stake, total_stake)
+            if justified:
+                logger.info(
+                    f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
+                    f"reached 2/3+ attestation threshold"
+                )
 
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
@@ -373,6 +430,11 @@ class Blockchain:
             valid, reason = self.validate_transaction(tx)
             if not valid:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: {reason}"
+
+        # Validate attestations (votes for the parent block)
+        valid, reason = self._validate_attestations(block)
+        if not valid:
+            return False, reason
 
         return True, "Valid"
 
@@ -496,6 +558,9 @@ class Blockchain:
         self.fork_choice.remove_tip(old_tip)
         self.fork_choice.add_tip(block.block_hash, block.header.block_number, new_weight)
 
+        # Process attestations for finality
+        self._process_attestations(block, self.supply.staked)
+
         # Persist
         if self.db is not None:
             self.db.store_block(block)
@@ -575,6 +640,14 @@ class Blockchain:
 
         if len(rollback_blocks) > MAX_REORG_DEPTH:
             return False, f"Reorg rejected — depth {len(rollback_blocks)} exceeds max {MAX_REORG_DEPTH}"
+
+        # Finality boundary: refuse to revert finalized blocks
+        for blk in rollback_blocks:
+            if self.finality.is_finalized(blk.block_hash):
+                return False, (
+                    f"Reorg rejected — block #{blk.header.block_number} "
+                    f"({blk.block_hash.hex()[:16]}) is finalized"
+                )
 
         # Snapshot current state for rollback
         if self.db is not None:

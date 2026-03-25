@@ -27,6 +27,9 @@ class MessageType(Enum):
     INV = "inv"              # announce tx/block hashes we have
     GETDATA = "getdata"      # request full tx/block by hash
 
+    # Attestation relay
+    ANNOUNCE_ATTESTATION = "announce_attestation"
+
     # Slashing evidence relay
     ANNOUNCE_SLASH = "announce_slash"
 

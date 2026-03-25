@@ -267,11 +267,14 @@ def verify_slashing_evidence(
 
 def create_slash_transaction(
     submitter_entity,
-    evidence: SlashingEvidence,
+    evidence: SlashingEvidence | AttestationSlashingEvidence,
     fee: int = 1,
 ) -> SlashTransaction:
     """
-    Create a slash transaction submitting evidence of double-signing.
+    Create a slash transaction submitting evidence of a slashable offense.
+
+    Accepts either double-proposal evidence (SlashingEvidence) or
+    double-attestation evidence (AttestationSlashingEvidence).
 
     The submitter signs the evidence hash to prove they are the one
     reporting the offense (for finder's reward attribution).

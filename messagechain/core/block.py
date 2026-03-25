@@ -141,6 +141,7 @@ class Block:
     transactions: list[MessageTransaction]
     validator_signatures: list[tuple[bytes, Signature]] = field(default_factory=list)
     slash_transactions: list = field(default_factory=list)  # list[SlashTransaction]
+    attestations: list = field(default_factory=list)  # list[Attestation] for parent block
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -162,6 +163,8 @@ class Block:
         }
         if self.slash_transactions:
             result["slash_transactions"] = [tx.serialize() for tx in self.slash_transactions]
+        if self.attestations:
+            result["attestations"] = [att.serialize() for att in self.attestations]
         return result
 
     @classmethod
@@ -177,8 +180,12 @@ class Block:
         if data.get("slash_transactions"):
             from messagechain.consensus.slashing import SlashTransaction
             slash_txs = [SlashTransaction.deserialize(s) for s in data["slash_transactions"]]
+        attestations = []
+        if data.get("attestations"):
+            from messagechain.consensus.attestation import Attestation
+            attestations = [Attestation.deserialize(a) for a in data["attestations"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
-                    slash_transactions=slash_txs)
+                    slash_transactions=slash_txs, attestations=attestations)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

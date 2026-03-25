@@ -10,6 +10,7 @@ we compare cumulative stake weight. If a competing chain has more weight,
 we reorganize: roll back our current tip, replay the better chain.
 
 Reorg safety:
+- Finalized blocks (2/3+ attestations) cannot be reverted — finality boundary
 - State snapshots are taken before reorg so we can roll back if the new
   chain fails validation
 - Deep reorgs (beyond MAX_REORG_DEPTH) are rejected to prevent long-range attacks
