@@ -2,14 +2,22 @@
 
 # Message constraints
 MAX_MESSAGE_WORDS = 100  # max words per message (L2 splits long messages across txs)
+MAX_MESSAGE_BYTES = 10_000  # max message size in bytes (prevents single-word megabyte abuse)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
-GENESIS_SUPPLY = 1_000_000
-INITIAL_ENTITY_GRANT = 1000  # tokens granted when entity registers
-BLOCK_REWARD = 50  # new tokens minted per block (paid to proposer)
-ANNUAL_INFLATION_RATE = 0.02  # 2% target annual inflation
-HALVING_INTERVAL = 210_000  # blocks between reward halvings (like BTC)
+# Target: ~2% annual inflation that diminishes over time via halvings.
+# At BLOCK_TIME_TARGET=10s, ~3,153,600 blocks/year.
+# Year 1: 10 tokens/block * 3,153,600 = 31,536,000 minted against 1B supply = ~3.15%
+# Year 2+: halving every 6,307,200 blocks (~2 years) gradually reduces rate.
+# Entity grants are drawn from genesis supply, not newly minted.
+GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
+INITIAL_ENTITY_GRANT = 1000  # tokens granted from genesis reserve (not minted)
+BLOCK_REWARD = 10  # new tokens minted per block (paid to proposer)
+HALVING_INTERVAL = 6_307_200  # blocks between reward halvings (~2 years at 10s blocks)
 MIN_FEE = 1  # minimum transaction fee
+
+# Timestamp tolerance
+MAX_TIMESTAMP_DRIFT = 300  # max seconds a tx timestamp can be ahead of current time
 
 # Block parameters
 BLOCK_TIME_TARGET = 10  # seconds between blocks
@@ -39,6 +47,7 @@ BAN_DURATION = 86400      # ban length in seconds (24 hours)
 # Mempool
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
+MEMPOOL_PER_SENDER_LIMIT = 25 # max pending txs per entity in mempool
 
 # inv/getdata relay
 INV_BATCH_SIZE = 500      # max tx hashes per INV message

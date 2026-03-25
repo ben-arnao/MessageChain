@@ -69,6 +69,16 @@ class Entity:
         fingerprint_hash = h(HASH_ALGO, fingerprint_data).digest()
         iris_hash = h(HASH_ALGO, iris_data).digest()
 
+        return cls.from_hashes(dna_hash, fingerprint_hash, iris_hash)
+
+    @classmethod
+    def from_hashes(cls, dna_hash: bytes, fingerprint_hash: bytes, iris_hash: bytes) -> "Entity":
+        """
+        Create an entity from pre-hashed biometric data.
+
+        Used on the server side — the client hashes biometrics locally and
+        sends only hashes. Raw biometric data never leaves the client device.
+        """
         entity_id = derive_entity_id(dna_hash, fingerprint_hash, iris_hash)
 
         # The biometric hash IS the private key — no separate key derivation.

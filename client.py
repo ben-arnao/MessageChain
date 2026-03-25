@@ -16,6 +16,8 @@ import struct
 import sys
 import getpass
 
+import hashlib
+from messagechain.config import HASH_ALGO
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.transaction import create_transaction
 
@@ -83,12 +85,19 @@ def cmd_create_account(args):
     entity = Entity.create(dna, fingerprint, iris)
     print(f"\nYour entity ID: {entity.entity_id_hex}")
 
-    # Register with the server
+    # Hash biometrics locally — NEVER send raw biometric data over the wire.
+    # Only the hashes are sent to the server for registration.
+    h = hashlib.new
+    dna_hash = h(HASH_ALGO, dna).hexdigest()
+    fingerprint_hash = h(HASH_ALGO, fingerprint).hexdigest()
+    iris_hash = h(HASH_ALGO, iris).hexdigest()
+
+    # Register with the server (sends hashes, not raw data)
     print(f"Registering with server at {args.host}:{args.rpc_port}...")
     response = rpc_call(args.host, args.rpc_port, "register_entity", {
-        "dna_hex": dna.hex(),
-        "fingerprint_hex": fingerprint.hex(),
-        "iris_hex": iris.hex(),
+        "dna_hash": dna_hash,
+        "fingerprint_hash": fingerprint_hash,
+        "iris_hash": iris_hash,
     })
 
     if response.get("ok"):
@@ -135,7 +144,7 @@ def cmd_send_message(args):
     if args.bio_type:
         bio_type = BiometricType(args.bio_type)
 
-    # Get current nonce from server
+    # Get current nonce from server (also used to advance WOTS+ leaf index)
     nonce_resp = rpc_call(args.host, args.rpc_port, "get_nonce", {
         "entity_id": entity.entity_id_hex,
     })
@@ -143,6 +152,11 @@ def cmd_send_message(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
+
+    # Advance keypair past already-used one-time keys to prevent WOTS+ reuse.
+    # The nonce equals the number of signatures already made, so we skip that many leaves.
+    # +1 accounts for the genesis block signature if this entity proposed it.
+    entity.keypair.advance_to_leaf(nonce)
 
     # Get fee estimate
     fee = args.fee

@@ -50,11 +50,11 @@ class KeyPair:
     The root hash is the long-lived public key. Each leaf is a one-time WOTS+ key.
     """
 
-    def __init__(self, seed: bytes, height: int = MERKLE_TREE_HEIGHT):
+    def __init__(self, seed: bytes, height: int = MERKLE_TREE_HEIGHT, start_leaf: int = 0):
         self.height = height
         self.num_leaves = 2 ** height
         self._seed = seed
-        self._next_leaf = 0
+        self._next_leaf = start_leaf
 
         # Generate all WOTS+ keypairs and build the Merkle tree
         self._wots_keys = []  # (private_keys, public_key, public_seed) per leaf
@@ -81,8 +81,19 @@ class KeyPair:
         self.public_key = self._tree[height][0]
 
     @classmethod
-    def generate(cls, seed: bytes, height: int = MERKLE_TREE_HEIGHT) -> "KeyPair":
-        return cls(seed, height)
+    def generate(cls, seed: bytes, height: int = MERKLE_TREE_HEIGHT, start_leaf: int = 0) -> "KeyPair":
+        return cls(seed, height, start_leaf=start_leaf)
+
+    def advance_to_leaf(self, leaf_index: int):
+        """Advance the next-leaf pointer to skip already-used leaves.
+
+        Used when reconstructing a keypair (e.g., from biometrics) to avoid
+        reusing one-time WOTS+ keys. The caller should set this based on
+        the on-chain nonce or signature count.
+        """
+        if leaf_index > self.num_leaves:
+            raise RuntimeError(f"Leaf index {leaf_index} exceeds tree capacity {self.num_leaves}")
+        self._next_leaf = max(self._next_leaf, leaf_index)
 
     def _auth_path(self, leaf_index: int) -> list[bytes]:
         """Get the Merkle authentication path for a leaf."""

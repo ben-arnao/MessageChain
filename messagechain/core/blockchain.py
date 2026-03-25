@@ -534,27 +534,24 @@ class Blockchain:
         return True, f"Chain reorganized (rollback={len(rolled_back)}, applied={len(apply_blocks)})"
 
     def _reset_state(self):
-        """Reset in-memory state to genesis defaults for replay."""
-        # Keep public_keys and balances from chain[0] (genesis)
-        # but clear transaction-derived state
+        """Reset in-memory state to genesis defaults for replay.
+
+        Public keys are preserved (they come from registration, not blocks),
+        but all balance/nonce state is rebuilt from block replay. Each entity
+        gets exactly one INITIAL_ENTITY_GRANT — no double-granting.
+        """
         old_pks = dict(self.public_keys)
         self.supply = SupplyTracker()
         self.nonces = {}
         self.entity_message_count = {}
-
-        # Re-register all known entities with zero state
-        # (genesis entity gets re-initialized during replay)
         self.public_keys = {}
 
-        # Re-apply genesis state
-        if self.chain:
-            genesis = self.chain[0]
-            # Genesis entity needs to be re-initialized
-            # We restore public keys from what we know
-            for eid, pk in old_pks.items():
-                self.public_keys[eid] = pk
-                self.nonces[eid] = 0
-                self.supply.initialize_balance(eid, INITIAL_ENTITY_GRANT)
+        # Restore public keys and grant each entity its initial balance exactly once
+        for eid, pk in old_pks.items():
+            self.public_keys[eid] = pk
+            self.nonces[eid] = 0
+            self.supply.balances[eid] = INITIAL_ENTITY_GRANT
+            self.supply.total_grants_distributed += INITIAL_ENTITY_GRANT
 
     def _snapshot_memory_state(self) -> dict:
         """Capture in-memory state for rollback."""

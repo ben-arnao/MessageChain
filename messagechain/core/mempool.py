@@ -11,25 +11,29 @@ Now supports:
 """
 
 import time
-from messagechain.config import MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL
+from collections import defaultdict
+from messagechain.config import MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT
 from messagechain.core.transaction import MessageTransaction
 
 
 class Mempool:
     """Pool of validated transactions, ordered by fee for block inclusion."""
 
-    def __init__(self, max_size: int = MEMPOOL_MAX_SIZE, tx_ttl: int = MEMPOOL_TX_TTL):
+    def __init__(self, max_size: int = MEMPOOL_MAX_SIZE, tx_ttl: int = MEMPOOL_TX_TTL,
+                 per_sender_limit: int = MEMPOOL_PER_SENDER_LIMIT):
         self.pending: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
+        self._sender_counts: dict[bytes, int] = defaultdict(int)  # entity_id -> count
         self.max_size = max_size
         self.tx_ttl = tx_ttl
+        self.per_sender_limit = per_sender_limit
 
     def add_transaction(self, tx: MessageTransaction) -> bool:
         """
         Add a transaction to the mempool if not already present.
 
-        If the mempool is full, the transaction is accepted only if its fee
-        exceeds the lowest-fee transaction currently in the pool. The lowest-fee
-        transaction is evicted to make room.
+        Enforces per-sender limits and global size limits. If the mempool is
+        full, the transaction is accepted only if its fee exceeds the
+        lowest-fee transaction currently in the pool.
         """
         if tx.tx_hash in self.pending:
             return False
@@ -38,15 +42,20 @@ class Mempool:
         if self._is_expired(tx):
             return False
 
+        # Per-sender limit: prevent one entity from flooding the mempool
+        if self._sender_counts[tx.entity_id] >= self.per_sender_limit:
+            return False
+
         if len(self.pending) >= self.max_size:
             # Find the lowest-fee transaction
             min_tx = min(self.pending.values(), key=lambda t: t.fee)
             if tx.fee <= min_tx.fee:
                 return False  # new tx doesn't beat the worst in pool
             # Evict lowest-fee tx
-            del self.pending[min_tx.tx_hash]
+            self._remove_tx(min_tx)
 
         self.pending[tx.tx_hash] = tx
+        self._sender_counts[tx.entity_id] += 1
         return True
 
     def get_transactions(self, max_count: int) -> list[MessageTransaction]:
@@ -59,10 +68,20 @@ class Mempool:
         txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
         return txs[:max_count]
 
+    def _remove_tx(self, tx: MessageTransaction):
+        """Remove a single transaction and update sender count."""
+        if tx.tx_hash in self.pending:
+            del self.pending[tx.tx_hash]
+            self._sender_counts[tx.entity_id] = max(0, self._sender_counts[tx.entity_id] - 1)
+            if self._sender_counts[tx.entity_id] == 0:
+                del self._sender_counts[tx.entity_id]
+
     def remove_transactions(self, tx_hashes: list[bytes]):
         """Remove transactions after they've been included in a block."""
         for h in tx_hashes:
-            self.pending.pop(h, None)
+            tx = self.pending.get(h)
+            if tx:
+                self._remove_tx(tx)
 
     def expire_transactions(self) -> int:
         """
@@ -72,11 +91,11 @@ class Mempool:
         """
         now = time.time()
         expired = [
-            tx_hash for tx_hash, tx in self.pending.items()
+            tx for tx in self.pending.values()
             if now - tx.timestamp > self.tx_ttl
         ]
-        for tx_hash in expired:
-            del self.pending[tx_hash]
+        for tx in expired:
+            self._remove_tx(tx)
         return len(expired)
 
     def _is_expired(self, tx: MessageTransaction) -> bool:
