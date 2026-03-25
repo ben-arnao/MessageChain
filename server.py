@@ -35,7 +35,7 @@ from messagechain.core.transaction import MessageTransaction, create_transaction
 from messagechain.core.mempool import Mempool
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.crypto.keys import verify_signature
+from messagechain.crypto.keys import verify_signature, KeyPair
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
@@ -82,6 +82,7 @@ class Server:
         self.peers: dict[str, Peer] = {}
 
         self.wallet_id: bytes | None = None  # the entity_id that earns fees
+        self.wallet_entity: Entity | None = None  # full entity for block signing
         self._running = False
 
         # IBD / sync
@@ -114,6 +115,17 @@ class Server:
         if self.wallet_id not in self.blockchain.public_keys:
             logger.warning("Wallet not yet registered on chain — will earn rewards once registered")
 
+    def set_wallet_entity(self, entity: Entity):
+        """Set the full wallet entity (with keypair) for block signing."""
+        self.wallet_entity = entity
+        self.wallet_id = entity.entity_id
+
+    def _sync_validators_from_chain(self):
+        """Load validator stakes from chain state into the consensus module."""
+        for entity_id, staked in self.blockchain.supply.staked.items():
+            if staked > 0:
+                self.consensus.stakes[entity_id] = staked
+
     async def start(self):
         """Start P2P server, RPC server, and block production."""
         # Initialize genesis if fresh chain
@@ -124,6 +136,9 @@ class Server:
             logger.info(f"Genesis block created")
         else:
             logger.info(f"Loaded chain from storage: height={self.blockchain.height}")
+
+        # Sync validator stakes from chain state
+        self._sync_validators_from_chain()
 
         self._running = True
 
@@ -229,16 +244,26 @@ class Server:
             self.ban_manager.manual_unban(addr)
             return {"ok": True, "result": {"message": f"Unbanned {addr}"}}
 
+        elif method == "stake":
+            return self._rpc_stake(request["params"])
+
+        elif method == "unstake":
+            return self._rpc_unstake(request["params"])
+
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
     def _rpc_register_entity(self, params: dict) -> dict:
-        """Register a new entity from client-provided biometric data."""
+        """Register a new entity from client-provided biometric hashes.
+
+        The client hashes biometrics locally and sends only hashes.
+        Raw biometric data never leaves the client device.
+        """
         try:
-            entity = Entity.create(
-                dna_data=bytes.fromhex(params["dna_hex"]),
-                fingerprint_data=bytes.fromhex(params["fingerprint_hex"]),
-                iris_data=bytes.fromhex(params["iris_hex"]),
+            entity = Entity.from_hashes(
+                dna_hash=bytes.fromhex(params["dna_hash"]),
+                fingerprint_hash=bytes.fromhex(params["fingerprint_hash"]),
+                iris_hash=bytes.fromhex(params["iris_hash"]),
             )
             success, msg = self.blockchain.register_entity(entity)
             if success:
@@ -281,6 +306,42 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _rpc_stake(self, params: dict) -> dict:
+        """Stake tokens for validation."""
+        try:
+            entity_id = bytes.fromhex(params["entity_id"])
+            amount = int(params["amount"])
+            if not self.blockchain.supply.stake(entity_id, amount):
+                return {"ok": False, "error": "Insufficient balance for staking"}
+            self.consensus.register_validator(entity_id, amount)
+            return {"ok": True, "result": {
+                "entity_id": params["entity_id"],
+                "staked": self.blockchain.supply.get_staked(entity_id),
+                "balance": self.blockchain.supply.get_balance(entity_id),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _rpc_unstake(self, params: dict) -> dict:
+        """Unstake tokens."""
+        try:
+            entity_id = bytes.fromhex(params["entity_id"])
+            amount = int(params["amount"])
+            if not self.blockchain.supply.unstake(entity_id, amount):
+                return {"ok": False, "error": "Insufficient staked amount"}
+            remaining = self.blockchain.supply.get_staked(entity_id)
+            if remaining == 0:
+                self.consensus.remove_validator(entity_id)
+            else:
+                self.consensus.stakes[entity_id] = remaining
+            return {"ok": True, "result": {
+                "entity_id": params["entity_id"],
+                "staked": remaining,
+                "balance": self.blockchain.supply.get_balance(entity_id),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def _rpc_get_entity(self, params: dict) -> dict:
         entity_id = bytes.fromhex(params["entity_id"])
         if entity_id not in self.blockchain.public_keys:
@@ -301,7 +362,8 @@ class Server:
             if self.mempool.size == 0:
                 continue
 
-            if self.wallet_id is None or self.wallet_id not in self.blockchain.public_keys:
+            # Need a full entity (with keypair) to sign blocks
+            if self.wallet_entity is None or self.wallet_id not in self.blockchain.public_keys:
                 continue
 
             latest = self.blockchain.get_latest_block()
@@ -319,20 +381,11 @@ class Server:
             if not txs:
                 continue
 
-            tx_hashes = [tx.tx_hash for tx in txs]
-            merkle_root = compute_merkle_root(tx_hashes)
-
-            header = BlockHeader(
-                version=1,
-                block_number=latest.header.block_number + 1,
-                prev_hash=latest.block_hash,
-                merkle_root=merkle_root,
-                timestamp=time.time(),
-                proposer_id=self.wallet_id,
+            # Compute state root and create signed block
+            state_root = self.blockchain.compute_current_state_root()
+            block = self.consensus.create_block(
+                self.wallet_entity, txs, latest, state_root=state_root,
             )
-
-            block = Block(header=header, transactions=txs)
-            block.block_hash = block._compute_hash()
 
             success, reason = self.blockchain.add_block(block)
             if success:
@@ -664,16 +717,27 @@ async def run(args):
         data_dir=args.data_dir,
     )
 
-    # Ask for wallet ID
-    wallet_id = args.wallet
-    if not wallet_id:
-        print("Enter your wallet ID (entity_id hex) to receive block rewards and fees.")
-        print("If you don't have one yet, use: python client.py create-account")
-        print("You can also press Enter to run without a wallet (no rewards).\n")
-        wallet_id = input("Wallet ID: ").strip()
+    # Authenticate with biometrics to unlock block signing
+    if args.wallet:
+        # Wallet ID provided but we need biometrics to sign blocks
+        print(f"Wallet ID: {args.wallet}")
+        print("Authenticate with your biometrics to enable block production.\n")
+    else:
+        print("To produce blocks and earn rewards, authenticate with your biometrics.")
+        print("If you don't have an account yet, use: python client.py create-account")
+        print("You can also press Enter to run as a relay-only node (no rewards).\n")
 
-    if wallet_id:
-        server.set_wallet(wallet_id)
+    import getpass
+    dna = getpass.getpass("DNA sample (hidden, or Enter to skip):        ").encode("utf-8")
+    if dna:
+        fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
+        iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
+        entity = Entity.create(dna, fingerprint, iris)
+        server.set_wallet_entity(entity)
+        print(f"Authenticated as: {entity.entity_id_hex[:16]}...")
+    elif args.wallet:
+        server.set_wallet(args.wallet)
+        print("Warning: wallet set but no biometrics — node cannot sign blocks.")
 
     await server.start()
 

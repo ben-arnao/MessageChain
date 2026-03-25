@@ -18,7 +18,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MAX_MESSAGE_WORDS, MIN_FEE
+from messagechain.config import HASH_ALGO, MAX_MESSAGE_WORDS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
 from messagechain.identity.biometrics import BiometricType, Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -86,9 +86,14 @@ class MessageTransaction:
         return tx
 
 
-def _validate_message_length(message: str) -> bool:
-    """Check message is within the word limit."""
-    return len(message.split()) <= MAX_MESSAGE_WORDS
+def _validate_message(message: str) -> tuple[bool, str]:
+    """Check message is within word and byte limits."""
+    msg_bytes = message.encode("utf-8")
+    if len(msg_bytes) > MAX_MESSAGE_BYTES:
+        return False, f"Message exceeds {MAX_MESSAGE_BYTES} bytes ({len(msg_bytes)} bytes)"
+    if len(message.split()) > MAX_MESSAGE_WORDS:
+        return False, f"Message exceeds {MAX_MESSAGE_WORDS} words"
+    return True, "OK"
 
 
 def create_transaction(
@@ -104,8 +109,9 @@ def create_transaction(
     The fee is set by the user — higher fee means higher priority for
     block inclusion (BTC-style fee bidding).
     """
-    if not _validate_message_length(message):
-        raise ValueError(f"Message exceeds {MAX_MESSAGE_WORDS} words")
+    valid, reason = _validate_message(message)
+    if not valid:
+        raise ValueError(reason)
 
     if fee < MIN_FEE:
         raise ValueError(f"Fee must be at least {MIN_FEE}")
@@ -134,7 +140,12 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
     """Verify a transaction's quantum-resistant signature."""
     if tx.word_count > MAX_MESSAGE_WORDS:
         return False
+    if len(tx.message) > MAX_MESSAGE_BYTES:
+        return False
     if tx.fee < MIN_FEE:
+        return False
+    # Reject timestamps too far in the future (clock drift protection)
+    if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
     msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
     return verify_signature(msg_hash, tx.signature, public_key)
