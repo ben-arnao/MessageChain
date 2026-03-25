@@ -54,6 +54,7 @@ class Blockchain:
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
         self.entity_message_count: dict[bytes, int] = {}
         self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
+        self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self.fork_choice = ForkChoice()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
@@ -81,6 +82,10 @@ class Blockchain:
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
+
+        # Restore proposer signature counts (for WOTS+ leaf tracking)
+        if hasattr(self.db, 'get_all_proposer_sig_counts'):
+            self.proposer_sig_counts = self.db.get_all_proposer_sig_counts()
 
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
@@ -120,6 +125,8 @@ class Blockchain:
             self.db.set_public_key(eid, pk)
         for eid, cnt in self.entity_message_count.items():
             self.db.set_message_count(eid, cnt)
+        for eid, cnt in self.proposer_sig_counts.items():
+            self.db.set_proposer_sig_count(eid, cnt)
         self.db.set_supply_meta("total_supply", self.supply.total_supply)
         self.db.set_supply_meta("total_minted", self.supply.total_minted)
         self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -150,23 +157,26 @@ class Blockchain:
 
         return genesis_block
 
-    def register_entity(self, entity) -> tuple[bool, str]:
+    def register_entity(self, entity_id: bytes, public_key: bytes) -> tuple[bool, str]:
         """
         Register a new entity on the chain.
+
+        Accepts only the public entity_id and public_key — never private key
+        material. The server never needs to see biometric hashes or seeds.
 
         ENFORCES: one entity per person. If the entity_id (derived from
         biometrics) already exists, registration is REJECTED.
         """
-        if entity.entity_id in self.public_keys:
+        if entity_id in self.public_keys:
             return False, "Entity already exists — duplicate biometrics rejected"
 
-        self.public_keys[entity.entity_id] = entity.public_key
-        self.nonces[entity.entity_id] = 0
+        self.public_keys[entity_id] = public_key
+        self.nonces[entity_id] = 0
 
         if self.db is not None:
-            self.db.set_public_key(entity.entity_id, entity.public_key)
-            self.db.set_nonce(entity.entity_id, 0)
-            self.db.set_balance(entity.entity_id, self.supply.get_balance(entity.entity_id))
+            self.db.set_public_key(entity_id, public_key)
+            self.db.set_nonce(entity_id, 0)
+            self.db.set_balance(entity_id, self.supply.get_balance(entity_id))
             self.db.flush_state()
 
         return True, "Entity registered"
@@ -344,15 +354,17 @@ class Blockchain:
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
 
-        # Verify proposer signature
+        # Verify proposer signature (mandatory — unsigned blocks are rejected)
         if block.header.proposer_id not in self.public_keys:
             return False, "Unknown proposer"
 
+        if block.header.proposer_signature is None:
+            return False, "Missing proposer signature — unsigned blocks are rejected"
+
         proposer_pk = self.public_keys[block.header.proposer_id]
-        if block.header.proposer_signature:
-            header_hash = _hash(block.header.signable_data())
-            if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
-                return False, "Invalid proposer signature"
+        header_hash = _hash(block.header.signable_data())
+        if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
+            return False, "Invalid proposer signature"
 
         # Validate all transactions
         for tx in block.transactions:
@@ -393,6 +405,10 @@ class Blockchain:
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
         self.supply.mint_block_reward(proposer_id, block.header.block_number)
+        # Track proposer's block signature count
+        self.proposer_sig_counts[proposer_id] = (
+            self.proposer_sig_counts.get(proposer_id, 0) + 1
+        )
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
@@ -431,7 +447,15 @@ class Blockchain:
         """Append a validated block to the current best chain."""
         proposer_id = block.header.proposer_id
 
-        # Apply state changes
+        # Validate ALL slash transactions BEFORE applying any state changes.
+        # This prevents state corruption if a slash tx fails validation
+        # partway through (previously, regular tx state was already applied).
+        for stx in block.slash_transactions:
+            valid, reason = self.validate_slash_transaction(stx)
+            if not valid:
+                return False, f"Invalid slash tx: {reason}"
+
+        # Apply state changes (all validation passed above)
         for tx in block.transactions:
             self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
             self.nonces[tx.entity_id] = tx.nonce + 1
@@ -439,16 +463,17 @@ class Blockchain:
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
 
-        # Apply slash transactions
         for stx in block.slash_transactions:
-            valid, reason = self.validate_slash_transaction(stx)
-            if not valid:
-                return False, f"Invalid slash tx: {reason}"
             self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
 
         reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
+
+        # Track proposer's block signature count (for WOTS+ leaf management)
+        self.proposer_sig_counts[proposer_id] = (
+            self.proposer_sig_counts.get(proposer_id, 0) + 1
+        )
 
         # Verify state_root commitment (skip for legacy blocks with zero state_root)
         if block.header.state_root != b"\x00" * 32:
@@ -620,6 +645,7 @@ class Blockchain:
         self.supply = SupplyTracker()
         self.nonces = {}
         self.entity_message_count = {}
+        self.proposer_sig_counts = {}
         self.public_keys = {}
         self.slashed_validators = set()
 
@@ -636,6 +662,7 @@ class Blockchain:
             "nonces": dict(self.nonces),
             "public_keys": dict(self.public_keys),
             "message_counts": dict(self.entity_message_count),
+            "proposer_sig_counts": dict(self.proposer_sig_counts),
             "total_supply": self.supply.total_supply,
             "total_minted": self.supply.total_minted,
             "total_fees_collected": self.supply.total_fees_collected,
@@ -653,7 +680,19 @@ class Blockchain:
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
         self.entity_message_count = snapshot["message_counts"]
+        self.proposer_sig_counts = snapshot.get("proposer_sig_counts", {})
         self.slashed_validators = snapshot.get("slashed_validators", set())
+
+    def get_wots_leaves_used(self, entity_id: bytes) -> int:
+        """Total WOTS+ leaves consumed by this entity (tx nonce + block sigs).
+
+        Used to safely advance a keypair past already-used one-time keys
+        when reconstructing from biometrics (e.g., on server restart).
+        """
+        return (
+            self.nonces.get(entity_id, 0)
+            + self.proposer_sig_counts.get(entity_id, 0)
+        )
 
     def get_entity_stats(self, entity_id: bytes) -> dict:
         return {

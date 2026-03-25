@@ -89,6 +89,11 @@ class ChainDB:
                 count INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS proposer_sig_counts (
+                entity_id BLOB PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -307,6 +312,23 @@ class ChainDB:
 
     def get_all_message_counts(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, count FROM message_counts")
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Proposer Signature Counts ────────────────────────
+
+    def get_proposer_sig_count(self, entity_id: bytes) -> int:
+        cur = self._conn.execute("SELECT count FROM proposer_sig_counts WHERE entity_id = ?", (entity_id,))
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def set_proposer_sig_count(self, entity_id: bytes, count: int):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO proposer_sig_counts (entity_id, count) VALUES (?, ?)",
+            (entity_id, count),
+        )
+
+    def get_all_proposer_sig_counts(self) -> dict[bytes, int]:
+        cur = self._conn.execute("SELECT entity_id, count FROM proposer_sig_counts")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
     # ── Supply Meta ──────────────────────────────────────────────

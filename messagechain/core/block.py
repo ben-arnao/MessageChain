@@ -179,7 +179,14 @@ class Block:
             slash_txs = [SlashTransaction.deserialize(s) for s in data["slash_transactions"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs)
-        block.block_hash = bytes.fromhex(data["block_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = block._compute_hash()
+        declared_hash = bytes.fromhex(data["block_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"Block hash mismatch: declared {data['block_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return block
 
 

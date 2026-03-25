@@ -16,8 +16,6 @@ import struct
 import sys
 import getpass
 
-import hashlib
-from messagechain.config import HASH_ALGO
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.transaction import create_transaction
 
@@ -81,23 +79,16 @@ def cmd_create_account(args):
 
     dna, fingerprint, iris = collect_biometrics()
 
-    # Derive entity locally (to show the user their ID)
+    # Derive entity locally — all private key material stays on this device.
     entity = Entity.create(dna, fingerprint, iris)
     print(f"\nYour entity ID: {entity.entity_id_hex}")
 
-    # Hash biometrics locally — NEVER send raw biometric data over the wire.
-    # Only the hashes are sent to the server for registration.
-    h = hashlib.new
-    dna_hash = h(HASH_ALGO, dna).hexdigest()
-    fingerprint_hash = h(HASH_ALGO, fingerprint).hexdigest()
-    iris_hash = h(HASH_ALGO, iris).hexdigest()
-
-    # Register with the server (sends hashes, not raw data)
+    # Send ONLY the public entity_id and public_key to the server.
+    # Biometric hashes are private key material and never leave the client.
     print(f"Registering with server at {args.host}:{args.rpc_port}...")
     response = rpc_call(args.host, args.rpc_port, "register_entity", {
-        "dna_hash": dna_hash,
-        "fingerprint_hash": fingerprint_hash,
-        "iris_hash": iris_hash,
+        "entity_id": entity.entity_id_hex,
+        "public_key": entity.public_key.hex(),
     })
 
     if response.get("ok"):

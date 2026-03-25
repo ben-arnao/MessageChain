@@ -51,7 +51,7 @@ class TestSlashingEvidence(unittest.TestCase):
         self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob)
+        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
 
@@ -191,8 +191,8 @@ class TestSlashTransaction(unittest.TestCase):
         self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.carol)
-        self.chain.register_entity(self.alice)
-        self.chain.register_entity(self.bob)
+        self.chain.register_entity(self.alice.entity_id, self.alice.public_key)
+        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
         # Fund entities
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000

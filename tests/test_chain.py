@@ -14,7 +14,7 @@ class TestBlockchain(unittest.TestCase):
         self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob)
+        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
         # Fund test entities so they can pay fees
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
@@ -28,7 +28,7 @@ class TestBlockchain(unittest.TestCase):
     def test_duplicate_entity_rejected(self):
         """Same biometrics cannot register twice — one person one wallet."""
         alice_dup = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        success, msg = self.chain.register_entity(alice_dup)
+        success, msg = self.chain.register_entity(alice_dup.entity_id, alice_dup.public_key)
         self.assertFalse(success)
         self.assertIn("duplicate", msg.lower())
 

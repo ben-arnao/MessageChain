@@ -8,5 +8,6 @@
 
 ## Workflow
 
+- **Test-driven development** — This is a TDD environment. Write tests first, then implement the code to make them pass.
 - Always commit changes and push to remote when done with a task.
 - All tests must pass at all times. Run `python -m unittest discover tests/` to verify.

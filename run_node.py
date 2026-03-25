@@ -49,7 +49,7 @@ def run_demo():
     print("\n--- Initializing Blockchain ---")
     chain = Blockchain()
     genesis = chain.initialize_genesis(alice)
-    success, msg = chain.register_entity(bob)
+    success, msg = chain.register_entity(bob.entity_id, bob.public_key)
     print(f"Bob registration: {msg}")
     info = chain.get_chain_info()
     print(f"Genesis block: {genesis.block_hash.hex()[:32]}...")
@@ -58,7 +58,7 @@ def run_demo():
     # Demonstrate duplicate biometric rejection
     print("\n--- One Entity Per Person (duplicate rejection) ---")
     alice_duplicate = create_demo_entity("alice")  # same biometrics!
-    success, msg = chain.register_entity(alice_duplicate)
+    success, msg = chain.register_entity(alice_duplicate.entity_id, alice_duplicate.public_key)
     print(f"Alice duplicate registration: {msg}")
     print(f"  (entity_id matches: {alice_duplicate.entity_id == alice.entity_id})")
 

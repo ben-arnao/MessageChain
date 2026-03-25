@@ -1,13 +1,20 @@
 """
 Slashing for MessageChain.
 
-Validators who double-sign (sign two different blocks at the same height)
-are punished by having their entire stake destroyed. This is the maximum
-deterrent — a double-signing validator is actively attacking the network.
+Two slashable offenses:
 
-Evidence is self-contained: two conflicting signed block headers from the
-same proposer at the same height. Anyone can verify the evidence using only
-the offender's public key — no external state required.
+1. **Double-proposal**: Signing two different block headers at the same height.
+   A proposer who equivocates is attacking consensus.
+
+2. **Double-attestation**: Signing two attestations for different blocks at the
+   same height. A validator who votes for conflicting blocks is attacking
+   finality (nothing-at-stake).
+
+Both offenses carry the same penalty: 100% stake destruction.
+
+Evidence is self-contained: two conflicting signed messages from the same
+validator at the same height. Anyone can verify the evidence using only the
+offender's public key — no external state required.
 
 Anyone can submit evidence. The submitter receives a finder's reward
 (a percentage of the slashed stake) to incentivize monitoring.
@@ -20,6 +27,7 @@ from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, SLASH_FINDER_REWARD_PCT
 from messagechain.core.block import BlockHeader, _hash
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
+from messagechain.consensus.attestation import Attestation, verify_attestation
 
 
 @dataclass
@@ -68,9 +76,98 @@ class SlashingEvidence:
 
 
 @dataclass
+class AttestationSlashingEvidence:
+    """Proof that a validator attested to two different blocks at the same height.
+
+    Both attestations must:
+    - Have the same validator_id (the offender)
+    - Have the same block_number
+    - Have different block_hashes (actually conflicting)
+    - Both carry valid signatures from the offender's key
+    """
+    offender_id: bytes
+    attestation_a: Attestation
+    attestation_b: Attestation
+    evidence_hash: bytes = b""
+
+    def __post_init__(self):
+        if not self.evidence_hash:
+            self.evidence_hash = self._compute_hash()
+
+    def _compute_hash(self) -> bytes:
+        return _hash(
+            b"attestation_slash"
+            + self.offender_id
+            + self.attestation_a.signable_data()
+            + self.attestation_b.signable_data()
+        )
+
+    def serialize(self) -> dict:
+        return {
+            "type": "attestation_slash",
+            "offender_id": self.offender_id.hex(),
+            "attestation_a": self.attestation_a.serialize(),
+            "attestation_b": self.attestation_b.serialize(),
+            "evidence_hash": self.evidence_hash.hex(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "AttestationSlashingEvidence":
+        ev = cls(
+            offender_id=bytes.fromhex(data["offender_id"]),
+            attestation_a=Attestation.deserialize(data["attestation_a"]),
+            attestation_b=Attestation.deserialize(data["attestation_b"]),
+        )
+        ev.evidence_hash = bytes.fromhex(data["evidence_hash"])
+        return ev
+
+
+def verify_attestation_slashing_evidence(
+    evidence: AttestationSlashingEvidence,
+    offender_public_key: bytes,
+) -> tuple[bool, str]:
+    """
+    Verify that attestation slashing evidence is valid.
+
+    Checks:
+    1. Both attestations name the same validator (the offender)
+    2. Both attestations are at the same block height
+    3. The attestations are for different blocks (actually conflicting)
+    4. Both signatures are valid under the offender's public key
+    """
+    # Same validator
+    if evidence.attestation_a.validator_id != evidence.offender_id:
+        return False, "attestation_a validator does not match offender"
+    if evidence.attestation_b.validator_id != evidence.offender_id:
+        return False, "attestation_b validator does not match offender"
+
+    # Same height
+    if evidence.attestation_a.block_number != evidence.attestation_b.block_number:
+        return False, "attestations are at different heights"
+
+    # Actually different blocks
+    if evidence.attestation_a.block_hash == evidence.attestation_b.block_hash:
+        return False, "attestations are for the same block — not conflicting"
+
+    # Verify both signatures
+    if not verify_attestation(evidence.attestation_a, offender_public_key):
+        return False, "attestation_a signature is invalid"
+
+    if not verify_attestation(evidence.attestation_b, offender_public_key):
+        return False, "attestation_b signature is invalid"
+
+    return True, "Valid double-attestation evidence"
+
+
+@dataclass
 class SlashTransaction:
-    """A transaction that submits slashing evidence against a double-signer."""
-    evidence: SlashingEvidence
+    """A transaction that submits slashing evidence.
+
+    Supports both evidence types:
+    - SlashingEvidence (double-proposal)
+    - AttestationSlashingEvidence (double-attestation)
+    """
+    evidence: SlashingEvidence | AttestationSlashingEvidence
     submitter_id: bytes
     timestamp: float
     fee: int
@@ -106,8 +203,13 @@ class SlashTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "SlashTransaction":
         sig = Signature.deserialize(data["signature"])
+        ev_data = data["evidence"]
+        if ev_data.get("type") == "attestation_slash":
+            evidence = AttestationSlashingEvidence.deserialize(ev_data)
+        else:
+            evidence = SlashingEvidence.deserialize(ev_data)
         tx = cls(
-            evidence=SlashingEvidence.deserialize(data["evidence"]),
+            evidence=evidence,
             submitter_id=bytes.fromhex(data["submitter_id"]),
             timestamp=data["timestamp"],
             fee=data["fee"],

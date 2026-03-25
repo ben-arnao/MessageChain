@@ -20,7 +20,7 @@ class TestKeyRotation(unittest.TestCase):
         self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob)
+        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
         # Fund test entities so they can pay fees
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000

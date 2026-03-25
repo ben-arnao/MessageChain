@@ -35,7 +35,7 @@ from messagechain.core.transaction import MessageTransaction, create_transaction
 from messagechain.core.mempool import Mempool
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.crypto.keys import verify_signature, KeyPair
+from messagechain.crypto.keys import verify_signature, KeyPair, Signature
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
@@ -254,24 +254,22 @@ class Server:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
     def _rpc_register_entity(self, params: dict) -> dict:
-        """Register a new entity from client-provided biometric hashes.
+        """Register a new entity from client-provided public identity.
 
-        The client hashes biometrics locally and sends only hashes.
-        Raw biometric data never leaves the client device.
+        The client derives entity_id and public_key locally from biometrics,
+        then sends ONLY the public values. The server never sees biometric
+        hashes or private key material.
         """
         try:
-            entity = Entity.from_hashes(
-                dna_hash=bytes.fromhex(params["dna_hash"]),
-                fingerprint_hash=bytes.fromhex(params["fingerprint_hash"]),
-                iris_hash=bytes.fromhex(params["iris_hash"]),
-            )
-            success, msg = self.blockchain.register_entity(entity)
+            entity_id = bytes.fromhex(params["entity_id"])
+            public_key = bytes.fromhex(params["public_key"])
+            success, msg = self.blockchain.register_entity(entity_id, public_key)
             if success:
                 return {
                     "ok": True,
                     "result": {
-                        "entity_id": entity.entity_id_hex,
-                        "public_key": entity.public_key.hex(),
+                        "entity_id": params["entity_id"],
+                        "public_key": params["public_key"],
                         "message": msg,
                         "initial_balance": 0,
                     },
@@ -307,10 +305,23 @@ class Server:
             return {"ok": False, "error": str(e)}
 
     def _rpc_stake(self, params: dict) -> dict:
-        """Stake tokens for validation."""
+        """Stake tokens for validation. Requires a signature to authenticate."""
         try:
             entity_id = bytes.fromhex(params["entity_id"])
             amount = int(params["amount"])
+
+            # Authenticate: caller must sign "stake" + amount with their key
+            if entity_id not in self.blockchain.public_keys:
+                return {"ok": False, "error": "Unknown entity"}
+            if "signature" not in params:
+                return {"ok": False, "error": "Signature required — stake must be authenticated"}
+            sig = Signature.deserialize(params["signature"])
+            msg = entity_id + b"stake" + struct.pack(">Q", amount)
+            msg_hash = _hash(msg)
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_signature(msg_hash, sig, public_key):
+                return {"ok": False, "error": "Invalid signature — authentication failed"}
+
             if not self.blockchain.supply.stake(entity_id, amount):
                 return {"ok": False, "error": "Insufficient balance for staking"}
             self.consensus.register_validator(entity_id, amount)
@@ -323,10 +334,23 @@ class Server:
             return {"ok": False, "error": str(e)}
 
     def _rpc_unstake(self, params: dict) -> dict:
-        """Unstake tokens."""
+        """Unstake tokens. Requires a signature to authenticate."""
         try:
             entity_id = bytes.fromhex(params["entity_id"])
             amount = int(params["amount"])
+
+            # Authenticate: caller must sign "unstake" + amount with their key
+            if entity_id not in self.blockchain.public_keys:
+                return {"ok": False, "error": "Unknown entity"}
+            if "signature" not in params:
+                return {"ok": False, "error": "Signature required — unstake must be authenticated"}
+            sig = Signature.deserialize(params["signature"])
+            msg = entity_id + b"unstake" + struct.pack(">Q", amount)
+            msg_hash = _hash(msg)
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_signature(msg_hash, sig, public_key):
+                return {"ok": False, "error": "Invalid signature — authentication failed"}
+
             if not self.blockchain.supply.unstake(entity_id, amount):
                 return {"ok": False, "error": "Insufficient staked amount"}
             remaining = self.blockchain.supply.get_staked(entity_id)
