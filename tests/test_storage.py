@@ -18,7 +18,6 @@ from messagechain.consensus.fork_choice import (
 )
 from messagechain.storage.chaindb import ChainDB
 from messagechain.network.sync import ChainSyncer, SyncState
-from messagechain.config import INITIAL_ENTITY_GRANT
 
 import hashlib
 from messagechain.config import HASH_ALGO
@@ -212,7 +211,7 @@ class TestPersistentBlockchain:
             # Reload
             chain2 = Blockchain(db=db)
             assert bob.entity_id in chain2.public_keys
-            assert chain2.supply.get_balance(bob.entity_id) == INITIAL_ENTITY_GRANT
+            assert chain2.supply.get_balance(bob.entity_id) == 0
         finally:
             db.close()
             os.unlink(path)

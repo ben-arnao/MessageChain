@@ -16,7 +16,7 @@ Now supports:
 
 import hashlib
 import logging
-from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, INITIAL_ENTITY_GRANT
+from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
@@ -126,7 +126,6 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
-        self.supply.initialize_balance(genesis_entity.entity_id, INITIAL_ENTITY_GRANT)
 
         # Track as chain tip
         self.fork_choice.add_tip(genesis_block.block_hash, 0, 0)
@@ -151,7 +150,6 @@ class Blockchain:
 
         self.public_keys[entity.entity_id] = entity.public_key
         self.nonces[entity.entity_id] = 0
-        self.supply.initialize_balance(entity.entity_id, INITIAL_ENTITY_GRANT)
 
         if self.db is not None:
             self.db.set_public_key(entity.entity_id, entity.public_key)
@@ -537,8 +535,7 @@ class Blockchain:
         """Reset in-memory state to genesis defaults for replay.
 
         Public keys are preserved (they come from registration, not blocks),
-        but all balance/nonce state is rebuilt from block replay. Each entity
-        gets exactly one INITIAL_ENTITY_GRANT — no double-granting.
+        but all balance/nonce state is rebuilt from block replay.
         """
         old_pks = dict(self.public_keys)
         self.supply = SupplyTracker()
@@ -546,12 +543,10 @@ class Blockchain:
         self.entity_message_count = {}
         self.public_keys = {}
 
-        # Restore public keys and grant each entity its initial balance exactly once
+        # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
             self.public_keys[eid] = pk
             self.nonces[eid] = 0
-            self.supply.balances[eid] = INITIAL_ENTITY_GRANT
-            self.supply.total_grants_distributed += INITIAL_ENTITY_GRANT
 
     def _snapshot_memory_state(self) -> dict:
         """Capture in-memory state for rollback."""

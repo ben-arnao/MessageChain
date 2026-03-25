@@ -19,7 +19,7 @@ ensuring permanent (diminishing) issuance to replace lost tokens.
 
 import math
 from messagechain.config import (
-    GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE, INITIAL_ENTITY_GRANT,
+    GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE,
 )
 
 
@@ -30,20 +30,8 @@ class SupplyTracker:
         self.total_supply: int = GENESIS_SUPPLY
         self.total_minted: int = 0  # tokens created via block rewards
         self.total_fees_collected: int = 0
-        self.total_grants_distributed: int = 0  # tokens distributed from genesis reserve
         self.balances: dict[bytes, int] = {}
         self.staked: dict[bytes, int] = {}
-
-    def initialize_balance(self, entity_id: bytes, amount: int):
-        """
-        Grant initial tokens to a new entity from genesis supply.
-
-        This is NOT minting — it distributes from the genesis reserve.
-        Total supply does not change; tokens move from unallocated reserve
-        to the entity's balance.
-        """
-        self.balances[entity_id] = self.balances.get(entity_id, 0) + amount
-        self.total_grants_distributed += amount
 
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
@@ -109,18 +97,11 @@ class SupplyTracker:
         self.balances[to_id] = self.balances.get(to_id, 0) + amount
         return True
 
-    @property
-    def genesis_reserve_remaining(self) -> int:
-        """Tokens from genesis supply not yet distributed as entity grants."""
-        return max(0, GENESIS_SUPPLY - self.total_grants_distributed)
-
     def get_supply_stats(self, current_block_height: int = 0) -> dict:
         return {
             "total_supply": self.total_supply,
             "genesis_supply": GENESIS_SUPPLY,
             "total_minted": self.total_minted,
-            "total_grants_distributed": self.total_grants_distributed,
-            "genesis_reserve_remaining": self.genesis_reserve_remaining,
             "total_fees_collected": self.total_fees_collected,
             "inflation_pct": (self.total_minted / self.total_supply) * 100 if self.total_supply > 0 else 0,
             "current_block_reward": self.calculate_block_reward(current_block_height),

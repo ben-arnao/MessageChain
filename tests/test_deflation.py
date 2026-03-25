@@ -10,8 +10,8 @@ class TestInflation(unittest.TestCase):
         self.tracker = SupplyTracker()
         self.entity_id = b"\x01" * 32
         self.proposer_id = b"\x02" * 32
-        self.tracker.initialize_balance(self.entity_id, 10000)
-        self.tracker.initialize_balance(self.proposer_id, 0)
+        self.tracker.balances[self.entity_id] = 10000
+        self.tracker.balances[self.proposer_id] = 0
 
     def test_initial_state(self):
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY)
@@ -58,7 +58,7 @@ class TestInflation(unittest.TestCase):
 
     def test_transfer(self):
         other = b"\x03" * 32
-        self.tracker.initialize_balance(other, 0)
+        self.tracker.balances[other] = 0
         self.assertTrue(self.tracker.transfer(self.entity_id, other, 100))
         self.assertEqual(self.tracker.get_balance(other), 100)
 

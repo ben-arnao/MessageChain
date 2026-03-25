@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 
 from messagechain.config import (
-    DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK, INITIAL_ENTITY_GRANT,
+    DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE,
 )
 from messagechain.identity.biometrics import Entity, BiometricType
@@ -273,7 +273,7 @@ class Server:
                         "entity_id": entity.entity_id_hex,
                         "public_key": entity.public_key.hex(),
                         "message": msg,
-                        "initial_balance": INITIAL_ENTITY_GRANT,
+                        "initial_balance": 0,
                     },
                 }
             else:
