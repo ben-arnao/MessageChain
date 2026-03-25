@@ -17,8 +17,11 @@ Now supports:
 import hashlib
 import logging
 from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, INITIAL_ENTITY_GRANT
-from messagechain.core.block import Block, compute_merkle_root, create_genesis_block
+from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
+from messagechain.core.key_rotation import (
+    KeyRotationTransaction, verify_key_rotation,
+)
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
 from messagechain.consensus.fork_choice import (
@@ -47,6 +50,7 @@ class Blockchain:
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
         self.entity_message_count: dict[bytes, int] = {}
+        self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
         self.fork_choice = ForkChoice()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
 
@@ -206,6 +210,53 @@ class Blockchain:
 
         return True, "Valid"
 
+    def validate_key_rotation(self, tx: KeyRotationTransaction) -> tuple[bool, str]:
+        """Validate a key rotation transaction against current chain state."""
+        if tx.entity_id not in self.public_keys:
+            return False, "Unknown entity — must register first"
+
+        current_pk = self.public_keys[tx.entity_id]
+
+        expected_rotation = self.key_rotation_counts.get(tx.entity_id, 0)
+        if tx.rotation_number != expected_rotation:
+            return False, f"Invalid rotation number: expected {expected_rotation}, got {tx.rotation_number}"
+
+        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
+            return False, f"Insufficient balance for rotation fee of {tx.fee}"
+
+        if not verify_key_rotation(tx, current_pk):
+            return False, "Invalid key rotation signature or parameters"
+
+        return True, "Valid"
+
+    def apply_key_rotation(self, tx: KeyRotationTransaction, proposer_id: bytes) -> tuple[bool, str]:
+        """Validate and apply a key rotation, updating the entity's public key."""
+        valid, reason = self.validate_key_rotation(tx)
+        if not valid:
+            return False, reason
+
+        # Pay fee to proposer
+        self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
+
+        # Update the entity's public key
+        self.public_keys[tx.entity_id] = tx.new_public_key
+        self.key_rotation_counts[tx.entity_id] = tx.rotation_number + 1
+
+        # Persist
+        if self.db is not None:
+            self.db.set_public_key(tx.entity_id, tx.new_public_key)
+            self.db.flush_state()
+
+        return True, "Key rotated successfully"
+
+    def compute_current_state_root(self) -> bytes:
+        """Compute a Merkle commitment to the current account state."""
+        return compute_state_root(
+            self.supply.balances,
+            self.nonces,
+            self.supply.staked,
+        )
+
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
         latest = self.get_latest_block()
@@ -321,6 +372,12 @@ class Blockchain:
             )
 
         reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
+
+        # Verify state_root commitment (skip for legacy blocks with zero state_root)
+        if block.header.state_root != b"\x00" * 32:
+            expected_state_root = self.compute_current_state_root()
+            if block.header.state_root != expected_state_root:
+                return False, "Invalid state_root — state commitment mismatch"
 
         self.chain.append(block)
         self._block_by_hash[block.block_hash] = block

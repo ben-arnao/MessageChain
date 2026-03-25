@@ -492,9 +492,10 @@ class Node:
                 if self.consensus.validator_count > 0:
                     continue
 
-            # Create and broadcast block
+            # Create and broadcast block (with state_root commitment)
             txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-            block = self.consensus.create_block(self.entity, txs, latest)
+            state_root = self.blockchain.compute_current_state_root()
+            block = self.consensus.create_block(self.entity, txs, latest, state_root=state_root)
 
             success, reason = self.blockchain.add_block(block)
             if success:
@@ -516,9 +517,10 @@ class Node:
             # Check for stale sync
             await self.syncer.check_sync_stale()
 
-            # Cleanup expired bans and stale rate limit buckets
+            # Cleanup expired bans, stale rate limit buckets, and old mempool txs
             self.ban_manager.cleanup_expired()
             self.rate_limiter.cleanup_stale()
+            self.mempool.expire_transactions()
 
             # Periodically ask peers for their height
             if not self.syncer.is_syncing:

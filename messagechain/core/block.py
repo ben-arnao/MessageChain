@@ -42,6 +42,51 @@ def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     return layer[0]
 
 
+def compute_state_root(
+    balances: dict[bytes, int],
+    nonces: dict[bytes, int],
+    staked: dict[bytes, int],
+) -> bytes:
+    """
+    Compute a Merkle commitment to the full account state.
+
+    This enables light clients to verify account state without replaying
+    the entire chain. Each leaf is hash(entity_id || balance || nonce || stake).
+    The leaves are sorted by entity_id for determinism.
+    """
+    if not balances:
+        return _hash(b"empty_state")
+
+    leaves = []
+    for entity_id in sorted(balances.keys()):
+        balance = balances.get(entity_id, 0)
+        nonce = nonces.get(entity_id, 0)
+        stake = staked.get(entity_id, 0)
+        leaf = _hash(
+            entity_id
+            + struct.pack(">Q", balance)
+            + struct.pack(">Q", nonce)
+            + struct.pack(">Q", stake)
+        )
+        leaves.append(leaf)
+
+    # Build Merkle tree over sorted leaves
+    layer = list(leaves)
+    if len(layer) % 2 == 1:
+        layer.append(layer[-1])
+
+    while len(layer) > 1:
+        next_layer = []
+        for i in range(0, len(layer), 2):
+            combined = _hash(layer[i] + layer[i + 1])
+            next_layer.append(combined)
+        layer = next_layer
+        if len(layer) > 1 and len(layer) % 2 == 1:
+            layer.append(layer[-1])
+
+    return layer[0]
+
+
 @dataclass
 class BlockHeader:
     version: int
@@ -50,6 +95,7 @@ class BlockHeader:
     merkle_root: bytes
     timestamp: float
     proposer_id: bytes
+    state_root: bytes = b"\x00" * 32  # Merkle root of account state
     proposer_signature: Signature | None = None
 
     def signable_data(self) -> bytes:
@@ -58,6 +104,7 @@ class BlockHeader:
             + struct.pack(">Q", self.block_number)
             + self.prev_hash
             + self.merkle_root
+            + self.state_root
             + struct.pack(">d", self.timestamp)
             + self.proposer_id
         )
@@ -68,6 +115,7 @@ class BlockHeader:
             "block_number": self.block_number,
             "prev_hash": self.prev_hash.hex(),
             "merkle_root": self.merkle_root.hex(),
+            "state_root": self.state_root.hex(),
             "timestamp": self.timestamp,
             "proposer_id": self.proposer_id.hex(),
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
@@ -82,6 +130,7 @@ class BlockHeader:
             merkle_root=bytes.fromhex(data["merkle_root"]),
             timestamp=data["timestamp"],
             proposer_id=bytes.fromhex(data["proposer_id"]),
+            state_root=bytes.fromhex(data["state_root"]) if data.get("state_root") else b"\x00" * 32,
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
         )
 
