@@ -1,28 +1,34 @@
 """
 Biometric identity system for MessageChain.
 
-Core principle: your biometric data IS your private key.
+Core principle: two-factor authentication — biometrics + private key.
 
 Each entity is uniquely identified by a combination of three biometric factors:
-DNA, fingerprint, and iris scan. The combined biometric hashes serve as the
-cryptographic private key — there is no separate secret. Your body is your key.
+DNA, fingerprint, and iris scan. The entity ID (wallet address) is derived
+from biometrics alone, enforcing one-person-one-wallet.
+
+To SIGN transactions, both factors are required:
+1. Biometric data (something you are) — determines your wallet address
+2. A private key (something you know) — combined with biometrics to derive
+   the signing key seed
 
 Security model:
 - The ENTITY ID is PUBLIC. It is visible on-chain in every transaction.
   It is derived via: SHA3-256("entity_id" || dna_hash || fingerprint_hash || iris_hash)
-- The BIOMETRIC SEED is PRIVATE. It never leaves the local device.
-  It is derived via: SHA3-256("private_key" || dna_hash || fingerprint_hash || iris_hash)
+  Entity ID depends ONLY on biometrics (one person = one wallet).
+- The SIGNING KEY SEED is PRIVATE. It never leaves the local device.
+  It is derived via: SHA3-256("private_key" || dna_hash || fingerprint_hash || iris_hash || private_key)
+  The seed requires BOTH biometrics and the private key — stolen biometrics
+  alone cannot produce a valid signature.
 - Domain separation ensures that knowing the entity ID reveals nothing about
-  the private key seed, and vice versa. Both are deterministic from the same
-  biometric inputs, but are cryptographically independent.
+  the signing key seed, and vice versa.
 
 One person = one entity = one wallet. Duplicate registrations are rejected.
 Entity ID == wallet ID. There is no separate wallet concept.
 
-In production, biometric data never leaves the local device. Hashes are computed
-locally, the keypair derived locally, and only the public key goes on-chain.
-The biometric type used for a given message is metadata indicating which factor
-authenticated the user locally to unlock signing.
+In production, biometric data and the private key never leave the local device.
+Hashes are computed locally, the keypair derived locally, and only the public
+key goes on-chain.
 """
 
 import hashlib
@@ -58,18 +64,20 @@ def derive_entity_id(dna_hash: bytes, fingerprint_hash: bytes, iris_hash: bytes)
     return hashlib.new(HASH_ALGO, combined).digest()
 
 
-def _derive_biometric_seed(dna_hash: bytes, fingerprint_hash: bytes, iris_hash: bytes) -> bytes:
+def _derive_signing_seed(
+    dna_hash: bytes, fingerprint_hash: bytes, iris_hash: bytes, private_key: bytes
+) -> bytes:
     """
-    Derive the private key seed from three biometric hashes.
+    Derive the signing key seed from biometric hashes + private key.
 
     This seed is SECRET — it never leaves the local device. It is the sole
-    input to keypair generation. Same biometrics always produce the same seed,
-    so the entity can always re-derive their keys from their body.
+    input to keypair generation. Requires BOTH biometrics and the private key,
+    so stolen biometrics alone cannot produce a valid signing key.
 
     Domain-separated from the entity ID so that knowing the public entity ID
     reveals nothing about this seed.
     """
-    combined = _DOMAIN_PRIVATE_KEY + dna_hash + fingerprint_hash + iris_hash
+    combined = _DOMAIN_PRIVATE_KEY + dna_hash + fingerprint_hash + iris_hash + private_key
     return hashlib.new(HASH_ALGO, combined).digest()
 
 
@@ -78,15 +86,14 @@ class Entity:
     """
     A unique participant in the MessageChain network.
 
-    Identity model:
-    - entity_id == wallet ID (public, visible on-chain)
-    - biometric_seed == private key (secret, never transmitted)
+    Two-factor identity model:
+    - entity_id == wallet ID (public, derived from biometrics only)
+    - signing seed == derived from biometrics + private key (secret, never transmitted)
     - One person = one entity = one wallet (enforced by biometric uniqueness)
 
-    The biometric hashes ARE the private key material. The keypair is derived
-    from them via a domain-separated seed. Same biometrics = same entity ID =
-    same wallet = same keys. There is no separate key management — your body
-    is your credential.
+    To sign transactions, BOTH factors are required:
+    1. Biometric data (something you are) — determines wallet address
+    2. Private key (something you know) — combined with biometrics for signing key
     """
     entity_id: bytes               # PUBLIC — the wallet/entity address on-chain
     keypair: KeyPair
@@ -96,34 +103,57 @@ class Entity:
     _iris_hash: bytes              # PRIVATE — individual biometric hash
 
     @classmethod
-    def create(cls, dna_data: bytes, fingerprint_data: bytes, iris_data: bytes) -> "Entity":
+    def create(
+        cls,
+        dna_data: bytes,
+        fingerprint_data: bytes,
+        iris_data: bytes,
+        *,
+        private_key: bytes,
+    ) -> "Entity":
         """
-        Create an entity from raw biometric data.
+        Create an entity from raw biometric data and a private key.
 
-        In production, raw data comes from biometric sensors on the local device.
+        Both factors are required:
+        - Biometric data: from hardware sensors on the local device
+        - Private key: a secret known only to the user
+
         All hashing and key derivation happens locally — nothing secret is transmitted.
         """
+        if not private_key:
+            raise ValueError("Private key is required — both biometrics and a private key are needed to sign")
+
         h = hashlib.new
         dna_hash = h(HASH_ALGO, dna_data).digest()
         fingerprint_hash = h(HASH_ALGO, fingerprint_data).digest()
         iris_hash = h(HASH_ALGO, iris_data).digest()
 
-        return cls.from_hashes(dna_hash, fingerprint_hash, iris_hash)
+        return cls.from_hashes(dna_hash, fingerprint_hash, iris_hash, private_key=private_key)
 
     @classmethod
-    def from_hashes(cls, dna_hash: bytes, fingerprint_hash: bytes, iris_hash: bytes) -> "Entity":
+    def from_hashes(
+        cls,
+        dna_hash: bytes,
+        fingerprint_hash: bytes,
+        iris_hash: bytes,
+        *,
+        private_key: bytes,
+    ) -> "Entity":
         """
-        Create an entity from pre-hashed biometric data.
+        Create an entity from pre-hashed biometric data and a private key.
 
-        Used on the server side — the client hashes biometrics locally and
-        sends only hashes. Raw biometric data never leaves the client device.
+        Entity ID is derived from biometrics only (one person = one wallet).
+        Signing key seed is derived from biometrics + private key (2FA).
         """
+        if not private_key:
+            raise ValueError("Private key is required — both biometrics and a private key are needed to sign")
+
         entity_id = derive_entity_id(dna_hash, fingerprint_hash, iris_hash)
 
-        # Biometric seed is the PRIVATE KEY — domain-separated from entity_id.
-        # entity_id is public (on-chain), biometric_seed is secret (local only).
-        # Knowing entity_id cannot reveal biometric_seed, and vice versa.
-        biometric_seed = _derive_biometric_seed(dna_hash, fingerprint_hash, iris_hash)
+        # Signing seed requires BOTH biometrics and private key.
+        # entity_id is public (on-chain), signing seed is secret (local only).
+        # Stolen biometrics alone cannot produce a valid signing key.
+        biometric_seed = _derive_signing_seed(dna_hash, fingerprint_hash, iris_hash, private_key)
         keypair = KeyPair.generate(biometric_seed)
 
         return cls(

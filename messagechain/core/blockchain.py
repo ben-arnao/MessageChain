@@ -16,7 +16,7 @@ Now supports:
 
 import hashlib
 import logging
-from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK
+from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
@@ -119,29 +119,38 @@ class Blockchain:
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
 
     def _persist_state(self):
-        """Write current in-memory state to database."""
+        """Write current in-memory state to database atomically.
+
+        All writes are wrapped in a single SQL transaction so a crash
+        mid-persist cannot leave the database in a partially-updated state.
+        """
         if self.db is None:
             return
-        for eid, bal in self.supply.balances.items():
-            self.db.set_balance(eid, bal)
-        for eid, stk in self.supply.staked.items():
-            self.db.set_staked(eid, stk)
-        for eid, nonce in self.nonces.items():
-            self.db.set_nonce(eid, nonce)
-        for eid, pk in self.public_keys.items():
-            self.db.set_public_key(eid, pk)
-        for eid, cnt in self.entity_message_count.items():
-            self.db.set_message_count(eid, cnt)
-        for eid, cnt in self.proposer_sig_counts.items():
-            self.db.set_proposer_sig_count(eid, cnt)
-        self.db.set_supply_meta("total_supply", self.supply.total_supply)
-        self.db.set_supply_meta("total_minted", self.supply.total_minted)
-        self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
-        # Persist slashed validators
-        if hasattr(self.db, 'add_slashed_validator'):
-            for eid in self.slashed_validators:
-                self.db.add_slashed_validator(eid, self.height, b"")
-        self.db.flush_state()
+        self.db.begin_transaction()
+        try:
+            for eid, bal in self.supply.balances.items():
+                self.db.set_balance(eid, bal)
+            for eid, stk in self.supply.staked.items():
+                self.db.set_staked(eid, stk)
+            for eid, nonce in self.nonces.items():
+                self.db.set_nonce(eid, nonce)
+            for eid, pk in self.public_keys.items():
+                self.db.set_public_key(eid, pk)
+            for eid, cnt in self.entity_message_count.items():
+                self.db.set_message_count(eid, cnt)
+            for eid, cnt in self.proposer_sig_counts.items():
+                self.db.set_proposer_sig_count(eid, cnt)
+            self.db.set_supply_meta("total_supply", self.supply.total_supply)
+            self.db.set_supply_meta("total_minted", self.supply.total_minted)
+            self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
+            # Persist slashed validators
+            if hasattr(self.db, 'add_slashed_validator'):
+                for eid in self.slashed_validators:
+                    self.db.add_slashed_validator(eid, self.height, b"")
+            self.db.commit_transaction()
+        except Exception:
+            self.db.rollback_transaction()
+            raise
 
     def initialize_genesis(self, genesis_entity) -> Block:
         """Create the genesis block and initialize chain state."""
@@ -189,6 +198,16 @@ class Blockchain:
             self.db.flush_state()
 
         return True, "Entity registered"
+
+    def sync_consensus_stakes(self, consensus: "ProofOfStake"):
+        """Populate consensus.stakes from the supply tracker's staked amounts.
+
+        Must be called after loading from DB so that the consensus module
+        has accurate stake data (prevents falling into permissive bootstrap mode).
+        """
+        for entity_id, amount in self.supply.staked.items():
+            if amount >= VALIDATOR_MIN_STAKE:
+                consensus.stakes[entity_id] = amount
 
     def get_latest_block(self) -> Block | None:
         return self.chain[-1] if self.chain else None
@@ -342,6 +361,34 @@ class Blockchain:
             self.supply.staked,
         )
 
+    def compute_post_state_root(
+        self,
+        transactions: list[MessageTransaction],
+        proposer_id: bytes,
+        block_height: int,
+    ) -> bytes:
+        """Compute the state root AFTER applying a set of transactions.
+
+        Used by block proposers to compute the correct post-state commitment
+        without actually mutating chain state. The block header commits to
+        the post-application state so validators can verify consistency.
+        """
+        sim_balances = dict(self.supply.balances)
+        sim_nonces = dict(self.nonces)
+        sim_staked = dict(self.supply.staked)
+
+        # Simulate fee payments
+        for tx in transactions:
+            sim_balances[tx.entity_id] = sim_balances.get(tx.entity_id, 0) - tx.fee
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tx.fee
+            sim_nonces[tx.entity_id] = tx.nonce + 1
+
+        # Simulate block reward
+        reward = self.supply.calculate_block_reward(block_height)
+        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
+
+        return compute_state_root(sim_balances, sim_nonces, sim_staked)
+
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
         """Validate all attestations included in a block.
 
@@ -427,11 +474,42 @@ class Blockchain:
         if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
             return False, "Invalid proposer signature"
 
-        # Validate all transactions
+        # Validate all transactions, tracking nonce and balance increments
+        # within the block to prevent duplicate-nonce / double-spend attacks.
+        pending_nonces: dict[bytes, int] = {}
+        pending_balance_spent: dict[bytes, int] = {}
         for tx in block.transactions:
-            valid, reason = self.validate_transaction(tx)
-            if not valid:
-                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: {reason}"
+            # Check nonce against chain state + any already-seen txs in this block
+            expected_nonce = pending_nonces.get(
+                tx.entity_id, self.nonces.get(tx.entity_id, 0)
+            )
+            if tx.nonce != expected_nonce:
+                return False, (
+                    f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                    f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+                )
+
+            # Check cumulative fee spend within this block doesn't exceed balance
+            spent_so_far = pending_balance_spent.get(tx.entity_id, 0)
+            if self.supply.get_balance(tx.entity_id) < spent_so_far + tx.fee:
+                return False, (
+                    f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                    f"Insufficient balance for fee of {tx.fee}"
+                )
+
+            # Verify entity is registered and signature is valid
+            if tx.entity_id not in self.public_keys:
+                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Unknown entity — must register first"
+            public_key = self.public_keys[tx.entity_id]
+            if not verify_transaction(tx, public_key):
+                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
+
+            if tx.timestamp <= 0:
+                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Transaction must have a valid timestamp"
+
+            # Advance pending state for next tx in the same block
+            pending_nonces[tx.entity_id] = expected_nonce + 1
+            pending_balance_spent[tx.entity_id] = spent_so_far + tx.fee
 
         # Validate attestations (votes for the parent block)
         valid, reason = self._validate_attestations(block)
@@ -559,7 +637,10 @@ class Blockchain:
                 self.attestation_sig_counts.get(att.validator_id, 0) + 1
             )
 
-        # Verify state_root commitment (skip for legacy blocks with zero state_root)
+        # Verify state_root commitment if the proposer committed to one.
+        # A zero state_root means "state uncommitted" — the proposer did not
+        # include a state commitment in this block. When a state_root IS present,
+        # it must match the post-application state (after fees, rewards, nonces).
         if block.header.state_root != b"\x00" * 32:
             expected_state_root = self.compute_current_state_root()
             if block.header.state_root != expected_state_root:

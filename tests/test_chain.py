@@ -10,8 +10,8 @@ from messagechain.consensus.pos import ProofOfStake
 
 class TestBlockchain(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -20,6 +20,14 @@ class TestBlockchain(unittest.TestCase):
         self.chain.supply.balances[self.bob.entity_id] = 10000
         self.consensus = ProofOfStake()
 
+    def _make_block(self, proposer, txs, prev=None):
+        """Create a block with correct post-state root."""
+        if prev is None:
+            prev = self.chain.get_latest_block()
+        block_height = prev.header.block_number + 1
+        state_root = self.chain.compute_post_state_root(txs, proposer.entity_id, block_height)
+        return self.consensus.create_block(proposer, txs, prev, state_root=state_root)
+
     def test_genesis_block(self):
         self.assertEqual(self.chain.height, 1)
         genesis = self.chain.get_block(0)
@@ -27,7 +35,7 @@ class TestBlockchain(unittest.TestCase):
 
     def test_duplicate_entity_rejected(self):
         """Same biometrics cannot register twice — one person one wallet."""
-        alice_dup = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        alice_dup = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
         success, msg = self.chain.register_entity(alice_dup.entity_id, alice_dup.public_key)
         self.assertFalse(success)
         self.assertIn("duplicate", msg.lower())
@@ -45,8 +53,7 @@ class TestBlockchain(unittest.TestCase):
             self.alice, "Test message", BiometricType.DNA,
             fee=5, nonce=0
         )
-        prev = self.chain.get_latest_block()
-        block = self.consensus.create_block(self.alice, [tx], prev)
+        block = self._make_block(self.alice, [tx])
         success, reason = self.chain.add_block(block)
         self.assertTrue(success, reason)
         self.assertEqual(self.chain.height, 2)
@@ -58,9 +65,8 @@ class TestBlockchain(unittest.TestCase):
             self.bob, "Bob pays fee", BiometricType.IRIS,
             fee=20, nonce=0
         )
-        prev = self.chain.get_latest_block()
         # Alice proposes the block, collects Bob's fee + block reward
-        block = self.consensus.create_block(self.alice, [tx], prev)
+        block = self._make_block(self.alice, [tx])
         self.chain.add_block(block)
 
         alice_balance_after = self.chain.supply.get_balance(self.alice.entity_id)
@@ -77,8 +83,7 @@ class TestBlockchain(unittest.TestCase):
                 entity, f"Message {i}", BiometricType.DNA,
                 fee=5, nonce=nonce
             )
-            prev = self.chain.get_latest_block()
-            block = self.consensus.create_block(entity, [tx], prev)
+            block = self._make_block(entity, [tx])
             self.chain.add_block(block)
 
         self.assertGreater(self.chain.supply.total_supply, initial_supply)
@@ -109,9 +114,9 @@ class TestBlockchain(unittest.TestCase):
                 self.alice, f"Signed with {bio_type.value}",
                 bio_type, fee=5, nonce=nonce
             )
-            prev = self.chain.get_latest_block()
-            block = self.consensus.create_block(self.alice, [tx], prev)
-            self.chain.add_block(block)
+            block = self._make_block(self.alice, [tx])
+            success, reason = self.chain.add_block(block)
+            self.assertTrue(success, reason)
             stored_tx = self.chain.chain[-1].transactions[0]
             self.assertEqual(stored_tx.biometric_type, bio_type)
 

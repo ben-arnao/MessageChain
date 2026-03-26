@@ -14,7 +14,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     """Fix #2: Reject deserialized objects with spoofed hashes."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.supply.balances[self.alice.entity_id] = 10000
@@ -72,8 +72,8 @@ class TestMandatoryProposerSignature(unittest.TestCase):
     """Fix #5: Unsigned blocks must be rejected."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -122,8 +122,8 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_register_with_public_data_only(self):
         """register_entity accepts entity_id and public_key, not Entity objects."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
@@ -135,7 +135,7 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_duplicate_public_data_rejected(self):
         """Duplicate entity_id is still rejected."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 

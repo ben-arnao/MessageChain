@@ -10,8 +10,8 @@ from messagechain.consensus.pos import ProofOfStake
 
 class TestStateRoot(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -34,7 +34,8 @@ class TestStateRoot(unittest.TestCase):
             self.alice, "Hello", BiometricType.DNA, fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
-        state_root = self.chain.compute_current_state_root()
+        block_height = prev.header.block_number + 1
+        state_root = self.chain.compute_post_state_root([tx], self.alice.entity_id, block_height)
         block = self.consensus.create_block(self.alice, [tx], prev, state_root=state_root)
         self.chain.add_block(block)
 
@@ -47,7 +48,8 @@ class TestStateRoot(unittest.TestCase):
             self.alice, "Test", BiometricType.DNA, fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
-        state_root = self.chain.compute_current_state_root()
+        block_height = prev.header.block_number + 1
+        state_root = self.chain.compute_post_state_root([tx], self.alice.entity_id, block_height)
         block = self.consensus.create_block(self.alice, [tx], prev, state_root=state_root)
 
         self.assertEqual(block.header.state_root, state_root)
@@ -74,7 +76,8 @@ class TestStateRoot(unittest.TestCase):
             self.alice, "Roundtrip", BiometricType.DNA, fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
-        state_root = self.chain.compute_current_state_root()
+        block_height = prev.header.block_number + 1
+        state_root = self.chain.compute_post_state_root([tx], self.alice.entity_id, block_height)
         block = self.consensus.create_block(self.alice, [tx], prev, state_root=state_root)
 
         data = block.serialize()
@@ -103,23 +106,16 @@ class TestStateRoot(unittest.TestCase):
         self.assertEqual(root1, root2)
 
     def test_block_with_valid_state_root_accepted(self):
-        """Block with correct state_root is accepted."""
+        """Block with correct post-state state_root is accepted."""
         tx = create_transaction(
             self.alice, "Valid state", BiometricType.DNA, fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
-        # Compute state_root BEFORE the block is applied (pre-state)
-        # The block's state_root should reflect post-application state
-        # We need to simulate what state will look like after the block
-        state_root = self.chain.compute_current_state_root()
+        block_height = prev.header.block_number + 1
+        state_root = self.chain.compute_post_state_root([tx], self.alice.entity_id, block_height)
         block = self.consensus.create_block(self.alice, [tx], prev, state_root=state_root)
         success, reason = self.chain.add_block(block)
-        # The block uses pre-state root but validation checks post-state.
-        # Since state changes during apply, a pre-state root won't match post-state.
-        # Legacy blocks (zero state_root) skip the check.
-        # This test verifies the mechanism works end-to-end.
-        # For a proper test, we'd need to predict post-state root.
-        self.assertIsNotNone(success)
+        self.assertTrue(success, reason)
 
     def test_legacy_block_zero_state_root_accepted(self):
         """Blocks with zero state_root (legacy) skip the state_root check."""

@@ -149,6 +149,7 @@ class Server:
                 os.urandom(32),  # random DNA data
                 os.urandom(32),  # random fingerprint data
                 os.urandom(32),  # random iris data
+                private_key=os.urandom(32),  # random private key
             )
             self.blockchain.initialize_genesis(bootstrap)
             logger.info(f"Genesis block created")
@@ -457,8 +458,11 @@ class Server:
             if not txs:
                 continue
 
-            # Compute state root and create signed block
-            state_root = self.blockchain.compute_current_state_root()
+            # Compute post-state root (state AFTER applying fees + reward)
+            block_height = latest.header.block_number + 1
+            state_root = self.blockchain.compute_post_state_root(
+                txs, self.wallet_id, block_height,
+            )
             block = self.consensus.create_block(
                 self.wallet_entity, txs, latest, state_root=state_root,
             )
@@ -865,7 +869,8 @@ async def run(args):
     if dna:
         fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
         iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
-        entity = Entity.create(dna, fingerprint, iris)
+        private_key_input = getpass.getpass("Private key (hidden):       ").encode("utf-8")
+        entity = Entity.create(dna, fingerprint, iris, private_key=private_key_input)
 
         # Advance WOTS+ keypair past all previously-used one-time signing keys.
         # Without this, restarting the server would reuse WOTS+ leaves, which

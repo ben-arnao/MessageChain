@@ -38,7 +38,7 @@ class ChainDB:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             self._local.conn = sqlite3.connect(self.db_path)
             self._local.conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+            self._local.conn.execute("PRAGMA synchronous=FULL")
         return self._local.conn
 
     def _init_schema(self):
@@ -351,7 +351,6 @@ class ChainDB:
             "INSERT OR REPLACE INTO slashed_validators (entity_id, slashed_at_block, evidence_hash) VALUES (?, ?, ?)",
             (entity_id, block_number, evidence_hash),
         )
-        self._conn.commit()
 
     def is_slashed(self, entity_id: bytes) -> bool:
         cur = self._conn.execute("SELECT 1 FROM slashed_validators WHERE entity_id = ?", (entity_id,))
@@ -378,32 +377,41 @@ class ChainDB:
         }
 
     def restore_state_snapshot(self, snapshot: dict):
-        """Restore state from a snapshot (used during chain reorg)."""
+        """Restore state from a snapshot (used during chain reorg).
+
+        All operations are wrapped in a single transaction so a crash
+        cannot leave the database with deleted-but-not-restored data.
+        """
         conn = self._conn
-        conn.execute("DELETE FROM balances")
-        conn.execute("DELETE FROM staked")
-        conn.execute("DELETE FROM nonces")
-        conn.execute("DELETE FROM public_keys")
-        conn.execute("DELETE FROM message_counts")
-        conn.execute("DELETE FROM proposer_sig_counts")
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM balances")
+            conn.execute("DELETE FROM staked")
+            conn.execute("DELETE FROM nonces")
+            conn.execute("DELETE FROM public_keys")
+            conn.execute("DELETE FROM message_counts")
+            conn.execute("DELETE FROM proposer_sig_counts")
 
-        for eid, bal in snapshot["balances"].items():
-            conn.execute("INSERT INTO balances (entity_id, balance) VALUES (?, ?)", (eid, bal))
-        for eid, amt in snapshot["staked"].items():
-            conn.execute("INSERT INTO staked (entity_id, amount) VALUES (?, ?)", (eid, amt))
-        for eid, nonce in snapshot["nonces"].items():
-            conn.execute("INSERT INTO nonces (entity_id, nonce) VALUES (?, ?)", (eid, nonce))
-        for eid, pk in snapshot["public_keys"].items():
-            conn.execute("INSERT INTO public_keys (entity_id, public_key) VALUES (?, ?)", (eid, pk))
-        for eid, cnt in snapshot["message_counts"].items():
-            conn.execute("INSERT INTO message_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
-        for eid, cnt in snapshot.get("proposer_sig_counts", {}).items():
-            conn.execute("INSERT INTO proposer_sig_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
+            for eid, bal in snapshot["balances"].items():
+                conn.execute("INSERT INTO balances (entity_id, balance) VALUES (?, ?)", (eid, bal))
+            for eid, amt in snapshot["staked"].items():
+                conn.execute("INSERT INTO staked (entity_id, amount) VALUES (?, ?)", (eid, amt))
+            for eid, nonce in snapshot["nonces"].items():
+                conn.execute("INSERT INTO nonces (entity_id, nonce) VALUES (?, ?)", (eid, nonce))
+            for eid, pk in snapshot["public_keys"].items():
+                conn.execute("INSERT INTO public_keys (entity_id, public_key) VALUES (?, ?)", (eid, pk))
+            for eid, cnt in snapshot["message_counts"].items():
+                conn.execute("INSERT INTO message_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
+            for eid, cnt in snapshot.get("proposer_sig_counts", {}).items():
+                conn.execute("INSERT INTO proposer_sig_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
 
-        conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
-        conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
-        conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_fees_collected'", (snapshot["total_fees_collected"],))
-        conn.commit()
+            conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
+            conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
+            conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_fees_collected'", (snapshot["total_fees_collected"],))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def flush_state(self):
         """Commit any pending writes."""

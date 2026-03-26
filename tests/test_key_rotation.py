@@ -16,8 +16,8 @@ from messagechain.config import KEY_ROTATION_FEE
 
 class TestKeyRotation(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -112,7 +112,7 @@ class TestKeyRotation(unittest.TestCase):
 
         # Second rotation — need to use new keypair to sign
         # Simulate entity with new keypair
-        alice_rotated = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        alice_rotated = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
         alice_rotated.keypair = new_kp0  # swap in the rotated keypair
 
         new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)

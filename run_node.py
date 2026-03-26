@@ -28,6 +28,7 @@ def create_demo_entity(name: str = "demo") -> Entity:
         dna_data=f"{name}-dna-sample".encode(),
         fingerprint_data=f"{name}-fingerprint-scan".encode(),
         iris_data=f"{name}-iris-scan".encode(),
+        private_key=f"{name}-private-key".encode(),
     )
 
 
@@ -51,6 +52,9 @@ def run_demo():
     genesis = chain.initialize_genesis(alice)
     success, msg = chain.register_entity(bob.entity_id, bob.public_key)
     print(f"Bob registration: {msg}")
+    # Fund entities so they can pay transaction fees
+    chain.supply.balances[alice.entity_id] = 10000
+    chain.supply.balances[bob.entity_id] = 10000
     info = chain.get_chain_info()
     print(f"Genesis block: {genesis.block_hash.hex()[:32]}...")
     print(f"Total supply: {info['total_supply']:,}")

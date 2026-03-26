@@ -34,6 +34,7 @@ def make_entity(name: str) -> Entity:
         f"{name}-dna".encode(),
         f"{name}-finger".encode(),
         f"{name}-iris".encode(),
+        private_key=f"{name}-privkey".encode(),
     )
 
 

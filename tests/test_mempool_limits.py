@@ -10,7 +10,7 @@ from messagechain.core.transaction import create_transaction
 
 class TestMempoolLimits(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
 
     def _make_tx(self, fee: int, nonce: int, ts: float | None = None):
         tx = create_transaction(
