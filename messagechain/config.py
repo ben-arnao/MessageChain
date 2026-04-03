@@ -1,8 +1,8 @@
 """Global configuration constants for the MessageChain protocol."""
 
 # Message constraints
-MAX_MESSAGE_WORDS = 100  # max words per message (L2 splits long messages across txs)
-MAX_MESSAGE_BYTES = 1_024  # max message size in bytes (~1KB, fits 100 words with Unicode room)
+MAX_MESSAGE_CHARS = 280  # max characters per message (Twitter-length short messages)
+MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode room)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # Target: ~1% annual inflation that diminishes over time via halvings.

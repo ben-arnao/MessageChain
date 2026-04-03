@@ -2,7 +2,7 @@
 MessageTransaction - the fundamental unit of data on MessageChain.
 
 Each transaction represents one message posted by one entity. It contains:
-- The message content (up to MAX_MESSAGE_WORDS words)
+- The message content (up to MAX_MESSAGE_CHARS characters)
 - The entity who posted it
 - Which biometric type was used to authenticate locally
 - A quantum-resistant signature
@@ -18,7 +18,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MAX_MESSAGE_WORDS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
+from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
 from messagechain.identity.biometrics import BiometricType, Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -53,10 +53,10 @@ class MessageTransaction:
         return hashlib.new(HASH_ALGO, self._signable_data()).digest()
 
     @property
-    def word_count(self) -> int:
-        """Count words in the message."""
+    def char_count(self) -> int:
+        """Count characters in the message."""
         text = self.message.decode("utf-8", errors="replace")
-        return len(text.split())
+        return len(text)
 
     def serialize(self) -> dict:
         return {
@@ -94,12 +94,12 @@ class MessageTransaction:
 
 
 def _validate_message(message: str) -> tuple[bool, str]:
-    """Check message is within word and byte limits."""
+    """Check message is within character and byte limits."""
     msg_bytes = message.encode("utf-8")
     if len(msg_bytes) > MAX_MESSAGE_BYTES:
         return False, f"Message exceeds {MAX_MESSAGE_BYTES} bytes ({len(msg_bytes)} bytes)"
-    if len(message.split()) > MAX_MESSAGE_WORDS:
-        return False, f"Message exceeds {MAX_MESSAGE_WORDS} words"
+    if len(message) > MAX_MESSAGE_CHARS:
+        return False, f"Message exceeds {MAX_MESSAGE_CHARS} characters"
     return True, "OK"
 
 
@@ -145,7 +145,7 @@ def create_transaction(
 
 def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
     """Verify a transaction's quantum-resistant signature."""
-    if tx.word_count > MAX_MESSAGE_WORDS:
+    if tx.char_count > MAX_MESSAGE_CHARS:
         return False
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False

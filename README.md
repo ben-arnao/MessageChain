@@ -87,7 +87,7 @@ Base Layer (this protocol)
 ├── Quantum-resistant signatures
 ├── Inflationary token economics
 ├── Fee-based transaction priority
-├── Timestamped messages (100 words)
+├── Timestamped messages (280 characters)
 └── One entity = one wallet
 
 L2 / Third-Party (built on top)

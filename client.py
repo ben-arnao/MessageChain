@@ -118,15 +118,15 @@ def cmd_send_message(args):
     # Get message
     message = args.message
     if not message:
-        print("Enter your message (100 words max):")
+        print("Enter your message (280 characters max):")
         message = input("> ").strip()
     if not message:
         print("Error: Message cannot be empty.")
         sys.exit(1)
 
-    word_count = len(message.split())
-    if word_count > 100:
-        print(f"Error: Message is {word_count} words (max 100).")
+    char_count = len(message)
+    if char_count > 280:
+        print(f"Error: Message is {char_count} characters (max 280).")
         sys.exit(1)
 
     # Collect credentials to sign (biometrics + private key)
@@ -179,7 +179,7 @@ def cmd_send_message(args):
         print(f"\nMessage sent!")
         print(f"  TX hash: {result['tx_hash']}")
         print(f"  Fee:     {result['fee']} tokens")
-        print(f"  Words:   {word_count}")
+        print(f"  Chars:   {char_count}")
         print(f"  Status:  {result['message']}")
     else:
         print(f"\nFailed: {response.get('error')}")

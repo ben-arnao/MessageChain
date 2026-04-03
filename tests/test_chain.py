@@ -138,15 +138,15 @@ class TestBlockchain(unittest.TestCase):
         self.assertIn("nonce", reason.lower())
 
     def test_message_too_long_rejected(self):
-        long_msg = " ".join(["word"] * 101)  # 101 words
+        long_msg = "a" * 281  # 281 characters
         with self.assertRaises(ValueError):
             create_transaction(
                 self.alice, long_msg, BiometricType.DNA,
                 fee=5, nonce=0
             )
 
-    def test_100_words_accepted(self):
-        msg = " ".join(["word"] * 100)  # exactly 100 words
+    def test_280_chars_accepted(self):
+        msg = "a" * 280  # exactly 280 characters
         tx = create_transaction(
             self.alice, msg, BiometricType.DNA,
             fee=5, nonce=0

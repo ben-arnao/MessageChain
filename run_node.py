@@ -144,7 +144,7 @@ def run_demo():
     print("  - Quantum-resistant signatures (WOTS+ / SHA3-256)")
     print("  - Inflationary supply (block rewards, halving schedule)")
     print("  - Fee bidding (BTC-style priority)")
-    print("  - Timestamped messages (100 word max)")
+    print("  - Timestamped messages (280 char max)")
     print("  - One entity = one wallet (enforced by biometrics)")
     print()
     print("L2 / THIRD-PARTY PROTOCOLS (built on top):")
