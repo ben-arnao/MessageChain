@@ -4,67 +4,66 @@ A message-based blockchain where your biometrics are your private key.
 
 ## Quick Start
 
-**Terminal 1 — Start the server:**
+Three commands. That's it.
 
 ```bash
-python server.py
-# Enter your wallet ID when prompted (or press Enter to skip)
+# 1. Start a node
+python -m messagechain start
+
+# 2. Create your account
+python -m messagechain account
+
+# 3. Send a message
+python -m messagechain send "Hello, MessageChain!"
 ```
 
-**Terminal 2 — Create an account:**
+## Commands
+
+### Start a node
 
 ```bash
-python client.py create-account
-# Enter your DNA, fingerprint, and iris data when prompted
-# Save the entity ID it gives you — that's your wallet
+# Relay-only (no biometrics needed)
+python -m messagechain start
+
+# Mine blocks and earn rewards
+python -m messagechain start --mine
 ```
 
-**Terminal 2 — Send a message:**
+That's all you need. The node auto-creates its data directory, picks default ports (P2P: 9333, RPC: 9334), and starts running.
+
+**For power users:**
 
 ```bash
-python client.py send-message
-# Enter your message, authenticate with biometrics, set a fee
+python -m messagechain start --port 9333 --rpc-port 9334 --seed 192.168.1.10:9333 --data-dir ./mydata
 ```
 
-## How It Works
-
-### Two commands, that's it
+### Create an account
 
 ```bash
-# 1. Create your one and only account
-python client.py create-account
-
-# 2. Send messages
-python client.py send-message -m "Hello, MessageChain" -f 10
+python -m messagechain account
 ```
 
-### Server
+Prompts for your biometrics (DNA, fingerprint, iris) and a private key. Returns your entity ID — that's your wallet address. Done.
+
+### Send a message
 
 ```bash
-# Basic
-python server.py
-
-# With options
-python server.py --port 9333 --rpc-port 9334 --wallet <your-entity-id>
-
-# Connect to an existing network
-python server.py --seed 192.168.1.10:9333
+python -m messagechain send "Your message here"
 ```
 
-The server processes transactions, produces blocks, and deposits fees + block rewards into your wallet.
+Prompts for biometric auth, auto-detects the optimal fee, signs, and submits. One command.
 
-### Client
+**For power users:**
 
 ```bash
-# Create account — provide biometrics, get your wallet ID
-python client.py create-account
+python -m messagechain send "Hello" --fee 50 --server 10.0.0.1:9334
+```
 
-# Send message — provide biometrics to sign, set your fee
-python client.py send-message -m "your message here" -f 10
+### Other commands
 
-# Options
-python client.py send-message --bio-type iris --fee 25 --message "signed with iris"
-python client.py --host 192.168.1.10 --rpc-port 9334 send-message
+```bash
+python -m messagechain demo     # Run a local demo of the protocol
+python -m messagechain info     # Show chain info from a running node
 ```
 
 ## Core Design
@@ -76,7 +75,7 @@ python client.py --host 192.168.1.10 --rpc-port 9334 send-message
 | **Quantum resistant** | WOTS+ hash-based signatures over SHA3-256. Immune to quantum attacks. |
 | **Inflationary supply** | Block rewards with halving schedule. Offsets tokens lost to death/abandonment. |
 | **Fee bidding** | You set your fee. Higher fee = faster block inclusion. Like Bitcoin. |
-| **100 words per message** | Base layer limit. L2 protocols split long content across multiple transactions. |
+| **280 characters per message** | Base layer limit. L2 protocols split long content across multiple transactions. |
 | **Timestamped** | Every transaction is timestamped. |
 
 ## Architecture
@@ -97,6 +96,16 @@ L2 / Third-Party (built on top)
 ├── Threading / chaining messages
 ├── Long message splitting
 └── Profile systems, social graphs
+```
+
+## Advanced Usage
+
+The original entry points are still available for fine-grained control:
+
+```bash
+python server.py [options]       # Full node server
+python client.py <command>       # Client commands
+python run_node.py --demo        # Demo mode
 ```
 
 ## Running Tests

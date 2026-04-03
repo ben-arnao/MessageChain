@@ -1,0 +1,340 @@
+"""
+Unified CLI for MessageChain.
+
+    messagechain start              # Run a node (relay-only)
+    messagechain start --mine       # Run a node and produce blocks
+    messagechain account            # Create an account
+    messagechain send "Hello!"      # Send a message
+    messagechain demo               # Run local demo
+    messagechain info               # Show chain info
+"""
+
+import argparse
+import asyncio
+import getpass
+import logging
+import os
+import sys
+
+from messagechain.config import DEFAULT_PORT
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="messagechain",
+        description="MessageChain — decentralized, quantum-resistant messaging",
+        usage="messagechain <command> [options]",
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="Verbose logging"
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # --- start ---
+    start = sub.add_parser(
+        "start",
+        help="Start a node",
+        description="Start a MessageChain node. Relay-only by default.",
+    )
+    start.add_argument(
+        "--mine", action="store_true",
+        help="Produce blocks and earn rewards (requires biometric auth)",
+    )
+    start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
+    start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
+    start.add_argument("--seed", nargs="*", help="Seed nodes (host:port)")
+    start.add_argument("--data-dir", type=str, default=None, help="Chain data directory")
+
+    # --- account ---
+    account = sub.add_parser(
+        "account",
+        help="Create an account",
+        description="Create a new account using your biometrics.",
+    )
+    account.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+
+    # --- send ---
+    send = sub.add_parser(
+        "send",
+        help="Send a message",
+        description="Send a message to the chain (280 chars max).",
+    )
+    send.add_argument("message", type=str, help="Message text (280 chars max)")
+    send.add_argument(
+        "--fee", type=int, default=None,
+        help="Transaction fee (auto-detected if omitted)",
+    )
+    send.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+
+    # --- demo ---
+    sub.add_parser(
+        "demo",
+        help="Run a local demo",
+        description="Run a full local demo of the protocol.",
+    )
+
+    # --- info ---
+    info = sub.add_parser(
+        "info",
+        help="Show chain info",
+        description="Query a running node for chain info.",
+    )
+    info.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+
+    return parser
+
+
+def resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill in sensible defaults so users don't have to think about config."""
+    cmd = args.command
+
+    # Server address defaults
+    if hasattr(args, "server") and args.server is None:
+        args.server = "127.0.0.1:9334"
+
+    # Data dir defaults for node
+    if cmd == "start" and args.data_dir is None:
+        args.data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
+
+    return args
+
+
+def _parse_server(server_str: str) -> tuple[str, int]:
+    """Parse 'host:port' into (host, port)."""
+    if ":" in server_str:
+        host, port = server_str.rsplit(":", 1)
+        return host, int(port)
+    return server_str, 9334
+
+
+def _collect_credentials():
+    """Collect biometric data and private key from the user."""
+    print("Authenticate with your biometrics and private key.")
+    print("(In production, biometrics come from hardware scanners.)\n")
+
+    dna = getpass.getpass("DNA sample (hidden):        ").encode("utf-8")
+    fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
+    iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
+    private_key = getpass.getpass("Private key (hidden):       ").encode("utf-8")
+
+    if not all([dna, fingerprint, iris, private_key]):
+        print("Error: All biometric inputs and private key are required.")
+        sys.exit(1)
+
+    return dna, fingerprint, iris, private_key
+
+
+def cmd_start(args):
+    """Start a MessageChain node."""
+    from messagechain.identity.biometrics import Entity
+
+    # Ensure data directory exists
+    os.makedirs(args.data_dir, exist_ok=True)
+
+    seed_nodes = []
+    if args.seed:
+        for s in args.seed:
+            host, port = s.split(":")
+            seed_nodes.append((host, int(port)))
+
+    # Import server here to avoid circular imports and keep startup fast
+    from server import Server
+
+    server = Server(
+        p2p_port=args.port,
+        rpc_port=args.rpc_port,
+        seed_nodes=seed_nodes,
+        data_dir=args.data_dir,
+    )
+
+    entity = None
+    if args.mine:
+        print("=== Start Mining Node ===\n")
+        print("To produce blocks and earn rewards, authenticate with your biometrics.\n")
+        dna, fingerprint, iris, private_key = _collect_credentials()
+        entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+
+        # Advance keypair past used leaves
+        leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
+        if leaves_used > 0:
+            entity.keypair.advance_to_leaf(leaves_used)
+
+        server.set_wallet_entity(entity)
+        print(f"\nMining as: {entity.entity_id_hex[:16]}...")
+    else:
+        print("=== Start Relay Node ===\n")
+        print("Running as relay-only (no block production).")
+        print("To earn rewards, restart with: messagechain start --mine\n")
+
+    async def _run():
+        await server.start()
+        port_info = f"P2P: {args.port} | RPC: {args.rpc_port}"
+        print(f"Node running. {port_info}")
+        print(f"Data: {args.data_dir}")
+        print("Press Ctrl+C to stop.\n")
+        try:
+            while True:
+                await asyncio.sleep(1)
+        except KeyboardInterrupt:
+            print("\nShutting down...")
+            await server.stop()
+
+    asyncio.run(_run())
+
+
+def cmd_account(args):
+    """Create a new account."""
+    from messagechain.identity.biometrics import Entity
+
+    print("=== Create Account ===\n")
+    dna, fingerprint, iris, private_key = _collect_credentials()
+
+    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    print(f"\nYour entity ID: {entity.entity_id_hex}")
+
+    host, port = _parse_server(args.server)
+    print(f"Registering with server at {host}:{port}...")
+
+    from client import rpc_call
+    response = rpc_call(host, port, "register_entity", {
+        "entity_id": entity.entity_id_hex,
+        "public_key": entity.public_key.hex(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nAccount created!")
+        print(f"  Entity ID: {result['entity_id']}")
+        print(f"  Balance:   {result['initial_balance']} tokens")
+        print(f"\nSave your entity ID — this is your wallet address.")
+        print("Your biometrics + private key are your credentials. Never share them.")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_send(args):
+    """Send a message to the chain."""
+    from messagechain.identity.biometrics import Entity, BiometricType
+
+    message = args.message
+    char_count = len(message)
+    if char_count > 280:
+        print(f"Error: Message is {char_count} characters (max 280).")
+        sys.exit(1)
+    if not message.strip():
+        print("Error: Message cannot be empty.")
+        sys.exit(1)
+
+    print(f"=== Send Message ({char_count} chars) ===\n")
+
+    # Authenticate
+    dna, fingerprint, iris, private_key = _collect_credentials()
+    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    from messagechain.core.transaction import create_transaction
+
+    # Get nonce
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+
+    # Advance keypair past used leaves
+    entity.keypair.advance_to_leaf(nonce)
+
+    # Auto-detect fee (or use explicit)
+    fee = args.fee
+    if fee is None:
+        est_resp = rpc_call(host, port, "get_fee_estimate", {})
+        fee = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 5
+        print(f"Fee: {fee} tokens (auto)")
+    else:
+        print(f"Fee: {fee} tokens")
+
+    # Default biometric type — no need to ask the user
+    bio_type = BiometricType.FINGERPRINT
+
+    # Create, sign, submit
+    tx = create_transaction(entity, message, bio_type, fee=fee, nonce=nonce)
+    print("Submitting...")
+
+    response = rpc_call(host, port, "submit_transaction", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nMessage sent!")
+        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  Fee:     {result['fee']} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_demo(_args):
+    """Run local demo."""
+    from run_node import run_demo
+    run_demo()
+
+
+def cmd_info(args):
+    """Show chain info from a running node."""
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    response = rpc_call(host, port, "get_chain_info", {})
+
+    if response.get("ok"):
+        info = response["result"]
+        print("=== Chain Info ===\n")
+        for key, value in info.items():
+            label = key.replace("_", " ").title()
+            print(f"  {label}: {value}")
+    else:
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    args = resolve_defaults(args)
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+    commands = {
+        "start": cmd_start,
+        "account": cmd_account,
+        "send": cmd_send,
+        "demo": cmd_demo,
+        "info": cmd_info,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        handler(args)
+    else:
+        parser.print_help()
