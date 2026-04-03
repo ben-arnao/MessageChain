@@ -25,9 +25,14 @@ from messagechain.config import FINALITY_THRESHOLD
 class TestAttestation(unittest.TestCase):
     """Test basic attestation creation and verification."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
 
     def test_create_attestation(self):
         """An attestation can be created and has correct fields."""
@@ -135,10 +140,16 @@ class TestFinalityTracker(unittest.TestCase):
 class TestAttestationsInBlocks(unittest.TestCase):
     """Test attestations flowing through the block pipeline."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -151,8 +162,7 @@ class TestAttestationsInBlocks(unittest.TestCase):
     def test_block_with_valid_attestations(self):
         """Block containing valid attestations for parent is accepted."""
         # Create block 1 (no attestations — genesis has none to vote on)
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         success, _ = self.chain.add_block(block1)
         self.assertTrue(success)
 
@@ -161,24 +171,23 @@ class TestAttestationsInBlocks(unittest.TestCase):
         att_carol = create_attestation(self.carol, block1.block_hash, block1.header.block_number)
 
         # Create block 2 carrying attestations for block 1
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att_bob, att_carol]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att_bob, att_carol]
         )
         success, reason = self.chain.add_block(block2)
         self.assertTrue(success, reason)
 
     def test_block_with_wrong_target_attestation_rejected(self):
         """Attestation referencing wrong block is rejected."""
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         # Attestation for a different block
         wrong_hash = _hash(b"wrong_block")
         att = create_attestation(self.bob, wrong_hash, block1.header.block_number)
 
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att]
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
@@ -186,16 +195,15 @@ class TestAttestationsInBlocks(unittest.TestCase):
 
     def test_block_with_invalid_attestation_signature_rejected(self):
         """Attestation with forged signature is rejected."""
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         # Create attestation signed by bob but claim it's from carol
         att = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att.validator_id = self.carol.entity_id  # forge the validator_id
 
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att]
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
@@ -203,15 +211,14 @@ class TestAttestationsInBlocks(unittest.TestCase):
 
     def test_duplicate_attestation_in_block_rejected(self):
         """Same validator attesting twice in one block is rejected."""
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         att1 = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att2 = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
 
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att1, att2]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att1, att2]
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
@@ -219,15 +226,14 @@ class TestAttestationsInBlocks(unittest.TestCase):
 
     def test_attestation_from_unknown_entity_rejected(self):
         """Attestation from unregistered entity is rejected."""
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         stranger = Entity.create(b"stranger-dna", b"stranger-finger", b"stranger-iris", private_key=b"stranger-private-key")
         att = create_attestation(stranger, block1.block_hash, block1.header.block_number)
 
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att]
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
@@ -254,10 +260,16 @@ class TestAttestationsInBlocks(unittest.TestCase):
 class TestFinality(unittest.TestCase):
     """Test that finalized blocks cannot be reverted."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -273,8 +285,7 @@ class TestFinality(unittest.TestCase):
 
     def test_block_finalized_with_sufficient_attestations(self):
         """Block becomes finalized when 2/3+ stake attests."""
-        prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         # All 3 validators attest (3000/3000 = 1.0 >= 0.67)
@@ -283,8 +294,8 @@ class TestFinality(unittest.TestCase):
         att_bob = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att_carol = create_attestation(self.carol, block1.block_hash, block1.header.block_number)
 
-        block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att_alice, att_bob, att_carol]
+        block2 = self.chain.propose_block(
+            self.consensus, self.alice, [], attestations=[att_alice, att_bob, att_carol]
         )
         self.chain.add_block(block2)
 
@@ -310,10 +321,16 @@ class TestFinality(unittest.TestCase):
 class TestDoubleAttestationSlashing(unittest.TestCase):
     """Test slashing for double-attestation (nothing-at-stake attack)."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.carol)
         self.chain.register_entity(self.alice.entity_id, self.alice.public_key)

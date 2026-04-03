@@ -53,7 +53,7 @@ def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity
 
     for i in range(num_blocks):
         tx = create_transaction(bob, f"Message {i}", BiometricType.DNA, fee=2, nonce=i)
-        block = pos.create_block(alice, [tx], chain.get_latest_block())
+        block = chain.propose_block(pos, alice, [tx])
         success, reason = chain.add_block(block)
         assert success, f"Failed to add block {i}: {reason}"
 
@@ -304,7 +304,7 @@ class TestForkCommonAncestor(unittest.TestCase):
 
         # Create block A (on main chain)
         tx_a = create_transaction(bob, "fork A", BiometricType.DNA, fee=2, nonce=0)
-        block_a = pos.create_block(alice, [tx_a], parent)
+        block_a = chain.propose_block(pos, alice, [tx_a])
         chain.add_block(block_a)
 
         # Create block B (competing fork, same parent)
@@ -374,11 +374,11 @@ class TestChainReorg(unittest.TestCase):
 
         # Build main chain 2 blocks deep so it's strictly better than a 1-block fork
         tx1 = create_transaction(bob, "main chain 1", BiometricType.DNA, fee=2, nonce=0)
-        block1 = pos.create_block(alice, [tx1], genesis)
+        block1 = chain.propose_block(pos, alice, [tx1])
         chain.add_block(block1)
 
         tx2 = create_transaction(bob, "main chain 2", BiometricType.DNA, fee=2, nonce=1)
-        block2 = pos.create_block(alice, [tx2], block1)
+        block2 = chain.propose_block(pos, alice, [tx2])
         chain.add_block(block2)
 
         # Create competing fork block from genesis (shorter fork, won't trigger reorg)
@@ -513,7 +513,7 @@ class TestIntegration(unittest.TestCase):
             pos = ProofOfStake()
             for i in range(5):
                 tx = create_transaction(bob, f"Msg {i}", BiometricType.DNA, fee=2, nonce=i)
-                block = pos.create_block(alice, [tx], chain.get_latest_block())
+                block = chain.propose_block(pos, alice, [tx])
                 success, _ = chain.add_block(block)
                 assert success
 

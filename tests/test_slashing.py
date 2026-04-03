@@ -4,7 +4,7 @@ import unittest
 import time
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.blockchain import Blockchain
-from messagechain.core.block import Block, BlockHeader, _hash, compute_merkle_root
+from messagechain.core.block import Block, BlockHeader, _hash, compute_merkle_root, compute_state_root
 from messagechain.core.transaction import create_transaction
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.consensus.slashing import (
@@ -46,9 +46,14 @@ def _make_conflicting_headers(proposer_entity, prev_block):
 
 
 class TestSlashingEvidence(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
@@ -185,10 +190,16 @@ class TestSlashingEvidence(unittest.TestCase):
 
 
 class TestSlashTransaction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.carol)
         self.chain.register_entity(self.alice.entity_id, self.alice.public_key)
@@ -321,9 +332,30 @@ class TestSlashTransaction(unittest.TestCase):
         )
         slash_tx = create_slash_transaction(self.bob, evidence, fee=1)
 
-        # Create a block that includes the slash transaction
+        # Create a block that includes the slash transaction.
+        # Must compute the correct state_root that accounts for slash effects.
         consensus = ProofOfStake()
-        block = consensus.create_block(self.carol, [], prev)
+        prev = self.chain.get_latest_block()
+        block_height = prev.header.block_number + 1
+
+        # Simulate state after slash tx + block reward
+        sim_balances = dict(self.chain.supply.balances)
+        sim_nonces = dict(self.chain.nonces)
+        sim_staked = dict(self.chain.supply.staked)
+        # Slash tx fee: bob pays 1 to carol (proposer)
+        sim_balances[slash_tx.submitter_id] -= slash_tx.fee
+        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + slash_tx.fee
+        # Slash: alice stake (1000) -> 0, finder reward to bob
+        slashed_amount = sim_staked.get(self.alice.entity_id, 0)
+        finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
+        sim_staked[self.alice.entity_id] = 0
+        sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
+        # Block reward to proposer
+        reward = self.chain.supply.calculate_block_reward(block_height)
+        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + reward
+        state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)
+
+        block = consensus.create_block(self.carol, [], prev, state_root=state_root)
         block.slash_transactions = [slash_tx]
 
         success, msg = self.chain.add_block(block)
