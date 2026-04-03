@@ -34,7 +34,7 @@ key goes on-chain.
 import hashlib
 from enum import Enum
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO
+from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
 from messagechain.crypto.keys import KeyPair
 
 # Domain separation tags — ensure entity_id and private seed are
@@ -110,6 +110,7 @@ class Entity:
         iris_data: bytes,
         *,
         private_key: bytes,
+        tree_height: int | None = None,
     ) -> "Entity":
         """
         Create an entity from raw biometric data and a private key.
@@ -128,7 +129,7 @@ class Entity:
         fingerprint_hash = h(HASH_ALGO, fingerprint_data).digest()
         iris_hash = h(HASH_ALGO, iris_data).digest()
 
-        return cls.from_hashes(dna_hash, fingerprint_hash, iris_hash, private_key=private_key)
+        return cls.from_hashes(dna_hash, fingerprint_hash, iris_hash, private_key=private_key, tree_height=tree_height)
 
     @classmethod
     def from_hashes(
@@ -138,6 +139,7 @@ class Entity:
         iris_hash: bytes,
         *,
         private_key: bytes,
+        tree_height: int | None = None,
     ) -> "Entity":
         """
         Create an entity from pre-hashed biometric data and a private key.
@@ -148,13 +150,18 @@ class Entity:
         if not private_key:
             raise ValueError("Private key is required — both biometrics and a private key are needed to sign")
 
+        if tree_height is None:
+            # Import at call time so tests can patch config.MERKLE_TREE_HEIGHT
+            from messagechain.config import MERKLE_TREE_HEIGHT as _h
+            tree_height = _h
+
         entity_id = derive_entity_id(dna_hash, fingerprint_hash, iris_hash)
 
         # Signing seed requires BOTH biometrics and private key.
         # entity_id is public (on-chain), signing seed is secret (local only).
         # Stolen biometrics alone cannot produce a valid signing key.
         biometric_seed = _derive_signing_seed(dna_hash, fingerprint_hash, iris_hash, private_key)
-        keypair = KeyPair.generate(biometric_seed)
+        keypair = KeyPair.generate(biometric_seed, height=tree_height)
 
         return cls(
             entity_id=entity_id,

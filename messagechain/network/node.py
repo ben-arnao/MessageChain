@@ -575,10 +575,9 @@ class Node:
                 if self.consensus.validator_count > 0:
                     continue
 
-            # Create and broadcast block (with state_root commitment)
+            # Create and broadcast block (with correct post-state root)
             txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-            state_root = self.blockchain.compute_current_state_root()
-            block = self.consensus.create_block(self.entity, txs, latest, state_root=state_root)
+            block = self.blockchain.propose_block(self.consensus, self.entity, txs)
 
             success, reason = self.blockchain.add_block(block)
             if success:

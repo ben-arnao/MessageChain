@@ -20,7 +20,7 @@ ensuring permanent (diminishing) issuance to replace lost tokens.
 import math
 from messagechain.config import (
     GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE,
-    SLASH_FINDER_REWARD_PCT,
+    SLASH_FINDER_REWARD_PCT, UNBONDING_PERIOD, MIN_TOTAL_STAKE,
 )
 
 
@@ -33,6 +33,8 @@ class SupplyTracker:
         self.total_fees_collected: int = 0
         self.balances: dict[bytes, int] = {}
         self.staked: dict[bytes, int] = {}
+        # Pending unstakes: entity_id -> list of (amount, release_block)
+        self.pending_unstakes: dict[bytes, list[tuple[int, int]]] = {}
 
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
@@ -82,13 +84,60 @@ class SupplyTracker:
         self.staked[entity_id] = self.staked.get(entity_id, 0) + amount
         return True
 
-    def unstake(self, entity_id: bytes, amount: int) -> bool:
-        """Unlock staked tokens."""
+    def get_pending_unstake(self, entity_id: bytes) -> int:
+        """Total tokens pending release for this entity."""
+        return sum(amt for amt, _ in self.pending_unstakes.get(entity_id, []))
+
+    def unstake(
+        self,
+        entity_id: bytes,
+        amount: int,
+        current_block: int = 0,
+        total_staked_after_check: int | None = None,
+        min_total_stake: int = MIN_TOTAL_STAKE,
+        bootstrap_ended: bool = False,
+    ) -> bool:
+        """Queue staked tokens for unbonding.
+
+        Tokens are removed from stake immediately but held in a pending
+        state for UNBONDING_PERIOD blocks. During this time they can
+        still be slashed but cannot be spent or re-staked.
+
+        If bootstrap_ended is True, rejects unstakes that would drop
+        total network stake below MIN_TOTAL_STAKE.
+        """
         if self.get_staked(entity_id) < amount:
             return False
+
+        # Prevent total stake from dropping below safety floor
+        if bootstrap_ended and total_staked_after_check is not None:
+            if total_staked_after_check < min_total_stake:
+                return False
+
         self.staked[entity_id] -= amount
-        self.balances[entity_id] = self.balances.get(entity_id, 0) + amount
+        release_block = current_block + UNBONDING_PERIOD
+        if entity_id not in self.pending_unstakes:
+            self.pending_unstakes[entity_id] = []
+        self.pending_unstakes[entity_id].append((amount, release_block))
         return True
+
+    def process_pending_unstakes(self, current_block: int) -> int:
+        """Release matured unstakes. Returns total tokens released."""
+        total_released = 0
+        for entity_id in list(self.pending_unstakes.keys()):
+            pending = self.pending_unstakes[entity_id]
+            still_pending = []
+            for amount, release_block in pending:
+                if current_block >= release_block:
+                    self.balances[entity_id] = self.balances.get(entity_id, 0) + amount
+                    total_released += amount
+                else:
+                    still_pending.append((amount, release_block))
+            if still_pending:
+                self.pending_unstakes[entity_id] = still_pending
+            else:
+                del self.pending_unstakes[entity_id]
+        return total_released
 
     def transfer(self, from_id: bytes, to_id: bytes, amount: int) -> bool:
         """Transfer tokens between entities."""
@@ -100,19 +149,24 @@ class SupplyTracker:
 
     def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:
         """
-        Slash a validator: burn their entire stake, pay finder a reward.
+        Slash a validator: burn their entire stake + pending unstakes, pay finder a reward.
 
         Returns (total_slashed, finder_reward).
         """
-        slashed_amount = self.staked.get(offender_id, 0)
+        staked_amount = self.staked.get(offender_id, 0)
+        pending_amount = self.get_pending_unstake(offender_id)
+        slashed_amount = staked_amount + pending_amount
+
         if slashed_amount == 0:
             return 0, 0
 
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         burned = slashed_amount - finder_reward
 
-        # Remove all stake
+        # Remove all stake and pending unstakes
         self.staked[offender_id] = 0
+        if offender_id in self.pending_unstakes:
+            del self.pending_unstakes[offender_id]
 
         # Pay finder
         self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward

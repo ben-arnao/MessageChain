@@ -293,9 +293,10 @@ class TestAtomicStatePersistence(unittest.TestCase):
         # The balance from the failed persist should NOT be 9999
         # It should be whatever was committed before
         bal = db2.get_balance(entity.entity_id)
-        # The genesis init persists state once, so entity has 0 balance from genesis
-        self.assertEqual(bal, 0,
-                        "Failed persist must not leave partial state (balance should be 0 from genesis)")
+        # The genesis init persists state once, so entity has GENESIS_ALLOCATION from genesis
+        from messagechain.config import GENESIS_ALLOCATION
+        self.assertEqual(bal, GENESIS_ALLOCATION,
+                        "Failed persist must not leave partial state (balance should be genesis allocation)")
         db.close()
         db2.close()
 

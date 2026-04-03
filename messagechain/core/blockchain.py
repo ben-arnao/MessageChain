@@ -16,7 +16,7 @@ Now supports:
 
 import hashlib
 import logging
-from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE
+from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
@@ -164,6 +164,10 @@ class Blockchain:
         # Genesis block was signed — track the WOTS+ leaf consumed
         self.proposer_sig_counts[genesis_entity.entity_id] = 1
 
+        # Genesis allocation — bootstrap the economy so the genesis entity
+        # can stake, pay fees, and transfer tokens to new participants.
+        self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
+
         # Track as chain tip
         self.fork_choice.add_tip(genesis_block.block_hash, 0, 0)
 
@@ -175,18 +179,33 @@ class Blockchain:
 
         return genesis_block
 
-    def register_entity(self, entity_id: bytes, public_key: bytes) -> tuple[bool, str]:
+    def register_entity(
+        self,
+        entity_id: bytes,
+        public_key: bytes,
+        registration_proof: "Signature | None" = None,
+    ) -> tuple[bool, str]:
         """
         Register a new entity on the chain.
 
-        Accepts only the public entity_id and public_key — never private key
-        material. The server never needs to see biometric hashes or seeds.
+        Requires a registration_proof: a signature over
+        SHA3-256("register" || entity_id) using the keypair corresponding
+        to public_key. This proves the registrant controls the keypair
+        and prevents fabrication of arbitrary identities.
 
         ENFORCES: one entity per person. If the entity_id (derived from
         biometrics) already exists, registration is REJECTED.
         """
         if entity_id in self.public_keys:
             return False, "Entity already exists — duplicate biometrics rejected"
+
+        # Require proof of key ownership
+        if registration_proof is None:
+            return False, "Registration proof required — must sign entity_id with keypair"
+
+        proof_msg = _hash(b"register" + entity_id)
+        if not verify_signature(proof_msg, registration_proof, public_key):
+            return False, "Invalid registration proof — signature does not match public key"
 
         self.public_keys[entity_id] = public_key
         self.nonces[entity_id] = 0
@@ -583,6 +602,8 @@ class Blockchain:
             self.attestation_sig_counts[att.validator_id] = (
                 self.attestation_sig_counts.get(att.validator_id, 0) + 1
             )
+        # Release matured pending unstakes
+        self.supply.process_pending_unstakes(block.header.block_number)
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
@@ -619,8 +640,6 @@ class Blockchain:
 
     def _append_block(self, block: Block) -> tuple[bool, str]:
         """Append a validated block to the current best chain."""
-        proposer_id = block.header.proposer_id
-
         # Validate ALL slash transactions BEFORE applying any state changes.
         # This prevents state corruption if a slash tx fails validation
         # partway through (previously, regular tx state was already applied).
@@ -629,35 +648,12 @@ class Blockchain:
             if not valid:
                 return False, f"Invalid slash tx: {reason}"
 
-        # Apply state changes (all validation passed above)
-        for tx in block.transactions:
-            self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
-            self.nonces[tx.entity_id] = tx.nonce + 1
-            self.entity_message_count[tx.entity_id] = (
-                self.entity_message_count.get(tx.entity_id, 0) + 1
-            )
+        # Apply state changes (single code path for normal + reorg)
+        self._apply_block_state(block)
+        reward = self.supply.calculate_block_reward(block.header.block_number)
 
-        for stx in block.slash_transactions:
-            self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
-            self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
-            self.slashed_validators.add(stx.evidence.offender_id)
-            # Track slash submitter's signature (WOTS+ leaf consumed)
-            self.slash_sig_counts[stx.submitter_id] = (
-                self.slash_sig_counts.get(stx.submitter_id, 0) + 1
-            )
-
-        reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
-
-        # Track proposer's block signature count (WOTS+ leaf consumed)
-        self.proposer_sig_counts[proposer_id] = (
-            self.proposer_sig_counts.get(proposer_id, 0) + 1
-        )
-
-        # Track attestation signatures (each consumes a WOTS+ leaf from the validator)
-        for att in block.attestations:
-            self.attestation_sig_counts[att.validator_id] = (
-                self.attestation_sig_counts.get(att.validator_id, 0) + 1
-            )
+        # Process pending unstakes at this block height
+        self.supply.process_pending_unstakes(block.header.block_number)
 
         # Verify state_root commitment (mandatory for all post-genesis blocks).
         # Every block must commit to the post-application state. A zeroed

@@ -29,12 +29,22 @@ class ProofOfStake:
 
     def __init__(self):
         self.stakes: dict[bytes, int] = {}  # entity_id -> staked amount
+        self._bootstrap_ended: bool = False  # one-way flag
+
+    @property
+    def is_bootstrap_mode(self) -> bool:
+        """Bootstrap mode is active only before any validator has ever staked."""
+        if self._bootstrap_ended:
+            return False
+        return len(self.stakes) == 0
 
     def register_validator(self, entity_id: bytes, stake_amount: int) -> bool:
         """Register a validator with their stake."""
         if stake_amount < VALIDATOR_MIN_STAKE:
             return False
         self.stakes[entity_id] = self.stakes.get(entity_id, 0) + stake_amount
+        # Once any validator registers, bootstrap mode is permanently off
+        self._bootstrap_ended = True
         return True
 
     def remove_validator(self, entity_id: bytes):
@@ -93,8 +103,8 @@ class ProofOfStake:
 
         During bootstrap (no validators staked), this is permissive.
         """
-        if not self.stakes:
-            return True  # no validators = permissive (bootstrap phase)
+        if self.is_bootstrap_mode:
+            return True  # permissive only during initial bootstrap (one-way)
 
         # Attestations in a block vote for the parent
         attested_stake = 0
