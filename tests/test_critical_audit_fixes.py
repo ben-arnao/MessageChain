@@ -30,6 +30,7 @@ from messagechain.consensus.attestation import Attestation, create_attestation
 from messagechain.consensus.fork_choice import find_common_ancestor, MAX_REORG_DEPTH
 from messagechain.core.key_rotation import KeyRotationTransaction, create_key_rotation, derive_rotated_keypair
 from messagechain.crypto.keys import KeyPair, Signature
+from tests import register_entity_for_test
 
 
 def _make_entity(name: str) -> Entity:
@@ -235,7 +236,7 @@ class TestWotsLeafTracking(unittest.TestCase):
 
         chain = Blockchain()
         chain.initialize_genesis(proposer)
-        chain.register_entity(validator.entity_id, validator.public_key)
+        register_entity_for_test(chain, validator)
 
         # Give validator some balance and stake
         chain.supply.balances[validator.entity_id] = 10000

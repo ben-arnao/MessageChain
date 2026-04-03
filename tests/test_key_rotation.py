@@ -4,6 +4,7 @@ import unittest
 from messagechain.identity.biometrics import Entity, BiometricType
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
+from tests import register_entity_for_test
 from messagechain.core.key_rotation import (
     KeyRotationTransaction,
     create_key_rotation,
@@ -25,7 +26,7 @@ class TestKeyRotation(unittest.TestCase):
         self.bob.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.bob)
         # Fund test entities so they can pay fees
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000

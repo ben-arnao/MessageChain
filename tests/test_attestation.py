@@ -13,6 +13,7 @@ from messagechain.consensus.attestation import (
     create_attestation,
     verify_attestation,
 )
+from tests import register_entity_for_test
 from messagechain.consensus.slashing import (
     AttestationSlashingEvidence,
     SlashTransaction,
@@ -152,8 +153,8 @@ class TestAttestationsInBlocks(unittest.TestCase):
         self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
-        self.chain.register_entity(self.carol.entity_id, self.carol.public_key)
+        register_entity_for_test(self.chain, self.bob)
+        register_entity_for_test(self.chain, self.carol)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
         self.chain.supply.balances[self.carol.entity_id] = 10000
@@ -272,8 +273,8 @@ class TestFinality(unittest.TestCase):
         self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
-        self.chain.register_entity(self.carol.entity_id, self.carol.public_key)
+        register_entity_for_test(self.chain, self.bob)
+        register_entity_for_test(self.chain, self.carol)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
         self.chain.supply.balances[self.carol.entity_id] = 10000
@@ -333,8 +334,8 @@ class TestDoubleAttestationSlashing(unittest.TestCase):
         self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.carol)
-        self.chain.register_entity(self.alice.entity_id, self.alice.public_key)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.alice)
+        register_entity_for_test(self.chain, self.bob)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
         self.chain.supply.balances[self.carol.entity_id] = 10000

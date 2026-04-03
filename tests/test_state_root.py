@@ -6,6 +6,7 @@ from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import compute_state_root, BlockHeader, Block
 from messagechain.core.transaction import create_transaction
 from messagechain.consensus.pos import ProofOfStake
+from tests import register_entity_for_test
 
 
 class TestStateRoot(unittest.TestCase):
@@ -14,7 +15,7 @@ class TestStateRoot(unittest.TestCase):
         self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.bob)
         # Fund test entities so they can pay fees
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000

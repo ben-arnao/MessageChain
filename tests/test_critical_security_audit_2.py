@@ -23,6 +23,7 @@ from messagechain.consensus.pos import ProofOfStake
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.storage.chaindb import ChainDB
 from messagechain.crypto.keys import KeyPair
+from tests import register_entity_for_test
 
 
 def _make_entity(name: str) -> Entity:
@@ -70,7 +71,7 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         self.sender = _make_entity("sender")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.proposer)
-        self.chain.register_entity(self.sender.entity_id, self.sender.public_key)
+        register_entity_for_test(self.chain, self.sender)
         # Give sender some balance for fees
         self.chain.supply.balances[self.sender.entity_id] = 1000
 
@@ -308,7 +309,7 @@ class TestStateRootBypass(unittest.TestCase):
         self.sender = _make_entity("sender-sr")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.proposer)
-        self.chain.register_entity(self.sender.entity_id, self.sender.public_key)
+        register_entity_for_test(self.chain, self.sender)
         self.chain.supply.balances[self.sender.entity_id] = 1000
 
     def test_wrong_state_root_rejected(self):

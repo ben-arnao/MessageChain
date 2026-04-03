@@ -8,6 +8,7 @@ from messagechain.core.block import Block, BlockHeader, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.crypto.keys import Signature
+from tests import register_entity_for_test
 
 
 class TestHashVerificationOnDeserialize(unittest.TestCase):
@@ -76,7 +77,7 @@ class TestMandatoryProposerSignature(unittest.TestCase):
         self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.bob)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
 
@@ -127,8 +128,8 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
-        # Register using only public data — no Entity object needed
-        success, msg = chain.register_entity(bob.entity_id, bob.public_key)
+        # Register using only public data + registration proof
+        success, msg = register_entity_for_test(chain, bob)
         self.assertTrue(success)
         self.assertEqual(chain.public_keys[bob.entity_id], bob.public_key)
         self.assertEqual(chain.nonces[bob.entity_id], 0)
@@ -140,7 +141,7 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
         chain.initialize_genesis(alice)
 
         # Alice is already registered via initialize_genesis
-        success, msg = chain.register_entity(alice.entity_id, alice.public_key)
+        success, msg = register_entity_for_test(chain, alice)
         self.assertFalse(success)
         self.assertIn("duplicate", msg.lower())
 

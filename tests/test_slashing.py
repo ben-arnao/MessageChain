@@ -14,6 +14,7 @@ from messagechain.consensus.slashing import (
     verify_slashing_evidence,
 )
 from messagechain.config import SLASH_FINDER_REWARD_PCT
+from tests import register_entity_for_test
 
 
 def _make_conflicting_headers(proposer_entity, prev_block):
@@ -56,7 +57,7 @@ class TestSlashingEvidence(unittest.TestCase):
         self.bob.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.bob)
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000
 
@@ -202,8 +203,8 @@ class TestSlashTransaction(unittest.TestCase):
         self.carol.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.carol)
-        self.chain.register_entity(self.alice.entity_id, self.alice.public_key)
-        self.chain.register_entity(self.bob.entity_id, self.bob.public_key)
+        register_entity_for_test(self.chain, self.alice)
+        register_entity_for_test(self.chain, self.bob)
         # Fund entities
         self.chain.supply.balances[self.alice.entity_id] = 10000
         self.chain.supply.balances[self.bob.entity_id] = 10000

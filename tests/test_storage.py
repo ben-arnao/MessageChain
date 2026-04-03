@@ -18,6 +18,7 @@ from messagechain.consensus.fork_choice import (
 )
 from messagechain.storage.chaindb import ChainDB
 from messagechain.network.sync import ChainSyncer, SyncState
+from tests import register_entity_for_test
 
 import hashlib
 from messagechain.config import HASH_ALGO
@@ -44,7 +45,7 @@ def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity
     bob = make_entity("bob")
     chain = Blockchain(db=db)
     chain.initialize_genesis(alice)
-    chain.register_entity(bob.entity_id, bob.public_key)
+    register_entity_for_test(chain, bob)
     # Fund test entities so they can pay fees
     chain.supply.balances[alice.entity_id] = 10000
     chain.supply.balances[bob.entity_id] = 10000
@@ -209,7 +210,7 @@ class TestPersistentBlockchain(unittest.TestCase):
             chain.initialize_genesis(alice)
 
             bob = make_entity("bob")
-            success, _ = chain.register_entity(bob.entity_id, bob.public_key)
+            success, _ = register_entity_for_test(chain, bob)
             assert success
 
             # Reload
@@ -295,7 +296,7 @@ class TestForkCommonAncestor(unittest.TestCase):
         bob = make_entity("bob")
         chain = Blockchain()
         chain.initialize_genesis(alice)
-        chain.register_entity(bob.entity_id, bob.public_key)
+        register_entity_for_test(chain, bob)
         chain.supply.balances[alice.entity_id] = 10000
         chain.supply.balances[bob.entity_id] = 10000
 
@@ -347,7 +348,7 @@ class TestChainReorg(unittest.TestCase):
         fake_parent.block_hash = fake_parent._compute_hash()
 
         bob = make_entity("bob-orphan")
-        chain.register_entity(bob.entity_id, bob.public_key)
+        register_entity_for_test(chain, bob)
         chain.supply.balances[bob.entity_id] = 10000
         tx = create_transaction(bob, "orphan", BiometricType.DNA, fee=2, nonce=0)
         block = pos.create_block(alice, [tx], fake_parent)
@@ -362,7 +363,7 @@ class TestChainReorg(unittest.TestCase):
         bob = make_entity("bob")
         chain = Blockchain()
         chain.initialize_genesis(alice)
-        chain.register_entity(bob.entity_id, bob.public_key)
+        register_entity_for_test(chain, bob)
         chain.supply.balances[alice.entity_id] = 10000
         chain.supply.balances[bob.entity_id] = 10000
         # Give alice stake so main chain blocks have weight > 1,
@@ -506,7 +507,7 @@ class TestIntegration(unittest.TestCase):
             bob = make_entity("bob")
             chain = Blockchain(db=db)
             chain.initialize_genesis(alice)
-            chain.register_entity(bob.entity_id, bob.public_key)
+            register_entity_for_test(chain, bob)
             chain.supply.balances[alice.entity_id] = 10000
             chain.supply.balances[bob.entity_id] = 10000
 
