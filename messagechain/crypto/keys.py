@@ -50,7 +50,10 @@ class KeyPair:
     The root hash is the long-lived public key. Each leaf is a one-time WOTS+ key.
     """
 
-    def __init__(self, seed: bytes, height: int = MERKLE_TREE_HEIGHT, start_leaf: int = 0):
+    def __init__(self, seed: bytes, height: int | None = None, start_leaf: int = 0):
+        if height is None:
+            import messagechain.config
+            height = messagechain.config.MERKLE_TREE_HEIGHT
         self.height = height
         self.num_leaves = 2 ** height
         self._seed = seed
@@ -81,7 +84,7 @@ class KeyPair:
         self.public_key = self._tree[height][0]
 
     @classmethod
-    def generate(cls, seed: bytes, height: int = MERKLE_TREE_HEIGHT, start_leaf: int = 0) -> "KeyPair":
+    def generate(cls, seed: bytes, height: int | None = None, start_leaf: int = 0) -> "KeyPair":
         return cls(seed, height, start_leaf=start_leaf)
 
     def advance_to_leaf(self, leaf_index: int):

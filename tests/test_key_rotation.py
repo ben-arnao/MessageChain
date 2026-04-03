@@ -15,9 +15,14 @@ from messagechain.config import KEY_ROTATION_FEE
 
 
 class TestKeyRotation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.register_entity(self.bob.entity_id, self.bob.public_key)

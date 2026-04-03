@@ -389,6 +389,28 @@ class Blockchain:
 
         return compute_state_root(sim_balances, sim_nonces, sim_staked)
 
+    def propose_block(
+        self,
+        consensus: "ProofOfStake",
+        proposer_entity,
+        transactions: list[MessageTransaction],
+        attestations: list[Attestation] | None = None,
+    ) -> Block:
+        """Create a block with the correct post-state root.
+
+        Convenience method that computes the state root automatically,
+        ensuring every block commits to the correct post-application state.
+        """
+        prev = self.get_latest_block()
+        block_height = prev.header.block_number + 1
+        state_root = self.compute_post_state_root(
+            transactions, proposer_entity.entity_id, block_height
+        )
+        return consensus.create_block(
+            proposer_entity, transactions, prev,
+            state_root=state_root, attestations=attestations,
+        )
+
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
         """Validate all attestations included in a block.
 
@@ -637,14 +659,13 @@ class Blockchain:
                 self.attestation_sig_counts.get(att.validator_id, 0) + 1
             )
 
-        # Verify state_root commitment if the proposer committed to one.
-        # A zero state_root means "state uncommitted" — the proposer did not
-        # include a state commitment in this block. When a state_root IS present,
-        # it must match the post-application state (after fees, rewards, nonces).
-        if block.header.state_root != b"\x00" * 32:
-            expected_state_root = self.compute_current_state_root()
-            if block.header.state_root != expected_state_root:
-                return False, "Invalid state_root — state commitment mismatch"
+        # Verify state_root commitment (mandatory for all post-genesis blocks).
+        # Every block must commit to the post-application state. A zeroed
+        # state_root no longer bypasses validation — this prevents attackers
+        # from submitting blocks with fabricated state.
+        expected_state_root = self.compute_current_state_root()
+        if block.header.state_root != expected_state_root:
+            return False, "Invalid state_root — state commitment mismatch"
 
         self.chain.append(block)
         self._block_by_hash[block.block_hash] = block

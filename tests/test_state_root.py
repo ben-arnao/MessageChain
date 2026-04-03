@@ -117,16 +117,17 @@ class TestStateRoot(unittest.TestCase):
         success, reason = self.chain.add_block(block)
         self.assertTrue(success, reason)
 
-    def test_legacy_block_zero_state_root_accepted(self):
-        """Blocks with zero state_root (legacy) skip the state_root check."""
+    def test_zero_state_root_rejected(self):
+        """Blocks with zero state_root must be rejected — no bypass allowed."""
         tx = create_transaction(
             self.alice, "Legacy block", BiometricType.DNA, fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
-        # Default state_root is zero — should be accepted (legacy compat)
+        # Default state_root is zero — must be REJECTED (bypass removed)
         block = self.consensus.create_block(self.alice, [tx], prev)
         success, reason = self.chain.add_block(block)
-        self.assertTrue(success, reason)
+        self.assertFalse(success, "Zero state_root must not bypass validation")
+        self.assertIn("state_root", reason)
 
 
 if __name__ == "__main__":

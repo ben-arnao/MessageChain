@@ -27,8 +27,12 @@ from messagechain.core.block import _hash
 
 
 class TestProposalTransaction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.alice.keypair._next_leaf = 0
 
     def test_create_and_verify_proposal(self):
         """Signed proposal passes verification."""
@@ -79,8 +83,12 @@ class TestProposalTransaction(unittest.TestCase):
 
 
 class TestVoteTransaction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.alice.keypair._next_leaf = 0
         self.proposal_id = _hash(b"proposal-id")
 
     def test_create_and_verify_vote(self):
@@ -107,9 +115,14 @@ class TestVoteTransaction(unittest.TestCase):
 
 
 class TestDelegateTransaction(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
 
     def test_create_and_verify_delegation(self):
         """Signed delegation passes verification."""
@@ -137,11 +150,18 @@ class TestDelegateTransaction(unittest.TestCase):
 class TestGovernanceTracker(unittest.TestCase):
     """Tests for the governance state machine."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
-        self.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
+        self.dave.keypair._next_leaf = 0
 
         self.supply = SupplyTracker()
         self.supply.balances[self.alice.entity_id] = 1000
@@ -261,11 +281,18 @@ class TestGovernanceTracker(unittest.TestCase):
 class TestDelegation(unittest.TestCase):
     """Tests for vote delegation mechanics."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        self.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
-        self.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.carol.keypair._next_leaf = 0
+        self.dave.keypair._next_leaf = 0
 
         self.supply = SupplyTracker()
         self.supply.balances[self.alice.entity_id] = 1000
@@ -385,9 +412,14 @@ class TestDelegation(unittest.TestCase):
 class TestGovernanceInfo(unittest.TestCase):
     """Tests for proposal info/summary."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
 
         self.supply = SupplyTracker()
         self.supply.balances[self.alice.entity_id] = 1000
