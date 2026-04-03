@@ -1,7 +1,7 @@
 """Tests for key rotation — entities can rotate to fresh WOTS+ Merkle trees."""
 
 import unittest
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
 from tests import register_entity_for_test
@@ -18,8 +18,8 @@ from messagechain.config import KEY_ROTATION_FEE
 class TestKeyRotation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -32,7 +32,7 @@ class TestKeyRotation(unittest.TestCase):
         self.chain.supply.balances[self.bob.entity_id] = 10000
 
     def test_derive_rotated_keypair_deterministic(self):
-        """Same biometrics + same rotation number = same new keys."""
+        """Same private key + same rotation number = same new keys."""
         kp1 = derive_rotated_keypair(self.alice, rotation_number=0)
         kp2 = derive_rotated_keypair(self.alice, rotation_number=0)
         self.assertEqual(kp1.public_key, kp2.public_key)
@@ -118,7 +118,7 @@ class TestKeyRotation(unittest.TestCase):
 
         # Second rotation — need to use new keypair to sign
         # Simulate entity with new keypair
-        alice_rotated = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        alice_rotated = Entity.create(b"alice-private-key")
         alice_rotated.keypair = new_kp0  # swap in the rotated keypair
 
         new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)

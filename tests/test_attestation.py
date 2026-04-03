@@ -2,7 +2,7 @@
 
 import unittest
 import time
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, _hash
 from messagechain.core.transaction import create_transaction
@@ -28,8 +28,8 @@ class TestAttestation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -143,9 +143,9 @@ class TestAttestationsInBlocks(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -230,7 +230,7 @@ class TestAttestationsInBlocks(unittest.TestCase):
         block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
-        stranger = Entity.create(b"stranger-dna", b"stranger-finger", b"stranger-iris", private_key=b"stranger-private-key")
+        stranger = Entity.create(b"stranger-private-key")
         att = create_attestation(stranger, block1.block_hash, block1.header.block_number)
 
         block2 = self.chain.propose_block(
@@ -263,9 +263,9 @@ class TestFinality(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -324,9 +324,9 @@ class TestDoubleAttestationSlashing(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

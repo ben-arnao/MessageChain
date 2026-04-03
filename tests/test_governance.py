@@ -29,7 +29,7 @@ from messagechain.core.block import _hash
 class TestProposalTransaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -49,7 +49,7 @@ class TestProposalTransaction(unittest.TestCase):
 
     def test_wrong_key_fails_verification(self):
         """Proposal verified against wrong key is rejected."""
-        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        bob = Entity.create(b"bob-private-key")
         content_hash = _hash(b"diff")
         tx = create_proposal(self.alice, "https://example.com/pr/1", content_hash, "desc")
         self.assertFalse(verify_proposal(tx, bob.public_key))
@@ -85,7 +85,7 @@ class TestProposalTransaction(unittest.TestCase):
 class TestVoteTransaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -102,7 +102,7 @@ class TestVoteTransaction(unittest.TestCase):
         self.assertTrue(verify_vote(tx, self.alice.public_key))
 
     def test_wrong_key_fails(self):
-        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        bob = Entity.create(b"bob-private-key")
         tx = create_vote(self.alice, self.proposal_id, approve=True)
         self.assertFalse(verify_vote(tx, bob.public_key))
 
@@ -117,8 +117,8 @@ class TestVoteTransaction(unittest.TestCase):
 class TestDelegateTransaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -152,10 +152,10 @@ class TestGovernanceTracker(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
-        cls.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
+        cls.dave = Entity.create(b"dave-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -283,10 +283,10 @@ class TestDelegation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
-        cls.dave = Entity.create(b"dave-dna", b"dave-finger", b"dave-iris", private_key=b"dave-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
+        cls.dave = Entity.create(b"dave-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -414,8 +414,8 @@ class TestGovernanceInfo(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

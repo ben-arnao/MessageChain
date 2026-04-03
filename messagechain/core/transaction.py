@@ -4,7 +4,6 @@ MessageTransaction - the fundamental unit of data on MessageChain.
 Each transaction represents one message posted by one entity. It contains:
 - The message content (up to MAX_MESSAGE_CHARS characters)
 - The entity who posted it
-- Which biometric type was used to authenticate locally
 - A quantum-resistant signature
 - A user-set fee (BTC-style bidding: higher fee = higher block priority)
 - A timestamp
@@ -19,7 +18,7 @@ import struct
 import time
 from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
-from messagechain.identity.biometrics import BiometricType, Entity
+from messagechain.identity.biometrics import Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -27,7 +26,6 @@ from messagechain.crypto.keys import Signature, verify_signature
 class MessageTransaction:
     entity_id: bytes
     message: bytes
-    biometric_type: BiometricType
     timestamp: float
     nonce: int  # per-entity tx counter (replay protection)
     fee: int  # user-set fee (higher = more likely to be included in next block)
@@ -43,7 +41,6 @@ class MessageTransaction:
         return (
             self.entity_id
             + self.message
-            + self.biometric_type.value.encode()
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
@@ -62,7 +59,6 @@ class MessageTransaction:
         return {
             "entity_id": self.entity_id.hex(),
             "message": self.message.decode("utf-8", errors="replace"),
-            "biometric_type": self.biometric_type.value,
             "timestamp": self.timestamp,
             "nonce": self.nonce,
             "fee": self.fee,
@@ -76,7 +72,6 @@ class MessageTransaction:
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             message=data["message"].encode("utf-8"),
-            biometric_type=BiometricType(data["biometric_type"]),
             timestamp=data["timestamp"],
             nonce=data["nonce"],
             fee=data["fee"],
@@ -106,7 +101,6 @@ def _validate_message(message: str) -> tuple[bool, str]:
 def create_transaction(
     entity: Entity,
     message: str,
-    bio_type: BiometricType,
     fee: int,
     nonce: int,
 ) -> MessageTransaction:
@@ -128,7 +122,6 @@ def create_transaction(
     tx = MessageTransaction(
         entity_id=entity.entity_id,
         message=msg_bytes,
-        biometric_type=bio_type,
         timestamp=time.time(),
         nonce=nonce,
         fee=fee,

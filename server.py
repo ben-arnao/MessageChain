@@ -28,7 +28,7 @@ from messagechain.config import (
     DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE,
 )
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, compute_merkle_root, BlockHeader
 from messagechain.core.transaction import MessageTransaction, create_transaction, verify_transaction
@@ -140,17 +140,12 @@ class Server:
         """Start P2P server, RPC server, and block production."""
         # Initialize genesis if fresh chain
         if self.blockchain.height == 0:
-            # Create a bootstrap entity with random biometrics for the genesis block.
+            # Create a bootstrap entity with a random private key for the genesis block.
             # SECURITY: Using os.urandom ensures each network has a unique,
-            # unguessable genesis entity. Hardcoded biometric strings would allow
-            # anyone reading the source to derive the genesis keypair.
+            # unguessable genesis entity. Hardcoded keys would allow anyone
+            # reading the source to derive the genesis keypair.
             import os
-            bootstrap = Entity.create(
-                os.urandom(32),  # random DNA data
-                os.urandom(32),  # random fingerprint data
-                os.urandom(32),  # random iris data
-                private_key=os.urandom(32),  # random private key
-            )
+            bootstrap = Entity.create(os.urandom(32))
             self.blockchain.initialize_genesis(bootstrap)
             logger.info(f"Genesis block created")
         else:
@@ -275,9 +270,9 @@ class Server:
     def _rpc_register_entity(self, params: dict) -> dict:
         """Register a new entity from client-provided public identity.
 
-        The client derives entity_id and public_key locally from biometrics,
-        then sends ONLY the public values. The server never sees biometric
-        hashes or private key material.
+        The client derives entity_id and public_key locally from their
+        private key, then sends ONLY the public values. The server never
+        sees private key material.
         """
         try:
             entity_id = bytes.fromhex(params["entity_id"])
@@ -854,23 +849,19 @@ async def run(args):
         data_dir=args.data_dir,
     )
 
-    # Authenticate with biometrics to unlock block signing
+    # Authenticate with private key to unlock block signing
     if args.wallet:
-        # Wallet ID provided but we need biometrics to sign blocks
         print(f"Wallet ID: {args.wallet}")
-        print("Authenticate with your biometrics to enable block production.\n")
+        print("Authenticate with your private key to enable block production.\n")
     else:
-        print("To produce blocks and earn rewards, authenticate with your biometrics.")
+        print("To produce blocks and earn rewards, authenticate with your private key.")
         print("If you don't have an account yet, use: python client.py create-account")
         print("You can also press Enter to run as a relay-only node (no rewards).\n")
 
     import getpass
-    dna = getpass.getpass("DNA sample (hidden, or Enter to skip):        ").encode("utf-8")
-    if dna:
-        fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
-        iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
-        private_key_input = getpass.getpass("Private key (hidden):       ").encode("utf-8")
-        entity = Entity.create(dna, fingerprint, iris, private_key=private_key_input)
+    private_key_input = getpass.getpass("Private key (hidden, or Enter to skip): ").encode("utf-8")
+    if private_key_input:
+        entity = Entity.create(private_key_input)
 
         # Advance WOTS+ keypair past all previously-used one-time signing keys.
         # Without this, restarting the server would reuse WOTS+ leaves, which
@@ -884,7 +875,7 @@ async def run(args):
         print(f"Authenticated as: {entity.entity_id_hex[:16]}...")
     elif args.wallet:
         server.set_wallet(args.wallet)
-        print("Warning: wallet set but no biometrics — node cannot sign blocks.")
+        print("Warning: wallet set but no private key — node cannot sign blocks.")
 
     await server.start()
 

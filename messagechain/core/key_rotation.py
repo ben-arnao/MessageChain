@@ -151,12 +151,12 @@ def derive_rotated_keypair(entity: Entity, rotation_number: int) -> KeyPair:
     """
     Derive a new KeyPair for key rotation.
 
-    Uses the biometric seed + rotation number to deterministically generate
-    a fresh Merkle tree. Same biometrics + same rotation number = same new keys.
-    This means the entity can always re-derive their rotated keys from their body.
+    Uses the entity's seed + rotation number to deterministically generate
+    a fresh Merkle tree. Same private key + same rotation number = same new keys.
+    This means the entity can always re-derive their rotated keys from their key.
     """
     rotation_seed = hashlib.new(
         HASH_ALGO,
-        entity._biometric_seed + struct.pack(">Q", rotation_number),
+        entity._seed + struct.pack(">Q", rotation_number),
     ).digest()
     return KeyPair.generate(rotation_seed)

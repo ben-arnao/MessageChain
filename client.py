@@ -3,7 +3,7 @@
 MessageChain Client
 
 Two commands:
-    python client.py create-account    # Register with your biometrics
+    python client.py create-account    # Register with your private key
     python client.py send-message      # Post a message to the chain
 
 That's it.
@@ -16,7 +16,7 @@ import struct
 import sys
 import getpass
 
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.transaction import create_transaction
 
 
@@ -51,47 +51,40 @@ def _recv_exact(sock, n):
     return buf
 
 
-def collect_credentials() -> tuple[bytes, bytes, bytes, bytes]:
+def collect_private_key() -> bytes:
     """
-    Collect biometric data and private key from the user.
+    Collect private key from the user.
 
-    Two-factor authentication:
-    1. Biometrics (something you are) — determines your wallet address
-    2. Private key (something you know) — combined with biometrics for signing
+    The private key is the sole credential:
+    - It deterministically derives the signing keypair
+    - The entity ID (wallet address) is derived from the public key
 
-    In production, biometrics come from hardware scanners. The private key is
-    a secret passphrase chosen by the user. Both are required to sign transactions.
+    In production, the private key never leaves the local device.
     """
-    print("Provide your biometric data and private key.")
-    print("In production, biometrics come from hardware scanners.\n")
+    print("Enter your private key.")
+    print("Your private key is your identity — guard it carefully.\n")
 
-    dna = getpass.getpass("DNA sample (hidden):        ").encode("utf-8")
-    fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
-    iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
-    private_key = getpass.getpass("Private key (hidden):       ").encode("utf-8")
+    private_key = getpass.getpass("Private key (hidden): ").encode("utf-8")
 
-    if not dna or not fingerprint or not iris:
-        print("Error: All three biometric inputs are required.")
-        sys.exit(1)
     if not private_key:
         print("Error: Private key is required.")
         sys.exit(1)
 
-    return dna, fingerprint, iris, private_key
+    return private_key
 
 
 def cmd_create_account(args):
-    """Create a new account on the chain using biometrics."""
+    """Create a new account on the chain."""
     print("=== Create Account ===\n")
 
-    dna, fingerprint, iris, private_key = collect_credentials()
+    private_key = collect_private_key()
 
-    # Derive entity locally — all private key material stays on this device.
-    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    # Derive entity locally — private key material stays on this device.
+    entity = Entity.create(private_key)
     print(f"\nYour entity ID: {entity.entity_id_hex}")
 
     # Send ONLY the public entity_id and public_key to the server.
-    # Biometric hashes and private key never leave the client.
+    # Private key never leaves the client.
     print(f"Registering with server at {args.host}:{args.rpc_port}...")
     response = rpc_call(args.host, args.rpc_port, "register_entity", {
         "entity_id": entity.entity_id_hex,
@@ -105,7 +98,7 @@ def cmd_create_account(args):
         print(f"  Public key:      {result['public_key'][:32]}...")
         print(f"  Initial balance: {result['initial_balance']} tokens")
         print(f"\nSave your entity ID — this is your wallet address.")
-        print("Your biometrics + private key are your credentials. Never share them.")
+        print("Your private key is your sole credential. Never share it.")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -129,18 +122,13 @@ def cmd_send_message(args):
         print(f"Error: Message is {char_count} characters (max 280).")
         sys.exit(1)
 
-    # Collect credentials to sign (biometrics + private key)
-    print("\nAuthenticate with your biometrics and private key to sign this message.")
-    dna, fingerprint, iris, private_key = collect_credentials()
+    # Collect private key to sign
+    print("\nAuthenticate with your private key to sign this message.")
+    private_key = collect_private_key()
 
-    # Reconstruct entity from biometrics + private key (2FA)
-    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    # Reconstruct entity from private key
+    entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
-
-    # Pick which biometric type to record on-chain
-    bio_type = BiometricType.FINGERPRINT  # default
-    if args.bio_type:
-        bio_type = BiometricType(args.bio_type)
 
     # Get current nonce from server (also used to advance WOTS+ leaf index)
     nonce_resp = rpc_call(args.host, args.rpc_port, "get_nonce", {
@@ -166,7 +154,7 @@ def cmd_send_message(args):
         fee = int(fee_input) if fee_input else suggested
 
     # Create and sign transaction locally
-    tx = create_transaction(entity, message, bio_type, fee=fee, nonce=nonce)
+    tx = create_transaction(entity, message, fee=fee, nonce=nonce)
 
     # Submit to server
     print(f"Submitting transaction...")
@@ -197,16 +185,12 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # create-account
-    subparsers.add_parser("create-account", help="Register a new account with biometrics")
+    subparsers.add_parser("create-account", help="Register a new account")
 
     # send-message
     send_parser = subparsers.add_parser("send-message", help="Send a message to the chain")
     send_parser.add_argument("-m", "--message", type=str, help="Message text (or enter interactively)")
     send_parser.add_argument("-f", "--fee", type=int, help="Transaction fee (or enter interactively)")
-    send_parser.add_argument(
-        "-b", "--bio-type", choices=["dna", "fingerprint", "iris"],
-        help="Biometric type to record (default: fingerprint)"
-    )
 
     args = parser.parse_args()
 

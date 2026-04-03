@@ -1,6 +1,6 @@
 # MessageChain
 
-A message-based blockchain where your biometrics are your private key.
+A message-based blockchain with quantum-resistant signatures.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ python -m messagechain send "Hello, MessageChain!"
 ### Start a node
 
 ```bash
-# Relay-only (no biometrics needed)
+# Relay-only
 python -m messagechain start
 
 # Mine blocks and earn rewards
@@ -43,7 +43,7 @@ python -m messagechain start --port 9333 --rpc-port 9334 --seed 192.168.1.10:933
 python -m messagechain account
 ```
 
-Prompts for your biometrics (DNA, fingerprint, iris) and a private key. Returns your entity ID — that's your wallet address. Done.
+Prompts for your private key. Returns your entity ID — that's your wallet address. Done.
 
 ### Send a message
 
@@ -51,7 +51,7 @@ Prompts for your biometrics (DNA, fingerprint, iris) and a private key. Returns 
 python -m messagechain send "Your message here"
 ```
 
-Prompts for biometric auth, auto-detects the optimal fee, signs, and submits. One command.
+Prompts for your private key, auto-detects the optimal fee, signs, and submits. One command.
 
 **For power users:**
 
@@ -70,28 +70,28 @@ python -m messagechain info     # Show chain info from a running node
 
 | Principle | How |
 |---|---|
-| **Your body is your key** | Biometrics (DNA + fingerprint + iris) ARE the private key. No passwords, no seed phrases. |
-| **One person, one wallet** | Same biometrics = same entity ID. Duplicate registrations are rejected. |
+| **Private key = identity** | Your private key deterministically derives your keypair and wallet address. |
 | **Quantum resistant** | WOTS+ hash-based signatures over SHA3-256. Immune to quantum attacks. |
 | **Inflationary supply** | Block rewards with halving schedule. Offsets tokens lost to death/abandonment. |
 | **Fee bidding** | You set your fee. Higher fee = faster block inclusion. Like Bitcoin. |
 | **280 characters per message** | Base layer limit. L2 protocols split long content across multiple transactions. |
 | **Timestamped** | Every transaction is timestamped. |
+| **Anti-bot via fees** | Economic cost per message disincentivizes spam and bot abuse. L2 can add identity/reputation. |
 
 ## Architecture
 
 ```
 Base Layer (this protocol)
-├── Biometric identity
+├── Private key identity
 ├── Quantum-resistant signatures
 ├── Inflationary token economics
 ├── Fee-based transaction priority
 ├── Timestamped messages (280 characters)
-└── One entity = one wallet
+└── Anti-bot incentives via fee economics
 
 L2 / Third-Party (built on top)
-├── Link entity IDs to real people
-├── Trust scores / reputation
+├── Identity verification / reputation
+├── Trust scores
 ├── Message schemas and structure
 ├── Threading / chaining messages
 ├── Long message splitting

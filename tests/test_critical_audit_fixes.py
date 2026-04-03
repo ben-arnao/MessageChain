@@ -7,7 +7,7 @@ Covers:
 3. Hash verification on deserialize for SlashTx, Evidence, KeyRotation
 4. Stake/unstake must go through on-chain transactions
 5. Stake/unstake signature replay protection (nonce)
-6. Genesis entity must not use hardcoded biometrics
+6. Genesis entity must not use hardcoded keys
 7. Attestation and slash gossip handlers exist
 """
 
@@ -17,7 +17,7 @@ import time
 import unittest
 
 from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT, SLASH_FINDER_REWARD_PCT
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, create_genesis_block, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction
@@ -34,12 +34,7 @@ from tests import register_entity_for_test
 
 
 def _make_entity(name: str) -> Entity:
-    return Entity.create(
-        f"{name}-dna".encode(),
-        f"{name}-finger".encode(),
-        f"{name}-iris".encode(),
-        private_key=f"{name}-privkey".encode(),
-    )
+    return Entity.create(f"{name}-privkey".encode())
 
 
 class TestForkChoiceInfiniteLoop(unittest.TestCase):
@@ -348,25 +343,24 @@ class TestStakeUnstakeOnChain(unittest.TestCase):
 
 
 class TestGenesisNotHardcoded(unittest.TestCase):
-    """Fix #6: Genesis entity must not use publicly-known hardcoded biometrics."""
+    """Fix #6: Genesis entity must not use publicly-known hardcoded keys."""
 
-    def test_genesis_uses_random_biometrics(self):
+    def test_genesis_uses_random_key(self):
         """Two server instances must produce different genesis entities."""
-        # The old code used Entity.create(b"genesis-dna", ...) which is deterministic
-        # and public. The fix should use os.urandom.
+        # The old code used hardcoded deterministic keys which are public.
+        # The fix should use os.urandom.
         # We verify by checking the code doesn't pass hardcoded byte literals to Entity.create
         import inspect
         import server as server_module
         source = inspect.getsource(server_module.Server.start)
         # Check that the actual Entity.create call doesn't use hardcoded strings
-        # (comments mentioning the old pattern are fine)
         self.assertNotIn('b"genesis-dna"', source,
-            "Server must not use hardcoded genesis biometrics")
+            "Server must not use hardcoded genesis keys")
         self.assertNotIn("b'genesis-dna'", source,
-            "Server must not use hardcoded genesis biometrics")
+            "Server must not use hardcoded genesis keys")
         # Verify os.urandom is used instead
         self.assertIn("os.urandom", source,
-            "Server must use os.urandom for genesis biometrics")
+            "Server must use os.urandom for genesis key")
 
 
 class TestAttestationSlashGossip(unittest.TestCase):

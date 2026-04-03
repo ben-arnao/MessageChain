@@ -35,7 +35,7 @@ PROTOCOL_VERSIONS: list[ProtocolVersion] = [
         activation_height=0,
         features=[
             "base_protocol",
-            "biometric_identity",
+            "private_key_identity",
             "wots_signatures",
             "pos_consensus",
             "fee_market",

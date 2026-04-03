@@ -5,7 +5,7 @@ they become spendable, and that pending unstakes can still be slashed.
 """
 
 import unittest
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
 from messagechain.consensus.pos import ProofOfStake
@@ -16,8 +16,8 @@ from tests import register_entity_for_test
 
 class TestUnbondingPeriod(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -87,8 +87,8 @@ class TestUnbondingInBlockchain(unittest.TestCase):
     """Test that unbonding integrates correctly with block processing."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)

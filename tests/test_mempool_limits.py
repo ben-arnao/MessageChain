@@ -3,18 +3,18 @@
 import time
 import unittest
 from unittest.mock import patch
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.mempool import Mempool
 from messagechain.core.transaction import create_transaction
 
 
 class TestMempoolLimits(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.alice = Entity.create(b"alice-private-key")
 
     def _make_tx(self, fee: int, nonce: int, ts: float | None = None):
         tx = create_transaction(
-            self.alice, f"msg {nonce}", BiometricType.DNA, fee=fee, nonce=nonce
+            self.alice, f"msg {nonce}", fee=fee, nonce=nonce
         )
         if ts is not None:
             tx.timestamp = ts

@@ -1,7 +1,7 @@
 """Tests for state commitment (state_root) in block headers."""
 
 import unittest
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import compute_state_root, BlockHeader, Block
 from messagechain.core.transaction import create_transaction
@@ -11,8 +11,8 @@ from tests import register_entity_for_test
 
 class TestStateRoot(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -32,7 +32,7 @@ class TestStateRoot(unittest.TestCase):
         root_before = self.chain.compute_current_state_root()
 
         tx = create_transaction(
-            self.alice, "Hello", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Hello", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -46,7 +46,7 @@ class TestStateRoot(unittest.TestCase):
     def test_state_root_in_header(self):
         """Block header includes state_root field."""
         tx = create_transaction(
-            self.alice, "Test", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Test", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -74,7 +74,7 @@ class TestStateRoot(unittest.TestCase):
     def test_state_root_serialization_roundtrip(self):
         """state_root survives block header serialization."""
         tx = create_transaction(
-            self.alice, "Roundtrip", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Roundtrip", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -109,7 +109,7 @@ class TestStateRoot(unittest.TestCase):
     def test_block_with_valid_state_root_accepted(self):
         """Block with correct post-state state_root is accepted."""
         tx = create_transaction(
-            self.alice, "Valid state", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Valid state", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -121,7 +121,7 @@ class TestStateRoot(unittest.TestCase):
     def test_zero_state_root_rejected(self):
         """Blocks with zero state_root must be rejected — no bypass allowed."""
         tx = create_transaction(
-            self.alice, "Legacy block", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Legacy block", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         # Default state_root is zero — must be REJECTED (bypass removed)

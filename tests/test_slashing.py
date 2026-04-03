@@ -2,7 +2,7 @@
 
 import unittest
 import time
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, _hash, compute_merkle_root, compute_state_root
 from messagechain.core.transaction import create_transaction
@@ -49,8 +49,8 @@ def _make_conflicting_headers(proposer_entity, prev_block):
 class TestSlashingEvidence(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -193,9 +193,9 @@ class TestSlashingEvidence(unittest.TestCase):
 class TestSlashTransaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        cls.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
-        cls.carol = Entity.create(b"carol-dna", b"carol-finger", b"carol-iris", private_key=b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+        cls.carol = Entity.create(b"carol-private-key")
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

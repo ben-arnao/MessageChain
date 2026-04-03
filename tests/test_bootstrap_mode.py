@@ -14,8 +14,8 @@ from tests import register_entity_for_test
 
 class TestBootstrapMode(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)

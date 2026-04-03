@@ -2,7 +2,7 @@
 
 import unittest
 import time
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction
@@ -15,7 +15,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     """Fix #2: Reject deserialized objects with spoofed hashes."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        self.alice = Entity.create(b"alice-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.supply.balances[self.alice.entity_id] = 10000
@@ -23,7 +23,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     def test_tx_with_spoofed_hash_rejected(self):
         """A transaction with a tampered tx_hash must be rejected on deserialize."""
         tx = create_transaction(
-            self.alice, "Legit message", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Legit message", fee=5, nonce=0
         )
         data = tx.serialize()
         # Tamper with the hash
@@ -35,7 +35,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     def test_tx_with_correct_hash_accepted(self):
         """A transaction with a correct hash deserializes without error."""
         tx = create_transaction(
-            self.alice, "Legit message", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Legit message", fee=5, nonce=0
         )
         data = tx.serialize()
         restored = MessageTransaction.deserialize(data)
@@ -45,7 +45,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
         """A block with a tampered block_hash must be rejected on deserialize."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.alice, "Block test", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Block test", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)
@@ -60,7 +60,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
         """A block with a correct hash deserializes without error."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.alice, "Block test", BiometricType.DNA, fee=5, nonce=0
+            self.alice, "Block test", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)
@@ -73,8 +73,8 @@ class TestMandatoryProposerSignature(unittest.TestCase):
     """Fix #5: Unsigned blocks must be rejected."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -84,7 +84,7 @@ class TestMandatoryProposerSignature(unittest.TestCase):
     def test_unsigned_block_rejected(self):
         """A block with no proposer signature must be rejected."""
         tx = create_transaction(
-            self.bob, "Unsigned block test", BiometricType.DNA, fee=5, nonce=0
+            self.bob, "Unsigned block test", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         from messagechain.core.block import compute_merkle_root
@@ -110,7 +110,7 @@ class TestMandatoryProposerSignature(unittest.TestCase):
         """A properly signed block is accepted."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.bob, "Signed block test", BiometricType.DNA, fee=5, nonce=0
+            self.bob, "Signed block test", fee=5, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)
@@ -123,8 +123,8 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_register_with_public_data_only(self):
         """register_entity accepts entity_id and public_key, not Entity objects."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        alice = Entity.create(b"alice-private-key")
+        bob = Entity.create(b"bob-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
@@ -136,7 +136,7 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_duplicate_public_data_rejected(self):
         """Duplicate entity_id is still rejected."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        alice = Entity.create(b"alice-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 

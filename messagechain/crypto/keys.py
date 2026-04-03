@@ -90,7 +90,7 @@ class KeyPair:
     def advance_to_leaf(self, leaf_index: int):
         """Advance the next-leaf pointer to skip already-used leaves.
 
-        Used when reconstructing a keypair (e.g., from biometrics) to avoid
+        Used when reconstructing a keypair (e.g., from private key) to avoid
         reusing one-time WOTS+ keys. The caller should set this based on
         the on-chain nonce or signature count.
         """

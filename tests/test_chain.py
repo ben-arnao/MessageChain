@@ -1,7 +1,7 @@
 """Integration tests for the full MessageChain."""
 
 import unittest
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from tests import register_entity_for_test
 from messagechain.core.transaction import create_transaction, verify_transaction
@@ -11,8 +11,8 @@ from messagechain.consensus.pos import ProofOfStake
 
 class TestBlockchain(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key")
+        self.bob = Entity.create(b"bob-private-key")
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -35,15 +35,15 @@ class TestBlockchain(unittest.TestCase):
         self.assertIsNotNone(genesis)
 
     def test_duplicate_entity_rejected(self):
-        """Same biometrics cannot register twice — one person one wallet."""
-        alice_dup = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        """Same private key cannot register twice."""
+        alice_dup = Entity.create(b"alice-private-key")
         success, msg = register_entity_for_test(self.chain, alice_dup)
         self.assertFalse(success)
         self.assertIn("duplicate", msg.lower())
 
     def test_post_message(self):
         tx = create_transaction(
-            self.alice, "Hello world!", BiometricType.FINGERPRINT,
+            self.alice, "Hello world!",
             fee=10, nonce=0
         )
         valid, reason = self.chain.validate_transaction(tx)
@@ -51,7 +51,7 @@ class TestBlockchain(unittest.TestCase):
 
     def test_create_and_add_block(self):
         tx = create_transaction(
-            self.alice, "Test message", BiometricType.DNA,
+            self.alice, "Test message",
             fee=5, nonce=0
         )
         block = self._make_block(self.alice, [tx])
@@ -63,7 +63,7 @@ class TestBlockchain(unittest.TestCase):
         """Block proposer collects fees from transactions."""
         alice_balance_before = self.chain.supply.get_balance(self.alice.entity_id)
         tx = create_transaction(
-            self.bob, "Bob pays fee", BiometricType.IRIS,
+            self.bob, "Bob pays fee",
             fee=20, nonce=0
         )
         # Alice proposes the block, collects Bob's fee + block reward
@@ -81,7 +81,7 @@ class TestBlockchain(unittest.TestCase):
             entity = self.alice if i % 2 == 0 else self.bob
             nonce = self.chain.nonces.get(entity.entity_id, 0)
             tx = create_transaction(
-                entity, f"Message {i}", BiometricType.DNA,
+                entity, f"Message {i}",
                 fee=5, nonce=nonce
             )
             block = self._make_block(entity, [tx])
@@ -95,9 +95,9 @@ class TestBlockchain(unittest.TestCase):
         mempool = Mempool()
         nonce = self.chain.nonces.get(self.alice.entity_id, 0)
 
-        low = create_transaction(self.alice, "low fee", BiometricType.DNA, fee=1, nonce=nonce)
-        high = create_transaction(self.alice, "high fee", BiometricType.DNA, fee=100, nonce=nonce + 1)
-        mid = create_transaction(self.alice, "mid fee", BiometricType.DNA, fee=10, nonce=nonce + 2)
+        low = create_transaction(self.alice, "low fee", fee=1, nonce=nonce)
+        high = create_transaction(self.alice, "high fee", fee=100, nonce=nonce + 1)
+        mid = create_transaction(self.alice, "mid fee", fee=10, nonce=nonce + 2)
 
         mempool.add_transaction(low)
         mempool.add_transaction(high)
@@ -108,30 +108,17 @@ class TestBlockchain(unittest.TestCase):
         self.assertEqual(ordered[1].fee, 10)
         self.assertEqual(ordered[2].fee, 1)
 
-    def test_biometric_type_recorded(self):
-        for bio_type in BiometricType:
-            nonce = self.chain.nonces.get(self.alice.entity_id, 0)
-            tx = create_transaction(
-                self.alice, f"Signed with {bio_type.value}",
-                bio_type, fee=5, nonce=nonce
-            )
-            block = self._make_block(self.alice, [tx])
-            success, reason = self.chain.add_block(block)
-            self.assertTrue(success, reason)
-            stored_tx = self.chain.chain[-1].transactions[0]
-            self.assertEqual(stored_tx.biometric_type, bio_type)
-
     def test_timestamp_present(self):
         """Every transaction must be timestamped."""
         tx = create_transaction(
-            self.alice, "Timestamped message", BiometricType.FINGERPRINT,
+            self.alice, "Timestamped message",
             fee=5, nonce=0
         )
         self.assertGreater(tx.timestamp, 0)
 
     def test_invalid_nonce_rejected(self):
         tx = create_transaction(
-            self.alice, "Test", BiometricType.DNA,
+            self.alice, "Test",
             fee=5, nonce=99  # wrong nonce
         )
         valid, reason = self.chain.validate_transaction(tx)
@@ -142,14 +129,14 @@ class TestBlockchain(unittest.TestCase):
         long_msg = "a" * 281  # 281 characters
         with self.assertRaises(ValueError):
             create_transaction(
-                self.alice, long_msg, BiometricType.DNA,
+                self.alice, long_msg,
                 fee=5, nonce=0
             )
 
     def test_280_chars_accepted(self):
         msg = "a" * 280  # exactly 280 characters
         tx = create_transaction(
-            self.alice, msg, BiometricType.DNA,
+            self.alice, msg,
             fee=5, nonce=0
         )
         self.assertIsNotNone(tx)
@@ -163,7 +150,7 @@ class TestBlockchain(unittest.TestCase):
 
     def test_block_serialization_roundtrip(self):
         tx = create_transaction(
-            self.alice, "Serialize me", BiometricType.FINGERPRINT,
+            self.alice, "Serialize me",
             fee=15, nonce=0
         )
         prev = self.chain.get_latest_block()

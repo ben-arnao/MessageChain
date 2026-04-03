@@ -8,7 +8,7 @@ import time
 
 import unittest
 
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root
 from messagechain.core.transaction import create_transaction
@@ -31,12 +31,7 @@ def _hash(data: bytes) -> bytes:
 # ── Helpers ──────────────────────────────────────────────────────
 
 def make_entity(name: str) -> Entity:
-    return Entity.create(
-        f"{name}-dna".encode(),
-        f"{name}-finger".encode(),
-        f"{name}-iris".encode(),
-        private_key=f"{name}-privkey".encode(),
-    )
+    return Entity.create(f"{name}-privkey".encode())
 
 
 def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity]:
@@ -53,7 +48,7 @@ def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity
     pos = ProofOfStake()
 
     for i in range(num_blocks):
-        tx = create_transaction(bob, f"Message {i}", BiometricType.DNA, fee=2, nonce=i)
+        tx = create_transaction(bob, f"Message {i}", fee=2, nonce=i)
         block = chain.propose_block(pos, alice, [tx])
         success, reason = chain.add_block(block)
         assert success, f"Failed to add block {i}: {reason}"
@@ -304,12 +299,12 @@ class TestForkCommonAncestor(unittest.TestCase):
         parent = chain.get_latest_block()
 
         # Create block A (on main chain)
-        tx_a = create_transaction(bob, "fork A", BiometricType.DNA, fee=2, nonce=0)
+        tx_a = create_transaction(bob, "fork A", fee=2, nonce=0)
         block_a = chain.propose_block(pos, alice, [tx_a])
         chain.add_block(block_a)
 
         # Create block B (competing fork, same parent)
-        tx_b = create_transaction(bob, "fork B", BiometricType.DNA, fee=3, nonce=0)
+        tx_b = create_transaction(bob, "fork B", fee=3, nonce=0)
         block_b = pos.create_block(alice, [tx_b], parent)
 
         # Store block_b in the hash index
@@ -350,7 +345,7 @@ class TestChainReorg(unittest.TestCase):
         bob = make_entity("bob-orphan")
         register_entity_for_test(chain, bob)
         chain.supply.balances[bob.entity_id] = 10000
-        tx = create_transaction(bob, "orphan", BiometricType.DNA, fee=2, nonce=0)
+        tx = create_transaction(bob, "orphan", fee=2, nonce=0)
         block = pos.create_block(alice, [tx], fake_parent)
 
         success, reason = chain.add_block(block)
@@ -374,16 +369,16 @@ class TestChainReorg(unittest.TestCase):
         genesis = chain.get_latest_block()
 
         # Build main chain 2 blocks deep so it's strictly better than a 1-block fork
-        tx1 = create_transaction(bob, "main chain 1", BiometricType.DNA, fee=2, nonce=0)
+        tx1 = create_transaction(bob, "main chain 1", fee=2, nonce=0)
         block1 = chain.propose_block(pos, alice, [tx1])
         chain.add_block(block1)
 
-        tx2 = create_transaction(bob, "main chain 2", BiometricType.DNA, fee=2, nonce=1)
+        tx2 = create_transaction(bob, "main chain 2", fee=2, nonce=1)
         block2 = chain.propose_block(pos, alice, [tx2])
         chain.add_block(block2)
 
         # Create competing fork block from genesis (shorter fork, won't trigger reorg)
-        tx_fork = create_transaction(bob, "fork chain", BiometricType.DNA, fee=2, nonce=0)
+        tx_fork = create_transaction(bob, "fork chain", fee=2, nonce=0)
         block_fork = pos.create_block(alice, [tx_fork], genesis)
 
         success, reason = chain.add_block(block_fork)
@@ -513,7 +508,7 @@ class TestIntegration(unittest.TestCase):
 
             pos = ProofOfStake()
             for i in range(5):
-                tx = create_transaction(bob, f"Msg {i}", BiometricType.DNA, fee=2, nonce=i)
+                tx = create_transaction(bob, f"Msg {i}", fee=2, nonce=i)
                 block = chain.propose_block(pos, alice, [tx])
                 success, _ = chain.add_block(block)
                 assert success

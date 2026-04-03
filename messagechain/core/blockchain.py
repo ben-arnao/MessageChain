@@ -2,7 +2,7 @@
 Blockchain state machine for MessageChain.
 
 Core invariants:
-- One entity per person (duplicate biometrics rejected)
+- One entity per private key (duplicate entity IDs rejected)
 - Every transaction is timestamped
 - Fees follow BTC-style bidding (set by user, collected by proposer)
 - Supply inflates via block rewards to offset natural loss
@@ -193,11 +193,11 @@ class Blockchain:
         to public_key. This proves the registrant controls the keypair
         and prevents fabrication of arbitrary identities.
 
-        ENFORCES: one entity per person. If the entity_id (derived from
-        biometrics) already exists, registration is REJECTED.
+        ENFORCES: one entity per key. If the entity_id already exists,
+        registration is REJECTED.
         """
         if entity_id in self.public_keys:
-            return False, "Entity already exists — duplicate biometrics rejected"
+            return False, "Entity already exists — duplicate entity rejected"
 
         # Require proof of key ownership
         if registration_proof is None:
@@ -896,7 +896,7 @@ class Blockchain:
         - Key rotation signatures (rotation_count tracks these)
 
         Used to safely advance a keypair past already-used one-time keys
-        when reconstructing from biometrics (e.g., on server restart).
+        when reconstructing from a private key (e.g., on server restart).
         """
         return (
             self.nonces.get(entity_id, 0)

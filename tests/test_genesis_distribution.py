@@ -14,7 +14,7 @@ from messagechain.config import GENESIS_ALLOCATION
 class TestGenesisDistribution(unittest.TestCase):
     def test_genesis_entity_receives_allocation(self):
         """The genesis entity receives GENESIS_ALLOCATION tokens."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        alice = Entity.create(b"alice-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
@@ -28,7 +28,7 @@ class TestGenesisDistribution(unittest.TestCase):
 
     def test_total_supply_accounts_for_allocation(self):
         """Total supply includes the genesis allocation."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
+        alice = Entity.create(b"alice-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
@@ -38,8 +38,8 @@ class TestGenesisDistribution(unittest.TestCase):
 
     def test_non_genesis_entities_start_with_zero(self):
         """Entities registered after genesis start with zero balance."""
-        alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris", private_key=b"alice-private-key")
-        bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris", private_key=b"bob-private-key")
+        alice = Entity.create(b"alice-private-key")
+        bob = Entity.create(b"bob-private-key")
         chain = Blockchain()
         chain.initialize_genesis(alice)
 

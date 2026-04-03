@@ -15,7 +15,7 @@ import time
 import unittest
 
 from messagechain.config import HASH_ALGO, MIN_FEE, VALIDATOR_MIN_STAKE
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction
@@ -27,12 +27,7 @@ from tests import register_entity_for_test
 
 
 def _make_entity(name: str) -> Entity:
-    return Entity.create(
-        f"{name}-dna".encode(),
-        f"{name}-finger".encode(),
-        f"{name}-iris".encode(),
-        private_key=f"{name}-privkey".encode(),
-    )
+    return Entity.create(f"{name}-privkey".encode())
 
 
 def _make_signed_block(proposer, prev_block, transactions, blockchain):
@@ -80,10 +75,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         must be rejected."""
         # Create two transactions with nonce=0 from the same sender
         tx1 = create_transaction(
-            self.sender, "First message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=MIN_FEE, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Second message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "Second message", fee=MIN_FEE, nonce=0
         )
 
         # Build a block containing both
@@ -99,10 +94,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         """A block with properly sequential nonces (0, 1) from the same entity
         should be accepted."""
         tx1 = create_transaction(
-            self.sender, "First message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=MIN_FEE, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Second message", BiometricType.DNA, fee=MIN_FEE, nonce=1
+            self.sender, "Second message", fee=MIN_FEE, nonce=1
         )
 
         block = _make_signed_block(
@@ -115,10 +110,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
     def test_block_with_gap_nonce_rejected(self):
         """A block where nonces skip (0, 2) must be rejected."""
         tx1 = create_transaction(
-            self.sender, "First message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=MIN_FEE, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Third message", BiometricType.DNA, fee=MIN_FEE, nonce=2
+            self.sender, "Third message", fee=MIN_FEE, nonce=2
         )
 
         block = _make_signed_block(
@@ -135,10 +130,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         self.chain.supply.balances[self.sender.entity_id] = MIN_FEE
 
         tx1 = create_transaction(
-            self.sender, "Spend all", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "Spend all", fee=MIN_FEE, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Spend again", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "Spend again", fee=MIN_FEE, nonce=0
         )
 
         block = _make_signed_block(
@@ -316,7 +311,7 @@ class TestStateRootBypass(unittest.TestCase):
     def test_wrong_state_root_rejected(self):
         """A block with an incorrect non-zero state_root must be rejected."""
         tx = create_transaction(
-            self.sender, "Test message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "Test message", fee=MIN_FEE, nonce=0
         )
 
         prev = self.chain.get_latest_block()
@@ -346,7 +341,7 @@ class TestStateRootBypass(unittest.TestCase):
     def test_correct_state_root_accepted(self):
         """A block with the correct state root must be accepted."""
         tx = create_transaction(
-            self.sender, "Test message", BiometricType.DNA, fee=MIN_FEE, nonce=0
+            self.sender, "Test message", fee=MIN_FEE, nonce=0
         )
 
         prev = self.chain.get_latest_block()

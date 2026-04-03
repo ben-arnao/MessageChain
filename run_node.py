@@ -14,7 +14,7 @@ import asyncio
 import logging
 import sys
 
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.biometrics import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
 from messagechain.consensus.pos import ProofOfStake
@@ -23,13 +23,8 @@ from messagechain.network.node import Node
 
 
 def create_demo_entity(name: str = "demo") -> Entity:
-    """Create an entity with simulated biometric data."""
-    return Entity.create(
-        dna_data=f"{name}-dna-sample".encode(),
-        fingerprint_data=f"{name}-fingerprint-scan".encode(),
-        iris_data=f"{name}-iris-scan".encode(),
-        private_key=f"{name}-private-key".encode(),
-    )
+    """Create an entity with a deterministic private key for demos."""
+    return Entity.create(f"{name}-private-key".encode())
 
 
 def run_demo():
@@ -38,8 +33,8 @@ def run_demo():
     print("  MessageChain Protocol Demo")
     print("=" * 60)
 
-    # Create entities (simulating biometric enrollment)
-    print("\n--- Entity Registration (biometric = private key) ---")
+    # Create entities
+    print("\n--- Entity Registration (private key = identity) ---")
     alice = create_demo_entity("alice")
     bob = create_demo_entity("bob")
     print(f"Alice: {alice.entity_id_hex[:32]}...")
@@ -59,9 +54,9 @@ def run_demo():
     print(f"Genesis block: {genesis.block_hash.hex()[:32]}...")
     print(f"Total supply: {info['total_supply']:,}")
 
-    # Demonstrate duplicate biometric rejection
-    print("\n--- One Entity Per Person (duplicate rejection) ---")
-    alice_duplicate = create_demo_entity("alice")  # same biometrics!
+    # Demonstrate duplicate rejection
+    print("\n--- Duplicate Entity Rejection ---")
+    alice_duplicate = create_demo_entity("alice")  # same private key!
     success, msg = chain.register_entity(alice_duplicate.entity_id, alice_duplicate.public_key)
     print(f"Alice duplicate registration: {msg}")
     print(f"  (entity_id matches: {alice_duplicate.entity_id == alice.entity_id})")
@@ -69,26 +64,25 @@ def run_demo():
     # Post messages with fee bidding
     print("\n--- Posting Messages (BTC-style fee bidding) ---")
     messages = [
-        (alice, "Hello this is the first message on MessageChain!", BiometricType.FINGERPRINT, 10),
-        (bob, "Bob here verified via iris scan", BiometricType.IRIS, 5),
-        (alice, "Higher fee means my message gets priority in the next block", BiometricType.DNA, 25),
-        (bob, "Decentralized messaging with built in economics", BiometricType.FINGERPRINT, 3),
-        (alice, "Each message is quantum resistant and timestamped", BiometricType.IRIS, 15),
+        (alice, "Hello this is the first message on MessageChain!", 10),
+        (bob, "Bob here posting a message", 5),
+        (alice, "Higher fee means my message gets priority in the next block", 25),
+        (bob, "Decentralized messaging with built in economics", 3),
+        (alice, "Each message is quantum resistant and timestamped", 15),
     ]
 
     consensus = ProofOfStake()
-    for entity, msg_text, bio_type, fee in messages:
+    for entity, msg_text, fee in messages:
         nonce = chain.nonces.get(entity.entity_id, 0)
-        tx = create_transaction(entity, msg_text, bio_type, fee=fee, nonce=nonce)
+        tx = create_transaction(entity, msg_text, fee=fee, nonce=nonce)
 
         # Each message in its own block for demo clarity
         prev = chain.get_latest_block()
         block = consensus.create_block(entity, [tx], prev)
         success, reason = chain.add_block(block)
 
-        bio_label = bio_type.value.upper()
         ts = f"{tx.timestamp:.0f}"
-        print(f"  [{bio_label}] fee={fee:>3} | {entity.entity_id_hex[:8]}...: \"{msg_text}\"")
+        print(f"  fee={fee:>3} | {entity.entity_id_hex[:8]}...: \"{msg_text}\"")
         print(f"    Block #{block.header.block_number} | Timestamp: {ts} | {reason}")
 
     # Show fee bidding behavior
@@ -97,9 +91,9 @@ def run_demo():
     nonce_a = chain.nonces.get(alice.entity_id, 0)
     nonce_b = chain.nonces.get(bob.entity_id, 0)
 
-    low_fee_tx = create_transaction(alice, "Low fee message", BiometricType.DNA, fee=2, nonce=nonce_a)
-    high_fee_tx = create_transaction(bob, "High fee message", BiometricType.FINGERPRINT, fee=50, nonce=nonce_b)
-    mid_fee_tx = create_transaction(alice, "Mid fee message", BiometricType.IRIS, fee=10, nonce=nonce_a + 1)
+    low_fee_tx = create_transaction(alice, "Low fee message", fee=2, nonce=nonce_a)
+    high_fee_tx = create_transaction(bob, "High fee message", fee=50, nonce=nonce_b)
+    mid_fee_tx = create_transaction(alice, "Mid fee message", fee=10, nonce=nonce_a + 1)
 
     mempool.add_transaction(low_fee_tx)
     mempool.add_transaction(high_fee_tx)
@@ -140,16 +134,16 @@ def run_demo():
     # Architecture info
     print("\n--- Protocol Architecture ---")
     print("BASE LAYER (this protocol):")
-    print("  - Biometric identity (your body = your private key)")
+    print("  - Private key identity (your key = your identity)")
     print("  - Quantum-resistant signatures (WOTS+ / SHA3-256)")
     print("  - Inflationary supply (block rewards, halving schedule)")
     print("  - Fee bidding (BTC-style priority)")
     print("  - Timestamped messages (280 char max)")
-    print("  - One entity = one wallet (enforced by biometrics)")
+    print("  - Anti-bot incentives via fee economics")
     print()
     print("L2 / THIRD-PARTY PROTOCOLS (built on top):")
-    print("  - Link entity IDs to real people (verification messages)")
-    print("  - Trust scores / reputation (like credit scores)")
+    print("  - Identity verification / reputation systems")
+    print("  - Trust scores (like credit scores)")
     print("  - Message content structure and schemas")
     print("  - Threading / chaining messages together")
     print("  - Splitting long messages across multiple txs")
@@ -181,7 +175,7 @@ async def run_node(args):
     if args.post:
         nonce = node.blockchain.nonces.get(entity.entity_id, 0)
         tx = create_transaction(
-            entity, args.post, BiometricType.FINGERPRINT,
+            entity, args.post,
             fee=args.fee or 10, nonce=nonce
         )
         success, reason = node.submit_transaction(tx)

@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     start.add_argument(
         "--mine", action="store_true",
-        help="Produce blocks and earn rewards (requires biometric auth)",
+        help="Produce blocks and earn rewards (requires private key)",
     )
     start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     account = sub.add_parser(
         "account",
         help="Create an account",
-        description="Create a new account using your biometrics.",
+        description="Create a new account using your private key.",
     )
     account.add_argument(
         "--server", type=str, default=None,
@@ -118,21 +118,18 @@ def _parse_server(server_str: str) -> tuple[str, int]:
     return server_str, 9334
 
 
-def _collect_credentials():
-    """Collect biometric data and private key from the user."""
-    print("Authenticate with your biometrics and private key.")
-    print("(In production, biometrics come from hardware scanners.)\n")
+def _collect_private_key():
+    """Collect private key from the user."""
+    print("Authenticate with your private key.")
+    print("Your private key is your identity — guard it carefully.\n")
 
-    dna = getpass.getpass("DNA sample (hidden):        ").encode("utf-8")
-    fingerprint = getpass.getpass("Fingerprint scan (hidden):  ").encode("utf-8")
-    iris = getpass.getpass("Iris scan (hidden):         ").encode("utf-8")
-    private_key = getpass.getpass("Private key (hidden):       ").encode("utf-8")
+    private_key = getpass.getpass("Private key (hidden): ").encode("utf-8")
 
-    if not all([dna, fingerprint, iris, private_key]):
-        print("Error: All biometric inputs and private key are required.")
+    if not private_key:
+        print("Error: Private key is required.")
         sys.exit(1)
 
-    return dna, fingerprint, iris, private_key
+    return private_key
 
 
 def cmd_start(args):
@@ -161,9 +158,9 @@ def cmd_start(args):
     entity = None
     if args.mine:
         print("=== Start Mining Node ===\n")
-        print("To produce blocks and earn rewards, authenticate with your biometrics.\n")
-        dna, fingerprint, iris, private_key = _collect_credentials()
-        entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+        print("To produce blocks and earn rewards, authenticate with your private key.\n")
+        private_key = _collect_private_key()
+        entity = Entity.create(private_key)
 
         # Advance keypair past used leaves
         leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
@@ -198,9 +195,9 @@ def cmd_account(args):
     from messagechain.identity.biometrics import Entity
 
     print("=== Create Account ===\n")
-    dna, fingerprint, iris, private_key = _collect_credentials()
+    private_key = _collect_private_key()
 
-    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    entity = Entity.create(private_key)
     print(f"\nYour entity ID: {entity.entity_id_hex}")
 
     host, port = _parse_server(args.server)
@@ -218,7 +215,7 @@ def cmd_account(args):
         print(f"  Entity ID: {result['entity_id']}")
         print(f"  Balance:   {result['initial_balance']} tokens")
         print(f"\nSave your entity ID — this is your wallet address.")
-        print("Your biometrics + private key are your credentials. Never share them.")
+        print("Your private key is your sole credential. Never share it.")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -226,7 +223,7 @@ def cmd_account(args):
 
 def cmd_send(args):
     """Send a message to the chain."""
-    from messagechain.identity.biometrics import Entity, BiometricType
+    from messagechain.identity.biometrics import Entity
 
     message = args.message
     char_count = len(message)
@@ -240,8 +237,8 @@ def cmd_send(args):
     print(f"=== Send Message ({char_count} chars) ===\n")
 
     # Authenticate
-    dna, fingerprint, iris, private_key = _collect_credentials()
-    entity = Entity.create(dna, fingerprint, iris, private_key=private_key)
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -270,11 +267,8 @@ def cmd_send(args):
     else:
         print(f"Fee: {fee} tokens")
 
-    # Default biometric type — no need to ask the user
-    bio_type = BiometricType.FINGERPRINT
-
     # Create, sign, submit
-    tx = create_transaction(entity, message, bio_type, fee=fee, nonce=nonce)
+    tx = create_transaction(entity, message, fee=fee, nonce=nonce)
     print("Submitting...")
 
     response = rpc_call(host, port, "submit_transaction", {
