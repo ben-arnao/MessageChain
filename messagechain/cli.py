@@ -372,7 +372,11 @@ def cmd_transfer(args):
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
         fee = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 1
 
-    recipient_id = bytes.fromhex(args.to)
+    from messagechain.validation import parse_hex
+    recipient_id = parse_hex(args.to)
+    if recipient_id is None:
+        print(f"Error: Invalid recipient ID (not valid hex): {args.to}")
+        sys.exit(1)
     tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
 
     print(f"Transferring {args.amount} tokens to {args.to[:16]}... (fee: {fee})")

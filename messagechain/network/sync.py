@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
+from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
 from messagechain.core.block import Block, BlockHeader
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, write_message,
@@ -92,6 +93,15 @@ class ChainSyncer:
         self._sync_target_height = 0
         self._current_sync_peer: str = ""
 
+    def _parse_block_hashes(self, headers: list[dict]) -> list[bytes]:
+        """Safely parse block hashes from header dicts, skipping invalid ones."""
+        result = []
+        for h in headers:
+            bh = parse_hex(h.get("block_hash", ""))
+            if bh is not None:
+                result.append(bh)
+        return result
+
     @property
     def is_syncing(self) -> bool:
         return self.state in (SyncState.SYNCING_HEADERS, SyncState.SYNCING_BLOCKS)
@@ -107,7 +117,18 @@ class ChainSyncer:
 
     def update_peer_height(self, peer_address: str, height: int, best_hash: str = "",
                            cumulative_weight: int = 0):
-        """Update our knowledge of a peer's chain height and weight."""
+        """Update our knowledge of a peer's chain height and weight.
+
+        Rejects negative or absurdly high block heights to prevent
+        peers from manipulating sync decisions.
+        """
+        # Clamp to valid range
+        if height < 0:
+            height = 0
+        if height > MAX_SANE_BLOCK_HEIGHT:
+            logger.warning(f"Peer {peer_address} reported absurd height {height}, clamping")
+            height = MAX_SANE_BLOCK_HEIGHT
+
         self.peer_heights[peer_address] = PeerSyncInfo(
             peer_address=peer_address,
             chain_height=height,
@@ -210,9 +231,7 @@ class ChainSyncer:
             logger.info(f"Headers sync complete. {len(self.pending_headers)} headers to fetch blocks for.")
             if self.pending_headers:
                 self.state = SyncState.SYNCING_BLOCKS
-                self.blocks_needed = [
-                    bytes.fromhex(h["block_hash"]) for h in self.pending_headers
-                ]
+                self.blocks_needed = self._parse_block_hashes(self.pending_headers)
                 await self._request_next_blocks(peer_addr)
             else:
                 self.state = SyncState.COMPLETE
@@ -231,10 +250,19 @@ class ChainSyncer:
             if hdr["prev_hash"] != expected_prev:
                 logger.warning(f"Header chain broken at block #{hdr['block_number']}")
                 break
-            if self.blockchain.has_block(bytes.fromhex(hdr["block_hash"])):
+            bh = parse_hex(hdr.get("block_hash", ""))
+            if bh is None:
+                logger.warning("Invalid block_hash hex in header from peer")
+                break
+            if self.blockchain.has_block(bh):
                 # Already have this block, skip
                 expected_prev = hdr["block_hash"]
                 continue
+            # Validate block_number is sane
+            bn = hdr.get("block_number", 0)
+            if not isinstance(bn, int) or bn < 0 or bn > MAX_SANE_BLOCK_HEIGHT:
+                logger.warning(f"Invalid block_number {bn} in header from peer")
+                break
             valid_headers.append(hdr)
             expected_prev = hdr["block_hash"]
 
@@ -243,15 +271,16 @@ class ChainSyncer:
         # Request more headers if we got a full batch
         if len(headers_data) >= HEADERS_BATCH_SIZE:
             next_start = headers_data[-1]["block_number"] + 1
+            if next_start > MAX_SANE_BLOCK_HEIGHT:
+                self.state = SyncState.COMPLETE
+                return
             await self._request_headers(peer_addr, next_start)
         else:
             # Got partial batch — all headers received
             if self.pending_headers:
                 logger.info(f"All headers received ({len(self.pending_headers)} new). Downloading blocks...")
                 self.state = SyncState.SYNCING_BLOCKS
-                self.blocks_needed = [
-                    bytes.fromhex(h["block_hash"]) for h in self.pending_headers
-                ]
+                self.blocks_needed = self._parse_block_hashes(self.pending_headers)
                 await self._request_next_blocks(peer_addr)
             else:
                 self.state = SyncState.COMPLETE

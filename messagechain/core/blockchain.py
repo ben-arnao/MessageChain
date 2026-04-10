@@ -38,6 +38,7 @@ from messagechain.consensus.attestation import (
 )
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
+from messagechain.crypto.sig_cache import get_global_cache
 from messagechain.consensus.fork_choice import (
     ForkChoice, compute_block_stake_weight, find_fork_point, MAX_REORG_DEPTH,
 )
@@ -76,6 +77,8 @@ class Blockchain:
         self._immature_rewards: list[tuple[int, bytes, int]] = []
         # Orphan block pool: blocks whose parent is not yet known (bounded)
         self.orphan_pool: dict[bytes, Block] = {}  # block_hash -> Block
+        # Signature verification cache (invalidated on reorg)
+        self.sig_cache = get_global_cache()
         # AssumeValid: skip signature verification for blocks at or below this hash
         self.assume_valid_hash: bytes | None = ASSUME_VALID_BLOCK_HASH
         self._assume_valid_height: int | None = None
@@ -936,6 +939,10 @@ class Blockchain:
         5. If anything fails, restore snapshot
         """
         logger.info(f"REORG: {old_tip_hash.hex()[:16]} -> {new_tip_hash.hex()[:16]}")
+
+        # Invalidate signature cache — cached results from the old fork may
+        # not be valid on the new fork (e.g., different nonce expectations).
+        self.sig_cache.invalidate()
 
         # Find fork point
         ancestor_hash, rollback_blocks, apply_blocks = find_fork_point(

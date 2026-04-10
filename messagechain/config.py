@@ -16,7 +16,7 @@ HALVING_INTERVAL = 12_614_400  # blocks between reward halvings (~4 years at 10s
 MIN_FEE = 1  # minimum transaction fee
 
 # Timestamp tolerance
-MAX_TIMESTAMP_DRIFT = 300  # max seconds a tx timestamp can be ahead of current time
+MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
 
 # Block parameters
 BLOCK_TIME_TARGET = 10  # seconds between blocks

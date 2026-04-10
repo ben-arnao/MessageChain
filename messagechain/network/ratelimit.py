@@ -97,3 +97,43 @@ class PeerRateLimiter:
                 to_remove.append(ip)
         for ip in to_remove:
             del self._buckets[ip]
+
+
+class RPCRateLimiter:
+    """Simple sliding-window rate limiter for RPC connections.
+
+    Tracks request timestamps per IP and rejects requests that exceed
+    the configured rate within the window.
+    """
+
+    def __init__(self, max_requests: int = 60, window_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._requests: dict[str, list[float]] = {}
+
+    def check(self, ip: str) -> bool:
+        """Check if a request from this IP is allowed. Returns True if allowed."""
+        now = time.time()
+        cutoff = now - self.window_seconds
+
+        if ip not in self._requests:
+            self._requests[ip] = []
+
+        # Prune expired entries
+        self._requests[ip] = [t for t in self._requests[ip] if t > cutoff]
+
+        if len(self._requests[ip]) >= self.max_requests:
+            return False
+
+        self._requests[ip].append(now)
+        return True
+
+    def cleanup_stale(self, max_age: float = 600):
+        """Remove tracking for IPs that haven't made requests recently."""
+        now = time.time()
+        to_remove = [
+            ip for ip, times in self._requests.items()
+            if not times or (now - times[-1]) > max_age
+        ]
+        for ip in to_remove:
+            del self._requests[ip]

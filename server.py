@@ -62,6 +62,8 @@ from messagechain.network.ratelimit import PeerRateLimiter
 
 import hashlib
 from messagechain.config import HASH_ALGO
+from messagechain.validation import parse_hex, sanitize_error, safe_json_loads
+from messagechain.network.ratelimit import RPCRateLimiter
 
 logger = logging.getLogger("messagechain.server")
 
@@ -104,6 +106,9 @@ class Server:
         # Network protection
         self.ban_manager = PeerBanManager()
         self.rate_limiter = PeerRateLimiter()
+
+        # RPC rate limiting
+        self.rpc_rate_limiter = RPCRateLimiter(max_requests=60, window_seconds=60.0)
 
         # inv/getdata: track recently seen tx hashes
         self._seen_txs: OrderedDict = OrderedDict()
@@ -199,13 +204,23 @@ class Server:
     async def _handle_rpc_connection(self, reader, writer):
         """Handle a client RPC request."""
         try:
+            # Rate limit by client IP
+            addr = writer.get_extra_info("peername")
+            client_ip = addr[0] if addr else "unknown"
+            if not self.rpc_rate_limiter.check(client_ip):
+                resp = json.dumps({"ok": False, "error": "Rate limited"}).encode("utf-8")
+                writer.write(struct.pack(">I", len(resp)))
+                writer.write(resp)
+                await writer.drain()
+                return
+
             length_bytes = await reader.readexactly(4)
             length = struct.unpack(">I", length_bytes)[0]
-            if length > 10_000_000:
+            if length > 1_000_000:  # 1MB limit (reduced from 10MB)
                 writer.close()
                 return
             data = await reader.readexactly(length)
-            request = json.loads(data.decode("utf-8"))
+            request = safe_json_loads(data.decode("utf-8"), max_depth=16)
 
             response = await self._process_rpc(request)
 
@@ -240,7 +255,9 @@ class Server:
             return {"ok": True, "result": {"fee_estimate": self.mempool.get_fee_estimate()}}
 
         elif method == "get_nonce":
-            entity_id = bytes.fromhex(request["params"]["entity_id"])
+            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            if entity_id is None:
+                return {"ok": False, "error": "Invalid entity_id hex"}
             nonce = self.blockchain.nonces.get(entity_id, 0)
             return {"ok": True, "result": {"nonce": nonce}}
 
@@ -287,8 +304,10 @@ class Server:
         sees private key material.
         """
         try:
-            entity_id = bytes.fromhex(params["entity_id"])
-            public_key = bytes.fromhex(params["public_key"])
+            entity_id = parse_hex(params.get("entity_id", ""))
+            public_key = parse_hex(params.get("public_key", ""))
+            if entity_id is None or public_key is None:
+                return {"ok": False, "error": "Invalid hex in entity_id or public_key"}
             success, msg = self.blockchain.register_entity(entity_id, public_key)
             if success:
                 return {
@@ -303,7 +322,7 @@ class Server:
             else:
                 return {"ok": False, "error": msg}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_transaction(self, params: dict) -> dict:
         """Accept a signed transaction from a client."""
@@ -328,7 +347,7 @@ class Server:
                 },
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_stake(self, params: dict) -> dict:
         """Accept a signed stake transaction from a client.
@@ -373,7 +392,7 @@ class Server:
                 "balance": self.blockchain.supply.get_balance(entity_id),
             }}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_unstake(self, params: dict) -> dict:
         """Accept a signed unstake transaction from a client.
@@ -424,7 +443,7 @@ class Server:
                 "balance": self.blockchain.supply.get_balance(entity_id),
             }}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_transfer(self, params: dict) -> dict:
         """Accept a signed transfer transaction from a client."""
@@ -449,10 +468,12 @@ class Server:
                 },
             }
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_get_entity(self, params: dict) -> dict:
-        entity_id = bytes.fromhex(params["entity_id"])
+        entity_id = parse_hex(params.get("entity_id", ""))
+        if entity_id is None:
+            return {"ok": False, "error": "Invalid entity_id hex"}
         if entity_id not in self.blockchain.public_keys:
             return {"ok": False, "error": "Entity not found"}
         return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}

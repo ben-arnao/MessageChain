@@ -11,6 +11,7 @@ import json
 import struct
 from enum import Enum
 from dataclasses import dataclass
+from messagechain.validation import safe_json_loads
 
 
 class MessageType(Enum):
@@ -71,7 +72,7 @@ def encode_message(msg: NetworkMessage) -> bytes:
 
 def decode_message(data: bytes) -> NetworkMessage:
     """Decode a length-prefixed network message."""
-    parsed = json.loads(data.decode("utf-8"))
+    parsed = safe_json_loads(data.decode("utf-8"), max_depth=32)
     return NetworkMessage.deserialize(parsed)
 
 
@@ -80,7 +81,7 @@ async def read_message(reader) -> NetworkMessage | None:
     try:
         length_bytes = await reader.readexactly(4)
         length = struct.unpack(">I", length_bytes)[0]
-        if length > 10_000_000:  # 10MB sanity limit
+        if length > 1_000_000:  # 1MB sanity limit (reduced from 10MB)
             return None
         data = await reader.readexactly(length)
         return decode_message(data)

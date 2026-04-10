@@ -44,6 +44,7 @@ from messagechain.network.ban import (
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
 )
 from messagechain.network.ratelimit import PeerRateLimiter
+from messagechain.validation import parse_hex
 
 logger = logging.getLogger(__name__)
 
@@ -347,8 +348,13 @@ class Node:
         # Request any tx hashes we haven't seen
         needed = []
         for h in tx_hashes:
+            tx_hash_bytes = parse_hex(h)
+            if tx_hash_bytes is None:
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_hex_in_inv"
+                )
+                return
             if h not in self._seen_txs:
-                tx_hash_bytes = bytes.fromhex(h)
                 if tx_hash_bytes not in self.mempool.pending:
                     needed.append(h)
             # Mark that this peer knows about this tx
@@ -373,7 +379,12 @@ class Node:
             return
 
         for h in tx_hashes:
-            tx_hash_bytes = bytes.fromhex(h)
+            tx_hash_bytes = parse_hex(h)
+            if tx_hash_bytes is None:
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_hex_in_getdata"
+                )
+                return
             tx = self.mempool.pending.get(tx_hash_bytes)
             if tx:
                 msg = NetworkMessage(
@@ -508,7 +519,10 @@ class Node:
         block_hashes = payload.get("block_hashes", [])
         blocks = []
         for hash_hex in block_hashes[:50]:  # cap at 50 blocks per batch
-            block = self.blockchain.get_block_by_hash(bytes.fromhex(hash_hex))
+            bh = parse_hex(hash_hex)
+            if bh is None:
+                continue
+            block = self.blockchain.get_block_by_hash(bh)
             if block:
                 blocks.append(block.serialize())
 
@@ -524,7 +538,9 @@ class Node:
         """Serve a single block by hash or number."""
         block = None
         if "block_hash" in payload:
-            block = self.blockchain.get_block_by_hash(bytes.fromhex(payload["block_hash"]))
+            bh = parse_hex(payload["block_hash"])
+            if bh is not None:
+                block = self.blockchain.get_block_by_hash(bh)
         elif "block_number" in payload:
             block = self.blockchain.get_block(payload["block_number"])
 
