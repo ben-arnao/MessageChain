@@ -11,7 +11,6 @@ blocks can never be reverted.
 """
 
 import hashlib
-import math
 import struct
 import time
 from messagechain.config import (
@@ -73,11 +72,6 @@ class ProofOfStake:
         return sum(self.stakes.values())
 
     @property
-    def total_effective_stake(self) -> int:
-        """Sum of sqrt(stake) for all validators (integer floor)."""
-        return sum(int(math.isqrt(s)) for s in self.stakes.values())
-
-    @property
     def validator_count(self) -> int:
         return len(self.stakes)
 
@@ -86,9 +80,8 @@ class ProofOfStake:
         Deterministically select the next block proposer.
 
         Uses the previous block hash (and optional RANDAO mix) as a seed,
-        weighted by sqrt(stake). Sqrt weighting gives diminishing returns
-        to large stakers, preventing plutocratic concentration of block
-        production while still rewarding higher commitment.
+        weighted by stake. Every node computes the same result for the same
+        chain state.
 
         When randao_mix is provided, it is mixed into the seed to prevent
         proposer grinding attacks (where a proposer manipulates block contents
@@ -99,7 +92,7 @@ class ProofOfStake:
 
         # Sort validators for deterministic ordering
         validators = sorted(self.stakes.items(), key=lambda x: x[0])
-        total = self.total_effective_stake
+        total = self.total_stake
         if total == 0:
             return None  # all stakes are zero — no valid proposer
 
@@ -110,10 +103,10 @@ class ProofOfStake:
         seed = _hash(seed_input + b"proposer_selection")
         rand_value = int.from_bytes(seed, "big") % total
 
-        # Sqrt-weighted selection
+        # Stake-weighted selection
         cumulative = 0
         for entity_id, stake in validators:
-            cumulative += int(math.isqrt(stake))
+            cumulative += stake
             if rand_value < cumulative:
                 return entity_id
 
