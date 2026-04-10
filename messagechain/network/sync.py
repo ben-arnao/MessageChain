@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+import messagechain.config
 from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
 from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
 from messagechain.core.block import Block, BlockHeader
@@ -101,6 +102,14 @@ class ChainSyncer:
             if bh is not None:
                 result.append(bh)
         return result
+
+    def _check_headers_limit(self) -> bool:
+        """Check if pending headers have reached the limit.
+
+        Returns True if at or above the limit (no more should be stored).
+        Prevents OOM from header spam attacks during IBD.
+        """
+        return len(self.pending_headers) >= messagechain.config.MAX_PENDING_HEADERS
 
     @property
     def is_syncing(self) -> bool:
@@ -265,6 +274,22 @@ class ChainSyncer:
                 break
             valid_headers.append(hdr)
             expected_prev = hdr["block_hash"]
+
+        # Enforce header spam limit before extending
+        max_pending = messagechain.config.MAX_PENDING_HEADERS
+        remaining_capacity = max_pending - len(self.pending_headers)
+        if remaining_capacity <= 0:
+            logger.warning(
+                f"Pending headers at limit ({max_pending}), "
+                f"dropping {len(valid_headers)} new headers from {peer_addr}"
+            )
+            valid_headers = []
+        elif len(valid_headers) > remaining_capacity:
+            logger.warning(
+                f"Truncating headers batch from {len(valid_headers)} to {remaining_capacity} "
+                f"(limit: {max_pending})"
+            )
+            valid_headers = valid_headers[:remaining_capacity]
 
         self.pending_headers.extend(valid_headers)
 

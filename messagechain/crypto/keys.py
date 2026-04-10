@@ -8,7 +8,6 @@ supports up to 2^height signatures.
 
 import hashlib
 import struct
-import json
 from dataclasses import dataclass, field
 from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
 from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _hash
@@ -22,6 +21,27 @@ class Signature:
     auth_path: list[bytes]  # sibling hashes from leaf to root
     wots_public_key: bytes  # the leaf's WOTS+ public key
     wots_public_seed: bytes
+
+    def canonical_bytes(self) -> bytes:
+        """Canonical byte representation of the signature.
+
+        Deterministic serialization used for witness_hash computation
+        and relay-level deduplication. Prevents malleability from
+        non-canonical encodings of the same signature.
+        """
+        parts = []
+        # WOTS+ signature chains (sorted order guaranteed by list)
+        for s in self.wots_signature:
+            parts.append(s)
+        # Leaf index as big-endian 4 bytes
+        parts.append(struct.pack(">I", self.leaf_index))
+        # Auth path
+        for h in self.auth_path:
+            parts.append(h)
+        # Public key and seed
+        parts.append(self.wots_public_key)
+        parts.append(self.wots_public_seed)
+        return b"".join(parts)
 
     def serialize(self) -> dict:
         return {

@@ -1,5 +1,8 @@
 """Global configuration constants for the MessageChain protocol."""
 
+# Cryptography (defined early — needed by Treasury ID derivation below)
+HASH_ALGO = "sha3_256"
+
 # Message constraints
 MAX_MESSAGE_CHARS = 280  # max characters per message (Twitter-length short messages)
 MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode room)
@@ -11,6 +14,22 @@ MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode 
 # Halving every ~4 years gradually reduces rate while keeping inflation meaningful.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
+
+# Treasury — a governance-controlled fund for community spending.
+# The treasury entity has a well-known deterministic ID (no private key exists).
+# Funds can only leave the treasury via approved governance proposals.
+import hashlib as _hashlib
+TREASURY_ENTITY_ID = _hashlib.new(HASH_ALGO, b"messagechain-treasury-v1").digest()
+TREASURY_ALLOCATION = 40_000_000  # 4% of genesis supply
+
+# Default genesis allocation table: genesis validator + treasury.
+# The genesis_entity's ID is filled in at chain init time.
+# Allocations are absolute token amounts. Sum must not exceed GENESIS_SUPPLY.
+DEFAULT_GENESIS_ALLOCATIONS = {
+    TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
+    # Genesis validator allocation is added dynamically in Blockchain.initialize_genesis
+}
+
 BLOCK_REWARD = 3  # new tokens minted per block (paid to proposer)
 HALVING_INTERVAL = 12_614_400  # blocks between reward halvings (~4 years at 10s blocks)
 MIN_FEE = 1  # minimum transaction fee
@@ -25,8 +44,7 @@ MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx 
 COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
 MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
 
-# Cryptography
-HASH_ALGO = "sha3_256"
+# Cryptography (HASH_ALGO defined at top of file)
 WOTS_W = 16  # Winternitz parameter (base-16)
 WOTS_KEY_CHAINS = 64  # number of hash chains per WOTS keypair
 WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
@@ -73,6 +91,17 @@ DUST_LIMIT = 10           # transfers below this amount are rejected
 
 # Orphan block pool
 MAX_ORPHAN_BLOCKS = 100   # max orphan blocks stored (bounded to prevent memory exhaustion)
+
+# Header spam protection — bound pending headers during IBD to prevent OOM
+MAX_PENDING_HEADERS = 50_000  # max headers held in memory during sync
+
+# Transaction relay privacy — Poisson-distributed random delay before INV relay
+TX_RELAY_DELAY_MEAN = 2.0  # average seconds of delay before relaying tx to peers
+
+# Orphan transaction pool — hold out-of-order nonce txs temporarily
+MEMPOOL_MAX_ORPHAN_TXS = 100       # max orphan txs total
+MEMPOOL_MAX_ORPHAN_PER_SENDER = 3  # max orphan txs per entity
+MEMPOOL_MAX_ORPHAN_NONCE_GAP = 3   # max nonce gap allowed for orphan txs
 
 # Minimum cumulative stake weight — reject peers on chains below this during IBD
 # Prevents fake-chain attacks where an attacker tricks a new node into syncing garbage

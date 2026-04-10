@@ -32,10 +32,13 @@ class MessageTransaction:
     signature: Signature
     version: int = 1  # transaction format version (enables future upgrades without hard forks)
     tx_hash: bytes = b""
+    witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
     def __post_init__(self):
         if not self.tx_hash:
             self.tx_hash = self._compute_hash()
+        if not self.witness_hash and self.signature and self.signature.wots_public_key:
+            self.witness_hash = self._compute_witness_hash()
 
     def _signable_data(self) -> bytes:
         """Canonical byte representation for signing (excludes signature and tx_hash)."""
@@ -50,6 +53,18 @@ class MessageTransaction:
 
     def _compute_hash(self) -> bytes:
         return hashlib.new(HASH_ALGO, self._signable_data()).digest()
+
+    def _compute_witness_hash(self) -> bytes:
+        """Hash covering both transaction data AND signature.
+
+        Unlike tx_hash (which excludes the signature for malleability
+        resistance), witness_hash includes the canonical signature bytes.
+        Used for relay-level deduplication to detect modified signatures.
+        """
+        return hashlib.new(
+            HASH_ALGO,
+            self._signable_data() + self.signature.canonical_bytes()
+        ).digest()
 
     @property
     def char_count(self) -> int:
@@ -136,6 +151,7 @@ def create_transaction(
     msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
     tx.signature = entity.keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
+    tx.witness_hash = tx._compute_witness_hash()
 
     return tx
 

@@ -50,6 +50,22 @@ def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
 
+def compute_block_sig_cost(block) -> int:
+    """Compute the total signature verification cost for a block.
+
+    Each transaction sig, transfer sig, slash sig, proposer sig, and
+    attestation sig costs 1 verification. This budget prevents DoS via
+    blocks stuffed with expensive WOTS+ signature verifications.
+    """
+    return (
+        len(block.transactions)
+        + len(block.transfer_transactions)
+        + len(block.slash_transactions)
+        + 1  # proposer signature
+        + len(block.attestations)
+    )
+
+
 class Blockchain:
     """The chain: ordered list of validated blocks + derived state.
 
@@ -169,8 +185,34 @@ class Blockchain:
             self.db.rollback_transaction()
             raise
 
-    def initialize_genesis(self, genesis_entity) -> Block:
-        """Create the genesis block and initialize chain state."""
+    def initialize_genesis(
+        self,
+        genesis_entity,
+        allocation_table: dict[bytes, int] | None = None,
+    ) -> Block:
+        """Create the genesis block and initialize chain state.
+
+        Args:
+            genesis_entity: The entity that signs the genesis block.
+            allocation_table: Optional mapping of entity_id -> token amount.
+                If provided, tokens are distributed per the table. If None,
+                the genesis entity receives GENESIS_ALLOCATION (backward compat).
+        """
+        # Validate allocation table if provided
+        if allocation_table is not None:
+            for entity_id, amount in allocation_table.items():
+                if amount <= 0:
+                    raise ValueError(
+                        f"Allocation must be positive, got {amount} "
+                        f"for entity {entity_id.hex()[:16]}..."
+                    )
+            total_allocated = sum(allocation_table.values())
+            if total_allocated > self.supply.total_supply:
+                raise ValueError(
+                    f"Allocation total ({total_allocated}) exceeds "
+                    f"genesis supply ({self.supply.total_supply})"
+                )
+
         genesis_block = create_genesis_block(genesis_entity)
         self.chain.append(genesis_block)
         self._block_by_hash[genesis_block.block_hash] = genesis_block
@@ -181,9 +223,15 @@ class Blockchain:
         # Genesis block was signed — track the WOTS+ leaf consumed
         self.proposer_sig_counts[genesis_entity.entity_id] = 1
 
-        # Genesis allocation — bootstrap the economy so the genesis entity
-        # can stake, pay fees, and transfer tokens to new participants.
-        self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
+        # Distribute genesis allocation
+        if allocation_table is not None:
+            for entity_id, amount in allocation_table.items():
+                self.supply.balances[entity_id] = (
+                    self.supply.balances.get(entity_id, 0) + amount
+                )
+        else:
+            # Backward-compatible single-entity allocation
+            self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
 
         # Track as chain tip
         self.fork_choice.add_tip(genesis_block.block_hash, 0, 0)
@@ -602,11 +650,11 @@ class Blockchain:
             seen_tx_hashes.add(tx.tx_hash)
 
         # Check total signature verification cost (sigops-style limit)
-        # Each tx signature costs 1, proposer signature costs 1, each attestation costs 1
+        # Counts all tx sigs + proposer sig + attestation sigs + slash sigs
         import messagechain.config
-        sig_cost = len(all_txs) + 1 + len(block.attestations)
+        sig_cost = compute_block_sig_cost(block)
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
-            return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {MAX_BLOCK_SIG_COST}"
+            return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
         # Verify merkle root (includes message + transfer tx hashes)
         tx_hashes = [tx.tx_hash for tx in all_txs]

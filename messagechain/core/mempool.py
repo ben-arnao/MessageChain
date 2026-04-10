@@ -12,7 +12,11 @@ Now supports:
 
 import time
 from collections import defaultdict
-from messagechain.config import MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT, MEMPOOL_MAX_ANCESTORS
+from messagechain.config import (
+    MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT,
+    MEMPOOL_MAX_ANCESTORS, MEMPOOL_MAX_ORPHAN_TXS,
+    MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
+)
 from messagechain.core.transaction import MessageTransaction
 
 
@@ -26,6 +30,9 @@ class Mempool:
         self.max_size = max_size
         self.tx_ttl = tx_ttl
         self.per_sender_limit = per_sender_limit
+        # Orphan pool: holds txs with future nonces (out-of-order arrival)
+        self.orphan_pool: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
+        self._orphan_sender_counts: dict[bytes, int] = defaultdict(int)
 
     def add_transaction(self, tx: MessageTransaction) -> bool:
         """
@@ -172,6 +179,74 @@ class Mempool:
             except Exception:
                 continue  # skip corrupt entries
         return loaded
+
+    def add_orphan_tx(self, tx: MessageTransaction, expected_nonce: int) -> bool:
+        """Add a transaction with a future nonce to the orphan pool.
+
+        Only accepts transactions within MEMPOOL_MAX_ORPHAN_NONCE_GAP of the
+        expected nonce. Enforces per-sender and global limits.
+
+        Returns True if the tx was accepted into the orphan pool.
+        """
+        if tx.tx_hash in self.orphan_pool:
+            return False
+
+        # Reject if nonce gap is too large
+        gap = tx.nonce - expected_nonce
+        if gap <= 0 or gap > MEMPOOL_MAX_ORPHAN_NONCE_GAP:
+            return False
+
+        # Per-sender limit
+        if self._orphan_sender_counts[tx.entity_id] >= MEMPOOL_MAX_ORPHAN_PER_SENDER:
+            return False
+
+        # Global limit — evict random if full
+        if len(self.orphan_pool) >= MEMPOOL_MAX_ORPHAN_TXS:
+            return False
+
+        self.orphan_pool[tx.tx_hash] = tx
+        self._orphan_sender_counts[tx.entity_id] += 1
+        return True
+
+    def promote_orphans(self, entity_id: bytes, new_nonce: int) -> list[MessageTransaction]:
+        """Promote orphan txs whose nonce gap has been filled.
+
+        Called when a transaction is confirmed or added to the main pool,
+        advancing the expected nonce for an entity. Returns the list of
+        promoted transactions (caller should add them to main pool).
+        """
+        promoted = []
+        to_remove = []
+        for tx_hash, tx in self.orphan_pool.items():
+            if tx.entity_id == entity_id and tx.nonce == new_nonce:
+                promoted.append(tx)
+                to_remove.append(tx_hash)
+
+        for tx_hash in to_remove:
+            tx = self.orphan_pool.pop(tx_hash)
+            self._orphan_sender_counts[tx.entity_id] = max(
+                0, self._orphan_sender_counts[tx.entity_id] - 1
+            )
+            if self._orphan_sender_counts[tx.entity_id] == 0:
+                del self._orphan_sender_counts[tx.entity_id]
+
+        return promoted
+
+    def expire_orphans(self) -> int:
+        """Remove expired orphan transactions. Returns count removed."""
+        now = time.time()
+        expired = [
+            tx_hash for tx_hash, tx in self.orphan_pool.items()
+            if now - tx.timestamp > self.tx_ttl
+        ]
+        for tx_hash in expired:
+            tx = self.orphan_pool.pop(tx_hash)
+            self._orphan_sender_counts[tx.entity_id] = max(
+                0, self._orphan_sender_counts[tx.entity_id] - 1
+            )
+            if self._orphan_sender_counts[tx.entity_id] == 0:
+                del self._orphan_sender_counts[tx.entity_id]
+        return len(expired)
 
     @property
     def size(self) -> int:
