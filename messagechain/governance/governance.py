@@ -28,12 +28,14 @@ import struct
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from messagechain.config import (
     HASH_ALGO,
     GOVERNANCE_VOTING_WINDOW,
     GOVERNANCE_PROPOSAL_FEE,
     GOVERNANCE_VOTE_FEE,
     GOVERNANCE_DELEGATE_FEE,
+    MAX_DELEGATION_TARGETS,
     MIN_FEE,
     TREASURY_ENTITY_ID,
 )
@@ -195,21 +197,21 @@ class VoteTransaction:
 
 @dataclass
 class DelegateTransaction:
-    """Delegate voting power to another entity (single-hop, revocable).
+    """Delegate voting power to up to MAX_DELEGATION_TARGETS validators.
 
-    To revoke delegation, set delegate_id to empty bytes (b"").
-    Delegation covers all future proposals until revoked.
+    To revoke all delegations, set targets to an empty list.
+    Delegation covers all future proposals until changed or revoked.
     A direct vote on a specific proposal always overrides delegation.
 
     Fields:
         delegator_id: entity giving up their vote
-        delegate_id: entity receiving voting power (b"" to revoke)
+        targets: list of (delegate_id, weight_pct) pairs — pcts must sum to 100
         timestamp: delegation time
         fee: must be >= GOVERNANCE_DELEGATE_FEE
         signature: delegator's quantum-resistant signature
     """
     delegator_id: bytes
-    delegate_id: bytes  # b"" means revoke
+    targets: list[tuple[bytes, int]]  # [(delegate_id, pct)] or [] to revoke
     timestamp: float
     fee: int
     signature: Signature
@@ -220,13 +222,12 @@ class DelegateTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
-        return (
-            b"governance_delegate"
-            + self.delegator_id
-            + self.delegate_id
-            + struct.pack(">d", self.timestamp)
-            + struct.pack(">Q", self.fee)
-        )
+        parts = b"governance_delegate" + self.delegator_id
+        for delegate_id, pct in sorted(self.targets, key=lambda x: x[0]):
+            parts += delegate_id + struct.pack(">B", pct)
+        parts += struct.pack(">d", self.timestamp)
+        parts += struct.pack(">Q", self.fee)
+        return parts
 
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
@@ -235,7 +236,10 @@ class DelegateTransaction:
         return {
             "type": "governance_delegate",
             "delegator_id": self.delegator_id.hex(),
-            "delegate_id": self.delegate_id.hex(),
+            "targets": [
+                {"delegate_id": did.hex(), "pct": pct}
+                for did, pct in self.targets
+            ],
             "timestamp": self.timestamp,
             "fee": self.fee,
             "signature": self.signature.serialize(),
@@ -245,9 +249,13 @@ class DelegateTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "DelegateTransaction":
         sig = Signature.deserialize(data["signature"])
+        targets = [
+            (bytes.fromhex(t["delegate_id"]), t["pct"])
+            for t in data.get("targets", [])
+        ]
         tx = cls(
             delegator_id=bytes.fromhex(data["delegator_id"]),
-            delegate_id=bytes.fromhex(data["delegate_id"]),
+            targets=targets,
             timestamp=data["timestamp"],
             fee=data["fee"],
             signature=sig,
@@ -414,13 +422,13 @@ def create_treasury_spend_proposal(
 
 def create_delegation(
     delegator_entity,
-    delegate_id: bytes,
+    targets: list[tuple[bytes, int]],
     fee: int = GOVERNANCE_DELEGATE_FEE,
 ) -> DelegateTransaction:
-    """Create and sign a delegation (or revocation if delegate_id is empty)."""
+    """Create and sign a delegation (or revocation if targets is empty)."""
     tx = DelegateTransaction(
         delegator_id=delegator_entity.entity_id,
-        delegate_id=delegate_id,
+        targets=targets,
         timestamp=time.time(),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
@@ -463,7 +471,8 @@ class GovernanceTracker:
 
     def __init__(self):
         self.proposals: dict[bytes, ProposalState] = {}  # proposal_id -> state
-        self.delegations: dict[bytes, bytes] = {}  # delegator_id -> delegate_id
+        # delegator_id -> list of (delegate_id, weight_pct) — pcts must sum to 100
+        self.delegations: dict[bytes, list[tuple[bytes, int]]] = {}
         self._executed_treasury_spends: set[bytes] = set()  # replay protection
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
@@ -491,12 +500,37 @@ class GovernanceTracker:
         state.votes[tx.voter_id] = tx.approve
         return True
 
-    def set_delegation(self, delegator_id: bytes, delegate_id: bytes):
-        """Set or revoke a delegation."""
-        if delegate_id == b"":
+    def set_delegation(
+        self, delegator_id: bytes, targets: list[tuple[bytes, int]],
+    ) -> bool:
+        """Set or revoke delegation to up to MAX_DELEGATION_TARGETS validators.
+
+        targets: list of (delegate_id, weight_pct) pairs. Percentages must
+        sum to 100. Empty list revokes all delegations.
+        Returns False if validation fails.
+        """
+        if not targets:
             self.delegations.pop(delegator_id, None)
-        else:
-            self.delegations[delegator_id] = delegate_id
+            return True
+        if len(targets) > MAX_DELEGATION_TARGETS:
+            return False
+        if any(did == delegator_id for did, _ in targets):
+            return False
+        if sum(pct for _, pct in targets) != 100:
+            return False
+        if any(pct <= 0 for _, pct in targets):
+            return False
+        self.delegations[delegator_id] = targets
+        return True
+
+    def revoke_delegations_to(self, validator_id: bytes):
+        """Revoke all delegations pointing to a validator (e.g. after slashing)."""
+        to_remove = []
+        for delegator_id, targets in self.delegations.items():
+            if any(did == validator_id for did, _ in targets):
+                to_remove.append(delegator_id)
+        for delegator_id in to_remove:
+            del self.delegations[delegator_id]
 
     def get_proposal_status(
         self, proposal_id: bytes, current_block: int,
@@ -521,10 +555,12 @@ class GovernanceTracker:
         state — so late staking cannot manipulate results.
 
         Delegation rules:
-        - If entity A delegated to entity B, and B voted but A did not,
-          then A's snapshot stake counts toward B's vote direction.
-        - If A voted directly, their delegation is ignored for this proposal.
-        - Single-hop only: if B delegated to C, A's weight does NOT follow.
+        - Explicit delegation: weight is split proportionally across targets
+          who voted. If a target didn't vote, that portion is not counted.
+        - Default delegation (no explicit delegation): weight is distributed
+          to voters using sqrt(stake) weighting.
+        - Direct vote always overrides any delegation.
+        - Single-hop only: no transitive delegation.
         """
         state = self.proposals.get(proposal_id)
         if state is None:
@@ -533,29 +569,67 @@ class GovernanceTracker:
         snapshot = state.stake_snapshot
         direct_votes = dict(state.votes)
 
-        # Build reverse delegation map: delegate_id -> [delegator_ids]
-        reverse_delegations: dict[bytes, list[bytes]] = {}
-        for delegator_id, delegate_id in self.delegations.items():
-            if delegate_id not in reverse_delegations:
-                reverse_delegations[delegate_id] = []
-            reverse_delegations[delegate_id].append(delegator_id)
+        # Build reverse delegation map: delegate_id -> [(delegator_id, pct)]
+        reverse_delegations: dict[bytes, list[tuple[bytes, int]]] = {}
+        explicitly_delegated: set[bytes] = set()
+        for delegator_id, targets in self.delegations.items():
+            explicitly_delegated.add(delegator_id)
+            for delegate_id, pct in targets:
+                if delegate_id not in reverse_delegations:
+                    reverse_delegations[delegate_id] = []
+                reverse_delegations[delegate_id].append((delegator_id, pct))
 
         yes_weight = 0
         total_weight = 0
 
+        # Count direct votes + explicit delegations
         for voter_id, approve in direct_votes.items():
             stake = snapshot.get(voter_id, 0)
             total_weight += stake
             if approve:
                 yes_weight += stake
 
-            # Add delegated weight from entities who didn't vote directly
-            for delegator_id in reverse_delegations.get(voter_id, []):
+            # Add explicitly delegated weight (proportional)
+            for delegator_id, pct in reverse_delegations.get(voter_id, []):
                 if delegator_id not in direct_votes:
                     delegator_stake = snapshot.get(delegator_id, 0)
-                    total_weight += delegator_stake
+                    portion = delegator_stake * pct // 100
+                    total_weight += portion
                     if approve:
-                        yes_weight += delegator_stake
+                        yes_weight += portion
+
+        # Default delegation: non-voting, non-delegating entities distribute
+        # their weight to voters using sqrt(stake) weighting
+        voter_stakes = {
+            vid: snapshot.get(vid, 0)
+            for vid in direct_votes
+            if snapshot.get(vid, 0) > 0
+        }
+        if voter_stakes:
+            sqrt_weights = {vid: int(math.isqrt(s)) for vid, s in voter_stakes.items()}
+            total_sqrt = sum(sqrt_weights.values())
+
+            if total_sqrt > 0:
+                for entity_id, stake in snapshot.items():
+                    if entity_id in direct_votes:
+                        continue  # already counted
+                    if entity_id in explicitly_delegated:
+                        continue  # handled above
+                    if stake <= 0:
+                        continue
+
+                    # Distribute this entity's stake to voters by sqrt weight
+                    distributed = 0
+                    sorted_voters = sorted(sqrt_weights.items(), key=lambda x: x[0])
+                    for i, (vid, sw) in enumerate(sorted_voters):
+                        if i == len(sorted_voters) - 1:
+                            portion = stake - distributed
+                        else:
+                            portion = stake * sw // total_sqrt
+                        distributed += portion
+                        total_weight += portion
+                        if direct_votes[vid]:
+                            yes_weight += portion
 
         return yes_weight, total_weight
 
@@ -652,10 +726,17 @@ def verify_treasury_spend(tx: TreasurySpendTransaction, public_key: bytes) -> bo
 
 
 def verify_delegation(tx: DelegateTransaction, public_key: bytes) -> bool:
-    """Verify a delegation transaction's signature."""
+    """Verify a delegation transaction's signature and targets."""
     if tx.fee < GOVERNANCE_DELEGATE_FEE:
         return False
-    if tx.delegate_id == tx.delegator_id:
+    if len(tx.targets) > MAX_DELEGATION_TARGETS:
         return False
+    if tx.targets:
+        if any(did == tx.delegator_id for did, _ in tx.targets):
+            return False
+        if sum(pct for _, pct in tx.targets) != 100:
+            return False
+        if any(pct <= 0 for _, pct in tx.targets):
+            return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

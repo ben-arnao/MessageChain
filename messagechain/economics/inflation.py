@@ -72,6 +72,7 @@ class SupplyTracker:
         proposer_id: bytes,
         block_height: int,
         attestor_stakes: dict[bytes, int] | None = None,
+        bootstrap: bool = False,
     ) -> dict:
         """Mint new tokens and split between proposer and attestors.
 
@@ -88,10 +89,13 @@ class SupplyTracker:
         self.total_supply += reward
         self.total_minted += reward
 
+        # Determine effective cap (no cap during bootstrap)
+        effective_cap = reward if bootstrap else PROPOSER_REWARD_CAP
+
         if not attestor_stakes:
             # No attestors — proposer gets everything (bootstrap/genesis)
             # Apply reward cap: excess goes to treasury
-            proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+            proposer_reward = min(reward, effective_cap)
             treasury_excess = reward - proposer_reward
             self.balances[proposer_id] = self.balances.get(proposer_id, 0) + proposer_reward
             if treasury_excess > 0:
@@ -136,11 +140,11 @@ class SupplyTracker:
         proposer_total = proposer_share + proposer_att_reward
 
         treasury_excess = 0
-        if proposer_total > PROPOSER_REWARD_CAP:
-            treasury_excess = proposer_total - PROPOSER_REWARD_CAP
+        if proposer_total > effective_cap:
+            treasury_excess = proposer_total - effective_cap
             # Claw back attestor overage already credited + reduce proposer share
             self.balances[proposer_id] = self.balances.get(proposer_id, 0) - proposer_att_reward
-            proposer_share = PROPOSER_REWARD_CAP
+            proposer_share = effective_cap
             proposer_att_reward = 0
             attestor_rewards[proposer_id] = 0
             self.balances[TREASURY_ENTITY_ID] = (

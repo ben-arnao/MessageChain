@@ -577,6 +577,8 @@ class Blockchain:
 
         # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
+        is_bootstrap = not any(s > 0 for s in sim_staked.values())
+        effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
 
         attestor_stakes = {}
         if attestations:
@@ -604,15 +606,15 @@ class Blockchain:
             # Apply reward cap to proposer
             proposer_att_reward = attestor_rewards.get(proposer_id, 0)
             proposer_total = proposer_share + proposer_att_reward
-            if proposer_total > PROPOSER_REWARD_CAP:
-                treasury_excess = proposer_total - PROPOSER_REWARD_CAP
-                proposer_share = max(0, PROPOSER_REWARD_CAP - proposer_att_reward)
+            if proposer_total > effective_cap:
+                treasury_excess = proposer_total - effective_cap
+                proposer_share = max(0, effective_cap - proposer_att_reward)
                 sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_share
         else:
             # No attestors — apply cap
-            proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+            proposer_reward = min(reward, effective_cap)
             treasury_excess = reward - proposer_reward
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
             if treasury_excess > 0:
@@ -916,10 +918,14 @@ class Blockchain:
             if stake > 0:
                 attestor_stakes[att.validator_id] = stake
 
+        # Bootstrap mode: no validators have staked yet
+        is_bootstrap = not any(s > 0 for s in self.supply.staked.values())
+
         # Mint block reward split between proposer and attestors
         result = self.supply.mint_block_reward(
             proposer_id, block.header.block_number,
             attestor_stakes=attestor_stakes,
+            bootstrap=is_bootstrap,
         )
 
         # Track immature rewards for ALL recipients (proposer + attestors)

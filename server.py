@@ -287,6 +287,9 @@ class Server:
         elif method == "submit_transfer":
             return self._rpc_submit_transfer(request["params"])
 
+        elif method == "submit_delegation":
+            return self._rpc_submit_delegation(request["params"])
+
         elif method == "get_messages":
             count = request.get("params", {}).get("count", 10)
             count = min(count, 100)  # cap to prevent abuse
@@ -441,6 +444,47 @@ class Server:
                 "tx_hash": tx.tx_hash.hex(),
                 "staked": remaining,
                 "balance": self.blockchain.supply.get_balance(entity_id),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_submit_delegation(self, params: dict) -> dict:
+        """Accept a signed delegation transaction from a client."""
+        try:
+            from messagechain.governance.governance import (
+                DelegateTransaction, verify_delegation, GovernanceTracker,
+            )
+            tx = DelegateTransaction.deserialize(params["transaction"])
+            entity_id = tx.delegator_id
+
+            if entity_id not in self.blockchain.public_keys:
+                return {"ok": False, "error": "Entity not registered"}
+
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_delegation(tx, public_key):
+                return {"ok": False, "error": "Invalid delegation transaction"}
+
+            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
+                return {"ok": False, "error": "Insufficient balance for fee"}
+
+            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
+
+            # Apply delegation to governance tracker
+            if not hasattr(self, 'governance'):
+                self.governance = GovernanceTracker()
+            self.governance.set_delegation(entity_id, tx.targets)
+
+            if self.blockchain.db is not None:
+                self.blockchain._persist_state()
+
+            targets_info = [
+                {"delegate_id": did.hex(), "pct": pct}
+                for did, pct in tx.targets
+            ]
+            return {"ok": True, "result": {
+                "entity_id": entity_id.hex(),
+                "tx_hash": tx.tx_hash.hex(),
+                "targets": targets_info,
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}

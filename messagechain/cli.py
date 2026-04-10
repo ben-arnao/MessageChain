@@ -113,6 +113,27 @@ def build_parser() -> argparse.ArgumentParser:
     unstake.add_argument("--fee", type=int, default=None, help="Transaction fee")
     unstake.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- delegate ---
+    delegate = sub.add_parser(
+        "delegate",
+        help="Delegate trust to validators",
+        description="Delegate voting power to up to 3 validators you trust.",
+    )
+    delegate.add_argument(
+        "--to", action="append", dest="delegates",
+        help="Validator entity ID (hex). Can specify up to 3.",
+    )
+    delegate.add_argument(
+        "--pct", action="append", dest="pcts", type=int,
+        help="Percentage for each --to (must sum to 100).",
+    )
+    delegate.add_argument(
+        "--revoke", action="store_true",
+        help="Revoke all delegations.",
+    )
+    delegate.add_argument("--fee", type=int, default=None, help="Transaction fee")
+    delegate.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- generate-key ---
     sub.add_parser(
         "generate-key",
@@ -514,6 +535,71 @@ def cmd_unstake(args):
         sys.exit(1)
 
 
+def cmd_delegate(args):
+    """Delegate voting power to trusted validators."""
+    from messagechain.identity.identity import Entity
+    from messagechain.governance.governance import create_delegation
+    from messagechain.config import GOVERNANCE_DELEGATE_FEE
+
+    if args.revoke:
+        print("=== Revoke Delegation ===\n")
+        targets = []
+    else:
+        print("=== Delegate Trust ===\n")
+        if not args.delegates:
+            print("Error: Specify at least one --to <validator_id>")
+            sys.exit(1)
+        if not args.pcts or len(args.pcts) != len(args.delegates):
+            print("Error: Each --to must have a matching --pct")
+            sys.exit(1)
+        if sum(args.pcts) != 100:
+            print(f"Error: Percentages must sum to 100 (got {sum(args.pcts)})")
+            sys.exit(1)
+
+        from messagechain.validation import parse_hex
+        targets = []
+        for delegate_hex, pct in zip(args.delegates, args.pcts):
+            did = parse_hex(delegate_hex)
+            if did is None:
+                print(f"Error: Invalid hex: {delegate_hex}")
+                sys.exit(1)
+            targets.append((did, pct))
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nDelegating as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    fee = args.fee if args.fee is not None else GOVERNANCE_DELEGATE_FEE
+    tx = create_delegation(entity, targets, fee=fee)
+
+    response = rpc_call(host, port, "submit_delegation", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        if args.revoke:
+            print("\nDelegation revoked!")
+        else:
+            for delegate_hex, pct in zip(args.delegates, args.pcts):
+                print(f"  {delegate_hex[:16]}... — {pct}%")
+            print("\nDelegation submitted!")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_generate_key(_args):
     """Generate a new cryptographically random private key."""
     import os
@@ -593,6 +679,7 @@ def main():
         "balance": cmd_balance,
         "stake": cmd_stake,
         "unstake": cmd_unstake,
+        "delegate": cmd_delegate,
         "generate-key": cmd_generate_key,
         "read": cmd_read,
         "demo": cmd_demo,

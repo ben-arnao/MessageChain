@@ -177,3 +177,4 @@ GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 2  # Use integer arithmetic: yes * 2
 GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent)
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power
+MAX_DELEGATION_TARGETS = 3            # max validators a user can delegate to
