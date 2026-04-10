@@ -354,9 +354,9 @@ class TestGenesisNotHardcoded(unittest.TestCase):
         import server as server_module
         source = inspect.getsource(server_module.Server.start)
         # Check that the actual Entity.create call doesn't use hardcoded strings
-        self.assertNotIn('b"genesis-dna"', source,
+        self.assertNotIn('b"genesis-key"', source,
             "Server must not use hardcoded genesis keys")
-        self.assertNotIn("b'genesis-dna'", source,
+        self.assertNotIn("b'genesis-key'", source,
             "Server must not use hardcoded genesis keys")
         # Verify os.urandom is used instead
         self.assertIn("os.urandom", source,
