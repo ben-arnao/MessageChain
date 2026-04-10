@@ -300,14 +300,17 @@ class Blockchain:
 
         return True, "Entity registered"
 
-    def sync_consensus_stakes(self, consensus: "ProofOfStake"):
+    def sync_consensus_stakes(self, consensus: "ProofOfStake", block_height: int | None = None):
         """Populate consensus.stakes from the supply tracker's staked amounts.
 
         Must be called after loading from DB so that the consensus module
         has accurate stake data (prevents falling into permissive bootstrap mode).
         """
+        from messagechain.consensus.pos import graduated_min_stake
+        height = block_height if block_height is not None else self.height
+        min_stake = graduated_min_stake(height)
         for entity_id, amount in self.supply.staked.items():
-            if amount >= VALIDATOR_MIN_STAKE:
+            if amount >= min_stake:
                 consensus.stakes[entity_id] = amount
 
     def get_latest_block(self) -> Block | None:

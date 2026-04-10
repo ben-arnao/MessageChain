@@ -193,9 +193,10 @@ def create_unstake_transaction(
     return tx
 
 
-def verify_stake_transaction(tx: StakeTransaction, public_key: bytes) -> bool:
+def verify_stake_transaction(tx: StakeTransaction, public_key: bytes, block_height: int = 0) -> bool:
     """Verify a stake transaction's signature."""
-    if tx.amount < VALIDATOR_MIN_STAKE:
+    from messagechain.consensus.pos import graduated_min_stake
+    if tx.amount < graduated_min_stake(block_height):
         return False
     if tx.fee < MIN_FEE:
         return False

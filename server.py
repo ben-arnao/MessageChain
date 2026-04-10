@@ -364,7 +364,7 @@ class Server:
                 return {"ok": False, "error": "Unknown entity"}
 
             public_key = self.blockchain.public_keys[entity_id]
-            if not verify_stake_transaction(tx, public_key):
+            if not verify_stake_transaction(tx, public_key, block_height=self.blockchain.height):
                 return {"ok": False, "error": "Invalid stake transaction signature"}
 
             # Validate nonce
@@ -380,7 +380,7 @@ class Server:
             self.blockchain.supply.stake(entity_id, tx.amount)
             self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
             self.blockchain.nonces[entity_id] = tx.nonce + 1
-            self.consensus.register_validator(entity_id, tx.amount)
+            self.consensus.register_validator(entity_id, tx.amount, block_height=self.blockchain.height)
 
             if self.blockchain.db is not None:
                 self.blockchain._persist_state()

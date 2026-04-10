@@ -82,8 +82,15 @@ WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
 MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (production)
 # Tests override this to 4 (16 leaves) via tests/__init__.py for fast execution.
 
-# Consensus
-VALIDATOR_MIN_STAKE = 100
+# Consensus — graduated minimum stake
+# Early network is accessible (1 token), matures into higher barrier.
+# These thresholds are checked via graduated_min_stake() in pos.py.
+VALIDATOR_MIN_STAKE = 100            # legacy flat minimum (used as final tier)
+GRADUATED_STAKE_TIERS = [
+    (50_000, 1),      # blocks 0–49,999: 1 token
+    (200_000, 10),    # blocks 50,000–199,999: 10 tokens
+    (None, 100),      # blocks 200,000+: 100 tokens
+]
 CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fraction)
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry

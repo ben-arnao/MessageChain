@@ -11,10 +11,12 @@ blocks can never be reverted.
 """
 
 import hashlib
+import math
 import struct
 import time
 from messagechain.config import (
-    HASH_ALGO, VALIDATOR_MIN_STAKE, CONSENSUS_THRESHOLD_NUMERATOR,
+    HASH_ALGO, VALIDATOR_MIN_STAKE, GRADUATED_STAKE_TIERS,
+    CONSENSUS_THRESHOLD_NUMERATOR,
     CONSENSUS_THRESHOLD_DENOMINATOR, MAX_TXS_PER_BLOCK, MAX_BLOCK_MESSAGE_BYTES,
 )
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root
@@ -25,6 +27,19 @@ from messagechain.consensus.attestation import Attestation, create_attestation, 
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
+
+
+def graduated_min_stake(block_height: int) -> int:
+    """Return the minimum stake required at a given block height.
+
+    Early network is accessible (1 token minimum). As the chain matures,
+    the barrier increases to harden sybil resistance.
+    """
+    for threshold, min_stake in GRADUATED_STAKE_TIERS:
+        if threshold is not None and block_height < threshold:
+            return min_stake
+    # Final tier (threshold is None)
+    return GRADUATED_STAKE_TIERS[-1][1]
 
 
 class ProofOfStake:
@@ -41,9 +56,9 @@ class ProofOfStake:
             return False
         return len(self.stakes) == 0
 
-    def register_validator(self, entity_id: bytes, stake_amount: int) -> bool:
+    def register_validator(self, entity_id: bytes, stake_amount: int, block_height: int = 0) -> bool:
         """Register a validator with their stake."""
-        if stake_amount < VALIDATOR_MIN_STAKE:
+        if stake_amount < graduated_min_stake(block_height):
             return False
         self.stakes[entity_id] = self.stakes.get(entity_id, 0) + stake_amount
         # Once any validator registers, bootstrap mode is permanently off
@@ -58,6 +73,11 @@ class ProofOfStake:
         return sum(self.stakes.values())
 
     @property
+    def total_effective_stake(self) -> int:
+        """Sum of sqrt(stake) for all validators (integer floor)."""
+        return sum(int(math.isqrt(s)) for s in self.stakes.values())
+
+    @property
     def validator_count(self) -> int:
         return len(self.stakes)
 
@@ -66,8 +86,9 @@ class ProofOfStake:
         Deterministically select the next block proposer.
 
         Uses the previous block hash (and optional RANDAO mix) as a seed,
-        weighted by stake. Every node computes the same result for the same
-        chain state.
+        weighted by sqrt(stake). Sqrt weighting gives diminishing returns
+        to large stakers, preventing plutocratic concentration of block
+        production while still rewarding higher commitment.
 
         When randao_mix is provided, it is mixed into the seed to prevent
         proposer grinding attacks (where a proposer manipulates block contents
@@ -78,7 +99,7 @@ class ProofOfStake:
 
         # Sort validators for deterministic ordering
         validators = sorted(self.stakes.items(), key=lambda x: x[0])
-        total = self.total_stake
+        total = self.total_effective_stake
         if total == 0:
             return None  # all stakes are zero — no valid proposer
 
@@ -89,10 +110,10 @@ class ProofOfStake:
         seed = _hash(seed_input + b"proposer_selection")
         rand_value = int.from_bytes(seed, "big") % total
 
-        # Stake-weighted selection
+        # Sqrt-weighted selection
         cumulative = 0
         for entity_id, stake in validators:
-            cumulative += stake
+            cumulative += int(math.isqrt(stake))
             if rand_value < cumulative:
                 return entity_id
 
