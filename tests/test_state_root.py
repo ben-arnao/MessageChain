@@ -1,7 +1,7 @@
 """Tests for state commitment (state_root) in block headers."""
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import compute_state_root, BlockHeader, Block
 from messagechain.core.transaction import create_transaction

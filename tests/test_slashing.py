@@ -2,7 +2,7 @@
 
 import unittest
 import time
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, _hash, compute_merkle_root, compute_state_root
 from messagechain.core.transaction import create_transaction

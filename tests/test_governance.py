@@ -1,7 +1,7 @@
 """Tests for on-chain governance: proposals, voting, and delegation."""
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.governance.governance import (

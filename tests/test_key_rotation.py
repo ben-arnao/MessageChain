@@ -1,7 +1,7 @@
 """Tests for key rotation — entities can rotate to fresh WOTS+ Merkle trees."""
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
 from tests import register_entity_for_test

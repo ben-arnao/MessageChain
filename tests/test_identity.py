@@ -1,7 +1,7 @@
 """Tests for private-key identity system."""
 
 import unittest
-from messagechain.identity.biometrics import Entity, derive_entity_id
+from messagechain.identity.identity import Entity, derive_entity_id
 
 
 class TestEntity(unittest.TestCase):

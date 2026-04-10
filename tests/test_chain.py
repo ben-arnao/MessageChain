@@ -1,7 +1,7 @@
 """Integration tests for the full MessageChain."""
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from tests import register_entity_for_test
 from messagechain.core.transaction import create_transaction, verify_transaction

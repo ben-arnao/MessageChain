@@ -6,7 +6,7 @@ Entity ID is derived from the public key.
 """
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 
 
 class TestPrivateKeyEntityCreation(unittest.TestCase):

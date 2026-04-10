@@ -6,7 +6,7 @@ the entity_id, preventing arbitrary fabricated identities.
 
 import unittest
 import hashlib
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.crypto.keys import verify_signature, KeyPair
 from messagechain.config import HASH_ALGO

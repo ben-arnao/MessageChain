@@ -6,7 +6,7 @@ token distribution.
 """
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.config import GENESIS_ALLOCATION
 

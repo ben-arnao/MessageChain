@@ -18,7 +18,7 @@ import struct
 import time
 from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
 

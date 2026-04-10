@@ -17,7 +17,7 @@ import time
 import unittest
 
 from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT, SLASH_FINDER_REWARD_PCT
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, create_genesis_block, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction

@@ -134,7 +134,7 @@ def _collect_private_key():
 
 def cmd_start(args):
     """Start a MessageChain node."""
-    from messagechain.identity.biometrics import Entity
+    from messagechain.identity.identity import Entity
 
     # Ensure data directory exists
     os.makedirs(args.data_dir, exist_ok=True)
@@ -192,7 +192,7 @@ def cmd_start(args):
 
 def cmd_account(args):
     """Create a new account."""
-    from messagechain.identity.biometrics import Entity
+    from messagechain.identity.identity import Entity
 
     print("=== Create Account ===\n")
     private_key = _collect_private_key()
@@ -223,7 +223,7 @@ def cmd_account(args):
 
 def cmd_send(args):
     """Send a message to the chain."""
-    from messagechain.identity.biometrics import Entity
+    from messagechain.identity.identity import Entity
 
     message = args.message
     char_count = len(message)

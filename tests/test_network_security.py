@@ -383,7 +383,7 @@ class TestMessageCategoryMapping(unittest.TestCase):
 
     def test_tx_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
+        from messagechain.identity.identity import Entity
         entity = Entity.create(b"test-privkey")
         node = Node(entity, port=19333)
         assert node._msg_category(MessageType.ANNOUNCE_TX) == "tx"
@@ -392,7 +392,7 @@ class TestMessageCategoryMapping(unittest.TestCase):
 
     def test_block_req_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
+        from messagechain.identity.identity import Entity
         entity = Entity.create(b"test-privkey")
         node = Node(entity, port=19334)
         assert node._msg_category(MessageType.REQUEST_BLOCK) == "block_req"
@@ -400,14 +400,14 @@ class TestMessageCategoryMapping(unittest.TestCase):
 
     def test_headers_req_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
+        from messagechain.identity.identity import Entity
         entity = Entity.create(b"test-privkey")
         node = Node(entity, port=19335)
         assert node._msg_category(MessageType.REQUEST_HEADERS) == "headers_req"
 
     def test_general_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
+        from messagechain.identity.identity import Entity
         entity = Entity.create(b"test-privkey")
         node = Node(entity, port=19336)
         assert node._msg_category(MessageType.HANDSHAKE) == "general"

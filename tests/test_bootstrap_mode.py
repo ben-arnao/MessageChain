@@ -5,7 +5,7 @@ must be a one-way door: once validators stake, it cannot be re-entered.
 """
 
 import unittest
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.config import VALIDATOR_MIN_STAKE, MIN_TOTAL_STAKE

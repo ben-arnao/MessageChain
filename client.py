@@ -16,7 +16,7 @@ import struct
 import sys
 import getpass
 
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.transaction import create_transaction
 
 

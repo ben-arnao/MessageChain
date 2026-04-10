@@ -28,7 +28,7 @@ from messagechain.config import (
     DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE,
 )
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, compute_merkle_root, BlockHeader
 from messagechain.core.transaction import MessageTransaction, create_transaction, verify_transaction

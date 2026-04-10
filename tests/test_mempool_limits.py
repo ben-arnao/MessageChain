@@ -3,7 +3,7 @@
 import time
 import unittest
 from unittest.mock import patch
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 from messagechain.core.mempool import Mempool
 from messagechain.core.transaction import create_transaction
 

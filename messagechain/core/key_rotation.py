@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 
 
 @dataclass
