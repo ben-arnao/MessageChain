@@ -200,61 +200,51 @@ class TestGovernanceTracker(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.bob, "Add feature X", "Detailed description of feature X",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=100)
+        self.tracker.add_proposal(self.proposal_tx, block_height=100, supply_tracker=self.supply)
 
     def test_proposal_starts_open(self):
         """New proposal is in OPEN status."""
         status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, current_block=101, supply_tracker=self.supply,
+            self.proposal_tx.proposal_id, current_block=101,
         )
         self.assertEqual(status, ProposalStatus.OPEN)
 
     def test_proposal_closes_after_voting_window(self):
         """Proposal becomes CLOSED after voting window expires."""
         vote = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=101)
 
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
         status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, expired_block, self.supply,
+            self.proposal_tx.proposal_id, expired_block,
         )
         self.assertEqual(status, ProposalStatus.CLOSED)
 
     def test_tally_records_majority_yes(self):
         """Tally correctly records when majority of stake voted yes."""
-        # Carol (3000) votes yes, Bob (2000) votes no
         vote_yes = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.bob, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_yes)
-        self.tracker.add_vote(vote_no)
+        self.tracker.add_vote(vote_yes, current_block=101)
+        self.tracker.add_vote(vote_no, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
-        # 3000 / 5000 = 60%
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 3000)
         self.assertEqual(total_weight, 5000)
 
     def test_tally_records_majority_no(self):
         """Tally correctly records when majority of stake voted no."""
-        # Bob (2000) votes yes, Carol (3000) votes no
         vote_yes = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.carol, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_yes)
-        self.tracker.add_vote(vote_no)
+        self.tracker.add_vote(vote_yes, current_block=101)
+        self.tracker.add_vote(vote_no, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
-        # 2000 / 5000 = 40%
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 2000)
         self.assertEqual(total_weight, 5000)
 
     def test_no_votes_zero_weight(self):
         """Proposal with no votes has zero total weight."""
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 0)
         self.assertEqual(total_weight, 0)
 
@@ -262,9 +252,195 @@ class TestGovernanceTracker(unittest.TestCase):
         """Proposal with no votes still closes after window."""
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
         status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, expired_block, self.supply,
+            self.proposal_tx.proposal_id, expired_block,
         )
         self.assertEqual(status, ProposalStatus.CLOSED)
+
+
+class TestStakeSnapshot(unittest.TestCase):
+    """Tally uses stake snapshot from proposal creation, not live state."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+
+    def setUp(self):
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+
+        self.supply = SupplyTracker()
+        self.supply.balances[self.alice.entity_id] = 5000
+        self.supply.balances[self.bob.entity_id] = 5000
+        self.supply.staked[self.alice.entity_id] = 3000
+        self.supply.staked[self.bob.entity_id] = 1000
+
+        self.tracker = GovernanceTracker()
+
+    def test_tally_uses_snapshot_not_live_stake(self):
+        """Stake changes after proposal creation do not affect tally."""
+        proposal_tx = create_proposal(self.alice, "Snapshot test", "desc")
+        self.tracker.add_proposal(proposal_tx, block_height=100, supply_tracker=self.supply)
+
+        # Alice stakes more AFTER proposal creation
+        self.supply.staked[self.alice.entity_id] = 9000
+
+        vote = create_vote(self.alice, proposal_tx.proposal_id, approve=True)
+        self.tracker.add_vote(vote, current_block=101)
+
+        yes_weight, total_weight = self.tracker.tally(proposal_tx.proposal_id)
+        # Should use snapshot value (3000), not live value (9000)
+        self.assertEqual(yes_weight, 3000)
+        self.assertEqual(total_weight, 3000)
+
+    def test_late_staker_cannot_swing_vote(self):
+        """Entity that stakes after proposal creation has zero voting power."""
+        # Bob has 1000 staked at proposal creation
+        proposal_tx = create_proposal(self.alice, "Late staker test", "desc")
+        self.tracker.add_proposal(proposal_tx, block_height=100, supply_tracker=self.supply)
+
+        # Bob massively increases stake after proposal
+        self.supply.staked[self.bob.entity_id] = 100_000
+
+        vote = create_vote(self.bob, proposal_tx.proposal_id, approve=True)
+        self.tracker.add_vote(vote, current_block=101)
+
+        yes_weight, _ = self.tracker.tally(proposal_tx.proposal_id)
+        # Should use snapshot value (1000), not inflated value
+        self.assertEqual(yes_weight, 1000)
+
+    def test_unstaker_keeps_snapshot_weight(self):
+        """Entity that unstakes after proposal creation keeps snapshot voting power."""
+        proposal_tx = create_proposal(self.alice, "Unstaker test", "desc")
+        self.tracker.add_proposal(proposal_tx, block_height=100, supply_tracker=self.supply)
+
+        # Alice unstakes everything after proposal
+        self.supply.staked[self.alice.entity_id] = 0
+
+        vote = create_vote(self.alice, proposal_tx.proposal_id, approve=True)
+        self.tracker.add_vote(vote, current_block=101)
+
+        yes_weight, _ = self.tracker.tally(proposal_tx.proposal_id)
+        # Should use snapshot value (3000), not current (0)
+        self.assertEqual(yes_weight, 3000)
+
+    def test_snapshot_captures_total_eligible_stake(self):
+        """Proposal info includes total eligible stake from snapshot."""
+        proposal_tx = create_proposal(self.alice, "Eligible stake test", "desc")
+        self.tracker.add_proposal(proposal_tx, block_height=100, supply_tracker=self.supply)
+
+        info = self.tracker.get_proposal_info(proposal_tx.proposal_id, current_block=101)
+        # Alice (3000) + Bob (1000) = 4000
+        self.assertEqual(info["total_eligible_stake"], 4000)
+
+
+class TestVoteWindowEnforcement(unittest.TestCase):
+    """Votes on closed proposals are rejected."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+
+    def setUp(self):
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+
+        self.supply = SupplyTracker()
+        self.supply.staked[self.alice.entity_id] = 1000
+        self.supply.staked[self.bob.entity_id] = 1000
+
+        self.tracker = GovernanceTracker()
+        self.proposal_tx = create_proposal(self.alice, "Window test", "desc")
+        self.tracker.add_proposal(self.proposal_tx, block_height=100, supply_tracker=self.supply)
+
+    def test_vote_during_window_accepted(self):
+        """Vote during open window is accepted."""
+        vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
+        accepted = self.tracker.add_vote(vote, current_block=101)
+        self.assertTrue(accepted)
+
+        yes_weight, _ = self.tracker.tally(self.proposal_tx.proposal_id)
+        self.assertEqual(yes_weight, 1000)
+
+    def test_vote_after_window_rejected(self):
+        """Vote after window closes is rejected."""
+        vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
+        expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
+        accepted = self.tracker.add_vote(vote, current_block=expired_block)
+        self.assertFalse(accepted)
+
+        # Vote should not be recorded
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
+        self.assertEqual(yes_weight, 0)
+        self.assertEqual(total_weight, 0)
+
+    def test_vote_at_window_boundary_accepted(self):
+        """Vote at exactly the last block of the window is accepted."""
+        vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
+        last_block = 100 + GOVERNANCE_VOTING_WINDOW
+        accepted = self.tracker.add_vote(vote, current_block=last_block)
+        self.assertTrue(accepted)
+
+
+class TestVoteImmutability(unittest.TestCase):
+    """Once cast, votes cannot be changed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-private-key")
+        cls.bob = Entity.create(b"bob-private-key")
+
+    def setUp(self):
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+
+        self.supply = SupplyTracker()
+        self.supply.staked[self.alice.entity_id] = 5000
+        self.supply.staked[self.bob.entity_id] = 1000
+
+        self.tracker = GovernanceTracker()
+        self.proposal_tx = create_proposal(self.alice, "Immutability test", "desc")
+        self.tracker.add_proposal(self.proposal_tx, block_height=100, supply_tracker=self.supply)
+
+    def test_duplicate_vote_rejected(self):
+        """Second vote from same entity on same proposal is rejected."""
+        vote1 = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
+        vote2 = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
+
+        accepted1 = self.tracker.add_vote(vote1, current_block=101)
+        accepted2 = self.tracker.add_vote(vote2, current_block=102)
+
+        self.assertTrue(accepted1)
+        self.assertFalse(accepted2)
+
+    def test_first_vote_preserved(self):
+        """After rejected duplicate, original vote is preserved in tally."""
+        vote1 = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
+        vote2 = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
+
+        self.tracker.add_vote(vote1, current_block=101)
+        self.tracker.add_vote(vote2, current_block=102)
+
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
+        # Original yes vote preserved, not overwritten to no
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 5000)
+
+    def test_different_entities_can_vote(self):
+        """Different entities can still vote independently."""
+        vote1 = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
+        vote2 = create_vote(self.bob, self.proposal_tx.proposal_id, approve=False)
+
+        accepted1 = self.tracker.add_vote(vote1, current_block=101)
+        accepted2 = self.tracker.add_vote(vote2, current_block=101)
+
+        self.assertTrue(accepted1)
+        self.assertTrue(accepted2)
+
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 6000)
 
 
 class TestDelegation(unittest.TestCase):
@@ -298,18 +474,16 @@ class TestDelegation(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.alice, "Test proposal", "Test delegation mechanics",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=50)
+        self.tracker.add_proposal(self.proposal_tx, block_height=50, supply_tracker=self.supply)
 
     def test_delegated_vote_adds_weight(self):
         """Delegate's vote carries delegator's stake too."""
         self.tracker.set_delegation(self.alice.entity_id, self.bob.entity_id)
 
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 1500)
         self.assertEqual(total_weight, 1500)
 
@@ -319,12 +493,10 @@ class TestDelegation(unittest.TestCase):
 
         vote_bob = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         vote_alice = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_bob)
-        self.tracker.add_vote(vote_alice)
+        self.tracker.add_vote(vote_bob, current_block=51)
+        self.tracker.add_vote(vote_alice, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 500)
         self.assertEqual(total_weight, 1500)
 
@@ -334,13 +506,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.set_delegation(self.bob.entity_id, self.carol.entity_id)
 
         vote = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
-        # Carol (3000) + Bob (500, delegated to Carol) = 3500
-        # Alice's 1000 delegated to Bob, but Bob didn't vote
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 3500)
         self.assertEqual(total_weight, 3500)
 
@@ -350,11 +518,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.set_delegation(self.alice.entity_id, b"")
 
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 500)
         self.assertEqual(total_weight, 500)
 
@@ -364,11 +530,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.set_delegation(self.dave.entity_id, self.carol.entity_id)
 
         vote = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 4200)
         self.assertEqual(total_weight, 4200)
 
@@ -377,11 +541,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.set_delegation(self.alice.entity_id, self.bob.entity_id)
 
         vote = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 3000)
         self.assertEqual(total_weight, 3000)
 
@@ -409,12 +571,12 @@ class TestGovernanceInfo(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.bob, "Fix bug in consensus", "Details about the bug fix",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=10)
+        self.tracker.add_proposal(self.proposal_tx, block_height=10, supply_tracker=self.supply)
 
     def test_proposal_info_fields(self):
         """Proposal info contains all expected fields."""
         info = self.tracker.get_proposal_info(
-            self.proposal_tx.proposal_id, current_block=20, supply_tracker=self.supply,
+            self.proposal_tx.proposal_id, current_block=20,
         )
         self.assertIn("proposal_id", info)
         self.assertIn("title", info)
@@ -422,6 +584,7 @@ class TestGovernanceInfo(unittest.TestCase):
         self.assertIn("status", info)
         self.assertIn("yes_weight", info)
         self.assertIn("total_weight", info)
+        self.assertIn("total_eligible_stake", info)
         self.assertIn("approval_pct", info)
         self.assertIn("blocks_remaining", info)
         self.assertIn("direct_votes", info)
@@ -430,21 +593,22 @@ class TestGovernanceInfo(unittest.TestCase):
         self.assertNotIn("owner_approved", info)
         self.assertEqual(info["title"], "Fix bug in consensus")
         self.assertEqual(info["status"], "open")
+        self.assertEqual(info["total_eligible_stake"], 2000)
 
     def test_unknown_proposal_raises(self):
         """Querying unknown proposal raises ValueError."""
         with self.assertRaises(ValueError):
-            self.tracker.get_proposal_status(b"\x00" * 32, 100, self.supply)
+            self.tracker.get_proposal_status(b"\x00" * 32, 100)
 
     def test_blocks_remaining_counts_down(self):
         """Blocks remaining decreases as chain advances."""
         info = self.tracker.get_proposal_info(
-            self.proposal_tx.proposal_id, current_block=10, supply_tracker=self.supply,
+            self.proposal_tx.proposal_id, current_block=10,
         )
         self.assertEqual(info["blocks_remaining"], GOVERNANCE_VOTING_WINDOW)
 
         info2 = self.tracker.get_proposal_info(
-            self.proposal_tx.proposal_id, current_block=110, supply_tracker=self.supply,
+            self.proposal_tx.proposal_id, current_block=110,
         )
         self.assertEqual(info2["blocks_remaining"], GOVERNANCE_VOTING_WINDOW - 100)
 

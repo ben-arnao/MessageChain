@@ -15,7 +15,9 @@ Transaction types:
 - DelegateTransaction: delegate voting power to another entity (single-hop)
 
 Rules:
-- Voting power = entity staked amount at time of tally
+- Voting power = entity staked amount at proposal creation (snapshot)
+- Votes are immutable — first vote wins, duplicates rejected
+- Votes on closed proposals are rejected
 - Delegation is single-hop (no transitive chains) and revocable
 - A direct vote always overrides delegation for that proposal
 - Proposals close after GOVERNANCE_VOTING_WINDOW blocks
@@ -335,6 +337,8 @@ class ProposalState:
     """Tracks the on-chain state of a proposal."""
     proposal: ProposalTransaction
     created_at_block: int
+    stake_snapshot: dict  # entity_id -> staked amount at proposal creation
+    total_eligible_stake: int
     votes: dict = field(default_factory=dict)  # voter_id -> bool
 
 
@@ -354,19 +358,30 @@ class GovernanceTracker:
         self.proposals: dict[bytes, ProposalState] = {}  # proposal_id -> state
         self.delegations: dict[bytes, bytes] = {}  # delegator_id -> delegate_id
 
-    def add_proposal(self, tx: ProposalTransaction, block_height: int):
-        """Register a new proposal from a validated ProposalTransaction."""
+    def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
+        """Register a new proposal and snapshot current stake distribution."""
+        snapshot = dict(supply_tracker.staked)
+        total = sum(snapshot.values())
         self.proposals[tx.proposal_id] = ProposalState(
             proposal=tx,
             created_at_block=block_height,
+            stake_snapshot=snapshot,
+            total_eligible_stake=total,
         )
 
-    def add_vote(self, tx: VoteTransaction):
-        """Record a vote from a validated VoteTransaction."""
+    def add_vote(self, tx: VoteTransaction, current_block: int) -> bool:
+        """Record a vote. Returns False if rejected (closed or duplicate)."""
         state = self.proposals.get(tx.proposal_id)
         if state is None:
-            return
+            return False
+        # Reject votes after voting window closes
+        if current_block - state.created_at_block > GOVERNANCE_VOTING_WINDOW:
+            return False
+        # Reject duplicate votes (immutable — first vote wins)
+        if tx.voter_id in state.votes:
+            return False
         state.votes[tx.voter_id] = tx.approve
+        return True
 
     def set_delegation(self, delegator_id: bytes, delegate_id: bytes):
         """Set or revoke a delegation."""
@@ -376,7 +391,7 @@ class GovernanceTracker:
             self.delegations[delegator_id] = delegate_id
 
     def get_proposal_status(
-        self, proposal_id: bytes, current_block: int, supply_tracker
+        self, proposal_id: bytes, current_block: int,
     ) -> ProposalStatus:
         """Determine whether a proposal is OPEN or CLOSED."""
         state = self.proposals.get(proposal_id)
@@ -389,19 +404,17 @@ class GovernanceTracker:
 
         return ProposalStatus.OPEN
 
-    def tally(
-        self, proposal_id: bytes, supply_tracker
-    ) -> tuple[int, int]:
-        """Tally votes for a proposal, weighted by staked tokens.
+    def tally(self, proposal_id: bytes) -> tuple[int, int]:
+        """Tally votes for a proposal, weighted by snapshotted stake.
 
         Returns (yes_weight, total_participating_weight).
 
-        Only staked tokens count as voting power — entities must have skin
-        in the game to influence vote outcomes.
+        Uses the stake snapshot captured at proposal creation — not live
+        state — so late staking cannot manipulate results.
 
         Delegation rules:
         - If entity A delegated to entity B, and B voted but A did not,
-          then A's stake counts toward B's vote direction.
+          then A's snapshot stake counts toward B's vote direction.
         - If A voted directly, their delegation is ignored for this proposal.
         - Single-hop only: if B delegated to C, A's weight does NOT follow.
         """
@@ -409,6 +422,7 @@ class GovernanceTracker:
         if state is None:
             return 0, 0
 
+        snapshot = state.stake_snapshot
         direct_votes = dict(state.votes)
 
         # Build reverse delegation map: delegate_id -> [delegator_ids]
@@ -422,7 +436,7 @@ class GovernanceTracker:
         total_weight = 0
 
         for voter_id, approve in direct_votes.items():
-            stake = supply_tracker.get_staked(voter_id)
+            stake = snapshot.get(voter_id, 0)
             total_weight += stake
             if approve:
                 yes_weight += stake
@@ -430,7 +444,7 @@ class GovernanceTracker:
             # Add delegated weight from entities who didn't vote directly
             for delegator_id in reverse_delegations.get(voter_id, []):
                 if delegator_id not in direct_votes:
-                    delegator_stake = supply_tracker.get_staked(delegator_id)
+                    delegator_stake = snapshot.get(delegator_id, 0)
                     total_weight += delegator_stake
                     if approve:
                         yes_weight += delegator_stake
@@ -438,15 +452,15 @@ class GovernanceTracker:
         return yes_weight, total_weight
 
     def get_proposal_info(
-        self, proposal_id: bytes, current_block: int, supply_tracker
+        self, proposal_id: bytes, current_block: int,
     ) -> dict:
         """Get a summary of a proposal's current state and tally."""
         state = self.proposals.get(proposal_id)
         if state is None:
             raise ValueError("Unknown proposal")
 
-        yes_weight, total_weight = self.tally(proposal_id, supply_tracker)
-        status = self.get_proposal_status(proposal_id, current_block, supply_tracker)
+        yes_weight, total_weight = self.tally(proposal_id)
+        status = self.get_proposal_status(proposal_id, current_block)
         blocks_remaining = max(
             0,
             GOVERNANCE_VOTING_WINDOW - (current_block - state.created_at_block),
@@ -461,6 +475,7 @@ class GovernanceTracker:
             "status": status.value,
             "yes_weight": yes_weight,
             "total_weight": total_weight,
+            "total_eligible_stake": state.total_eligible_stake,
             "approval_pct": (yes_weight / total_weight * 100) if total_weight > 0 else 0,
             "blocks_remaining": blocks_remaining,
             "direct_votes": len(state.votes),

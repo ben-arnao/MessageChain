@@ -2,6 +2,7 @@
 
 Voting power is determined by staked tokens, not wallet balance.
 Only entities with skin in the game (staked tokens) can influence votes.
+Voting power is snapshotted at proposal creation time.
 """
 
 import unittest
@@ -51,72 +52,56 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.alice, "Stake-weighted governance", "Test stake weighting",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=100)
+        self.tracker.add_proposal(self.proposal_tx, block_height=100, supply_tracker=self.supply)
 
     def test_unstaked_entity_has_zero_voting_power(self):
         """An entity with tokens but no stake has zero voting power."""
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 0)
         self.assertEqual(total_weight, 0)
 
     def test_staked_entity_voting_power_equals_stake(self):
         """Voting power equals staked amount, not wallet balance."""
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 5000)
         self.assertEqual(total_weight, 5000)
 
     def test_stake_weighted_majority(self):
         """Tally reflects stake-weighted majority correctly."""
-        # Bob (5000 stake) votes yes, Carol (3000 stake) votes no
         vote_yes = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.carol, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_yes)
-        self.tracker.add_vote(vote_no)
+        self.tracker.add_vote(vote_yes, current_block=101)
+        self.tracker.add_vote(vote_no, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
-        # 5000 / 8000 = 62.5%
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 5000)
         self.assertEqual(total_weight, 8000)
 
     def test_stake_weighted_rejection(self):
         """Tally reflects stake-weighted rejection correctly."""
-        # Dave (1000 stake) votes yes, Carol (3000 stake) votes no
         vote_yes = create_vote(self.dave, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.carol, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_yes)
-        self.tracker.add_vote(vote_no)
+        self.tracker.add_vote(vote_yes, current_block=101)
+        self.tracker.add_vote(vote_no, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
-        # 1000 / 4000 = 25%
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 1000)
         self.assertEqual(total_weight, 4000)
 
     def test_high_balance_low_stake_loses_to_low_balance_high_stake(self):
         """Balance is irrelevant — only stake determines voting power."""
-        # Alice (10k balance, 0 stake) votes no
-        # Bob (100 balance, 5k stake) votes yes
         vote_alice = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
         vote_bob = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote_alice)
-        self.tracker.add_vote(vote_bob)
+        self.tracker.add_vote(vote_alice, current_block=101)
+        self.tracker.add_vote(vote_bob, current_block=101)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 5000)
         self.assertEqual(total_weight, 5000)
 
@@ -147,18 +132,16 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.alice, "Test delegation", "Test delegation mechanics",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=50)
+        self.tracker.add_proposal(self.proposal_tx, block_height=50, supply_tracker=self.supply)
 
     def test_delegation_carries_stake_not_balance(self):
         """Delegated voting power is the delegator's stake, not balance."""
         self.tracker.set_delegation(self.alice.entity_id, self.bob.entity_id)
 
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 2500)
         self.assertEqual(total_weight, 2500)
 
@@ -168,12 +151,10 @@ class TestStakeWeightedDelegation(unittest.TestCase):
 
         vote_bob = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         vote_alice = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
-        self.tracker.add_vote(vote_bob)
-        self.tracker.add_vote(vote_alice)
+        self.tracker.add_vote(vote_bob, current_block=51)
+        self.tracker.add_vote(vote_alice, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 500)
         self.assertEqual(total_weight, 2500)
 
@@ -181,20 +162,25 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         """Delegator with no stake adds zero to delegate's voting power."""
         self.supply.staked[self.alice.entity_id] = 0
 
+        # Re-create proposal with updated supply (Alice now has 0 stake in snapshot)
+        self.tracker = GovernanceTracker()
+        self.proposal_tx = create_proposal(
+            self.alice, "Test delegation", "Test delegation mechanics",
+        )
+        self.tracker.add_proposal(self.proposal_tx, block_height=50, supply_tracker=self.supply)
+
         self.tracker.set_delegation(self.alice.entity_id, self.carol.entity_id)
 
         vote = create_vote(self.carol, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=51)
 
-        yes_weight, total_weight = self.tracker.tally(
-            self.proposal_tx.proposal_id, self.supply,
-        )
+        yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         self.assertEqual(yes_weight, 3000)
         self.assertEqual(total_weight, 3000)
 
 
 class TestStakeWeightedProposalStatus(unittest.TestCase):
-    """Proposal status uses stake-weighted tally."""
+    """Proposal status transitions."""
 
     @classmethod
     def setUpClass(cls):
@@ -215,40 +201,39 @@ class TestStakeWeightedProposalStatus(unittest.TestCase):
         self.proposal_tx = create_proposal(
             self.alice, "Status test", "Test proposal status",
         )
-        self.tracker.add_proposal(self.proposal_tx, block_height=100)
+        self.tracker.add_proposal(self.proposal_tx, block_height=100, supply_tracker=self.supply)
 
     def test_open_during_voting_window(self):
         """Proposal is OPEN during voting window regardless of votes."""
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=101)
 
-        status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, 150, self.supply,
-        )
+        status = self.tracker.get_proposal_status(self.proposal_tx.proposal_id, 150)
         self.assertEqual(status, ProposalStatus.OPEN)
 
     def test_closed_after_window(self):
         """Proposal is CLOSED after voting window ends."""
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        self.tracker.add_vote(vote, current_block=101)
 
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
-        status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, expired_block, self.supply,
-        )
+        status = self.tracker.get_proposal_status(self.proposal_tx.proposal_id, expired_block)
         self.assertEqual(status, ProposalStatus.CLOSED)
 
     def test_closed_when_only_unstaked_voted(self):
         """Proposal closes normally even if only unstaked entities voted."""
         self.supply.staked[self.alice.entity_id] = 0
 
-        vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
-        self.tracker.add_vote(vote)
+        # Need fresh proposal to snapshot the 0 stake
+        tracker = GovernanceTracker()
+        proposal_tx = create_proposal(self.alice, "Status test 2", "desc")
+        tracker.add_proposal(proposal_tx, block_height=100, supply_tracker=self.supply)
+
+        vote = create_vote(self.alice, proposal_tx.proposal_id, approve=True)
+        tracker.add_vote(vote, current_block=101)
 
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
-        status = self.tracker.get_proposal_status(
-            self.proposal_tx.proposal_id, expired_block, self.supply,
-        )
+        status = tracker.get_proposal_status(proposal_tx.proposal_id, expired_block)
         self.assertEqual(status, ProposalStatus.CLOSED)
 
 
