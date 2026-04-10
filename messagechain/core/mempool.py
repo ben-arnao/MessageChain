@@ -12,7 +12,7 @@ Now supports:
 
 import time
 from collections import defaultdict
-from messagechain.config import MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT
+from messagechain.config import MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT, MEMPOOL_MAX_ANCESTORS
 from messagechain.core.transaction import MessageTransaction
 
 
@@ -42,8 +42,8 @@ class Mempool:
         if self._is_expired(tx):
             return False
 
-        # Per-sender limit: prevent one entity from flooding the mempool
-        if self._sender_counts[tx.entity_id] >= self.per_sender_limit:
+        # Per-sender ancestor limit: prevent deep unconfirmed chains (BTC-style)
+        if self._sender_counts[tx.entity_id] >= min(self.per_sender_limit, MEMPOOL_MAX_ANCESTORS):
             return False
 
         if len(self.pending) >= self.max_size:

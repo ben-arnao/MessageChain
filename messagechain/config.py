@@ -21,6 +21,9 @@ MAX_TIMESTAMP_DRIFT = 300  # max seconds a tx timestamp can be ahead of current 
 # Block parameters
 BLOCK_TIME_TARGET = 10  # seconds between blocks
 MAX_TXS_PER_BLOCK = 50
+MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
+COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
+MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
 
 # Cryptography
 HASH_ALGO = "sha3_256"
@@ -49,6 +52,14 @@ BAN_DURATION = 86400      # ban length in seconds (24 hours)
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
 MEMPOOL_PER_SENDER_LIMIT = 25 # max pending txs per entity in mempool
+MEMPOOL_MAX_ANCESTORS = 25    # max unconfirmed tx chain depth per entity (BTC-style)
+
+# Address manager (Sybil/eclipse resistance)
+ADDRMAN_NEW_BUCKET_COUNT = 256      # buckets in the "new" table
+ADDRMAN_TRIED_BUCKET_COUNT = 64     # buckets in the "tried" table
+ADDRMAN_BUCKET_SIZE = 64            # entries per bucket
+ADDRMAN_MAX_PER_SOURCE = 32        # max addresses accepted from a single source
+ADDRMAN_HORIZON_DAYS = 30           # max age before address is considered stale
 
 # inv/getdata relay
 INV_BATCH_SIZE = 500      # max tx hashes per INV message

@@ -16,7 +16,10 @@ Now supports:
 
 import hashlib
 import logging
-from messagechain.config import HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION
+from messagechain.config import (
+    HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
+    MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
+)
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
@@ -65,6 +68,8 @@ class Blockchain:
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
+        # Immature block rewards: list of (block_height, proposer_id, reward_amount)
+        self._immature_rewards: list[tuple[int, bytes, int]] = []
 
         # If db exists, try to load persisted state
         if self.db is not None:
@@ -268,8 +273,8 @@ class Blockchain:
         if tx.timestamp <= 0:
             return False, "Transaction must have a valid timestamp"
 
-        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
-            return False, f"Insufficient balance for fee of {tx.fee}"
+        if self.get_spendable_balance(tx.entity_id) < tx.fee:
+            return False, f"Insufficient spendable balance for fee of {tx.fee}"
 
         public_key = self.public_keys[tx.entity_id]
         if not verify_transaction(tx, public_key):
@@ -371,6 +376,36 @@ class Blockchain:
         )
 
         return True, f"Validator slashed (total={slashed}, reward={finder_reward})"
+
+    def get_median_time_past(self) -> float:
+        """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
+
+        Returns the median timestamp of the most recent blocks. This prevents
+        proposers from manipulating timestamps to affect timelocks, unbonding
+        periods, and TTLs. Same mechanism as Bitcoin (BIP 113).
+        """
+        if not self.chain:
+            return 0.0
+        timestamps = [
+            b.header.timestamp
+            for b in self.chain[-MTP_BLOCK_COUNT:]
+        ]
+        timestamps.sort()
+        return timestamps[len(timestamps) // 2]
+
+    def get_immature_balance(self, entity_id: bytes) -> int:
+        """Get the total immature (locked) block reward balance for an entity."""
+        current_height = self.height
+        return sum(
+            amount for height, eid, amount in self._immature_rewards
+            if eid == entity_id and current_height - height < COINBASE_MATURITY
+        )
+
+    def get_spendable_balance(self, entity_id: bytes) -> int:
+        """Get spendable balance (total balance minus immature rewards)."""
+        total = self.supply.get_balance(entity_id)
+        immature = self.get_immature_balance(entity_id)
+        return total - immature
 
     def compute_current_state_root(self) -> bytes:
         """Compute a Merkle commitment to the current account state."""
@@ -493,9 +528,28 @@ class Blockchain:
         if block.header.block_number != latest.header.block_number + 1:
             return False, "Invalid block number"
 
+        # Check block timestamp against Median Time Past (BIP 113)
+        mtp = self.get_median_time_past()
+        if block.header.timestamp <= mtp:
+            return False, f"Block timestamp {block.header.timestamp} must exceed median time past {mtp}"
+
         # Check transaction count
         if len(block.transactions) > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
+
+        # Check for duplicate transaction hashes within the block
+        seen_tx_hashes = set()
+        for tx in block.transactions:
+            if tx.tx_hash in seen_tx_hashes:
+                return False, f"Duplicate transaction {tx.tx_hash.hex()[:16]} in block"
+            seen_tx_hashes.add(tx.tx_hash)
+
+        # Check total signature verification cost (sigops-style limit)
+        # Each tx signature costs 1, proposer signature costs 1, each attestation costs 1
+        import messagechain.config
+        sig_cost = len(block.transactions) + 1 + len(block.attestations)
+        if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
+            return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {MAX_BLOCK_SIG_COST}"
 
         # Verify merkle root
         tx_hashes = [tx.tx_hash for tx in block.transactions]
@@ -530,9 +584,9 @@ class Blockchain:
                     f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
                 )
 
-            # Check cumulative fee spend within this block doesn't exceed balance
+            # Check cumulative fee spend within this block doesn't exceed spendable balance
             spent_so_far = pending_balance_spent.get(tx.entity_id, 0)
-            if self.supply.get_balance(tx.entity_id) < spent_so_far + tx.fee:
+            if self.get_spendable_balance(tx.entity_id) < spent_so_far + tx.fee:
                 return False, (
                     f"Invalid tx {tx.tx_hash.hex()[:16]}: "
                     f"Insufficient balance for fee of {tx.fee}"
@@ -592,7 +646,17 @@ class Blockchain:
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
-        self.supply.mint_block_reward(proposer_id, block.header.block_number)
+        reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
+        # Track immature reward for coinbase maturity enforcement
+        self._immature_rewards.append(
+            (block.header.block_number, proposer_id, reward)
+        )
+        # Prune fully-matured rewards to bound memory
+        cutoff = block.header.block_number - COINBASE_MATURITY
+        self._immature_rewards = [
+            (h, eid, amt) for h, eid, amt in self._immature_rewards
+            if h > cutoff
+        ]
         # Track proposer's block signature count (WOTS+ leaf consumed)
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1
@@ -844,6 +908,7 @@ class Blockchain:
         self.key_rotation_counts = {}
         self.public_keys = {}
         self.slashed_validators = set()
+        self._immature_rewards = []
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -867,6 +932,7 @@ class Blockchain:
             "total_fees_collected": self.supply.total_fees_collected,
             "chain_length": len(self.chain),
             "slashed_validators": set(self.slashed_validators),
+            "immature_rewards": list(self._immature_rewards),
         }
 
     def _restore_memory_snapshot(self, snapshot: dict):
@@ -884,6 +950,7 @@ class Blockchain:
         self.slash_sig_counts = snapshot.get("slash_sig_counts", {})
         self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
         self.slashed_validators = snapshot.get("slashed_validators", set())
+        self._immature_rewards = snapshot.get("immature_rewards", [])
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
         """Total WOTS+ leaves consumed by this entity across ALL signature types.
