@@ -6,8 +6,10 @@ issuance the effective circulating supply would shrink to zero over time.
 Controlled inflation ensures the network remains usable indefinitely.
 
 Model:
-- Fixed block reward, halving periodically (like BTC's issuance schedule)
+- Fixed block reward (power of 2), halving periodically (like BTC's issuance)
 - Block reward = BLOCK_REWARD / (2 ^ (block_height // HALVING_INTERVAL))
+- BLOCK_REWARD=16 gives 4 meaningful halvings (16->8->4->2->1) over ~16 years
+- Floor of 1 token/block ensures permanent diminishing issuance
 - Transaction fees use a BTC-style bidding system: users set their own fee,
   higher fee = higher priority for block inclusion
 - Fees are paid to the block proposer (incentivizes validators)

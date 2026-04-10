@@ -8,10 +8,10 @@ MAX_MESSAGE_CHARS = 280  # max characters per message (Twitter-length short mess
 MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode room)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
-# Target: ~1% annual inflation that diminishes over time via halvings.
-# At BLOCK_TIME_TARGET=10s, ~3,153,600 blocks/year.
-# Year 1: 3 tokens/block * 3,153,600 = 9,460,800 minted against 1B supply = ~0.95%
-# Halving every ~4 years gradually reduces rate while keeping inflation meaningful.
+# BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
+# At BLOCK_TIME_TARGET=10s, ~3,155,760 blocks/year.
+# Year 1: 16 tokens/block * 3,155,760 ≈ 50.5M minted against 1B supply ≈ 1.6%/year
+# 4 meaningful halvings over ~16 years (16→8→4→2→1), then floor of 1 forever.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
 
@@ -30,7 +30,7 @@ DEFAULT_GENESIS_ALLOCATIONS = {
     # Genesis validator allocation is added dynamically in Blockchain.initialize_genesis
 }
 
-BLOCK_REWARD = 3  # new tokens minted per block (paid to proposer)
+BLOCK_REWARD = 16  # new tokens minted per block (paid to proposer)
 HALVING_INTERVAL = 12_614_400  # blocks between reward halvings (~4 years at 10s blocks)
 MIN_FEE = 1  # minimum transaction fee
 
