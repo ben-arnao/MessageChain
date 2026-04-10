@@ -102,6 +102,33 @@ class Mempool:
         """Check if a transaction has exceeded its TTL."""
         return time.time() - tx.timestamp > self.tx_ttl
 
+    def try_replace_by_fee(self, new_tx: MessageTransaction) -> bool:
+        """Replace an existing unconfirmed transaction with a higher-fee version.
+
+        BIP 125-style RBF: the new transaction must have the same sender and
+        nonce as an existing mempool transaction, and a strictly higher fee.
+
+        Returns True if replacement succeeded, False otherwise.
+        """
+        # Find existing tx from same sender with same nonce
+        existing = None
+        for tx in self.pending.values():
+            if tx.entity_id == new_tx.entity_id and tx.nonce == new_tx.nonce:
+                existing = tx
+                break
+
+        if existing is None:
+            return False  # nothing to replace
+
+        if new_tx.fee <= existing.fee:
+            return False  # new fee must be strictly higher
+
+        # Remove old, add new
+        self._remove_tx(existing)
+        self.pending[new_tx.tx_hash] = new_tx
+        self._sender_counts[new_tx.entity_id] += 1
+        return True
+
     def get_fee_estimate(self) -> int:
         """Estimate fee needed to get into the next block (median of pending)."""
         if not self.pending:

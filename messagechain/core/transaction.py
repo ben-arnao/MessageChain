@@ -30,6 +30,7 @@ class MessageTransaction:
     nonce: int  # per-entity tx counter (replay protection)
     fee: int  # user-set fee (higher = more likely to be included in next block)
     signature: Signature
+    version: int = 1  # transaction format version (enables future upgrades without hard forks)
     tx_hash: bytes = b""
 
     def __post_init__(self):
@@ -39,7 +40,8 @@ class MessageTransaction:
     def _signable_data(self) -> bytes:
         """Canonical byte representation for signing (excludes signature and tx_hash)."""
         return (
-            self.entity_id
+            struct.pack(">I", self.version)
+            + self.entity_id
             + self.message
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.nonce)
@@ -57,6 +59,7 @@ class MessageTransaction:
 
     def serialize(self) -> dict:
         return {
+            "version": self.version,
             "entity_id": self.entity_id.hex(),
             "message": self.message.decode("utf-8", errors="replace"),
             "timestamp": self.timestamp,
@@ -76,6 +79,7 @@ class MessageTransaction:
             nonce=data["nonce"],
             fee=data["fee"],
             signature=sig,
+            version=data.get("version", 1),
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
