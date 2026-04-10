@@ -134,6 +134,30 @@ def build_parser() -> argparse.ArgumentParser:
     delegate.add_argument("--fee", type=int, default=None, help="Transaction fee")
     delegate.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- propose ---
+    propose = sub.add_parser(
+        "propose",
+        help="Propose a governance vote",
+        description="Create a governance proposal for validators to vote on.",
+    )
+    propose.add_argument("--title", required=True, help="Short title for the proposal")
+    propose.add_argument("--description", required=True, help="Detailed description")
+    propose.add_argument("--fee", type=int, default=None, help="Transaction fee (default: 1000)")
+    propose.add_argument("--server", type=str, default=None, help="Server address host:port")
+
+    # --- vote ---
+    vote = sub.add_parser(
+        "vote",
+        help="Vote on a governance proposal",
+        description="Cast a yes/no vote on an active proposal.",
+    )
+    vote.add_argument("--proposal", required=True, help="Proposal ID (hex)")
+    vote_group = vote.add_mutually_exclusive_group(required=True)
+    vote_group.add_argument("--yes", action="store_true", help="Vote yes")
+    vote_group.add_argument("--no", action="store_true", help="Vote no")
+    vote.add_argument("--fee", type=int, default=None, help="Transaction fee (default: 100)")
+    vote.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- generate-key ---
     sub.add_parser(
         "generate-key",
@@ -600,6 +624,98 @@ def cmd_delegate(args):
         sys.exit(1)
 
 
+def cmd_propose(args):
+    """Create a governance proposal."""
+    from messagechain.identity.identity import Entity
+    from messagechain.governance.governance import create_proposal
+    from messagechain.config import GOVERNANCE_PROPOSAL_FEE
+
+    print("=== Create Proposal ===\n")
+    print(f"  Title: {args.title}")
+    print(f"  Description: {args.description}")
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nProposing as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    fee = args.fee if args.fee is not None else GOVERNANCE_PROPOSAL_FEE
+    tx = create_proposal(entity, args.title, args.description, fee=fee)
+
+    response = rpc_call(host, port, "submit_proposal", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nProposal created!")
+        print(f"  Proposal ID: {result['proposal_id']}")
+        print(f"  Fee:         {result['fee']} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_vote(args):
+    """Cast a vote on a governance proposal."""
+    from messagechain.identity.identity import Entity
+    from messagechain.governance.governance import create_vote
+    from messagechain.config import GOVERNANCE_VOTE_FEE
+
+    approve = args.yes
+    print(f"=== Cast Vote ({'YES' if approve else 'NO'}) ===\n")
+    print(f"  Proposal: {args.proposal[:16]}...")
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nVoting as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    from messagechain.validation import parse_hex
+    proposal_id = parse_hex(args.proposal)
+    if proposal_id is None:
+        print(f"Error: Invalid proposal ID (not valid hex): {args.proposal}")
+        sys.exit(1)
+
+    fee = args.fee if args.fee is not None else GOVERNANCE_VOTE_FEE
+    tx = create_vote(entity, proposal_id, approve, fee=fee)
+
+    response = rpc_call(host, port, "submit_vote", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nVote submitted!")
+        print(f"  Vote:    {'YES' if approve else 'NO'}")
+        print(f"  TX hash: {result['tx_hash']}")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_generate_key(_args):
     """Generate a new cryptographically random private key."""
     import os
@@ -680,6 +796,8 @@ def main():
         "stake": cmd_stake,
         "unstake": cmd_unstake,
         "delegate": cmd_delegate,
+        "propose": cmd_propose,
+        "vote": cmd_vote,
         "generate-key": cmd_generate_key,
         "read": cmd_read,
         "demo": cmd_demo,

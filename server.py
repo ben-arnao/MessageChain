@@ -290,6 +290,12 @@ class Server:
         elif method == "submit_delegation":
             return self._rpc_submit_delegation(request["params"])
 
+        elif method == "submit_proposal":
+            return self._rpc_submit_proposal(request["params"])
+
+        elif method == "submit_vote":
+            return self._rpc_submit_vote(request["params"])
+
         elif method == "get_messages":
             count = request.get("params", {}).get("count", 10)
             count = min(count, 100)  # cap to prevent abuse
@@ -485,6 +491,81 @@ class Server:
                 "entity_id": entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
                 "targets": targets_info,
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_submit_proposal(self, params: dict) -> dict:
+        """Accept a signed governance proposal from a client."""
+        try:
+            from messagechain.governance.governance import (
+                ProposalTransaction, verify_proposal, GovernanceTracker,
+            )
+            tx = ProposalTransaction.deserialize(params["transaction"])
+            entity_id = tx.proposer_id
+
+            if entity_id not in self.blockchain.public_keys:
+                return {"ok": False, "error": "Entity not registered"}
+
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_proposal(tx, public_key):
+                return {"ok": False, "error": "Invalid proposal transaction"}
+
+            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
+                return {"ok": False, "error": "Insufficient balance for fee"}
+
+            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
+
+            if not hasattr(self, 'governance'):
+                self.governance = GovernanceTracker()
+            self.governance.add_proposal(tx, self.blockchain.height, self.blockchain.supply)
+
+            if self.blockchain.db is not None:
+                self.blockchain._persist_state()
+
+            return {"ok": True, "result": {
+                "proposal_id": tx.proposal_id.hex(),
+                "title": tx.title,
+                "fee": tx.fee,
+                "tx_hash": tx.tx_hash.hex(),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_submit_vote(self, params: dict) -> dict:
+        """Accept a signed governance vote from a client."""
+        try:
+            from messagechain.governance.governance import (
+                VoteTransaction, verify_vote, GovernanceTracker,
+            )
+            tx = VoteTransaction.deserialize(params["transaction"])
+            entity_id = tx.voter_id
+
+            if entity_id not in self.blockchain.public_keys:
+                return {"ok": False, "error": "Entity not registered"}
+
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_vote(tx, public_key):
+                return {"ok": False, "error": "Invalid vote transaction"}
+
+            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
+                return {"ok": False, "error": "Insufficient balance for fee"}
+
+            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
+
+            if not hasattr(self, 'governance'):
+                self.governance = GovernanceTracker()
+            accepted = self.governance.add_vote(tx, self.blockchain.height)
+            if not accepted:
+                return {"ok": False, "error": "Vote rejected (proposal closed or duplicate)"}
+
+            if self.blockchain.db is not None:
+                self.blockchain._persist_state()
+
+            return {"ok": True, "result": {
+                "tx_hash": tx.tx_hash.hex(),
+                "proposal_id": tx.proposal_id.hex(),
+                "approve": tx.approve,
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
