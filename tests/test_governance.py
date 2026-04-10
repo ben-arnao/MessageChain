@@ -168,6 +168,11 @@ class TestGovernanceTracker(unittest.TestCase):
         self.supply.balances[self.bob.entity_id] = 2000
         self.supply.balances[self.carol.entity_id] = 3000
         self.supply.balances[self.dave.entity_id] = 4000
+        # Voting power is stake-weighted — set staked amounts to match balances
+        self.supply.staked[self.alice.entity_id] = 1000
+        self.supply.staked[self.bob.entity_id] = 2000
+        self.supply.staked[self.carol.entity_id] = 3000
+        self.supply.staked[self.dave.entity_id] = 4000
 
         self.owner = self.alice
         self.tracker = GovernanceTracker(owner_id=self.alice.entity_id)
@@ -299,6 +304,11 @@ class TestDelegation(unittest.TestCase):
         self.supply.balances[self.bob.entity_id] = 500
         self.supply.balances[self.carol.entity_id] = 3000
         self.supply.balances[self.dave.entity_id] = 200
+        # Voting power is stake-weighted — set staked amounts to match balances
+        self.supply.staked[self.alice.entity_id] = 1000
+        self.supply.staked[self.bob.entity_id] = 500
+        self.supply.staked[self.carol.entity_id] = 3000
+        self.supply.staked[self.dave.entity_id] = 200
 
         self.tracker = GovernanceTracker()
 
@@ -424,6 +434,9 @@ class TestGovernanceInfo(unittest.TestCase):
         self.supply = SupplyTracker()
         self.supply.balances[self.alice.entity_id] = 1000
         self.supply.balances[self.bob.entity_id] = 1000
+        # Voting power is stake-weighted
+        self.supply.staked[self.alice.entity_id] = 1000
+        self.supply.staked[self.bob.entity_id] = 1000
 
         self.tracker = GovernanceTracker(owner_id=self.alice.entity_id)
 

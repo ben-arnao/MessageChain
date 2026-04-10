@@ -2,16 +2,17 @@
 On-chain governance for MessageChain.
 
 Enables stake-holders to vote on protocol/codebase changes (e.g., GitHub PRs)
-using their wallet balance as voting weight. Designed so the community can
-signal consensus before changes are merged.
+using their staked tokens as voting weight. Designed so the community can
+signal consensus before changes are merged. Only entities with skin in the
+game (staked tokens) can influence governance decisions.
 
 Transaction types:
 - ProposalTransaction: create a proposal linked to a PR (URL + content hash)
-- VoteTransaction: cast a balance-weighted yes/no vote on a proposal
+- VoteTransaction: cast a stake-weighted yes/no vote on a proposal
 - DelegateTransaction: delegate voting power to another entity (single-hop)
 
 Rules:
-- Voting power = entity wallet balance at time of tally
+- Voting power = entity staked amount at time of tally
 - Delegation is single-hop (no transitive chains) and revocable
 - A direct vote always overrides delegation for that proposal
 - Proposals expire after GOVERNANCE_VOTING_WINDOW blocks
@@ -125,7 +126,7 @@ class ProposalTransaction:
 
 @dataclass
 class VoteTransaction:
-    """Cast a balance-weighted vote on a governance proposal.
+    """Cast a stake-weighted vote on a governance proposal.
 
     Fields:
         voter_id: entity casting the vote
@@ -413,7 +414,7 @@ class GovernanceTracker:
 
         A proposal can be merged if:
         - Owner approved it (always sufficient), OR
-        - >50% of participating wallet balance voted yes
+        - >50% of participating stake voted yes
         """
         state = self.proposals.get(proposal_id)
         if state is None:
@@ -432,13 +433,16 @@ class GovernanceTracker:
     def tally(
         self, proposal_id: bytes, supply_tracker
     ) -> tuple[int, int]:
-        """Tally votes for a proposal, weighted by wallet balance.
+        """Tally votes for a proposal, weighted by staked tokens.
 
         Returns (yes_weight, total_participating_weight).
 
+        Only staked tokens count as voting power — entities must have skin
+        in the game to influence governance decisions.
+
         Delegation rules:
         - If entity A delegated to entity B, and B voted but A did not,
-          then A's balance counts toward B's vote direction.
+          then A's stake counts toward B's vote direction.
         - If A voted directly, their delegation is ignored for this proposal.
         - Single-hop only: if B delegated to C, A's weight does NOT follow.
         """
@@ -461,20 +465,20 @@ class GovernanceTracker:
 
         # Process each direct voter
         for voter_id, approve in direct_votes.items():
-            # Voter's own balance
-            balance = supply_tracker.get_balance(voter_id)
-            total_weight += balance
+            # Voter's staked amount determines voting power
+            stake = supply_tracker.get_staked(voter_id)
+            total_weight += stake
             if approve:
-                yes_weight += balance
+                yes_weight += stake
 
             # Add delegated weight from entities who delegated to this voter
             # but did NOT vote directly themselves
             for delegator_id in reverse_delegations.get(voter_id, []):
                 if delegator_id not in direct_votes:
-                    delegator_balance = supply_tracker.get_balance(delegator_id)
-                    total_weight += delegator_balance
+                    delegator_stake = supply_tracker.get_staked(delegator_id)
+                    total_weight += delegator_stake
                     if approve:
-                        yes_weight += delegator_balance
+                        yes_weight += delegator_stake
 
         return yes_weight, total_weight
 
