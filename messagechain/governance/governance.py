@@ -1,13 +1,16 @@
 """
-On-chain governance for MessageChain.
+On-chain voting for MessageChain.
 
-Enables stake-holders to vote on protocol/codebase changes (e.g., GitHub PRs)
-using their staked tokens as voting weight. Designed so the community can
-signal consensus before changes are merged. Only entities with skin in the
-game (staked tokens) can influence governance decisions.
+A general-purpose secure voting system that records proposals, votes,
+and results on-chain. Stake-holders vote using their staked tokens as
+voting weight. Only entities with skin in the game (staked tokens) can
+influence vote outcomes.
+
+What happens downstream of the vote results is out of scope — this
+module provides a tamper-proof record of votes, nothing more.
 
 Transaction types:
-- ProposalTransaction: create a proposal linked to a PR (URL + content hash)
+- ProposalTransaction: create a proposal (title + description + optional reference hash)
 - VoteTransaction: cast a stake-weighted yes/no vote on a proposal
 - DelegateTransaction: delegate voting power to another entity (single-hop)
 
@@ -15,12 +18,7 @@ Rules:
 - Voting power = entity staked amount at time of tally
 - Delegation is single-hop (no transitive chains) and revocable
 - A direct vote always overrides delegation for that proposal
-- Proposals expire after GOVERNANCE_VOTING_WINDOW blocks
-- Repo owner can approve unilaterally (bypass consensus)
-- Repo owner approval is always sufficient for merge
-
-Proposal references both a human-readable PR URL and a SHA3-256 hash of the
-diff content, so voters know exactly what they are approving.
+- Proposals close after GOVERNANCE_VOTING_WINDOW blocks
 """
 
 import hashlib
@@ -31,7 +29,6 @@ from enum import Enum
 from messagechain.config import (
     HASH_ALGO,
     GOVERNANCE_VOTING_WINDOW,
-    GOVERNANCE_APPROVAL_THRESHOLD,
     GOVERNANCE_PROPOSAL_FEE,
     GOVERNANCE_VOTE_FEE,
     GOVERNANCE_DELEGATE_FEE,
@@ -49,24 +46,24 @@ def _hash(data: bytes) -> bytes:
 
 @dataclass
 class ProposalTransaction:
-    """Create a governance proposal linked to a PR.
+    """Create a governance proposal.
 
     Fields:
         proposer_id: entity creating the proposal
-        pr_url: GitHub PR URL (human-readable reference)
-        content_hash: SHA3-256 of the diff content (tamper-proof reference)
-        description: short description of the proposed change
+        title: short subject identifying what is being voted on
+        description: detailed description of the proposal
+        reference_hash: optional SHA3-256 hash of referenced external content
         timestamp: creation time
         fee: must be >= GOVERNANCE_PROPOSAL_FEE
         signature: proposer's quantum-resistant signature
     """
     proposer_id: bytes
-    pr_url: str
-    content_hash: bytes
+    title: str
     description: str
     timestamp: float
     fee: int
     signature: Signature
+    reference_hash: bytes = b""
     tx_hash: bytes = b""
 
     def __post_init__(self):
@@ -77,9 +74,9 @@ class ProposalTransaction:
         return (
             b"governance_proposal"
             + self.proposer_id
-            + self.pr_url.encode("utf-8")
-            + self.content_hash
+            + self.title.encode("utf-8")
             + self.description.encode("utf-8")
+            + self.reference_hash
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.fee)
         )
@@ -96,9 +93,9 @@ class ProposalTransaction:
         return {
             "type": "governance_proposal",
             "proposer_id": self.proposer_id.hex(),
-            "pr_url": self.pr_url,
-            "content_hash": self.content_hash.hex(),
+            "title": self.title,
             "description": self.description,
+            "reference_hash": self.reference_hash.hex(),
             "timestamp": self.timestamp,
             "fee": self.fee,
             "signature": self.signature.serialize(),
@@ -108,14 +105,16 @@ class ProposalTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "ProposalTransaction":
         sig = Signature.deserialize(data["signature"])
+        ref_hash_hex = data.get("reference_hash", "")
+        ref_hash = bytes.fromhex(ref_hash_hex) if ref_hash_hex else b""
         tx = cls(
             proposer_id=bytes.fromhex(data["proposer_id"]),
-            pr_url=data["pr_url"],
-            content_hash=bytes.fromhex(data["content_hash"]),
+            title=data["title"],
             description=data["description"],
             timestamp=data["timestamp"],
             fee=data["fee"],
             signature=sig,
+            reference_hash=ref_hash,
         )
         expected_hash = tx._compute_hash()
         declared_hash = bytes.fromhex(data["tx_hash"])
@@ -262,20 +261,20 @@ class DelegateTransaction:
 
 def create_proposal(
     proposer_entity,
-    pr_url: str,
-    content_hash: bytes,
+    title: str,
     description: str,
+    reference_hash: bytes = b"",
     fee: int = GOVERNANCE_PROPOSAL_FEE,
 ) -> ProposalTransaction:
     """Create and sign a governance proposal."""
     tx = ProposalTransaction(
         proposer_id=proposer_entity.entity_id,
-        pr_url=pr_url,
-        content_hash=content_hash,
+        title=title,
         description=description,
         timestamp=time.time(),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
+        reference_hash=reference_hash,
     )
     msg_hash = _hash(tx._signable_data())
     tx.signature = proposer_entity.keypair.sign(msg_hash)
@@ -327,18 +326,15 @@ def create_delegation(
 
 
 class ProposalStatus(Enum):
-    ACTIVE = "active"
-    APPROVED = "approved"
-    REJECTED = "rejected"
-    EXPIRED = "expired"
+    OPEN = "open"
+    CLOSED = "closed"
 
 
 @dataclass
 class ProposalState:
-    """Tracks the on-chain state of a governance proposal."""
+    """Tracks the on-chain state of a proposal."""
     proposal: ProposalTransaction
     created_at_block: int
-    owner_approved: bool = False
     votes: dict = field(default_factory=dict)  # voter_id -> bool
 
 
@@ -346,14 +342,15 @@ class ProposalState:
 
 
 class GovernanceTracker:
-    """Tracks all governance state: proposals, votes, delegations, owner.
+    """Tracks all voting state: proposals, votes, and delegations.
 
-    This is the core state machine for on-chain governance. It is updated
+    This is the core state machine for on-chain voting. It is updated
     by the blockchain when governance transactions are included in blocks.
+    The tracker records votes and tallies results — it does not enforce
+    any outcomes.
     """
 
-    def __init__(self, owner_id: bytes | None = None):
-        self.owner_id: bytes | None = owner_id
+    def __init__(self):
         self.proposals: dict[bytes, ProposalState] = {}  # proposal_id -> state
         self.delegations: dict[bytes, bytes] = {}  # delegator_id -> delegate_id
 
@@ -378,57 +375,19 @@ class GovernanceTracker:
         else:
             self.delegations[delegator_id] = delegate_id
 
-    def owner_approve(self, proposal_id: bytes):
-        """Mark a proposal as owner-approved."""
-        state = self.proposals.get(proposal_id)
-        if state is not None:
-            state.owner_approved = True
-
     def get_proposal_status(
         self, proposal_id: bytes, current_block: int, supply_tracker
     ) -> ProposalStatus:
-        """Determine the current status of a proposal."""
+        """Determine whether a proposal is OPEN or CLOSED."""
         state = self.proposals.get(proposal_id)
         if state is None:
             raise ValueError("Unknown proposal")
 
-        # Owner approval always results in APPROVED
-        if state.owner_approved:
-            return ProposalStatus.APPROVED
-
-        # Check if voting window has expired
         blocks_elapsed = current_block - state.created_at_block
         if blocks_elapsed > GOVERNANCE_VOTING_WINDOW:
-            # Window closed — check final tally
-            yes_weight, total_weight = self.tally(proposal_id, supply_tracker)
-            if total_weight > 0 and (yes_weight / total_weight) > GOVERNANCE_APPROVAL_THRESHOLD:
-                return ProposalStatus.APPROVED
-            return ProposalStatus.EXPIRED
+            return ProposalStatus.CLOSED
 
-        return ProposalStatus.ACTIVE
-
-    def can_merge(
-        self, proposal_id: bytes, current_block: int, supply_tracker
-    ) -> bool:
-        """Check if a proposal has met the conditions for merge.
-
-        A proposal can be merged if:
-        - Owner approved it (always sufficient), OR
-        - >50% of participating stake voted yes
-        """
-        state = self.proposals.get(proposal_id)
-        if state is None:
-            return False
-
-        # Owner can always merge
-        if state.owner_approved:
-            return True
-
-        # Check consensus
-        yes_weight, total_weight = self.tally(proposal_id, supply_tracker)
-        if total_weight == 0:
-            return False
-        return (yes_weight / total_weight) > GOVERNANCE_APPROVAL_THRESHOLD
+        return ProposalStatus.OPEN
 
     def tally(
         self, proposal_id: bytes, supply_tracker
@@ -438,7 +397,7 @@ class GovernanceTracker:
         Returns (yes_weight, total_participating_weight).
 
         Only staked tokens count as voting power — entities must have skin
-        in the game to influence governance decisions.
+        in the game to influence vote outcomes.
 
         Delegation rules:
         - If entity A delegated to entity B, and B voted but A did not,
@@ -450,7 +409,6 @@ class GovernanceTracker:
         if state is None:
             return 0, 0
 
-        # Collect direct votes: voter_id -> approve
         direct_votes = dict(state.votes)
 
         # Build reverse delegation map: delegate_id -> [delegator_ids]
@@ -463,16 +421,13 @@ class GovernanceTracker:
         yes_weight = 0
         total_weight = 0
 
-        # Process each direct voter
         for voter_id, approve in direct_votes.items():
-            # Voter's staked amount determines voting power
             stake = supply_tracker.get_staked(voter_id)
             total_weight += stake
             if approve:
                 yes_weight += stake
 
-            # Add delegated weight from entities who delegated to this voter
-            # but did NOT vote directly themselves
+            # Add delegated weight from entities who didn't vote directly
             for delegator_id in reverse_delegations.get(voter_id, []):
                 if delegator_id not in direct_votes:
                     delegator_stake = supply_tracker.get_staked(delegator_id)
@@ -485,7 +440,7 @@ class GovernanceTracker:
     def get_proposal_info(
         self, proposal_id: bytes, current_block: int, supply_tracker
     ) -> dict:
-        """Get a summary of a proposal's current state."""
+        """Get a summary of a proposal's current state and tally."""
         state = self.proposals.get(proposal_id)
         if state is None:
             raise ValueError("Unknown proposal")
@@ -499,18 +454,16 @@ class GovernanceTracker:
 
         return {
             "proposal_id": proposal_id.hex(),
-            "pr_url": state.proposal.pr_url,
-            "content_hash": state.proposal.content_hash.hex(),
+            "title": state.proposal.title,
             "description": state.proposal.description,
+            "reference_hash": state.proposal.reference_hash.hex() if state.proposal.reference_hash else "",
             "proposer": state.proposal.proposer_id.hex(),
             "status": status.value,
-            "owner_approved": state.owner_approved,
             "yes_weight": yes_weight,
             "total_weight": total_weight,
             "approval_pct": (yes_weight / total_weight * 100) if total_weight > 0 else 0,
             "blocks_remaining": blocks_remaining,
             "direct_votes": len(state.votes),
-            "can_merge": self.can_merge(proposal_id, current_block, supply_tracker),
         }
 
 
@@ -521,9 +474,9 @@ def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
     """Verify a proposal transaction's signature."""
     if tx.fee < GOVERNANCE_PROPOSAL_FEE:
         return False
-    if not tx.pr_url:
+    if not tx.title:
         return False
-    if not tx.content_hash or len(tx.content_hash) != 32:
+    if tx.reference_hash and len(tx.reference_hash) != 32:
         return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)
@@ -543,7 +496,6 @@ def verify_delegation(tx: DelegateTransaction, public_key: bytes) -> bool:
     """Verify a delegation transaction's signature."""
     if tx.fee < GOVERNANCE_DELEGATE_FEE:
         return False
-    # Cannot delegate to yourself
     if tx.delegate_id == tx.delegator_id:
         return False
     msg_hash = _hash(tx._signable_data())

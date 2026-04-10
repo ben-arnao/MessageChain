@@ -1,7 +1,7 @@
-"""Tests for stake-weighted governance voting.
+"""Tests for stake-weighted voting.
 
 Voting power is determined by staked tokens, not wallet balance.
-Only entities with skin in the game (staked tokens) can influence governance.
+Only entities with skin in the game (staked tokens) can influence votes.
 """
 
 import unittest
@@ -9,6 +9,7 @@ from messagechain.identity.identity import Entity
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.governance.governance import (
     GovernanceTracker,
+    ProposalStatus,
     create_proposal,
     create_vote,
 )
@@ -47,16 +48,13 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.supply.staked[self.dave.entity_id] = 1000
 
         self.tracker = GovernanceTracker()
-        content_hash = _hash(b"diff contents")
         self.proposal_tx = create_proposal(
-            self.alice, "https://github.com/user/repo/pull/1",
-            content_hash, "Stake-weighted governance",
+            self.alice, "Stake-weighted governance", "Test stake weighting",
         )
         self.tracker.add_proposal(self.proposal_tx, block_height=100)
 
     def test_unstaked_entity_has_zero_voting_power(self):
         """An entity with tokens but no stake has zero voting power."""
-        # Alice has 10,000 balance but 0 stake
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
         self.tracker.add_vote(vote)
 
@@ -68,7 +66,6 @@ class TestStakeWeightedVoting(unittest.TestCase):
 
     def test_staked_entity_voting_power_equals_stake(self):
         """Voting power equals staked amount, not wallet balance."""
-        # Bob has 100 balance but 5000 stake
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         self.tracker.add_vote(vote)
 
@@ -79,33 +76,37 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.assertEqual(total_weight, 5000)
 
     def test_stake_weighted_majority(self):
-        """Proposal passes when majority of participating stake votes yes."""
+        """Tally reflects stake-weighted majority correctly."""
         # Bob (5000 stake) votes yes, Carol (3000 stake) votes no
         vote_yes = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.carol, self.proposal_tx.proposal_id, approve=False)
         self.tracker.add_vote(vote_yes)
         self.tracker.add_vote(vote_no)
 
-        # 5000 / 8000 = 62.5% > 50%
-        self.assertTrue(
-            self.tracker.can_merge(self.proposal_tx.proposal_id, 150, self.supply)
+        yes_weight, total_weight = self.tracker.tally(
+            self.proposal_tx.proposal_id, self.supply,
         )
+        # 5000 / 8000 = 62.5%
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 8000)
 
     def test_stake_weighted_rejection(self):
-        """Proposal rejected when majority of participating stake votes no."""
+        """Tally reflects stake-weighted rejection correctly."""
         # Dave (1000 stake) votes yes, Carol (3000 stake) votes no
         vote_yes = create_vote(self.dave, self.proposal_tx.proposal_id, approve=True)
         vote_no = create_vote(self.carol, self.proposal_tx.proposal_id, approve=False)
         self.tracker.add_vote(vote_yes)
         self.tracker.add_vote(vote_no)
 
-        # 1000 / 4000 = 25% < 50%
-        self.assertFalse(
-            self.tracker.can_merge(self.proposal_tx.proposal_id, 150, self.supply)
+        yes_weight, total_weight = self.tracker.tally(
+            self.proposal_tx.proposal_id, self.supply,
         )
+        # 1000 / 4000 = 25%
+        self.assertEqual(yes_weight, 1000)
+        self.assertEqual(total_weight, 4000)
 
     def test_high_balance_low_stake_loses_to_low_balance_high_stake(self):
-        """Balance is irrelevant — only stake determines outcome."""
+        """Balance is irrelevant — only stake determines voting power."""
         # Alice (10k balance, 0 stake) votes no
         # Bob (100 balance, 5k stake) votes yes
         vote_alice = create_vote(self.alice, self.proposal_tx.proposal_id, approve=False)
@@ -116,7 +117,6 @@ class TestStakeWeightedVoting(unittest.TestCase):
         yes_weight, total_weight = self.tracker.tally(
             self.proposal_tx.proposal_id, self.supply,
         )
-        # Alice contributes 0 (no stake), Bob contributes 5000
         self.assertEqual(yes_weight, 5000)
         self.assertEqual(total_weight, 5000)
 
@@ -144,16 +144,13 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         self.supply.staked[self.carol.entity_id] = 3000
 
         self.tracker = GovernanceTracker()
-        content_hash = _hash(b"diff")
         self.proposal_tx = create_proposal(
-            self.alice, "https://github.com/user/repo/pull/2",
-            content_hash, "Test delegation",
+            self.alice, "Test delegation", "Test delegation mechanics",
         )
         self.tracker.add_proposal(self.proposal_tx, block_height=50)
 
     def test_delegation_carries_stake_not_balance(self):
         """Delegated voting power is the delegator's stake, not balance."""
-        # Alice (2000 stake, 10k balance) delegates to Bob (500 stake)
         self.tracker.set_delegation(self.alice.entity_id, self.bob.entity_id)
 
         vote = create_vote(self.bob, self.proposal_tx.proposal_id, approve=True)
@@ -162,7 +159,6 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         yes_weight, total_weight = self.tracker.tally(
             self.proposal_tx.proposal_id, self.supply,
         )
-        # Bob's stake (500) + Alice's delegated stake (2000) = 2500
         self.assertEqual(yes_weight, 2500)
         self.assertEqual(total_weight, 2500)
 
@@ -178,13 +174,11 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         yes_weight, total_weight = self.tracker.tally(
             self.proposal_tx.proposal_id, self.supply,
         )
-        # Bob: 500 yes. Alice: 2000 no (direct override). Total: 2500.
         self.assertEqual(yes_weight, 500)
         self.assertEqual(total_weight, 2500)
 
     def test_unstaked_delegator_adds_zero_weight(self):
         """Delegator with no stake adds zero to delegate's voting power."""
-        # Give Alice zero stake
         self.supply.staked[self.alice.entity_id] = 0
 
         self.tracker.set_delegation(self.alice.entity_id, self.carol.entity_id)
@@ -195,7 +189,6 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         yes_weight, total_weight = self.tracker.tally(
             self.proposal_tx.proposal_id, self.supply,
         )
-        # Only Carol's stake (3000), Alice's 0 stake adds nothing
         self.assertEqual(yes_weight, 3000)
         self.assertEqual(total_weight, 3000)
 
@@ -219,41 +212,44 @@ class TestStakeWeightedProposalStatus(unittest.TestCase):
         self.supply.staked[self.bob.entity_id] = 1000
 
         self.tracker = GovernanceTracker()
-        content_hash = _hash(b"diff")
         self.proposal_tx = create_proposal(
-            self.alice, "https://github.com/user/repo/pull/3",
-            content_hash, "Status test",
+            self.alice, "Status test", "Test proposal status",
         )
         self.tracker.add_proposal(self.proposal_tx, block_height=100)
 
-    def test_approved_after_window_by_stake_majority(self):
-        """Proposal approved after voting window if stake majority voted yes."""
+    def test_open_during_voting_window(self):
+        """Proposal is OPEN during voting window regardless of votes."""
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
         self.tracker.add_vote(vote)
-        # Alice: 5000 stake yes, Bob didn't vote -> 5000/5000 = 100%
 
-        from messagechain.governance.governance import ProposalStatus
+        status = self.tracker.get_proposal_status(
+            self.proposal_tx.proposal_id, 150, self.supply,
+        )
+        self.assertEqual(status, ProposalStatus.OPEN)
+
+    def test_closed_after_window(self):
+        """Proposal is CLOSED after voting window ends."""
+        vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
+        self.tracker.add_vote(vote)
+
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
         status = self.tracker.get_proposal_status(
             self.proposal_tx.proposal_id, expired_block, self.supply,
         )
-        self.assertEqual(status, ProposalStatus.APPROVED)
+        self.assertEqual(status, ProposalStatus.CLOSED)
 
-    def test_expired_when_only_unstaked_voted(self):
-        """Proposal expires if only unstaked entities voted (zero weight)."""
-        # Remove Alice's stake
+    def test_closed_when_only_unstaked_voted(self):
+        """Proposal closes normally even if only unstaked entities voted."""
         self.supply.staked[self.alice.entity_id] = 0
 
         vote = create_vote(self.alice, self.proposal_tx.proposal_id, approve=True)
         self.tracker.add_vote(vote)
 
-        from messagechain.governance.governance import ProposalStatus
         expired_block = 100 + GOVERNANCE_VOTING_WINDOW + 1
         status = self.tracker.get_proposal_status(
             self.proposal_tx.proposal_id, expired_block, self.supply,
         )
-        # total_weight = 0, so EXPIRED
-        self.assertEqual(status, ProposalStatus.EXPIRED)
+        self.assertEqual(status, ProposalStatus.CLOSED)
 
 
 if __name__ == "__main__":
