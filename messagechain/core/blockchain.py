@@ -552,6 +552,7 @@ class Blockchain:
         """
         from messagechain.config import (
             PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
+            PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID,
         )
         sim_balances = dict(self.supply.balances)
         sim_nonces = dict(self.nonces)
@@ -574,7 +575,7 @@ class Blockchain:
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
 
-        # Simulate block reward with attestation split
+        # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
 
         attestor_stakes = {}
@@ -589,17 +590,33 @@ class Blockchain:
             attestor_pool = reward - proposer_share
             total_att_stake = sum(attestor_stakes.values())
             sorted_atts = sorted(attestor_stakes.items(), key=lambda x: x[0])
+            attestor_rewards = {}
             distributed = 0
             for i, (att_id, stake) in enumerate(sorted_atts):
                 if i == len(sorted_atts) - 1:
                     att_reward = attestor_pool - distributed
                 else:
                     att_reward = attestor_pool * stake // total_att_stake
+                attestor_rewards[att_id] = att_reward
                 sim_balances[att_id] = sim_balances.get(att_id, 0) + att_reward
                 distributed += att_reward
+
+            # Apply reward cap to proposer
+            proposer_att_reward = attestor_rewards.get(proposer_id, 0)
+            proposer_total = proposer_share + proposer_att_reward
+            if proposer_total > PROPOSER_REWARD_CAP:
+                treasury_excess = proposer_total - PROPOSER_REWARD_CAP
+                proposer_share = max(0, PROPOSER_REWARD_CAP - proposer_att_reward)
+                sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_share
         else:
-            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
+            # No attestors — apply cap
+            proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+            treasury_excess = reward - proposer_reward
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
+            if treasury_excess > 0:
+                sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
         return compute_state_root(sim_balances, sim_nonces, sim_staked)
 

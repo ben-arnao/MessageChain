@@ -43,6 +43,11 @@ BLOCK_REWARD_FLOOR = 4  # minimum reward per block — never drops below this
 PROPOSER_REWARD_NUMERATOR = 1
 PROPOSER_REWARD_DENOMINATOR = 4
 
+# Per-block reward cap for any single validator (proposer share + attestor share combined).
+# Breaks the compounding loop: large stakers can't earn disproportionately more per block.
+# Excess is redirected to the treasury. Set to proposer's normal 1/4 share.
+PROPOSER_REWARD_CAP = BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR  # 4 tokens
+
 # Fee economics — EIP-1559-style base fee + tip
 # Non-linear size pricing: fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
 # This makes larger messages disproportionately expensive, incentivizing conciseness.

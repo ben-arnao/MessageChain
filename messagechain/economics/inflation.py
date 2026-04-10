@@ -27,6 +27,7 @@ from messagechain.config import (
     SLASH_FINDER_REWARD_PCT, UNBONDING_PERIOD, MIN_TOTAL_STAKE,
     TREASURY_ENTITY_ID, VALIDATOR_MIN_STAKE, BLOCK_REWARD_FLOOR,
     PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
+    PROPOSER_REWARD_CAP,
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
 )
@@ -89,12 +90,20 @@ class SupplyTracker:
 
         if not attestor_stakes:
             # No attestors — proposer gets everything (bootstrap/genesis)
-            self.balances[proposer_id] = self.balances.get(proposer_id, 0) + reward
+            # Apply reward cap: excess goes to treasury
+            proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+            treasury_excess = reward - proposer_reward
+            self.balances[proposer_id] = self.balances.get(proposer_id, 0) + proposer_reward
+            if treasury_excess > 0:
+                self.balances[TREASURY_ENTITY_ID] = (
+                    self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+                )
             return {
                 "total_reward": reward,
-                "proposer_reward": reward,
+                "proposer_reward": proposer_reward,
                 "total_attestor_reward": 0,
                 "attestor_rewards": {},
+                "treasury_excess": treasury_excess,
             }
 
         # Split: proposer share + attestor pool
@@ -122,6 +131,22 @@ class SupplyTracker:
             proposer_share += attestor_pool
             attestor_pool = 0
 
+        # If proposer is also an attestor, their total earnings may exceed cap
+        proposer_att_reward = attestor_rewards.get(proposer_id, 0)
+        proposer_total = proposer_share + proposer_att_reward
+
+        treasury_excess = 0
+        if proposer_total > PROPOSER_REWARD_CAP:
+            treasury_excess = proposer_total - PROPOSER_REWARD_CAP
+            # Claw back attestor overage already credited + reduce proposer share
+            self.balances[proposer_id] = self.balances.get(proposer_id, 0) - proposer_att_reward
+            proposer_share = PROPOSER_REWARD_CAP
+            proposer_att_reward = 0
+            attestor_rewards[proposer_id] = 0
+            self.balances[TREASURY_ENTITY_ID] = (
+                self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+            )
+
         self.balances[proposer_id] = self.balances.get(proposer_id, 0) + proposer_share
 
         return {
@@ -129,6 +154,7 @@ class SupplyTracker:
             "proposer_reward": proposer_share,
             "total_attestor_reward": attestor_pool,
             "attestor_rewards": attestor_rewards,
+            "treasury_excess": treasury_excess,
         }
 
     def pay_fee(self, from_id: bytes, to_proposer_id: bytes, fee: int) -> bool:

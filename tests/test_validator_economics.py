@@ -74,15 +74,17 @@ class TestAttestationRewards(unittest.TestCase):
         """Proposer share must be < 100% (leaving room for attestors)."""
         self.assertLess(PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR)
 
-    def test_no_attestors_proposer_gets_full_reward(self):
-        """When no attestors are present, proposer receives full reward."""
+    def test_no_attestors_proposer_gets_capped_reward(self):
+        """When no attestors are present, proposer gets reward up to cap."""
+        from messagechain.config import PROPOSER_REWARD_CAP
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         reward = tracker.calculate_block_reward(1)
         distributed = tracker.mint_block_reward(proposer, 1, attestor_stakes={})
-        self.assertEqual(distributed["proposer_reward"], reward)
+        expected = min(reward, PROPOSER_REWARD_CAP)
+        self.assertEqual(distributed["proposer_reward"], expected)
         self.assertEqual(distributed["total_attestor_reward"], 0)
-        self.assertEqual(tracker.get_balance(proposer), reward)
+        self.assertEqual(tracker.get_balance(proposer), expected)
 
     def test_reward_split_with_attestors(self):
         """Proposer gets 1/4, attestors share 3/4."""
@@ -124,6 +126,7 @@ class TestAttestationRewards(unittest.TestCase):
 
     def test_total_minted_equals_reward(self):
         """Total tokens distributed = block reward (no tokens created or lost)."""
+        from messagechain.config import TREASURY_ENTITY_ID
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         att_a = b"\x02" * 32
@@ -136,16 +139,18 @@ class TestAttestationRewards(unittest.TestCase):
 
         # Supply increased by exactly the reward
         self.assertEqual(tracker.total_supply, initial_supply + reward)
-        # All minted tokens are accounted for in balances
+        # All minted tokens are accounted for in balances (including treasury)
         total_distributed = (
             tracker.get_balance(proposer)
             + tracker.get_balance(att_a)
             + tracker.get_balance(att_b)
+            + tracker.get_balance(TREASURY_ENTITY_ID)
         )
         self.assertEqual(total_distributed, reward)
 
-    def test_proposer_who_is_also_attestor(self):
-        """If proposer is also an attestor, they get both shares."""
+    def test_proposer_who_is_also_attestor_is_capped(self):
+        """If proposer is also an attestor, their total is capped."""
+        from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         other_att = b"\x02" * 32
@@ -156,10 +161,13 @@ class TestAttestationRewards(unittest.TestCase):
 
         proposer_balance = tracker.get_balance(proposer)
         other_balance = tracker.get_balance(other_att)
-        # Proposer gets proposer share + half of attestor pool
-        # Other attestor gets half of attestor pool
-        self.assertGreater(proposer_balance, other_balance)
-        self.assertEqual(proposer_balance + other_balance, reward)
+        treasury_balance = tracker.get_balance(TREASURY_ENTITY_ID)
+        # Proposer's total (proposer share + attestor share) is capped
+        self.assertLessEqual(proposer_balance, PROPOSER_REWARD_CAP)
+        # Other attestor gets their full share (not affected by cap)
+        self.assertGreater(other_balance, 0)
+        # All tokens accounted for (proposer + other + treasury = reward)
+        self.assertEqual(proposer_balance + other_balance + treasury_balance, reward)
 
 
 class TestBaseFee(unittest.TestCase):

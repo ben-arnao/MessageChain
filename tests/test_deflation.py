@@ -2,7 +2,10 @@
 
 import unittest
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.config import GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE, BLOCK_REWARD_FLOOR
+from messagechain.config import (
+    GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE, BLOCK_REWARD_FLOOR,
+    PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID,
+)
 
 
 class TestInflation(unittest.TestCase):
@@ -21,7 +24,11 @@ class TestInflation(unittest.TestCase):
         reward = self.tracker.mint_block_reward(self.proposer_id, block_height=1)
         self.assertEqual(reward["total_reward"], BLOCK_REWARD)
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY + BLOCK_REWARD)
-        self.assertEqual(self.tracker.get_balance(self.proposer_id), BLOCK_REWARD)
+        # Proposer gets capped amount, excess goes to treasury
+        self.assertEqual(self.tracker.get_balance(self.proposer_id), PROPOSER_REWARD_CAP)
+        treasury_excess = BLOCK_REWARD - PROPOSER_REWARD_CAP
+        if treasury_excess > 0:
+            self.assertEqual(self.tracker.get_balance(TREASURY_ENTITY_ID), treasury_excess)
 
     def test_supply_increases_over_blocks(self):
         """Supply should increase with each block (inflation)."""

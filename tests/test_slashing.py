@@ -353,9 +353,14 @@ class TestSlashTransaction(unittest.TestCase):
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         sim_staked[self.alice.entity_id] = 0
         sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
-        # Block reward to proposer (no attestors, so proposer gets full reward)
+        # Block reward to proposer (no attestors, capped)
+        from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         reward = self.chain.supply.calculate_block_reward(block_height)
-        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + reward
+        proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+        treasury_excess = reward - proposer_reward
+        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + proposer_reward
+        if treasury_excess > 0:
+            sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
         state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)
 
         block = consensus.create_block(self.carol, [], prev, state_root=state_root)
