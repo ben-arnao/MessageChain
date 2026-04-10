@@ -19,6 +19,7 @@ import logging
 from messagechain.config import (
     HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
+    DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
@@ -73,6 +74,11 @@ class Blockchain:
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
         # Immature block rewards: list of (block_height, proposer_id, reward_amount)
         self._immature_rewards: list[tuple[int, bytes, int]] = []
+        # Orphan block pool: blocks whose parent is not yet known (bounded)
+        self.orphan_pool: dict[bytes, Block] = {}  # block_hash -> Block
+        # AssumeValid: skip signature verification for blocks at or below this hash
+        self.assume_valid_hash: bytes | None = ASSUME_VALID_BLOCK_HASH
+        self._assume_valid_height: int | None = None
 
         # If db exists, try to load persisted state
         if self.db is not None:
@@ -292,6 +298,10 @@ class Blockchain:
 
         if tx.recipient_id not in self.public_keys:
             return False, "Unknown recipient — must register first"
+
+        # Dust limit: reject transfers below minimum to prevent state bloat
+        if tx.amount < DUST_LIMIT:
+            return False, f"Transfer amount {tx.amount} below dust limit {DUST_LIMIT}"
 
         expected_nonce = self.nonces.get(tx.entity_id, 0)
         if tx.nonce != expected_nonce:
@@ -776,7 +786,12 @@ class Blockchain:
             # This block creates or extends a fork
             return self._handle_fork(block, parent)
 
-        # Orphan block — parent unknown
+        # Orphan block — parent unknown, store in bounded pool
+        if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
+            self.orphan_pool[block.block_hash] = block
+            logger.debug(f"Stored orphan block #{block.header.block_number} (pool: {len(self.orphan_pool)})")
+        else:
+            logger.warning(f"Orphan pool full ({MAX_ORPHAN_BLOCKS}), dropping block #{block.header.block_number}")
         return False, "Orphan block — parent not found"
 
     def _append_block(self, block: Block) -> tuple[bool, str]:
@@ -827,7 +842,40 @@ class Blockchain:
             self.db.add_chain_tip(block.block_hash, block.header.block_number, new_weight)
             self._persist_state()
 
+        # Process any orphan blocks that depend on this block
+        self._process_orphans(block.block_hash)
+
         return True, f"Block added (reward: {reward}, fees: {sum(tx.fee for tx in block.transactions)})"
+
+    def _process_orphans(self, parent_hash: bytes):
+        """Check if any orphan blocks depend on the given parent and try to add them."""
+        dependents = [
+            orphan for orphan in self.orphan_pool.values()
+            if orphan.header.prev_hash == parent_hash
+        ]
+        for orphan in dependents:
+            del self.orphan_pool[orphan.block_hash]
+            logger.debug(f"Processing orphan block #{orphan.header.block_number}")
+            self.add_block(orphan)
+
+    def is_assume_valid(self, block_height: int) -> bool:
+        """Check if a block at the given height is below the assume-valid boundary.
+
+        When assume_valid_hash is set, blocks at or below its height skip
+        signature verification during IBD. This dramatically speeds up initial
+        sync since WOTS+ verification is expensive.
+        """
+        if self.assume_valid_hash is None:
+            return False
+
+        # Lazily resolve the assume-valid height
+        if self._assume_valid_height is None:
+            av_block = self.get_block_by_hash(self.assume_valid_hash)
+            if av_block is None:
+                return False
+            self._assume_valid_height = av_block.header.block_number
+
+        return block_height <= self._assume_valid_height
 
     def _handle_fork(self, block: Block, parent: Block) -> tuple[bool, str]:
         """Handle a block that creates or extends a fork."""

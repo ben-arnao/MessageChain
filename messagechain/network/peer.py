@@ -1,11 +1,28 @@
 """
 Peer connection management for MessageChain P2P network.
+
+Connection types (Bitcoin Core-inspired):
+- FULL_RELAY: Standard connection that relays blocks, transactions, and addresses.
+- BLOCK_RELAY_ONLY: Only relays blocks. Prevents network topology mapping via
+  transaction relay timing analysis.
+- ANCHOR: Persisted across restarts to prevent eclipse attacks on reboot.
+  Functionally identical to BLOCK_RELAY_ONLY during operation.
+- FEELER: Short-lived probe to verify address reachability. No relay at all.
 """
 
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from enum import Enum
 from messagechain.config import SEEN_TX_CACHE_SIZE
+
+
+class ConnectionType(Enum):
+    """Type of peer connection, following Bitcoin Core's connection model."""
+    FULL_RELAY = "full_relay"
+    BLOCK_RELAY_ONLY = "block_relay_only"
+    ANCHOR = "anchor"
+    FEELER = "feeler"
 
 
 @dataclass
@@ -17,6 +34,7 @@ class Peer:
     reader: object = None
     writer: object = None
     is_connected: bool = False
+    connection_type: ConnectionType = ConnectionType.FULL_RELAY
     # inv/getdata: track which tx hashes this peer already knows about
     known_txs: object = field(default_factory=lambda: _LRUSet(SEEN_TX_CACHE_SIZE))
 
@@ -29,6 +47,14 @@ class Peer:
 
     def is_stale(self, timeout: float = 300) -> bool:
         return (time.time() - self.last_seen) > timeout if self.last_seen > 0 else False
+
+    def should_relay_tx(self) -> bool:
+        """Only FULL_RELAY connections relay transactions."""
+        return self.connection_type == ConnectionType.FULL_RELAY
+
+    def is_feeler(self) -> bool:
+        """Feeler connections are transient probes."""
+        return self.connection_type == ConnectionType.FEELER
 
 
 class _LRUSet:

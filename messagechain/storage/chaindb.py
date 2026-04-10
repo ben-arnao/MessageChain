@@ -104,6 +104,13 @@ class ChainDB:
                 slashed_at_block INTEGER NOT NULL,
                 evidence_hash BLOB NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS block_headers (
+                block_hash BLOB PRIMARY KEY,
+                block_number INTEGER NOT NULL,
+                header_data TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_headers_number ON block_headers(block_number);
         """)
         conn.commit()
 
@@ -197,6 +204,63 @@ class ChainDB:
             (start_height, end_height),
         )
         return [(row[0], bytes(row[1])) for row in cur.fetchall()]
+
+    # ── Block Pruning ────────────────────────────────────────────
+
+    def prune_block_to_header(self, block_number: int):
+        """Replace a full block with its header only.
+
+        Deletes the full block data and stores just the header in the
+        block_headers table. This is the actual storage reclamation that
+        makes pruning effective for long-term sustainability.
+        """
+        # Get the full block first
+        cur = self._conn.execute(
+            "SELECT data, block_hash FROM blocks WHERE block_number = ?",
+            (block_number,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return  # already pruned or doesn't exist
+
+        import json
+        block_data = json.loads(row[0])
+        block_hash = bytes(row[1])
+
+        # Extract header from block data
+        header_data = json.dumps(block_data.get("header", {}))
+
+        # Store header
+        self._conn.execute(
+            "INSERT OR REPLACE INTO block_headers (block_hash, block_number, header_data) VALUES (?, ?, ?)",
+            (block_hash, block_number, header_data),
+        )
+
+        # Delete full block data
+        self._conn.execute(
+            "DELETE FROM blocks WHERE block_number = ? AND block_hash = ?",
+            (block_number, block_hash),
+        )
+        self._conn.commit()
+
+    def has_block_header(self, block_number: int) -> bool:
+        """Check if a header-only record exists for a pruned block."""
+        cur = self._conn.execute(
+            "SELECT 1 FROM block_headers WHERE block_number = ?", (block_number,)
+        )
+        return cur.fetchone() is not None
+
+    def get_block_header(self, block_number: int) -> dict | None:
+        """Get a stored header by block number (for pruned blocks)."""
+        cur = self._conn.execute(
+            "SELECT header_data FROM block_headers WHERE block_number = ?",
+            (block_number,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        import json
+        return json.loads(row[0])
 
     # ── Chain Tips ───────────────────────────────────────────────
 

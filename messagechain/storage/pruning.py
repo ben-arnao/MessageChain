@@ -37,8 +37,13 @@ class BlockPruner:
         # block_number -> PrunedBlockRecord (headers of pruned blocks)
         self._pruned_headers: dict[int, PrunedBlockRecord] = {}
 
-    def prune(self, chain) -> int:
+    def prune(self, chain, db=None) -> int:
         """Prune old blocks from the chain, retaining only headers.
+
+        If a ChainDB instance is provided, block transaction data is actually
+        deleted from SQLite and replaced with header-only records. This is
+        essential for the 1000-year design goal — without it, storage grows
+        without bound.
 
         Returns the number of blocks pruned.
         """
@@ -61,6 +66,11 @@ class BlockPruner:
                 header=block.header,
                 block_hash=block.block_hash,
             )
+
+            # Actually delete from SQLite if db is available
+            if db is not None:
+                db.prune_block_to_header(i)
+
             pruned_count += 1
 
         return pruned_count

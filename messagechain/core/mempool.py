@@ -136,6 +136,43 @@ class Mempool:
         fees = sorted([tx.fee for tx in self.pending.values()], reverse=True)
         return fees[len(fees) // 2]
 
+    def save_to_file(self, path: str) -> int:
+        """Save mempool contents to disk for persistence across restarts.
+
+        Returns the number of transactions saved.
+        """
+        import json
+        txs = [tx.serialize() for tx in self.pending.values()]
+        try:
+            with open(path, "w") as f:
+                json.dump(txs, f)
+            return len(txs)
+        except Exception:
+            return 0
+
+    def load_from_file(self, path: str) -> int:
+        """Load mempool contents from disk.
+
+        Skips expired transactions and corrupt entries.
+        Returns the number of transactions loaded.
+        """
+        import json
+        try:
+            with open(path, "r") as f:
+                txs_data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return 0
+
+        loaded = 0
+        for tx_data in txs_data:
+            try:
+                tx = MessageTransaction.deserialize(tx_data)
+                if self.add_transaction(tx):
+                    loaded += 1
+            except Exception:
+                continue  # skip corrupt entries
+        return loaded
+
     @property
     def size(self) -> int:
         return len(self.pending)

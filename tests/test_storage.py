@@ -422,9 +422,9 @@ class TestChainSyncer(unittest.TestCase):
         chain, _ = make_chain_with_blocks(0)
         syncer = ChainSyncer(chain, lambda addr: None)
 
-        syncer.update_peer_height("peer1:9333", 5)
-        syncer.update_peer_height("peer2:9333", 10)
-        syncer.update_peer_height("peer3:9333", 3)
+        syncer.update_peer_height("peer1:9333", 5, cumulative_weight=500)
+        syncer.update_peer_height("peer2:9333", 10, cumulative_weight=1000)
+        syncer.update_peer_height("peer3:9333", 3, cumulative_weight=300)
 
         best = syncer.get_best_sync_peer()
         assert best == "peer2:9333"

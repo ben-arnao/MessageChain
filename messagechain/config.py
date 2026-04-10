@@ -68,6 +68,20 @@ SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
 # Key rotation
 KEY_ROTATION_FEE = 10     # fee required for key rotation transaction
 
+# Dust limit — minimum transfer amount to prevent state bloat from tiny accounts
+DUST_LIMIT = 10           # transfers below this amount are rejected
+
+# Orphan block pool
+MAX_ORPHAN_BLOCKS = 100   # max orphan blocks stored (bounded to prevent memory exhaustion)
+
+# Minimum cumulative stake weight — reject peers on chains below this during IBD
+# Prevents fake-chain attacks where an attacker tricks a new node into syncing garbage
+MIN_CUMULATIVE_STAKE_WEIGHT = 100
+
+# AssumeValid — skip signature verification for blocks below this known-good hash
+# Set to None to verify all blocks (default for new chains)
+ASSUME_VALID_BLOCK_HASH = None  # bytes or None
+
 # Staking
 UNBONDING_PERIOD = 60_480     # blocks before unstaked tokens become spendable (~7 days at 10s)
 

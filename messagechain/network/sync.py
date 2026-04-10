@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
+from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
 from messagechain.core.block import Block, BlockHeader
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, write_message,
@@ -53,6 +54,7 @@ class PeerSyncInfo:
     chain_height: int
     best_block_hash: str = ""
     last_response_time: float = 0.0
+    cumulative_weight: int = 0
 
 
 class ChainSyncer:
@@ -103,13 +105,15 @@ class ChainSyncer:
             return 0.0
         return min(1.0, self.blockchain.height / self._sync_target_height)
 
-    def update_peer_height(self, peer_address: str, height: int, best_hash: str = ""):
-        """Update our knowledge of a peer's chain height."""
+    def update_peer_height(self, peer_address: str, height: int, best_hash: str = "",
+                           cumulative_weight: int = 0):
+        """Update our knowledge of a peer's chain height and weight."""
         self.peer_heights[peer_address] = PeerSyncInfo(
             peer_address=peer_address,
             chain_height=height,
             best_block_hash=best_hash,
             last_response_time=time.time(),
+            cumulative_weight=cumulative_weight,
         )
 
     def needs_sync(self) -> bool:
@@ -121,10 +125,22 @@ class ChainSyncer:
         return False
 
     def get_best_sync_peer(self) -> str | None:
-        """Find the peer with the tallest chain to sync from."""
+        """Find the peer with the tallest chain to sync from.
+
+        Rejects peers whose cumulative stake weight is below the minimum
+        threshold (nMinimumChainWork equivalent). This prevents a new node
+        from being tricked into syncing a fabricated chain.
+        """
         if not self.peer_heights:
             return None
-        best = max(self.peer_heights.values(), key=lambda p: p.chain_height)
+        # Filter peers above minimum chain weight
+        eligible = [
+            p for p in self.peer_heights.values()
+            if p.cumulative_weight >= MIN_CUMULATIVE_STAKE_WEIGHT
+        ]
+        if not eligible:
+            return None
+        best = max(eligible, key=lambda p: p.chain_height)
         if best.chain_height <= self.blockchain.height:
             return None
         return best.peer_address
