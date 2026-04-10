@@ -75,10 +75,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         must be rejected."""
         # Create two transactions with nonce=0 from the same sender
         tx1 = create_transaction(
-            self.sender, "First message", fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=500, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Second message", fee=MIN_FEE, nonce=0
+            self.sender, "Second message", fee=500, nonce=0
         )
 
         # Build a block containing both
@@ -94,10 +94,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         """A block with properly sequential nonces (0, 1) from the same entity
         should be accepted."""
         tx1 = create_transaction(
-            self.sender, "First message", fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=500, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Second message", fee=MIN_FEE, nonce=1
+            self.sender, "Second message", fee=500, nonce=1
         )
 
         block = _make_signed_block(
@@ -110,10 +110,10 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
     def test_block_with_gap_nonce_rejected(self):
         """A block where nonces skip (0, 2) must be rejected."""
         tx1 = create_transaction(
-            self.sender, "First message", fee=MIN_FEE, nonce=0
+            self.sender, "First message", fee=500, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Third message", fee=MIN_FEE, nonce=2
+            self.sender, "Third message", fee=500, nonce=2
         )
 
         block = _make_signed_block(
@@ -127,13 +127,13 @@ class TestDuplicateTransactionsInBlock(unittest.TestCase):
         """Verify that a double-spend via duplicate nonce is actually prevented
         at the balance level too."""
         # Give sender exactly enough for one fee
-        self.chain.supply.balances[self.sender.entity_id] = MIN_FEE
+        self.chain.supply.balances[self.sender.entity_id] = 500
 
         tx1 = create_transaction(
-            self.sender, "Spend all", fee=MIN_FEE, nonce=0
+            self.sender, "Spend all", fee=500, nonce=0
         )
         tx2 = create_transaction(
-            self.sender, "Spend again", fee=MIN_FEE, nonce=0
+            self.sender, "Spend again", fee=500, nonce=0
         )
 
         block = _make_signed_block(
@@ -311,7 +311,7 @@ class TestStateRootBypass(unittest.TestCase):
     def test_wrong_state_root_rejected(self):
         """A block with an incorrect non-zero state_root must be rejected."""
         tx = create_transaction(
-            self.sender, "Test message", fee=MIN_FEE, nonce=0
+            self.sender, "Test message", fee=500, nonce=0
         )
 
         prev = self.chain.get_latest_block()
@@ -341,7 +341,7 @@ class TestStateRootBypass(unittest.TestCase):
     def test_correct_state_root_accepted(self):
         """A block with the correct state root must be accepted."""
         tx = create_transaction(
-            self.sender, "Test message", fee=MIN_FEE, nonce=0
+            self.sender, "Test message", fee=500, nonce=0
         )
 
         prev = self.chain.get_latest_block()
