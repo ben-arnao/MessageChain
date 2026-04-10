@@ -11,7 +11,7 @@ MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode 
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
 # At BLOCK_TIME_TARGET=120s, ~263,000 blocks/year.
 # Year 1: 16 tokens/block * 263,000 ≈ 4.2M minted against 1B supply ≈ 0.42%/year
-# 4 meaningful halvings over ~16 years (16→8→4→2→1), then floor of 1 forever.
+# 2 meaningful halvings over ~8 years (16→8→4), then floor of 4 forever.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
 
@@ -30,11 +30,26 @@ DEFAULT_GENESIS_ALLOCATIONS = {
     # Genesis validator allocation is added dynamically in Blockchain.initialize_genesis
 }
 
-BLOCK_REWARD = 16  # new tokens minted per block (paid to proposer)
+BLOCK_REWARD = 16  # new tokens minted per block (split between proposer + attestors)
 assert (BLOCK_REWARD & (BLOCK_REWARD - 1)) == 0, "BLOCK_REWARD must be a power of 2 for clean halvings"
 HALVING_INTERVAL = 1_051_200  # blocks between reward halvings (~4 years at 120s blocks)
-MIN_FEE = 100  # minimum transaction fee (high to deter message spam)
+BLOCK_REWARD_FLOOR = 4  # minimum reward per block — never drops below this
+# At 120s blocks (~263K blocks/year), floor of 4 = ~1.05M tokens/year ≈ 0.1% of genesis.
+# High enough to keep validation lucrative; low enough to limit long-term inflation.
+
+# Attestation reward split — incentivizes attestors who do essential security work.
+# Proposer gets 1/4, attestors share 3/4 pro-rata by stake weight.
+# If no attestors in a block, proposer gets the full reward (bootstrap/genesis).
+PROPOSER_REWARD_NUMERATOR = 1
+PROPOSER_REWARD_DENOMINATOR = 4
+
+# Fee economics — EIP-1559-style base fee + tip
+MIN_FEE = 100  # absolute floor for base fee (spam deterrent)
 FEE_PER_BYTE = 1  # additional fee per byte of message payload (size-based fee component)
+BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
+BASE_FEE_MAX_CHANGE_DENOMINATOR = 8  # max 12.5% change per block
+TARGET_BLOCK_SIZE = 10                # target txs per block (50% of MAX_TXS_PER_BLOCK)
+MIN_TIP = 1                          # minimum priority tip to proposer
 
 # Timestamp tolerance
 MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
@@ -120,6 +135,10 @@ UNBONDING_PERIOD = 5_040      # blocks before unstaked tokens become spendable (
 # Slashing
 SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
 SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
+
+# Chain identity — included in all transaction signatures to prevent cross-fork replay.
+# If MessageChain forks, each fork MUST change this value.
+CHAIN_ID = b"messagechain-v1"
 
 # Finality
 FINALITY_THRESHOLD_NUMERATOR = 2     # 2/3 of stake must attest for justification

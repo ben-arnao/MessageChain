@@ -75,7 +75,7 @@ def randao_select_proposer(
 
     # Combine prev_block_hash and RANDAO mix for seed
     seed = _hash(prev_block_hash + randao_mix + b"proposer_selection")
-    rand_value = int.from_bytes(seed[:8], "big") % total
+    rand_value = int.from_bytes(seed, "big") % total
 
     cumulative = 0
     for entity_id, stake in validators:

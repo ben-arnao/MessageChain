@@ -8,6 +8,7 @@ because their security reduces to the preimage/collision resistance of the hash 
 """
 
 import hashlib
+import hmac
 import struct
 from messagechain.config import HASH_ALGO, WOTS_W, WOTS_KEY_CHAINS, WOTS_CHAIN_LENGTH
 
@@ -115,4 +116,4 @@ def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, publ
         pk_parts.append(pk_i)
 
     computed_pk = _hash(b"".join(pk_parts))
-    return computed_pk == public_key
+    return hmac.compare_digest(computed_pk, public_key)

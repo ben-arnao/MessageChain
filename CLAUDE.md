@@ -6,6 +6,10 @@
 2. **Simplicity** — Keep things simple and straightforward.
 3. **Long-term thinking** — Design for durability on the scale of 100 to 1000+ years into the future.
 
+## Design Trade-offs
+
+- **Slow transactions and expensive fees are acceptable** if they combat ledger bloat, strengthen security, or preserve long-term node/validator incentives. Never optimize for speed or cheapness at the expense of these goals.
+
 ## Workflow
 
 - **Test-driven development** — This is a TDD environment. Write tests first, then implement the code to make them pass.

@@ -24,7 +24,7 @@ Design:
 import hashlib
 import struct
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR
+from messagechain.config import HASH_ALGO, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR, CHAIN_ID
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -47,7 +47,8 @@ class Attestation:
     def signable_data(self) -> bytes:
         """Data that the validator signs to create this attestation."""
         return (
-            b"attestation"
+            CHAIN_ID
+            + b"attestation"
             + self.validator_id
             + self.block_hash
             + struct.pack(">Q", self.block_number)
@@ -110,6 +111,9 @@ class FinalityTracker:
         self.finalized: set[bytes] = set()
         # Height of the last finalized block
         self.finalized_height: int = 0
+        # Track which block each validator attested to at each height
+        # (validator_id, block_number) -> block_hash — prevents conflicting attestations
+        self._attestation_by_height: dict[tuple[bytes, int], bytes] = {}
 
     def add_attestation(
         self,
@@ -119,15 +123,28 @@ class FinalityTracker:
     ) -> bool:
         """Record an attestation. Returns True if the block becomes justified."""
         bh = attestation.block_hash
+        vid = attestation.validator_id
+        height = attestation.block_number
+
         if bh not in self.attestations:
             self.attestations[bh] = set()
             self.attested_stake[bh] = 0
 
         # Don't double-count same validator
-        if attestation.validator_id in self.attestations[bh]:
+        if vid in self.attestations[bh]:
             return bh in self.finalized
 
-        self.attestations[bh].add(attestation.validator_id)
+        # Reject conflicting attestation: same validator, same height, different block.
+        # This is a nothing-at-stake defense — validators must not vote on multiple forks.
+        key = (vid, height)
+        if key in self._attestation_by_height:
+            existing_bh = self._attestation_by_height[key]
+            if existing_bh != bh:
+                # Conflicting attestation — reject silently (slashing handles punishment)
+                return False
+
+        self._attestation_by_height[key] = bh
+        self.attestations[bh].add(vid)
         self.attested_stake[bh] = self.attested_stake.get(bh, 0) + validator_stake
 
         # Check justification threshold

@@ -8,9 +8,12 @@ Solution: Scale the minimum relay fee based on mempool utilization.
 When the mempool is nearly empty, use the base fee. As it fills up,
 increase the minimum proportionally up to a configured maximum.
 
-This mirrors Bitcoin Core's incremental relay fee, which rises when
-the mempool exceeds its size limit.
+The ceiling is set high (10,000) so that during congestion, the cost
+to spam becomes prohibitive — this is by design, since MessageChain
+prioritizes ledger compactness over cheap transactions.
 """
+
+from messagechain.config import MIN_FEE
 
 
 class DynamicFeePolicy:
@@ -24,7 +27,7 @@ class DynamicFeePolicy:
         max_fee: Maximum the dynamic fee can reach.
     """
 
-    def __init__(self, base_fee: int = 1, max_fee: int = 100):
+    def __init__(self, base_fee: int = MIN_FEE, max_fee: int = 10_000):
         self.base_fee = base_fee
         self.max_fee = max_fee
 

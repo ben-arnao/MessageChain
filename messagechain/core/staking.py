@@ -17,7 +17,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MIN_FEE, VALIDATOR_MIN_STAKE
+from messagechain.config import HASH_ALGO, MIN_FEE, VALIDATOR_MIN_STAKE, CHAIN_ID
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -42,11 +42,12 @@ class StakeTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"stake"
+            CHAIN_ID
+            + b"stake"
             + self.entity_id
             + struct.pack(">Q", self.amount)
             + struct.pack(">Q", self.nonce)
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 
@@ -104,11 +105,12 @@ class UnstakeTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"unstake"
+            CHAIN_ID
+            + b"unstake"
             + self.entity_id
             + struct.pack(">Q", self.amount)
             + struct.pack(">Q", self.nonce)
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 

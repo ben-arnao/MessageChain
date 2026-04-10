@@ -41,7 +41,7 @@ class TestDuplicateTransactionDetection(unittest.TestCase):
 
     def test_block_rejects_duplicate_tx_hash(self):
         """A block with the same transaction included twice must be rejected."""
-        tx = create_transaction(self.proposer, "hello", fee=5, nonce=0)
+        tx = create_transaction(self.proposer, "hello", fee=500, nonce=0)
         # Manually build a block with the same tx twice
         from messagechain.core.block import Block, BlockHeader, compute_merkle_root, _hash as block_hash
 
@@ -101,7 +101,7 @@ class TestBlockSignatureCostLimits(unittest.TestCase):
         # Create transactions from different entities
         txs = []
         for e in entities:
-            tx = create_transaction(e, f"msg", fee=5, nonce=0)
+            tx = create_transaction(e, f"msg", fee=500, nonce=0)
             txs.append(tx)
 
         # With a very low sig cost limit, even a few txs should be rejected
@@ -160,7 +160,7 @@ class TestMedianTimePast(unittest.TestCase):
         """A block with timestamp <= MTP must be rejected."""
         # Add a few blocks to build up MTP history
         for i in range(5):
-            tx = create_transaction(self.proposer, f"msg{i}", fee=5, nonce=i)
+            tx = create_transaction(self.proposer, f"msg{i}", fee=500, nonce=i)
             block = self.chain.propose_block(self.consensus, self.proposer, [tx])
             self.chain.add_block(block)
 
@@ -199,8 +199,8 @@ class TestBlockRewardMaturity(unittest.TestCase):
         self.proposer = Entity.create(b"proposer-seed-maturity")
         self.chain.initialize_genesis(self.proposer)
         register_entity_for_test(self.chain, self.proposer)
-        # Give only a small initial balance so we can test reward spending
-        self.chain.supply.balances[self.proposer.entity_id] = 50
+        # Give enough balance to cover fees so we can test reward spending
+        self.chain.supply.balances[self.proposer.entity_id] = 100_000
 
     def test_maturity_config_exists(self):
         """Config must define COINBASE_MATURITY."""
@@ -214,13 +214,11 @@ class TestBlockRewardMaturity(unittest.TestCase):
 
         # Proposer has balance=50. Add one block to earn BLOCK_REWARD.
         # The reward should be locked (immature).
-        tx1 = create_transaction(self.proposer, "earn reward", fee=5, nonce=0)
+        tx1 = create_transaction(self.proposer, "earn reward", fee=500, nonce=0)
         block1 = self.chain.propose_block(self.consensus, self.proposer, [tx1])
         self.chain.add_block(block1)
 
-        # Total balance = 50 - 5 (fee paid to self) + 3 (reward) = 48 spendable
-        # But the 3 reward tokens are immature and should NOT be in spendable balance.
-        # So spendable should be 50 - 5 = 45, not 48.
+        # Reward tokens are immature and should NOT be in spendable balance.
         spendable = self.chain.get_spendable_balance(self.proposer.entity_id)
         total = self.chain.supply.get_balance(self.proposer.entity_id)
         self.assertLess(spendable, total, "Immature rewards should not be spendable")
@@ -234,7 +232,7 @@ class TestBlockRewardMaturity(unittest.TestCase):
         config.COINBASE_MATURITY = 3
         try:
             # Add a block to earn reward
-            tx1 = create_transaction(self.proposer, "earn", fee=5, nonce=0)
+            tx1 = create_transaction(self.proposer, "earn", fee=500, nonce=0)
             block1 = self.chain.propose_block(self.consensus, self.proposer, [tx1])
             self.chain.add_block(block1)
 
@@ -244,7 +242,7 @@ class TestBlockRewardMaturity(unittest.TestCase):
             # Add COINBASE_MATURITY more blocks to mature the reward
             for i in range(config.COINBASE_MATURITY):
                 nonce = i + 1
-                tx = create_transaction(self.proposer, f"m{i}", fee=5, nonce=nonce)
+                tx = create_transaction(self.proposer, f"m{i}", fee=500, nonce=nonce)
                 block = self.chain.propose_block(self.consensus, self.proposer, [tx])
                 self.chain.add_block(block)
 
@@ -355,7 +353,7 @@ class TestMempoolAncestorDescendant(unittest.TestCase):
                 message=f"msg{nonce}".encode(),
                 timestamp=time.time(),
                 nonce=nonce,
-                fee=5,
+                fee=500,
                 signature=_make_dummy_sig(),
                 tx_hash=_hash(f"tx-{nonce}".encode()),
             )
@@ -367,7 +365,7 @@ class TestMempoolAncestorDescendant(unittest.TestCase):
             message=f"msg-over".encode(),
             timestamp=time.time(),
             nonce=limit,
-            fee=5,
+            fee=500,
             signature=_make_dummy_sig(),
             tx_hash=_hash(f"tx-{limit}".encode()),
         )

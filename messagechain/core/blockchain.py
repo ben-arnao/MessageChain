@@ -21,7 +21,7 @@ from messagechain.config import (
     HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
-    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
+    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
@@ -80,6 +80,7 @@ class Blockchain:
         self.db = db  # optional ChainDB for persistence
         self.chain: list[Block] = []
         self.supply = SupplyTracker()
+        self.base_fee: int = self.supply.base_fee  # mirror for easy access
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
         self.entity_message_count: dict[bytes, int] = {}
@@ -125,6 +126,11 @@ class Blockchain:
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
+        self.supply.total_burned = self.db.get_supply_meta("total_burned") or 0
+        stored_base_fee = self.db.get_supply_meta("base_fee")
+        if stored_base_fee is not None:
+            self.supply.base_fee = stored_base_fee
+            self.base_fee = stored_base_fee
 
         # Restore proposer signature counts (for WOTS+ leaf tracking)
         if hasattr(self.db, 'get_all_proposer_sig_counts'):
@@ -179,6 +185,8 @@ class Blockchain:
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
+            self.db.set_supply_meta("total_burned", self.supply.total_burned)
+            self.db.set_supply_meta("base_fee", self.supply.base_fee)
             # Persist slashed validators
             if hasattr(self.db, 'add_slashed_validator'):
                 for eid in self.slashed_validators:
@@ -529,6 +537,7 @@ class Blockchain:
         proposer_id: bytes,
         block_height: int,
         transfer_transactions: list[TransferTransaction] | None = None,
+        attestations: list[Attestation] | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -536,26 +545,56 @@ class Blockchain:
         without actually mutating chain state. The block header commits to
         the post-application state so validators can verify consistency.
         """
+        from messagechain.config import (
+            PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
+        )
         sim_balances = dict(self.supply.balances)
         sim_nonces = dict(self.nonces)
         sim_staked = dict(self.supply.staked)
+        current_base_fee = self.supply.base_fee
 
-        # Simulate fee payments for message transactions
+        # Simulate fee payments for message transactions (with burn)
         for tx in transactions:
+            tip = tx.fee - current_base_fee
             sim_balances[tx.entity_id] = sim_balances.get(tx.entity_id, 0) - tx.fee
-            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tx.fee
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            # base_fee is burned — not added to any balance
             sim_nonces[tx.entity_id] = tx.nonce + 1
 
-        # Simulate transfer transactions
+        # Simulate transfer transactions (with burn)
         for ttx in (transfer_transactions or []):
+            tip = ttx.fee - current_base_fee
             sim_balances[ttx.entity_id] = sim_balances.get(ttx.entity_id, 0) - ttx.amount - ttx.fee
             sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
-            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + ttx.fee
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
 
-        # Simulate block reward
+        # Simulate block reward with attestation split
         reward = self.supply.calculate_block_reward(block_height)
-        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
+
+        attestor_stakes = {}
+        if attestations:
+            for att in attestations:
+                stake = sim_staked.get(att.validator_id, 0)
+                if stake > 0:
+                    attestor_stakes[att.validator_id] = stake
+
+        if attestor_stakes:
+            proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+            attestor_pool = reward - proposer_share
+            total_att_stake = sum(attestor_stakes.values())
+            sorted_atts = sorted(attestor_stakes.items(), key=lambda x: x[0])
+            distributed = 0
+            for i, (att_id, stake) in enumerate(sorted_atts):
+                if i == len(sorted_atts) - 1:
+                    att_reward = attestor_pool - distributed
+                else:
+                    att_reward = attestor_pool * stake // total_att_stake
+                sim_balances[att_id] = sim_balances.get(att_id, 0) + att_reward
+                distributed += att_reward
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_share
+        else:
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
 
         return compute_state_root(sim_balances, sim_nonces, sim_staked)
 
@@ -577,6 +616,7 @@ class Blockchain:
         state_root = self.compute_post_state_root(
             transactions, proposer_entity.entity_id, block_height,
             transfer_transactions=transfer_transactions,
+            attestations=attestations,
         )
         return consensus.create_block(
             proposer_entity, transactions, prev,
@@ -790,31 +830,67 @@ class Blockchain:
 
         return True, "Valid"
 
+    def _apply_transfer_with_burn(self, tx, proposer_id: bytes, base_fee: int):
+        """Apply a transfer transaction with EIP-1559 fee burning."""
+        tip = tx.fee - base_fee
+        self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
+        self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
+        self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tip
+        self.supply.total_supply -= base_fee  # burn
+        self.supply.total_burned += base_fee
+        self.supply.total_fees_collected += tx.fee
+        self.nonces[tx.entity_id] = tx.nonce + 1
+
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
         proposer_id = block.header.proposer_id
+        current_base_fee = self.supply.base_fee
+
+        # Count total txs for base fee adjustment
+        total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+
+        # Apply message transaction fees (EIP-1559: burn base fee, tip to proposer)
         for tx in block.transactions:
-            self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
+            self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, current_base_fee)
             self.nonces[tx.entity_id] = tx.nonce + 1
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
-        # Apply transfer transactions
+        # Apply transfer transactions (also with burn)
         for ttx in block.transfer_transactions:
-            self.apply_transfer_transaction(ttx, proposer_id)
-        # Apply slash transactions — each consumes a WOTS+ leaf from the submitter
+            self._apply_transfer_with_burn(ttx, proposer_id, current_base_fee)
+        # Apply slash transactions
         for stx in block.slash_transactions:
-            self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
+            self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
-        reward = self.supply.mint_block_reward(proposer_id, block.header.block_number)
-        # Track immature reward for coinbase maturity enforcement
-        self._immature_rewards.append(
-            (block.header.block_number, proposer_id, reward)
+
+        # Build attestor stakes map for reward distribution
+        attestor_stakes = {}
+        for att in block.attestations:
+            stake = self.supply.get_staked(att.validator_id)
+            if stake > 0:
+                attestor_stakes[att.validator_id] = stake
+
+        # Mint block reward split between proposer and attestors
+        result = self.supply.mint_block_reward(
+            proposer_id, block.header.block_number,
+            attestor_stakes=attestor_stakes,
         )
+
+        # Track immature rewards for ALL recipients (proposer + attestors)
+        self._immature_rewards.append(
+            (block.header.block_number, proposer_id, result["proposer_reward"])
+        )
+        for att_id, att_reward in result["attestor_rewards"].items():
+            if att_reward > 0:
+                self._immature_rewards.append(
+                    (block.header.block_number, att_id, att_reward)
+                )
+
         # Prune fully-matured rewards to bound memory
         cutoff = block.header.block_number - COINBASE_MATURITY
         self._immature_rewards = [
@@ -832,6 +908,10 @@ class Blockchain:
             )
         # Release matured pending unstakes
         self.supply.process_pending_unstakes(block.header.block_number)
+
+        # Update base fee for next block based on this block's fullness
+        self.supply.update_base_fee(total_tx_count)
+        self.base_fee = self.supply.base_fee
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
@@ -863,7 +943,16 @@ class Blockchain:
             # This block creates or extends a fork
             return self._handle_fork(block, parent)
 
-        # Orphan block — parent unknown, store in bounded pool
+        # Orphan block — parent unknown. Pre-validate structure before storing
+        # to prevent attackers from filling the pool with garbage blocks.
+        import messagechain.config
+        sig_cost = compute_block_sig_cost(block)
+        if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
+            return False, f"Orphan rejected — sig cost {sig_cost} exceeds limit"
+        total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if total_tx_count > MAX_TXS_PER_BLOCK:
+            return False, "Orphan rejected — too many transactions"
+
         if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
             self.orphan_pool[block.block_hash] = block
             logger.debug(f"Stored orphan block #{block.header.block_number} (pool: {len(self.orphan_pool)})")
@@ -881,12 +970,15 @@ class Blockchain:
             if not valid:
                 return False, f"Invalid slash tx: {reason}"
 
+        # Snapshot state BEFORE mutation so we can rollback if state_root is wrong.
+        # This prevents a block with invalid state_root from corrupting chain state.
+        snapshot = self._snapshot_memory_state()
+
         # Apply state changes (single code path for normal + reorg)
         self._apply_block_state(block)
         reward = self.supply.calculate_block_reward(block.header.block_number)
-
-        # Process pending unstakes at this block height
-        self.supply.process_pending_unstakes(block.header.block_number)
+        total_fees = sum(tx.fee for tx in block.transactions)
+        burned = total_fees  # approximate — each tx burns base_fee
 
         # Verify state_root commitment (mandatory for all post-genesis blocks).
         # Every block must commit to the post-application state. A zeroed
@@ -894,6 +986,8 @@ class Blockchain:
         # from submitting blocks with fabricated state.
         expected_state_root = self.compute_current_state_root()
         if block.header.state_root != expected_state_root:
+            # Rollback: restore state from snapshot to prevent corruption
+            self._restore_memory_snapshot(snapshot)
             return False, "Invalid state_root — state commitment mismatch"
 
         self.chain.append(block)
@@ -922,7 +1016,7 @@ class Blockchain:
         # Process any orphan blocks that depend on this block
         self._process_orphans(block.block_hash)
 
-        return True, f"Block added (reward: {reward}, fees: {sum(tx.fee for tx in block.transactions)})"
+        return True, f"Block added (reward: {reward}, fees: {total_fees})"
 
     def _process_orphans(self, parent_hash: bytes):
         """Check if any orphan blocks depend on the given parent and try to add them."""
@@ -1122,8 +1216,12 @@ class Blockchain:
             self.nonces[eid] = 0
 
     def _snapshot_memory_state(self) -> dict:
-        """Capture in-memory state for rollback."""
-        return {
+        """Capture in-memory state for rollback.
+
+        Includes governance state (delegations, votes) so that chain
+        reorganizations properly revert governance side-effects.
+        """
+        snapshot = {
             "balances": dict(self.supply.balances),
             "staked": dict(self.supply.staked),
             "nonces": dict(self.nonces),
@@ -1136,18 +1234,33 @@ class Blockchain:
             "total_supply": self.supply.total_supply,
             "total_minted": self.supply.total_minted,
             "total_fees_collected": self.supply.total_fees_collected,
+            "total_burned": self.supply.total_burned,
+            "base_fee": self.supply.base_fee,
             "chain_length": len(self.chain),
             "slashed_validators": set(self.slashed_validators),
             "immature_rewards": list(self._immature_rewards),
         }
+        # Snapshot governance state if tracker is attached
+        if hasattr(self, "governance") and self.governance is not None:
+            gov = self.governance
+            snapshot["gov_delegations"] = dict(gov.delegations)
+            snapshot["gov_proposals"] = {
+                pid: (dict(ps.votes), ps.created_at_block)
+                for pid, ps in gov.proposals.items()
+            }
+            snapshot["gov_executed_treasury_spends"] = set(gov._executed_treasury_spends)
+        return snapshot
 
     def _restore_memory_snapshot(self, snapshot: dict):
-        """Restore in-memory state from snapshot."""
+        """Restore in-memory state from snapshot (including governance)."""
         self.supply.balances = snapshot["balances"]
         self.supply.staked = snapshot["staked"]
         self.supply.total_supply = snapshot["total_supply"]
         self.supply.total_minted = snapshot["total_minted"]
         self.supply.total_fees_collected = snapshot["total_fees_collected"]
+        self.supply.total_burned = snapshot.get("total_burned", 0)
+        self.supply.base_fee = snapshot.get("base_fee", BASE_FEE_INITIAL)
+        self.base_fee = self.supply.base_fee
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
         self.entity_message_count = snapshot["message_counts"]
@@ -1157,6 +1270,12 @@ class Blockchain:
         self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
+        # Restore governance state if tracker is attached and was snapshotted
+        if hasattr(self, "governance") and self.governance is not None:
+            if "gov_delegations" in snapshot:
+                self.governance.delegations = snapshot["gov_delegations"]
+            if "gov_executed_treasury_spends" in snapshot:
+                self.governance._executed_treasury_spends = snapshot["gov_executed_treasury_spends"]
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
         """Total WOTS+ leaves consumed by this entity across ALL signature types.

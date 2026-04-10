@@ -247,12 +247,15 @@ class TestWotsLeafTracking(unittest.TestCase):
         genesis = chain.get_latest_block()
         att = create_attestation(validator, genesis.block_hash, 0)
 
-        # Create a block that includes this attestation
+        # Create a block that includes this attestation (with correct state root)
         pos = ProofOfStake()
         pos.stakes[proposer.entity_id] = 1000
+        state_root = chain.compute_post_state_root(
+            [], proposer.entity_id, 1, attestations=[att],
+        )
         block = pos.create_block(
             proposer, [], genesis,
-            attestations=[att],
+            state_root=state_root, attestations=[att],
         )
         chain.add_block(block)
 

@@ -42,16 +42,23 @@ class SignatureCache:
 
     def __init__(self, max_size: int = DEFAULT_CACHE_SIZE):
         self.max_size = max_size
-        self._cache: OrderedDict[bytes, bool] = OrderedDict()
+        self._cache: OrderedDict[bytes, tuple[bool, int]] = OrderedDict()
         # block_hash -> list of cache keys, for partial invalidation on reorg
         self._block_keys: dict[bytes, list[bytes]] = {}
+        # Monotonic version counter — incremented on invalidation.
+        # Entries cached at a prior version are treated as misses.
+        self._version: int = 0
 
     def lookup(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes) -> bool | None:
         """Check if a verification result is cached. Returns None on miss."""
         key = _cache_key(msg_hash, sig_hash, pub_key)
         if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
+            result, cached_version = self._cache[key]
+            if cached_version == self._version:
+                self._cache.move_to_end(key)
+                return result
+            # Stale entry from prior version — treat as miss
+            del self._cache[key]
         return None
 
     def store(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes, result: bool):
@@ -67,7 +74,7 @@ class SignatureCache:
             return
         if len(self._cache) >= self.max_size:
             self._cache.popitem(last=False)
-        self._cache[key] = result
+        self._cache[key] = (result, self._version)
 
     def invalidate(self, block_hashes: set[bytes] | None = None):
         """Invalidate cache entries.
@@ -77,12 +84,18 @@ class SignatureCache:
         entire cache is cleared.
         """
         if block_hashes is None:
+            # Full invalidation: clear everything and bump version.
+            # Version bump ensures any concurrent lookups in progress
+            # won't return stale results from the prior epoch.
             self._cache.clear()
             self._block_keys.clear()
-            return
-        for bh in block_hashes:
-            for key in self._block_keys.pop(bh, []):
-                self._cache.pop(key, None)
+            self._version += 1
+        else:
+            # Partial invalidation: only remove entries for specific blocks.
+            # No version bump needed — unaffected entries remain valid.
+            for bh in block_hashes:
+                for key in self._block_keys.pop(bh, []):
+                    self._cache.pop(key, None)
 
     def associate_block(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes, block_hash: bytes):
         """Associate a cached entry with a block for partial invalidation."""

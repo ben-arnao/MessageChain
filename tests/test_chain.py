@@ -87,8 +87,16 @@ class TestBlockchain(unittest.TestCase):
             block = self._make_block(entity, [tx])
             self.chain.add_block(block)
 
-        self.assertGreater(self.chain.supply.total_supply, initial_supply)
+        # With EIP-1559 fee burning, total_supply may decrease even as
+        # block rewards are minted.  Verify that minting occurred and that
+        # the net change equals (minted - burned).
         self.assertGreater(self.chain.supply.total_minted, 0)
+        expected_supply = (
+            initial_supply
+            + self.chain.supply.total_minted
+            - self.chain.supply.total_burned
+        )
+        self.assertEqual(self.chain.supply.total_supply, expected_supply)
 
     def test_fee_bidding_priority(self):
         """Higher fee transactions are prioritized in mempool."""

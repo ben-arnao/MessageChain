@@ -24,7 +24,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, SLASH_FINDER_REWARD_PCT
+from messagechain.config import HASH_ALGO, SLASH_FINDER_REWARD_PCT, CHAIN_ID
 from messagechain.core.block import BlockHeader, _hash
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
 from messagechain.consensus.attestation import Attestation, verify_attestation
@@ -194,9 +194,10 @@ class SlashTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            self.evidence.evidence_hash
+            CHAIN_ID
+            + self.evidence.evidence_hash
             + self.submitter_id
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 

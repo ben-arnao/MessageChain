@@ -13,7 +13,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MIN_FEE, MAX_TIMESTAMP_DRIFT
+from messagechain.config import HASH_ALGO, MIN_FEE, MAX_TIMESTAMP_DRIFT, CHAIN_ID
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -39,12 +39,13 @@ class TransferTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"transfer"
+            CHAIN_ID
+            + b"transfer"
             + self.entity_id
             + self.recipient_id
             + struct.pack(">Q", self.amount)
             + struct.pack(">Q", self.nonce)
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 

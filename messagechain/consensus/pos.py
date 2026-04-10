@@ -61,12 +61,17 @@ class ProofOfStake:
     def validator_count(self) -> int:
         return len(self.stakes)
 
-    def select_proposer(self, prev_block_hash: bytes) -> bytes | None:
+    def select_proposer(self, prev_block_hash: bytes, randao_mix: bytes | None = None) -> bytes | None:
         """
         Deterministically select the next block proposer.
 
-        Uses the previous block hash as a seed, weighted by stake.
-        Every node computes the same result for the same chain state.
+        Uses the previous block hash (and optional RANDAO mix) as a seed,
+        weighted by stake. Every node computes the same result for the same
+        chain state.
+
+        When randao_mix is provided, it is mixed into the seed to prevent
+        proposer grinding attacks (where a proposer manipulates block contents
+        to influence the next selection).
         """
         if not self.stakes:
             return None
@@ -77,9 +82,12 @@ class ProofOfStake:
         if total == 0:
             return None  # all stakes are zero — no valid proposer
 
-        # Hash the prev block to get a random value
-        seed = _hash(prev_block_hash + b"proposer_selection")
-        rand_value = int.from_bytes(seed[:8], "big") % total
+        # Build seed from prev_block_hash and optional RANDAO mix
+        seed_input = prev_block_hash
+        if randao_mix is not None:
+            seed_input = prev_block_hash + randao_mix
+        seed = _hash(seed_input + b"proposer_selection")
+        rand_value = int.from_bytes(seed, "big") % total
 
         # Stake-weighted selection
         cumulative = 0

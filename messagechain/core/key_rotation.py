@@ -17,7 +17,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE
+from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
 from messagechain.identity.identity import Entity
 
@@ -41,11 +41,12 @@ class KeyRotationTransaction:
     def _signable_data(self) -> bytes:
         """Canonical byte representation for signing."""
         return (
-            self.entity_id
+            CHAIN_ID
+            + self.entity_id
             + self.old_public_key
             + self.new_public_key
             + struct.pack(">Q", self.rotation_number)
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 

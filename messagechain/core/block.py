@@ -105,7 +105,7 @@ class BlockHeader:
             + self.prev_hash
             + self.merkle_root
             + self.state_root
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + self.proposer_id
         )
 

@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: run with production MERKLE_TREE_HEIGHT=10 (deselect with '-m \"not slow\"')",
+]
+# Run fast tests only:  python -m pytest -m "not slow"
+# Run with parallelism: python -m pytest -n auto  (requires pytest-xdist)

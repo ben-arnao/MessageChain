@@ -371,25 +371,33 @@ class Node:
 
     @staticmethod
     def _is_valid_peer_address(host: str, port) -> bool:
-        """Reject private/invalid IPs and out-of-range ports (eclipse resistance)."""
+        """Reject non-routable IPs and out-of-range ports (eclipse resistance).
+
+        Uses ipaddress module for comprehensive validation covering IPv4, IPv6,
+        private, loopback, multicast, link-local, and reserved ranges.
+        Rejects hostnames entirely to prevent DNS rebinding attacks.
+        """
+        import ipaddress
         if not isinstance(host, str) or not isinstance(port, int):
             return False
         if not (1 <= port <= 65535):
             return False
-        # Reject RFC1918 private addresses and loopback
-        if host.startswith(("127.", "10.", "0.")):
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            return False  # Not a valid IP — reject hostnames
+        if ip.is_private:
             return False
-        if host.startswith("192.168."):
+        if ip.is_loopback:
             return False
-        if host.startswith("172."):
-            parts = host.split(".")
-            if len(parts) >= 2:
-                try:
-                    second = int(parts[1])
-                    if 16 <= second <= 31:
-                        return False
-                except ValueError:
-                    return False
+        if ip.is_multicast:
+            return False
+        if ip.is_link_local:
+            return False
+        if ip.is_reserved:
+            return False
+        if ip.is_unspecified:
+            return False
         return True
 
     def _msg_category(self, msg_type: MessageType) -> str:

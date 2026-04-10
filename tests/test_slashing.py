@@ -339,19 +339,21 @@ class TestSlashTransaction(unittest.TestCase):
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
 
-        # Simulate state after slash tx + block reward
+        # Simulate state after slash tx + block reward (with EIP-1559 burn)
         sim_balances = dict(self.chain.supply.balances)
         sim_nonces = dict(self.chain.nonces)
         sim_staked = dict(self.chain.supply.staked)
-        # Slash tx fee: bob pays 500 to carol (proposer)
+        current_base_fee = self.chain.supply.base_fee
+        # Slash tx fee: bob pays fee, base_fee is burned, tip to carol (proposer)
+        tip = slash_tx.fee - current_base_fee
         sim_balances[slash_tx.submitter_id] -= slash_tx.fee
-        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + slash_tx.fee
+        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + tip
         # Slash: alice stake (1000) -> 0, finder reward to bob
         slashed_amount = sim_staked.get(self.alice.entity_id, 0)
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         sim_staked[self.alice.entity_id] = 0
         sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
-        # Block reward to proposer
+        # Block reward to proposer (no attestors, so proposer gets full reward)
         reward = self.chain.supply.calculate_block_reward(block_height)
         sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + reward
         state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)

@@ -2,7 +2,7 @@
 
 import unittest
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.config import GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE
+from messagechain.config import GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE, BLOCK_REWARD_FLOOR
 
 
 class TestInflation(unittest.TestCase):
@@ -19,7 +19,7 @@ class TestInflation(unittest.TestCase):
 
     def test_block_reward_minting(self):
         reward = self.tracker.mint_block_reward(self.proposer_id, block_height=1)
-        self.assertEqual(reward, BLOCK_REWARD)
+        self.assertEqual(reward["total_reward"], BLOCK_REWARD)
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY + BLOCK_REWARD)
         self.assertEqual(self.tracker.get_balance(self.proposer_id), BLOCK_REWARD)
 
@@ -36,18 +36,18 @@ class TestInflation(unittest.TestCase):
         self.assertEqual(reward_after_halving, 8)
 
     def test_four_meaningful_halvings(self):
-        """BLOCK_REWARD=16 gives 4 meaningful halvings: 16 -> 8 -> 4 -> 2 -> 1 (floor)."""
+        """BLOCK_REWARD=16 gives 2 meaningful halvings: 16 -> 8 -> 4 (floor)."""
         self.assertEqual(self.tracker.calculate_block_reward(0), 16)
         self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL), 8)
         self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 2), 4)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 3), 2)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 4), 1)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 5), 1)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 3), 4)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 4), 4)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 5), 4)
 
     def test_reward_never_reaches_zero(self):
-        """Even after many halvings, reward stays at least 1."""
+        """Even after many halvings, reward stays at least BLOCK_REWARD_FLOOR."""
         reward = self.tracker.calculate_block_reward(HALVING_INTERVAL * 100)
-        self.assertGreaterEqual(reward, 1)
+        self.assertGreaterEqual(reward, BLOCK_REWARD_FLOOR)
 
     def test_fee_payment(self):
         self.assertTrue(self.tracker.pay_fee(self.entity_id, self.proposer_id, 100))

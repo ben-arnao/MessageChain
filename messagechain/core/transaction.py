@@ -17,7 +17,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, MAX_TIMESTAMP_DRIFT
+from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE, MAX_TIMESTAMP_DRIFT, CHAIN_ID
 from messagechain.identity.identity import Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -43,10 +43,11 @@ class MessageTransaction:
     def _signable_data(self) -> bytes:
         """Canonical byte representation for signing (excludes signature and tx_hash)."""
         return (
-            struct.pack(">I", self.version)
+            CHAIN_ID
+            + struct.pack(">I", self.version)
             + self.entity_id
             + self.message
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
         )
@@ -107,6 +108,15 @@ class MessageTransaction:
         return tx
 
 
+def calculate_min_fee(message_bytes: bytes) -> int:
+    """Calculate minimum fee for a message based on its size.
+
+    Fee = MIN_FEE + len(message_bytes) * FEE_PER_BYTE.
+    This ties the cost of a transaction directly to its storage impact.
+    """
+    return MIN_FEE + len(message_bytes) * FEE_PER_BYTE
+
+
 def _validate_message(message: str) -> tuple[bool, str]:
     """Check message is within character and byte limits."""
     msg_bytes = message.encode("utf-8")
@@ -133,10 +143,10 @@ def create_transaction(
     if not valid:
         raise ValueError(reason)
 
-    if fee < MIN_FEE:
-        raise ValueError(f"Fee must be at least {MIN_FEE}")
-
     msg_bytes = message.encode("utf-8")
+    min_required = calculate_min_fee(msg_bytes)
+    if fee < min_required:
+        raise ValueError(f"Fee must be at least {min_required} for this message ({len(msg_bytes)} bytes)")
 
     tx = MessageTransaction(
         entity_id=entity.entity_id,
@@ -162,7 +172,7 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
         return False
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
-    if tx.fee < MIN_FEE:
+    if tx.fee < calculate_min_fee(tx.message):
         return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
