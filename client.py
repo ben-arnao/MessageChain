@@ -174,10 +174,174 @@ def cmd_send_message(args):
         sys.exit(1)
 
 
+def cmd_transfer(args):
+    """Transfer tokens to another entity."""
+    from messagechain.core.transfer import create_transfer_transaction
+
+    print("=== Transfer Tokens ===\n")
+    private_key = collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nSending as: {entity.entity_id_hex[:16]}...")
+
+    nonce_resp = rpc_call(args.host, args.rpc_port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    fee = args.fee if args.fee else 1
+    recipient_id = bytes.fromhex(args.to)
+    tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
+
+    print(f"Transferring {args.amount} tokens to {args.to[:16]}... (fee: {fee})")
+    response = rpc_call(args.host, args.rpc_port, "submit_transfer", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nTransfer submitted!")
+        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  Amount:  {result['amount']} tokens")
+        print(f"  Fee:     {result['fee']} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_balance(args):
+    """Check account balance."""
+    print("=== Account Balance ===\n")
+    private_key = collect_private_key()
+    entity = Entity.create(private_key)
+
+    response = rpc_call(args.host, args.rpc_port, "get_entity", {
+        "entity_id": entity.entity_id_hex,
+    })
+
+    if response.get("ok"):
+        info = response["result"]
+        print(f"  Entity ID:       {info['entity_id']}")
+        print(f"  Balance:         {info['balance']} tokens")
+        print(f"  Staked:          {info['staked']} tokens")
+        print(f"  Messages posted: {info['messages_posted']}")
+        print(f"  Nonce:           {info['nonce']}")
+    else:
+        print(f"\nError: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_stake(args):
+    """Stake tokens to become a validator."""
+    from messagechain.core.staking import create_stake_transaction
+
+    print("=== Stake Tokens ===\n")
+    private_key = collect_private_key()
+    entity = Entity.create(private_key)
+
+    nonce_resp = rpc_call(args.host, args.rpc_port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    fee = args.fee if args.fee else 1
+    tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
+
+    response = rpc_call(args.host, args.rpc_port, "stake", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nStake submitted!")
+        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  Staked:  {result['staked']} tokens")
+        print(f"  Balance: {result['balance']} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_unstake(args):
+    """Unstake tokens."""
+    from messagechain.core.staking import create_unstake_transaction
+
+    print("=== Unstake Tokens ===\n")
+    private_key = collect_private_key()
+    entity = Entity.create(private_key)
+
+    nonce_resp = rpc_call(args.host, args.rpc_port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    entity.keypair.advance_to_leaf(nonce)
+
+    fee = args.fee if args.fee else 1
+    tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
+
+    response = rpc_call(args.host, args.rpc_port, "unstake", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nUnstake submitted!")
+        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  Staked:  {result['staked']} tokens")
+        print(f"  Balance: {result['balance']} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_generate_key(_args):
+    """Generate a new cryptographically random private key."""
+    import os
+    key = os.urandom(32)
+    print("=== Key Generated ===\n")
+    print(f"  Private key: {key.hex()}")
+    print(f"\n  WARNING: Save this key securely. It is your sole credential.")
+    print("  Anyone with this key controls your account. There is no recovery.")
+    print("  This key will NOT be shown again.")
+
+
+def cmd_read(args):
+    """Read recent messages from the chain."""
+    response = rpc_call(args.host, args.rpc_port, "get_messages", {"count": args.last})
+
+    if response.get("ok"):
+        messages = response["result"]["messages"]
+        if not messages:
+            print("No messages on chain yet.")
+            return
+
+        print(f"=== Recent Messages ({len(messages)}) ===\n")
+        for msg in messages:
+            import datetime
+            ts = datetime.datetime.fromtimestamp(msg["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
+            entity = msg["entity_id"][:16]
+            print(f"  [{ts}] {entity}...")
+            print(f"  {msg['message']}")
+            print()
+    else:
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MessageChain Client",
-        usage="client.py {create-account,send-message} [options]",
+        usage="client.py {create-account,send-message,transfer,balance,stake,unstake,generate-key,read} [options]",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
     parser.add_argument("--rpc-port", type=int, default=9334, help="Server RPC port (default: 9334)")
@@ -192,12 +356,50 @@ def main():
     send_parser.add_argument("-m", "--message", type=str, help="Message text (or enter interactively)")
     send_parser.add_argument("-f", "--fee", type=int, help="Transaction fee (or enter interactively)")
 
+    # transfer
+    transfer_parser = subparsers.add_parser("transfer", help="Transfer tokens to another entity")
+    transfer_parser.add_argument("--to", required=True, help="Recipient entity ID (hex)")
+    transfer_parser.add_argument("--amount", type=int, required=True, help="Amount to transfer")
+    transfer_parser.add_argument("-f", "--fee", type=int, help="Transaction fee")
+
+    # balance
+    subparsers.add_parser("balance", help="Check your account balance")
+
+    # stake
+    stake_parser = subparsers.add_parser("stake", help="Stake tokens to become a validator")
+    stake_parser.add_argument("--amount", type=int, required=True, help="Amount to stake")
+    stake_parser.add_argument("-f", "--fee", type=int, help="Transaction fee")
+
+    # unstake
+    unstake_parser = subparsers.add_parser("unstake", help="Unstake tokens")
+    unstake_parser.add_argument("--amount", type=int, required=True, help="Amount to unstake")
+    unstake_parser.add_argument("-f", "--fee", type=int, help="Transaction fee")
+
+    # generate-key
+    subparsers.add_parser("generate-key", help="Generate a new private key")
+
+    # read
+    read_parser = subparsers.add_parser("read", help="Read recent messages from the chain")
+    read_parser.add_argument("--last", type=int, default=10, help="Number of messages (default: 10)")
+
     args = parser.parse_args()
 
-    if args.command == "create-account":
-        cmd_create_account(args)
-    elif args.command == "send-message":
-        cmd_send_message(args)
+    commands = {
+        "create-account": cmd_create_account,
+        "send-message": cmd_send_message,
+        "transfer": cmd_transfer,
+        "balance": cmd_balance,
+        "stake": cmd_stake,
+        "unstake": cmd_unstake,
+        "generate-key": cmd_generate_key,
+        "read": cmd_read,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        handler(args)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

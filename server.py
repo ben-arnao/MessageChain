@@ -41,6 +41,9 @@ from messagechain.core.staking import (
     create_stake_transaction, create_unstake_transaction,
     verify_stake_transaction, verify_unstake_transaction,
 )
+from messagechain.core.transfer import (
+    TransferTransaction, verify_transfer_transaction,
+)
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
@@ -264,6 +267,15 @@ class Server:
         elif method == "unstake":
             return self._rpc_unstake(request["params"])
 
+        elif method == "submit_transfer":
+            return self._rpc_submit_transfer(request["params"])
+
+        elif method == "get_messages":
+            count = request.get("params", {}).get("count", 10)
+            count = min(count, 100)  # cap to prevent abuse
+            messages = self.blockchain.get_recent_messages(count)
+            return {"ok": True, "result": {"messages": messages}}
+
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
@@ -414,6 +426,31 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def _rpc_submit_transfer(self, params: dict) -> dict:
+        """Accept a signed transfer transaction from a client."""
+        try:
+            tx = TransferTransaction.deserialize(params["transaction"])
+            valid, reason = self.blockchain.validate_transfer_transaction(tx)
+            if not valid:
+                return {"ok": False, "error": reason}
+            self.mempool.add_transaction(tx)
+
+            tx_hash_hex = tx.tx_hash.hex()
+            self._track_seen_tx(tx_hash_hex)
+            asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
+
+            return {
+                "ok": True,
+                "result": {
+                    "tx_hash": tx.tx_hash.hex(),
+                    "amount": tx.amount,
+                    "fee": tx.fee,
+                    "message": "Transfer accepted into mempool",
+                },
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def _rpc_get_entity(self, params: dict) -> dict:
         entity_id = bytes.fromhex(params["entity_id"])
         if entity_id not in self.blockchain.public_keys:
@@ -449,23 +486,29 @@ class Server:
                     continue
 
             # Build block from highest-fee transactions
-            txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-            if not txs:
+            all_pending = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
+            if not all_pending:
                 continue
+
+            # Separate message txs from transfer txs
+            txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
+            transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
 
             # Compute post-state root (state AFTER applying fees + reward)
             block_height = latest.header.block_number + 1
             state_root = self.blockchain.compute_post_state_root(
                 txs, self.wallet_id, block_height,
+                transfer_transactions=transfer_txs,
             )
             block = self.consensus.create_block(
                 self.wallet_entity, txs, latest, state_root=state_root,
+                transfer_transactions=transfer_txs,
             )
 
             success, reason = self.blockchain.add_block(block)
             if success:
-                self.mempool.remove_transactions([tx.tx_hash for tx in txs])
-                total_fees = sum(tx.fee for tx in txs)
+                self.mempool.remove_transactions([tx.tx_hash for tx in all_pending])
+                total_fees = sum(tx.fee for tx in all_pending)
                 balance = self.blockchain.supply.get_balance(self.wallet_id)
                 logger.info(
                     f"Block #{block.header.block_number} | "

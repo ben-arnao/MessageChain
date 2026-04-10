@@ -25,6 +25,9 @@ from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
 )
+from messagechain.core.transfer import (
+    TransferTransaction, verify_transfer_transaction,
+)
 from messagechain.consensus.slashing import (
     SlashTransaction, SlashingEvidence, AttestationSlashingEvidence,
     verify_slashing_evidence, verify_attestation_slashing_evidence,
@@ -282,6 +285,35 @@ class Blockchain:
 
         return True, "Valid"
 
+    def validate_transfer_transaction(self, tx: TransferTransaction) -> tuple[bool, str]:
+        """Validate a transfer transaction against current chain state."""
+        if tx.entity_id not in self.public_keys:
+            return False, "Unknown sender — must register first"
+
+        if tx.recipient_id not in self.public_keys:
+            return False, "Unknown recipient — must register first"
+
+        expected_nonce = self.nonces.get(tx.entity_id, 0)
+        if tx.nonce != expected_nonce:
+            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+
+        if self.get_spendable_balance(tx.entity_id) < tx.amount + tx.fee:
+            return False, f"Insufficient spendable balance for transfer of {tx.amount} + fee {tx.fee}"
+
+        public_key = self.public_keys[tx.entity_id]
+        if not verify_transfer_transaction(tx, public_key):
+            return False, "Invalid signature"
+
+        return True, "Valid"
+
+    def apply_transfer_transaction(self, tx: TransferTransaction, proposer_id: bytes):
+        """Apply a validated transfer: move tokens from sender to recipient, fee to proposer."""
+        self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
+        self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
+        self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tx.fee
+        self.supply.total_fees_collected += tx.fee
+        self.nonces[tx.entity_id] = tx.nonce + 1
+
     def validate_key_rotation(self, tx: KeyRotationTransaction) -> tuple[bool, str]:
         """Validate a key rotation transaction against current chain state."""
         if tx.entity_id not in self.public_keys:
@@ -420,6 +452,7 @@ class Blockchain:
         transactions: list[MessageTransaction],
         proposer_id: bytes,
         block_height: int,
+        transfer_transactions: list[TransferTransaction] | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -431,11 +464,18 @@ class Blockchain:
         sim_nonces = dict(self.nonces)
         sim_staked = dict(self.supply.staked)
 
-        # Simulate fee payments
+        # Simulate fee payments for message transactions
         for tx in transactions:
             sim_balances[tx.entity_id] = sim_balances.get(tx.entity_id, 0) - tx.fee
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tx.fee
             sim_nonces[tx.entity_id] = tx.nonce + 1
+
+        # Simulate transfer transactions
+        for ttx in (transfer_transactions or []):
+            sim_balances[ttx.entity_id] = sim_balances.get(ttx.entity_id, 0) - ttx.amount - ttx.fee
+            sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + ttx.fee
+            sim_nonces[ttx.entity_id] = ttx.nonce + 1
 
         # Simulate block reward
         reward = self.supply.calculate_block_reward(block_height)
@@ -449,6 +489,7 @@ class Blockchain:
         proposer_entity,
         transactions: list[MessageTransaction],
         attestations: list[Attestation] | None = None,
+        transfer_transactions: list[TransferTransaction] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -458,11 +499,13 @@ class Blockchain:
         prev = self.get_latest_block()
         block_height = prev.header.block_number + 1
         state_root = self.compute_post_state_root(
-            transactions, proposer_entity.entity_id, block_height
+            transactions, proposer_entity.entity_id, block_height,
+            transfer_transactions=transfer_transactions,
         )
         return consensus.create_block(
             proposer_entity, transactions, prev,
             state_root=state_root, attestations=attestations,
+            transfer_transactions=transfer_transactions,
         )
 
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
@@ -539,7 +582,8 @@ class Blockchain:
 
         # Check for duplicate transaction hashes within the block
         seen_tx_hashes = set()
-        for tx in block.transactions:
+        all_txs = list(block.transactions) + list(block.transfer_transactions)
+        for tx in all_txs:
             if tx.tx_hash in seen_tx_hashes:
                 return False, f"Duplicate transaction {tx.tx_hash.hex()[:16]} in block"
             seen_tx_hashes.add(tx.tx_hash)
@@ -547,12 +591,12 @@ class Blockchain:
         # Check total signature verification cost (sigops-style limit)
         # Each tx signature costs 1, proposer signature costs 1, each attestation costs 1
         import messagechain.config
-        sig_cost = len(block.transactions) + 1 + len(block.attestations)
+        sig_cost = len(all_txs) + 1 + len(block.attestations)
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {MAX_BLOCK_SIG_COST}"
 
-        # Verify merkle root
-        tx_hashes = [tx.tx_hash for tx in block.transactions]
+        # Verify merkle root (includes message + transfer tx hashes)
+        tx_hashes = [tx.tx_hash for tx in all_txs]
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
@@ -606,6 +650,36 @@ class Blockchain:
             pending_nonces[tx.entity_id] = expected_nonce + 1
             pending_balance_spent[tx.entity_id] = spent_so_far + tx.fee
 
+        # Validate transfer transactions (same nonce/balance tracking)
+        for ttx in block.transfer_transactions:
+            if ttx.entity_id not in self.public_keys:
+                return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Unknown sender"
+            if ttx.recipient_id not in self.public_keys:
+                return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Unknown recipient"
+
+            expected_nonce = pending_nonces.get(
+                ttx.entity_id, self.nonces.get(ttx.entity_id, 0)
+            )
+            if ttx.nonce != expected_nonce:
+                return False, (
+                    f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                    f"Invalid nonce: expected {expected_nonce}, got {ttx.nonce}"
+                )
+
+            spent_so_far = pending_balance_spent.get(ttx.entity_id, 0)
+            if self.get_spendable_balance(ttx.entity_id) < spent_so_far + ttx.amount + ttx.fee:
+                return False, (
+                    f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                    f"Insufficient balance for transfer of {ttx.amount} + fee {ttx.fee}"
+                )
+
+            public_key = self.public_keys[ttx.entity_id]
+            if not verify_transfer_transaction(ttx, public_key):
+                return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Invalid signature"
+
+            pending_nonces[ttx.entity_id] = expected_nonce + 1
+            pending_balance_spent[ttx.entity_id] = spent_so_far + ttx.amount + ttx.fee
+
         # Validate attestations (votes for the parent block)
         valid, reason = self._validate_attestations(block)
         if not valid:
@@ -638,6 +712,9 @@ class Blockchain:
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
+        # Apply transfer transactions
+        for ttx in block.transfer_transactions:
+            self.apply_transfer_transaction(ttx, proposer_id)
         # Apply slash transactions — each consumes a WOTS+ leaf from the submitter
         for stx in block.slash_transactions:
             self.supply.pay_fee(stx.submitter_id, proposer_id, stx.fee)
@@ -981,6 +1058,22 @@ class Blockchain:
             "messages_posted": self.entity_message_count.get(entity_id, 0),
             "nonce": self.nonces.get(entity_id, 0),
         }
+
+    def get_recent_messages(self, count: int) -> list[dict]:
+        """Get the most recent messages from the chain, newest first."""
+        messages = []
+        for block in reversed(self.chain):
+            for tx in reversed(block.transactions):
+                messages.append({
+                    "message": tx.message.decode("utf-8", errors="replace"),
+                    "entity_id": tx.entity_id.hex(),
+                    "timestamp": tx.timestamp,
+                    "tx_hash": tx.tx_hash.hex(),
+                    "block_number": block.header.block_number,
+                })
+                if len(messages) >= count:
+                    return messages
+        return messages
 
     def get_chain_info(self) -> dict:
         best_tip = self.fork_choice.get_best_tip()
