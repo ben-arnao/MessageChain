@@ -115,7 +115,7 @@ class TestTransferOnChain(unittest.TestCase):
             self.chain.get_wots_leaves_used(self.genesis.entity_id)
         )
         tx = create_transfer_transaction(
-            self.genesis, self.recipient.entity_id, 100, nonce=nonce, fee=500,
+            self.genesis, self.recipient.entity_id, 100, nonce=nonce, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertTrue(valid, reason)
@@ -131,7 +131,7 @@ class TestTransferOnChain(unittest.TestCase):
         tx = create_transfer_transaction(
             self.genesis, self.recipient.entity_id,
             GENESIS_ALLOCATION + 1,  # more than available
-            nonce=nonce, fee=500,
+            nonce=nonce, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertFalse(valid)
@@ -142,7 +142,7 @@ class TestTransferOnChain(unittest.TestCase):
         from messagechain.core.transfer import create_transfer_transaction
         unknown = Entity.create(b"unknown_key")
         tx = create_transfer_transaction(
-            unknown, self.recipient.entity_id, 50, nonce=0, fee=500,
+            unknown, self.recipient.entity_id, 50, nonce=0, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertFalse(valid)
@@ -157,7 +157,7 @@ class TestTransferOnChain(unittest.TestCase):
             self.chain.get_wots_leaves_used(self.genesis.entity_id)
         )
         tx = create_transfer_transaction(
-            self.genesis, unknown.entity_id, 50, nonce=nonce, fee=500,
+            self.genesis, unknown.entity_id, 50, nonce=nonce, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertFalse(valid)
@@ -170,7 +170,7 @@ class TestTransferOnChain(unittest.TestCase):
             self.chain.get_wots_leaves_used(self.genesis.entity_id)
         )
         tx = create_transfer_transaction(
-            self.genesis, self.recipient.entity_id, 50, nonce=999, fee=500,
+            self.genesis, self.recipient.entity_id, 50, nonce=999, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertFalse(valid)
@@ -219,7 +219,7 @@ class TestTransferOnChain(unittest.TestCase):
 
         amount = 100
         tx = create_transfer_transaction(
-            self.genesis, self.recipient.entity_id, amount, nonce=nonce, fee=500,
+            self.genesis, self.recipient.entity_id, amount, nonce=nonce, fee=1500,
         )
 
         recipient_before = self.chain.supply.get_balance(self.recipient.entity_id)
@@ -355,7 +355,7 @@ class TestReadMessages(unittest.TestCase):
         self.genesis.keypair.advance_to_leaf(
             self.chain.get_wots_leaves_used(self.genesis.entity_id)
         )
-        tx = create_transaction(self.genesis, "Hello chain!", fee=500, nonce=nonce)
+        tx = create_transaction(self.genesis, "Hello chain!", fee=1500, nonce=nonce)
 
         consensus = ProofOfStake()
         block = self.chain.propose_block(consensus, self.genesis, [tx])
@@ -378,7 +378,7 @@ class TestReadMessages(unittest.TestCase):
             self.genesis.keypair.advance_to_leaf(
                 self.chain.get_wots_leaves_used(self.genesis.entity_id)
             )
-            tx = create_transaction(self.genesis, f"Message {i}", fee=500, nonce=nonce)
+            tx = create_transaction(self.genesis, f"Message {i}", fee=1500, nonce=nonce)
             block = self.chain.propose_block(consensus, self.genesis, [tx])
             self.chain.add_block(block)
 
@@ -397,7 +397,7 @@ class TestReadMessages(unittest.TestCase):
             self.genesis.keypair.advance_to_leaf(
                 self.chain.get_wots_leaves_used(self.genesis.entity_id)
             )
-            tx = create_transaction(self.genesis, f"Message {i}", fee=500, nonce=nonce)
+            tx = create_transaction(self.genesis, f"Message {i}", fee=1500, nonce=nonce)
             block = self.chain.propose_block(consensus, self.genesis, [tx])
             self.chain.add_block(block)
 

@@ -69,7 +69,7 @@ class TestSignatureCanonicalization(unittest.TestCase):
         register_entity_for_test(chain, entity)
         chain.supply.balances[entity.entity_id] = 1000
 
-        tx = create_transaction(entity, "test witness hash", fee=500, nonce=0)
+        tx = create_transaction(entity, "test witness hash", fee=1500, nonce=0)
         self.assertTrue(hasattr(tx, 'witness_hash'))
         self.assertIsInstance(tx.witness_hash, bytes)
         self.assertTrue(len(tx.witness_hash) > 0)
@@ -84,7 +84,7 @@ class TestSignatureCanonicalization(unittest.TestCase):
         register_entity_for_test(chain, entity)
         chain.supply.balances[entity.entity_id] = 1000
 
-        tx = create_transaction(entity, "deterministic", fee=500, nonce=0)
+        tx = create_transaction(entity, "deterministic", fee=1500, nonce=0)
         wh1 = tx.witness_hash
         # Recompute
         wh2 = tx._compute_witness_hash()
@@ -155,7 +155,7 @@ class TestSigCostBudgetEnforcement(unittest.TestCase):
             # Create multiple transactions so sig cost exceeds 3
             txs = []
             for i in range(5):
-                tx = create_transaction(self.entity, f"msg {i}", fee=500, nonce=i)
+                tx = create_transaction(self.entity, f"msg {i}", fee=1500, nonce=i)
                 txs.append(tx)
                 self.chain.nonces[self.entity.entity_id] = i + 1
 

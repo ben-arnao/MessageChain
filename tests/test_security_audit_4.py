@@ -132,8 +132,8 @@ class TestStateRootBeforeMutation(unittest.TestCase):
         bob_bal_before = chain.supply.get_balance(self.bob.entity_id)
         nonces_before = dict(chain.nonces)
 
-        # Create a valid tx (fee must cover MIN_FEE + per-byte cost)
-        tx = create_transaction(self.bob, "test", MIN_FEE + 100, nonce=0)
+        # Create a valid tx (fee must cover identity creation fee + per-byte cost)
+        tx = create_transaction(self.bob, "test", 1500, nonce=0)
 
         # Create block with WRONG state root
         consensus = ProofOfStake()

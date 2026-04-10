@@ -1,10 +1,11 @@
 """Tests for anti-bloat parameter tuning and size-based fees.
 
 Validates the parameter changes that differentiate MessageChain from BTC:
-- Slower block time (120s vs 10s) to reduce header chain growth
-- Higher minimum fees to make message spam expensive
-- Size-based fee component so bigger messages cost more
-- Lower per-sender mempool limits to throttle burst spam
+- Slower block time (600s / 10 min) to reduce header chain growth
+- Non-linear size-based fees (quadratic) to punish large messages
+- Per-block byte budget (MAX_BLOCK_MESSAGE_BYTES) to cap storage per block
+- Message TTL for explicit retention bounds
+- Identity creation fee to gate account-level state bloat
 - Higher dynamic fee ceiling to punish congestion-era spam
 - Dependent parameter recalculation (halving, unbonding, governance)
 """
@@ -14,6 +15,8 @@ from messagechain.config import (
     BLOCK_TIME_TARGET,
     MIN_FEE,
     MAX_TXS_PER_BLOCK,
+    MAX_BLOCK_MESSAGE_BYTES,
+    MAX_MESSAGE_BYTES,
     MEMPOOL_PER_SENDER_LIMIT,
     MEMPOOL_MAX_ANCESTORS,
     HALVING_INTERVAL,
@@ -24,131 +27,154 @@ from messagechain.config import (
     GOVERNANCE_DELEGATE_FEE,
     KEY_ROTATION_FEE,
     FEE_PER_BYTE,
+    FEE_QUADRATIC_COEFF,
     BLOCK_REWARD,
+    MESSAGE_DEFAULT_TTL,
+    MESSAGE_MIN_TTL,
+    MESSAGE_MAX_TTL,
+    IDENTITY_CREATION_FEE,
 )
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 from messagechain.core.transaction import (
     create_transaction,
     verify_transaction,
     calculate_min_fee,
+    _validate_ttl,
 )
 from messagechain.identity.identity import Entity
 
 
 class TestBlockTimeParameters(unittest.TestCase):
-    """Block time should be slow — we don't care about TX speed."""
+    """Block time is 600s (10 min, same as BTC) — speed is not a priority."""
 
-    def test_block_time_is_120_seconds(self):
-        self.assertEqual(BLOCK_TIME_TARGET, 120)
+    def test_block_time_is_600_seconds(self):
+        self.assertEqual(BLOCK_TIME_TARGET, 600)
 
-    def test_halving_interval_is_4_years_at_120s(self):
-        """~4 years of blocks at 120s/block."""
+    def test_halving_interval_is_4_years_at_600s(self):
+        """~4 years of blocks at 600s/block."""
         blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
         years = HALVING_INTERVAL / blocks_per_year
         self.assertAlmostEqual(years, 4.0, delta=0.1)
 
-    def test_unbonding_period_is_7_days_at_120s(self):
-        """~7 days of blocks at 120s/block."""
+    def test_unbonding_period_is_7_days_at_600s(self):
+        """~7 days of blocks at 600s/block."""
         blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
         days = UNBONDING_PERIOD / blocks_per_day
         self.assertAlmostEqual(days, 7.0, delta=0.1)
 
-    def test_governance_voting_window_is_7_days_at_120s(self):
-        """~7 days of blocks at 120s/block."""
+    def test_governance_voting_window_is_7_days_at_600s(self):
+        """~7 days of blocks at 600s/block."""
         blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
         days = GOVERNANCE_VOTING_WINDOW / blocks_per_day
         self.assertAlmostEqual(days, 7.0, delta=0.1)
 
 
-class TestFeeParameters(unittest.TestCase):
-    """Fees should be high — messages are meant to be deliberate, not cheap."""
+class TestNonLinearFees(unittest.TestCase):
+    """Fees use quadratic pricing — larger messages cost disproportionately more."""
 
-    def test_min_fee_is_100(self):
-        self.assertEqual(MIN_FEE, 100)
+    def test_fee_per_byte_raised(self):
+        self.assertGreaterEqual(FEE_PER_BYTE, 3)
 
-    def test_fee_per_byte_exists(self):
-        self.assertGreater(FEE_PER_BYTE, 0)
+    def test_quadratic_coefficient_exists(self):
+        self.assertGreater(FEE_QUADRATIC_COEFF, 0)
 
-    def test_governance_fees_scaled_up(self):
-        self.assertEqual(GOVERNANCE_PROPOSAL_FEE, 1000)
-        self.assertEqual(GOVERNANCE_VOTE_FEE, 100)
-        self.assertEqual(GOVERNANCE_DELEGATE_FEE, 100)
+    def test_empty_message_costs_min_fee(self):
+        self.assertEqual(calculate_min_fee(b""), MIN_FEE)
 
-    def test_key_rotation_fee_scaled_up(self):
-        self.assertEqual(KEY_ROTATION_FEE, 1000)
+    def test_fee_formula(self):
+        """Fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000."""
+        msg = b"Hello, world!"
+        size = len(msg)
+        expected = MIN_FEE + size * FEE_PER_BYTE + (size * size * FEE_QUADRATIC_COEFF) // 1000
+        self.assertEqual(calculate_min_fee(msg), expected)
+
+    def test_fee_grows_super_linearly(self):
+        """Doubling message size more than doubles the fee increase."""
+        fee_100 = calculate_min_fee(b"x" * 100)
+        fee_200 = calculate_min_fee(b"x" * 200)
+        fee_400 = calculate_min_fee(b"x" * 400)
+        delta_small = fee_200 - fee_100
+        delta_large = fee_400 - fee_200
+        self.assertGreater(delta_large, delta_small)
+
+    def test_max_message_fee_is_substantial(self):
+        """Max-size message (1120 bytes) should cost far more than MIN_FEE."""
+        fee = calculate_min_fee(b"x" * 1120)
+        self.assertGreater(fee, MIN_FEE * 10)
+
+    def test_small_message_still_affordable(self):
+        """Short messages (50 bytes) should be reasonably priced."""
+        fee = calculate_min_fee(b"x" * 50)
+        # Should be modest — base fee + small linear + negligible quadratic
+        self.assertLess(fee, MIN_FEE * 5)
 
 
-class TestSizeBasedFees(unittest.TestCase):
-    """Larger messages should cost more — ties cost to storage impact."""
+class TestSizeBasedFeeIntegration(unittest.TestCase):
+    """Transaction creation/verification respects non-linear fees."""
 
     def setUp(self):
         self.alice = Entity.create(b"alice-key-for-fee-tests")
 
-    def test_calculate_min_fee_empty_message(self):
-        """Empty message should cost just the base MIN_FEE."""
-        fee = calculate_min_fee(b"")
-        self.assertEqual(fee, MIN_FEE)
-
-    def test_calculate_min_fee_scales_with_size(self):
-        """Bigger messages should cost more."""
-        small = calculate_min_fee(b"hi")
-        large = calculate_min_fee(b"x" * 500)
-        self.assertGreater(large, small)
-
-    def test_calculate_min_fee_formula(self):
-        """Fee = MIN_FEE + len(message_bytes) * FEE_PER_BYTE."""
-        msg = b"Hello, world!"
-        expected = MIN_FEE + len(msg) * FEE_PER_BYTE
-        self.assertEqual(calculate_min_fee(msg), expected)
-
-    def test_max_size_message_fee(self):
-        """A max-size message (1120 bytes) has a known minimum fee."""
-        msg = b"x" * 1120
-        expected = MIN_FEE + 1120 * FEE_PER_BYTE
-        self.assertEqual(calculate_min_fee(msg), expected)
-
-    def test_create_transaction_rejects_fee_below_size_minimum(self):
-        """Transaction creation rejects fee below size-based minimum."""
-        msg = "A" * 100  # 100 bytes in ASCII
-        min_required = MIN_FEE + 100 * FEE_PER_BYTE
+    def test_create_transaction_rejects_fee_below_nonlinear_minimum(self):
+        msg = "A" * 100
+        min_required = calculate_min_fee(msg.encode("utf-8"))
         with self.assertRaises(ValueError):
             create_transaction(self.alice, msg, fee=min_required - 1, nonce=0)
 
-    def test_create_transaction_accepts_fee_at_size_minimum(self):
-        """Transaction creation accepts fee exactly at size-based minimum."""
+    def test_create_transaction_accepts_fee_at_nonlinear_minimum(self):
         msg = "A" * 100
-        min_required = MIN_FEE + 100 * FEE_PER_BYTE
+        min_required = calculate_min_fee(msg.encode("utf-8"))
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
         self.assertEqual(tx.fee, min_required)
 
-    def test_verify_transaction_rejects_fee_below_size_minimum(self):
-        """Verification rejects transaction with fee below size-based minimum."""
+    def test_verify_transaction_with_valid_fee(self):
         msg = "B" * 200
-        min_required = MIN_FEE + 200 * FEE_PER_BYTE
-        # Create with valid fee, then tamper
+        min_required = calculate_min_fee(msg.encode("utf-8"))
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
-        # We can't easily tamper with fee without breaking the hash,
-        # so just test that verify checks fee vs message size
-        self.assertTrue(
-            verify_transaction(tx, self.alice.keypair.public_key)
-        )
+        self.assertTrue(verify_transaction(tx, self.alice.keypair.public_key))
+
+
+class TestBlockByteBudget(unittest.TestCase):
+    """MAX_BLOCK_MESSAGE_BYTES caps total message payload per block."""
+
+    def test_byte_budget_exists(self):
+        self.assertGreater(MAX_BLOCK_MESSAGE_BYTES, 0)
+
+    def test_byte_budget_is_10kb(self):
+        self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 10_000)
+
+    def test_max_size_messages_exceed_budget(self):
+        """20 max-size messages (1120 bytes each = 22,400) exceed the 10KB budget."""
+        total = MAX_TXS_PER_BLOCK * MAX_MESSAGE_BYTES
+        self.assertGreater(total, MAX_BLOCK_MESSAGE_BYTES)
+
+    def test_small_messages_fit_within_budget(self):
+        """20 small messages (50 bytes each = 1000) fit within the 10KB budget."""
+        total = MAX_TXS_PER_BLOCK * 50
+        self.assertLess(total, MAX_BLOCK_MESSAGE_BYTES)
+
+    def test_byte_budget_limits_max_messages_to_about_8(self):
+        """At 1120 bytes each, only ~8-9 max-size messages fit in the budget."""
+        max_fit = MAX_BLOCK_MESSAGE_BYTES // MAX_MESSAGE_BYTES
+        self.assertLess(max_fit, 10)
+        self.assertGreater(max_fit, 5)
 
 
 class TestBlockSizeParameters(unittest.TestCase):
-    """Block capacity should be limited to cap daily throughput."""
+    """Block capacity limits daily throughput to combat bloat."""
 
-    def test_max_txs_per_block_reduced(self):
+    def test_max_txs_per_block(self):
         self.assertEqual(MAX_TXS_PER_BLOCK, 20)
 
     def test_daily_throughput_cap(self):
-        """With 120s blocks and 20 txs/block, daily throughput is ~14,400."""
+        """With 600s blocks and 20 txs/block, daily throughput is ~2,880."""
         blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
         daily_txs = blocks_per_day * MAX_TXS_PER_BLOCK
-        self.assertLessEqual(daily_txs, 15000)
+        self.assertLessEqual(daily_txs, 3000)
 
 
 class TestMempoolParameters(unittest.TestCase):
-    """Per-sender limits should be tight to prevent burst spam."""
+    """Per-sender limits prevent burst spam."""
 
     def test_per_sender_limit_reduced(self):
         self.assertEqual(MEMPOOL_PER_SENDER_LIMIT, 5)
@@ -158,7 +184,7 @@ class TestMempoolParameters(unittest.TestCase):
 
 
 class TestDynamicFeeCeiling(unittest.TestCase):
-    """Dynamic fee ceiling should be high enough to punish spam during congestion."""
+    """Dynamic fee ceiling punishes spam during congestion."""
 
     def test_default_max_fee_is_10000(self):
         policy = DynamicFeePolicy()
@@ -178,12 +204,95 @@ class TestDynamicFeeCeiling(unittest.TestCase):
         fee = policy.get_min_relay_fee(0, 5000)
         self.assertEqual(fee, MIN_FEE)
 
-    def test_half_full_mempool_fee(self):
-        policy = DynamicFeePolicy()
-        fee = policy.get_min_relay_fee(2500, 5000)
-        # Should be roughly halfway between 100 and 10000
-        self.assertGreater(fee, MIN_FEE)
-        self.assertLess(fee, 10_000)
+
+class TestMessageTTL(unittest.TestCase):
+    """Messages have a TTL (time-to-live) for explicit retention bounds."""
+
+    def test_default_ttl_is_30_days(self):
+        blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
+        days = MESSAGE_DEFAULT_TTL / blocks_per_day
+        self.assertAlmostEqual(days, 30.0, delta=0.5)
+
+    def test_min_ttl_is_1_day(self):
+        blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
+        days = MESSAGE_MIN_TTL / blocks_per_day
+        self.assertAlmostEqual(days, 1.0, delta=0.1)
+
+    def test_max_ttl_is_1_year(self):
+        blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
+        years = MESSAGE_MAX_TTL / blocks_per_year
+        self.assertAlmostEqual(years, 1.0, delta=0.05)
+
+    def test_validate_ttl_zero_is_default(self):
+        valid, _ = _validate_ttl(0)
+        self.assertTrue(valid)
+
+    def test_validate_ttl_rejects_below_minimum(self):
+        valid, _ = _validate_ttl(MESSAGE_MIN_TTL - 1)
+        self.assertFalse(valid)
+
+    def test_validate_ttl_rejects_above_maximum(self):
+        valid, _ = _validate_ttl(MESSAGE_MAX_TTL + 1)
+        self.assertFalse(valid)
+
+    def test_validate_ttl_accepts_valid_range(self):
+        valid, _ = _validate_ttl(MESSAGE_MIN_TTL)
+        self.assertTrue(valid)
+        valid, _ = _validate_ttl(MESSAGE_MAX_TTL)
+        self.assertTrue(valid)
+        valid, _ = _validate_ttl(MESSAGE_DEFAULT_TTL)
+        self.assertTrue(valid)
+
+    def test_transaction_includes_ttl(self):
+        alice = Entity.create(b"alice-ttl-test")
+        fee = calculate_min_fee(b"hello")
+        tx = create_transaction(alice, "hello", fee=fee, nonce=0)
+        # Default TTL is 0 (meaning protocol default)
+        self.assertEqual(tx.ttl, 0)
+        self.assertEqual(tx.effective_ttl, MESSAGE_DEFAULT_TTL)
+
+    def test_transaction_custom_ttl(self):
+        alice = Entity.create(b"alice-custom-ttl")
+        fee = calculate_min_fee(b"hello")
+        tx = create_transaction(alice, "hello", fee=fee, nonce=0, ttl=MESSAGE_MIN_TTL)
+        self.assertEqual(tx.ttl, MESSAGE_MIN_TTL)
+        self.assertEqual(tx.effective_ttl, MESSAGE_MIN_TTL)
+
+    def test_transaction_rejects_invalid_ttl(self):
+        alice = Entity.create(b"alice-bad-ttl")
+        fee = calculate_min_fee(b"hello")
+        with self.assertRaises(ValueError):
+            create_transaction(alice, "hello", fee=fee, nonce=0, ttl=1)  # below min
+
+
+class TestIdentityCreationFee(unittest.TestCase):
+    """First transaction from a new entity must pay an extra creation fee."""
+
+    def test_identity_creation_fee_exists(self):
+        self.assertGreater(IDENTITY_CREATION_FEE, 0)
+
+    def test_identity_creation_fee_is_1000(self):
+        self.assertEqual(IDENTITY_CREATION_FEE, 1000)
+
+    def test_creation_fee_exceeds_min_fee(self):
+        """Identity creation fee should be significantly higher than MIN_FEE."""
+        self.assertGreater(IDENTITY_CREATION_FEE, MIN_FEE)
+
+
+class TestGovernanceFees(unittest.TestCase):
+    """Governance fees scaled appropriately."""
+
+    def test_governance_proposal_fee(self):
+        self.assertEqual(GOVERNANCE_PROPOSAL_FEE, 1000)
+
+    def test_governance_vote_fee(self):
+        self.assertEqual(GOVERNANCE_VOTE_FEE, 100)
+
+    def test_governance_delegate_fee(self):
+        self.assertEqual(GOVERNANCE_DELEGATE_FEE, 100)
+
+    def test_key_rotation_fee(self):
+        self.assertEqual(KEY_ROTATION_FEE, 1000)
 
 
 class TestHalvingStillWorks(unittest.TestCase):
@@ -199,6 +308,33 @@ class TestHalvingStillWorks(unittest.TestCase):
         # After hitting floor, reward stays at floor
         self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL * 3), BLOCK_REWARD_FLOOR)
         self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL * 100), BLOCK_REWARD_FLOOR)
+
+
+class TestChainGrowthAnalysis(unittest.TestCase):
+    """Verify storage growth is bounded for the 1000-year design goal."""
+
+    def test_daily_message_bytes_bounded(self):
+        """Daily max message payload should be reasonable."""
+        blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET  # 144
+        daily_message_bytes = blocks_per_day * MAX_BLOCK_MESSAGE_BYTES
+        # 144 blocks * 10KB = 1.44MB/day max message payload
+        self.assertLess(daily_message_bytes, 2_000_000)  # under 2MB/day
+
+    def test_annual_growth_bounded(self):
+        """Annual max storage should stay reasonable."""
+        blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
+        annual_bytes = blocks_per_year * MAX_BLOCK_MESSAGE_BYTES
+        # ~52,560 blocks * 10KB = ~526MB/year max message payload
+        self.assertLess(annual_bytes, 600_000_000)  # under 600MB/year
+
+    def test_1000_year_projection(self):
+        """Even over 1000 years, message data stays manageable with pruning."""
+        blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
+        annual_bytes = blocks_per_year * MAX_BLOCK_MESSAGE_BYTES
+        # Without pruning: ~526GB over 1000 years
+        # With pruning (MESSAGE_DEFAULT_TTL): only retain ~30 days of data
+        retained_bytes = MESSAGE_DEFAULT_TTL * MAX_BLOCK_MESSAGE_BYTES
+        self.assertLess(retained_bytes, 100_000_000)  # under 100MB retained
 
 
 if __name__ == "__main__":

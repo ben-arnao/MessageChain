@@ -9,8 +9,8 @@ MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode 
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
-# At BLOCK_TIME_TARGET=120s, ~263,000 blocks/year.
-# Year 1: 16 tokens/block * 263,000 ≈ 4.2M minted against 1B supply ≈ 0.42%/year
+# At BLOCK_TIME_TARGET=600s, ~52,600 blocks/year.
+# Year 1: 16 tokens/block * 52,600 ≈ 841K minted against 1B supply ≈ 0.084%/year
 # 2 meaningful halvings over ~8 years (16→8→4), then floor of 4 forever.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
@@ -32,9 +32,9 @@ DEFAULT_GENESIS_ALLOCATIONS = {
 
 BLOCK_REWARD = 16  # new tokens minted per block (split between proposer + attestors)
 assert (BLOCK_REWARD & (BLOCK_REWARD - 1)) == 0, "BLOCK_REWARD must be a power of 2 for clean halvings"
-HALVING_INTERVAL = 1_051_200  # blocks between reward halvings (~4 years at 120s blocks)
+HALVING_INTERVAL = 210_240  # blocks between reward halvings (~4 years at 600s blocks)
 BLOCK_REWARD_FLOOR = 4  # minimum reward per block — never drops below this
-# At 120s blocks (~263K blocks/year), floor of 4 = ~1.05M tokens/year ≈ 0.1% of genesis.
+# At 600s blocks (~52.6K blocks/year), floor of 4 = ~210K tokens/year ≈ 0.021% of genesis.
 # High enough to keep validation lucrative; low enough to limit long-term inflation.
 
 # Attestation reward split — incentivizes attestors who do essential security work.
@@ -44,8 +44,11 @@ PROPOSER_REWARD_NUMERATOR = 1
 PROPOSER_REWARD_DENOMINATOR = 4
 
 # Fee economics — EIP-1559-style base fee + tip
+# Non-linear size pricing: fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
+# This makes larger messages disproportionately expensive, incentivizing conciseness.
 MIN_FEE = 100  # absolute floor for base fee (spam deterrent)
-FEE_PER_BYTE = 1  # additional fee per byte of message payload (size-based fee component)
+FEE_PER_BYTE = 3  # per-byte fee component (3x higher than original — storage is expensive)
+FEE_QUADRATIC_COEFF = 2  # quadratic surcharge coefficient: (bytes^2 * 2) // 1000
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
 BASE_FEE_MAX_CHANGE_DENOMINATOR = 8  # max 12.5% change per block
 TARGET_BLOCK_SIZE = 10                # target txs per block (50% of MAX_TXS_PER_BLOCK)
@@ -55,11 +58,22 @@ MIN_TIP = 1                          # minimum priority tip to proposer
 MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
 
 # Block parameters
-BLOCK_TIME_TARGET = 120  # seconds between blocks (slow — TX speed is not a priority)
-MAX_TXS_PER_BLOCK = 20  # reduced to cap daily throughput and limit ledger bloat
+BLOCK_TIME_TARGET = 600  # seconds between blocks (10 min, same as BTC — speed is not a priority)
+MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
+MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
 MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
 COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
 MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
+
+# Message TTL — messages expire after a protocol-defined retention period.
+# Expired message data can be pruned; hash commitments remain in headers for auditability.
+MESSAGE_DEFAULT_TTL = 4_320   # default message retention in blocks (~30 days at 600s)
+MESSAGE_MIN_TTL = 144         # minimum TTL (~1 day at 600s) — prevents gaming fees via short TTL
+MESSAGE_MAX_TTL = 52_560      # maximum TTL (~1 year at 600s) — bounds long-term storage commitment
+
+# Identity creation fee — first transaction from a new entity must pay this surcharge.
+# Every new identity is permanent state; this gates account-level bloat.
+IDENTITY_CREATION_FEE = 1_000  # tokens required on top of normal tx fee for new entities
 
 # Cryptography (HASH_ALGO defined at top of file)
 WOTS_W = 16  # Winternitz parameter (base-16)
@@ -130,7 +144,7 @@ MIN_CUMULATIVE_STAKE_WEIGHT = 100
 ASSUME_VALID_BLOCK_HASH = None  # bytes or None
 
 # Staking
-UNBONDING_PERIOD = 5_040      # blocks before unstaked tokens become spendable (~7 days at 120s)
+UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
 
 # Slashing
 SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
@@ -145,7 +159,7 @@ FINALITY_THRESHOLD_NUMERATOR = 2     # 2/3 of stake must attest for justificatio
 FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= total * 2
 
 # Governance — on-chain voting for protocol/codebase changes
-GOVERNANCE_VOTING_WINDOW = 5_040      # blocks (~7 days at 120s/block)
+GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 1    # >50% of participating stake must approve
 GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 2  # Use integer arithmetic: yes * 2 > total * 1
 GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent)

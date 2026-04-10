@@ -223,7 +223,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_b=header_b,
         )
 
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         proposer_id = self.carol.entity_id
 
         success, msg = self.chain.apply_slash_transaction(slash_tx, proposer_id)
@@ -241,13 +241,13 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
 
         bob_balance_after = self.chain.supply.get_balance(self.bob.entity_id)
         expected_reward = 1000 * SLASH_FINDER_REWARD_PCT // 100  # 100
         # Bob gains reward but pays fee
-        self.assertEqual(bob_balance_after, bob_balance_before + expected_reward - 500)
+        self.assertEqual(bob_balance_after, bob_balance_before + expected_reward - 1500)
 
     def test_burned_tokens_reduce_supply(self):
         """90% of slashed stake is burned, reducing total supply."""
@@ -260,7 +260,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
 
         burned = 1000 - (1000 * SLASH_FINDER_REWARD_PCT // 100)  # 900
@@ -276,7 +276,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
 
         # Second attempt with new evidence (different headers but same offender)
@@ -286,7 +286,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_c,
             header_b=header_d,
         )
-        slash_tx2 = create_slash_transaction(self.bob, evidence2, fee=500)
+        slash_tx2 = create_slash_transaction(self.bob, evidence2, fee=1500)
         success, msg = self.chain.apply_slash_transaction(slash_tx2, self.carol.entity_id)
         self.assertFalse(success)
         self.assertIn("already slashed", msg)
@@ -316,7 +316,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.carol, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.carol, evidence, fee=1500)
         success, msg = self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
         self.assertFalse(success)
         self.assertIn("no stake", msg)
@@ -331,7 +331,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
 
         # Create a block that includes the slash transaction.
         # Must compute the correct state_root that accounts for slash effects.
@@ -376,7 +376,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
 
         data = slash_tx.serialize()
         restored = SlashTransaction.deserialize(data)
@@ -394,7 +394,7 @@ class TestSlashTransaction(unittest.TestCase):
             header_a=header_a,
             header_b=header_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
 
         consensus = ProofOfStake()
         block = consensus.create_block(self.carol, [], prev)

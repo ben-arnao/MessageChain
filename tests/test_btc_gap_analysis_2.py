@@ -357,7 +357,7 @@ class TestCompactBlockFilters(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "filter test", nonce=0, fee=500)
+        tx = create_transaction(entities[0], "filter test", nonce=0, fee=1500)
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
         filt = create_block_filter(block)
@@ -370,7 +370,7 @@ class TestCompactBlockFilters(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "match test", nonce=0, fee=500)
+        tx = create_transaction(entities[0], "match test", nonce=0, fee=1500)
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
         filt = create_block_filter(block)
@@ -383,7 +383,7 @@ class TestCompactBlockFilters(unittest.TestCase):
         consensus = ProofOfStake()
 
         # Only entities[0] transacts
-        tx = create_transaction(entities[0], "no match", nonce=0, fee=500)
+        tx = create_transaction(entities[0], "no match", nonce=0, fee=1500)
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
         filt = create_block_filter(block)
@@ -398,7 +398,7 @@ class TestCompactBlockFilters(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "serialize test", nonce=0, fee=500)
+        tx = create_transaction(entities[0], "serialize test", nonce=0, fee=1500)
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
         filt = create_block_filter(block)
@@ -434,8 +434,8 @@ class TestMempoolPersistence(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
 
         mempool = Mempool()
-        tx1 = create_transaction(entities[0], "persist me 1", nonce=0, fee=500)
-        tx2 = create_transaction(entities[0], "persist me 2", nonce=1, fee=500)
+        tx1 = create_transaction(entities[0], "persist me 1", nonce=0, fee=1500)
+        tx2 = create_transaction(entities[0], "persist me 2", nonce=1, fee=1500)
         mempool.add_transaction(tx1)
         mempool.add_transaction(tx2)
 
@@ -460,7 +460,7 @@ class TestMempoolPersistence(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
 
         mempool = Mempool()
-        tx = create_transaction(entities[0], "will expire", nonce=0, fee=500)
+        tx = create_transaction(entities[0], "will expire", nonce=0, fee=1500)
         mempool.add_transaction(tx)
 
         with tempfile.NamedTemporaryFile(suffix=".dat", delete=False) as f:

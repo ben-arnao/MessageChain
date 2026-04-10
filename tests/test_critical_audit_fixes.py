@@ -302,7 +302,7 @@ class TestStakeUnstakeOnChain(unittest.TestCase):
             amount=100,
             nonce=0,
             timestamp=time.time(),
-            fee=500,
+            fee=1500,
             signature=Signature([], 0, [], b"", b""),
         )
         self.assertEqual(tx.nonce, 0)
@@ -339,7 +339,7 @@ class TestStakeUnstakeOnChain(unittest.TestCase):
             amount=50,
             nonce=0,
             timestamp=time.time(),
-            fee=500,
+            fee=1500,
             signature=Signature([], 0, [], b"", b""),
         )
         self.assertEqual(tx.nonce, 0)

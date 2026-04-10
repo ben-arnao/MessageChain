@@ -14,6 +14,7 @@ but the header chain and UTXO set are retained.
 """
 
 from dataclasses import dataclass
+from messagechain.config import MESSAGE_DEFAULT_TTL
 from messagechain.core.block import Block, BlockHeader
 
 
@@ -32,7 +33,7 @@ class BlockPruner:
         keep_recent: Number of recent blocks to keep in full (not pruned).
     """
 
-    def __init__(self, keep_recent: int = 1000):
+    def __init__(self, keep_recent: int = MESSAGE_DEFAULT_TTL):
         self.keep_recent = keep_recent
         # block_number -> PrunedBlockRecord (headers of pruned blocks)
         self._pruned_headers: dict[int, PrunedBlockRecord] = {}

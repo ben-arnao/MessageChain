@@ -15,7 +15,7 @@ import struct
 import time
 from messagechain.config import (
     HASH_ALGO, VALIDATOR_MIN_STAKE, CONSENSUS_THRESHOLD_NUMERATOR,
-    CONSENSUS_THRESHOLD_DENOMINATOR, MAX_TXS_PER_BLOCK,
+    CONSENSUS_THRESHOLD_DENOMINATOR, MAX_TXS_PER_BLOCK, MAX_BLOCK_MESSAGE_BYTES,
 )
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root
 from messagechain.core.transaction import MessageTransaction
@@ -158,7 +158,16 @@ class ProofOfStake:
         Attestations are votes for the parent block (prev_block), collected
         from validators after the parent was proposed.
         """
-        txs = transactions[:MAX_TXS_PER_BLOCK]
+        # Apply both tx count cap and message byte budget.
+        # Byte budget ensures large messages compete for limited space.
+        txs = []
+        msg_bytes_used = 0
+        for tx in transactions[:MAX_TXS_PER_BLOCK]:
+            tx_msg_size = len(tx.message)
+            if msg_bytes_used + tx_msg_size > MAX_BLOCK_MESSAGE_BYTES:
+                break
+            txs.append(tx)
+            msg_bytes_used += tx_msg_size
         transfer_txs = (transfer_transactions or [])[:MAX_TXS_PER_BLOCK]
         tx_hashes = [tx.tx_hash for tx in txs] + [tx.tx_hash for tx in transfer_txs]
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")

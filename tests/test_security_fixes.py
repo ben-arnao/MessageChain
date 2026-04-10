@@ -23,7 +23,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     def test_tx_with_spoofed_hash_rejected(self):
         """A transaction with a tampered tx_hash must be rejected on deserialize."""
         tx = create_transaction(
-            self.alice, "Legit message", fee=500, nonce=0
+            self.alice, "Legit message", fee=1500, nonce=0
         )
         data = tx.serialize()
         # Tamper with the hash
@@ -35,7 +35,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     def test_tx_with_correct_hash_accepted(self):
         """A transaction with a correct hash deserializes without error."""
         tx = create_transaction(
-            self.alice, "Legit message", fee=500, nonce=0
+            self.alice, "Legit message", fee=1500, nonce=0
         )
         data = tx.serialize()
         restored = MessageTransaction.deserialize(data)
@@ -45,7 +45,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
         """A block with a tampered block_hash must be rejected on deserialize."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.alice, "Block test", fee=500, nonce=0
+            self.alice, "Block test", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)
@@ -60,7 +60,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
         """A block with a correct hash deserializes without error."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.alice, "Block test", fee=500, nonce=0
+            self.alice, "Block test", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)
@@ -84,7 +84,7 @@ class TestMandatoryProposerSignature(unittest.TestCase):
     def test_unsigned_block_rejected(self):
         """A block with no proposer signature must be rejected."""
         tx = create_transaction(
-            self.bob, "Unsigned block test", fee=500, nonce=0
+            self.bob, "Unsigned block test", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         from messagechain.core.block import compute_merkle_root
@@ -110,7 +110,7 @@ class TestMandatoryProposerSignature(unittest.TestCase):
         """A properly signed block is accepted."""
         consensus = ProofOfStake()
         tx = create_transaction(
-            self.bob, "Signed block test", fee=500, nonce=0
+            self.bob, "Signed block test", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = consensus.create_block(self.alice, [tx], prev)

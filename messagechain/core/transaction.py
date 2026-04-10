@@ -17,7 +17,11 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE, MAX_TIMESTAMP_DRIFT, CHAIN_ID
+from messagechain.config import (
+    HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE,
+    FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
+    MESSAGE_DEFAULT_TTL, MESSAGE_MIN_TTL, MESSAGE_MAX_TTL,
+)
 from messagechain.identity.identity import Entity
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -31,6 +35,7 @@ class MessageTransaction:
     fee: int  # user-set fee (higher = more likely to be included in next block)
     signature: Signature
     version: int = 1  # transaction format version (enables future upgrades without hard forks)
+    ttl: int = 0  # message retention in blocks (0 = protocol default MESSAGE_DEFAULT_TTL)
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -50,7 +55,13 @@ class MessageTransaction:
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
+            + struct.pack(">I", self.effective_ttl)
         )
+
+    @property
+    def effective_ttl(self) -> int:
+        """Resolve TTL: 0 means protocol default."""
+        return self.ttl if self.ttl > 0 else MESSAGE_DEFAULT_TTL
 
     def _compute_hash(self) -> bytes:
         return hashlib.new(HASH_ALGO, self._signable_data()).digest()
@@ -81,6 +92,7 @@ class MessageTransaction:
             "timestamp": self.timestamp,
             "nonce": self.nonce,
             "fee": self.fee,
+            "ttl": self.ttl,
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
@@ -96,6 +108,7 @@ class MessageTransaction:
             fee=data["fee"],
             signature=sig,
             version=data.get("version", 1),
+            ttl=data.get("ttl", 0),
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -109,12 +122,17 @@ class MessageTransaction:
 
 
 def calculate_min_fee(message_bytes: bytes) -> int:
-    """Calculate minimum fee for a message based on its size.
+    """Calculate minimum fee for a message with non-linear size pricing.
 
-    Fee = MIN_FEE + len(message_bytes) * FEE_PER_BYTE.
-    This ties the cost of a transaction directly to its storage impact.
+    Fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
+
+    The quadratic term makes larger messages disproportionately more expensive,
+    incentivizing conciseness and penalizing bloat-heavy messages.
     """
-    return MIN_FEE + len(message_bytes) * FEE_PER_BYTE
+    size = len(message_bytes)
+    linear = size * FEE_PER_BYTE
+    quadratic = (size * size * FEE_QUADRATIC_COEFF) // 1000
+    return MIN_FEE + linear + quadratic
 
 
 def _validate_message(message: str) -> tuple[bool, str]:
@@ -127,19 +145,37 @@ def _validate_message(message: str) -> tuple[bool, str]:
     return True, "OK"
 
 
+def _validate_ttl(ttl: int) -> tuple[bool, str]:
+    """Check TTL is within protocol bounds (0 means default)."""
+    if ttl == 0:
+        return True, "OK"  # 0 = use protocol default
+    if ttl < MESSAGE_MIN_TTL:
+        return False, f"TTL {ttl} below minimum {MESSAGE_MIN_TTL}"
+    if ttl > MESSAGE_MAX_TTL:
+        return False, f"TTL {ttl} exceeds maximum {MESSAGE_MAX_TTL}"
+    return True, "OK"
+
+
 def create_transaction(
     entity: Entity,
     message: str,
     fee: int,
     nonce: int,
+    ttl: int = 0,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
 
     The fee is set by the user — higher fee means higher priority for
     block inclusion (BTC-style fee bidding).
+
+    TTL sets message retention in blocks (0 = protocol default).
     """
     valid, reason = _validate_message(message)
+    if not valid:
+        raise ValueError(reason)
+
+    valid, reason = _validate_ttl(ttl)
     if not valid:
         raise ValueError(reason)
 
@@ -155,6 +191,7 @@ def create_transaction(
         nonce=nonce,
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
+        ttl=ttl,
     )
 
     # Sign the transaction data with quantum-resistant signature
@@ -173,6 +210,10 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
     if tx.fee < calculate_min_fee(tx.message):
+        return False
+    # Validate TTL bounds
+    valid, _ = _validate_ttl(tx.ttl)
+    if not valid:
         return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:

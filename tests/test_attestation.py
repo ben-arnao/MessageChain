@@ -429,7 +429,7 @@ class TestDoubleAttestationSlashing(unittest.TestCase):
             attestation_b=att_b,
         )
 
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         success, msg = self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
         self.assertTrue(success, msg)
         self.assertEqual(self.chain.supply.get_staked(self.alice.entity_id), 0)
@@ -461,7 +461,7 @@ class TestDoubleAttestationSlashing(unittest.TestCase):
             attestation_a=att_a,
             attestation_b=att_b,
         )
-        slash_tx = create_slash_transaction(self.bob, evidence, fee=500)
+        slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
 
         data = slash_tx.serialize()
         restored = SlashTransaction.deserialize(data)

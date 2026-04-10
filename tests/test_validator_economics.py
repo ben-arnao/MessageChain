@@ -303,7 +303,7 @@ class TestBaseFeeBlockchainIntegration(unittest.TestCase):
         """When a block is added, the base fee portion of tx fees is burned."""
         initial_supply = self.chain.supply.total_supply
         nonce = self.chain.nonces.get(self.bob.entity_id, 0)
-        fee = self.chain.base_fee + 50  # base + tip
+        fee = max(self.chain.base_fee + 50, 1500)  # must exceed identity creation fee
         tx = create_transaction(self.bob, "Hello", fee=fee, nonce=nonce)
         block = self._make_block(self.alice, [tx])
         success, _ = self.chain.add_block(block)
@@ -311,9 +311,7 @@ class TestBaseFeeBlockchainIntegration(unittest.TestCase):
 
         # Supply increased by block reward but decreased by base_fee burn
         reward = self.chain.supply.calculate_block_reward(1)
-        expected_supply = initial_supply + reward - self.chain.base_fee
-        # base_fee may have been updated after block was applied, use BASE_FEE_INITIAL
-        # since this is the first block
+        # base_fee was BASE_FEE_INITIAL when the block was applied
         expected_supply = initial_supply + reward - BASE_FEE_INITIAL
         self.assertEqual(self.chain.supply.total_supply, expected_supply)
 

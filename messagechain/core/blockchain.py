@@ -18,10 +18,12 @@ import hashlib
 import logging
 import time as _time
 from messagechain.config import (
-    HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
+    HASH_ALGO, MAX_TXS_PER_BLOCK, MAX_BLOCK_MESSAGE_BYTES,
+    VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
+    IDENTITY_CREATION_FEE,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
@@ -702,6 +704,13 @@ class Blockchain:
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
 
+        # Check block message byte budget — limits total message payload per block.
+        # This creates a secondary constraint: large messages compete for limited
+        # byte space even when the tx count is under the cap.
+        total_message_bytes = sum(len(tx.message) for tx in block.transactions)
+        if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
+            return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
+
         # Check for duplicate transaction hashes within the block
         seen_tx_hashes = set()
         all_txs = list(block.transactions) + list(block.transfer_transactions)
@@ -748,6 +757,15 @@ class Blockchain:
                 return False, (
                     f"Invalid tx {tx.tx_hash.hex()[:16]}: "
                     f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+                )
+
+            # Identity creation fee: first tx from a new entity costs extra.
+            # Every new identity is permanent state; this gates account-level bloat.
+            is_new_entity = expected_nonce == 0
+            if is_new_entity and tx.fee < IDENTITY_CREATION_FEE:
+                return False, (
+                    f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                    f"First transaction requires identity creation fee of {IDENTITY_CREATION_FEE}, got {tx.fee}"
                 )
 
             # Check cumulative fee spend within this block doesn't exceed spendable balance
@@ -821,6 +839,9 @@ class Blockchain:
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
+        total_message_bytes = sum(len(tx.message) for tx in block.transactions)
+        if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
+            return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
 
         all_txs = list(block.transactions) + list(block.transfer_transactions)
         tx_hashes = [tx.tx_hash for tx in all_txs]
@@ -952,6 +973,9 @@ class Blockchain:
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Orphan rejected — too many transactions"
+        total_message_bytes = sum(len(tx.message) for tx in block.transactions)
+        if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
+            return False, "Orphan rejected — message bytes exceed budget"
 
         if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
             self.orphan_pool[block.block_hash] = block

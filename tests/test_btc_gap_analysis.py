@@ -241,7 +241,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=1500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
@@ -257,7 +257,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=1500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
 
         mempool = Mempool()
@@ -278,7 +278,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=1500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
@@ -335,13 +335,13 @@ class TestReplaceByFee(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello v1", fee=500, nonce=0)
+        tx1 = create_transaction(entities[0], "hello v1", fee=1500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
         self.assertEqual(mempool.size, 1)
 
         # Replace with higher fee, same nonce
-        tx2 = create_transaction(entities[0], "hello v2", fee=1000, nonce=0)
+        tx2 = create_transaction(entities[0], "hello v2", fee=2000, nonce=0)
         replaced = mempool.try_replace_by_fee(tx2)
         self.assertTrue(replaced)
         self.assertEqual(mempool.size, 1)
@@ -354,11 +354,11 @@ class TestReplaceByFee(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello", fee=500, nonce=0)
+        tx1 = create_transaction(entities[0], "hello", fee=1500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
 
-        tx2 = create_transaction(entities[0], "hello v2", fee=500, nonce=0)
+        tx2 = create_transaction(entities[0], "hello v2", fee=1500, nonce=0)
         replaced = mempool.try_replace_by_fee(tx2)
         self.assertFalse(replaced)
         self.assertEqual(mempool.size, 1)
@@ -369,7 +369,7 @@ class TestReplaceByFee(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         chain.supply.balances[entities[1].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello", fee=500, nonce=0)
+        tx1 = create_transaction(entities[0], "hello", fee=1500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
 
@@ -389,7 +389,7 @@ class TestTransactionVersioning(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "versioned msg", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "versioned msg", fee=1500, nonce=0)
         self.assertTrue(hasattr(tx, 'version'))
         self.assertEqual(tx.version, 1)  # default version
 
@@ -398,7 +398,7 @@ class TestTransactionVersioning(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "test msg", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "test msg", fee=1500, nonce=0)
         # Version should be part of signable data
         signable = tx._signable_data()
         # Signable data starts with CHAIN_ID then the version
@@ -410,7 +410,7 @@ class TestTransactionVersioning(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "roundtrip", fee=500, nonce=0)
+        tx = create_transaction(entities[0], "roundtrip", fee=1500, nonce=0)
         data = tx.serialize()
         self.assertIn("version", data)
         tx2 = MessageTransaction.deserialize(data)
@@ -429,7 +429,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=1500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -444,7 +444,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=1500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -459,7 +459,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=1500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -478,7 +478,7 @@ class TestSPVProofs(unittest.TestCase):
 
         txs = []
         for i in range(4):
-            tx = create_transaction(entities[0], f"msg {i}", fee=500, nonce=i)
+            tx = create_transaction(entities[0], f"msg {i}", fee=1500, nonce=i)
             txs.append(tx)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)

@@ -59,7 +59,7 @@ class TestPrivateKeySecurity(unittest.TestCase):
         # Attacker signs a transaction
         tx = create_transaction(
             attacker, "Fraudulent message",
-            fee=500, nonce=0,
+            fee=1500, nonce=0,
         )
 
         # Verification against the real public key should fail
@@ -72,7 +72,7 @@ class TestPrivateKeySecurity(unittest.TestCase):
         entity = Entity.create(b"my-key")
         tx = create_transaction(
             entity, "Legitimate message",
-            fee=500, nonce=0,
+            fee=1500, nonce=0,
         )
         self.assertTrue(verify_transaction(tx, entity.public_key))
 

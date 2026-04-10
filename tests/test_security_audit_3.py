@@ -231,8 +231,9 @@ class TestDynamicFeeInMempool(unittest.TestCase):
 
     def test_low_fee_rejected_under_pressure(self):
         """When mempool is 50%+ full, low fee should be rejected."""
-        from messagechain.config import MIN_FEE as CURRENT_MIN_FEE
-        base_fee = CURRENT_MIN_FEE + 20  # account for FEE_PER_BYTE
+        from messagechain.core.transaction import calculate_min_fee
+        # Use a base_fee well above calculate_min_fee for short messages
+        base_fee = calculate_min_fee(b"low fee msg") + 50
         policy = DynamicFeePolicy(base_fee=base_fee, max_fee=base_fee * 100)
         pool = Mempool(max_size=10, fee_policy=policy)
         alice = Entity.create(b"alice-m4")
@@ -242,13 +243,13 @@ class TestDynamicFeeInMempool(unittest.TestCase):
             tx = create_transaction(alice, f"msg {i}", fee=high_fee, nonce=i)
             pool.add_transaction(tx)
 
-        low_tx = create_transaction(alice, "low fee", fee=base_fee, nonce=5)
+        low_tx = create_transaction(alice, "low fee msg", fee=base_fee, nonce=5)
         self.assertFalse(pool.add_transaction(low_tx))
 
     def test_static_policy_allows_min_fee(self):
         """Static fee policy always allows the base fee."""
-        from messagechain.config import MIN_FEE as CURRENT_MIN_FEE
-        base_fee = CURRENT_MIN_FEE + 20  # account for FEE_PER_BYTE
+        from messagechain.core.transaction import calculate_min_fee
+        base_fee = calculate_min_fee(b"msg") + 50
         static = DynamicFeePolicy(base_fee=base_fee, max_fee=base_fee)
         pool = Mempool(max_size=10, fee_policy=static)
         alice = Entity.create(b"alice-m4b")

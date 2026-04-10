@@ -32,7 +32,7 @@ class TestStateRoot(unittest.TestCase):
         root_before = self.chain.compute_current_state_root()
 
         tx = create_transaction(
-            self.alice, "Hello", fee=500, nonce=0
+            self.alice, "Hello", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -46,7 +46,7 @@ class TestStateRoot(unittest.TestCase):
     def test_state_root_in_header(self):
         """Block header includes state_root field."""
         tx = create_transaction(
-            self.alice, "Test", fee=500, nonce=0
+            self.alice, "Test", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -74,7 +74,7 @@ class TestStateRoot(unittest.TestCase):
     def test_state_root_serialization_roundtrip(self):
         """state_root survives block header serialization."""
         tx = create_transaction(
-            self.alice, "Roundtrip", fee=500, nonce=0
+            self.alice, "Roundtrip", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -109,7 +109,7 @@ class TestStateRoot(unittest.TestCase):
     def test_block_with_valid_state_root_accepted(self):
         """Block with correct post-state state_root is accepted."""
         tx = create_transaction(
-            self.alice, "Valid state", fee=500, nonce=0
+            self.alice, "Valid state", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -121,7 +121,7 @@ class TestStateRoot(unittest.TestCase):
     def test_zero_state_root_rejected(self):
         """Blocks with zero state_root must be rejected — no bypass allowed."""
         tx = create_transaction(
-            self.alice, "Legacy block", fee=500, nonce=0
+            self.alice, "Legacy block", fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         # Default state_root is zero — must be REJECTED (bypass removed)

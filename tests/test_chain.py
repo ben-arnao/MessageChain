@@ -44,7 +44,7 @@ class TestBlockchain(unittest.TestCase):
     def test_post_message(self):
         tx = create_transaction(
             self.alice, "Hello world!",
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         valid, reason = self.chain.validate_transaction(tx)
         self.assertTrue(valid, reason)
@@ -52,7 +52,7 @@ class TestBlockchain(unittest.TestCase):
     def test_create_and_add_block(self):
         tx = create_transaction(
             self.alice, "Test message",
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         block = self._make_block(self.alice, [tx])
         success, reason = self.chain.add_block(block)
@@ -64,14 +64,14 @@ class TestBlockchain(unittest.TestCase):
         alice_balance_before = self.chain.supply.get_balance(self.alice.entity_id)
         tx = create_transaction(
             self.bob, "Bob pays fee",
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         # Alice proposes the block, collects Bob's fee + block reward
         block = self._make_block(self.alice, [tx])
         self.chain.add_block(block)
 
         alice_balance_after = self.chain.supply.get_balance(self.alice.entity_id)
-        # Alice gained: fee (500) + block reward
+        # Alice gained: tip portion of fee + block reward
         self.assertGreater(alice_balance_after, alice_balance_before)
 
     def test_inflation_over_blocks(self):
@@ -82,7 +82,7 @@ class TestBlockchain(unittest.TestCase):
             nonce = self.chain.nonces.get(entity.entity_id, 0)
             tx = create_transaction(
                 entity, f"Message {i}",
-                fee=500, nonce=nonce
+                fee=1500, nonce=nonce
             )
             block = self._make_block(entity, [tx])
             self.chain.add_block(block)
@@ -103,31 +103,31 @@ class TestBlockchain(unittest.TestCase):
         mempool = Mempool()
         nonce = self.chain.nonces.get(self.alice.entity_id, 0)
 
-        low = create_transaction(self.alice, "low fee", fee=200, nonce=nonce)
-        high = create_transaction(self.alice, "high fee", fee=1000, nonce=nonce + 1)
-        mid = create_transaction(self.alice, "mid fee", fee=500, nonce=nonce + 2)
+        low = create_transaction(self.alice, "low fee", fee=1200, nonce=nonce)
+        high = create_transaction(self.alice, "high fee", fee=3000, nonce=nonce + 1)
+        mid = create_transaction(self.alice, "mid fee", fee=2000, nonce=nonce + 2)
 
         mempool.add_transaction(low)
         mempool.add_transaction(high)
         mempool.add_transaction(mid)
 
         ordered = mempool.get_transactions(10)
-        self.assertEqual(ordered[0].fee, 1000)  # highest first
-        self.assertEqual(ordered[1].fee, 500)
-        self.assertEqual(ordered[2].fee, 200)
+        self.assertEqual(ordered[0].fee, 3000)  # highest first
+        self.assertEqual(ordered[1].fee, 2000)
+        self.assertEqual(ordered[2].fee, 1200)
 
     def test_timestamp_present(self):
         """Every transaction must be timestamped."""
         tx = create_transaction(
             self.alice, "Timestamped message",
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         self.assertGreater(tx.timestamp, 0)
 
     def test_invalid_nonce_rejected(self):
         tx = create_transaction(
             self.alice, "Test",
-            fee=500, nonce=99  # wrong nonce
+            fee=1500, nonce=99  # wrong nonce
         )
         valid, reason = self.chain.validate_transaction(tx)
         self.assertFalse(valid)
@@ -138,14 +138,14 @@ class TestBlockchain(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_transaction(
                 self.alice, long_msg,
-                fee=500, nonce=0
+                fee=1500, nonce=0
             )
 
     def test_280_chars_accepted(self):
         msg = "a" * 280  # exactly 280 characters
         tx = create_transaction(
             self.alice, msg,
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         self.assertIsNotNone(tx)
 
@@ -159,7 +159,7 @@ class TestBlockchain(unittest.TestCase):
     def test_block_serialization_roundtrip(self):
         tx = create_transaction(
             self.alice, "Serialize me",
-            fee=500, nonce=0
+            fee=1500, nonce=0
         )
         prev = self.chain.get_latest_block()
         block = self.consensus.create_block(self.alice, [tx], prev)
@@ -169,7 +169,7 @@ class TestBlockchain(unittest.TestCase):
         restored = Block.deserialize(data)
         self.assertEqual(restored.block_hash, block.block_hash)
         self.assertEqual(len(restored.transactions), 1)
-        self.assertEqual(restored.transactions[0].fee, 500)
+        self.assertEqual(restored.transactions[0].fee, 1500)
 
 
 if __name__ == "__main__":
