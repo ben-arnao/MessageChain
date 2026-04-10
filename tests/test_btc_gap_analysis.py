@@ -20,7 +20,7 @@ import unittest
 
 from tests import register_entity_for_test
 import messagechain.config
-from messagechain.config import HASH_ALGO
+from messagechain.config import HASH_ALGO, CHAIN_ID
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root, _hash
 from messagechain.core.transaction import MessageTransaction, create_transaction
@@ -241,7 +241,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
@@ -257,7 +257,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
 
         mempool = Mempool()
@@ -278,7 +278,7 @@ class TestCompactBlockRelay(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         consensus = ProofOfStake()
 
-        tx = create_transaction(entities[0], "hello", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "hello", fee=500, nonce=0)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=[tx])
 
@@ -306,8 +306,8 @@ class TestFeeEstimation(unittest.TestCase):
         estimator = FeeEstimator()
 
         # Record some blocks with known fee distributions
-        estimator.record_block_fees([10, 20, 30, 40, 50])
-        estimator.record_block_fees([15, 25, 35, 45, 55])
+        estimator.record_block_fees([200, 300, 400, 500, 600])
+        estimator.record_block_fees([250, 350, 450, 550, 650])
 
         estimate = estimator.estimate_fee(target_blocks=1)
         self.assertGreater(estimate, messagechain.config.MIN_FEE)
@@ -318,7 +318,7 @@ class TestFeeEstimation(unittest.TestCase):
         estimator = FeeEstimator()
 
         for _ in range(10):
-            estimator.record_block_fees([5, 10, 15, 20, 25, 30, 35, 40, 45, 50])
+            estimator.record_block_fees([200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100])
 
         fast = estimator.estimate_fee(target_blocks=1)
         slow = estimator.estimate_fee(target_blocks=10)
@@ -335,13 +335,13 @@ class TestReplaceByFee(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello v1", fee=5, nonce=0)
+        tx1 = create_transaction(entities[0], "hello v1", fee=500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
         self.assertEqual(mempool.size, 1)
 
         # Replace with higher fee, same nonce
-        tx2 = create_transaction(entities[0], "hello v2", fee=15, nonce=0)
+        tx2 = create_transaction(entities[0], "hello v2", fee=1000, nonce=0)
         replaced = mempool.try_replace_by_fee(tx2)
         self.assertTrue(replaced)
         self.assertEqual(mempool.size, 1)
@@ -354,11 +354,11 @@ class TestReplaceByFee(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello", fee=10, nonce=0)
+        tx1 = create_transaction(entities[0], "hello", fee=500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
 
-        tx2 = create_transaction(entities[0], "hello v2", fee=10, nonce=0)
+        tx2 = create_transaction(entities[0], "hello v2", fee=500, nonce=0)
         replaced = mempool.try_replace_by_fee(tx2)
         self.assertFalse(replaced)
         self.assertEqual(mempool.size, 1)
@@ -369,12 +369,12 @@ class TestReplaceByFee(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
         chain.supply.balances[entities[1].entity_id] = 10000
 
-        tx1 = create_transaction(entities[0], "hello", fee=5, nonce=0)
+        tx1 = create_transaction(entities[0], "hello", fee=500, nonce=0)
         mempool = Mempool()
         mempool.add_transaction(tx1)
 
         # Different sender, same nonce — should not replace
-        tx2 = create_transaction(entities[1], "world", fee=15, nonce=0)
+        tx2 = create_transaction(entities[1], "world", fee=1000, nonce=0)
         replaced = mempool.try_replace_by_fee(tx2)
         self.assertFalse(replaced)
 
@@ -389,7 +389,7 @@ class TestTransactionVersioning(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "versioned msg", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "versioned msg", fee=500, nonce=0)
         self.assertTrue(hasattr(tx, 'version'))
         self.assertEqual(tx.version, 1)  # default version
 
@@ -398,19 +398,19 @@ class TestTransactionVersioning(unittest.TestCase):
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "test msg", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "test msg", fee=500, nonce=0)
         # Version should be part of signable data
         signable = tx._signable_data()
-        # First 4 bytes should be the version
+        # Signable data starts with CHAIN_ID then the version
         version_bytes = struct.pack(">I", tx.version)
-        self.assertTrue(signable.startswith(version_bytes))
+        self.assertTrue(signable.startswith(CHAIN_ID + version_bytes))
 
     def test_version_serialization_roundtrip(self):
         """Version survives serialization/deserialization."""
         chain, entities = _make_chain_and_entities()
         chain.supply.balances[entities[0].entity_id] = 10000
 
-        tx = create_transaction(entities[0], "roundtrip", fee=5, nonce=0)
+        tx = create_transaction(entities[0], "roundtrip", fee=500, nonce=0)
         data = tx.serialize()
         self.assertIn("version", data)
         tx2 = MessageTransaction.deserialize(data)
@@ -429,7 +429,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=5, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -444,7 +444,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=5, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -459,7 +459,7 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
-        txs = [create_transaction(entities[0], f"msg {i}", fee=5, nonce=i) for i in range(3)]
+        txs = [create_transaction(entities[0], f"msg {i}", fee=500, nonce=i) for i in range(3)]
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
 
@@ -478,7 +478,7 @@ class TestSPVProofs(unittest.TestCase):
 
         txs = []
         for i in range(4):
-            tx = create_transaction(entities[0], f"msg {i}", fee=5, nonce=i)
+            tx = create_transaction(entities[0], f"msg {i}", fee=500, nonce=i)
             txs.append(tx)
         chain.nonces[entities[0].entity_id] = 0
         block = _propose_and_add(chain, consensus, entities[0], txs=txs)
@@ -581,13 +581,13 @@ class TestDynamicMinRelayFee(unittest.TestCase):
     def test_min_fee_at_empty_mempool(self):
         """When mempool is empty, minimum fee is the base MIN_FEE."""
         from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=1, max_fee=100)
-        self.assertEqual(policy.get_min_relay_fee(mempool_size=0, mempool_max=5000), 1)
+        policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
+        self.assertEqual(policy.get_min_relay_fee(mempool_size=0, mempool_max=5000), 100)
 
     def test_min_fee_increases_with_mempool_pressure(self):
         """As mempool fills up, minimum relay fee increases."""
         from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=1, max_fee=100)
+        policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
 
         fee_low = policy.get_min_relay_fee(mempool_size=100, mempool_max=5000)
         fee_mid = policy.get_min_relay_fee(mempool_size=2500, mempool_max=5000)
@@ -599,19 +599,19 @@ class TestDynamicMinRelayFee(unittest.TestCase):
     def test_min_fee_capped_at_max(self):
         """Minimum relay fee never exceeds the configured max."""
         from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=1, max_fee=50)
+        policy = DynamicFeePolicy(base_fee=100, max_fee=5000)
 
         fee = policy.get_min_relay_fee(mempool_size=5000, mempool_max=5000)
-        self.assertLessEqual(fee, 50)
+        self.assertLessEqual(fee, 5000)
 
     def test_mempool_rejects_below_dynamic_fee(self):
         """Mempool integration: transactions below dynamic fee are rejected."""
         from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=1, max_fee=100)
+        policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
 
-        # When mempool is 90% full, min fee should be > 1
+        # When mempool is 90% full, min fee should be > 100
         min_fee = policy.get_min_relay_fee(mempool_size=4500, mempool_max=5000)
-        self.assertGreater(min_fee, 1)
+        self.assertGreater(min_fee, 100)
 
 
 if __name__ == "__main__":
