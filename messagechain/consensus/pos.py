@@ -13,7 +13,10 @@ blocks can never be reverted.
 import hashlib
 import struct
 import time
-from messagechain.config import HASH_ALGO, VALIDATOR_MIN_STAKE, CONSENSUS_THRESHOLD, MAX_TXS_PER_BLOCK
+from messagechain.config import (
+    HASH_ALGO, VALIDATOR_MIN_STAKE, CONSENSUS_THRESHOLD_NUMERATOR,
+    CONSENSUS_THRESHOLD_DENOMINATOR, MAX_TXS_PER_BLOCK,
+)
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import verify_signature
@@ -71,6 +74,8 @@ class ProofOfStake:
         # Sort validators for deterministic ordering
         validators = sorted(self.stakes.items(), key=lambda x: x[0])
         total = self.total_stake
+        if total == 0:
+            return None  # all stakes are zero — no valid proposer
 
         # Hash the prev block to get a random value
         seed = _hash(prev_block_hash + b"proposer_selection")
@@ -106,6 +111,10 @@ class ProofOfStake:
         if self.is_bootstrap_mode:
             return True  # permissive only during initial bootstrap (one-way)
 
+        total = self.total_stake
+        if total == 0:
+            return False  # post-bootstrap with zero stake — cannot meet threshold
+
         # Attestations in a block vote for the parent
         attested_stake = 0
         seen = set()
@@ -122,7 +131,10 @@ class ProofOfStake:
             if att.validator_id in self.stakes:
                 attested_stake += self.stakes[att.validator_id]
 
-        return (attested_stake / self.total_stake) >= CONSENSUS_THRESHOLD
+        # Integer arithmetic to avoid floating-point rounding errors in consensus.
+        # attested/total >= NUM/DEN  ↔  attested * DEN >= total * NUM
+        return (attested_stake * CONSENSUS_THRESHOLD_DENOMINATOR
+                >= total * CONSENSUS_THRESHOLD_NUMERATOR)
 
     def create_block(
         self,

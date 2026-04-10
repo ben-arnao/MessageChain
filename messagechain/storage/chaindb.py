@@ -17,6 +17,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from messagechain.validation import safe_json_loads
 
 from messagechain.core.block import Block
 
@@ -149,7 +150,7 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.deserialize(json.loads(row[0]))
+        return Block.deserialize(safe_json_loads(row[0]))
 
     def get_block_by_number(self, block_number: int) -> Block | None:
         """Get block by height. If multiple at same height (forks), returns the one on the best chain."""
@@ -160,14 +161,14 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.deserialize(json.loads(row[0]))
+        return Block.deserialize(safe_json_loads(row[0]))
 
     def get_blocks_at_height(self, block_number: int) -> list[Block]:
         """Get all blocks at a given height (for fork detection)."""
         cur = self._conn.execute(
             "SELECT data FROM blocks WHERE block_number = ?", (block_number,)
         )
-        return [Block.deserialize(json.loads(row[0])) for row in cur.fetchall()]
+        return [Block.deserialize(safe_json_loads(row[0])) for row in cur.fetchall()]
 
     def has_block(self, block_hash: bytes) -> bool:
         cur = self._conn.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (block_hash,))
@@ -224,7 +225,7 @@ class ChainDB:
             return  # already pruned or doesn't exist
 
         import json
-        block_data = json.loads(row[0])
+        block_data = safe_json_loads(row[0])
         block_hash = bytes(row[1])
 
         # Extract header from block data
@@ -260,7 +261,7 @@ class ChainDB:
         if row is None:
             return None
         import json
-        return json.loads(row[0])
+        return safe_json_loads(row[0])
 
     # ── Chain Tips ───────────────────────────────────────────────
 

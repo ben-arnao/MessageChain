@@ -16,20 +16,25 @@ from messagechain.config import (
     MEMPOOL_MAX_SIZE, MEMPOOL_TX_TTL, MEMPOOL_PER_SENDER_LIMIT,
     MEMPOOL_MAX_ANCESTORS, MEMPOOL_MAX_ORPHAN_TXS,
     MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
+    MIN_FEE,
 )
 from messagechain.core.transaction import MessageTransaction
+from messagechain.economics.dynamic_fee import DynamicFeePolicy
 
 
 class Mempool:
     """Pool of validated transactions, ordered by fee for block inclusion."""
 
     def __init__(self, max_size: int = MEMPOOL_MAX_SIZE, tx_ttl: int = MEMPOOL_TX_TTL,
-                 per_sender_limit: int = MEMPOOL_PER_SENDER_LIMIT):
+                 per_sender_limit: int = MEMPOOL_PER_SENDER_LIMIT,
+                 fee_policy: DynamicFeePolicy | None = None):
         self.pending: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
         self._sender_counts: dict[bytes, int] = defaultdict(int)  # entity_id -> count
         self.max_size = max_size
         self.tx_ttl = tx_ttl
         self.per_sender_limit = per_sender_limit
+        # M4: Dynamic fee policy — scales min relay fee with mempool pressure
+        self.fee_policy = fee_policy or DynamicFeePolicy(base_fee=MIN_FEE, max_fee=10_000)
         # Orphan pool: holds txs with future nonces (out-of-order arrival)
         self.orphan_pool: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
         self._orphan_sender_counts: dict[bytes, int] = defaultdict(int)
@@ -47,6 +52,11 @@ class Mempool:
 
         # Reject expired transactions on arrival
         if self._is_expired(tx):
+            return False
+
+        # M4: Enforce dynamic minimum relay fee based on mempool pressure
+        min_relay_fee = self.fee_policy.get_min_relay_fee(len(self.pending), self.max_size)
+        if tx.fee < min_relay_fee:
             return False
 
         # Per-sender ancestor limit: prevent deep unconfirmed chains (BTC-style)

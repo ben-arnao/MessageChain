@@ -24,7 +24,7 @@ Design:
 import hashlib
 import struct
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, FINALITY_THRESHOLD
+from messagechain.config import HASH_ALGO, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -131,7 +131,12 @@ class FinalityTracker:
         self.attested_stake[bh] = self.attested_stake.get(bh, 0) + validator_stake
 
         # Check justification threshold
-        if total_stake > 0 and (self.attested_stake[bh] / total_stake) >= FINALITY_THRESHOLD:
+        # Integer arithmetic to avoid floating-point rounding errors.
+        # attested/total >= NUM/DEN  ↔  attested * DEN >= total * NUM
+        if total_stake > 0 and (
+            self.attested_stake[bh] * FINALITY_THRESHOLD_DENOMINATOR
+            >= total_stake * FINALITY_THRESHOLD_NUMERATOR
+        ):
             if bh not in self.finalized:
                 self.finalized.add(bh)
                 if attestation.block_number > self.finalized_height:

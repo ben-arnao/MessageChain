@@ -140,3 +140,34 @@ def verify_merkle_proof(tx_hash: bytes, proof: MerkleProof, merkle_root: bytes) 
             current = _hash(current + sibling)
 
     return current == merkle_root
+
+
+def verify_spv_proof_with_header(
+    tx_hash: bytes,
+    proof: MerkleProof,
+    block_header: "BlockHeader",
+    header_signature_verifier=None,
+) -> bool:
+    """Full SPV verification: tx-in-block AND block header validity.
+
+    Args:
+        tx_hash: The transaction hash to verify.
+        proof: The Merkle proof (siblings + directions).
+        block_header: The block header containing the merkle_root.
+        header_signature_verifier: Optional callable(header) -> bool that
+            verifies the proposer's signature. If None, only Merkle
+            inclusion is checked (no header authentication).
+
+    Returns:
+        True if the transaction is provably included in a valid block.
+    """
+    # Step 1: Verify Merkle inclusion
+    if not verify_merkle_proof(tx_hash, proof, block_header.merkle_root):
+        return False
+
+    # Step 2: Verify block header signature (if verifier provided)
+    if header_signature_verifier is not None:
+        if not header_signature_verifier(block_header):
+            return False
+
+    return True

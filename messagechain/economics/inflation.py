@@ -23,7 +23,7 @@ import math
 from messagechain.config import (
     GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE,
     SLASH_FINDER_REWARD_PCT, UNBONDING_PERIOD, MIN_TOTAL_STAKE,
-    TREASURY_ENTITY_ID,
+    TREASURY_ENTITY_ID, VALIDATOR_MIN_STAKE,
 )
 
 
@@ -109,7 +109,15 @@ class SupplyTracker:
         If bootstrap_ended is True, rejects unstakes that would drop
         total network stake below MIN_TOTAL_STAKE.
         """
-        if self.get_staked(entity_id) < amount:
+        current_stake = self.get_staked(entity_id)
+        if current_stake < amount:
+            return False
+
+        # M7: Per-validator minimum stake enforcement.
+        # After unstaking, remaining stake must be either 0 (full exit)
+        # or >= VALIDATOR_MIN_STAKE (still a valid validator).
+        remaining = current_stake - amount
+        if remaining > 0 and remaining < VALIDATOR_MIN_STAKE:
             return False
 
         # Prevent total stake from dropping below safety floor

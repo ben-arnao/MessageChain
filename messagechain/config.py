@@ -9,8 +9,8 @@ MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode 
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
-# At BLOCK_TIME_TARGET=10s, ~3,155,760 blocks/year.
-# Year 1: 16 tokens/block * 3,155,760 ≈ 50.5M minted against 1B supply ≈ 1.6%/year
+# At BLOCK_TIME_TARGET=120s, ~263,000 blocks/year.
+# Year 1: 16 tokens/block * 263,000 ≈ 4.2M minted against 1B supply ≈ 0.42%/year
 # 4 meaningful halvings over ~16 years (16→8→4→2→1), then floor of 1 forever.
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
@@ -31,15 +31,17 @@ DEFAULT_GENESIS_ALLOCATIONS = {
 }
 
 BLOCK_REWARD = 16  # new tokens minted per block (paid to proposer)
-HALVING_INTERVAL = 12_614_400  # blocks between reward halvings (~4 years at 10s blocks)
-MIN_FEE = 1  # minimum transaction fee
+assert (BLOCK_REWARD & (BLOCK_REWARD - 1)) == 0, "BLOCK_REWARD must be a power of 2 for clean halvings"
+HALVING_INTERVAL = 1_051_200  # blocks between reward halvings (~4 years at 120s blocks)
+MIN_FEE = 100  # minimum transaction fee (high to deter message spam)
+FEE_PER_BYTE = 1  # additional fee per byte of message payload (size-based fee component)
 
 # Timestamp tolerance
 MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
 
 # Block parameters
-BLOCK_TIME_TARGET = 10  # seconds between blocks
-MAX_TXS_PER_BLOCK = 50
+BLOCK_TIME_TARGET = 120  # seconds between blocks (slow — TX speed is not a priority)
+MAX_TXS_PER_BLOCK = 20  # reduced to cap daily throughput and limit ledger bloat
 MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
 COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
 MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
@@ -53,7 +55,8 @@ MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (produc
 
 # Consensus
 VALIDATOR_MIN_STAKE = 100
-CONSENSUS_THRESHOLD = 0.67  # 2/3 of stake must sign off
+CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fraction)
+CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 
 # Network
@@ -69,8 +72,8 @@ BAN_DURATION = 86400      # ban length in seconds (24 hours)
 # Mempool
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
-MEMPOOL_PER_SENDER_LIMIT = 25 # max pending txs per entity in mempool
-MEMPOOL_MAX_ANCESTORS = 25    # max unconfirmed tx chain depth per entity (BTC-style)
+MEMPOOL_PER_SENDER_LIMIT = 5  # max pending txs per entity (tight to throttle burst spam)
+MEMPOOL_MAX_ANCESTORS = 5     # max unconfirmed tx chain depth per entity
 
 # Address manager (Sybil/eclipse resistance)
 ADDRMAN_NEW_BUCKET_COUNT = 256      # buckets in the "new" table
@@ -84,7 +87,7 @@ INV_BATCH_SIZE = 500      # max tx hashes per INV message
 SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
 
 # Key rotation
-KEY_ROTATION_FEE = 10     # fee required for key rotation transaction
+KEY_ROTATION_FEE = 1000   # fee required for key rotation transaction
 
 # Dust limit — minimum transfer amount to prevent state bloat from tiny accounts
 DUST_LIMIT = 10           # transfers below this amount are rejected
@@ -112,18 +115,20 @@ MIN_CUMULATIVE_STAKE_WEIGHT = 100
 ASSUME_VALID_BLOCK_HASH = None  # bytes or None
 
 # Staking
-UNBONDING_PERIOD = 60_480     # blocks before unstaked tokens become spendable (~7 days at 10s)
+UNBONDING_PERIOD = 5_040      # blocks before unstaked tokens become spendable (~7 days at 120s)
 
 # Slashing
 SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
 SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 
 # Finality
-FINALITY_THRESHOLD = 0.67     # 2/3 of stake must attest for justification
+FINALITY_THRESHOLD_NUMERATOR = 2     # 2/3 of stake must attest for justification
+FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= total * 2
 
 # Governance — on-chain voting for protocol/codebase changes
-GOVERNANCE_VOTING_WINDOW = 60_480     # blocks (~7 days at 10s/block)
-GOVERNANCE_APPROVAL_THRESHOLD = 0.50  # >50% of participating stake must approve
-GOVERNANCE_PROPOSAL_FEE = 10          # fee to create a proposal (spam deterrent)
-GOVERNANCE_VOTE_FEE = 1               # fee to cast a vote
-GOVERNANCE_DELEGATE_FEE = 1           # fee to delegate/revoke voting power
+GOVERNANCE_VOTING_WINDOW = 5_040      # blocks (~7 days at 120s/block)
+GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 1    # >50% of participating stake must approve
+GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 2  # Use integer arithmetic: yes * 2 > total * 1
+GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent)
+GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
+GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power

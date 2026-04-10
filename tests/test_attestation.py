@@ -20,7 +20,7 @@ from messagechain.consensus.slashing import (
     create_slash_transaction,
     verify_attestation_slashing_evidence,
 )
-from messagechain.config import FINALITY_THRESHOLD
+from messagechain.config import FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR
 
 
 class TestAttestation(unittest.TestCase):
@@ -76,24 +76,22 @@ class TestFinalityTracker(unittest.TestCase):
         self.assertFalse(self.tracker.is_finalized(b"any_hash"))
 
     def test_block_finalized_at_threshold(self):
-        """Block becomes finalized when 2/3+ of stake attests."""
+        """Block becomes finalized when 2/3+ of stake attests.
+
+        With integer arithmetic: attested*3 >= total*2.
+        200*3=600 >= 300*2=600, so exactly 2/3 IS finalized (correct).
+        """
         block_hash = _hash(b"block1")
-        # 200/300 = 0.6667 which is < 0.67, so need 3/3 or uneven stakes
         att1 = Attestation(b"v1", block_hash, 1, None)
         att2 = Attestation(b"v2", block_hash, 1, None)
 
         total_stake = 300
-        # 1/3 - not finalized
+        # 1/3 — not finalized (100*3=300 < 300*2=600)
         self.tracker.add_attestation(att1, 100, total_stake)
         self.assertFalse(self.tracker.is_finalized(block_hash))
 
-        # 200/300 = 0.667 < 0.67 - still not finalized
+        # 2/3 — finalized (200*3=600 >= 300*2=600)
         self.tracker.add_attestation(att2, 100, total_stake)
-        self.assertFalse(self.tracker.is_finalized(block_hash))
-
-        # 3/3 = 1.0 >= 0.67 - finalized
-        att3 = Attestation(b"v3", block_hash, 1, None)
-        self.tracker.add_attestation(att3, 100, total_stake)
         self.assertTrue(self.tracker.is_finalized(block_hash))
 
     def test_block_not_finalized_below_threshold(self):

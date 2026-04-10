@@ -16,10 +16,12 @@ Now supports:
 
 import hashlib
 import logging
+import time as _time
 from messagechain.config import (
     HASH_ALGO, MAX_TXS_PER_BLOCK, VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
+    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.transaction import MessageTransaction, verify_transaction
@@ -86,6 +88,7 @@ class Blockchain:
         self.attestation_sig_counts: dict[bytes, int] = {}  # entity_id -> attestation signatures made
         self.slash_sig_counts: dict[bytes, int] = {}  # entity_id -> slash submission signatures made
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
+        self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
@@ -261,6 +264,10 @@ class Blockchain:
         ENFORCES: one entity per key. If the entity_id already exists,
         registration is REJECTED.
         """
+        # L4: Validate entity_id is correct length (SHA3-256 = 32 bytes)
+        if len(entity_id) != 32:
+            return False, f"Entity ID must be 32 bytes, got {len(entity_id)}"
+
         if entity_id in self.public_keys:
             return False, "Entity already exists — duplicate entity rejected"
 
@@ -386,6 +393,9 @@ class Blockchain:
         if tx.rotation_number != expected_rotation:
             return False, f"Invalid rotation number: expected {expected_rotation}, got {tx.rotation_number}"
 
+        if tx.fee < KEY_ROTATION_FEE:
+            return False, f"Key rotation fee must be at least {KEY_ROTATION_FEE}, got {tx.fee}"
+
         if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
             return False, f"Insufficient balance for rotation fee of {tx.fee}"
 
@@ -425,6 +435,10 @@ class Blockchain:
         if tx.evidence.offender_id in self.slashed_validators:
             return False, "Validator already slashed"
 
+        # M8: Reject duplicate evidence submissions
+        if tx.evidence.evidence_hash in self._processed_evidence:
+            return False, "Evidence already submitted"
+
         if self.supply.get_staked(tx.evidence.offender_id) == 0:
             return False, "Offender has no stake to slash"
 
@@ -462,6 +476,7 @@ class Blockchain:
             tx.evidence.offender_id, tx.submitter_id
         )
         self.slashed_validators.add(tx.evidence.offender_id)
+        self._processed_evidence.add(tx.evidence.evidence_hash)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -637,8 +652,14 @@ class Blockchain:
         if block.header.timestamp <= mtp:
             return False, f"Block timestamp {block.header.timestamp} must exceed median time past {mtp}"
 
-        # Check transaction count
-        if len(block.transactions) > MAX_TXS_PER_BLOCK:
+        # L1: Reject blocks with timestamps too far in the future (BTC: 2 hours)
+        max_future = _time.time() + 7200
+        if block.header.timestamp > max_future:
+            return False, f"Block timestamp {block.header.timestamp} too far in the future"
+
+        # Check transaction count (all types combined)
+        total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
 
         # Check for duplicate transaction hashes within the block
@@ -706,6 +727,9 @@ class Blockchain:
 
             if tx.timestamp <= 0:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Transaction must have a valid timestamp"
+            # L3: Enforce timestamp drift for txs within blocks (not just standalone)
+            if tx.timestamp > _time.time() + MAX_TIMESTAMP_DRIFT:
+                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Timestamp too far in future"
 
             # Advance pending state for next tx in the same block
             pending_nonces[tx.entity_id] = expected_nonce + 1
@@ -754,10 +778,12 @@ class Blockchain:
             return False, "Invalid prev_hash"
         if block.header.block_number != parent.header.block_number + 1:
             return False, "Invalid block number"
-        if len(block.transactions) > MAX_TXS_PER_BLOCK:
+        total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
 
-        tx_hashes = [tx.tx_hash for tx in block.transactions]
+        all_txs = list(block.transactions) + list(block.transfer_transactions)
+        tx_hashes = [tx.tx_hash for tx in all_txs]
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"

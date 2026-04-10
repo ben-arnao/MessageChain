@@ -39,10 +39,13 @@ class RANDAOMix:
         with the current mix to produce the new mix.
         """
         hashed_reveal = _hash(b"randao_reveal" + reveal)
-        # XOR the hashed reveal with current mix
-        self.current_mix = bytes(
+        # XOR then re-hash to prevent last-proposer bias.
+        # Without re-hash, the last proposer can compute desired output
+        # by choosing reveal = current_mix XOR desired_output.
+        xored = bytes(
             a ^ b for a, b in zip(self.current_mix, hashed_reveal)
         )
+        self.current_mix = _hash(b"randao_mix" + xored)
         return self.current_mix
 
     def serialize(self) -> dict:

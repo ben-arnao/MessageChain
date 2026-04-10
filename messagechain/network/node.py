@@ -215,13 +215,31 @@ class Node:
         # ── Message dispatch ──
 
         if msg.msg_type == MessageType.HANDSHAKE:
-            peer.entity_id = msg.sender_id
+            # M2: Validate handshake payload before use
+            sender_id = msg.sender_id
+            if not isinstance(sender_id, str) or len(sender_id) < 16:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_sender_id"
+                )
+                return
+            peer_height = msg.payload.get("chain_height", 0)
+            if not isinstance(peer_height, int) or peer_height < 0:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_chain_height"
+                )
+                return
+            best_hash = msg.payload.get("best_block_hash", "")
+            if not isinstance(best_hash, str):
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_best_hash"
+                )
+                return
+
+            peer.entity_id = sender_id
             self.peers[peer.address] = peer
-            logger.info(f"Handshake from {peer.address} (entity: {msg.sender_id[:16]})")
+            logger.info(f"Handshake from {peer.address} (entity: {sender_id[:16]})")
 
             # Track peer's chain height for sync decisions
-            peer_height = msg.payload.get("chain_height", 0)
-            best_hash = msg.payload.get("best_block_hash", "")
             self.syncer.update_peer_height(peer.address, peer_height, best_hash)
 
             # If peer is ahead, initiate sync
@@ -235,7 +253,13 @@ class Node:
             await self._handle_getdata(msg.payload, peer)
 
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
-            tx = MessageTransaction.deserialize(msg.payload)
+            try:
+                tx = MessageTransaction.deserialize(msg.payload)
+            except Exception:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_tx_data"
+                )
+                return
             tx_hash_hex = tx.tx_hash.hex()
 
             # Already seen?
@@ -254,11 +278,21 @@ class Node:
                 self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
 
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
-            block = Block.deserialize(msg.payload)
+            try:
+                block = Block.deserialize(msg.payload)
+            except Exception:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_block_data"
+                )
+                return
             success, reason = self.blockchain.add_block(block)
             if success:
-                # Remove included txs from mempool
-                self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
+                # Remove included txs from mempool (all transaction types)
+                all_tx_hashes = (
+                    [tx.tx_hash for tx in block.transactions]
+                    + [tx.tx_hash for tx in block.transfer_transactions]
+                )
+                self.mempool.remove_transactions(all_tx_hashes)
                 logger.info(f"Added block #{block.header.block_number} ({reason})")
                 # Gossip to other peers
                 await self._broadcast(msg, exclude=peer.address)
@@ -286,10 +320,15 @@ class Node:
 
         elif msg.msg_type == MessageType.PEER_LIST:
             for p_info in msg.payload.get("peers", []):
-                addr = f"{p_info['host']}:{p_info['port']}"
+                host = p_info.get("host", "")
+                port = p_info.get("port", 0)
+                # M1: Validate peer addresses — reject private/invalid IPs
+                if not self._is_valid_peer_address(host, port):
+                    continue
+                addr = f"{host}:{port}"
                 if addr not in self.peers and len(self.peers) < MAX_PEERS:
                     if not self.ban_manager.is_banned(addr):
-                        asyncio.create_task(self._connect_to_peer(p_info["host"], p_info["port"]))
+                        asyncio.create_task(self._connect_to_peer(host, port))
 
         # ── IBD / Sync Protocol Messages ──────────────────────────
 
@@ -315,7 +354,13 @@ class Node:
         elif msg.msg_type == MessageType.RESPONSE_BLOCK:
             block_data = msg.payload.get("block")
             if block_data:
-                block = Block.deserialize(block_data)
+                try:
+                    block = Block.deserialize(block_data)
+                except Exception:
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_PROTOCOL_VIOLATION, "invalid_response_block"
+                    )
+                    return
                 self.blockchain.add_block(block)
 
         elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
@@ -323,6 +368,29 @@ class Node:
 
         elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
             await self._handle_announce_slash(msg.payload, peer)
+
+    @staticmethod
+    def _is_valid_peer_address(host: str, port) -> bool:
+        """Reject private/invalid IPs and out-of-range ports (eclipse resistance)."""
+        if not isinstance(host, str) or not isinstance(port, int):
+            return False
+        if not (1 <= port <= 65535):
+            return False
+        # Reject RFC1918 private addresses and loopback
+        if host.startswith(("127.", "10.", "0.")):
+            return False
+        if host.startswith("192.168."):
+            return False
+        if host.startswith("172."):
+            parts = host.split(".")
+            if len(parts) >= 2:
+                try:
+                    second = int(parts[1])
+                    if 16 <= second <= 31:
+                        return False
+                except ValueError:
+                    return False
+        return True
 
     def _msg_category(self, msg_type: MessageType) -> str:
         """Map message type to rate limit category."""
@@ -344,6 +412,16 @@ class Node:
                 peer.address, OFFENSE_PROTOCOL_VIOLATION, "inv_too_large"
             )
             return
+
+        # M3: Rate-limit by hash count, not just message count.
+        # Each batch of 50 hashes costs one extra rate-limit token.
+        extra_tokens = len(tx_hashes) // 50
+        for _ in range(extra_tokens):
+            if not self.rate_limiter.check(peer.address, "tx"):
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_RATE_LIMIT, "inv_hash_flood"
+                )
+                return
 
         # Request any tx hashes we haven't seen
         needed = []

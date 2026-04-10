@@ -120,6 +120,8 @@ class KeyPair:
 
     def _auth_path(self, leaf_index: int) -> list[bytes]:
         """Get the Merkle authentication path for a leaf."""
+        if leaf_index < 0 or leaf_index >= self.num_leaves:
+            raise IndexError(f"leaf_index {leaf_index} out of range [0, {self.num_leaves})")
         path = []
         idx = leaf_index
         for level in range(self.height):
