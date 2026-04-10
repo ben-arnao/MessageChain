@@ -353,10 +353,14 @@ class TestSlashTransaction(unittest.TestCase):
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         sim_staked[self.alice.entity_id] = 0
         sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
-        # Block reward to proposer (no attestors, capped)
+        # Block reward to proposer (no attestors)
+        # After slashing the only staker, all stakes are 0 — bootstrap mode
+        # means no cap on proposer reward
         from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         reward = self.chain.supply.calculate_block_reward(block_height)
-        proposer_reward = min(reward, PROPOSER_REWARD_CAP)
+        is_bootstrap = not any(s > 0 for s in sim_staked.values())
+        effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
+        proposer_reward = min(reward, effective_cap)
         treasury_excess = reward - proposer_reward
         sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + proposer_reward
         if treasury_excess > 0:
