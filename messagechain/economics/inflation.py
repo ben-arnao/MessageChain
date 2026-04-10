@@ -21,6 +21,7 @@ import math
 from messagechain.config import (
     GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE,
     SLASH_FINDER_REWARD_PCT, UNBONDING_PERIOD, MIN_TOTAL_STAKE,
+    TREASURY_ENTITY_ID,
 )
 
 
@@ -140,11 +141,31 @@ class SupplyTracker:
         return total_released
 
     def transfer(self, from_id: bytes, to_id: bytes, amount: int) -> bool:
-        """Transfer tokens between entities."""
+        """Transfer tokens between entities.
+
+        Treasury funds cannot be moved via normal transfers — only
+        governance-approved treasury spends can debit the treasury.
+        """
+        if from_id == TREASURY_ENTITY_ID:
+            return False
         if self.get_balance(from_id) < amount:
             return False
         self.balances[from_id] -= amount
         self.balances[to_id] = self.balances.get(to_id, 0) + amount
+        return True
+
+    def treasury_spend(self, recipient_id: bytes, amount: int) -> bool:
+        """Move funds from treasury to recipient (governance-authorized only).
+
+        This is the ONLY way to debit the treasury. Callers must ensure
+        governance approval before invoking this method.
+        """
+        if self.get_balance(TREASURY_ENTITY_ID) < amount:
+            return False
+        if amount <= 0:
+            return False
+        self.balances[TREASURY_ENTITY_ID] -= amount
+        self.balances[recipient_id] = self.balances.get(recipient_id, 0) + amount
         return True
 
     def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:

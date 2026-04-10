@@ -35,6 +35,7 @@ from messagechain.config import (
     GOVERNANCE_VOTE_FEE,
     GOVERNANCE_DELEGATE_FEE,
     MIN_FEE,
+    TREASURY_ENTITY_ID,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -258,6 +259,87 @@ class DelegateTransaction:
         return tx
 
 
+@dataclass
+class TreasurySpendTransaction:
+    """Proposal to transfer funds from the governance-controlled treasury.
+
+    Fields:
+        proposer_id: entity proposing the spend
+        recipient_id: entity that will receive the funds
+        amount: number of tokens to transfer from treasury
+        title: short subject describing the spend
+        description: detailed justification
+        timestamp: creation time
+        fee: must be >= GOVERNANCE_PROPOSAL_FEE
+        signature: proposer's quantum-resistant signature
+    """
+    proposer_id: bytes
+    recipient_id: bytes
+    amount: int
+    title: str
+    description: str
+    timestamp: float
+    fee: int
+    signature: Signature
+    tx_hash: bytes = b""
+
+    def __post_init__(self):
+        if not self.tx_hash:
+            self.tx_hash = self._compute_hash()
+
+    def _signable_data(self) -> bytes:
+        return (
+            b"treasury_spend"
+            + self.proposer_id
+            + self.recipient_id
+            + struct.pack(">Q", self.amount)
+            + self.title.encode("utf-8")
+            + self.description.encode("utf-8")
+            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", self.fee)
+        )
+
+    def _compute_hash(self) -> bytes:
+        return _hash(self._signable_data())
+
+    @property
+    def proposal_id(self) -> bytes:
+        return self.tx_hash
+
+    def serialize(self) -> dict:
+        return {
+            "type": "treasury_spend",
+            "proposer_id": self.proposer_id.hex(),
+            "recipient_id": self.recipient_id.hex(),
+            "amount": self.amount,
+            "title": self.title,
+            "description": self.description,
+            "timestamp": self.timestamp,
+            "fee": self.fee,
+            "signature": self.signature.serialize(),
+            "tx_hash": self.tx_hash.hex(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "TreasurySpendTransaction":
+        sig = Signature.deserialize(data["signature"])
+        tx = cls(
+            proposer_id=bytes.fromhex(data["proposer_id"]),
+            recipient_id=bytes.fromhex(data["recipient_id"]),
+            amount=data["amount"],
+            title=data["title"],
+            description=data["description"],
+            timestamp=data["timestamp"],
+            fee=data["fee"],
+            signature=sig,
+        )
+        expected_hash = tx._compute_hash()
+        declared_hash = bytes.fromhex(data["tx_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError("Treasury spend tx hash mismatch")
+        return tx
+
+
 # --- Transaction creation helpers ---
 
 
@@ -301,6 +383,31 @@ def create_vote(
     )
     msg_hash = _hash(tx._signable_data())
     tx.signature = voter_entity.keypair.sign(msg_hash)
+    tx.tx_hash = tx._compute_hash()
+    return tx
+
+
+def create_treasury_spend_proposal(
+    proposer_entity,
+    recipient_id: bytes,
+    amount: int,
+    title: str,
+    description: str,
+    fee: int = GOVERNANCE_PROPOSAL_FEE,
+) -> TreasurySpendTransaction:
+    """Create and sign a treasury spend proposal."""
+    tx = TreasurySpendTransaction(
+        proposer_id=proposer_entity.entity_id,
+        recipient_id=recipient_id,
+        amount=amount,
+        title=title,
+        description=description,
+        timestamp=time.time(),
+        fee=fee,
+        signature=Signature([], 0, [], b"", b""),  # placeholder
+    )
+    msg_hash = _hash(tx._signable_data())
+    tx.signature = proposer_entity.keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
     return tx
 
@@ -357,6 +464,7 @@ class GovernanceTracker:
     def __init__(self):
         self.proposals: dict[bytes, ProposalState] = {}  # proposal_id -> state
         self.delegations: dict[bytes, bytes] = {}  # delegator_id -> delegate_id
+        self._executed_treasury_spends: set[bytes] = set()  # replay protection
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
         """Register a new proposal and snapshot current stake distribution."""
@@ -451,6 +559,26 @@ class GovernanceTracker:
 
         return yes_weight, total_weight
 
+    def execute_treasury_spend(
+        self,
+        tx: TreasurySpendTransaction,
+        supply_tracker,
+    ) -> bool:
+        """Execute an approved treasury spend. Returns False if rejected.
+
+        Rejects if: amount is invalid, treasury has insufficient funds,
+        or the spend has already been executed (replay protection).
+        """
+        if tx.amount <= 0:
+            return False
+        # Replay protection — each tx_hash can only execute once
+        if tx.tx_hash in self._executed_treasury_spends:
+            return False
+        result = supply_tracker.treasury_spend(tx.recipient_id, tx.amount)
+        if result:
+            self._executed_treasury_spends.add(tx.tx_hash)
+        return result
+
     def get_proposal_info(
         self, proposal_id: bytes, current_block: int,
     ) -> dict:
@@ -503,6 +631,22 @@ def verify_vote(tx: VoteTransaction, public_key: bytes) -> bool:
         return False
     if not tx.proposal_id or len(tx.proposal_id) != 32:
         return False
+    msg_hash = _hash(tx._signable_data())
+    return verify_signature(msg_hash, tx.signature, public_key)
+
+
+def verify_treasury_spend(tx: TreasurySpendTransaction, public_key: bytes) -> bool:
+    """Verify a treasury spend proposal's signature and fields."""
+    if tx.fee < GOVERNANCE_PROPOSAL_FEE:
+        return False
+    if not tx.title:
+        return False
+    if tx.amount <= 0:
+        return False
+    if not tx.recipient_id:
+        return False
+    if tx.recipient_id == TREASURY_ENTITY_ID:
+        return False  # treasury cannot send to itself
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)
 
