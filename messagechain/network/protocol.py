@@ -56,10 +56,33 @@ class NetworkMessage:
 
     @classmethod
     def deserialize(cls, data: dict) -> "NetworkMessage":
+        # Strict validation. A peer MUST NOT be able to crash the deserializer
+        # with a malformed payload — any defect raises a ValueError which the
+        # caller can handle (ban the peer, log, etc.) rather than an
+        # uncaught KeyError/TypeError bubbling up through async handlers.
+        if not isinstance(data, dict):
+            raise ValueError("NetworkMessage data must be a dict")
+        if "type" not in data:
+            raise ValueError("NetworkMessage missing 'type' field")
+        if "payload" not in data:
+            raise ValueError("NetworkMessage missing 'payload' field")
+        raw_type = data["type"]
+        if not isinstance(raw_type, str):
+            raise ValueError("NetworkMessage 'type' must be a string")
+        try:
+            msg_type = MessageType(raw_type)
+        except ValueError:
+            raise ValueError(f"Unknown NetworkMessage type: {raw_type!r}")
+        payload = data["payload"]
+        if not isinstance(payload, dict):
+            raise ValueError("NetworkMessage 'payload' must be a dict")
+        sender_id = data.get("sender_id", "")
+        if not isinstance(sender_id, str):
+            raise ValueError("NetworkMessage 'sender_id' must be a string")
         return cls(
-            msg_type=MessageType(data["type"]),
-            payload=data["payload"],
-            sender_id=data.get("sender_id", ""),
+            msg_type=msg_type,
+            payload=payload,
+            sender_id=sender_id,
         )
 
 

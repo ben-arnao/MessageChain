@@ -33,7 +33,7 @@ from messagechain.identity.identity import Entity
 def _make_chain_and_entities(num_entities=2):
     """Helper: create a blockchain with registered entities."""
     chain = Blockchain()
-    entities = [Entity.create(f"test_key_{i}".encode()) for i in range(num_entities)]
+    entities = [Entity.create(f"test_key_{i}".encode().ljust(32, b"\x00")) for i in range(num_entities)]
     chain.initialize_genesis(entities[0])
     for e in entities[1:]:
         register_entity_for_test(chain, e)

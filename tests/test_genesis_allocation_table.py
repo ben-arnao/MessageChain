@@ -22,9 +22,9 @@ class TestGenesisAllocationTable(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -92,8 +92,8 @@ class TestTreasuryEntity(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -148,9 +148,9 @@ class TestTreasurySpend(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

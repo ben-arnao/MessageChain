@@ -15,7 +15,7 @@ class TestHashVerificationOnDeserialize(unittest.TestCase):
     """Fix #2: Reject deserialized objects with spoofed hashes."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         self.chain.supply.balances[self.alice.entity_id] = 10000
@@ -73,8 +73,8 @@ class TestMandatoryProposerSignature(unittest.TestCase):
     """Fix #5: Unsigned blocks must be rejected."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
-        self.bob = Entity.create(b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -123,8 +123,8 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_register_with_public_data_only(self):
         """register_entity accepts entity_id and public_key, not Entity objects."""
-        alice = Entity.create(b"alice-private-key")
-        bob = Entity.create(b"bob-private-key")
+        alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         chain = Blockchain()
         chain.initialize_genesis(alice)
 
@@ -136,7 +136,7 @@ class TestRegisterEntityPublicOnly(unittest.TestCase):
 
     def test_duplicate_public_data_rejected(self):
         """Duplicate entity_id is still rejected."""
-        alice = Entity.create(b"alice-private-key")
+        alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         chain = Blockchain()
         chain.initialize_genesis(alice)
 

@@ -281,8 +281,8 @@ class TestBaseFeeBlockchainIntegration(unittest.TestCase):
     """Base fee integrated into block production and validation."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-economics-key")
-        self.bob = Entity.create(b"bob-economics-key")
+        self.alice = Entity.create(b"alice-economics-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-economics-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -337,9 +337,9 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
     """Attestation rewards work end-to-end in the blockchain."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-att-econ-key")
-        self.bob = Entity.create(b"bob-att-econ-key")
-        self.carol = Entity.create(b"carol-att-econ-key")
+        self.alice = Entity.create(b"alice-att-econ-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-att-econ-key".ljust(32, b"\x00"))
+        self.carol = Entity.create(b"carol-att-econ-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)

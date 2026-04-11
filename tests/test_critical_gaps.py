@@ -34,7 +34,7 @@ class TestDuplicateTransactionDetection(unittest.TestCase):
     def setUp(self):
         self.chain = Blockchain()
         self.consensus = ProofOfStake()
-        self.proposer = Entity.create(b"proposer-seed-dup")
+        self.proposer = Entity.create(b"proposer-seed-dup".ljust(32, b"\x00"))
         self.chain.initialize_genesis(self.proposer)
         register_entity_for_test(self.chain, self.proposer)
         self.chain.supply.balances[self.proposer.entity_id] = 100_000
@@ -85,7 +85,7 @@ class TestBlockSignatureCostLimits(unittest.TestCase):
 
         chain = Blockchain()
         consensus = ProofOfStake()
-        proposer = Entity.create(b"proposer-seed-sigcost")
+        proposer = Entity.create(b"proposer-seed-sigcost".ljust(32, b"\x00"))
         chain.initialize_genesis(proposer)
         register_entity_for_test(chain, proposer)
         chain.supply.balances[proposer.entity_id] = 1_000_000
@@ -93,7 +93,7 @@ class TestBlockSignatureCostLimits(unittest.TestCase):
         # Create many entities to generate many transactions
         entities = []
         for i in range(10):
-            e = Entity.create(f"sigcost-entity-{i}".encode())
+            e = Entity.create(f"sigcost-entity-{i}".encode().ljust(32, b"\x00"))
             register_entity_for_test(chain, e)
             chain.supply.balances[e.entity_id] = 100_000
             entities.append(e)
@@ -145,7 +145,7 @@ class TestMedianTimePast(unittest.TestCase):
     def setUp(self):
         self.chain = Blockchain()
         self.consensus = ProofOfStake()
-        self.proposer = Entity.create(b"proposer-seed-mtp")
+        self.proposer = Entity.create(b"proposer-seed-mtp".ljust(32, b"\x00"))
         self.chain.initialize_genesis(self.proposer)
         register_entity_for_test(self.chain, self.proposer)
         self.chain.supply.balances[self.proposer.entity_id] = 100_000
@@ -196,7 +196,7 @@ class TestBlockRewardMaturity(unittest.TestCase):
     def setUp(self):
         self.chain = Blockchain()
         self.consensus = ProofOfStake()
-        self.proposer = Entity.create(b"proposer-seed-maturity")
+        self.proposer = Entity.create(b"proposer-seed-maturity".ljust(32, b"\x00"))
         self.chain.initialize_genesis(self.proposer)
         register_entity_for_test(self.chain, self.proposer)
         # Give enough balance to cover fees so we can test reward spending

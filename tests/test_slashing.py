@@ -49,8 +49,8 @@ def _make_conflicting_headers(proposer_entity, prev_block):
 class TestSlashingEvidence(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -193,9 +193,9 @@ class TestSlashingEvidence(unittest.TestCase):
 class TestSlashTransaction(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

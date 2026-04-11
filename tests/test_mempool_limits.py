@@ -18,7 +18,7 @@ _TEST_MSG_FEE = MIN_FEE + 20 * FEE_PER_BYTE  # generous for "msg X" style messag
 
 class TestMempoolLimits(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
 
     def _make_tx(self, fee: int, nonce: int, ts: float | None = None):
         tx = create_transaction(

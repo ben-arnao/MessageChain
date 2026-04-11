@@ -10,7 +10,8 @@ a node should not serve GETDATA for a transaction it hasn't yet
 announced via INV to the requesting peer.
 """
 
-import random
+import math
+import secrets
 from collections import defaultdict
 
 import messagechain.config
@@ -33,8 +34,19 @@ class TxRelayScheduler:
 
         Returns delay in seconds. The mean is configurable via
         TX_RELAY_DELAY_MEAN (default 2.0 seconds).
+
+        Uses `secrets` rather than the standard `random` module: relay delays
+        are a privacy feature, and predictable delays would let a surveillance
+        peer correlate timings to identify transaction origins. Inverse-CDF
+        sampling against a cryptographically-random uniform [0,1) gives us the
+        same exponential distribution as `random.expovariate` without the
+        deterministic-PRNG weakness.
         """
-        return random.expovariate(1.0 / self._mean)
+        # Draw u uniformly from (0, 1] using 53 bits of crypto randomness.
+        # Avoid u == 0 so -log(u) stays finite.
+        raw = secrets.randbits(53) + 1  # in [1, 2^53]
+        u = raw / (1 << 53)              # in (0, 1]
+        return -self._mean * math.log(u)
 
     def mark_announced(self, peer_addr: str, tx_hash: bytes):
         """Record that we announced a tx to a peer via INV."""

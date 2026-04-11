@@ -142,6 +142,12 @@ class Blockchain:
         if hasattr(self.db, 'get_all_slashed'):
             self.slashed_validators = self.db.get_all_slashed()
 
+        # Restore processed-evidence set so a restart cannot re-apply an
+        # already-consumed slashing evidence transaction (which would let
+        # a validator be slashed twice for the same offence).
+        if hasattr(self.db, 'get_all_processed_evidence'):
+            self._processed_evidence = self.db.get_all_processed_evidence()
+
         # Rebuild in-memory chain from best tip
         best_tip = self.db.get_best_tip()
         if best_tip is None:
@@ -193,6 +199,11 @@ class Blockchain:
             if hasattr(self.db, 'add_slashed_validator'):
                 for eid in self.slashed_validators:
                     self.db.add_slashed_validator(eid, self.height, b"")
+            # Persist processed evidence hashes so they cannot be re-applied
+            # after a restart.
+            if hasattr(self.db, 'mark_evidence_processed'):
+                for ev_hash in self._processed_evidence:
+                    self.db.mark_evidence_processed(ev_hash, self.height)
             self.db.commit_transaction()
         except Exception:
             self.db.rollback_transaction()
@@ -1011,7 +1022,19 @@ class Blockchain:
         return False, "Orphan block — parent not found"
 
     def _append_block(self, block: Block) -> tuple[bool, str]:
-        """Append a validated block to the current best chain."""
+        """Append a validated block to the current best chain.
+
+        Ordering note (Bitcoin-style validate-then-apply):
+        We first use compute_post_state_root to simulate the block's effect
+        without touching chain state. If the simulated root does not match
+        the block's header commitment, we reject BEFORE any mutation. This
+        mirrors Bitcoin Core's CheckBlock-before-ConnectBlock pattern and
+        avoids relying solely on snapshot/rollback for correctness.
+
+        We still snapshot + verify after application as defence-in-depth:
+        the simulation and the real apply path run different code and any
+        drift between them should be caught by the post-apply check.
+        """
         # Validate ALL slash transactions BEFORE applying any state changes.
         # This prevents state corruption if a slash tx fails validation
         # partway through (previously, regular tx state was already applied).
@@ -1019,6 +1042,33 @@ class Blockchain:
             valid, reason = self.validate_slash_transaction(stx)
             if not valid:
                 return False, f"Invalid slash tx: {reason}"
+
+        # Pre-check: simulate the block's state transition without mutating.
+        # If the resulting state root doesn't match the header commitment,
+        # reject immediately — no state changes have been applied yet.
+        #
+        # compute_post_state_root doesn't model slashing state transitions
+        # (it simulates only transactions, transfers, and reward splits),
+        # so we skip the pre-check for blocks containing slashing txs and
+        # rely on the snapshot/rollback safety net further down.
+        if not block.slash_transactions:
+            try:
+                simulated_root = self.compute_post_state_root(
+                    transactions=block.transactions,
+                    proposer_id=block.header.proposer_id,
+                    block_height=block.header.block_number,
+                    transfer_transactions=block.transfer_transactions,
+                    attestations=block.attestations,
+                )
+            except Exception:
+                # Simulation may be a superset of the real apply logic and
+                # can legitimately fail on edge cases; fall through to the
+                # existing snapshot/rollback path rather than rejecting on
+                # simulation exceptions alone.
+                simulated_root = None
+
+            if simulated_root is not None and block.header.state_root != simulated_root:
+                return False, "Invalid state_root — state commitment mismatch"
 
         # Snapshot state BEFORE mutation so we can rollback if state_root is wrong.
         # This prevents a block with invalid state_root from corrupting chain state.

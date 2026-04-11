@@ -77,14 +77,73 @@ def _check_depth(obj, max_depth: int, current: int = 0):
             _check_depth(v, max_depth, current + 1)
 
 
+def _prescan_depth(text: str, max_depth: int) -> None:
+    """Streaming-style depth check on raw JSON text.
+
+    Counts '{'/'['/']'/'}' nesting while respecting string literals and
+    escape sequences. This runs BEFORE json.loads(), so a pathological
+    input like '{{{...}}}' with millions of levels is rejected without
+    ever materialising the nested Python object.
+
+    We still run the post-parse `_check_depth` for belt-and-braces, but
+    the prescan is what makes the function safe against JSON-bomb DoS.
+    """
+    if isinstance(text, (bytes, bytearray)):
+        # json.loads accepts bytes; we need str for our scanner.
+        try:
+            text = text.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("safe_json_loads: invalid UTF-8")
+    depth = 0
+    in_string = False
+    escape = False
+    limit = max_depth
+    for ch in text:
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{" or ch == "[":
+            depth += 1
+            if depth > limit:
+                raise ValueError(
+                    f"JSON nesting exceeds max depth of {max_depth}"
+                )
+        elif ch == "}" or ch == "]":
+            if depth > 0:
+                depth -= 1
+
+
 def safe_json_loads(data: str | bytes, max_depth: int = 32) -> dict:
     """Parse JSON with a nesting depth limit.
 
     Prevents JSON bomb attacks where deeply nested structures
-    consume excessive memory or CPU during parsing.
+    consume excessive memory or CPU during parsing. The depth check is
+    performed on the raw text BEFORE json.loads() so that a pathological
+    input is rejected without building the full Python object tree.
     """
-    parsed = json.loads(data)
-    _check_depth(parsed, max_depth)
+    if isinstance(data, (bytes, bytearray)):
+        text = data.decode("utf-8", errors="strict")
+    else:
+        text = data
+    _prescan_depth(text, max_depth)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e.msg}") from None
+    # Defence-in-depth: also run the object-walking check. A corrupted
+    # json module could theoretically produce deeper structures than the
+    # text implied, so we keep this belt-and-braces pass.
+    try:
+        _check_depth(parsed, max_depth)
+    except JSONDepthError as e:
+        raise ValueError(str(e)) from None
     return parsed
 
 

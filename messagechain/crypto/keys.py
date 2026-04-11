@@ -7,10 +7,14 @@ supports up to 2^height signatures.
 """
 
 import hashlib
+import hmac
 import struct
 from dataclasses import dataclass, field
-from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
+from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT, WOTS_KEY_CHAINS
 from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _hash
+
+# Hash output size for SHA3-256, used for strict size validation on signatures.
+_HASH_SIZE = 32
 
 
 @dataclass
@@ -113,8 +117,15 @@ class KeyPair:
         Used when reconstructing a keypair (e.g., from private key) to avoid
         reusing one-time WOTS+ keys. The caller should set this based on
         the on-chain nonce or signature count.
+
+        Valid leaf indices are [0, num_leaves). A value equal to or greater
+        than num_leaves is invalid — WOTS+ keys are one-time, and allowing
+        leaf_index == num_leaves would permit a subsequent out-of-bounds
+        access in sign() or wrap-around key reuse.
         """
-        if leaf_index > self.num_leaves:
+        if leaf_index < 0:
+            raise RuntimeError(f"Leaf index {leaf_index} must be non-negative")
+        if leaf_index >= self.num_leaves:
             raise RuntimeError(f"Leaf index {leaf_index} exceeds tree capacity {self.num_leaves}")
         self._next_leaf = max(self._next_leaf, leaf_index)
 
@@ -159,9 +170,46 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
     """
     Verify a signature against a Merkle-tree root public key.
 
-    1. Verify the WOTS+ signature against the leaf public key
-    2. Verify the leaf public key is in the Merkle tree (via auth path)
+    1. Structural validation of the signature (sizes, counts, ranges)
+    2. Verify the WOTS+ signature against the leaf public key
+    3. Verify the leaf public key is in the Merkle tree (via auth path)
+
+    Returns False on any structural defect or verification failure. Never
+    raises on malformed input — all rejection is via False return.
     """
+    # Step 0: Structural validation. A malformed signature must be rejected
+    # cleanly rather than producing an IndexError or allowing truncated
+    # authentication paths to compute a spurious root.
+    if not isinstance(root_public_key, (bytes, bytearray)) or len(root_public_key) != _HASH_SIZE:
+        return False
+    if not isinstance(message_hash, (bytes, bytearray)) or len(message_hash) != _HASH_SIZE:
+        return False
+    if not isinstance(signature, Signature):
+        return False
+    if len(signature.wots_signature) != WOTS_KEY_CHAINS:
+        return False
+    for part in signature.wots_signature:
+        if not isinstance(part, (bytes, bytearray)) or len(part) != _HASH_SIZE:
+            return False
+    if not isinstance(signature.wots_public_key, (bytes, bytearray)) or len(signature.wots_public_key) != _HASH_SIZE:
+        return False
+    if not isinstance(signature.wots_public_seed, (bytes, bytearray)) or len(signature.wots_public_seed) != _HASH_SIZE:
+        return False
+    # Determine the expected tree height from the root length and auth path length;
+    # we derive it from root tree depth by the auth path size check below, and
+    # clamp leaf_index to the corresponding tree size.
+    tree_height = len(signature.auth_path)
+    if tree_height <= 0 or tree_height > 64:
+        return False
+    for sibling in signature.auth_path:
+        if not isinstance(sibling, (bytes, bytearray)) or len(sibling) != _HASH_SIZE:
+            return False
+    if not isinstance(signature.leaf_index, int):
+        return False
+    num_leaves = 1 << tree_height
+    if signature.leaf_index < 0 or signature.leaf_index >= num_leaves:
+        return False
+
     # Step 1: Verify WOTS+ signature
     if not wots_verify(message_hash, signature.wots_signature,
                        signature.wots_public_key, signature.wots_public_seed):
@@ -177,4 +225,5 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
             current = _hash(sibling + current)
         idx >>= 1
 
-    return current == root_public_key
+    # Constant-time comparison to avoid timing side-channels.
+    return hmac.compare_digest(current, root_public_key)

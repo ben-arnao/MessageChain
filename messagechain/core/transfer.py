@@ -116,10 +116,12 @@ def create_transfer_transaction(
 
 
 def verify_transfer_transaction(tx: TransferTransaction, public_key: bytes) -> bool:
-    """Verify a transfer transaction's signature."""
+    """Verify a transfer transaction's signature and structural fields."""
     if tx.amount <= 0:
         return False
     if tx.fee < MIN_FEE:
+        return False
+    if tx.timestamp <= 0:
         return False
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False

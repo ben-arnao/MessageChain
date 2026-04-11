@@ -92,7 +92,7 @@ class TestBlockTxCountAllTypes(unittest.TestCase):
     def test_validate_block_standalone_counts_transfers(self):
         """validate_block_standalone counts both tx types."""
         chain = Blockchain()
-        alice = Entity.create(b"alice-c2")
+        alice = Entity.create(b"alice-c2".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
 
         from messagechain.config import MAX_TXS_PER_BLOCK
@@ -236,7 +236,7 @@ class TestDynamicFeeInMempool(unittest.TestCase):
         base_fee = calculate_min_fee(b"low fee msg") + 50
         policy = DynamicFeePolicy(base_fee=base_fee, max_fee=base_fee * 100)
         pool = Mempool(max_size=10, fee_policy=policy)
-        alice = Entity.create(b"alice-m4")
+        alice = Entity.create(b"alice-m4".ljust(32, b"\x00"))
 
         high_fee = base_fee * 50
         for i in range(5):
@@ -252,7 +252,7 @@ class TestDynamicFeeInMempool(unittest.TestCase):
         base_fee = calculate_min_fee(b"msg") + 50
         static = DynamicFeePolicy(base_fee=base_fee, max_fee=base_fee)
         pool = Mempool(max_size=10, fee_policy=static)
-        alice = Entity.create(b"alice-m4b")
+        alice = Entity.create(b"alice-m4b".ljust(32, b"\x00"))
         tx = create_transaction(alice, "msg", fee=base_fee, nonce=0)
         self.assertTrue(pool.add_transaction(tx))
 
@@ -262,7 +262,7 @@ class TestKeyRotationMinFee(unittest.TestCase):
 
     def test_zero_fee_rotation_rejected(self):
         chain = Blockchain()
-        alice = Entity.create(b"alice-m6")
+        alice = Entity.create(b"alice-m6".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
         register_entity_for_test(chain, alice)
         chain.supply.balances[alice.entity_id] = 10000
@@ -317,7 +317,7 @@ class TestSlashingEvidenceDedup(unittest.TestCase):
 
     def test_duplicate_evidence_tracked(self):
         chain = Blockchain()
-        alice = Entity.create(b"alice-m8")
+        alice = Entity.create(b"alice-m8".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
 
         chain._processed_evidence.add(b"evidence-hash-123")
@@ -368,7 +368,7 @@ class TestFutureBlockTimestamp(unittest.TestCase):
 
     def test_future_timestamp_rejected(self):
         chain = Blockchain()
-        alice = Entity.create(b"alice-l1")
+        alice = Entity.create(b"alice-l1".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
         register_entity_for_test(chain, alice)
 
@@ -395,7 +395,7 @@ class TestEntityIdLengthValidation(unittest.TestCase):
 
     def test_short_entity_id_rejected(self):
         chain = Blockchain()
-        alice = Entity.create(b"alice-l4")
+        alice = Entity.create(b"alice-l4".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
 
         ok, reason = chain.register_entity(b"short", b"\x00" * 32)
@@ -404,9 +404,9 @@ class TestEntityIdLengthValidation(unittest.TestCase):
 
     def test_correct_length_accepted(self):
         chain = Blockchain()
-        alice = Entity.create(b"alice-l4b")
+        alice = Entity.create(b"alice-l4b".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
-        ok, _ = register_entity_for_test(chain, Entity.create(b"bob-l4b"))
+        ok, _ = register_entity_for_test(chain, Entity.create(b"bob-l4b".ljust(32, b"\x00")))
         self.assertTrue(ok)
 
 

@@ -17,7 +17,13 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MIN_FEE, VALIDATOR_MIN_STAKE, CHAIN_ID
+from messagechain.config import (
+    CHAIN_ID,
+    HASH_ALGO,
+    MAX_TIMESTAMP_DRIFT,
+    MIN_FEE,
+    VALIDATOR_MIN_STAKE,
+)
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -194,21 +200,36 @@ def create_unstake_transaction(
 
 
 def verify_stake_transaction(tx: StakeTransaction, public_key: bytes, block_height: int = 0) -> bool:
-    """Verify a stake transaction's signature."""
+    """Verify a stake transaction's signature and structural fields.
+
+    Mirrors the uniform timestamp/amount validation applied to message and
+    transfer transactions so that no transaction type has a weaker check
+    than another.
+    """
     from messagechain.consensus.pos import graduated_min_stake
+    if tx.amount <= 0:
+        return False
     if tx.amount < graduated_min_stake(block_height):
         return False
     if tx.fee < MIN_FEE:
+        return False
+    if tx.timestamp <= 0:
+        return False
+    if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)
 
 
 def verify_unstake_transaction(tx: UnstakeTransaction, public_key: bytes) -> bool:
-    """Verify an unstake transaction's signature."""
+    """Verify an unstake transaction's signature and structural fields."""
     if tx.amount <= 0:
         return False
     if tx.fee < MIN_FEE:
+        return False
+    if tx.timestamp <= 0:
+        return False
+    if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

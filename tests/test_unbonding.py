@@ -16,8 +16,8 @@ from tests import register_entity_for_test
 
 class TestUnbondingPeriod(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
-        self.bob = Entity.create(b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -87,8 +87,8 @@ class TestUnbondingInBlockchain(unittest.TestCase):
     """Test that unbonding integrates correctly with block processing."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
-        self.bob = Entity.create(b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)

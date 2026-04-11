@@ -50,7 +50,7 @@ class TestGraduatedMinStake(unittest.TestCase):
         from messagechain.core.blockchain import Blockchain
         from messagechain.identity.identity import Entity
 
-        alice = Entity.create(b"alice-grad-test")
+        alice = Entity.create(b"alice-grad-test".ljust(32, b"\x00"))
         chain = Blockchain()
         chain.initialize_genesis(alice)
 

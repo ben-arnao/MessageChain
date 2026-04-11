@@ -18,8 +18,8 @@ from messagechain.config import KEY_ROTATION_FEE
 class TestKeyRotation(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -118,7 +118,7 @@ class TestKeyRotation(unittest.TestCase):
 
         # Second rotation — need to use new keypair to sign
         # Simulate entity with new keypair
-        alice_rotated = Entity.create(b"alice-private-key")
+        alice_rotated = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         alice_rotated.keypair = new_kp0  # swap in the rotated keypair
 
         new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)

@@ -128,7 +128,14 @@ class Node:
             await self._server.wait_closed()
 
     async def _handle_connection(self, reader, writer):
-        """Handle an incoming peer connection."""
+        """Handle an incoming peer connection.
+
+        Read loop is wrapped in asyncio.wait_for with PEER_READ_TIMEOUT to
+        prevent slow-loris style peer-slot exhaustion attacks where a peer
+        opens a connection and simply never sends data. A peer that stays
+        silent for longer than the timeout is disconnected.
+        """
+        from messagechain.config import HANDSHAKE_TIMEOUT
         addr = writer.get_extra_info("peername")
         address = f"{addr[0]}:{addr[1]}"
         logger.info(f"Incoming connection from {address}")
@@ -141,11 +148,22 @@ class Node:
 
         peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
 
+        # Long-lived idle timeout for an established peer. Handshake must
+        # arrive within HANDSHAKE_TIMEOUT; regular traffic after that is
+        # checked against a more generous idle window so that well-behaved
+        # peers aren't disconnected during quiet periods.
+        first_message = True
         try:
             while self._running:
-                msg = await read_message(reader)
+                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                try:
+                    msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.debug(f"Peer {address} timed out after {timeout}s")
+                    break
                 if msg is None:
                     break
+                first_message = False
                 await self._handle_message(msg, peer)
         except Exception as e:
             logger.debug(f"Connection error with {address}: {e}")
@@ -165,8 +183,14 @@ class Node:
             logger.debug(f"Skipping banned peer {addr}")
             return
 
+        from messagechain.config import HANDSHAKE_TIMEOUT
         try:
-            reader, writer = await asyncio.open_connection(host, port)
+            # Bound the initial TCP connect so an unreachable host doesn't
+            # hang the event loop forever.
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=HANDSHAKE_TIMEOUT,
+            )
             peer = Peer(host=host, port=port, reader=reader, writer=writer, is_connected=True)
             self.peers[addr] = peer
             peer.touch()
@@ -184,13 +208,22 @@ class Node:
             )
             await write_message(writer, handshake)
 
-            # Listen for messages
+            # Listen for messages with a bounded idle timeout
+            first_message = True
             while self._running and peer.is_connected:
-                msg = await read_message(reader)
+                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                try:
+                    msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.debug(f"Outbound peer {addr} timed out after {timeout}s")
+                    break
                 if msg is None:
                     break
+                first_message = False
                 await self._handle_message(msg, peer)
 
+        except asyncio.TimeoutError:
+            logger.debug(f"Connect to {addr} timed out")
         except Exception as e:
             logger.debug(f"Failed to connect to {addr}: {e}")
 

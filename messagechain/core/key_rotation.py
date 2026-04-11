@@ -17,7 +17,7 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID
+from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID, MAX_TIMESTAMP_DRIFT
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
 from messagechain.identity.identity import Entity
 
@@ -133,10 +133,15 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
     Verify a key rotation transaction.
 
     Checks that:
-    1. The old_public_key matches the entity's current key on chain
-    2. The signature is valid under the old key
-    3. The new key is different from the old key
+    1. Timestamp is sane (positive and within drift window)
+    2. The old_public_key matches the entity's current key on chain
+    3. The signature is valid under the old key
+    4. The new key is different from the old key
     """
+    if tx.timestamp <= 0:
+        return False
+    if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
+        return False
     if tx.old_public_key != current_public_key:
         return False
     if tx.new_public_key == tx.old_public_key:

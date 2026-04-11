@@ -11,8 +11,8 @@ from messagechain.consensus.pos import ProofOfStake
 
 class TestBlockchain(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
-        self.bob = Entity.create(b"bob-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         register_entity_for_test(self.chain, self.bob)
@@ -36,7 +36,7 @@ class TestBlockchain(unittest.TestCase):
 
     def test_duplicate_entity_rejected(self):
         """Same private key cannot register twice."""
-        alice_dup = Entity.create(b"alice-private-key")
+        alice_dup = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         success, msg = register_entity_for_test(self.chain, alice_dup)
         self.assertFalse(success)
         self.assertIn("duplicate", msg.lower())

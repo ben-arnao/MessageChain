@@ -31,7 +31,7 @@ def _hash(data: bytes) -> bytes:
 # ── Helpers ──────────────────────────────────────────────────────
 
 def make_entity(name: str) -> Entity:
-    return Entity.create(f"{name}-privkey".encode())
+    return Entity.create(f"{name}-privkey".encode().ljust(32, b"\x00"))
 
 
 def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity]:

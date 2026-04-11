@@ -108,7 +108,7 @@ class TestSigCostBudgetEnforcement(unittest.TestCase):
     """#9: MAX_BLOCK_SIG_COST must be enforced during block validation."""
 
     def setUp(self):
-        self.entity = Entity.create(b"test_sig_cost_seed_123456789012")
+        self.entity = Entity.create(b"test_sig_cost_seed_123456789012".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.entity)
         register_entity_for_test(self.chain, self.entity)

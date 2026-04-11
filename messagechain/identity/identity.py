@@ -31,6 +31,11 @@ from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
 from messagechain.crypto.keys import KeyPair
 
+# Minimum private key length in bytes. Matches 256-bit security expected for
+# a 32-byte SHA3-256 seed. Private keys with less entropy than this are
+# trivially brute-forceable and must be rejected at creation time.
+MIN_PRIVATE_KEY_BYTES = 32
+
 # Domain separation tags — ensure entity_id and signing seed are
 # cryptographically independent even though they derive from related inputs.
 _DOMAIN_ENTITY_ID = b"entity_id"
@@ -95,9 +100,19 @@ class Entity:
         - The entity ID is derived from the resulting public key
 
         All key derivation happens locally — nothing secret is transmitted.
+
+        Private keys must be at least MIN_PRIVATE_KEY_BYTES bytes (32 bytes =
+        256 bits) to ensure adequate entropy. Shorter keys are brute-forceable.
         """
         if not private_key:
             raise ValueError("Private key is required")
+        if not isinstance(private_key, (bytes, bytearray)):
+            raise TypeError("Private key must be bytes")
+        if len(private_key) < MIN_PRIVATE_KEY_BYTES:
+            raise ValueError(
+                f"Private key must be at least {MIN_PRIVATE_KEY_BYTES} bytes "
+                f"(got {len(private_key)})"
+            )
 
         seed = _derive_signing_seed(private_key)
 

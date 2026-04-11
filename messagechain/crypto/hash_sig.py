@@ -107,7 +107,25 @@ def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, publ
 
     For each signature element, hash it (W-1-d) more times to reach the
     public chain endpoint. If all endpoints match the public key, it's valid.
+
+    Returns False on malformed input rather than raising — callers rely on
+    this being total over all inputs to avoid DoS via uncaught exceptions.
     """
+    # Strict structural validation. A WOTS+ verification must be total
+    # (never raise) so that adversarial peers cannot crash validation
+    # by sending malformed signatures.
+    if not isinstance(msg_hash, (bytes, bytearray)) or len(msg_hash) != 32:
+        return False
+    if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != 32:
+        return False
+    if not isinstance(public_seed, (bytes, bytearray)) or len(public_seed) != 32:
+        return False
+    if not isinstance(signature, list) or len(signature) != WOTS_KEY_CHAINS:
+        return False
+    for part in signature:
+        if not isinstance(part, (bytes, bytearray)) or len(part) != 32:
+            return False
+
     digits = _message_to_base_w(msg_hash)
     pk_parts = []
     for i, d in enumerate(digits):

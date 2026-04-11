@@ -106,6 +106,11 @@ class ChainDB:
                 evidence_hash BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS processed_evidence (
+                evidence_hash BLOB PRIMARY KEY,
+                processed_at_block INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS block_headers (
                 block_hash BLOB PRIMARY KEY,
                 block_number INTEGER NOT NULL,
@@ -423,6 +428,40 @@ class ChainDB:
 
     def get_all_slashed(self) -> set[bytes]:
         cur = self._conn.execute("SELECT entity_id FROM slashed_validators")
+        return {bytes(row[0]) for row in cur.fetchall()}
+
+    def get_slashed_validators(self) -> set[bytes]:
+        """Alias for get_all_slashed — used by restart-recovery paths."""
+        return self.get_all_slashed()
+
+    def set_slashed(self, entity_id: bytes, block_number: int = 0, evidence_hash: bytes = b"") -> None:
+        """Persist a slashed-validator record. Convenience wrapper around
+        add_slashed_validator that auto-commits for callers that don't batch.
+        """
+        self.add_slashed_validator(entity_id, block_number, evidence_hash or b"\x00" * 32)
+        self._conn.commit()
+
+    # ── Processed Slashing Evidence ─────────────────────────────────
+
+    def mark_evidence_processed(self, evidence_hash: bytes, block_number: int = 0) -> None:
+        """Record that a slashing-evidence tx has been processed, so the same
+        evidence cannot be re-submitted to double-slash a validator.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO processed_evidence (evidence_hash, processed_at_block) VALUES (?, ?)",
+            (evidence_hash, block_number),
+        )
+        self._conn.commit()
+
+    def is_evidence_processed(self, evidence_hash: bytes) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM processed_evidence WHERE evidence_hash = ?",
+            (evidence_hash,),
+        )
+        return cur.fetchone() is not None
+
+    def get_all_processed_evidence(self) -> set[bytes]:
+        cur = self._conn.execute("SELECT evidence_hash FROM processed_evidence")
         return {bytes(row[0]) for row in cur.fetchall()}
 
     # ── Batch Operations (for state snapshots / reorgs) ──────────

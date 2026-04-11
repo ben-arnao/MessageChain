@@ -113,7 +113,7 @@ class TestSizeBasedFeeIntegration(unittest.TestCase):
     """Transaction creation/verification respects non-linear fees."""
 
     def setUp(self):
-        self.alice = Entity.create(b"alice-key-for-fee-tests")
+        self.alice = Entity.create(b"alice-key-for-fee-tests".ljust(32, b"\x00"))
 
     def test_create_transaction_rejects_fee_below_nonlinear_minimum(self):
         msg = "A" * 100
@@ -244,7 +244,7 @@ class TestMessageTTL(unittest.TestCase):
         self.assertTrue(valid)
 
     def test_transaction_includes_ttl(self):
-        alice = Entity.create(b"alice-ttl-test")
+        alice = Entity.create(b"alice-ttl-test".ljust(32, b"\x00"))
         fee = calculate_min_fee(b"hello")
         tx = create_transaction(alice, "hello", fee=fee, nonce=0)
         # Default TTL is 0 (meaning protocol default)
@@ -252,14 +252,14 @@ class TestMessageTTL(unittest.TestCase):
         self.assertEqual(tx.effective_ttl, MESSAGE_DEFAULT_TTL)
 
     def test_transaction_custom_ttl(self):
-        alice = Entity.create(b"alice-custom-ttl")
+        alice = Entity.create(b"alice-custom-ttl".ljust(32, b"\x00"))
         fee = calculate_min_fee(b"hello")
         tx = create_transaction(alice, "hello", fee=fee, nonce=0, ttl=MESSAGE_MIN_TTL)
         self.assertEqual(tx.ttl, MESSAGE_MIN_TTL)
         self.assertEqual(tx.effective_ttl, MESSAGE_MIN_TTL)
 
     def test_transaction_rejects_invalid_ttl(self):
-        alice = Entity.create(b"alice-bad-ttl")
+        alice = Entity.create(b"alice-bad-ttl".ljust(32, b"\x00"))
         fee = calculate_min_fee(b"hello")
         with self.assertRaises(ValueError):
             create_transaction(alice, "hello", fee=fee, nonce=0, ttl=1)  # below min

@@ -28,8 +28,8 @@ class TestAttestation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -141,9 +141,9 @@ class TestAttestationsInBlocks(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -228,7 +228,7 @@ class TestAttestationsInBlocks(unittest.TestCase):
         block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
-        stranger = Entity.create(b"stranger-private-key")
+        stranger = Entity.create(b"stranger-private-key".ljust(32, b"\x00"))
         att = create_attestation(stranger, block1.block_hash, block1.header.block_number)
 
         block2 = self.chain.propose_block(
@@ -261,9 +261,9 @@ class TestFinality(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -322,9 +322,9 @@ class TestDoubleAttestationSlashing(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"alice-private-key")
-        cls.bob = Entity.create(b"bob-private-key")
-        cls.carol = Entity.create(b"carol-private-key")
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-private-key".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

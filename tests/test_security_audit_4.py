@@ -82,7 +82,7 @@ class TestChainID(unittest.TestCase):
     def test_message_tx_signable_data_includes_chain_id(self):
         """MessageTransaction._signable_data must include CHAIN_ID."""
         import messagechain.config as cfg
-        entity = Entity.create(b"chain-id-test-key")
+        entity = Entity.create(b"chain-id-test-key".ljust(32, b"\x00"))
         tx = create_transaction(entity, "test", MIN_FEE + 100, nonce=0)
         signable = tx._signable_data()
         self.assertIn(cfg.CHAIN_ID, signable,
@@ -91,8 +91,8 @@ class TestChainID(unittest.TestCase):
     def test_transfer_tx_signable_data_includes_chain_id(self):
         """TransferTransaction._signable_data must include CHAIN_ID."""
         import messagechain.config as cfg
-        alice = Entity.create(b"chain-id-alice")
-        bob = Entity.create(b"chain-id-bob")
+        alice = Entity.create(b"chain-id-alice".ljust(32, b"\x00"))
+        bob = Entity.create(b"chain-id-bob".ljust(32, b"\x00"))
         tx = create_transfer_transaction(alice, bob.entity_id, 100, nonce=0)
         signable = tx._signable_data()
         self.assertIn(cfg.CHAIN_ID, signable,
@@ -101,7 +101,7 @@ class TestChainID(unittest.TestCase):
     def test_attestation_signable_data_includes_chain_id(self):
         """Attestation.signable_data must include CHAIN_ID."""
         import messagechain.config as cfg
-        entity = Entity.create(b"chain-id-att-key")
+        entity = Entity.create(b"chain-id-att-key".ljust(32, b"\x00"))
         att = create_attestation(entity, _hash(b"block"), block_number=1)
         signable = att.signable_data()
         self.assertIn(cfg.CHAIN_ID, signable,
@@ -113,8 +113,8 @@ class TestStateRootBeforeMutation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"state-root-alice")
-        cls.bob = Entity.create(b"state-root-bob")
+        cls.alice = Entity.create(b"state-root-alice".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"state-root-bob".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -231,7 +231,7 @@ class TestOrphanBlockValidation(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"orphan-alice")
+        cls.alice = Entity.create(b"orphan-alice".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0
@@ -269,7 +269,7 @@ class TestConflictingAttestations(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.alice = Entity.create(b"conflict-alice")
+        cls.alice = Entity.create(b"conflict-alice".ljust(32, b"\x00"))
 
     def setUp(self):
         self.alice.keypair._next_leaf = 0

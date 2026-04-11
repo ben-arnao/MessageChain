@@ -34,7 +34,7 @@ from tests import register_entity_for_test
 
 
 def _make_entity(name: str) -> Entity:
-    return Entity.create(f"{name}-privkey".encode())
+    return Entity.create(f"{name}-privkey".encode().ljust(32, b"\x00"))
 
 
 class TestForkChoiceInfiniteLoop(unittest.TestCase):

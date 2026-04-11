@@ -14,13 +14,13 @@ from messagechain.config import HASH_ALGO
 
 class TestRegistrationAuth(unittest.TestCase):
     def setUp(self):
-        self.alice = Entity.create(b"alice-private-key")
+        self.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
 
     def test_registration_with_valid_proof(self):
         """Registration with a valid binding signature succeeds."""
-        bob = Entity.create(b"bob-private-key")
+        bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         # Create registration proof: sign entity_id with keypair
         msg = hashlib.new(HASH_ALGO, b"register" + bob.entity_id).digest()
         proof = bob.keypair.sign(msg)
@@ -30,15 +30,15 @@ class TestRegistrationAuth(unittest.TestCase):
 
     def test_registration_without_proof_rejected(self):
         """Registration without a binding signature is rejected."""
-        bob = Entity.create(b"bob-private-key")
+        bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
         success, reason = self.chain.register_entity(bob.entity_id, bob.public_key)
         self.assertFalse(success)
         self.assertIn("proof", reason.lower())
 
     def test_registration_with_wrong_key_rejected(self):
         """Registration with a proof from a different keypair is rejected."""
-        bob = Entity.create(b"bob-private-key")
-        eve = Entity.create(b"eve-private-key")
+        bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+        eve = Entity.create(b"eve-private-key".ljust(32, b"\x00"))
 
         # Eve signs Bob's entity_id — proof doesn't match bob's public_key
         msg = hashlib.new(HASH_ALGO, b"register" + bob.entity_id).digest()

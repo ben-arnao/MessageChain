@@ -18,8 +18,8 @@ class TestTransferTransaction(unittest.TestCase):
     """Unit tests for TransferTransaction creation, signing, and verification."""
 
     def setUp(self):
-        self.sender = Entity.create(b"sender_key")
-        self.recipient = Entity.create(b"recipient_key")
+        self.sender = Entity.create(b"sender_key".ljust(32, b"\x00"))
+        self.recipient = Entity.create(b"recipient_key".ljust(32, b"\x00"))
 
     def test_create_transfer_transaction(self):
         """Basic creation produces a valid signed transfer."""
@@ -99,10 +99,10 @@ class TestTransferOnChain(unittest.TestCase):
 
     def setUp(self):
         self.chain = Blockchain()
-        self.genesis = Entity.create(b"genesis_key")
+        self.genesis = Entity.create(b"genesis_key".ljust(32, b"\x00"))
         self.chain.initialize_genesis(self.genesis)
 
-        self.recipient = Entity.create(b"recipient_key")
+        self.recipient = Entity.create(b"recipient_key".ljust(32, b"\x00"))
         register_entity_for_test(self.chain, self.recipient)
 
     def test_validate_transfer_valid(self):
@@ -140,7 +140,7 @@ class TestTransferOnChain(unittest.TestCase):
     def test_validate_transfer_unknown_sender(self):
         """Transfer from unregistered entity is rejected."""
         from messagechain.core.transfer import create_transfer_transaction
-        unknown = Entity.create(b"unknown_key")
+        unknown = Entity.create(b"unknown_key".ljust(32, b"\x00"))
         tx = create_transfer_transaction(
             unknown, self.recipient.entity_id, 50, nonce=0, fee=1500,
         )
@@ -151,7 +151,7 @@ class TestTransferOnChain(unittest.TestCase):
     def test_validate_transfer_unknown_recipient(self):
         """Transfer to unregistered entity is rejected."""
         from messagechain.core.transfer import create_transfer_transaction
-        unknown = Entity.create(b"unknown_recipient")
+        unknown = Entity.create(b"unknown_recipient".ljust(32, b"\x00"))
         nonce = self.chain.nonces[self.genesis.entity_id]
         self.genesis.keypair.advance_to_leaf(
             self.chain.get_wots_leaves_used(self.genesis.entity_id)
@@ -338,7 +338,7 @@ class TestReadMessages(unittest.TestCase):
 
     def setUp(self):
         self.chain = Blockchain()
-        self.genesis = Entity.create(b"genesis_key")
+        self.genesis = Entity.create(b"genesis_key".ljust(32, b"\x00"))
         self.chain.initialize_genesis(self.genesis)
 
     def test_get_recent_messages_empty(self):

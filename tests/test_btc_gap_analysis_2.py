@@ -42,7 +42,7 @@ def _hash(data: bytes) -> bytes:
 def _make_chain_and_entities(num_entities=2, db=None):
     """Helper: create a blockchain with registered entities."""
     chain = Blockchain(db=db)
-    entities = [Entity.create(f"gap2_key_{i}".encode()) for i in range(num_entities)]
+    entities = [Entity.create(f"gap2_key_{i}".encode().ljust(32, b"\x00")) for i in range(num_entities)]
     chain.initialize_genesis(entities[0])
     for e in entities[1:]:
         register_entity_for_test(chain, e)
@@ -143,7 +143,7 @@ class TestMinimumChainWeight(unittest.TestCase):
         """ChainSyncer rejects peers whose reported chain weight is below minimum."""
         from messagechain.network.sync import ChainSyncer
         chain = Blockchain()
-        entities = [Entity.create(b"min_weight_test")]
+        entities = [Entity.create(b"min_weight_test".ljust(32, b"\x00"))]
         chain.initialize_genesis(entities[0])
 
         syncer = ChainSyncer(chain, lambda addr: None)
@@ -159,7 +159,7 @@ class TestMinimumChainWeight(unittest.TestCase):
         """ChainSyncer accepts peers whose reported chain weight meets minimum."""
         from messagechain.network.sync import ChainSyncer
         chain = Blockchain()
-        entities = [Entity.create(b"min_weight_test2")]
+        entities = [Entity.create(b"min_weight_test2".ljust(32, b"\x00"))]
         chain.initialize_genesis(entities[0])
 
         syncer = ChainSyncer(chain, lambda addr: None)

@@ -137,7 +137,16 @@ class ProofOfStake:
         if total == 0:
             return False  # post-bootstrap with zero stake — cannot meet threshold
 
-        # Attestations in a block vote for the parent
+        # Attestations in a block vote for the parent.
+        # SECURITY: we REQUIRE a public key to verify every attestation. If
+        # the caller has no public-key dict or the validator's key is absent,
+        # the attestation cannot be trusted and MUST NOT be counted. Earlier
+        # revisions silently skipped verification when keys were unavailable,
+        # which let an attacker forge attestations and cross the consensus
+        # threshold with unsigned votes.
+        if public_keys is None:
+            return False
+
         attested_stake = 0
         seen = set()
         for att in block.attestations:
@@ -145,10 +154,13 @@ class ProofOfStake:
                 continue  # skip duplicates
             seen.add(att.validator_id)
 
-            # Verify signature if public keys are available
-            if public_keys and att.validator_id in public_keys:
-                if not verify_attestation(att, public_keys[att.validator_id]):
-                    continue  # skip invalid attestation
+            # A validator's public key must be known AND the attestation
+            # signature must verify. Anything else is rejected.
+            pub = public_keys.get(att.validator_id)
+            if pub is None:
+                continue
+            if not verify_attestation(att, pub):
+                continue
 
             if att.validator_id in self.stakes:
                 attested_stake += self.stakes[att.validator_id]
