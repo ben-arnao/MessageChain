@@ -18,7 +18,7 @@ from messagechain.config import (
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_FEE, MIN_TIP, MAX_TXS_PER_BLOCK,
 )
-from tests import register_entity_for_test
+from tests import register_entity_for_test, pick_selected_proposer
 
 
 class TestBlockRewardFloor(unittest.TestCase):
@@ -369,9 +369,14 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
 
     def test_attestors_receive_rewards(self):
         """Attestors receive a share of the block reward."""
+        # Pick the deterministically-selected proposer for each block
+        candidates = [self.alice, self.bob, self.carol]
+
         # First block (no attestations possible yet)
-        block1 = self._make_block(self.alice, [])
-        self.chain.add_block(block1)
+        proposer1 = pick_selected_proposer(self.chain, candidates)
+        block1 = self._make_block(proposer1, [])
+        ok, reason = self.chain.add_block(block1)
+        self.assertTrue(ok, reason)
 
         bob_before = self.chain.supply.get_balance(self.bob.entity_id)
         carol_before = self.chain.supply.get_balance(self.carol.entity_id)
@@ -381,9 +386,10 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
         att_carol = create_attestation(self.carol, block1.block_hash, block1.header.block_number)
 
         # Block2 includes attestations — attestors should earn rewards
-        block2 = self._make_block(self.alice, [], attestations=[att_bob, att_carol])
-        success, _ = self.chain.add_block(block2)
-        self.assertTrue(success)
+        proposer2 = pick_selected_proposer(self.chain, candidates)
+        block2 = self._make_block(proposer2, [], attestations=[att_bob, att_carol])
+        success, reason = self.chain.add_block(block2)
+        self.assertTrue(success, reason)
 
         bob_after = self.chain.supply.get_balance(self.bob.entity_id)
         carol_after = self.chain.supply.get_balance(self.carol.entity_id)

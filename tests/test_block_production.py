@@ -261,5 +261,125 @@ class TestBootstrapThreshold(unittest.TestCase):
             messagechain.config.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = original
 
 
+# ─── Strict proposer validation in validate_block ───────────────────
+
+class TestStrictProposerValidation(unittest.TestCase):
+    """validate_block must reject a block whose proposer_id is not the
+    deterministically-selected one for the slot.
+
+    Without this check, any registered validator could claim to be the
+    proposer for any slot, making the round rotation fix inert — an
+    attacker with valid keys could steal blocks, censor honest proposers
+    by racing them, and defeat the RANDAO leaf-consumption cost."""
+
+    def test_wrong_proposer_rejected(self):
+        """A block proposed by a registered validator who isn't the
+        selected proposer must be rejected."""
+        chain, consensus, entities = _make_chain_with_validators(3)
+
+        latest = chain.get_latest_block()
+        selected_id = chain._selected_proposer_for_slot(latest, round_number=0)
+        self.assertIsNotNone(selected_id)
+
+        # Find a validator who is NOT the selected one
+        wrong_proposer = next(e for e in entities if e.entity_id != selected_id)
+
+        block = consensus.create_block(wrong_proposer, [], latest)
+        ok, reason = chain.add_block(block)
+        self.assertFalse(ok)
+        self.assertIn("Wrong proposer", reason)
+
+    def test_selected_proposer_accepted(self):
+        """A block proposed by the deterministically-selected proposer
+        must validate cleanly."""
+        from tests import pick_selected_proposer
+        chain, consensus, entities = _make_chain_with_validators(3)
+
+        proposer = pick_selected_proposer(chain, entities)
+        block = chain.propose_block(consensus, proposer, [])
+        ok, reason = chain.add_block(block)
+        self.assertTrue(ok, reason)
+
+    def test_round_rotation_allows_alternate_proposer(self):
+        """After rounds elapse, a *different* validator must be able to
+        propose. This is the liveness escape hatch: if the round-0 proposer
+        is offline, the round-1 proposer can step in once BLOCK_TIME_TARGET
+        seconds have elapsed past the slot start.
+
+        Checks that _selected_proposer_for_slot returns a different entity
+        at higher rounds when there's enough validator diversity."""
+        chain, consensus, entities = _make_chain_with_validators(5)
+        latest = chain.get_latest_block()
+
+        seen = set()
+        for r in range(10):
+            selected = chain._selected_proposer_for_slot(latest, round_number=r)
+            if selected:
+                seen.add(selected)
+        self.assertGreater(len(seen), 1,
+                           "round rotation must reach different validators with 5 staked")
+
+    def test_no_enforcement_in_bootstrap(self):
+        """When no one has staked, any registered proposer is allowed."""
+        entities = [
+            Entity.create(f"boot_{i}_key".encode().ljust(32, b"\x00"))
+            for i in range(3)
+        ]
+        chain = Blockchain()
+        chain.initialize_genesis(entities[0])
+        for e in entities[1:]:
+            register_entity_for_test(chain, e)
+        # NOT staking anyone → bootstrap mode, no enforcement
+        consensus = ProofOfStake()
+
+        # Any of the registered entities can propose (propose_block computes
+        # the correct state_root automatically).
+        for proposer in entities:
+            block = chain.propose_block(consensus, proposer, [])
+            ok, reason = chain.add_block(block)
+            self.assertTrue(ok, f"bootstrap must allow {proposer.entity_id.hex()[:8]}: {reason}")
+
+    def test_early_timestamp_rejected_with_enforcement_on(self):
+        """When ENFORCE_SLOT_TIMING is True, a block with a timestamp less
+        than BLOCK_TIME_TARGET after the parent must be rejected."""
+        original = messagechain.config.ENFORCE_SLOT_TIMING
+        try:
+            messagechain.config.ENFORCE_SLOT_TIMING = True
+            chain, consensus, entities = _make_chain_with_validators(1)
+            latest = chain.get_latest_block()
+            proposer = entities[0]  # only one staked, so always selected
+
+            # Propose with a timestamp just after the parent (way too early)
+            block = consensus.create_block(
+                proposer, [], latest,
+                state_root=chain.compute_post_state_root([], proposer.entity_id, 1),
+                timestamp=latest.header.timestamp + 1,
+            )
+            ok, reason = chain.add_block(block)
+            self.assertFalse(ok)
+            self.assertIn("too early", reason.lower())
+        finally:
+            messagechain.config.ENFORCE_SLOT_TIMING = original
+
+    def test_on_time_timestamp_accepted_with_enforcement_on(self):
+        """Block timestamped at parent + BLOCK_TIME_TARGET must be accepted."""
+        original = messagechain.config.ENFORCE_SLOT_TIMING
+        try:
+            messagechain.config.ENFORCE_SLOT_TIMING = True
+            chain, consensus, entities = _make_chain_with_validators(1)
+            latest = chain.get_latest_block()
+            proposer = entities[0]
+
+            block = consensus.create_block(
+                proposer, [], latest,
+                state_root=chain.compute_post_state_root([], proposer.entity_id, 1),
+                timestamp=latest.header.timestamp + BLOCK_TIME_TARGET + 1,
+            )
+            ok, reason = chain.add_block(block)
+            self.assertTrue(ok, reason)
+        finally:
+            messagechain.config.ENFORCE_SLOT_TIMING = original
+
+
 if __name__ == "__main__":
     unittest.main()

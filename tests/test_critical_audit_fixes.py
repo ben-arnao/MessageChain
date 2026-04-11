@@ -247,17 +247,19 @@ class TestWotsLeafTracking(unittest.TestCase):
         genesis = chain.get_latest_block()
         att = create_attestation(validator, genesis.block_hash, 0)
 
-        # Create a block that includes this attestation (with correct state root)
+        # The staked validator is the selected proposer for the next slot.
+        # Propose with them so strict proposer validation passes.
         pos = ProofOfStake()
-        pos.stakes[proposer.entity_id] = 1000
+        pos.stakes[validator.entity_id] = 1000
         state_root = chain.compute_post_state_root(
-            [], proposer.entity_id, 1, attestations=[att],
+            [], validator.entity_id, 1, attestations=[att],
         )
         block = pos.create_block(
-            proposer, [], genesis,
+            validator, [], genesis,
             state_root=state_root, attestations=[att],
         )
-        chain.add_block(block)
+        ok, reason = chain.add_block(block)
+        self.assertTrue(ok, reason)
 
         # The validator signed one attestation, so leaf count should include it
         leaves = chain.get_wots_leaves_used(validator.entity_id)

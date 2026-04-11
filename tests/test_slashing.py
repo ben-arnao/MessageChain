@@ -14,7 +14,7 @@ from messagechain.consensus.slashing import (
     verify_slashing_evidence,
 )
 from messagechain.config import SLASH_FINDER_REWARD_PCT
-from tests import register_entity_for_test
+from tests import register_entity_for_test, pick_selected_proposer
 
 
 def _make_conflicting_headers(proposer_entity, prev_block):
@@ -323,6 +323,11 @@ class TestSlashTransaction(unittest.TestCase):
 
     def test_slash_in_block(self):
         """Slash transactions included in blocks are applied correctly."""
+        # Stake carol too so strict proposer validation has a choice.
+        # With two staked validators, we use the deterministically-selected
+        # one as proposer, not the offender (alice).
+        self.chain.supply.stake(self.carol.entity_id, 1000)
+
         prev = self.chain.get_latest_block()
         header_a, header_b = _make_conflicting_headers(self.alice, prev)
 
@@ -339,36 +344,40 @@ class TestSlashTransaction(unittest.TestCase):
         prev = self.chain.get_latest_block()
         block_height = prev.header.block_number + 1
 
+        # Pick the deterministically-selected proposer
+        proposer_entity = pick_selected_proposer(self.chain, [self.alice, self.bob, self.carol])
+        proposer_id = proposer_entity.entity_id
+
         # Simulate state after slash tx + block reward (with EIP-1559 burn)
         sim_balances = dict(self.chain.supply.balances)
         sim_nonces = dict(self.chain.nonces)
         sim_staked = dict(self.chain.supply.staked)
         current_base_fee = self.chain.supply.base_fee
-        # Slash tx fee: bob pays fee, base_fee is burned, tip to carol (proposer)
+        # Slash tx fee: bob pays fee, base_fee is burned, tip to proposer
         tip = slash_tx.fee - current_base_fee
         sim_balances[slash_tx.submitter_id] -= slash_tx.fee
-        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + tip
+        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
         # Slash: alice stake (1000) -> 0, finder reward to bob
         slashed_amount = sim_staked.get(self.alice.entity_id, 0)
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         sim_staked[self.alice.entity_id] = 0
         sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
         # Block reward to proposer (no attestors)
-        # After slashing the only staker, all stakes are 0 — bootstrap mode
-        # means no cap on proposer reward
         from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         reward = self.chain.supply.calculate_block_reward(block_height)
         is_bootstrap = not any(s > 0 for s in sim_staked.values())
         effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
         proposer_reward = min(reward, effective_cap)
         treasury_excess = reward - proposer_reward
-        sim_balances[self.carol.entity_id] = sim_balances.get(self.carol.entity_id, 0) + proposer_reward
+        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
         if treasury_excess > 0:
             sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
         state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)
 
-        block = consensus.create_block(self.carol, [], prev, state_root=state_root)
+        block = consensus.create_block(proposer_entity, [], prev, state_root=state_root)
         block.slash_transactions = [slash_tx]
+        # Recompute hash after modifying slash_transactions
+        block.block_hash = block._compute_hash()
 
         success, msg = self.chain.add_block(block)
         self.assertTrue(success, msg)

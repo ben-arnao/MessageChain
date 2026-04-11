@@ -108,6 +108,14 @@ MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 # Set to 1 in tests via tests/__init__.py for backward compatibility.
 MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 4
 
+# Slot-timing enforcement — if True, validate_block rejects blocks whose
+# timestamp is less than BLOCK_TIME_TARGET seconds after the parent's.
+# This prevents a malicious proposer from racing ahead of their slot to
+# claim round 0 with a near-zero timestamp gap. Disabled in tests
+# (tests/__init__.py) because existing fixtures produce blocks rapidly
+# with real wall-clock timestamps.
+ENFORCE_SLOT_TIMING = True
+
 # Network
 DEFAULT_PORT = 9333
 SEED_NODES = [("127.0.0.1", 9333)]

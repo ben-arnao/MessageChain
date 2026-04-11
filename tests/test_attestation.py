@@ -13,7 +13,7 @@ from messagechain.consensus.attestation import (
     create_attestation,
     verify_attestation,
 )
-from tests import register_entity_for_test
+from tests import register_entity_for_test, pick_selected_proposer
 from messagechain.consensus.slashing import (
     AttestationSlashingEvidence,
     SlashTransaction,
@@ -284,8 +284,11 @@ class TestFinality(unittest.TestCase):
 
     def test_block_finalized_with_sufficient_attestations(self):
         """Block becomes finalized when 2/3+ stake attests."""
-        block1 = self.chain.propose_block(self.consensus, self.alice, [])
-        self.chain.add_block(block1)
+        all_validators = [self.alice, self.bob, self.carol]
+        proposer1 = pick_selected_proposer(self.chain, all_validators)
+        block1 = self.chain.propose_block(self.consensus, proposer1, [])
+        ok, reason = self.chain.add_block(block1)
+        self.assertTrue(ok, reason)
 
         # All 3 validators attest (3000/3000 = 1.0 >= 0.67)
         # Note: 2/3 = 0.6667 < 0.67 threshold, so need all 3
@@ -293,24 +296,29 @@ class TestFinality(unittest.TestCase):
         att_bob = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att_carol = create_attestation(self.carol, block1.block_hash, block1.header.block_number)
 
+        proposer2 = pick_selected_proposer(self.chain, all_validators)
         block2 = self.chain.propose_block(
-            self.consensus, self.alice, [], attestations=[att_alice, att_bob, att_carol]
+            self.consensus, proposer2, [], attestations=[att_alice, att_bob, att_carol]
         )
-        self.chain.add_block(block2)
+        ok, reason = self.chain.add_block(block2)
+        self.assertTrue(ok, reason)
 
         self.assertTrue(self.chain.finality.is_finalized(block1.block_hash))
 
     def test_block_not_finalized_with_insufficient_attestations(self):
         """Block stays unfinalized with less than 2/3 attestation."""
+        all_validators = [self.alice, self.bob, self.carol]
         prev = self.chain.get_latest_block()
-        block1 = self.consensus.create_block(self.alice, [], prev)
+        proposer1 = pick_selected_proposer(self.chain, all_validators)
+        block1 = self.consensus.create_block(proposer1, [], prev)
         self.chain.add_block(block1)
 
         # Only 1 of 3 validators attests (1000/3000 = 0.33)
         att_bob = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
 
+        proposer2 = pick_selected_proposer(self.chain, all_validators)
         block2 = self.consensus.create_block(
-            self.alice, [], block1, attestations=[att_bob]
+            proposer2, [], block1, attestations=[att_bob]
         )
         self.chain.add_block(block2)
 

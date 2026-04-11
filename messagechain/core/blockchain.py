@@ -327,6 +327,59 @@ class Blockchain:
     def get_latest_block(self) -> Block | None:
         return self.chain[-1] if self.chain else None
 
+    def _selected_proposer_for_slot(
+        self, parent: Block, round_number: int
+    ) -> bytes | None:
+        """Compute the selected proposer for the slot after `parent` at
+        round `round_number`, using the chain's own supply.staked as the
+        authoritative stake state.
+
+        Returns None when no validator meets the graduated minimum stake
+        — that indicates bootstrap mode, and validate_block skips the
+        proposer-match check so any registered entity may propose.
+
+        This mirrors ProofOfStake.select_proposer but lives on Blockchain
+        so validate_block can enforce proposer correctness without taking
+        a consensus parameter. Keeping it here is a small duplication,
+        but the upside is that consensus and validate_block agree on the
+        selection algorithm byte-for-byte.
+        """
+        import struct
+        from messagechain.consensus.pos import graduated_min_stake
+
+        height = parent.header.block_number + 1
+        min_stake = graduated_min_stake(height)
+        # Slashed validators already have staked[eid] = 0, so the
+        # min_stake filter excludes them implicitly.
+        stakes = {
+            eid: amt
+            for eid, amt in self.supply.staked.items()
+            if amt >= min_stake
+        }
+        if not stakes:
+            return None  # bootstrap mode — no enforcement
+
+        validators = sorted(stakes.items(), key=lambda x: x[0])
+        total = sum(s for _, s in validators)
+        if total == 0:
+            return None
+
+        seed_input = (
+            parent.block_hash
+            + parent.header.randao_mix
+            + struct.pack(">I", round_number)
+            + b"proposer_selection"
+        )
+        seed = _hash(seed_input)
+        rand_value = int.from_bytes(seed, "big") % total
+
+        cumulative = 0
+        for entity_id, stake in validators:
+            cumulative += stake
+            if rand_value < cumulative:
+                return entity_id
+        return validators[-1][0]
+
     def get_block(self, index: int) -> Block | None:
         if 0 <= index < len(self.chain):
             return self.chain[index]
@@ -614,12 +667,20 @@ class Blockchain:
                 sim_balances[att_id] = sim_balances.get(att_id, 0) + att_reward
                 distributed += att_reward
 
-            # Apply reward cap to proposer
+            # Apply reward cap to proposer. Must mirror mint_block_reward's
+            # claw-back path exactly, otherwise the committed state_root
+            # diverges from the actual post-application state. The claw-back
+            # removes the proposer's attestor share from their balance, then
+            # credits them the full effective_cap as proposer_share. The
+            # earlier simpler formulation (leave the attestor share in place
+            # and reduce proposer_share) produced different sim_balances
+            # when proposer == attestor.
             proposer_att_reward = attestor_rewards.get(proposer_id, 0)
             proposer_total = proposer_share + proposer_att_reward
             if proposer_total > effective_cap:
                 treasury_excess = proposer_total - effective_cap
-                proposer_share = max(0, effective_cap - proposer_att_reward)
+                sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) - proposer_att_reward
+                proposer_share = effective_cap
                 sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_share
@@ -800,6 +861,44 @@ class Blockchain:
         )
         if block.header.randao_mix != expected_mix:
             return False, "Invalid randao_mix"
+
+        # Strict proposer enforcement: outside bootstrap mode, the block's
+        # proposer_id must match the deterministically-selected proposer
+        # for the slot+round indicated by the block's timestamp.
+        #
+        # Without this check, any registered validator could claim to be
+        # the proposer for any slot — stealing block rewards, censoring
+        # honest proposers via race conditions, and defeating the round-
+        # rotation liveness fix. See commit message of the block-production
+        # fix for background.
+        import messagechain.config as _cfg
+        from messagechain.config import BLOCK_TIME_TARGET
+        selected_round_0 = self._selected_proposer_for_slot(latest, round_number=0)
+        if selected_round_0 is not None:
+            # Post-bootstrap: compute which round the block claims to be for,
+            # based on its timestamp gap from the parent.
+            ts_gap = block.header.timestamp - latest.header.timestamp
+            if ts_gap < BLOCK_TIME_TARGET:
+                # Block produced before the next slot window opens.
+                # In strict mode this is illegal; in tests the round is
+                # simply pinned to 0 so the proposer match still enforces.
+                if _cfg.ENFORCE_SLOT_TIMING:
+                    return False, (
+                        f"Block timestamp too early: gap {ts_gap:.0f}s "
+                        f"< BLOCK_TIME_TARGET {BLOCK_TIME_TARGET}s"
+                    )
+                round_number = 0
+            else:
+                round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
+
+            expected_proposer = self._selected_proposer_for_slot(latest, round_number)
+            if expected_proposer != block.header.proposer_id:
+                return False, (
+                    f"Wrong proposer for slot "
+                    f"(round {round_number}, expected "
+                    f"{expected_proposer.hex()[:16] if expected_proposer else 'None'}, "
+                    f"got {block.header.proposer_id.hex()[:16]})"
+                )
 
         # Validate all transactions, tracking nonce and balance increments
         # within the block to prevent duplicate-nonce / double-spend attacks.
