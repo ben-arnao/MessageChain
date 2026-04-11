@@ -100,6 +100,14 @@ CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fract
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 
+# Minimum number of distinct validators needed to exit bootstrap mode.
+# Bootstrap mode is permissive (allows any node to propose, skips
+# attestation thresholds). The chain stays in bootstrap until at least
+# this many validators have registered, so we never end up with a
+# 1-validator post-bootstrap chain that has a single point of failure.
+# Set to 1 in tests via tests/__init__.py for backward compatibility.
+MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 4
+
 # Network
 DEFAULT_PORT = 9333
 SEED_NODES = [("127.0.0.1", 9333)]

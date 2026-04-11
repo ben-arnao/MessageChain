@@ -50,18 +50,29 @@ class ProofOfStake:
 
     @property
     def is_bootstrap_mode(self) -> bool:
-        """Bootstrap mode is active only before any validator has ever staked."""
+        """Bootstrap mode: permissive proposer + attestation rules.
+
+        Stays active until at least MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+        distinct validators are registered, so we never end up with a
+        1-validator post-bootstrap chain that has a single point of
+        failure for both liveness and finality. Once exited, the flag
+        is one-way: we never re-enter bootstrap even if validators leave.
+        """
         if self._bootstrap_ended:
             return False
-        return len(self.stakes) == 0
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+        return len(self.stakes) < MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
 
     def register_validator(self, entity_id: bytes, stake_amount: int, block_height: int = 0) -> bool:
         """Register a validator with their stake."""
         if stake_amount < graduated_min_stake(block_height):
             return False
         self.stakes[entity_id] = self.stakes.get(entity_id, 0) + stake_amount
-        # Once any validator registers, bootstrap mode is permanently off
-        self._bootstrap_ended = True
+        # Bootstrap mode ends only once we have enough distinct validators
+        # for the network to survive a single failure.
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+        if len(self.stakes) >= MIN_VALIDATORS_TO_EXIT_BOOTSTRAP:
+            self._bootstrap_ended = True
         return True
 
     def remove_validator(self, entity_id: bytes):
@@ -75,17 +86,25 @@ class ProofOfStake:
     def validator_count(self) -> int:
         return len(self.stakes)
 
-    def select_proposer(self, prev_block_hash: bytes, randao_mix: bytes | None = None) -> bytes | None:
+    def select_proposer(
+        self,
+        prev_block_hash: bytes,
+        randao_mix: bytes | None = None,
+        round_number: int = 0,
+    ) -> bytes | None:
         """
-        Deterministically select the next block proposer.
+        Deterministically select the block proposer for a given round.
 
-        Uses the previous block hash (and optional RANDAO mix) as a seed,
-        weighted by stake. Every node computes the same result for the same
-        chain state.
+        Uses the previous block hash, optional RANDAO mix, and the round
+        number as the seed. Every node computes the same result for the
+        same chain state and round.
 
-        When randao_mix is provided, it is mixed into the seed to prevent
-        proposer grinding attacks (where a proposer manipulates block contents
-        to influence the next selection).
+        round_number rotates the proposer when an earlier round timed out
+        without producing a block. Round 0 is the primary proposer; round
+        N is the fallback after the previous N proposers failed to produce
+        within their slot window. This is the network's liveness escape
+        hatch — without it, a single offline validator stalls the chain
+        forever.
         """
         if not self.stakes:
             return None
@@ -96,10 +115,11 @@ class ProofOfStake:
         if total == 0:
             return None  # all stakes are zero — no valid proposer
 
-        # Build seed from prev_block_hash and optional RANDAO mix
+        # Build seed from prev_block_hash, optional RANDAO mix, and round number
         seed_input = prev_block_hash
         if randao_mix is not None:
-            seed_input = prev_block_hash + randao_mix
+            seed_input = seed_input + randao_mix
+        seed_input = seed_input + struct.pack(">I", round_number)
         seed = _hash(seed_input + b"proposer_selection")
         rand_value = int.from_bytes(seed, "big") % total
 
@@ -112,9 +132,15 @@ class ProofOfStake:
 
         return validators[-1][0]  # fallback
 
-    def validate_proposer(self, entity_id: bytes, prev_block_hash: bytes) -> bool:
-        """Check if entity_id is the legitimate proposer for this round."""
-        expected = self.select_proposer(prev_block_hash)
+    def validate_proposer(
+        self,
+        entity_id: bytes,
+        prev_block_hash: bytes,
+        randao_mix: bytes | None = None,
+        round_number: int = 0,
+    ) -> bool:
+        """Check if entity_id is the legitimate proposer for the given round."""
+        expected = self.select_proposer(prev_block_hash, randao_mix=randao_mix, round_number=round_number)
         return expected == entity_id
 
     def validate_block_attestations(
@@ -178,6 +204,7 @@ class ProofOfStake:
         state_root: bytes = b"\x00" * 32,
         attestations: list[Attestation] | None = None,
         transfer_transactions: list | None = None,
+        timestamp: float | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -203,14 +230,24 @@ class ProofOfStake:
             block_number=prev_block.header.block_number + 1,
             prev_hash=prev_block.block_hash,
             merkle_root=merkle_root,
-            timestamp=time.time(),
+            timestamp=time.time() if timestamp is None else timestamp,
             proposer_id=proposer_entity.entity_id,
             state_root=state_root,
         )
 
-        # Proposer signs the block header
+        # Proposer signs the block header. randao_mix is excluded from
+        # signable_data to break a circular dependency (the mix is derived
+        # from this very signature) but is bound to the block via _compute_hash.
         header_hash = _hash(header.signable_data())
         header.proposer_signature = proposer_entity.keypair.sign(header_hash)
+
+        # Derive RANDAO mix from parent.randao_mix + proposer signature.
+        # Each grinding attempt requires a new signature → consumes a fresh
+        # WOTS+ leaf, observable on chain via proposer_sig_counts.
+        from messagechain.consensus.randao import derive_randao_mix
+        header.randao_mix = derive_randao_mix(
+            prev_block.header.randao_mix, header.proposer_signature
+        )
 
         block = Block(
             header=header,

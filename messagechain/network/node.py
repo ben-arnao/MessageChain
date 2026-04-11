@@ -19,7 +19,7 @@ import logging
 import time
 from collections import OrderedDict
 from messagechain.config import (
-    DEFAULT_PORT, SEED_NODES, MAX_PEERS, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK,
+    DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE,
 )
 from messagechain.identity.identity import Entity
@@ -688,43 +688,63 @@ class Node:
         await self._relay_tx_inv([tx_hash_hex])
 
     async def _block_production_loop(self):
-        """Periodically propose blocks if selected as proposer."""
+        """Slot-aligned block production with round-based proposer rotation.
+
+        Uses the shared block_producer helper so timing/rotation/RANDAO
+        logic stays in lockstep with server.py's loop. See
+        messagechain/consensus/block_producer.py for the timing model.
+        """
+        from messagechain.consensus import block_producer
+
+        # Small startup delay so node finishes init before first attempt
+        await asyncio.sleep(1)
+
         while self._running:
-            await asyncio.sleep(BLOCK_TIME_TARGET)
+            try:
+                await self._try_produce_block()
+            except Exception:
+                logger.exception("Block production iteration failed")
 
-            # Don't produce blocks while syncing
-            if self.syncer.is_syncing:
-                continue
+            sleep_seconds = block_producer.next_wake_seconds(self.blockchain)
+            await asyncio.sleep(sleep_seconds)
 
-            if self.mempool.size == 0:
-                continue
+    async def _try_produce_block(self):
+        """One iteration of block production. Build and broadcast if we
+        are the selected proposer for the current slot+round."""
+        from messagechain.consensus import block_producer
 
-            latest = self.blockchain.get_latest_block()
-            if latest is None:
-                continue
+        # Don't produce blocks while syncing
+        if self.syncer.is_syncing:
+            return
 
-            # Check if we're the selected proposer
-            proposer = self.consensus.select_proposer(latest.block_hash)
-            if proposer is None or proposer != self.entity.entity_id:
-                # If no validators registered, allow any node to propose (bootstrap)
-                if self.consensus.validator_count > 0:
-                    continue
+        ok, round_number, _reason = block_producer.should_propose(
+            self.blockchain, self.consensus, self.entity.entity_id,
+        )
+        if not ok:
+            return
 
-            # Create and broadcast block (with correct post-state root)
-            txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-            block = self.blockchain.propose_block(self.consensus, self.entity, txs)
+        # Build and broadcast block. Empty mempool is fine — empty blocks
+        # serve as heartbeat and carry attestations for the parent.
+        txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
+        block = self.blockchain.propose_block(self.consensus, self.entity, txs)
 
-            success, reason = self.blockchain.add_block(block)
-            if success:
+        success, reason = self.blockchain.add_block(block)
+        if success:
+            if txs:
                 self.mempool.remove_transactions([tx.tx_hash for tx in txs])
-                logger.info(f"Proposed block #{block.header.block_number} with {len(txs)} txs")
+            logger.info(
+                f"Proposed block #{block.header.block_number} with {len(txs)} txs "
+                f"(round {round_number})"
+            )
 
-                msg = NetworkMessage(
-                    msg_type=MessageType.ANNOUNCE_BLOCK,
-                    payload=block.serialize(),
-                    sender_id=self.entity.entity_id_hex,
-                )
-                await self._broadcast(msg)
+            msg = NetworkMessage(
+                msg_type=MessageType.ANNOUNCE_BLOCK,
+                payload=block.serialize(),
+                sender_id=self.entity.entity_id_hex,
+            )
+            await self._broadcast(msg)
+        else:
+            logger.warning(f"Failed to add proposed block: {reason}")
 
     async def _sync_loop(self):
         """Periodically check if we need to sync and handle stale syncs."""

@@ -96,9 +96,14 @@ class BlockHeader:
     timestamp: float
     proposer_id: bytes
     state_root: bytes = b"\x00" * 32  # Merkle root of account state
+    randao_mix: bytes = b"\x00" * 32  # accumulated RANDAO entropy (post-sign derived)
     proposer_signature: Signature | None = None
 
     def signable_data(self) -> bytes:
+        # NOTE: randao_mix is intentionally NOT included here. It is derived
+        # from the proposer signature (which is itself over signable_data),
+        # so including it would create a circular dependency. The randao_mix
+        # is bound to the block via _compute_hash() instead.
         return (
             struct.pack(">I", self.version)
             + struct.pack(">Q", self.block_number)
@@ -118,6 +123,7 @@ class BlockHeader:
             "state_root": self.state_root.hex(),
             "timestamp": self.timestamp,
             "proposer_id": self.proposer_id.hex(),
+            "randao_mix": self.randao_mix.hex(),
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
         }
 
@@ -131,6 +137,7 @@ class BlockHeader:
             timestamp=data["timestamp"],
             proposer_id=bytes.fromhex(data["proposer_id"]),
             state_root=bytes.fromhex(data["state_root"]) if data.get("state_root") else b"\x00" * 32,
+            randao_mix=bytes.fromhex(data["randao_mix"]) if data.get("randao_mix") else b"\x00" * 32,
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
         )
 
@@ -150,7 +157,10 @@ class Block:
             self.block_hash = self._compute_hash()
 
     def _compute_hash(self) -> bytes:
-        return _hash(self.header.signable_data())
+        # Bind both signable_data and randao_mix into block_hash. randao_mix
+        # is derived from the proposer signature post-signing, so it cannot
+        # live in signable_data, but it must still be tamper-evident.
+        return _hash(self.header.signable_data() + self.header.randao_mix)
 
     def serialize(self) -> dict:
         result = {

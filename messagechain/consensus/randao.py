@@ -56,6 +56,25 @@ class RANDAOMix:
         return cls(initial_mix=bytes.fromhex(data["current_mix"]))
 
 
+def derive_randao_mix(parent_mix: bytes, proposer_signature) -> bytes:
+    """Derive a block's randao_mix from its parent's mix and the proposer signature.
+
+    The proposer signature is over the block header, so each distinct block
+    candidate produces a distinct signature, which produces a distinct mix.
+    Grinding the mix therefore requires consuming a fresh WOTS+ leaf for
+    every attempt — visible on chain via proposer_sig_counts.
+
+    The signature's canonical_bytes() representation is hashed first
+    (domain separation against accidental collisions with bare bytes).
+    """
+    sig_bytes = proposer_signature.canonical_bytes()
+    reveal = _hash(b"randao_reveal" + sig_bytes)
+    # XOR + re-hash to prevent last-proposer bias (same construction as
+    # RANDAOMix.update — kept consistent for the existing test suite).
+    xored = bytes(a ^ b for a, b in zip(parent_mix, reveal))
+    return _hash(b"randao_mix" + xored)
+
+
 def randao_select_proposer(
     stakes: dict[bytes, int],
     prev_block_hash: bytes,

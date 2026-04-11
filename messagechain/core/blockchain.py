@@ -777,6 +777,16 @@ class Blockchain:
         if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
             return False, "Invalid proposer signature"
 
+        # Verify randao_mix is correctly derived from the parent's mix and
+        # this block's proposer signature. This binds the mix to the
+        # signature, so a malicious proposer cannot supply an arbitrary mix.
+        from messagechain.consensus.randao import derive_randao_mix
+        expected_mix = derive_randao_mix(
+            latest.header.randao_mix, block.header.proposer_signature
+        )
+        if block.header.randao_mix != expected_mix:
+            return False, "Invalid randao_mix"
+
         # Validate all transactions, tracking nonce and balance increments
         # within the block to prevent duplicate-nonce / double-spend attacks.
         pending_nonces: dict[bytes, int] = {}

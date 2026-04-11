@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 
 from messagechain.config import (
-    DEFAULT_PORT, BLOCK_TIME_TARGET, MAX_TXS_PER_BLOCK,
+    DEFAULT_PORT, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE,
 )
 from messagechain.identity.identity import Entity
@@ -606,63 +606,69 @@ class Server:
     # ── Block Production ────────────────────────────────────────────
 
     async def _block_production_loop(self):
-        """Produce blocks on a timer. Fees + rewards go to the configured wallet."""
+        """Slot-aligned block production. Fees + rewards go to the configured wallet.
+
+        Shares timing/rotation/RANDAO logic with messagechain/network/node.py
+        via messagechain.consensus.block_producer so the two implementations
+        cannot drift.
+        """
+        from messagechain.consensus import block_producer
+
+        await asyncio.sleep(1)
+
         while self._running:
-            await asyncio.sleep(BLOCK_TIME_TARGET)
+            try:
+                await self._try_produce_block()
+            except Exception:
+                logger.exception("Block production iteration failed")
 
-            # Don't produce blocks while syncing
-            if self.syncer.is_syncing:
-                continue
+            sleep_seconds = block_producer.next_wake_seconds(self.blockchain)
+            await asyncio.sleep(sleep_seconds)
 
-            if self.mempool.size == 0:
-                continue
+    async def _try_produce_block(self):
+        """One iteration of block production. Build and broadcast if we
+        are the selected proposer for the current slot+round."""
+        from messagechain.consensus import block_producer
 
-            # Need a full entity (with keypair) to sign blocks
-            if self.wallet_entity is None or self.wallet_id not in self.blockchain.public_keys:
-                continue
+        if self.syncer.is_syncing:
+            return
 
-            latest = self.blockchain.get_latest_block()
-            if latest is None:
-                continue
+        # Need a full entity (with keypair) to sign blocks
+        if self.wallet_entity is None or self.wallet_id not in self.blockchain.public_keys:
+            return
 
-            # Check if we're the proposer (or bootstrap mode)
-            proposer = self.consensus.select_proposer(latest.block_hash)
-            if proposer is not None and proposer != self.wallet_id:
-                if self.consensus.validator_count > 0:
-                    continue
+        ok, round_number, _reason = block_producer.should_propose(
+            self.blockchain, self.consensus, self.wallet_id,
+        )
+        if not ok:
+            return
 
-            # Build block from highest-fee transactions
-            all_pending = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-            if not all_pending:
-                continue
+        # Build the block. Empty mempool is fine — empty blocks carry
+        # attestations and advance block-denominated timers.
+        all_pending = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
+        txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
+        transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
 
-            # Separate message txs from transfer txs
-            txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
-            transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
+        block = self.blockchain.propose_block(
+            self.consensus, self.wallet_entity, txs,
+            transfer_transactions=transfer_txs,
+        )
 
-            # Compute post-state root (state AFTER applying fees + reward)
-            block_height = latest.header.block_number + 1
-            state_root = self.blockchain.compute_post_state_root(
-                txs, self.wallet_id, block_height,
-                transfer_transactions=transfer_txs,
-            )
-            block = self.consensus.create_block(
-                self.wallet_entity, txs, latest, state_root=state_root,
-                transfer_transactions=transfer_txs,
-            )
-
-            success, reason = self.blockchain.add_block(block)
-            if success:
+        success, reason = self.blockchain.add_block(block)
+        if success:
+            if all_pending:
                 self.mempool.remove_transactions([tx.tx_hash for tx in all_pending])
-                total_fees = sum(tx.fee for tx in all_pending)
-                balance = self.blockchain.supply.get_balance(self.wallet_id)
-                logger.info(
-                    f"Block #{block.header.block_number} | "
-                    f"{len(txs)} txs | fees: {total_fees} | "
-                    f"reward: {self.blockchain.supply.calculate_block_reward(block.header.block_number)} | "
-                    f"wallet balance: {balance}"
-                )
-                await self._broadcast_block(block)
+            total_fees = sum(tx.fee for tx in all_pending)
+            balance = self.blockchain.supply.get_balance(self.wallet_id)
+            logger.info(
+                f"Block #{block.header.block_number} | "
+                f"{len(txs)} txs | fees: {total_fees} | round: {round_number} | "
+                f"reward: {self.blockchain.supply.calculate_block_reward(block.header.block_number)} | "
+                f"wallet balance: {balance}"
+            )
+            await self._broadcast_block(block)
+        else:
+            logger.warning(f"Failed to add proposed block: {reason}")
 
     # ── Sync Loop ────────────────────────────────────────────────
 

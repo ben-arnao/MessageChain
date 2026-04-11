@@ -32,6 +32,7 @@ def _make_entity(name: str) -> Entity:
 
 def _make_signed_block(proposer, prev_block, transactions, blockchain):
     """Helper to create a properly signed block."""
+    from messagechain.consensus.randao import derive_randao_mix
     tx_hashes = [tx.tx_hash for tx in transactions]
     merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -46,6 +47,7 @@ def _make_signed_block(proposer, prev_block, transactions, blockchain):
     )
     header_hash = _hash(header.signable_data())
     header.proposer_signature = proposer.keypair.sign(header_hash)
+    header.randao_mix = derive_randao_mix(prev_block.header.randao_mix, header.proposer_signature)
 
     block = Block(header=header, transactions=transactions, attestations=[])
     block.block_hash = block._compute_hash()
@@ -319,6 +321,7 @@ class TestStateRootBypass(unittest.TestCase):
         merkle_root = compute_merkle_root(tx_hashes)
 
         # Use a garbage state root (non-zero, so it will be validated)
+        from messagechain.consensus.randao import derive_randao_mix
         header = BlockHeader(
             version=1,
             block_number=prev.header.block_number + 1,
@@ -330,6 +333,7 @@ class TestStateRootBypass(unittest.TestCase):
         )
         header_hash = _hash(header.signable_data())
         header.proposer_signature = self.proposer.keypair.sign(header_hash)
+        header.randao_mix = derive_randao_mix(prev.header.randao_mix, header.proposer_signature)
 
         block = Block(header=header, transactions=[tx], attestations=[])
         block.block_hash = block._compute_hash()
@@ -355,6 +359,7 @@ class TestStateRootBypass(unittest.TestCase):
             [tx], proposer_id, block_height,
         )
 
+        from messagechain.consensus.randao import derive_randao_mix
         header = BlockHeader(
             version=1,
             block_number=block_height,
@@ -366,6 +371,7 @@ class TestStateRootBypass(unittest.TestCase):
         )
         header_hash = _hash(header.signable_data())
         header.proposer_signature = self.proposer.keypair.sign(header_hash)
+        header.randao_mix = derive_randao_mix(prev.header.randao_mix, header.proposer_signature)
 
         block = Block(header=header, transactions=[tx], attestations=[])
         block.block_hash = block._compute_hash()
