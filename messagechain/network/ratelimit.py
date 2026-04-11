@@ -18,6 +18,10 @@ RATE_TX = (10, 50)          # 10 tx/sec, burst up to 50
 RATE_BLOCK_REQ = (2, 10)    # 2 block requests/sec, burst up to 10
 RATE_HEADERS_REQ = (2, 10)  # 2 header requests/sec, burst up to 10
 RATE_GENERAL = (30, 100)    # 30 msg/sec, burst up to 100
+# ADDR / PEER_LIST — matches Bitcoin Core's ~0.1/s average with a
+# small burst allowance. Strict because an attacker who can flood
+# address gossip can dominate our addrman and set up eclipse attacks.
+RATE_ADDR = (0.1, 10)       # 0.1 msg/sec, burst up to 10
 
 
 @dataclass
@@ -62,6 +66,7 @@ class PeerRateLimiter:
                 "block_req": TokenBucket(rate=RATE_BLOCK_REQ[0], max_tokens=RATE_BLOCK_REQ[1]),
                 "headers_req": TokenBucket(rate=RATE_HEADERS_REQ[0], max_tokens=RATE_HEADERS_REQ[1]),
                 "general": TokenBucket(rate=RATE_GENERAL[0], max_tokens=RATE_GENERAL[1]),
+                "addr": TokenBucket(rate=RATE_ADDR[0], max_tokens=RATE_ADDR[1]),
             }
 
     def check(self, address: str, category: str) -> bool:

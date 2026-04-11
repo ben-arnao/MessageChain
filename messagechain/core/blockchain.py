@@ -645,6 +645,13 @@ class Blockchain:
 
         Convenience method that computes the state root automatically,
         ensuring every block commits to the correct post-application state.
+
+        Chooses a timestamp strictly greater than the current Median Time
+        Past, as required by the BIP 113 check in validate_block. This
+        prevents a race on fast machines where the proposer's wall-clock
+        `time.time()` happens to equal the MTP (particularly when blocks
+        are produced rapidly in tests), which would otherwise make the
+        freshly-signed block fail its own validation.
         """
         prev = self.get_latest_block()
         block_height = prev.header.block_number + 1
@@ -653,10 +660,17 @@ class Blockchain:
             transfer_transactions=transfer_transactions,
             attestations=attestations,
         )
+        mtp = self.get_median_time_past()
+        # A small epsilon greater than the minimum float resolution the
+        # timestamp will be serialized at. Microsecond granularity is
+        # plenty — real block production is on the order of seconds.
+        now = _time.time()
+        timestamp = now if now > mtp else mtp + 1e-6
         return consensus.create_block(
             proposer_entity, transactions, prev,
             state_root=state_root, attestations=attestations,
             transfer_transactions=transfer_transactions,
+            timestamp=timestamp,
         )
 
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:

@@ -16,11 +16,13 @@ Now supports:
 
 import asyncio
 import logging
+import os
 import time
 from collections import OrderedDict
 from messagechain.config import (
     DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
-    SEEN_TX_CACHE_SIZE,
+    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
+    OUTBOUND_BLOCK_RELAY_ONLY_SLOTS, OUTBOUND_FULL_RELAY_SLOTS,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -31,7 +33,9 @@ from messagechain.consensus.pos import ProofOfStake
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message
 )
-from messagechain.network.peer import Peer
+from messagechain.network.peer import Peer, ConnectionType
+from messagechain.network.addrman import AddressManager
+from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
 from messagechain.consensus.attestation import Attestation, verify_attestation
 from messagechain.consensus.slashing import (
@@ -54,10 +58,11 @@ class Node:
 
     def __init__(self, entity: Entity, port: int = DEFAULT_PORT,
                  seed_nodes: list[tuple[str, int]] | None = None,
-                 db=None):
+                 db=None, data_dir: str | None = None):
         self.entity = entity
         self.port = port
         self.seed_nodes = seed_nodes or SEED_NODES
+        self.data_dir = data_dir
         self.blockchain = Blockchain(db=db)
         self.mempool = Mempool()
         self.consensus = ProofOfStake()
@@ -65,15 +70,65 @@ class Node:
         self._server = None
         self._running = False
 
-        # IBD / sync
-        self.syncer = ChainSyncer(self.blockchain, self._get_peer_writer)
-
-        # Network protection
+        # Network protection — must exist before syncer so the offense
+        # callback can reference ban_manager.
         self.ban_manager = PeerBanManager()
         self.rate_limiter = PeerRateLimiter()
 
+        # Sybil-resistant address manager (formerly dead code — now wired)
+        self.addrman = AddressManager()
+
+        # Persistent anchor store — reloaded at startup, saved at shutdown.
+        # Anchors survive node restarts to defeat eclipse-on-reboot attacks.
+        anchor_path = (
+            os.path.join(data_dir, "anchors.json")
+            if data_dir
+            else os.path.join(os.getcwd(), "anchors.json")
+        )
+        self.anchor_store = AnchorStore(anchor_path)
+
+        # IBD / sync — receives trusted checkpoints + a misbehavior callback
+        # so checkpoint violations and stalls are actually penalized.
+        self.syncer = ChainSyncer(
+            self.blockchain,
+            self._get_peer_writer,
+            trusted_checkpoints=list(TRUSTED_CHECKPOINTS),
+            on_peer_offense=self._on_sync_offense,
+        )
+
         # inv/getdata: track recently seen tx hashes (avoid re-requesting)
         self._seen_txs: OrderedDict = OrderedDict()
+
+    def _on_sync_offense(self, peer_address: str, points: int, reason: str):
+        """Callback invoked by ChainSyncer for sync-time misbehavior."""
+        self.ban_manager.record_offense(peer_address, points, reason)
+
+    def _current_cumulative_weight(self) -> int:
+        """Our node's best-tip cumulative stake weight, for handshakes."""
+        best = self.blockchain.fork_choice.get_best_tip()
+        return best[2] if best else 0
+
+    def _next_connection_type(self) -> ConnectionType:
+        """Decide the ConnectionType for the next outbound slot.
+
+        Mixes block-relay-only slots with full-relay slots so that a partial
+        eclipse can't block our view of blocks. Block-relay-only peers do
+        not relay transactions, which also defeats topology inference via
+        tx-relay timing analysis (BTC PR #15759).
+        """
+        full_relay_count = sum(
+            1 for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.FULL_RELAY
+        )
+        block_only_count = sum(
+            1 for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.BLOCK_RELAY_ONLY
+        )
+        if full_relay_count < OUTBOUND_FULL_RELAY_SLOTS:
+            return ConnectionType.FULL_RELAY
+        if block_only_count < OUTBOUND_BLOCK_RELAY_ONLY_SLOTS:
+            return ConnectionType.BLOCK_RELAY_ONLY
+        return ConnectionType.FULL_RELAY
 
     def _track_seen_tx(self, tx_hash_hex: str):
         """Mark a tx hash as seen (LRU bounded)."""
@@ -110,6 +165,15 @@ class Node:
         self._running = True
         logger.info(f"Listening on port {self.port}")
 
+        # Reconnect to anchor peers from last session FIRST — this is the
+        # restart-time eclipse defense. Anchors are known-good peers we
+        # previously held block-relay-only connections to; connecting to
+        # them before touching addrman or seeds makes it much harder for
+        # an attacker to isolate us across a restart (BTC PR #17428).
+        for host, port in self.anchor_store.load_anchors():
+            if port != self.port:
+                asyncio.create_task(self._connect_to_peer(host, port))
+
         # Connect to seed nodes
         for host, port in self.seed_nodes:
             if port != self.port:  # don't connect to self
@@ -123,6 +187,16 @@ class Node:
 
     async def stop(self):
         self._running = False
+        # Persist current block-relay-only peers as anchors for next startup.
+        # We save BLOCK_RELAY_ONLY connections specifically because tx-relay
+        # peers leak information that could be used for eclipse targeting.
+        anchors = [
+            (p.host, p.port)
+            for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.BLOCK_RELAY_ONLY
+        ][:OUTBOUND_BLOCK_RELAY_ONLY_SLOTS]
+        if anchors:
+            self.anchor_store.save_anchors(anchors)
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -191,11 +265,20 @@ class Node:
                 asyncio.open_connection(host, port),
                 timeout=HANDSHAKE_TIMEOUT,
             )
-            peer = Peer(host=host, port=port, reader=reader, writer=writer, is_connected=True)
+            # Decide what kind of outbound peer this is (full-relay vs
+            # block-relay-only) based on how many slots are already filled.
+            conn_type = self._next_connection_type()
+            peer = Peer(
+                host=host, port=port, reader=reader, writer=writer,
+                is_connected=True, connection_type=conn_type,
+            )
             self.peers[addr] = peer
             peer.touch()
 
-            # Send handshake with our chain height (for sync)
+            # Send handshake with our chain height + cumulative stake weight.
+            # Cumulative weight is the PoS analog of Bitcoin's chainwork and is
+            # what ChainSyncer uses (via MIN_CUMULATIVE_STAKE_WEIGHT) to pick
+            # a sync peer.
             latest = self.blockchain.get_latest_block()
             handshake = NetworkMessage(
                 msg_type=MessageType.HANDSHAKE,
@@ -203,6 +286,7 @@ class Node:
                     "port": self.port,
                     "chain_height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
+                    "cumulative_weight": self._current_cumulative_weight(),
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -267,13 +351,25 @@ class Node:
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_best_hash"
                 )
                 return
+            peer_weight = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(peer_weight, int) or peer_weight < 0:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_cumulative_weight"
+                )
+                return
 
             peer.entity_id = sender_id
             self.peers[peer.address] = peer
             logger.info(f"Handshake from {peer.address} (entity: {sender_id[:16]})")
 
-            # Track peer's chain height for sync decisions
-            self.syncer.update_peer_height(peer.address, peer_height, best_hash)
+            # Track peer's chain height AND cumulative weight for sync decisions.
+            # The weight is consulted by get_best_sync_peer against
+            # MIN_CUMULATIVE_STAKE_WEIGHT — without it the long-range-attack
+            # gate is a no-op.
+            self.syncer.update_peer_height(
+                peer.address, peer_height, best_hash,
+                cumulative_weight=peer_weight,
+            )
 
             # If peer is ahead, initiate sync
             if peer_height > self.blockchain.height and not self.syncer.is_syncing:
@@ -340,6 +436,7 @@ class Node:
                 payload={
                     "height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
+                    "cumulative_weight": self._current_cumulative_weight(),
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -349,18 +446,30 @@ class Node:
         elif msg.msg_type == MessageType.RESPONSE_CHAIN_HEIGHT:
             height = msg.payload.get("height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            self.syncer.update_peer_height(peer.address, height, best_hash)
+            weight = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(weight, int) or weight < 0:
+                weight = 0
+            self.syncer.update_peer_height(
+                peer.address, height, best_hash, cumulative_weight=weight,
+            )
 
         elif msg.msg_type == MessageType.PEER_LIST:
+            # Route announced addresses through AddressManager (Sybil/bucket
+            # defenses) and treat the sending peer's IP as the source. The
+            # per-source cap + bucketing prevents a single peer from
+            # dominating the address table (eclipse prep primitive).
+            source_ip = peer.host or address.rsplit(":", 1)[0]
             for p_info in msg.payload.get("peers", []):
                 host = p_info.get("host", "")
                 port = p_info.get("port", 0)
                 # M1: Validate peer addresses — reject private/invalid IPs
                 if not self._is_valid_peer_address(host, port):
                     continue
-                addr = f"{host}:{port}"
-                if addr not in self.peers and len(self.peers) < MAX_PEERS:
-                    if not self.ban_manager.is_banned(addr):
+                # addrman first — it may reject on Sybil grounds
+                self.addrman.add_address(host, port, source_ip)
+                addr_str = f"{host}:{port}"
+                if addr_str not in self.peers and len(self.peers) < MAX_PEERS:
+                    if not self.ban_manager.is_banned(addr_str):
                         asyncio.create_task(self._connect_to_peer(host, port))
 
         # ── IBD / Sync Protocol Messages ──────────────────────────
@@ -441,6 +550,10 @@ class Node:
             return "block_req"
         if msg_type == MessageType.REQUEST_HEADERS:
             return "headers_req"
+        if msg_type == MessageType.PEER_LIST:
+            # ADDR-equivalent — must be strictly throttled to prevent
+            # eclipse-prep attacks via flooded peer lists (BTC #22387).
+            return "addr"
         return "general"
 
     # ── inv/getdata relay ──────────────────────────────────────────

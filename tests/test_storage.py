@@ -455,9 +455,7 @@ class TestChainSyncer(unittest.TestCase):
         syncer = ChainSyncer(chain, lambda addr: None)
         syncer.state = SyncState.SYNCING_HEADERS
 
-        asyncio.get_event_loop().run_until_complete(
-            syncer.handle_headers_response([], "peer1:9333")
-        )
+        asyncio.run(syncer.handle_headers_response([], "peer1:9333"))
         assert syncer.state == SyncState.COMPLETE
 
 

@@ -24,6 +24,13 @@ BAN_THRESHOLD = 100       # score at which a peer gets banned
 BAN_DURATION = 86400      # 24 hours in seconds
 DECAY_INTERVAL = 3600     # score decays by 1 every hour of good behavior
 MAX_TRACKED_PEERS = 5000  # limit memory usage for tracking
+# Non-decaying cumulative offense ceiling. A patient attacker who offends
+# just under BAN_THRESHOLD and waits for decay to reset the score can
+# otherwise misbehave indefinitely. This "lifetime" counter never decays,
+# so once a peer crosses it they are banned regardless of recent behavior.
+# Set to 2x ban threshold — harmless peers with occasional one-off glitches
+# still get forgiveness, but sustained gaming is caught.
+LIFETIME_BAN_MULTIPLIER = 2
 
 # Offense severities (same scale as Bitcoin Core)
 OFFENSE_INVALID_BLOCK = 100       # instant ban
@@ -38,6 +45,10 @@ OFFENSE_MINOR = 1
 @dataclass
 class PeerScore:
     score: int = 0
+    # Lifetime cumulative offense points — NEVER decays. Closes the
+    # decay-gaming attack where a peer offends just under BAN_THRESHOLD,
+    # waits for hourly decay, and repeats indefinitely.
+    lifetime_score: int = 0
     banned_until: float = 0.0
     last_decay: float = field(default_factory=time.time)
     offenses: list = field(default_factory=list)  # [(timestamp, reason, points)]
@@ -47,7 +58,8 @@ class PeerScore:
         if self.banned_until == 0:
             return False
         if time.time() >= self.banned_until:
-            # Ban expired, reset
+            # Ban expired, reset current score but KEEP lifetime_score —
+            # a peer that was banned once should not get a clean slate.
             self.banned_until = 0.0
             self.score = 0
             self.offenses.clear()
@@ -116,17 +128,25 @@ class PeerBanManager:
             ps.last_decay = now
 
         ps.score += points
+        ps.lifetime_score += points
         ps.offenses.append((now, reason, points))
 
         # Trim offense history to last 50
         if len(ps.offenses) > 50:
             ps.offenses = ps.offenses[-50:]
 
-        logger.info(f"Peer {ip} offense: {reason} (+{points}, total={ps.score})")
+        logger.info(
+            f"Peer {ip} offense: {reason} "
+            f"(+{points}, current={ps.score}, lifetime={ps.lifetime_score})"
+        )
 
-        if ps.score >= self.ban_threshold:
+        lifetime_ceiling = self.ban_threshold * LIFETIME_BAN_MULTIPLIER
+        if ps.score >= self.ban_threshold or ps.lifetime_score >= lifetime_ceiling:
             ps.banned_until = now + self.ban_duration
-            logger.warning(f"Peer {ip} BANNED for {self.ban_duration}s (score={ps.score}, reason={reason})")
+            logger.warning(
+                f"Peer {ip} BANNED for {self.ban_duration}s "
+                f"(score={ps.score}, lifetime={ps.lifetime_score}, reason={reason})"
+            )
             return True
 
         return False
@@ -141,10 +161,15 @@ class PeerBanManager:
         logger.warning(f"Peer {ip} manually banned: {reason}")
 
     def manual_unban(self, address: str):
-        """Manually unban a peer."""
+        """Manually unban a peer.
+
+        Resets lifetime_score too, so an operator-granted second chance
+        is a genuine clean slate (unlike automatic ban expiry).
+        """
         ip = self._get_ip(address)
         if ip in self._scores:
             self._scores[ip].score = 0
+            self._scores[ip].lifetime_score = 0
             self._scores[ip].banned_until = 0.0
             self._scores[ip].offenses.clear()
             logger.info(f"Peer {ip} manually unbanned")

@@ -23,11 +23,14 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 import messagechain.config
 from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
+from messagechain.consensus.checkpoint import WeakSubjectivityCheckpoint
 from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
 from messagechain.core.block import Block, BlockHeader
+from messagechain.network.ban import OFFENSE_INVALID_HEADERS, OFFENSE_PROTOCOL_VIOLATION
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, write_message,
 )
@@ -71,14 +74,32 @@ class ChainSyncer:
     5. Apply blocks to local blockchain
     """
 
-    def __init__(self, blockchain, get_peer_writer):
+    def __init__(
+        self,
+        blockchain,
+        get_peer_writer,
+        trusted_checkpoints: list[WeakSubjectivityCheckpoint] | None = None,
+        on_peer_offense: Callable[[str, int, str], None] | None = None,
+    ):
         """
         Args:
             blockchain: The Blockchain instance to sync
             get_peer_writer: callable(address) -> (writer, peer) to get peer connection
+            trusted_checkpoints: Optional list of weak-subjectivity checkpoints.
+                During IBD, any header at a checkpoint's block_number whose hash
+                does not match is rejected and the peer is penalized. This is the
+                primary long-range-attack defense for PoS.
+            on_peer_offense: Optional callback invoked as
+                `on_peer_offense(peer_address, offense_points, reason)` when a
+                sync-time misbehavior is detected (checkpoint mismatch, stall).
         """
         self.blockchain = blockchain
         self.get_peer_writer = get_peer_writer
+        # Index checkpoints by block_number for O(1) lookup during header processing
+        self._checkpoints: dict[int, WeakSubjectivityCheckpoint] = {
+            cp.block_number: cp for cp in (trusted_checkpoints or [])
+        }
+        self._on_peer_offense = on_peer_offense or (lambda _a, _p, _r: None)
         self.state = SyncState.IDLE
         self.peer_heights: dict[str, PeerSyncInfo] = {}
 
@@ -255,6 +276,7 @@ class ChainSyncer:
                   if self.blockchain.get_latest_block() else "00" * 32)
         )
 
+        checkpoint_violation = False
         for hdr in headers_data:
             if hdr["prev_hash"] != expected_prev:
                 logger.warning(f"Header chain broken at block #{hdr['block_number']}")
@@ -263,17 +285,40 @@ class ChainSyncer:
             if bh is None:
                 logger.warning("Invalid block_hash hex in header from peer")
                 break
-            if self.blockchain.has_block(bh):
-                # Already have this block, skip
-                expected_prev = hdr["block_hash"]
-                continue
-            # Validate block_number is sane
+            # Validate block_number is sane BEFORE other checks
             bn = hdr.get("block_number", 0)
             if not isinstance(bn, int) or bn < 0 or bn > MAX_SANE_BLOCK_HEIGHT:
                 logger.warning(f"Invalid block_number {bn} in header from peer")
                 break
+            # Weak-subjectivity checkpoint gate: reject the whole batch if
+            # a header lands on a checkpoint height with the wrong hash.
+            # This is the primary long-range-attack defense for PoS.
+            cp = self._checkpoints.get(bn)
+            if cp is not None and bh != cp.block_hash:
+                logger.warning(
+                    f"Peer {peer_addr} served header at checkpoint height {bn} "
+                    f"with wrong hash {bh.hex()[:16]} (expected {cp.block_hash.hex()[:16]}) "
+                    f"— rejecting batch and penalizing peer"
+                )
+                self._on_peer_offense(
+                    peer_addr, OFFENSE_INVALID_HEADERS,
+                    f"checkpoint_mismatch:block={bn}",
+                )
+                checkpoint_violation = True
+                valid_headers = []  # discard everything we collected from this peer
+                break
+            if self.blockchain.has_block(bh):
+                # Already have this block, skip
+                expected_prev = hdr["block_hash"]
+                continue
             valid_headers.append(hdr)
             expected_prev = hdr["block_hash"]
+
+        if checkpoint_violation:
+            # Abort the sync round entirely — do not extend pending_headers,
+            # do not request more headers from this peer.
+            self.state = SyncState.IDLE
+            return
 
         # Enforce header spam limit before extending
         max_pending = messagechain.config.MAX_PENDING_HEADERS
@@ -379,14 +424,28 @@ class ChainSyncer:
             self.pending_headers = []
 
     async def check_sync_stale(self):
-        """Check if sync has stalled and restart if needed."""
+        """Check if sync has stalled and restart if needed.
+
+        A stalling peer — one that accepts our REQUEST_HEADERS/REQUEST_BLOCKS
+        but never responds — is penalized with a misbehavior offense so that
+        a repeated offender eventually gets banned. Without this, an attacker
+        can repeatedly stall our IBD without consequence.
+        """
         if not self.is_syncing:
             return
 
         if time.time() - self._last_progress_time > SYNC_STALE_TIMEOUT:
+            stale_peer = self._current_sync_peer
             logger.warning(
-                f"Sync stalled for {SYNC_STALE_TIMEOUT}s — resetting"
+                f"Sync stalled for {SYNC_STALE_TIMEOUT}s on peer {stale_peer} — resetting"
             )
+            if stale_peer:
+                self._on_peer_offense(
+                    stale_peer, OFFENSE_PROTOCOL_VIOLATION, "sync_stall",
+                )
+                # Drop the stalling peer from the sync candidate set so the
+                # restart picks a different peer.
+                self.peer_heights.pop(stale_peer, None)
             self.state = SyncState.IDLE
             self.pending_headers = []
             self.blocks_needed = []

@@ -10,6 +10,7 @@ Now supports:
 - Transaction expiry (TTL) — old transactions are pruned automatically
 """
 
+import os
 import time
 from collections import defaultdict
 from messagechain.config import (
@@ -210,9 +211,21 @@ class Mempool:
         if self._orphan_sender_counts[tx.entity_id] >= MEMPOOL_MAX_ORPHAN_PER_SENDER:
             return False
 
-        # Global limit — evict random if full
+        # Global limit — random eviction when full. Rejecting new entries
+        # outright lets an early attacker lock honest orphans out of the
+        # pool; random eviction matches Bitcoin Core's approach and keeps
+        # the pool rotating under adversarial pressure.
         if len(self.orphan_pool) >= MEMPOOL_MAX_ORPHAN_TXS:
-            return False
+            # os.urandom for unpredictability — an attacker should not be
+            # able to predict which entries will be evicted.
+            victim_idx = int.from_bytes(os.urandom(4), "big") % len(self.orphan_pool)
+            victim_hash = list(self.orphan_pool.keys())[victim_idx]
+            victim_tx = self.orphan_pool.pop(victim_hash)
+            self._orphan_sender_counts[victim_tx.entity_id] = max(
+                0, self._orphan_sender_counts[victim_tx.entity_id] - 1
+            )
+            if self._orphan_sender_counts[victim_tx.entity_id] == 0:
+                del self._orphan_sender_counts[victim_tx.entity_id]
 
         self.orphan_pool[tx.tx_hash] = tx
         self._orphan_sender_counts[tx.entity_id] += 1

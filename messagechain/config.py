@@ -163,6 +163,23 @@ MIN_CUMULATIVE_STAKE_WEIGHT = 100
 # Set to None to verify all blocks (default for new chains)
 ASSUME_VALID_BLOCK_HASH = None  # bytes or None
 
+# Weak-subjectivity checkpoints — the PoS long-range-attack defense.
+# A list of (block_number, block_hash, state_root) snapshots that new nodes
+# treat as ground truth during IBD. Any peer that serves a header at one of
+# these heights with a non-matching hash is rejected and penalized.
+#
+# Populate by embedding `WeakSubjectivityCheckpoint` instances at release
+# time. Empty by default — an unprotected fresh chain is intentional so that
+# local/test networks don't require bootstrap ceremonies.
+TRUSTED_CHECKPOINTS: tuple = ()
+
+# Outbound connection slot allocation — mix full-relay (tx + block) peers
+# with block-relay-only peers to defeat topology inference via tx-relay
+# timing and preserve block flow under partial eclipse. Matches Bitcoin
+# Core's default mix (8 full-relay + 2 block-relay-only).
+OUTBOUND_FULL_RELAY_SLOTS = 8
+OUTBOUND_BLOCK_RELAY_ONLY_SLOTS = 2
+
 # Staking
 UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
 

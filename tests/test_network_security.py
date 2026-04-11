@@ -411,4 +411,12 @@ class TestMessageCategoryMapping(unittest.TestCase):
         entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
         node = Node(entity, port=19336)
         assert node._msg_category(MessageType.HANDSHAKE) == "general"
-        assert node._msg_category(MessageType.PEER_LIST) == "general"
+
+    def test_peer_list_addr_category(self):
+        """PEER_LIST is ADDR-equivalent and must route to the strict `addr`
+        bucket (BTC PR #22387) — not the generic high-rate `general` bucket."""
+        from messagechain.network.node import Node
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
+        node = Node(entity, port=19337)
+        assert node._msg_category(MessageType.PEER_LIST) == "addr"

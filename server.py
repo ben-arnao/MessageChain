@@ -26,7 +26,8 @@ from collections import OrderedDict
 
 from messagechain.config import (
     DEFAULT_PORT, MAX_TXS_PER_BLOCK,
-    SEEN_TX_CACHE_SIZE,
+    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
+    OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -47,7 +48,9 @@ from messagechain.core.transfer import (
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
-from messagechain.network.peer import Peer
+from messagechain.network.peer import Peer, ConnectionType
+from messagechain.network.addrman import AddressManager
+from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
 from messagechain.consensus.attestation import Attestation, verify_attestation
 from messagechain.consensus.slashing import (
@@ -100,12 +103,30 @@ class Server:
         self.wallet_entity: Entity | None = None  # full entity for block signing
         self._running = False
 
-        # IBD / sync
-        self.syncer = ChainSyncer(self.blockchain, self._get_peer_writer)
-
-        # Network protection
+        # Network protection — must exist before syncer for the offense callback
         self.ban_manager = PeerBanManager()
         self.rate_limiter = PeerRateLimiter()
+
+        # Sybil-resistant address manager (was previously dead code)
+        self.addrman = AddressManager()
+
+        # Persistent anchor peers — survive restarts to defeat reboot-time
+        # eclipse attacks (BTC PR #17428).
+        import os as _os
+        anchor_path = (
+            _os.path.join(data_dir, "anchors.json")
+            if data_dir
+            else _os.path.join(_os.getcwd(), "anchors.json")
+        )
+        self.anchor_store = AnchorStore(anchor_path)
+
+        # IBD / sync — with weak-subjectivity checkpoints + offense callback
+        self.syncer = ChainSyncer(
+            self.blockchain,
+            self._get_peer_writer,
+            trusted_checkpoints=list(TRUSTED_CHECKPOINTS),
+            on_peer_offense=self._on_sync_offense,
+        )
 
         # RPC rate limiting
         self.rpc_rate_limiter = RPCRateLimiter(max_requests=60, window_seconds=60.0)
@@ -126,6 +147,31 @@ class Server:
         if peer and peer.is_connected and peer.writer:
             return (peer.writer, peer)
         return None
+
+    def _on_sync_offense(self, peer_address: str, points: int, reason: str):
+        """Callback for sync-time misbehavior (checkpoint mismatch, stall)."""
+        self.ban_manager.record_offense(peer_address, points, reason)
+
+    def _current_cumulative_weight(self) -> int:
+        """Our best-tip cumulative stake weight, for handshakes."""
+        best = self.blockchain.fork_choice.get_best_tip()
+        return best[2] if best else 0
+
+    def _next_connection_type(self) -> ConnectionType:
+        """Decide the ConnectionType for the next outbound slot."""
+        full_relay_count = sum(
+            1 for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.FULL_RELAY
+        )
+        block_only_count = sum(
+            1 for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.BLOCK_RELAY_ONLY
+        )
+        if full_relay_count < OUTBOUND_FULL_RELAY_SLOTS:
+            return ConnectionType.FULL_RELAY
+        if block_only_count < OUTBOUND_BLOCK_RELAY_ONLY_SLOTS:
+            return ConnectionType.BLOCK_RELAY_ONLY
+        return ConnectionType.FULL_RELAY
 
     def set_wallet(self, wallet_id_hex: str):
         """Set which wallet receives block rewards and fees."""
@@ -176,6 +222,10 @@ class Server:
         )
         logger.info(f"RPC listening on port {self.rpc_port}")
 
+        # Reconnect to anchor peers first (restart-time eclipse defense)
+        for host, port in self.anchor_store.load_anchors():
+            asyncio.create_task(self._connect_to_peer(host, port))
+
         # Connect to seed nodes
         for host, port in self.seed_nodes:
             asyncio.create_task(self._connect_to_peer(host, port))
@@ -196,6 +246,14 @@ class Server:
 
     async def stop(self):
         self._running = False
+        # Persist block-relay-only peers as anchors for next startup
+        anchors = [
+            (p.host, p.port)
+            for p in self.peers.values()
+            if p.is_connected and p.connection_type == ConnectionType.BLOCK_RELAY_ONLY
+        ][:OUTBOUND_BLOCK_RELAY_ONLY_SLOTS]
+        if anchors:
+            self.anchor_store.save_anchors(anchors)
         if self.db:
             self.db.close()
 
@@ -709,6 +767,8 @@ class Server:
             return "block_req"
         if msg_type == MessageType.REQUEST_HEADERS:
             return "headers_req"
+        if msg_type == MessageType.PEER_LIST:
+            return "addr"
         return "general"
 
     async def _handle_p2p_connection(self, reader, writer):
@@ -744,7 +804,11 @@ class Server:
             return
         try:
             reader, writer = await asyncio.open_connection(host, port)
-            peer = Peer(host=host, port=port, reader=reader, writer=writer, is_connected=True)
+            conn_type = self._next_connection_type()
+            peer = Peer(
+                host=host, port=port, reader=reader, writer=writer,
+                is_connected=True, connection_type=conn_type,
+            )
             self.peers[addr] = peer
 
             latest = self.blockchain.get_latest_block()
@@ -754,6 +818,7 @@ class Server:
                     "port": self.p2p_port,
                     "chain_height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
+                    "cumulative_weight": self._current_cumulative_weight(),
                 },
                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
             )
@@ -785,10 +850,19 @@ class Server:
         if msg.msg_type == MessageType.HANDSHAKE:
             peer.entity_id = msg.sender_id
             self.peers[peer.address] = peer
-            # Track peer height for sync
+            # Track peer height AND cumulative weight for sync
             peer_height = msg.payload.get("chain_height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            self.syncer.update_peer_height(peer.address, peer_height, best_hash)
+            peer_weight = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(peer_weight, int) or peer_weight < 0:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_cumulative_weight"
+                )
+                return
+            self.syncer.update_peer_height(
+                peer.address, peer_height, best_hash,
+                cumulative_weight=peer_weight,
+            )
             if peer_height > self.blockchain.height and not self.syncer.is_syncing:
                 asyncio.create_task(self.syncer.start_sync())
 
@@ -826,6 +900,7 @@ class Server:
                 payload={
                     "height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
+                    "cumulative_weight": self._current_cumulative_weight(),
                 },
             )
             if peer.writer:
@@ -834,7 +909,12 @@ class Server:
         elif msg.msg_type == MessageType.RESPONSE_CHAIN_HEIGHT:
             height = msg.payload.get("height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            self.syncer.update_peer_height(peer.address, height, best_hash)
+            weight = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(weight, int) or weight < 0:
+                weight = 0
+            self.syncer.update_peer_height(
+                peer.address, height, best_hash, cumulative_weight=weight,
+            )
 
         elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
             await self._handle_announce_attestation(msg.payload, peer)
