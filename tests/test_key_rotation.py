@@ -140,7 +140,10 @@ class TestKeyRotation(unittest.TestCase):
         bob_bal_after = self.chain.supply.get_balance(self.bob.entity_id)
 
         self.assertEqual(alice_bal_after, alice_bal_before - KEY_ROTATION_FEE)
-        self.assertEqual(bob_bal_after, bob_bal_before + KEY_ROTATION_FEE)
+        # EIP-1559: base fee is burned, only the tip goes to proposer
+        base_fee = self.chain.supply.base_fee
+        expected_tip = KEY_ROTATION_FEE - base_fee
+        self.assertEqual(bob_bal_after, bob_bal_before + expected_tip)
 
     def test_rotation_insufficient_balance_rejected(self):
         """Rotation rejected if entity can't afford the fee."""

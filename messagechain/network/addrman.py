@@ -32,15 +32,21 @@ def _hash(data: bytes) -> bytes:
 
 
 def _network_group(ip: str) -> str:
-    """Extract /16 network group from an IP address.
+    """Extract network group from an IP address.
 
-    This groups addresses by their first two octets, preventing
-    a single AS from dominating the address tables.
+    IPv4: groups by /16 (first two octets).
+    IPv6: groups by /48 (first three hextets).
+    This prevents a single AS from dominating the address tables.
     """
     parts = ip.split(".")
     if len(parts) == 4:
         return f"{parts[0]}.{parts[1]}"
-    return ip  # fallback for non-IPv4
+    # IPv6: strip brackets and group by /48 (first 3 hextets)
+    v6 = ip.strip("[]")
+    hextets = v6.split(":")
+    if len(hextets) >= 3:
+        return ":".join(hextets[:3])
+    return v6
 
 
 @dataclass

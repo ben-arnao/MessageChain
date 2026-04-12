@@ -130,6 +130,10 @@ class Entity:
             _seed=seed,
         )
 
+    def __repr__(self) -> str:
+        """Safe repr that never exposes the private seed."""
+        return f"Entity(entity_id={self.entity_id.hex()[:16]}...)"
+
     @property
     def public_key(self) -> bytes:
         return self.keypair.public_key

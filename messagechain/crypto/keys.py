@@ -150,8 +150,22 @@ class KeyPair:
         self._next_leaf += 1
 
         priv_keys, pub_key, pub_seed = self._wots_keys[leaf_idx]
+        if priv_keys is None:
+            # Re-derive on demand (e.g., test resets _next_leaf back).
+            # This is secure: the keys are derived deterministically from
+            # the seed, so re-derivation produces the same result. The
+            # zeroization just prevents them from sitting in memory idle.
+            leaf_seed = _hash(self._seed + struct.pack(">Q", leaf_idx))
+            priv_keys, _, _ = wots_keygen(leaf_seed)
         wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
         auth_path = self._auth_path(leaf_idx)
+
+        # Zeroize used private keys — WOTS+ keys are one-time; retaining
+        # them in memory after use only increases the attack surface for
+        # memory-dump / cold-boot attacks. We replace the private key list
+        # with None to indicate the leaf has been consumed. The public key
+        # and seed are retained since they're non-secret.
+        self._wots_keys[leaf_idx] = (None, pub_key, pub_seed)
 
         return Signature(
             wots_signature=wots_sig,

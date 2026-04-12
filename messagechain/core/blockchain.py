@@ -501,6 +501,11 @@ class Blockchain:
         if tx.entity_id not in self.public_keys:
             return False, "Unknown entity — must register first"
 
+        # Reject rotation to a public key already used by another entity
+        for eid, pk in self.public_keys.items():
+            if pk == tx.new_public_key and eid != tx.entity_id:
+                return False, "New public key already registered to another entity"
+
         current_pk = self.public_keys[tx.entity_id]
 
         expected_rotation = self.key_rotation_counts.get(tx.entity_id, 0)
@@ -524,8 +529,8 @@ class Blockchain:
         if not valid:
             return False, reason
 
-        # Pay fee to proposer
-        self.supply.pay_fee(tx.entity_id, proposer_id, tx.fee)
+        # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
+        self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, self.supply.base_fee)
 
         # Update the entity's public key
         self.public_keys[tx.entity_id] = tx.new_public_key
@@ -582,8 +587,8 @@ class Blockchain:
         if not valid:
             return False, reason
 
-        # Pay fee to proposer
-        self.supply.pay_fee(tx.submitter_id, proposer_id, tx.fee)
+        # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
+        self.supply.pay_fee_with_burn(tx.submitter_id, proposer_id, tx.fee, self.supply.base_fee)
 
         # Slash the offender
         slashed, finder_reward = self.supply.slash_validator(
@@ -915,6 +920,10 @@ class Blockchain:
         if latest is None:
             return False, "No genesis block"
 
+        # Block version must be a known protocol version
+        if block.header.version != 1:
+            return False, f"Unknown block version {block.header.version}"
+
         # Check prev_hash links
         if block.header.prev_hash != latest.block_hash:
             return False, "Invalid prev_hash"
@@ -1119,11 +1128,22 @@ class Blockchain:
         return True, "Valid"
 
     def validate_block_standalone(self, block: Block, parent: Block) -> tuple[bool, str]:
-        """Validate a block against a specific parent (for fork validation)."""
+        """Validate a block against a specific parent (for fork validation).
+
+        Performs full structural and cryptographic validation — same checks
+        as validate_block but against an explicit parent rather than the
+        current chain tip. This prevents forged blocks from being stored
+        as valid fork tips.
+        """
         if block.header.prev_hash != parent.block_hash:
             return False, "Invalid prev_hash"
         if block.header.block_number != parent.header.block_number + 1:
             return False, "Invalid block number"
+
+        # Block version must be known
+        if block.header.version != 1:
+            return False, f"Unknown block version {block.header.version}"
+
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
@@ -1131,7 +1151,28 @@ class Blockchain:
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
 
+        # Timestamp checks
+        if block.header.timestamp <= parent.header.timestamp:
+            return False, "Block timestamp must exceed parent timestamp"
+        max_future = _time.time() + 7200
+        if block.header.timestamp > max_future:
+            return False, "Block timestamp too far in the future"
+
+        # Duplicate tx check
+        seen_tx_hashes = set()
         all_txs = list(block.transactions) + list(block.transfer_transactions)
+        for tx in all_txs:
+            if tx.tx_hash in seen_tx_hashes:
+                return False, f"Duplicate transaction {tx.tx_hash.hex()[:16]} in block"
+            seen_tx_hashes.add(tx.tx_hash)
+
+        # Sig cost budget
+        import messagechain.config
+        sig_cost = compute_block_sig_cost(block)
+        if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
+            return False, f"Block sig cost {sig_cost} exceeds limit"
+
+        # Merkle root
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
@@ -1139,6 +1180,40 @@ class Blockchain:
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
+
+        # Proposer signature (mandatory)
+        if block.header.proposer_id not in self.public_keys:
+            return False, "Unknown proposer"
+        if block.header.proposer_signature is None:
+            return False, "Missing proposer signature"
+        proposer_pk = self.public_keys[block.header.proposer_id]
+        header_hash = _hash(block.header.signable_data())
+        if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
+            return False, "Invalid proposer signature"
+
+        # RANDAO mix
+        from messagechain.consensus.randao import derive_randao_mix
+        expected_mix = derive_randao_mix(
+            parent.header.randao_mix, block.header.proposer_signature
+        )
+        if block.header.randao_mix != expected_mix:
+            return False, "Invalid randao_mix"
+
+        # Validate transaction signatures
+        for tx in block.transactions:
+            if tx.entity_id not in self.public_keys:
+                return False, f"Unknown entity in tx {tx.tx_hash.hex()[:16]}"
+            pk = self.public_keys[tx.entity_id]
+            from messagechain.core.transaction import verify_transaction
+            if not verify_transaction(tx, pk):
+                return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
+
+        for ttx in block.transfer_transactions:
+            if ttx.entity_id not in self.public_keys:
+                return False, f"Unknown sender in transfer {ttx.tx_hash.hex()[:16]}"
+            pk = self.public_keys[ttx.entity_id]
+            if not verify_transfer_transaction(ttx, pk):
+                return False, f"Invalid signature in transfer {ttx.tx_hash.hex()[:16]}"
 
         return True, "Valid"
 
@@ -1262,6 +1337,11 @@ class Blockchain:
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
         if self.height == 0:
+            # Validate genesis block structure
+            if block.header.block_number != 0:
+                return False, f"First block must be block 0, got {block.header.block_number}"
+            if block.header.prev_hash != b"\x00" * 32:
+                return False, "Genesis block must have zero prev_hash"
             self.chain.append(block)
             self._block_by_hash[block.block_hash] = block
             self.fork_choice.add_tip(block.block_hash, 0, 0)
@@ -1645,6 +1725,11 @@ class Blockchain:
             "chain_length": len(self.chain),
             "slashed_validators": set(self.slashed_validators),
             "immature_rewards": list(self._immature_rewards),
+            "processed_evidence": set(self._processed_evidence),
+            "pending_unstakes": {
+                eid: list(entries)
+                for eid, entries in self.supply.pending_unstakes.items()
+            },
         }
         # Snapshot governance state if tracker is attached
         if hasattr(self, "governance") and self.governance is not None:
@@ -1676,6 +1761,12 @@ class Blockchain:
         self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
+        self._processed_evidence = snapshot.get("processed_evidence", set())
+        if "pending_unstakes" in snapshot:
+            self.supply.pending_unstakes = {
+                eid: list(entries)
+                for eid, entries in snapshot["pending_unstakes"].items()
+            }
         # Restore governance state if tracker is attached and was snapshotted
         if hasattr(self, "governance") and self.governance is not None:
             if "gov_delegations" in snapshot:

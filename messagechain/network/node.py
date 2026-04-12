@@ -747,6 +747,17 @@ class Node:
             )
             return
 
+        # Deduplicate: skip if already seen (prevents gossip amplification
+        # and redundant expensive signature verification)
+        att_key = (att.validator_id, att.block_number, att.block_hash)
+        if not hasattr(self, '_seen_attestations'):
+            self._seen_attestations: set = set()
+        if att_key in self._seen_attestations:
+            return
+        if len(self._seen_attestations) > 50_000:
+            self._seen_attestations.clear()  # periodic reset to bound memory
+        self._seen_attestations.add(att_key)
+
         # Verify the attesting validator is known
         if att.validator_id not in self.blockchain.public_keys:
             return

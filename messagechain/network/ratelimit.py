@@ -57,6 +57,11 @@ class PeerRateLimiter:
         self._buckets: dict[str, dict[str, TokenBucket]] = {}
 
     def _get_ip(self, address: str) -> str:
+        """Extract IP, handling both IPv4 and IPv6 bracket notation."""
+        if address.startswith("["):
+            bracket_end = address.find("]")
+            if bracket_end != -1:
+                return address[1:bracket_end]
         return address.rsplit(":", 1)[0] if ":" in address else address
 
     def _ensure_buckets(self, ip: str):

@@ -263,8 +263,13 @@ class TestSlashTransaction(unittest.TestCase):
         slash_tx = create_slash_transaction(self.bob, evidence, fee=1500)
         self.chain.apply_slash_transaction(slash_tx, self.carol.entity_id)
 
-        burned = 1000 - (1000 * SLASH_FINDER_REWARD_PCT // 100)  # 900
-        self.assertEqual(self.chain.supply.total_supply, supply_before - burned)
+        burned_stake = 1000 - (1000 * SLASH_FINDER_REWARD_PCT // 100)  # 900
+        # Slash fee also burns base_fee via EIP-1559
+        base_fee = self.chain.supply.base_fee
+        self.assertEqual(
+            self.chain.supply.total_supply,
+            supply_before - burned_stake - base_fee,
+        )
 
     def test_duplicate_slash_rejected(self):
         """Same validator cannot be slashed twice."""

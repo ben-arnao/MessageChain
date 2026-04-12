@@ -86,7 +86,15 @@ class PeerBanManager:
         self._scores: dict[str, PeerScore] = {}  # ip -> PeerScore
 
     def _get_ip(self, address: str) -> str:
-        """Extract IP from 'host:port' address string."""
+        """Extract IP from 'host:port' address string.
+
+        Handles both IPv4 ('1.2.3.4:8333') and IPv6 ('[::1]:8333') formats.
+        """
+        if address.startswith("["):
+            # IPv6 bracket notation: [::1]:8333
+            bracket_end = address.find("]")
+            if bracket_end != -1:
+                return address[1:bracket_end]
         return address.rsplit(":", 1)[0] if ":" in address else address
 
     def _get_score(self, ip: str) -> PeerScore:

@@ -224,6 +224,8 @@ class SupplyTracker:
 
     def stake(self, entity_id: bytes, amount: int) -> bool:
         """Lock tokens for validator staking."""
+        if amount <= 0:
+            return False
         if self.get_balance(entity_id) < amount:
             return False
         self.balances[entity_id] -= amount
@@ -252,6 +254,8 @@ class SupplyTracker:
         If bootstrap_ended is True, rejects unstakes that would drop
         total network stake below MIN_TOTAL_STAKE.
         """
+        if amount <= 0:
+            return False
         current_stake = self.get_staked(entity_id)
         if current_stake < amount:
             return False
@@ -299,6 +303,8 @@ class SupplyTracker:
         Treasury funds cannot be moved via normal transfers — only
         governance-approved treasury spends can debit the treasury.
         """
+        if amount <= 0:
+            return False
         if from_id == TREASURY_ENTITY_ID:
             return False
         if self.get_balance(from_id) < amount:

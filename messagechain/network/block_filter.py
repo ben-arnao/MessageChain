@@ -150,10 +150,16 @@ def _encode_gcs(sorted_values: list[int], n: int) -> bytes:
     return b"".join(parts)
 
 
+MAX_FILTER_ELEMENTS = 100_000  # safety cap for untrusted n_elements
+
+
 def _decode_gcs(data: bytes, n: int) -> set[int]:
     """Decode a GCS back into a set of values."""
     if not data or n == 0:
         return set()
+    # Cap n to prevent resource exhaustion from untrusted deserialization
+    if n > MAX_FILTER_ELEMENTS:
+        raise ValueError(f"n_elements {n} exceeds safety cap {MAX_FILTER_ELEMENTS}")
 
     values = []
     offset = 0
@@ -179,12 +185,17 @@ def _encode_varint(value: int) -> bytes:
     return bytes(parts)
 
 
+MAX_VARINT_BYTES = 10  # 10 bytes = 70 bits, enough for any reasonable value
+
+
 def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Decode a varint from data at offset. Returns (value, bytes_consumed)."""
     result = 0
     shift = 0
     pos = offset
     while pos < len(data):
+        if shift >= MAX_VARINT_BYTES * 7:
+            raise ValueError("varint too long — possible memory exhaustion attack")
         byte = data[pos]
         result |= (byte & 0x7F) << shift
         pos += 1

@@ -25,23 +25,30 @@ def _hash(data: bytes) -> bytes:
 
 
 def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
-    """Compute Merkle root from a list of transaction hashes."""
+    """Compute Merkle root from a list of transaction hashes.
+
+    Uses tagged internal nodes (prefixed with 0x01) and tagged leaf nodes
+    (prefixed with 0x00) to prevent second-preimage attacks via
+    duplicate-last-element padding (CVE-2012-2459). Odd-length layers
+    are padded with a sentinel value rather than duplicating the last
+    element, so [A, B, C] and [A, B, C, C] produce different roots.
+    """
     if not tx_hashes:
         return _hash(b"empty")
 
-    # Pad to even number
-    layer = list(tx_hashes)
-    if len(layer) % 2 == 1:
-        layer.append(layer[-1])
+    # Tag leaves with 0x00 prefix for domain separation
+    layer = [_hash(b"\x00" + h) for h in tx_hashes]
 
     while len(layer) > 1:
+        # Pad odd layers with a sentinel (not a duplicate)
+        if len(layer) % 2 == 1:
+            layer.append(_hash(b"\x02sentinel"))
         next_layer = []
         for i in range(0, len(layer), 2):
-            combined = _hash(layer[i] + layer[i + 1])
+            # Tag internal nodes with 0x01 prefix
+            combined = _hash(b"\x01" + layer[i] + layer[i + 1])
             next_layer.append(combined)
         layer = next_layer
-        if len(layer) > 1 and len(layer) % 2 == 1:
-            layer.append(layer[-1])
 
     return layer[0]
 

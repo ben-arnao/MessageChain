@@ -131,11 +131,15 @@ class Mempool:
         """Check if a transaction has exceeded its TTL."""
         return time.time() - tx.timestamp > self.tx_ttl
 
-    def try_replace_by_fee(self, new_tx: MessageTransaction) -> bool:
+    def try_replace_by_fee(
+        self, new_tx: MessageTransaction, public_key: bytes | None = None,
+    ) -> bool:
         """Replace an existing unconfirmed transaction with a higher-fee version.
 
         BIP 125-style RBF: the new transaction must have the same sender and
         nonce as an existing mempool transaction, and a strictly higher fee.
+        The replacement must also have a valid signature to prevent censorship
+        attacks where an attacker evicts valid txns with unsigned replacements.
 
         Returns True if replacement succeeded, False otherwise.
         """
@@ -151,6 +155,13 @@ class Mempool:
 
         if new_tx.fee <= existing.fee:
             return False  # new fee must be strictly higher
+
+        # Verify signature on the replacement (prevents censorship via
+        # unsigned replacements that evict valid transactions)
+        if public_key is not None:
+            from messagechain.core.transaction import verify_transaction
+            if not verify_transaction(new_tx, public_key):
+                return False
 
         # Remove old, add new
         self._remove_tx(existing)

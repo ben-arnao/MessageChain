@@ -35,6 +35,8 @@ from messagechain.config import (
     GOVERNANCE_PROPOSAL_FEE,
     GOVERNANCE_VOTE_FEE,
     GOVERNANCE_DELEGATE_FEE,
+    GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR,
+    GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR,
     MAX_DELEGATION_TARGETS,
     MIN_FEE,
     TREASURY_ENTITY_ID,
@@ -598,38 +600,11 @@ class GovernanceTracker:
                     if approve:
                         yes_weight += portion
 
-        # Default delegation: non-voting, non-delegating entities distribute
-        # their weight to voters using sqrt(stake) weighting
-        voter_stakes = {
-            vid: snapshot.get(vid, 0)
-            for vid in direct_votes
-            if snapshot.get(vid, 0) > 0
-        }
-        if voter_stakes:
-            sqrt_weights = {vid: int(math.isqrt(s)) for vid, s in voter_stakes.items()}
-            total_sqrt = sum(sqrt_weights.values())
-
-            if total_sqrt > 0:
-                for entity_id, stake in snapshot.items():
-                    if entity_id in direct_votes:
-                        continue  # already counted
-                    if entity_id in explicitly_delegated:
-                        continue  # handled above
-                    if stake <= 0:
-                        continue
-
-                    # Distribute this entity's stake to voters by sqrt weight
-                    distributed = 0
-                    sorted_voters = sorted(sqrt_weights.items(), key=lambda x: x[0])
-                    for i, (vid, sw) in enumerate(sorted_voters):
-                        if i == len(sorted_voters) - 1:
-                            portion = stake - distributed
-                        else:
-                            portion = stake * sw // total_sqrt
-                        distributed += portion
-                        total_weight += portion
-                        if direct_votes[vid]:
-                            yes_weight += portion
+        # Passive entities (non-voting, non-delegating) are NOT counted.
+        # Auto-assigning passive stake to active voters would let a small
+        # number of voters capture the full weight of all offline
+        # stakeholders — a governance capture vector. Only explicit votes
+        # and explicit delegations count.
 
         return yes_weight, total_weight
 
@@ -637,16 +612,37 @@ class GovernanceTracker:
         self,
         tx: TreasurySpendTransaction,
         supply_tracker,
+        current_block: int = 0,
     ) -> bool:
         """Execute an approved treasury spend. Returns False if rejected.
 
-        Rejects if: amount is invalid, treasury has insufficient funds,
-        or the spend has already been executed (replay protection).
+        Rejects if:
+        - Amount is invalid
+        - Treasury has insufficient funds
+        - Spend has already been executed (replay protection)
+        - Proposal does not exist on-chain
+        - Voting window is still open
+        - Proposal did not reach the approval threshold
         """
         if tx.amount <= 0:
             return False
         # Replay protection — each tx_hash can only execute once
         if tx.tx_hash in self._executed_treasury_spends:
+            return False
+        # Require an on-chain proposal for this treasury spend
+        state = self.proposals.get(tx.proposal_id)
+        if state is None:
+            return False
+        # Voting must be closed before execution
+        status = self.get_proposal_status(tx.proposal_id, current_block)
+        if status != ProposalStatus.CLOSED:
+            return False
+        # Require approval threshold: yes * DENOM > total * NUM
+        yes_weight, total_weight = self.tally(tx.proposal_id)
+        if total_weight == 0:
+            return False
+        if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
+                <= total_weight * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR):
             return False
         result = supply_tracker.treasury_spend(tx.recipient_id, tx.amount)
         if result:

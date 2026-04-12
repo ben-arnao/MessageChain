@@ -75,10 +75,13 @@ class SignatureCache:
     def store(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes, result: bool):
         """Store a verification result in the cache.
 
-        Caches both positive and negative results. Negative caching prevents
-        DoS via repeated submission of invalid signatures that are expensive
-        to verify (WOTS+ hash chains).
+        Only positive (True) results are cached. Caching negative results
+        risks cache poisoning: if a valid signature is transiently evaluated
+        as False (e.g., during state inconsistency), the cached False would
+        permanently block that signature until eviction.
         """
+        if not result:
+            return  # never cache negative results — prevents cache poisoning
         key = self._key(msg_hash, sig_hash, pub_key)
         if key in self._cache:
             self._cache.move_to_end(key)
@@ -114,6 +117,12 @@ class SignatureCache:
         if block_hash not in self._block_keys:
             self._block_keys[block_hash] = []
         self._block_keys[block_hash].append(key)
+        # Bound _block_keys to prevent unbounded memory growth. When full,
+        # prune the oldest half (FIFO by insertion order, which is block order).
+        if len(self._block_keys) > self.max_size:
+            keys_to_drop = list(self._block_keys.keys())[:len(self._block_keys) // 2]
+            for k in keys_to_drop:
+                del self._block_keys[k]
 
     def __len__(self) -> int:
         return len(self._cache)

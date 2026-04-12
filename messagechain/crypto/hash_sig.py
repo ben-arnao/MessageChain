@@ -24,11 +24,14 @@ def _prf(seed: bytes, index: int) -> bytes:
 
 def _chain(value: bytes, start: int, steps: int, public_seed: bytes, address: int) -> bytes:
     """Iterate the hash chain `steps` times starting at position `start`."""
-    assert start >= 0, f"chain start must be non-negative, got {start}"
-    assert steps >= 0, f"chain steps must be non-negative, got {steps}"
-    assert start + steps <= WOTS_CHAIN_LENGTH, (
-        f"chain overflow: start({start}) + steps({steps}) > CHAIN_LENGTH({WOTS_CHAIN_LENGTH})"
-    )
+    if start < 0:
+        raise ValueError(f"chain start must be non-negative, got {start}")
+    if steps < 0:
+        raise ValueError(f"chain steps must be non-negative, got {steps}")
+    if start + steps > WOTS_CHAIN_LENGTH:
+        raise ValueError(
+            f"chain overflow: start({start}) + steps({steps}) > CHAIN_LENGTH({WOTS_CHAIN_LENGTH})"
+        )
     result = value
     for i in range(start, start + steps):
         # Domain separation prevents multi-target attacks
