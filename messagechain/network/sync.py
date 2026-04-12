@@ -30,7 +30,11 @@ from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
 from messagechain.consensus.checkpoint import WeakSubjectivityCheckpoint
 from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
 from messagechain.core.block import Block, BlockHeader
-from messagechain.network.ban import OFFENSE_INVALID_HEADERS, OFFENSE_PROTOCOL_VIOLATION
+from messagechain.network.ban import (
+    OFFENSE_CHECKPOINT_VIOLATION,
+    OFFENSE_INVALID_HEADERS,
+    OFFENSE_PROTOCOL_VIOLATION,
+)
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, write_message,
 )
@@ -114,6 +118,10 @@ class ChainSyncer:
         self._last_progress_time = 0.0
         self._sync_target_height = 0
         self._current_sync_peer: str = ""
+        # Parallel block download bookkeeping: peer -> list of block_hashes
+        # currently in flight from that peer. Used to reassign on stall and
+        # to enforce per-peer inflight caps.
+        self._inflight_by_peer: dict[str, list[bytes]] = {}
 
     def _parse_block_hashes(self, headers: list[dict]) -> list[bytes]:
         """Safely parse block hashes from header dicts, skipping invalid ones."""
@@ -301,7 +309,7 @@ class ChainSyncer:
                     f"— rejecting batch and penalizing peer"
                 )
                 self._on_peer_offense(
-                    peer_addr, OFFENSE_INVALID_HEADERS,
+                    peer_addr, OFFENSE_CHECKPOINT_VIOLATION,
                     f"checkpoint_mismatch:block={bn}",
                 )
                 checkpoint_violation = True
@@ -355,14 +363,38 @@ class ChainSyncer:
             else:
                 self.state = SyncState.COMPLETE
 
+    def _eligible_sync_peers(self) -> list[str]:
+        """Return sync-eligible peer addresses ordered by claimed weight."""
+        eligible = [
+            p for p in self.peer_heights.values()
+            if p.cumulative_weight >= MIN_CUMULATIVE_STAKE_WEIGHT
+        ]
+        eligible.sort(key=lambda p: p.chain_height, reverse=True)
+        return [p.peer_address for p in eligible]
+
     async def _request_next_blocks(self, peer_addr: str):
-        """Request the next batch of full blocks."""
+        """Single-peer request — kept for headers fallback + tests.
+
+        The main block-download path uses _request_next_blocks_parallel,
+        which fans out across multiple peers. This method is still used
+        for the very first block request kicked off by start_sync, and
+        for single-peer topologies where only one peer is eligible.
+        """
         if not self.blocks_needed:
             self.state = SyncState.COMPLETE
             return
 
-        # Take next batch
-        batch = self.blocks_needed[:BLOCKS_BATCH_SIZE]
+        # If we have more than one eligible peer, prefer the parallel path
+        if len(self._eligible_sync_peers()) > 1:
+            await self._request_next_blocks_parallel()
+            return
+
+        batch = [
+            h for h in self.blocks_needed[:BLOCKS_BATCH_SIZE]
+            if h not in self._inflight_hashes()
+        ]
+        if not batch:
+            return
 
         result = self.get_peer_writer(peer_addr)
         if result is None:
@@ -379,10 +411,82 @@ class ChainSyncer:
         )
         try:
             await write_message(writer, msg)
-            logger.debug(f"Requested {len(batch)} blocks")
+            self._inflight_by_peer.setdefault(peer_addr, []).extend(batch)
+            logger.debug(f"Requested {len(batch)} blocks from {peer_addr}")
         except Exception as e:
             logger.warning(f"Failed to request blocks from {peer_addr}: {e}")
             self.state = SyncState.IDLE
+
+    def _inflight_hashes(self) -> set[bytes]:
+        """Set of block hashes currently in flight across all peers."""
+        return {
+            h for hashes in self._inflight_by_peer.values() for h in hashes
+        }
+
+    async def _request_next_blocks_parallel(self):
+        """Fan out REQUEST_BLOCKS_BATCH across multiple eligible peers.
+
+        One slow/malicious peer in a single-peer IBD dominates our entire
+        sync window — they can accept REQUEST_BLOCKS_BATCH and delay the
+        response for SYNC_STALE_TIMEOUT, burning a whole stall cycle per
+        batch. Splitting the work across up to MAX_SYNC_PEERS peers caps
+        the per-peer damage at ~1/N of our bandwidth.
+
+        Disjoint-slice assignment: each in-flight block hash is recorded
+        in _inflight_by_peer so we never ask two peers for the same block.
+        On stall (see check_sync_stale), the stalling peer's inflight
+        slice is released back to the free pool and reassigned.
+        """
+        if not self.blocks_needed:
+            self.state = SyncState.COMPLETE
+            return
+
+        eligible = self._eligible_sync_peers()
+        if not eligible:
+            self.state = SyncState.IDLE
+            return
+
+        # Skip hashes already requested from some peer
+        inflight = self._inflight_hashes()
+        free_hashes = [h for h in self.blocks_needed if h not in inflight]
+        if not free_hashes:
+            return
+
+        # Slice across at most MAX_SYNC_PEERS peers, BLOCKS_BATCH_SIZE each
+        peers_to_use = eligible[:MAX_SYNC_PEERS]
+        slices: list[list[bytes]] = []
+        i = 0
+        for _ in peers_to_use:
+            if i >= len(free_hashes):
+                break
+            slices.append(free_hashes[i : i + BLOCKS_BATCH_SIZE])
+            i += BLOCKS_BATCH_SIZE
+
+        for peer_addr, batch in zip(peers_to_use, slices):
+            if not batch:
+                continue
+            result = self.get_peer_writer(peer_addr)
+            if result is None:
+                logger.debug(
+                    f"Skipping unreachable sync peer {peer_addr} in parallel fan-out"
+                )
+                continue
+            writer, _ = result
+            msg = NetworkMessage(
+                msg_type=MessageType.REQUEST_BLOCKS_BATCH,
+                payload={"block_hashes": [h.hex() for h in batch]},
+            )
+            try:
+                await write_message(writer, msg)
+                self._inflight_by_peer.setdefault(peer_addr, []).extend(batch)
+                logger.debug(
+                    f"Parallel sync: requested {len(batch)} blocks from {peer_addr}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to request blocks from {peer_addr} in parallel fan-out: {e}"
+                )
+                continue
 
     async def handle_blocks_response(self, blocks_data: list[dict], peer_addr: str):
         """Process a batch of full blocks received from a peer."""
@@ -400,6 +504,11 @@ class ChainSyncer:
                 if block_hash in self.blocks_needed:
                     self.blocks_needed.remove(block_hash)
 
+                # Clear from any peer's inflight record
+                for inflight in self._inflight_by_peer.values():
+                    if block_hash in inflight:
+                        inflight.remove(block_hash)
+
                 # Apply block to chain
                 success, reason = self.blockchain.add_block(block)
                 if success:
@@ -411,9 +520,17 @@ class ChainSyncer:
             except Exception as e:
                 logger.warning(f"Failed to deserialize synced block: {e}")
 
-        # Request more blocks if needed
+        # Drop empty inflight buckets
+        self._inflight_by_peer = {
+            p: hs for p, hs in self._inflight_by_peer.items() if hs
+        }
+
+        # Request more blocks — parallel path pulls from all eligible peers
         if self.blocks_needed:
-            await self._request_next_blocks(peer_addr)
+            if len(self._eligible_sync_peers()) > 1:
+                await self._request_next_blocks_parallel()
+            else:
+                await self._request_next_blocks(peer_addr)
         else:
             elapsed = time.time() - self._sync_start_time
             logger.info(
@@ -422,6 +539,7 @@ class ChainSyncer:
             )
             self.state = SyncState.COMPLETE
             self.pending_headers = []
+            self._inflight_by_peer.clear()
 
     async def check_sync_stale(self):
         """Check if sync has stalled and restart if needed.
@@ -435,21 +553,27 @@ class ChainSyncer:
             return
 
         if time.time() - self._last_progress_time > SYNC_STALE_TIMEOUT:
-            stale_peer = self._current_sync_peer
             logger.warning(
-                f"Sync stalled for {SYNC_STALE_TIMEOUT}s on peer {stale_peer} — resetting"
+                f"Sync stalled for {SYNC_STALE_TIMEOUT}s — penalizing in-flight peers"
             )
-            if stale_peer:
+            # Penalize every peer that still has inflight blocks — they
+            # accepted REQUEST_BLOCKS_BATCH and didn't deliver. Also drop
+            # them from the candidate set and release their inflight
+            # slices so the next fan-out reassigns the work.
+            stalling_peers = list(self._inflight_by_peer.keys())
+            if not stalling_peers and self._current_sync_peer:
+                stalling_peers = [self._current_sync_peer]
+            for stale_peer in stalling_peers:
                 self._on_peer_offense(
                     stale_peer, OFFENSE_PROTOCOL_VIOLATION, "sync_stall",
                 )
-                # Drop the stalling peer from the sync candidate set so the
-                # restart picks a different peer.
                 self.peer_heights.pop(stale_peer, None)
+                self._inflight_by_peer.pop(stale_peer, None)
             self.state = SyncState.IDLE
             self.pending_headers = []
             self.blocks_needed = []
             self.downloaded_blocks = {}
+            self._inflight_by_peer.clear()
 
             # Try to restart with a different peer
             await self.start_sync()

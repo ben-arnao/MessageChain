@@ -15,6 +15,10 @@ from messagechain.config import HASH_ALGO
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import Signature
 
+# Account count at which compute_state_root starts logging a scaling
+# warning. See compute_state_root's docstring for context.
+STATE_ROOT_WARN_THRESHOLD = 100_000
+
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
@@ -53,9 +57,35 @@ def compute_state_root(
     This enables light clients to verify account state without replaying
     the entire chain. Each leaf is hash(entity_id || balance || nonce || stake).
     The leaves are sorted by entity_id for determinism.
+
+    Scaling note: this is O(N log N) in the total account count because
+    every block recomputes the root from scratch. Each block creation and
+    each block validation pay this cost in full. At ~1M accounts the
+    recomputation dominates block processing; at ~10M it makes IBD
+    impractical. The correct long-term fix is an incremental Merkle
+    Patricia Trie that only touches modified leaves per block, matching
+    Ethereum's state trie. That is a structural change tracked as a
+    follow-up. Until it lands, operators should watch
+    `len(balances)` — if it approaches STATE_ROOT_WARN_THRESHOLD the
+    function emits a log warning so the scaling limit is not a surprise.
     """
     if not balances:
         return _hash(b"empty_state")
+
+    # Soft warning at ~100K accounts. Chosen because on commodity hardware
+    # the full recomputation starts to noticeably eat into a target
+    # block-production budget around there (a few hundred milliseconds).
+    # Not a hard error — just a loud hint to operators that the current
+    # state-commitment implementation is approaching its ceiling.
+    if len(balances) > STATE_ROOT_WARN_THRESHOLD:
+        import logging
+        logging.getLogger(__name__).warning(
+            "compute_state_root: %d accounts is near the scaling limit "
+            "of the full-rebuild Merkle commitment. Migration to an "
+            "incremental Merkle Patricia Trie is required before N grows "
+            "much larger — every block pays O(N log N) in full.",
+            len(balances),
+        )
 
     leaves = []
     for entity_id in sorted(balances.keys()):

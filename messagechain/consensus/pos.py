@@ -204,12 +204,19 @@ class ProofOfStake:
         state_root: bytes = b"\x00" * 32,
         attestations: list[Attestation] | None = None,
         transfer_transactions: list | None = None,
+        slash_transactions: list | None = None,
         timestamp: float | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
         Attestations are votes for the parent block (prev_block), collected
         from validators after the parent was proposed.
+
+        slash_transactions (if any) are committed into the merkle_root so
+        that a byzantine relayer cannot strip them from the block without
+        invalidating the proposer's signature. Previously, slash_transactions
+        were attached post-signing and not cryptographically bound — any
+        relay node could drop them in transit.
         """
         # Apply both tx count cap and message byte budget.
         # Byte budget ensures large messages compete for limited space.
@@ -222,7 +229,12 @@ class ProofOfStake:
             txs.append(tx)
             msg_bytes_used += tx_msg_size
         transfer_txs = (transfer_transactions or [])[:MAX_TXS_PER_BLOCK]
-        tx_hashes = [tx.tx_hash for tx in txs] + [tx.tx_hash for tx in transfer_txs]
+        slash_txs = list(slash_transactions or [])
+        tx_hashes = (
+            [tx.tx_hash for tx in txs]
+            + [tx.tx_hash for tx in transfer_txs]
+            + [tx.tx_hash for tx in slash_txs]
+        )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
         header = BlockHeader(
@@ -254,6 +266,7 @@ class ProofOfStake:
             transactions=txs,
             attestations=attestations or [],
             transfer_transactions=transfer_txs,
+            slash_transactions=slash_txs,
         )
         block.block_hash = block._compute_hash()
         return block

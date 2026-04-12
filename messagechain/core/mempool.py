@@ -39,6 +39,17 @@ class Mempool:
         # Orphan pool: holds txs with future nonces (out-of-order arrival)
         self.orphan_pool: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
         self._orphan_sender_counts: dict[bytes, int] = defaultdict(int)
+        # Slash pool: holds SlashTransactions received via ANNOUNCE_SLASH
+        # gossip so the next time *this* node proposes a block, it can
+        # include them. Without this pool, slash txs validated and relayed
+        # by non-proposer witnesses are never included in any block — the
+        # slashing finder's-reward incentive collapses because only the
+        # witness who happens to be the next proposer can collect.
+        self.slash_pool: dict[bytes, object] = {}  # tx_hash -> SlashTransaction
+        # Hard cap on the slash pool. Slash txs are small and rare; a
+        # cap this low is generous but keeps this from becoming a DoS
+        # vector if an attacker spams fake slash announcements.
+        self.slash_pool_max_size: int = 1000
 
     def add_transaction(self, tx: MessageTransaction) -> bool:
         """
@@ -270,6 +281,33 @@ class Mempool:
             if self._orphan_sender_counts[tx.entity_id] == 0:
                 del self._orphan_sender_counts[tx.entity_id]
         return len(expired)
+
+    def add_slash_transaction(self, slash_tx) -> bool:
+        """Add a validated SlashTransaction to the slash pool.
+
+        Returns True on insertion, False if the tx is already present or
+        the pool is full. The pool is intentionally simple — slash txs
+        are rare and high-value, so we accept strict FIFO (refuse new
+        entries when full) rather than build another eviction scheme.
+        """
+        if slash_tx.tx_hash in self.slash_pool:
+            return False
+        if len(self.slash_pool) >= self.slash_pool_max_size:
+            return False
+        self.slash_pool[slash_tx.tx_hash] = slash_tx
+        return True
+
+    def get_slash_transactions(self, max_count: int | None = None) -> list:
+        """Return pending slash transactions for inclusion in a new block."""
+        items = list(self.slash_pool.values())
+        if max_count is not None:
+            items = items[:max_count]
+        return items
+
+    def remove_slash_transactions(self, tx_hashes: list[bytes]):
+        """Remove slash txs after they've been included in a block."""
+        for h in tx_hashes:
+            self.slash_pool.pop(h, None)
 
     @property
     def size(self) -> int:

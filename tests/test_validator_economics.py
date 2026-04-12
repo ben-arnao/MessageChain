@@ -398,10 +398,22 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
         self.assertGreater(bob_after, bob_before)
         self.assertGreater(carol_after, carol_before)
 
-        # Bob staked 3x more, should get ~3x more attestation reward
+        # Bob staked 3x more and should get a strictly larger attestation
+        # reward than Carol. The exact ratio depends on whether Bob is
+        # also the proposer — if so, the proposer-reward cap claws back
+        # part of his combined share, compressing the ratio below 3:1.
+        # The directional invariant (bob_gain > carol_gain) holds either
+        # way; a strict 3:1 assertion is only meaningful when neither
+        # attestor is the proposer.
         bob_gain = bob_after - bob_before
         carol_gain = carol_after - carol_before
-        if carol_gain > 0:
+        self.assertGreater(
+            bob_gain, carol_gain,
+            "higher stake should produce strictly higher attestation reward",
+        )
+        # When Bob is not the proposer, his full 3/4 share is preserved
+        # and the ratio should be near 3:1.
+        if proposer2.entity_id != self.bob.entity_id and carol_gain > 0:
             ratio = bob_gain / carol_gain
             self.assertAlmostEqual(ratio, 3.0, delta=1.0)
 

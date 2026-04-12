@@ -48,6 +48,7 @@ from messagechain.core.transfer import (
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
 )
+from messagechain.consensus.checkpoint import load_checkpoints_file
 from messagechain.network.peer import Peer, ConnectionType
 from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
@@ -120,11 +121,20 @@ class Server:
         )
         self.anchor_store = AnchorStore(anchor_path)
 
-        # IBD / sync — with weak-subjectivity checkpoints + offense callback
+        # IBD / sync — checkpoints come from data_dir/checkpoints.json
+        # (operator-shipped) plus the TRUSTED_CHECKPOINTS config.
+        checkpoints = list(TRUSTED_CHECKPOINTS)
+        if data_dir:
+            cp_path = _os.path.join(data_dir, "checkpoints.json")
+            file_cps = load_checkpoints_file(cp_path)
+            by_height = {cp.block_number: cp for cp in checkpoints}
+            for cp in file_cps:
+                by_height[cp.block_number] = cp
+            checkpoints = list(by_height.values())
         self.syncer = ChainSyncer(
             self.blockchain,
             self._get_peer_writer,
-            trusted_checkpoints=list(TRUSTED_CHECKPOINTS),
+            trusted_checkpoints=checkpoints,
             on_peer_offense=self._on_sync_offense,
         )
 
@@ -156,6 +166,19 @@ class Server:
         """Our best-tip cumulative stake weight, for handshakes."""
         best = self.blockchain.fork_choice.get_best_tip()
         return best[2] if best else 0
+
+    def _accept_peer_weight(self, claimed: int) -> int:
+        """Sanity-cap a peer-reported cumulative weight. See Node._accept_peer_weight."""
+        from messagechain.network.node import (
+            PEER_WEIGHT_CAP_MULTIPLIER, PEER_WEIGHT_CAP_FLOOR,
+        )
+        if not isinstance(claimed, int) or claimed < 0:
+            return 0
+        cap = max(
+            PEER_WEIGHT_CAP_FLOOR,
+            self._current_cumulative_weight() * PEER_WEIGHT_CAP_MULTIPLIER,
+        )
+        return min(claimed, cap)
 
     def _next_connection_type(self) -> ConnectionType:
         """Decide the ConnectionType for the next outbound slot."""
@@ -706,16 +729,22 @@ class Server:
         all_pending = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
         txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
         transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
+        slash_txs = self.mempool.get_slash_transactions()
 
         block = self.blockchain.propose_block(
             self.consensus, self.wallet_entity, txs,
             transfer_transactions=transfer_txs,
+            slash_transactions=slash_txs,
         )
 
         success, reason = self.blockchain.add_block(block)
         if success:
             if all_pending:
                 self.mempool.remove_transactions([tx.tx_hash for tx in all_pending])
+            if slash_txs:
+                self.mempool.remove_slash_transactions(
+                    [s.tx_hash for s in slash_txs]
+                )
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(
@@ -760,16 +789,13 @@ class Server:
     # ── P2P Network ─────────────────────────────────────────────────
 
     def _msg_category(self, msg_type: MessageType) -> str:
-        """Map message type to rate limit category."""
-        if msg_type in (MessageType.ANNOUNCE_TX, MessageType.INV, MessageType.GETDATA):
-            return "tx"
-        if msg_type in (MessageType.REQUEST_BLOCKS_BATCH,):
-            return "block_req"
-        if msg_type == MessageType.REQUEST_HEADERS:
-            return "headers_req"
-        if msg_type == MessageType.PEER_LIST:
-            return "addr"
-        return "general"
+        """Map message type to rate limit category.
+
+        Delegates to the shared dispatch module so Node and Server can
+        never drift on rate-limit policy (they did in the past).
+        """
+        from messagechain.network.dispatch import message_category
+        return message_category(msg_type)
 
     async def _handle_p2p_connection(self, reader, writer):
         addr = writer.get_extra_info("peername")
@@ -853,12 +879,13 @@ class Server:
             # Track peer height AND cumulative weight for sync
             peer_height = msg.payload.get("chain_height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            peer_weight = msg.payload.get("cumulative_weight", 0)
-            if not isinstance(peer_weight, int) or peer_weight < 0:
+            peer_weight_raw = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(peer_weight_raw, int) or peer_weight_raw < 0:
                 self.ban_manager.record_offense(
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_cumulative_weight"
                 )
                 return
+            peer_weight = self._accept_peer_weight(peer_weight_raw)
             self.syncer.update_peer_height(
                 peer.address, peer_height, best_hash,
                 cumulative_weight=peer_weight,
@@ -909,9 +936,7 @@ class Server:
         elif msg.msg_type == MessageType.RESPONSE_CHAIN_HEIGHT:
             height = msg.payload.get("height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            weight = msg.payload.get("cumulative_weight", 0)
-            if not isinstance(weight, int) or weight < 0:
-                weight = 0
+            weight = self._accept_peer_weight(msg.payload.get("cumulative_weight", 0))
             self.syncer.update_peer_height(
                 peer.address, height, best_hash, cumulative_weight=weight,
             )
@@ -971,7 +996,11 @@ class Server:
         await self._broadcast(relay_msg)
 
     async def _handle_announce_slash(self, payload: dict, peer: Peer):
-        """Handle incoming slashing evidence gossip."""
+        """Handle incoming slashing evidence gossip.
+
+        Pools the slash tx so this node includes it in its next proposed
+        block, then relays to peers (only on first sight, to avoid loops).
+        """
         try:
             slash_tx = SlashTx.deserialize(payload)
         except Exception:
@@ -985,10 +1014,15 @@ class Server:
             logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
             return
 
-        logger.info(f"Received valid slashing evidence against {slash_tx.evidence.offender_id.hex()[:16]}")
+        logger.info(
+            f"Received valid slashing evidence against "
+            f"{slash_tx.evidence.offender_id.hex()[:16]}"
+        )
 
-        relay_msg = NetworkMessage(MessageType.ANNOUNCE_SLASH, payload)
-        await self._broadcast(relay_msg)
+        added = self.mempool.add_slash_transaction(slash_tx)
+        if added:
+            relay_msg = NetworkMessage(MessageType.ANNOUNCE_SLASH, payload)
+            await self._broadcast(relay_msg)
 
     # ── inv/getdata relay ──────────────────────────────────────────
 

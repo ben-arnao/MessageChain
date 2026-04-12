@@ -95,6 +95,14 @@ class Blockchain:
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
+        # Per-block stake snapshots. Maps block_number -> {validator_id: stake}
+        # as of the END of that block. Used when processing attestations
+        # (which vote for block N-1 but arrive bundled in block N) so the
+        # 2/3 finality denominator is pinned to the stake set that existed
+        # at the attestation's target block, not the post-churn live set.
+        # Bounded to the last STAKE_SNAPSHOT_RETENTION blocks to cap memory.
+        self._stake_snapshots: dict[int, dict[bytes, int]] = {}
+        self._stake_snapshot_retention: int = 1024
         # Immature block rewards: list of (block_height, proposer_id, reward_amount)
         self._immature_rewards: list[tuple[int, bytes, int]] = []
         # Orphan block pool: blocks whose parent is not yet known (bounded)
@@ -165,6 +173,14 @@ class Blockchain:
         # Restore fork choice tips
         for tip_hash_db, tip_num, tip_w in self.db.get_all_tips():
             self.fork_choice.add_tip(tip_hash_db, tip_num, tip_w)
+
+        # Pin a single stake snapshot at the loaded tip so ongoing
+        # finality processing after load has a correct denominator for
+        # the next block's attestations. We can't reconstruct full
+        # historical snapshots from a cold load, but the tip's snapshot
+        # is all the next block needs.
+        if self.chain:
+            self._record_stake_snapshot(self.chain[-1].header.block_number)
 
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
 
@@ -259,6 +275,10 @@ class Blockchain:
 
         # Track as chain tip
         self.fork_choice.add_tip(genesis_block.block_hash, 0, 0)
+
+        # Pin stake snapshot at genesis so the first post-genesis block's
+        # attestations (which vote for block 0) can consult it.
+        self._record_stake_snapshot(0)
 
         # Persist
         if self.db is not None:
@@ -701,6 +721,7 @@ class Blockchain:
         transactions: list[MessageTransaction],
         attestations: list[Attestation] | None = None,
         transfer_transactions: list[TransferTransaction] | None = None,
+        slash_transactions: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -731,6 +752,7 @@ class Blockchain:
             proposer_entity, transactions, prev,
             state_root=state_root, attestations=attestations,
             transfer_transactions=transfer_transactions,
+            slash_transactions=slash_transactions,
             timestamp=timestamp,
         )
 
@@ -772,16 +794,41 @@ class Blockchain:
 
         When a block accumulates 2/3+ of stake in attestations, it becomes
         finalized and can never be reverted by a reorg.
+
+        Attestations in block N vote for block N-1. The 2/3 check must use
+        the stake map pinned at the END of block N-1, not the live stake
+        that already reflects block N's transactions. Without pinning,
+        validator churn between N-1 and N corrupts both the numerator
+        (ghost stake still counted) and the denominator (validators who
+        unstaked make the threshold artificially easier or harder to hit).
+        We consult _stake_snapshots[N-1] and fall back to `stakes` only
+        when no snapshot is available (bootstrap / loaded-from-db edge).
         """
-        total_stake = sum(stakes.values())
         for att in block.attestations:
-            validator_stake = stakes.get(att.validator_id, 0)
+            target_block = att.block_number
+            pinned = self._stake_snapshots.get(target_block)
+            if pinned is not None:
+                stakes_for_att = pinned
+            else:
+                stakes_for_att = stakes
+            validator_stake = stakes_for_att.get(att.validator_id, 0)
+            total_stake = sum(stakes_for_att.values())
             justified = self.finality.add_attestation(att, validator_stake, total_stake)
             if justified:
                 logger.info(
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
                 )
+
+    def _record_stake_snapshot(self, block_number: int):
+        """Pin the current stake map for a block. See _process_attestations."""
+        self._stake_snapshots[block_number] = dict(self.supply.staked)
+        # Prune old snapshots past retention window
+        if len(self._stake_snapshots) > self._stake_snapshot_retention:
+            cutoff = block_number - self._stake_snapshot_retention
+            stale = [n for n in self._stake_snapshots if n < cutoff]
+            for n in stale:
+                del self._stake_snapshots[n]
 
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
@@ -834,8 +881,14 @@ class Blockchain:
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
-        # Verify merkle root (includes message + transfer tx hashes)
-        tx_hashes = [tx.tx_hash for tx in all_txs]
+        # Verify merkle root. Includes message txs, transfer txs, AND
+        # slash txs — committing slash txs cryptographically prevents a
+        # byzantine relayer from stripping them in transit (previously a
+        # real gap: slash_transactions lived outside merkle_root).
+        tx_hashes = (
+            [tx.tx_hash for tx in all_txs]
+            + [tx.tx_hash for tx in block.slash_transactions]
+        )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
@@ -1000,7 +1053,10 @@ class Blockchain:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
 
         all_txs = list(block.transactions) + list(block.transfer_transactions)
-        tx_hashes = [tx.tx_hash for tx in all_txs]
+        tx_hashes = (
+            [tx.tx_hash for tx in all_txs]
+            + [tx.tx_hash for tx in block.slash_transactions]
+        )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
@@ -1226,8 +1282,14 @@ class Blockchain:
         self.fork_choice.remove_tip(old_tip)
         self.fork_choice.add_tip(block.block_hash, block.header.block_number, new_weight)
 
-        # Process attestations for finality
+        # Process attestations for finality — uses pinned snapshot for
+        # the attestations' target block (N-1) rather than the live
+        # post-N stake to avoid validator churn corrupting the 2/3 check.
         self._process_attestations(block, self.supply.staked)
+
+        # Pin the stake snapshot for this block so the NEXT block's
+        # attestations (which will target this block) can consult it.
+        self._record_stake_snapshot(block.header.block_number)
 
         # Persist
         if self.db is not None:

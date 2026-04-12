@@ -35,6 +35,11 @@ LIFETIME_BAN_MULTIPLIER = 2
 # Offense severities (same scale as Bitcoin Core)
 OFFENSE_INVALID_BLOCK = 100       # instant ban
 OFFENSE_INVALID_TX = 100          # instant ban
+# Serving a header at a known weak-subjectivity checkpoint height with a
+# different hash is unambiguous history-forging. There is no honest
+# reason to do this once, so there is no reason to tolerate it once.
+# Matches Bitcoin Core's instant-disconnect policy for checkpoint lies.
+OFFENSE_CHECKPOINT_VIOLATION = 100
 OFFENSE_INVALID_HEADERS = 50
 OFFENSE_UNREQUESTED_DATA = 20
 OFFENSE_PROTOCOL_VIOLATION = 10

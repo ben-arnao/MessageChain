@@ -13,7 +13,11 @@ Any chain that doesn't match the checkpoint at the specified height is rejected.
 This is the same approach used by Ethereum's Beacon Chain.
 """
 
+import json
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -67,6 +71,45 @@ def create_checkpoint(chain, block_number: int) -> WeakSubjectivityCheckpoint:
         block_hash=block.block_hash,
         state_root=block.header.state_root,
     )
+
+
+def load_checkpoints_file(path: str) -> list[WeakSubjectivityCheckpoint]:
+    """Load trusted weak-subjectivity checkpoints from a JSON file.
+
+    Operators ship this file out-of-band (e.g., alongside release binaries,
+    fetched from a trusted source, or distributed via signed update).
+    Trust anchors in "operator placed this file here" — the loader does
+    not verify signatures on the file itself; that's a deployment concern.
+
+    File format: a JSON array of objects, each with fields
+        {"block_number": int, "block_hash": hex, "state_root": hex}
+
+    Returns an empty list on missing/malformed files so a first-run node
+    still starts successfully — the operator is responsible for noticing
+    that checkpoints are absent and populating them.
+    """
+    try:
+        with open(path, "r") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return []
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to read checkpoints file {path}: {e}")
+        return []
+
+    if not isinstance(raw, list):
+        logger.warning(f"Checkpoints file {path}: expected a JSON array")
+        return []
+
+    result: list[WeakSubjectivityCheckpoint] = []
+    for entry in raw:
+        try:
+            result.append(WeakSubjectivityCheckpoint.deserialize(entry))
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning(f"Skipping malformed checkpoint entry: {e}")
+            continue
+    logger.info(f"Loaded {len(result)} trusted checkpoint(s) from {path}")
+    return result
 
 
 def validate_checkpoint(chain, checkpoint: WeakSubjectivityCheckpoint) -> bool:

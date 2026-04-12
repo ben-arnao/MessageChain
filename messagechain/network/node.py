@@ -33,10 +33,23 @@ from messagechain.consensus.pos import ProofOfStake
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message
 )
+from messagechain.consensus.checkpoint import (
+    WeakSubjectivityCheckpoint, load_checkpoints_file,
+)
 from messagechain.network.peer import Peer, ConnectionType
 from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
+
+# Plausibility cap on peer-reported cumulative weight. A peer can legitimately
+# be ahead of us, but not by more than this multiplier — otherwise they're
+# probably lying to hijack sync selection. Floor ensures a bootstrapping
+# node with zero weight can still accept a neighbor claiming reasonable
+# progress.
+PEER_WEIGHT_CAP_MULTIPLIER = 4      # accept up to 4x our own weight
+PEER_WEIGHT_CAP_FLOOR = 1_000_000   # but always allow at least this much
+# Cadence of the outbound-maintenance task — dials missing slots from addrman.
+OUTBOUND_MAINTAIN_INTERVAL = 30     # seconds
 from messagechain.consensus.attestation import Attestation, verify_attestation
 from messagechain.consensus.slashing import (
     SlashTransaction, verify_slashing_evidence, verify_attestation_slashing_evidence,
@@ -89,10 +102,25 @@ class Node:
 
         # IBD / sync — receives trusted checkpoints + a misbehavior callback
         # so checkpoint violations and stalls are actually penalized.
+        # Checkpoints come from two sources:
+        #   1. A JSON file (checkpoints.json) in data_dir — ship alongside
+        #      the release, or distribute out-of-band to operators.
+        #   2. The TRUSTED_CHECKPOINTS config tuple (embedded at build).
+        # File entries override config entries on block_number collision.
+        checkpoints = list(TRUSTED_CHECKPOINTS)
+        if data_dir:
+            cp_path = os.path.join(data_dir, "checkpoints.json")
+            file_cps = load_checkpoints_file(cp_path)
+            # Replace any config entry with a file entry at the same height
+            by_height = {cp.block_number: cp for cp in checkpoints}
+            for cp in file_cps:
+                by_height[cp.block_number] = cp
+            checkpoints = list(by_height.values())
+
         self.syncer = ChainSyncer(
             self.blockchain,
             self._get_peer_writer,
-            trusted_checkpoints=list(TRUSTED_CHECKPOINTS),
+            trusted_checkpoints=checkpoints,
             on_peer_offense=self._on_sync_offense,
         )
 
@@ -107,6 +135,59 @@ class Node:
         """Our node's best-tip cumulative stake weight, for handshakes."""
         best = self.blockchain.fork_choice.get_best_tip()
         return best[2] if best else 0
+
+    def _accept_peer_weight(self, claimed: int) -> int:
+        """Sanity-cap a peer-reported cumulative weight before trusting it.
+
+        Without a cap, a malicious peer can claim INT_MAX to always win
+        sync-peer selection; the stall penalty eventually catches them,
+        but each lie costs ~SYNC_STALE_TIMEOUT seconds of wasted IBD.
+        We bound the accepted value at max(floor, k * our_weight) so a
+        fresh node can still catch up from near-zero weight, but can't
+        be tricked into picking an attacker who claims astronomical
+        progress. The weak-subjectivity checkpoint is the real defense;
+        this is belt-and-suspenders for when checkpoints haven't yet
+        been crossed.
+        """
+        if not isinstance(claimed, int) or claimed < 0:
+            return 0
+        cap = max(
+            PEER_WEIGHT_CAP_FLOOR,
+            self._current_cumulative_weight() * PEER_WEIGHT_CAP_MULTIPLIER,
+        )
+        return min(claimed, cap)
+
+    async def _maintain_outbound_peers(self):
+        """Single tick of outbound-slot maintenance.
+
+        Pulls candidates from addrman.select_addresses and dials any
+        that fill open outbound slots. This is what *actually* gates
+        outbound connection decisions — PEER_LIST only populates
+        addrman, it does not control who we dial. An attacker flooding
+        PEER_LIST therefore cannot force us to connect to attacker-
+        chosen IPs; at worst it pollutes addrman, where Sybil bucketing
+        and per-source caps constrain the damage.
+        """
+        needed = MAX_PEERS - sum(1 for p in self.peers.values() if p.is_connected)
+        if needed <= 0:
+            return
+        candidates = self.addrman.select_addresses(needed)
+        for host, port in candidates:
+            addr = f"{host}:{port}"
+            if addr in self.peers and self.peers[addr].is_connected:
+                continue
+            if self.ban_manager.is_banned(addr):
+                continue
+            await self._connect_to_peer(host, port)
+
+    async def _outbound_maintenance_loop(self):
+        """Periodic background task that refills outbound slots."""
+        while self._running:
+            try:
+                await self._maintain_outbound_peers()
+            except Exception as e:
+                logger.debug(f"Outbound maintenance tick failed: {e}")
+            await asyncio.sleep(OUTBOUND_MAINTAIN_INTERVAL)
 
     def _next_connection_type(self) -> ConnectionType:
         """Decide the ConnectionType for the next outbound slot.
@@ -184,6 +265,12 @@ class Node:
 
         # Start sync check loop
         asyncio.create_task(self._sync_loop())
+
+        # Start outbound-slot maintenance — pulls candidates from addrman
+        # and fills open outbound slots. This is the only path that dials
+        # peers discovered via gossip, so PEER_LIST flooding cannot force
+        # direct connections to attacker-chosen IPs.
+        asyncio.create_task(self._outbound_maintenance_loop())
 
     async def stop(self):
         self._running = False
@@ -351,12 +438,14 @@ class Node:
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_best_hash"
                 )
                 return
-            peer_weight = msg.payload.get("cumulative_weight", 0)
-            if not isinstance(peer_weight, int) or peer_weight < 0:
+            peer_weight_raw = msg.payload.get("cumulative_weight", 0)
+            if not isinstance(peer_weight_raw, int) or peer_weight_raw < 0:
                 self.ban_manager.record_offense(
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_cumulative_weight"
                 )
                 return
+            # Sanity-cap the claim — see _accept_peer_weight.
+            peer_weight = self._accept_peer_weight(peer_weight_raw)
 
             peer.entity_id = sender_id
             self.peers[peer.address] = peer
@@ -446,18 +535,21 @@ class Node:
         elif msg.msg_type == MessageType.RESPONSE_CHAIN_HEIGHT:
             height = msg.payload.get("height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
-            weight = msg.payload.get("cumulative_weight", 0)
-            if not isinstance(weight, int) or weight < 0:
-                weight = 0
+            weight_raw = msg.payload.get("cumulative_weight", 0)
+            weight = self._accept_peer_weight(weight_raw)
             self.syncer.update_peer_height(
                 peer.address, height, best_hash, cumulative_weight=weight,
             )
 
         elif msg.msg_type == MessageType.PEER_LIST:
-            # Route announced addresses through AddressManager (Sybil/bucket
-            # defenses) and treat the sending peer's IP as the source. The
-            # per-source cap + bucketing prevents a single peer from
-            # dominating the address table (eclipse prep primitive).
+            # PEER_LIST only populates addrman — it does NOT schedule
+            # outbound dials directly. Dialing decisions are owned by the
+            # _outbound_maintenance_loop, which pulls candidates from
+            # addrman.select_addresses. This prevents an attacker from
+            # forcing our outbound connections to attacker-chosen IPs
+            # simply by flooding PEER_LIST. Even after addrman.add_address
+            # Sybil bucketing accepts a malicious entry, Bucket selection +
+            # tried-table preference make it unlikely to be picked.
             source_ip = peer.host or address.rsplit(":", 1)[0]
             for p_info in msg.payload.get("peers", []):
                 host = p_info.get("host", "")
@@ -465,12 +557,7 @@ class Node:
                 # M1: Validate peer addresses — reject private/invalid IPs
                 if not self._is_valid_peer_address(host, port):
                     continue
-                # addrman first — it may reject on Sybil grounds
                 self.addrman.add_address(host, port, source_ip)
-                addr_str = f"{host}:{port}"
-                if addr_str not in self.peers and len(self.peers) < MAX_PEERS:
-                    if not self.ban_manager.is_banned(addr_str):
-                        asyncio.create_task(self._connect_to_peer(host, port))
 
         # ── IBD / Sync Protocol Messages ──────────────────────────
 
@@ -543,18 +630,13 @@ class Node:
         return True
 
     def _msg_category(self, msg_type: MessageType) -> str:
-        """Map message type to rate limit category."""
-        if msg_type in (MessageType.ANNOUNCE_TX, MessageType.INV, MessageType.GETDATA):
-            return "tx"
-        if msg_type in (MessageType.REQUEST_BLOCK, MessageType.REQUEST_BLOCKS_BATCH):
-            return "block_req"
-        if msg_type == MessageType.REQUEST_HEADERS:
-            return "headers_req"
-        if msg_type == MessageType.PEER_LIST:
-            # ADDR-equivalent — must be strictly throttled to prevent
-            # eclipse-prep attacks via flooded peer lists (BTC #22387).
-            return "addr"
-        return "general"
+        """Map message type to rate limit category.
+
+        Delegates to the shared dispatch module so Node and Server can
+        never drift on rate-limit policy (they did in the past).
+        """
+        from messagechain.network.dispatch import message_category
+        return message_category(msg_type)
 
     # ── inv/getdata relay ──────────────────────────────────────────
 
@@ -695,7 +777,12 @@ class Node:
     async def _handle_announce_slash(self, payload: dict, peer: Peer):
         """Handle incoming slashing evidence gossip.
 
-        Validates the evidence and submits it as a slash transaction if valid.
+        Validates the evidence, stores it in the mempool's slash pool so
+        that the next time this node proposes a block the slash is
+        actually included, and relays to other peers. Without the pool
+        step, slash txs were being validated and gossiped forever but
+        never landing in any block — breaking the finder's-reward
+        incentive that makes third-party slashing viable at all.
         """
         try:
             slash_tx = SlashTransaction.deserialize(payload)
@@ -711,15 +798,22 @@ class Node:
             logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
             return
 
-        logger.info(f"Received valid slashing evidence against {slash_tx.evidence.offender_id.hex()[:16]}")
-
-        # Relay to other peers
-        relay_msg = NetworkMessage(
-            msg_type=MessageType.ANNOUNCE_SLASH,
-            payload=payload,
-            sender_id=self.entity.entity_id_hex,
+        logger.info(
+            f"Received valid slashing evidence against "
+            f"{slash_tx.evidence.offender_id.hex()[:16]}"
         )
-        await self._broadcast(relay_msg, exclude=peer.address)
+
+        # Pool it for inclusion in our next block
+        added = self.mempool.add_slash_transaction(slash_tx)
+
+        # Relay to other peers only on first sight to avoid gossip loops
+        if added:
+            relay_msg = NetworkMessage(
+                msg_type=MessageType.ANNOUNCE_SLASH,
+                payload=payload,
+                sender_id=self.entity.entity_id_hex,
+            )
+            await self._broadcast(relay_msg, exclude=peer.address)
 
     # ── Existing handlers ─────────────────────────────────────────
 
@@ -839,12 +933,24 @@ class Node:
         # Build and broadcast block. Empty mempool is fine — empty blocks
         # serve as heartbeat and carry attestations for the parent.
         txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
-        block = self.blockchain.propose_block(self.consensus, self.entity, txs)
+        # Pull any pending slash transactions received via ANNOUNCE_SLASH
+        # gossip. Including them is the path by which third-party witnesses
+        # collect the finder's reward — without this, slash txs relayed by
+        # a non-proposer witness never land in any block.
+        slash_txs = self.mempool.get_slash_transactions()
+        block = self.blockchain.propose_block(
+            self.consensus, self.entity, txs,
+            slash_transactions=slash_txs,
+        )
 
         success, reason = self.blockchain.add_block(block)
         if success:
             if txs:
                 self.mempool.remove_transactions([tx.tx_hash for tx in txs])
+            if slash_txs:
+                self.mempool.remove_slash_transactions(
+                    [s.tx_hash for s in slash_txs]
+                )
             logger.info(
                 f"Proposed block #{block.header.block_number} with {len(txs)} txs "
                 f"(round {round_number})"

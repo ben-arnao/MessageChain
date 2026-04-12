@@ -374,10 +374,13 @@ class TestSlashTransaction(unittest.TestCase):
             sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
         state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)
 
-        block = consensus.create_block(proposer_entity, [], prev, state_root=state_root)
-        block.slash_transactions = [slash_tx]
-        # Recompute hash after modifying slash_transactions
-        block.block_hash = block._compute_hash()
+        # Slash txs are now committed in the merkle_root, so they must be
+        # passed at construction time — post-hoc attachment would break
+        # the merkle_root / proposer_signature invariant.
+        block = consensus.create_block(
+            proposer_entity, [], prev, state_root=state_root,
+            slash_transactions=[slash_tx],
+        )
 
         success, msg = self.chain.add_block(block)
         self.assertTrue(success, msg)
