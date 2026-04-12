@@ -228,9 +228,9 @@ class TestGovernanceTracker(unittest.TestCase):
         self.tracker.add_vote(vote_no, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Passive entities (alice=1000, dave=4000) default-delegate by sqrt
-        self.assertEqual(yes_weight, 5757)
-        self.assertEqual(total_weight, 10000)
+        # Only direct voters count: carol(3000) yes, bob(2000) no
+        self.assertEqual(yes_weight, 3000)
+        self.assertEqual(total_weight, 5000)
 
     def test_tally_records_majority_no(self):
         """Tally correctly records when majority of stake voted no."""
@@ -240,9 +240,9 @@ class TestGovernanceTracker(unittest.TestCase):
         self.tracker.add_vote(vote_no, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Passive entities (alice=1000, dave=4000) default-delegate by sqrt
-        self.assertEqual(yes_weight, 4243)
-        self.assertEqual(total_weight, 10000)
+        # Only direct voters count: bob(2000) yes, carol(3000) no
+        self.assertEqual(yes_weight, 2000)
+        self.assertEqual(total_weight, 5000)
 
     def test_no_votes_zero_weight(self):
         """Proposal with no votes has zero total weight."""
@@ -292,9 +292,9 @@ class TestStakeSnapshot(unittest.TestCase):
 
         yes_weight, total_weight = self.tracker.tally(proposal_tx.proposal_id)
         # Should use snapshot value (3000), not live value (9000)
-        # Bob (1000 in snapshot) is passive, default-delegates to alice
-        self.assertEqual(yes_weight, 4000)
-        self.assertEqual(total_weight, 4000)
+        # Bob is passive — not counted (no default delegation)
+        self.assertEqual(yes_weight, 3000)
+        self.assertEqual(total_weight, 3000)
 
     def test_late_staker_cannot_swing_vote(self):
         """Entity that stakes after proposal creation has zero voting power."""
@@ -310,8 +310,8 @@ class TestStakeSnapshot(unittest.TestCase):
 
         yes_weight, _ = self.tracker.tally(proposal_tx.proposal_id)
         # Should use snapshot value (1000), not inflated value
-        # Alice (3000 in snapshot) is passive, default-delegates to bob
-        self.assertEqual(yes_weight, 4000)
+        # Alice is passive — not counted (no default delegation)
+        self.assertEqual(yes_weight, 1000)
 
     def test_unstaker_keeps_snapshot_weight(self):
         """Entity that unstakes after proposal creation keeps snapshot voting power."""
@@ -326,8 +326,8 @@ class TestStakeSnapshot(unittest.TestCase):
 
         yes_weight, _ = self.tracker.tally(proposal_tx.proposal_id)
         # Should use snapshot value (3000), not current (0)
-        # Bob (1000 in snapshot) is passive, default-delegates to alice
-        self.assertEqual(yes_weight, 4000)
+        # Bob is passive — not counted (no default delegation)
+        self.assertEqual(yes_weight, 3000)
 
     def test_snapshot_captures_total_eligible_stake(self):
         """Proposal info includes total eligible stake from snapshot."""
@@ -366,8 +366,8 @@ class TestVoteWindowEnforcement(unittest.TestCase):
         self.assertTrue(accepted)
 
         yes_weight, _ = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Alice (1000) is passive, default-delegates to bob
-        self.assertEqual(yes_weight, 2000)
+        # Alice is passive — not counted (no default delegation)
+        self.assertEqual(yes_weight, 1000)
 
     def test_vote_after_window_rejected(self):
         """Vote after window closes is rejected."""
@@ -430,9 +430,9 @@ class TestVoteImmutability(unittest.TestCase):
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
         # Original yes vote preserved, not overwritten to no
-        # Bob (1000) is passive, default-delegates to alice
-        self.assertEqual(yes_weight, 6000)
-        self.assertEqual(total_weight, 6000)
+        # Bob is passive — not counted (no default delegation)
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 5000)
 
     def test_different_entities_can_vote(self):
         """Different entities can still vote independently."""
@@ -491,9 +491,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Bob(500) + alice delegation(1000) + passive carol(3000) + dave(200)
-        self.assertEqual(yes_weight, 4700)
-        self.assertEqual(total_weight, 4700)
+        # Bob(500) + alice delegation(1000); carol & dave passive — not counted
+        self.assertEqual(yes_weight, 1500)
+        self.assertEqual(total_weight, 1500)
 
     def test_direct_vote_overrides_delegation(self):
         """If delegator votes directly, their delegation is ignored."""
@@ -505,12 +505,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote_alice, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Bob(500) direct yes + passive carol(3000) & dave(200) sqrt-distributed
-        # Alice(1000) voted no directly (overrides delegation). Allow ±2-token
-        # slack since the sqrt-remainder distribution depends on entity-id
-        # sort order, which changes when private-key seeds change.
-        self.assertAlmostEqual(yes_weight, 1828, delta=2)
-        self.assertEqual(total_weight, 4700)
+        # Bob(500) yes + Alice(1000) no (override); carol & dave passive — not counted
+        self.assertEqual(yes_weight, 500)
+        self.assertEqual(total_weight, 1500)
 
     def test_single_hop_only(self):
         """Delegation does NOT chain: A->B->C, A's weight only goes to B."""
@@ -521,10 +518,10 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Carol(3000) + bob explicit delegation(500) + dave(200) passive default
+        # Carol(3000) + bob explicit delegation(500); dave passive — not counted
         # Alice's delegation to bob is lost (bob didn't vote) — single-hop only
-        self.assertEqual(yes_weight, 3700)
-        self.assertEqual(total_weight, 3700)
+        self.assertEqual(yes_weight, 3500)
+        self.assertEqual(total_weight, 3500)
 
     def test_delegation_revocation(self):
         """Revoking delegation removes the delegator's weight from delegate."""
@@ -535,10 +532,10 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # After revocation, alice is passive (default-delegates by sqrt)
-        # Bob(500) + passive alice(1000) + carol(3000) + dave(200)
-        self.assertEqual(yes_weight, 4700)
-        self.assertEqual(total_weight, 4700)
+        # After revocation, alice is passive — not counted (no default delegation)
+        # Only Bob(500) direct vote counts
+        self.assertEqual(yes_weight, 500)
+        self.assertEqual(total_weight, 500)
 
     def test_multiple_delegators_to_same_delegate(self):
         """Multiple entities can delegate to the same person."""
@@ -549,9 +546,9 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Carol(3000) + alice delegation(1000) + dave delegation(200) + passive bob(500)
-        self.assertEqual(yes_weight, 4700)
-        self.assertEqual(total_weight, 4700)
+        # Carol(3000) + alice delegation(1000) + dave delegation(200); bob passive — not counted
+        self.assertEqual(yes_weight, 4200)
+        self.assertEqual(total_weight, 4200)
 
     def test_delegator_not_counted_if_delegate_didnt_vote(self):
         """If delegate doesn't vote, delegator's weight is not counted."""
@@ -561,10 +558,10 @@ class TestDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Carol(3000) + passive bob(500) + dave(200) default-delegate to carol
+        # Carol(3000) direct vote only; bob & dave passive — not counted
         # Alice explicitly delegated to bob, but bob didn't vote — not counted
-        self.assertEqual(yes_weight, 3700)
-        self.assertEqual(total_weight, 3700)
+        self.assertEqual(yes_weight, 3000)
+        self.assertEqual(total_weight, 3000)
 
 
 class TestGovernanceInfo(unittest.TestCase):

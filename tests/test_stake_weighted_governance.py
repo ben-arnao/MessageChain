@@ -69,9 +69,9 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Passive carol(3000) + dave(1000) default-delegate to bob
-        self.assertEqual(yes_weight, 9000)
-        self.assertEqual(total_weight, 9000)
+        # Only Bob's direct vote counts; carol & dave passive — not counted
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 5000)
 
     def test_stake_weighted_majority(self):
         """Tally reflects stake-weighted majority correctly."""
@@ -81,9 +81,9 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.tracker.add_vote(vote_no, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Passive dave(1000) sqrt-distributed to bob & carol (±1-token slack)
-        self.assertAlmostEqual(yes_weight, 5564, delta=1)
-        self.assertEqual(total_weight, 9000)
+        # Only direct voters: bob(5000) yes, carol(3000) no; dave passive — not counted
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 8000)
 
     def test_stake_weighted_rejection(self):
         """Tally reflects stake-weighted rejection correctly."""
@@ -93,10 +93,9 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.tracker.add_vote(vote_no, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Passive bob(5000) sqrt-distributed to dave & carol (remainder rounding
-        # depends on entity-id sort order, so allow a ±1-token slack)
-        self.assertAlmostEqual(yes_weight, 2824, delta=1)
-        self.assertEqual(total_weight, 9000)
+        # Only direct voters: dave(1000) yes, carol(3000) no; bob passive — not counted
+        self.assertEqual(yes_weight, 1000)
+        self.assertEqual(total_weight, 4000)
 
     def test_high_balance_low_stake_loses_to_low_balance_high_stake(self):
         """Balance is irrelevant — only stake determines voting power."""
@@ -106,9 +105,9 @@ class TestStakeWeightedVoting(unittest.TestCase):
         self.tracker.add_vote(vote_bob, current_block=101)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Alice has 0 stake, passive carol(3000) + dave(1000) go to bob
-        self.assertEqual(yes_weight, 9000)
-        self.assertEqual(total_weight, 9000)
+        # Alice has 0 stake (0 weight); Bob(5000) yes; carol & dave passive — not counted
+        self.assertEqual(yes_weight, 5000)
+        self.assertEqual(total_weight, 5000)
 
 
 class TestStakeWeightedDelegation(unittest.TestCase):
@@ -147,9 +146,9 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Bob(500) + alice delegation(2000) + passive carol(3000)
-        self.assertEqual(yes_weight, 5500)
-        self.assertEqual(total_weight, 5500)
+        # Bob(500) + alice delegation(2000); carol passive — not counted
+        self.assertEqual(yes_weight, 2500)
+        self.assertEqual(total_weight, 2500)
 
     def test_direct_vote_overrides_delegation_with_stake(self):
         """Direct vote uses voter's own stake, overriding delegation."""
@@ -161,9 +160,9 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         self.tracker.add_vote(vote_alice, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Bob(500) yes + alice(2000) no (override) + passive carol(3000) sqrt-distributed
-        self.assertEqual(yes_weight, 1500)
-        self.assertEqual(total_weight, 5500)
+        # Bob(500) yes + alice(2000) no (override); carol passive — not counted
+        self.assertEqual(yes_weight, 500)
+        self.assertEqual(total_weight, 2500)
 
     def test_unstaked_delegator_adds_zero_weight(self):
         """Delegator with no stake adds zero to delegate's voting power."""
@@ -182,9 +181,9 @@ class TestStakeWeightedDelegation(unittest.TestCase):
         self.tracker.add_vote(vote, current_block=51)
 
         yes_weight, total_weight = self.tracker.tally(self.proposal_tx.proposal_id)
-        # Carol(3000) + alice delegation(0) + passive bob(500)
-        self.assertEqual(yes_weight, 3500)
-        self.assertEqual(total_weight, 3500)
+        # Carol(3000) + alice delegation(0); bob passive — not counted
+        self.assertEqual(yes_weight, 3000)
+        self.assertEqual(total_weight, 3000)
 
 
 class TestStakeWeightedProposalStatus(unittest.TestCase):

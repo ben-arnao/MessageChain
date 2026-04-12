@@ -201,6 +201,31 @@ class TestTreasurySpend(unittest.TestCase):
         )
         self.assertFalse(verify_treasury_spend(tx, self.alice.public_key))
 
+    def _approve_treasury_spend(self, tracker, tx, chain):
+        """Helper: register treasury spend as proposal, vote yes, close window."""
+        from messagechain.config import GOVERNANCE_VOTING_WINDOW
+        from messagechain.governance.governance import (
+            VoteTransaction, ProposalTransaction,
+        )
+        # Register the spend as a proposal so execute can find it
+        proposal_block = 10
+        # Stake alice so she has voting power
+        chain.supply.staked[self.alice.entity_id] = chain.supply.get_balance(self.alice.entity_id)
+        tracker.add_proposal(tx, block_height=proposal_block, supply_tracker=chain.supply)
+        # Cast a yes vote from alice
+        vote = VoteTransaction(
+            voter_id=self.alice.entity_id,
+            proposal_id=tx.proposal_id,
+            approve=True,
+            timestamp=1.0,
+            fee=100,
+            signature=None,
+        )
+        vote.tx_hash = vote._compute_hash()
+        tracker.add_vote(vote, current_block=proposal_block + 1)
+        # Return a block number after the voting window closes
+        return proposal_block + GOVERNANCE_VOTING_WINDOW + 1
+
     def test_treasury_spend_rejects_exceeding_balance(self):
         """Cannot spend more than treasury holds."""
         from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
@@ -214,7 +239,8 @@ class TestTreasurySpend(unittest.TestCase):
             self.alice, self.bob.entity_id, TREASURY_ALLOCATION + 1,
             "Too much", "Exceeds treasury",
         )
-        result = tracker.execute_treasury_spend(tx, chain.supply)
+        closed_block = self._approve_treasury_spend(tracker, tx, chain)
+        result = tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block)
         self.assertFalse(result)
 
     def test_treasury_spend_executes_after_approval(self):
@@ -230,8 +256,8 @@ class TestTreasurySpend(unittest.TestCase):
             self.alice, self.bob.entity_id, 5000,
             "Fund dev", "Pay Bob",
         )
-        # Execute the spend (assumes governance approval already happened)
-        result = tracker.execute_treasury_spend(tx, chain.supply)
+        closed_block = self._approve_treasury_spend(tracker, tx, chain)
+        result = tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block)
         self.assertTrue(result)
         self.assertEqual(chain.supply.get_balance(self.bob.entity_id), 5000)
         self.assertEqual(
@@ -252,8 +278,9 @@ class TestTreasurySpend(unittest.TestCase):
             self.alice, self.bob.entity_id, 1000,
             "Fund dev", "Pay Bob",
         )
-        self.assertTrue(tracker.execute_treasury_spend(tx, chain.supply))
-        self.assertFalse(tracker.execute_treasury_spend(tx, chain.supply))
+        closed_block = self._approve_treasury_spend(tracker, tx, chain)
+        self.assertTrue(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
+        self.assertFalse(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
 
     def test_treasury_spend_serialization_roundtrip(self):
         """Treasury spend proposals serialize and deserialize correctly."""
