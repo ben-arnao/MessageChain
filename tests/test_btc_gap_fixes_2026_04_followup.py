@@ -356,38 +356,49 @@ class TestServerCompositionWithNode(unittest.TestCase):
             )
 
 
-# ─── Gap I: state_root cost scaling (benchmark + regression guard) ─
+# ─── Gap I: state_root cost scaling (incremental SMT benchmark) ─────
 
 class TestStateRootScaling(unittest.TestCase):
-    """compute_state_root is O(N log N) in account count, and every
-    block recomputes it from scratch. This test is a regression guard:
-    if the cost balloons above a sane envelope, the benchmark fails and
-    forces a conversation about migrating to an incremental Merkle
-    Patricia Trie. It also exercises the scaling-warning log path."""
+    """State commitment used to be O(N log N) per block (full-rebuild
+    flat Merkle). It's now an incremental Sparse Merkle Tree: each
+    per-account update is O(TREE_DEPTH), independent of N. This test
+    is a regression guard — if someone makes the incremental path
+    accidentally O(N) again, the envelope check fires."""
 
-    def test_scaling_envelope(self):
-        from messagechain.core.block import compute_state_root
+    def test_incremental_update_is_independent_of_population(self):
+        """Per-update cost should not grow with N.
+
+        We populate a fresh tree with M accounts, then measure the time
+        for ONE additional update. A dropback to O(N) would make the
+        second measurement with a larger population much slower.
+        """
+        from messagechain.core.state_tree import SparseMerkleTree
         import time as _time
 
-        # 10K accounts — well under the warning threshold but large
-        # enough to detect a regression (e.g., someone making the
-        # function quadratic by accident).
-        n = 10_000
-        balances = {bytes([i % 256] * 16 + [(i >> 8) & 0xff] * 16): i for i in range(n)}
-        nonces = {k: 0 for k in balances}
-        staked = {k: 0 for k in balances}
+        small = SparseMerkleTree()
+        for i in range(100):
+            small.set((i + 1).to_bytes(32, "big"), i + 1, 0, 0)
+
+        large = SparseMerkleTree()
+        for i in range(2_000):
+            large.set((i + 1).to_bytes(32, "big"), i + 1, 0, 0)
+
+        probe = (9_999_999).to_bytes(32, "big")
 
         t0 = _time.time()
-        root = compute_state_root(balances, nonces, staked)
-        elapsed = _time.time() - t0
+        small.set(probe, 1, 1, 1)
+        small_dt = _time.time() - t0
 
-        self.assertEqual(len(root), 32)
-        # Generous envelope — 2 seconds is way more than the observed
-        # ~150 ms on commodity hardware, but catches the 10x regression.
+        t0 = _time.time()
+        large.set(probe, 1, 1, 1)
+        large_dt = _time.time() - t0
+
+        # Generous envelope — 5x to absorb GC/cache noise. A real O(N)
+        # regression would make large_dt ~20x slower.
         self.assertLess(
-            elapsed, 2.0,
-            f"compute_state_root over {n} accounts took {elapsed:.3f}s "
-            f"— scaling regression, investigate before merging",
+            large_dt, max(small_dt * 5, 0.05),
+            f"SMT update at N=2000 ({large_dt:.4f}s) dwarfs N=100 "
+            f"({small_dt:.4f}s) — O(N) regression suspected",
         )
 
     def test_warning_threshold_exists(self):

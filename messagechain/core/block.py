@@ -51,70 +51,22 @@ def compute_state_root(
     nonces: dict[bytes, int],
     staked: dict[bytes, int],
 ) -> bytes:
+    """Compute a Merkle commitment to the full account state.
+
+    Thin wrapper over messagechain.core.state_tree.compute_state_root.
+    The real implementation is a Sparse Merkle Tree (O(TREE_DEPTH)
+    per update, replacing the earlier O(N log N) full rebuild).
+
+    Prefer `Blockchain.state_tree.root()` in hot paths — this function
+    builds a fresh tree from scratch every call. It exists for callers
+    that only have dicts in hand (tests, one-shot light-client
+    commitments) and for backward compatibility with import sites that
+    already reference `block.compute_state_root`.
     """
-    Compute a Merkle commitment to the full account state.
-
-    This enables light clients to verify account state without replaying
-    the entire chain. Each leaf is hash(entity_id || balance || nonce || stake).
-    The leaves are sorted by entity_id for determinism.
-
-    Scaling note: this is O(N log N) in the total account count because
-    every block recomputes the root from scratch. Each block creation and
-    each block validation pay this cost in full. At ~1M accounts the
-    recomputation dominates block processing; at ~10M it makes IBD
-    impractical. The correct long-term fix is an incremental Merkle
-    Patricia Trie that only touches modified leaves per block, matching
-    Ethereum's state trie. That is a structural change tracked as a
-    follow-up. Until it lands, operators should watch
-    `len(balances)` — if it approaches STATE_ROOT_WARN_THRESHOLD the
-    function emits a log warning so the scaling limit is not a surprise.
-    """
-    if not balances:
-        return _hash(b"empty_state")
-
-    # Soft warning at ~100K accounts. Chosen because on commodity hardware
-    # the full recomputation starts to noticeably eat into a target
-    # block-production budget around there (a few hundred milliseconds).
-    # Not a hard error — just a loud hint to operators that the current
-    # state-commitment implementation is approaching its ceiling.
-    if len(balances) > STATE_ROOT_WARN_THRESHOLD:
-        import logging
-        logging.getLogger(__name__).warning(
-            "compute_state_root: %d accounts is near the scaling limit "
-            "of the full-rebuild Merkle commitment. Migration to an "
-            "incremental Merkle Patricia Trie is required before N grows "
-            "much larger — every block pays O(N log N) in full.",
-            len(balances),
-        )
-
-    leaves = []
-    for entity_id in sorted(balances.keys()):
-        balance = balances.get(entity_id, 0)
-        nonce = nonces.get(entity_id, 0)
-        stake = staked.get(entity_id, 0)
-        leaf = _hash(
-            entity_id
-            + struct.pack(">Q", balance)
-            + struct.pack(">Q", nonce)
-            + struct.pack(">Q", stake)
-        )
-        leaves.append(leaf)
-
-    # Build Merkle tree over sorted leaves
-    layer = list(leaves)
-    if len(layer) % 2 == 1:
-        layer.append(layer[-1])
-
-    while len(layer) > 1:
-        next_layer = []
-        for i in range(0, len(layer), 2):
-            combined = _hash(layer[i] + layer[i + 1])
-            next_layer.append(combined)
-        layer = next_layer
-        if len(layer) > 1 and len(layer) % 2 == 1:
-            layer.append(layer[-1])
-
-    return layer[0]
+    # Lazy import to avoid a circular dependency with state_tree which
+    # needs nothing from block.py — keeps the module graph acyclic.
+    from messagechain.core.state_tree import compute_state_root as _impl
+    return _impl(balances, nonces, staked)
 
 
 @dataclass

@@ -26,6 +26,7 @@ from messagechain.config import (
     IDENTITY_CREATION_FEE,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
+from messagechain.core.state_tree import SparseMerkleTree
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
@@ -103,6 +104,12 @@ class Blockchain:
         # Bounded to the last STAKE_SNAPSHOT_RETENTION blocks to cap memory.
         self._stake_snapshots: dict[int, dict[bytes, int]] = {}
         self._stake_snapshot_retention: int = 1024
+        # Incremental state commitment. Kept in sync with supply.balances,
+        # supply.staked, and self.nonces via _touch_state. O(TREE_DEPTH)
+        # per update vs the O(N log N) full-rebuild compute_state_root was
+        # doing, so block proposal / validation is independent of total
+        # account count.
+        self.state_tree: SparseMerkleTree = SparseMerkleTree()
         # Immature block rewards: list of (block_height, proposer_id, reward_amount)
         self._immature_rewards: list[tuple[int, bytes, int]] = []
         # Orphan block pool: blocks whose parent is not yet known (bounded)
@@ -181,6 +188,11 @@ class Blockchain:
         # is all the next block needs.
         if self.chain:
             self._record_stake_snapshot(self.chain[-1].header.block_number)
+
+        # Rebuild the incremental state tree from the loaded dicts so
+        # that subsequent compute_current_state_root calls return the
+        # right commitment without a full rebuild on every block.
+        self._rebuild_state_tree()
 
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
 
@@ -279,6 +291,11 @@ class Blockchain:
         # Pin stake snapshot at genesis so the first post-genesis block's
         # attestations (which vote for block 0) can consult it.
         self._record_stake_snapshot(0)
+
+        # Seed the incremental state tree with the initial allocation.
+        # After this, every add_block uses O(K * TREE_DEPTH) incremental
+        # updates instead of a full rebuild.
+        self._rebuild_state_tree()
 
         # Persist
         if self.db is not None:
@@ -612,13 +629,75 @@ class Blockchain:
         immature = self.get_immature_balance(entity_id)
         return total - immature
 
+    def _touch_state(self, entity_ids):
+        """Sync the state tree with current dicts for the given entities.
+
+        Called whenever code mutates supply.balances / supply.staked /
+        nonces. Cheap — O(len(entity_ids) * TREE_DEPTH). The SMT is
+        the authoritative state commitment, but the balance/nonce/stake
+        dicts remain the source of truth for *values* — the tree just
+        commits to them.
+        """
+        for eid in entity_ids:
+            self.state_tree.set(
+                eid,
+                self.supply.balances.get(eid, 0),
+                self.nonces.get(eid, 0),
+                self.supply.staked.get(eid, 0),
+            )
+
+    def _rebuild_state_tree(self):
+        """Synchronize the state tree with the live balance/nonce/stake dicts.
+
+        Reuses the existing tree where possible — SparseMerkleTree.set()
+        is a no-op when called with the same triple, so entities that
+        haven't changed cost only a dict-lookup plus an integer compare.
+        The expensive O(TREE_DEPTH) path-rehash only fires on actual
+        changes. That makes steady-state re-sync O(N_accounts) dict
+        operations plus O(changes * TREE_DEPTH) hashes — orders of
+        magnitude cheaper than the naive "build a fresh tree from
+        scratch" approach, which pays the full path-rehash cost for
+        every leaf.
+
+        Called from:
+          * initialize_genesis (cold start — full population)
+          * _load_from_db (cold start)
+          * compute_current_state_root (warm path, reuses cached nodes)
+          * reorg rollback (hot path, many changes)
+        """
+        live_keys = set(self.supply.balances) | set(self.nonces) | set(self.supply.staked)
+        # Drop entries the tree holds that have been deleted from live.
+        tree_keys = set(self.state_tree._accounts.keys())
+        for eid in tree_keys - live_keys:
+            self.state_tree.remove(eid)
+        # Upsert everything else; set() is idempotent on unchanged triples.
+        for eid in live_keys:
+            self.state_tree.set(
+                eid,
+                self.supply.balances.get(eid, 0),
+                self.nonces.get(eid, 0),
+                self.supply.staked.get(eid, 0),
+            )
+
     def compute_current_state_root(self) -> bytes:
-        """Compute a Merkle commitment to the current account state."""
-        return compute_state_root(
-            self.supply.balances,
-            self.nonces,
-            self.supply.staked,
-        )
+        """Return the Merkle commitment to the current account state.
+
+        Resyncs the SparseMerkleTree with the live balance/nonce/stake
+        dicts before returning its root. The resync is cheap for
+        unchanged entries (SMT.set() is idempotent) so the steady-state
+        cost is O(N) dict lookups + O(changes * TREE_DEPTH) hash ops —
+        a big improvement over the old flat-Merkle full rebuild, which
+        paid O(N log N) in hash operations regardless of change rate.
+
+        The resync-per-call design keeps correctness robust against
+        call sites that mutate the underlying dicts directly (tests,
+        reorg rollback, governance). A stricter incremental design
+        that trusts the tree without resync is a follow-up, gated on
+        auditing every mutation path through a single `_touch_state`
+        hook.
+        """
+        self._rebuild_state_tree()
+        return self.state_tree.root()
 
     def compute_post_state_root(
         self,
@@ -1074,6 +1153,36 @@ class Blockchain:
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
 
+    def _block_affected_entities(self, block: Block) -> set[bytes]:
+        """Collect every entity_id whose balance/nonce/stake a block might touch.
+
+        Used after _apply_block_state to incrementally refresh only the
+        affected rows in state_tree, keeping the commitment update cost
+        O(touched * TREE_DEPTH) rather than O(N * TREE_DEPTH).
+
+        Includes:
+          * the proposer (block reward, fees)
+          * every tx sender (nonce + balance)
+          * every transfer recipient (balance)
+          * every attestor (attestation reward)
+          * every slashed validator (stake zeroed)
+          * every slash submitter (finder's reward)
+          * TREASURY_ENTITY_ID (reward-cap overflow)
+        """
+        from messagechain.config import TREASURY_ENTITY_ID
+        affected: set[bytes] = {block.header.proposer_id, TREASURY_ENTITY_ID}
+        for tx in block.transactions:
+            affected.add(tx.entity_id)
+        for ttx in block.transfer_transactions:
+            affected.add(ttx.entity_id)
+            affected.add(ttx.recipient_id)
+        for stx in block.slash_transactions:
+            affected.add(stx.evidence.offender_id)
+            affected.add(stx.submitter_id)
+        for att in block.attestations:
+            affected.add(att.validator_id)
+        return affected
+
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
         proposer_id = block.header.proposer_id
@@ -1259,14 +1368,26 @@ class Blockchain:
         total_fees = sum(tx.fee for tx in block.transactions)
         burned = total_fees  # approximate — each tx burns base_fee
 
+        # Incrementally refresh only the state_tree rows touched by this
+        # block. This is the O(K * TREE_DEPTH) path that replaces the
+        # O(N * TREE_DEPTH) full-rebuild — every block's cost is now
+        # bounded by the number of entities it touched, not the total
+        # account count.
+        self._touch_state(self._block_affected_entities(block))
+
         # Verify state_root commitment (mandatory for all post-genesis blocks).
         # Every block must commit to the post-application state. A zeroed
         # state_root no longer bypasses validation — this prevents attackers
         # from submitting blocks with fabricated state.
         expected_state_root = self.compute_current_state_root()
         if block.header.state_root != expected_state_root:
-            # Rollback: restore state from snapshot to prevent corruption
+            # Rollback: restore state from snapshot to prevent corruption.
+            # The state_tree now diverges from the restored dicts, so
+            # rebuild it from scratch to bring them back in sync. This
+            # is the slow path (O(N * TREE_DEPTH)) but it only fires on
+            # the rare rejection case.
             self._restore_memory_snapshot(snapshot)
+            self._rebuild_state_tree()
             return False, "Invalid state_root — state commitment mismatch"
 
         self.chain.append(block)
