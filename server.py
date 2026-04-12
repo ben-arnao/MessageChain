@@ -28,6 +28,7 @@ from messagechain.config import (
     DEFAULT_PORT, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
     OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
+    HANDSHAKE_TIMEOUT, MAX_PEERS,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -807,12 +808,27 @@ class Server:
             writer.close()
             return
 
+        # H4: MAX_PEERS enforcement — reject if at capacity
+        connected_count = sum(1 for p in self.peers.values() if p.is_connected)
+        if connected_count >= MAX_PEERS:
+            logger.debug(f"Rejecting inbound peer {address}: at MAX_PEERS ({MAX_PEERS})")
+            writer.close()
+            return
+
         peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
+        # C10: timeout on reads to prevent slow-loris DoS
+        first_message = True
         try:
             while self._running:
-                msg = await read_message(reader)
+                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                try:
+                    msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.debug(f"Peer {address} timed out after {timeout}s")
+                    break
                 if msg is None:
                     break
+                first_message = False
                 await self._handle_p2p_message(msg, peer)
         except Exception:
             pass
@@ -874,10 +890,23 @@ class Server:
             return
 
         if msg.msg_type == MessageType.HANDSHAKE:
-            peer.entity_id = msg.sender_id
+            # H3: Basic handshake validation
+            sender_id = msg.sender_id
+            if not isinstance(sender_id, str) or len(sender_id) < 16:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_sender_id"
+                )
+                return
+            peer_height = msg.payload.get("chain_height", 0)
+            if not isinstance(peer_height, int) or peer_height < 0:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_chain_height"
+                )
+                return
+
+            peer.entity_id = sender_id
             self.peers[peer.address] = peer
             # Track peer height AND cumulative weight for sync
-            peer_height = msg.payload.get("chain_height", 0)
             best_hash = msg.payload.get("best_block_hash", "")
             peer_weight_raw = msg.payload.get("cumulative_weight", 0)
             if not isinstance(peer_weight_raw, int) or peer_weight_raw < 0:
@@ -900,7 +929,13 @@ class Server:
             await self._handle_getdata(msg.payload, peer)
 
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
-            tx = MessageTransaction.deserialize(msg.payload)
+            try:
+                tx = MessageTransaction.deserialize(msg.payload)
+            except Exception:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_tx_data"
+                )
+                return
             tx_hash_hex = tx.tx_hash.hex()
             if tx_hash_hex in self._seen_txs:
                 return
@@ -913,7 +948,13 @@ class Server:
                 self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
 
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
-            block = Block.deserialize(msg.payload)
+            try:
+                block = Block.deserialize(msg.payload)
+            except Exception:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_block_data"
+                )
+                return
             success, reason = self.blockchain.add_block(block)
             if success:
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
@@ -1038,7 +1079,13 @@ class Server:
         needed = []
         for h in tx_hashes:
             if h not in self._seen_txs:
-                tx_hash_bytes = bytes.fromhex(h)
+                try:
+                    tx_hash_bytes = bytes.fromhex(h)
+                except (ValueError, TypeError):
+                    self.ban_manager.record_offense(
+                        peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_inv_hash"
+                    )
+                    return
                 if tx_hash_bytes not in self.mempool.pending:
                     needed.append(h)
             peer.known_txs.add(h)
@@ -1062,7 +1109,13 @@ class Server:
             return
 
         for h in tx_hashes:
-            tx_hash_bytes = bytes.fromhex(h)
+            try:
+                tx_hash_bytes = bytes.fromhex(h)
+            except (ValueError, TypeError):
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_getdata_hash"
+                )
+                return
             tx = self.mempool.pending.get(tx_hash_bytes)
             if tx:
                 msg = NetworkMessage(
@@ -1121,7 +1174,14 @@ class Server:
         block_hashes = payload.get("block_hashes", [])
         blocks = []
         for hash_hex in block_hashes[:50]:
-            block = self.blockchain.get_block_by_hash(bytes.fromhex(hash_hex))
+            try:
+                block_hash_bytes = bytes.fromhex(hash_hex)
+            except (ValueError, TypeError):
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "invalid_block_hash_hex"
+                )
+                return
+            block = self.blockchain.get_block_by_hash(block_hash_bytes)
             if block:
                 blocks.append(block.serialize())
         response = NetworkMessage(
