@@ -414,11 +414,11 @@ class TestWotsChainBoundsCheck(unittest.TestCase):
     """L5: WOTS+ chain function must validate bounds."""
 
     def test_negative_start_asserts(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _chain(b"\x00" * 32, -1, 1, b"\x00" * 32, 0)
 
     def test_overflow_asserts(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ValueError):
             _chain(b"\x00" * 32, 10, 10, b"\x00" * 32, 0)
 
     def test_valid_chain_works(self):

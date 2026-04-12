@@ -77,17 +77,22 @@ def generate_merkle_proof(block: Block, tx_index: int) -> MerkleProof:
     tx_hashes = [tx.tx_hash for tx in all_txs]
     tx_hash = tx_hashes[tx_index]
 
-    # Build Merkle tree layer by layer, recording siblings
+    # Build Merkle tree layer by layer, recording siblings.
+    # Uses the same tagged-node construction as compute_merkle_root:
+    #   - Leaves are tagged with b"\x00" prefix
+    #   - Internal nodes are tagged with b"\x01" prefix
+    #   - Odd-length layers are padded with _hash(b"\x02sentinel")
     siblings = []
     directions = []
 
-    layer = list(tx_hashes)
+    # Tag leaves with 0x00 prefix (matches compute_merkle_root)
+    layer = [_hash(b"\x00" + h) for h in tx_hashes]
     idx = tx_index
 
     while len(layer) > 1:
-        # Pad to even
+        # Pad odd layers with sentinel (not duplicate)
         if len(layer) % 2 == 1:
-            layer.append(layer[-1])
+            layer.append(_hash(b"\x02sentinel"))
 
         # Record sibling
         if idx % 2 == 0:
@@ -104,7 +109,8 @@ def generate_merkle_proof(block: Block, tx_index: int) -> MerkleProof:
         # Build next layer
         next_layer = []
         for i in range(0, len(layer), 2):
-            combined = _hash(layer[i] + layer[i + 1])
+            # Tag internal nodes with 0x01 prefix
+            combined = _hash(b"\x01" + layer[i] + layer[i + 1])
             next_layer.append(combined)
 
         layer = next_layer
@@ -129,15 +135,16 @@ def verify_merkle_proof(tx_hash: bytes, proof: MerkleProof, merkle_root: bytes) 
     Returns:
         True if the proof is valid (tx_hash is included in the tree).
     """
-    current = tx_hash
+    # Start from the tagged leaf (matches compute_merkle_root)
+    current = _hash(b"\x00" + tx_hash)
 
     for sibling, is_left in zip(proof.siblings, proof.directions):
         if is_left:
             # Sibling is on the left
-            current = _hash(sibling + current)
+            current = _hash(b"\x01" + sibling + current)
         else:
             # Sibling is on the right
-            current = _hash(current + sibling)
+            current = _hash(b"\x01" + current + sibling)
 
     return current == merkle_root
 
