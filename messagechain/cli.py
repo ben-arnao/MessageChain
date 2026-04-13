@@ -717,12 +717,18 @@ def cmd_vote(args):
 
 
 def cmd_generate_key(_args):
-    """Generate a new cryptographically random private key."""
+    """Generate a full key pair offline (private key, public key, entity ID)."""
     import os
+    from messagechain.identity.identity import Entity
+
     key = os.urandom(32)
-    print("=== Key Generated ===\n")
+    entity = Entity.create(key)
+
+    print("=== Key Pair Generated ===\n")
     print(f"  Private key: {key.hex()}")
-    print(f"\n  WARNING: Save this key securely. It is your sole credential.")
+    print(f"  Public key:  {entity.public_key.hex()}")
+    print(f"  Entity ID:   {entity.entity_id_hex}")
+    print(f"\n  WARNING: Save your private key securely. It is your sole credential.")
     print("  Anyone with this key controls your account. There is no recovery.")
     print("  This key will NOT be shown again.")
 
