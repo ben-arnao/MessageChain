@@ -772,12 +772,14 @@ class Node:
         # and redundant expensive signature verification)
         att_key = (att.validator_id, att.block_number, att.block_hash)
         if not hasattr(self, '_seen_attestations'):
-            self._seen_attestations: set = set()
+            self._seen_attestations: OrderedDict = OrderedDict()
         if att_key in self._seen_attestations:
             return
-        if len(self._seen_attestations) > 50_000:
-            self._seen_attestations.clear()  # periodic reset to bound memory
-        self._seen_attestations.add(att_key)
+        # M11: LRU eviction instead of full wipe to prevent replay window
+        if len(self._seen_attestations) >= 50_000:
+            for _ in range(12_500):
+                self._seen_attestations.popitem(last=False)
+        self._seen_attestations[att_key] = True
 
         # Verify the attesting validator is known
         if att.validator_id not in self.blockchain.public_keys:
@@ -852,6 +854,10 @@ class Node:
     async def _handle_request_headers(self, payload: dict, peer: Peer):
         """Serve headers to a syncing peer."""
         start_height = payload.get("start_height", 0)
+        # M19: Validate start_height type and range
+        if not isinstance(start_height, int) or start_height < 0:
+            start_height = 0
+        start_height = min(start_height, self.blockchain.height + 1)
         count = min(payload.get("count", 100), 500)  # cap at 500
 
         headers = []
@@ -996,6 +1002,11 @@ class Node:
             await self._broadcast(msg)
         else:
             logger.warning(f"Failed to add proposed block: {reason}")
+            if block_producer.is_clock_skew_reason(reason):
+                logger.warning(
+                    "This may indicate your system clock is out of sync. "
+                    "Check your OS time settings."
+                )
 
     async def _sync_loop(self):
         """Periodically check if we need to sync and handle stale syncs."""

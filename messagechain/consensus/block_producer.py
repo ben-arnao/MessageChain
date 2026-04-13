@@ -130,3 +130,12 @@ def next_wake_seconds(blockchain, now: float | None = None) -> float:
     # We're already past round 0 — wake at the next round boundary
     next_round_time = slot.next_slot_time + (slot.round_number + 1) * BLOCK_TIME_TARGET
     return max(1.0, next_round_time - now)
+
+
+_CLOCK_SKEW_KEYWORDS = ("timestamp too early", "too far in the future", "median time past")
+
+
+def is_clock_skew_reason(reason: str) -> bool:
+    """Return True if a block rejection reason suggests system clock skew."""
+    lower = reason.lower()
+    return any(kw in lower for kw in _CLOCK_SKEW_KEYWORDS)

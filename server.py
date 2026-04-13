@@ -229,14 +229,18 @@ class Server:
         """Start P2P server, RPC server, and block production."""
         # Initialize genesis if fresh chain
         if self.blockchain.height == 0:
-            # Create a bootstrap entity with a random private key for the genesis block.
-            # SECURITY: Using os.urandom ensures each network has a unique,
-            # unguessable genesis entity. Hardcoded keys would allow anyone
-            # reading the source to derive the genesis keypair.
-            import os
-            bootstrap = Entity.create(os.urandom(32))
-            self.blockchain.initialize_genesis(bootstrap)
-            logger.info(f"Genesis block created")
+            if self.wallet_entity is not None:
+                # Use the operator's entity as genesis — they get the genesis allocation
+                # and become the first validator.
+                self.blockchain.initialize_genesis(self.wallet_entity)
+                logger.info(
+                    f"Genesis block created (genesis entity: "
+                    f"{self.wallet_entity.entity_id.hex()[:16]}...)"
+                )
+            else:
+                # Relay-only node with no chain data — cannot create genesis without
+                # a keypair to sign the genesis block.  Must sync from a seed node.
+                logger.info("No chain data and no wallet — will sync genesis from peers")
         else:
             logger.info(f"Loaded chain from storage: height={self.blockchain.height}")
 
@@ -548,10 +552,15 @@ class Server:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_delegation(self, params: dict) -> dict:
-        """Accept a signed delegation transaction from a client."""
+        """Accept a signed delegation transaction from a client.
+
+        Validates the transaction and queues it for inclusion in the next
+        block. State is only mutated when the block containing this
+        transaction is produced and validated — never directly from RPC.
+        """
         try:
             from messagechain.governance.governance import (
-                DelegateTransaction, verify_delegation, GovernanceTracker,
+                DelegateTransaction, verify_delegation,
             )
             tx = DelegateTransaction.deserialize(params["transaction"])
             entity_id = tx.delegator_id
@@ -566,15 +575,10 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
-
-            # Apply delegation to governance tracker
-            if not hasattr(self, 'governance'):
-                self.governance = GovernanceTracker()
-            self.governance.set_delegation(entity_id, tx.targets)
-
-            if self.blockchain.db is not None:
-                self.blockchain._persist_state()
+            # Queue for block inclusion — do NOT mutate state directly.
+            if not hasattr(self, '_pending_governance_txs'):
+                self._pending_governance_txs = {}
+            self._pending_governance_txs[tx.tx_hash] = tx
 
             targets_info = [
                 {"delegate_id": did.hex(), "pct": pct}
@@ -584,15 +588,21 @@ class Server:
                 "entity_id": entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
                 "targets": targets_info,
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_proposal(self, params: dict) -> dict:
-        """Accept a signed governance proposal from a client."""
+        """Accept a signed governance proposal from a client.
+
+        Validates the transaction and queues it for inclusion in the next
+        block. State is only mutated when the block containing this
+        transaction is produced and validated — never directly from RPC.
+        """
         try:
             from messagechain.governance.governance import (
-                ProposalTransaction, verify_proposal, GovernanceTracker,
+                ProposalTransaction, verify_proposal,
             )
             tx = ProposalTransaction.deserialize(params["transaction"])
             entity_id = tx.proposer_id
@@ -607,29 +617,31 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
-
-            if not hasattr(self, 'governance'):
-                self.governance = GovernanceTracker()
-            self.governance.add_proposal(tx, self.blockchain.height, self.blockchain.supply)
-
-            if self.blockchain.db is not None:
-                self.blockchain._persist_state()
+            # Queue for block inclusion — do NOT mutate state directly.
+            if not hasattr(self, '_pending_governance_txs'):
+                self._pending_governance_txs = {}
+            self._pending_governance_txs[tx.tx_hash] = tx
 
             return {"ok": True, "result": {
                 "proposal_id": tx.proposal_id.hex(),
                 "title": tx.title,
                 "fee": tx.fee,
                 "tx_hash": tx.tx_hash.hex(),
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_vote(self, params: dict) -> dict:
-        """Accept a signed governance vote from a client."""
+        """Accept a signed governance vote from a client.
+
+        Validates the transaction and queues it for inclusion in the next
+        block. State is only mutated when the block containing this
+        transaction is produced and validated — never directly from RPC.
+        """
         try:
             from messagechain.governance.governance import (
-                VoteTransaction, verify_vote, GovernanceTracker,
+                VoteTransaction, verify_vote,
             )
             tx = VoteTransaction.deserialize(params["transaction"])
             entity_id = tx.voter_id
@@ -644,21 +656,16 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
-
-            if not hasattr(self, 'governance'):
-                self.governance = GovernanceTracker()
-            accepted = self.governance.add_vote(tx, self.blockchain.height)
-            if not accepted:
-                return {"ok": False, "error": "Vote rejected (proposal closed or duplicate)"}
-
-            if self.blockchain.db is not None:
-                self.blockchain._persist_state()
+            # Queue for block inclusion — do NOT mutate state directly.
+            if not hasattr(self, '_pending_governance_txs'):
+                self._pending_governance_txs = {}
+            self._pending_governance_txs[tx.tx_hash] = tx
 
             return {"ok": True, "result": {
                 "tx_hash": tx.tx_hash.hex(),
                 "proposal_id": tx.proposal_id.hex(),
                 "approve": tx.approve,
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
@@ -768,6 +775,11 @@ class Server:
             await self._broadcast_block(block)
         else:
             logger.warning(f"Failed to add proposed block: {reason}")
+            if block_producer.is_clock_skew_reason(reason):
+                logger.warning(
+                    "This may indicate your system clock is out of sync. "
+                    "Check your OS time settings."
+                )
 
     # ── Sync Loop ────────────────────────────────────────────────
 
@@ -856,7 +868,10 @@ class Server:
             logger.debug(f"Skipping banned peer {addr}")
             return
         try:
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=HANDSHAKE_TIMEOUT,
+            )
             conn_type = self._next_connection_type()
             peer = Peer(
                 host=host, port=port, reader=reader, writer=writer,
@@ -877,10 +892,16 @@ class Server:
             )
             await write_message(writer, handshake)
             while self._running and peer.is_connected:
-                msg = await read_message(reader)
+                try:
+                    msg = await asyncio.wait_for(read_message(reader), timeout=300)
+                except asyncio.TimeoutError:
+                    logger.debug(f"Peer {addr} read timed out")
+                    break
                 if msg is None:
                     break
                 await self._handle_p2p_message(msg, peer)
+        except asyncio.TimeoutError:
+            logger.debug(f"Peer connection timed out {addr}")
         except Exception as e:
             logger.debug(f"Peer connection failed {addr}: {e}")
 
@@ -993,6 +1014,16 @@ class Server:
                 peer.address, height, best_hash, cumulative_weight=weight,
             )
 
+        elif msg.msg_type == MessageType.PEER_LIST:
+            # C2: Populate addrman from peer gossip
+            addresses = msg.payload.get("addresses", [])
+            for entry in addresses[:1000]:
+                host = entry.get("host", "")
+                port = entry.get("port", 0)
+                if isinstance(host, str) and isinstance(port, int):
+                    if 1 <= port <= 65535:
+                        self.addrman.add_address(host, port, peer.host)
+
         elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
             await self._handle_announce_attestation(msg.payload, peer)
 
@@ -1028,6 +1059,20 @@ class Server:
             )
             return
 
+        # H6: Deduplicate — skip if already seen (prevents gossip amplification
+        # and redundant expensive signature verification)
+        att_key = (att.validator_id, att.block_number, att.block_hash)
+        if not hasattr(self, '_seen_attestations'):
+            self._seen_attestations: OrderedDict = OrderedDict()
+        if att_key in self._seen_attestations:
+            return
+        # LRU eviction instead of full wipe (M11 pattern)
+        if len(self._seen_attestations) >= 50_000:
+            # Evict oldest 25%
+            for _ in range(12_500):
+                self._seen_attestations.popitem(last=False)
+        self._seen_attestations[att_key] = True
+
         if att.validator_id not in self.blockchain.public_keys:
             return
 
@@ -1040,7 +1085,10 @@ class Server:
 
         validator_stake = self.blockchain.supply.get_staked(att.validator_id)
         total_stake = sum(self.blockchain.supply.staked.values())
-        self.blockchain.finality.add_attestation(att, validator_stake, total_stake)
+        self.blockchain.finality.add_attestation(
+            att, validator_stake, total_stake,
+            public_keys=self.blockchain.public_keys,
+        )
 
         logger.debug(f"Received attestation from {att.validator_id.hex()[:16]}")
 
@@ -1086,6 +1134,18 @@ class Server:
                 peer.address, OFFENSE_PROTOCOL_VIOLATION, "inv_too_large"
             )
             return
+
+        # H9: Per-hash rate limiting — consume extra tokens for large batches
+        extra_tokens = len(tx_hashes) // 50
+        if extra_tokens > 0:
+            ip = self.rate_limiter._get_ip(peer.address)
+            self.rate_limiter._ensure_buckets(ip)
+            bucket = self.rate_limiter._buckets[ip].get("tx")
+            if bucket and not bucket.consume(extra_tokens):
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_RATE_LIMIT, "inv_hash_flood"
+                )
+                return
 
         needed = []
         for h in tx_hashes:
