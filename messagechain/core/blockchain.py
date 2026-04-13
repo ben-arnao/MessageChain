@@ -653,10 +653,15 @@ class Blockchain:
         )
 
     def get_spendable_balance(self, entity_id: bytes) -> int:
-        """Get spendable balance (total balance minus immature rewards)."""
+        """Get spendable balance (total balance minus immature rewards).
+
+        Floor at 0 — immature tracking corruption must never produce a
+        negative spendable balance that could be misinterpreted as a
+        large positive value by callers expecting unsigned semantics.
+        """
         total = self.supply.get_balance(entity_id)
         immature = self.get_immature_balance(entity_id)
-        return total - immature
+        return max(0, total - immature)
 
     def _touch_state(self, entity_ids):
         """Sync the state tree with current dicts for the given entities.
@@ -1573,6 +1578,32 @@ class Blockchain:
         valid, reason = self.validate_block_standalone(block, parent)
         if not valid:
             return False, f"Fork block invalid: {reason}"
+
+        # Finality boundary: reject forks at or below a finalized height.
+        # Walk the canonical chain to see if any block at this height is
+        # already finalized — accepting a competing block would eventually
+        # require reverting finalized state, violating PoS finality.
+        for blk in self.chain:
+            if blk.header.block_number == block.header.block_number:
+                if self.finality.is_finalized(blk.block_hash):
+                    return False, (
+                        f"Fork rejected — height {block.header.block_number} "
+                        f"has a finalized block ({blk.block_hash.hex()[:16]})"
+                    )
+                break  # only need to check the block at this height
+            if blk.header.block_number > block.header.block_number:
+                break
+        # Also reject if any ancestor on the canonical chain between the
+        # fork point and the tip is finalized (the fork would revert it).
+        fork_height = block.header.block_number
+        for blk in self.chain:
+            if blk.header.block_number > parent.header.block_number:
+                if blk.header.block_number <= fork_height:
+                    if self.finality.is_finalized(blk.block_hash):
+                        return False, (
+                            f"Fork rejected — canonical block at height "
+                            f"{blk.header.block_number} is finalized"
+                        )
 
         # Store the block (even if not on best chain yet)
         self._block_by_hash[block.block_hash] = block

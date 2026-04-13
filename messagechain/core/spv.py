@@ -135,6 +135,10 @@ def verify_merkle_proof(tx_hash: bytes, proof: MerkleProof, merkle_root: bytes) 
     Returns:
         True if the proof is valid (tx_hash is included in the tree).
     """
+    # Validate proof structure: siblings and directions must match in length
+    if len(proof.siblings) != len(proof.directions):
+        return False
+
     # Start from the tagged leaf (matches compute_merkle_root)
     current = _hash(b"\x00" + tx_hash)
 

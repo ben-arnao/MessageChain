@@ -264,6 +264,15 @@ class ChainSyncer:
 
         self._last_progress_time = time.time()
 
+        # Reject oversized batches — prevents memory-exhaustion DoS.
+        max_allowed = HEADERS_BATCH_SIZE * 2
+        if len(headers_data) > max_allowed:
+            logger.warning(
+                f"Peer {peer_addr} sent {len(headers_data)} headers "
+                f"(limit {max_allowed}) — truncating"
+            )
+            headers_data = headers_data[:max_allowed]
+
         if not headers_data:
             # No more headers — switch to block download
             logger.info(f"Headers sync complete. {len(self.pending_headers)} headers to fetch blocks for.")
@@ -494,6 +503,15 @@ class ChainSyncer:
             return
 
         self._last_progress_time = time.time()
+
+        # Reject oversized batches — prevents memory-exhaustion DoS.
+        max_allowed = BLOCKS_BATCH_SIZE * 2
+        if len(blocks_data) > max_allowed:
+            logger.warning(
+                f"Peer {peer_addr} sent {len(blocks_data)} blocks "
+                f"(limit {max_allowed}) — truncating"
+            )
+            blocks_data = blocks_data[:max_allowed]
 
         for block_data in blocks_data:
             try:

@@ -1140,7 +1140,14 @@ class Server:
     async def _serve_headers(self, payload: dict, peer: Peer):
         """Serve headers to a syncing peer."""
         start_height = payload.get("start_height", 0)
-        count = min(payload.get("count", 100), 500)
+        if not isinstance(start_height, int) or start_height < 0:
+            start_height = 0
+        # Clamp to current chain height to avoid pointless iteration
+        start_height = min(start_height, self.blockchain.height + 1)
+        count = payload.get("count", 100)
+        if not isinstance(count, int) or count < 0:
+            count = 0
+        count = min(count, 500)
         headers = []
         for i in range(start_height, start_height + count):
             block = self.blockchain.get_block(i)

@@ -14,6 +14,7 @@ Key defenses:
 """
 
 import hashlib
+import ipaddress
 import os
 import time
 from dataclasses import dataclass, field
@@ -29,6 +30,20 @@ from messagechain.config import (
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
+
+
+def _is_public_ip(ip: str) -> bool:
+    """Return True if *ip* is a globally routable (public) address.
+
+    Rejects RFC 1918 private, loopback, link-local, multicast, and
+    other non-routable ranges.  Prevents eclipse attacks where a peer
+    floods addrman with unreachable addresses that evict real peers.
+    """
+    try:
+        addr = ipaddress.ip_address(ip.strip("[]"))
+    except ValueError:
+        return False
+    return addr.is_global and not addr.is_multicast
 
 
 def _network_group(ip: str) -> str:
@@ -124,6 +139,10 @@ class AddressManager:
 
         Returns True if the address was added, False if rejected.
         """
+        # Reject private/reserved IPs — prevents eclipse via unreachable addresses
+        if not _is_public_ip(ip):
+            return False
+
         addr_key = f"{ip}:{port}"
 
         # Already known

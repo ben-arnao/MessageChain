@@ -488,6 +488,20 @@ class GovernanceTracker:
             total_eligible_stake=total,
         )
 
+    def prune_closed_proposals(self, current_block: int) -> int:
+        """Remove proposals whose voting window has closed.
+
+        Prevents unbounded growth of self.proposals from governance spam.
+        Returns the number of proposals pruned.
+        """
+        to_remove = [
+            pid for pid, state in self.proposals.items()
+            if current_block - state.created_at_block > GOVERNANCE_VOTING_WINDOW
+        ]
+        for pid in to_remove:
+            del self.proposals[pid]
+        return len(to_remove)
+
     def add_vote(self, tx: VoteTransaction, current_block: int) -> bool:
         """Record a vote. Returns False if rejected (closed or duplicate)."""
         state = self.proposals.get(tx.proposal_id)

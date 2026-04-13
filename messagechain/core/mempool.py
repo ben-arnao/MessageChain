@@ -157,11 +157,13 @@ class Mempool:
             return False  # new fee must be strictly higher
 
         # Verify signature on the replacement (prevents censorship via
-        # unsigned replacements that evict valid transactions)
-        if public_key is not None:
-            from messagechain.core.transaction import verify_transaction
-            if not verify_transaction(new_tx, public_key):
-                return False
+        # unsigned replacements that evict valid transactions).
+        # public_key is REQUIRED — reject if not provided.
+        if public_key is None:
+            return False
+        from messagechain.core.transaction import verify_transaction
+        if not verify_transaction(new_tx, public_key):
+            return False
 
         # Remove old, add new
         self._remove_tx(existing)

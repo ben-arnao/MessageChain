@@ -340,9 +340,9 @@ class TestReplaceByFee(unittest.TestCase):
         mempool.add_transaction(tx1)
         self.assertEqual(mempool.size, 1)
 
-        # Replace with higher fee, same nonce
+        # Replace with higher fee, same nonce (public_key required for RBF)
         tx2 = create_transaction(entities[0], "hello v2", fee=2000, nonce=0)
-        replaced = mempool.try_replace_by_fee(tx2)
+        replaced = mempool.try_replace_by_fee(tx2, public_key=entities[0].keypair.public_key)
         self.assertTrue(replaced)
         self.assertEqual(mempool.size, 1)
         # The mempool should contain tx2 not tx1

@@ -278,7 +278,7 @@ class TestAddressManagerSybilResistance(unittest.TestCase):
 
         # Add many addresses from the same source
         for i in range(100):
-            am.add_address(f"10.0.{i // 256}.{i % 256}", 9333, source_ip="192.168.1.1")
+            am.add_address(f"44.0.{i // 256}.{i % 256}", 9333, source_ip="33.0.1.1")
 
         # Should be limited — not all 100 should make it in
         total = am.count_new()
@@ -289,13 +289,13 @@ class TestAddressManagerSybilResistance(unittest.TestCase):
         from messagechain.network.addrman import AddressManager
         am = AddressManager()
 
-        # Add addresses from a single source
+        # Add addresses from a single source (use public IPs)
         for i in range(200):
-            am.add_address(f"10.{i}.0.1", 9333, source_ip="1.2.3.4")
+            am.add_address(f"44.{i}.0.1", 9333, source_ip="1.2.3.4")
 
-        # Different source
+        # Different source (use public IPs)
         for i in range(50):
-            am.add_address(f"172.16.{i}.1", 9333, source_ip="5.6.7.8")
+            am.add_address(f"55.16.{i}.1", 9333, source_ip="5.6.7.8")
 
         # Both sources should have entries (not just the first flooding source)
         total = am.count_new()
@@ -306,8 +306,8 @@ class TestAddressManagerSybilResistance(unittest.TestCase):
         from messagechain.network.addrman import AddressManager
         am = AddressManager()
 
-        am.add_address("10.0.0.1", 9333, source_ip="1.2.3.4")
-        am.mark_good("10.0.0.1", 9333)
+        am.add_address("44.0.0.1", 9333, source_ip="1.2.3.4")
+        am.mark_good("44.0.0.1", 9333)
 
         self.assertGreater(am.count_tried(), 0)
 
