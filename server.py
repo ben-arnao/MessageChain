@@ -443,8 +443,9 @@ class Server:
     def _rpc_stake(self, params: dict) -> dict:
         """Accept a signed stake transaction from a client.
 
-        Stake operations are now proper on-chain transactions with nonce-based
-        replay protection, included in blocks just like message transactions.
+        Validates the transaction and queues it for inclusion in the next
+        block. State is only mutated when the block containing this
+        transaction is produced and validated — never directly from RPC.
         This ensures all nodes agree on validator stake state.
         """
         try:
@@ -466,21 +467,17 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
                 return {"ok": False, "error": "Insufficient balance for staking + fee"}
 
-            # Apply stake (will be included in next block via mempool in future)
-            # For now, apply directly but with proper nonce tracking
-            self.blockchain.supply.stake(entity_id, tx.amount)
-            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
-            self.blockchain.nonces[entity_id] = tx.nonce + 1
-            self.consensus.register_validator(entity_id, tx.amount, block_height=self.blockchain.height)
-
-            if self.blockchain.db is not None:
-                self.blockchain._persist_state()
+            # Queue for block inclusion — do NOT mutate state directly.
+            # State changes only happen when a block containing this tx is
+            # produced and validated, ensuring all peers see the same state.
+            if not hasattr(self, '_pending_stake_txs'):
+                self._pending_stake_txs = {}
+            self._pending_stake_txs[tx.tx_hash] = tx
 
             return {"ok": True, "result": {
                 "entity_id": entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
-                "staked": self.blockchain.supply.get_staked(entity_id),
-                "balance": self.blockchain.supply.get_balance(entity_id),
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
@@ -488,8 +485,9 @@ class Server:
     def _rpc_unstake(self, params: dict) -> dict:
         """Accept a signed unstake transaction from a client.
 
-        Unstake operations are now proper on-chain transactions with nonce-based
-        replay protection.
+        Validates the transaction and queues it for inclusion in the next
+        block. State is only mutated when the block containing this
+        transaction is produced and validated — never directly from RPC.
         """
         try:
             tx = UnstakeTransaction.deserialize(params["transaction"])
@@ -513,25 +511,15 @@ class Server:
             if self.blockchain.supply.get_staked(entity_id) < tx.amount:
                 return {"ok": False, "error": "Insufficient staked amount"}
 
-            # Apply unstake with proper nonce tracking
-            self.blockchain.supply.unstake(entity_id, tx.amount)
-            self.blockchain.supply.pay_fee(entity_id, self.wallet_id or entity_id, tx.fee)
-            self.blockchain.nonces[entity_id] = tx.nonce + 1
-
-            remaining = self.blockchain.supply.get_staked(entity_id)
-            if remaining == 0:
-                self.consensus.remove_validator(entity_id)
-            else:
-                self.consensus.stakes[entity_id] = remaining
-
-            if self.blockchain.db is not None:
-                self.blockchain._persist_state()
+            # Queue for block inclusion — do NOT mutate state directly.
+            if not hasattr(self, '_pending_unstake_txs'):
+                self._pending_unstake_txs = {}
+            self._pending_unstake_txs[tx.tx_hash] = tx
 
             return {"ok": True, "result": {
                 "entity_id": entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
-                "staked": remaining,
-                "balance": self.blockchain.supply.get_balance(entity_id),
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}

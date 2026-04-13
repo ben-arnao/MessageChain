@@ -543,7 +543,9 @@ class Blockchain:
 
         return True, "Key rotated successfully"
 
-    def validate_slash_transaction(self, tx: SlashTransaction) -> tuple[bool, str]:
+    def validate_slash_transaction(
+        self, tx: SlashTransaction, chain_height: int | None = None,
+    ) -> tuple[bool, str]:
         """Validate a slash transaction against current chain state."""
         if tx.submitter_id not in self.public_keys:
             return False, "Unknown submitter — must register first"
@@ -564,6 +566,15 @@ class Blockchain:
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
 
+        # H6: Reject expired evidence. Evidence older than UNBONDING_PERIOD
+        # is stale — the offender may have already unstaked and exited.
+        # This prevents ancient evidence from being weaponized.
+        from messagechain.config import UNBONDING_PERIOD
+        height = chain_height if chain_height is not None else self.height
+        evidence_height = self._evidence_block_number(tx.evidence)
+        if evidence_height is not None and height - evidence_height > UNBONDING_PERIOD:
+            return False, "Evidence expired — older than unbonding period"
+
         # Verify the evidence itself (two valid conflicting signatures)
         offender_pk = self.public_keys[tx.evidence.offender_id]
         if isinstance(tx.evidence, AttestationSlashingEvidence):
@@ -580,6 +591,19 @@ class Blockchain:
             return False, "Invalid submitter signature"
 
         return True, "Valid"
+
+    @staticmethod
+    def _evidence_block_number(evidence) -> int | None:
+        """Extract the block height from slashing evidence.
+
+        Returns the block_number the conflicting headers/attestations
+        reference, or None if the evidence type is unrecognized.
+        """
+        if hasattr(evidence, 'header_a'):
+            return evidence.header_a.block_number
+        if hasattr(evidence, 'attestation_a'):
+            return evidence.attestation_a.block_number
+        return None
 
     def apply_slash_transaction(self, tx: SlashTransaction, proposer_id: bytes) -> tuple[bool, str]:
         """Validate and apply a slash transaction."""
@@ -1124,6 +1148,15 @@ class Blockchain:
         valid, reason = self._validate_attestations(block)
         if not valid:
             return False, reason
+
+        # H7: Validate slash transactions during validate_block so blocks
+        # with invalid evidence are rejected before relay/storage, not just
+        # during _append_block. This prevents propagation of blocks with
+        # fabricated slash evidence across the network.
+        for stx in block.slash_transactions:
+            valid, reason = self.validate_slash_transaction(stx)
+            if not valid:
+                return False, f"Invalid slash tx: {reason}"
 
         return True, "Valid"
 

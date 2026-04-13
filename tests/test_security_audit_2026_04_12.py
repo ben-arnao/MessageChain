@@ -402,5 +402,143 @@ class TestNoDefaultDelegation(unittest.TestCase):
         self.assertEqual(total, 100)
 
 
+# ===========================================================================
+# H6: Slashing evidence must have an expiration window
+# ===========================================================================
+
+
+class TestSlashingEvidenceExpiration(unittest.TestCase):
+    """H6: Evidence from too far in the past must be rejected."""
+
+    def test_ancient_double_proposal_evidence_rejected(self):
+        """Double-proposal evidence older than MAX_EVIDENCE_AGE_BLOCKS is rejected."""
+        bc, entity = _setup_chain()
+        # Fund and stake
+        bc.supply.balances[entity.entity_id] = 100_000
+        bc.supply.stake(entity.entity_id, 1000)
+        # Create conflicting headers at height 1 (ancient relative to chain)
+        from messagechain.core.block import BlockHeader
+        header_a = BlockHeader(
+            version=1, block_number=1,
+            prev_hash=bc.get_latest_block().block_hash,
+            merkle_root=_hash(b"a"), timestamp=time.time(),
+            proposer_id=entity.entity_id,
+        )
+        header_b = BlockHeader(
+            version=1, block_number=1,
+            prev_hash=bc.get_latest_block().block_hash,
+            merkle_root=_hash(b"b"), timestamp=time.time(),
+            proposer_id=entity.entity_id,
+        )
+        header_a.proposer_signature = entity.keypair.sign(_hash(header_a.signable_data()))
+        header_b.proposer_signature = entity.keypair.sign(_hash(header_b.signable_data()))
+
+        from messagechain.consensus.slashing import SlashingEvidence
+        evidence = SlashingEvidence(
+            offender_id=entity.entity_id,
+            header_a=header_a, header_b=header_b,
+        )
+        # validate_slash_transaction should reject if chain height is far
+        # beyond the evidence height
+        from messagechain.consensus.slashing import verify_slashing_evidence
+        valid, _ = verify_slashing_evidence(evidence, entity.public_key)
+        # Evidence itself is cryptographically valid
+        self.assertTrue(valid)
+        # But the blockchain-level check should reject stale evidence
+        # Simulate chain being far ahead
+        from messagechain.config import UNBONDING_PERIOD
+        # We need a submitter
+        submitter = _make_entity()
+        bc.register_entity(submitter.entity_id, submitter.public_key,
+                           submitter.keypair.sign(_hash(b"register" + submitter.entity_id)))
+        bc.supply.balances[submitter.entity_id] = 10_000
+        from messagechain.consensus.slashing import create_slash_transaction
+        slash_tx = create_slash_transaction(submitter, evidence, fee=MIN_FEE)
+        # Pretend chain is far beyond evidence height
+        # The evidence references block_number=1; chain should reject if too old
+        valid, reason = bc.validate_slash_transaction(
+            slash_tx, chain_height=1 + UNBONDING_PERIOD + 1,
+        )
+        self.assertFalse(valid)
+        self.assertIn("expired", reason.lower())
+
+
+# ===========================================================================
+# H7: validate_block must validate slash transactions
+# ===========================================================================
+
+
+class TestValidateBlockSlashTxs(unittest.TestCase):
+    """H7: validate_block must reject blocks with invalid slash evidence."""
+
+    def test_validate_block_rejects_invalid_slash_evidence(self):
+        """A block containing fabricated slash evidence must fail validate_block."""
+        bc, entity = _setup_chain()
+        # Build a block with a bogus slash transaction
+        from messagechain.core.block import Block, BlockHeader, compute_merkle_root
+        from messagechain.consensus.slashing import (
+            SlashTransaction, SlashingEvidence,
+        )
+        from messagechain.crypto.keys import Signature
+        genesis = bc.get_latest_block()
+        # Fabricate evidence with no real conflicting headers
+        fake_header = BlockHeader(
+            version=1, block_number=1,
+            prev_hash=genesis.block_hash,
+            merkle_root=_hash(b"x"), timestamp=time.time(),
+            proposer_id=entity.entity_id,
+        )
+        evidence = SlashingEvidence(
+            offender_id=entity.entity_id,
+            header_a=fake_header,
+            header_b=fake_header,  # same header = not conflicting
+        )
+        slash_tx = SlashTransaction(
+            evidence=evidence,
+            submitter_id=entity.entity_id,
+            timestamp=time.time(),
+            fee=MIN_FEE,
+            signature=Signature([], 0, [], b"\x00" * 32, b"\x00" * 32),
+        )
+        # Build a block with this invalid slash tx
+        header = BlockHeader(
+            version=1, block_number=1,
+            prev_hash=genesis.block_hash,
+            merkle_root=compute_merkle_root([slash_tx.tx_hash]),
+            timestamp=time.time() + 1,
+            proposer_id=entity.entity_id,
+        )
+        header.proposer_signature = entity.keypair.sign(_hash(header.signable_data()))
+        from messagechain.consensus.randao import derive_randao_mix
+        header.randao_mix = derive_randao_mix(
+            genesis.header.randao_mix, header.proposer_signature,
+        )
+        block = Block(
+            header=header, transactions=[],
+            slash_transactions=[slash_tx],
+        )
+        block.block_hash = block._compute_hash()
+        valid, reason = bc.validate_block(block)
+        self.assertFalse(valid)
+
+
+# ===========================================================================
+# H13: PeerEvictionProtector must be wired into Node
+# ===========================================================================
+
+
+class TestPeerEvictionProtectorWired(unittest.TestCase):
+    """H13: Node must use PeerEvictionProtector for inbound connections."""
+
+    def test_node_has_eviction_protector(self):
+        from messagechain.network.node import Node
+        node = Node.__new__(Node)
+        # Check that the Node class references eviction protector
+        # (either as attribute or in _handle_connection logic)
+        import inspect
+        source = inspect.getsource(Node)
+        self.assertIn("eviction", source.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,7 @@ from messagechain.network.ban import (
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
 )
 from messagechain.network.ratelimit import PeerRateLimiter
+from messagechain.network.eviction import PeerEvictionProtector
 from messagechain.validation import parse_hex
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class Node:
         # callback can reference ban_manager.
         self.ban_manager = PeerBanManager()
         self.rate_limiter = PeerRateLimiter()
+        self.eviction_protector = PeerEvictionProtector()
 
         # Sybil-resistant address manager (formerly dead code — now wired)
         self.addrman = AddressManager()
@@ -307,7 +309,25 @@ class Node:
             writer.close()
             return
 
+        # Enforce MAX_PEERS with eviction. If full, try to evict the worst
+        # existing peer; if no eviction candidate, reject the newcomer.
+        connected_count = sum(1 for p in self.peers.values() if p.is_connected)
+        if connected_count >= MAX_PEERS:
+            victim = self.eviction_protector.select_eviction_candidate()
+            if victim and victim in self.peers:
+                logger.info(f"Evicting peer {victim} to make room for {address}")
+                old = self.peers[victim]
+                old.is_connected = False
+                if old.writer:
+                    old.writer.close()
+                self.eviction_protector.remove_peer(victim)
+            else:
+                logger.debug(f"Rejecting inbound peer {address}: at MAX_PEERS ({MAX_PEERS}), no eviction candidate")
+                writer.close()
+                return
+
         peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
+        self.eviction_protector.register_peer(address)
 
         # Long-lived idle timeout for an established peer. Handshake must
         # arrive within HANDSHAKE_TIMEOUT; regular traffic after that is
@@ -331,6 +351,7 @@ class Node:
         finally:
             peer.is_connected = False
             self.rate_limiter.remove_peer(address)
+            self.eviction_protector.remove_peer(address)
             writer.close()
 
     async def _connect_to_peer(self, host: str, port: int):
