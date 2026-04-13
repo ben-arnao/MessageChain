@@ -188,6 +188,14 @@ class ProofOfStake:
                 continue  # skip duplicates
             seen.add(att.validator_id)
 
+            # H1: Attestations must vote for the parent block. Reject
+            # attestations for a different block hash or block number —
+            # prevents replaying valid attestations from other blocks.
+            if att.block_hash != block.header.prev_hash:
+                continue
+            if att.block_number != block.header.block_number - 1:
+                continue
+
             # A validator's public key must be known AND the attestation
             # signature must verify. Anything else is rejected.
             pub = public_keys.get(att.validator_id)

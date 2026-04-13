@@ -3,9 +3,9 @@
 # Cryptography (defined early — needed by Treasury ID derivation below)
 HASH_ALGO = "sha3_256"
 
-# Message constraints
-MAX_MESSAGE_CHARS = 280  # max characters per message (Twitter-length short messages)
-MAX_MESSAGE_BYTES = 1_120  # max message size in bytes (~280 chars with Unicode room)
+# Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
+MAX_MESSAGE_CHARS = 280  # max characters per message
+MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
@@ -31,7 +31,8 @@ DEFAULT_GENESIS_ALLOCATIONS = {
 }
 
 BLOCK_REWARD = 16  # new tokens minted per block (split between proposer + attestors)
-assert (BLOCK_REWARD & (BLOCK_REWARD - 1)) == 0, "BLOCK_REWARD must be a power of 2 for clean halvings"
+if (BLOCK_REWARD & (BLOCK_REWARD - 1)) != 0:
+    raise ValueError("BLOCK_REWARD must be a power of 2 for clean halvings")
 HALVING_INTERVAL = 210_240  # blocks between reward halvings (~4 years at 600s blocks)
 BLOCK_REWARD_FLOOR = 4  # minimum reward per block — never drops below this
 # At 600s blocks (~52.6K blocks/year), floor of 4 = ~210K tokens/year ≈ 0.021% of genesis.
@@ -75,10 +76,6 @@ MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same a
 MESSAGE_DEFAULT_TTL = 4_320   # default message retention in blocks (~30 days at 600s)
 MESSAGE_MIN_TTL = 144         # minimum TTL (~1 day at 600s) — prevents gaming fees via short TTL
 MESSAGE_MAX_TTL = 52_560      # maximum TTL (~1 year at 600s) — bounds long-term storage commitment
-
-# Identity creation fee — first transaction from a new entity must pay this surcharge.
-# Every new identity is permanent state; this gates account-level bloat.
-IDENTITY_CREATION_FEE = 1_000  # tokens required on top of normal tx fee for new entities
 
 # Cryptography (HASH_ALGO defined at top of file)
 WOTS_W = 16  # Winternitz parameter (base-16)

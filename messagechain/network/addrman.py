@@ -139,6 +139,10 @@ class AddressManager:
 
         Returns True if the address was added, False if rejected.
         """
+        # M18: Validate port range
+        if not isinstance(port, int) or not (1 <= port <= 65535):
+            return False
+
         # Reject private/reserved IPs — prevents eclipse via unreachable addresses
         if not _is_public_ip(ip):
             return False

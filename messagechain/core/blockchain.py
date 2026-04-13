@@ -23,7 +23,6 @@ from messagechain.config import (
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
-    IDENTITY_CREATION_FEE,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.state_tree import SparseMerkleTree
@@ -758,7 +757,9 @@ class Blockchain:
 
         # Simulate fee payments for message transactions (with burn)
         for tx in transactions:
-            tip = tx.fee - current_base_fee
+            # M1/M2: Clamp tip to >= 0 to prevent negative balances
+            effective_base_fee = min(current_base_fee, tx.fee)
+            tip = tx.fee - effective_base_fee
             sim_balances[tx.entity_id] = sim_balances.get(tx.entity_id, 0) - tx.fee
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             # base_fee is burned — not added to any balance
@@ -766,7 +767,8 @@ class Blockchain:
 
         # Simulate transfer transactions (with burn)
         for ttx in (transfer_transactions or []):
-            tip = ttx.fee - current_base_fee
+            effective_base_fee = min(current_base_fee, ttx.fee)
+            tip = ttx.fee - effective_base_fee
             sim_balances[ttx.entity_id] = sim_balances.get(ttx.entity_id, 0) - ttx.amount - ttx.fee
             sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
@@ -1085,15 +1087,6 @@ class Blockchain:
                     f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
                 )
 
-            # Identity creation fee: first tx from a new entity costs extra.
-            # Every new identity is permanent state; this gates account-level bloat.
-            is_new_entity = expected_nonce == 0
-            if is_new_entity and tx.fee < IDENTITY_CREATION_FEE:
-                return False, (
-                    f"Invalid tx {tx.tx_hash.hex()[:16]}: "
-                    f"First transaction requires identity creation fee of {IDENTITY_CREATION_FEE}, got {tx.fee}"
-                )
-
             # Check cumulative fee spend within this block doesn't exceed spendable balance
             spent_so_far = pending_balance_spent.get(tx.entity_id, 0)
             if self.get_spendable_balance(tx.entity_id) < spent_so_far + tx.fee:
@@ -1257,12 +1250,14 @@ class Blockchain:
 
     def _apply_transfer_with_burn(self, tx, proposer_id: bytes, base_fee: int):
         """Apply a transfer transaction with EIP-1559 fee burning."""
-        tip = tx.fee - base_fee
+        # M1: Clamp base_fee to the actual fee to prevent negative tip
+        effective_base_fee = min(base_fee, tx.fee)
+        tip = tx.fee - effective_base_fee
         self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
         self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
         self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tip
-        self.supply.total_supply -= base_fee  # burn
-        self.supply.total_burned += base_fee
+        self.supply.total_supply -= effective_base_fee  # burn
+        self.supply.total_burned += effective_base_fee
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
 

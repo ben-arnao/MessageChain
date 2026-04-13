@@ -34,7 +34,8 @@ def _generate_self_signed_cert(cert_path: str, key_path: str):
         from cryptography.hazmat.primitives.asymmetric import rsa
         import datetime
 
-        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        # M15: Use 4096-bit RSA for the 1000-year design goal
+        key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
         subject = issuer = x509.Name([
             x509.NameAttribute(NameOID.COMMON_NAME, "messagechain-node"),
         ])
@@ -54,6 +55,11 @@ def _generate_self_signed_cert(cert_path: str, key_path: str):
                 serialization.PrivateFormat.TraditionalOpenSSL,
                 serialization.NoEncryption(),
             ))
+        # M14: Restrict private key file permissions
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass  # best-effort on platforms that don't support chmod
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
         logger.info(f"Generated self-signed TLS certificate: {cert_path}")
@@ -61,11 +67,16 @@ def _generate_self_signed_cert(cert_path: str, key_path: str):
         # Fallback: use openssl command if cryptography is not installed
         import subprocess
         subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "openssl", "req", "-x509", "-newkey", "rsa:4096",
             "-keyout", key_path, "-out", cert_path,
             "-days", "3650", "-nodes",
             "-subj", "/CN=messagechain-node",
         ], check=True, capture_output=True)
+        # M14: Restrict private key file permissions
+        try:
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
         logger.info(f"Generated self-signed TLS certificate via openssl: {cert_path}")
 
 

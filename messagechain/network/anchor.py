@@ -38,10 +38,23 @@ class AnchorStore:
         """Load anchor addresses from disk.
 
         Returns empty list if file doesn't exist or is corrupt.
+        Validates host and port to prevent anchor file poisoning.
         """
         try:
             with open(self.path, "r") as f:
                 data = json.load(f)
-            return [(entry["host"], entry["port"]) for entry in data]
+            result = []
+            for entry in data:
+                host = entry.get("host", "")
+                port = entry.get("port", 0)
+                # H7: Validate port range
+                if not isinstance(port, int) or not (1 <= port <= 65535):
+                    logger.warning(f"Skipping anchor with invalid port: {host}:{port}")
+                    continue
+                if not isinstance(host, str) or not host:
+                    logger.warning(f"Skipping anchor with invalid host")
+                    continue
+                result.append((host, port))
+            return result
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
             return []

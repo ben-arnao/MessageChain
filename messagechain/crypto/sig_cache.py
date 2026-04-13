@@ -12,6 +12,7 @@ Design inspired by Bitcoin Core's CSignatureCache (CuckooCache-based).
 import hashlib
 import os
 import struct
+import threading
 from collections import OrderedDict
 from messagechain.config import HASH_ALGO
 
@@ -43,6 +44,8 @@ class SignatureCache:
         # Per-instance random nonce. 32 bytes — wide enough that a hash
         # collision precomputation against a random node is infeasible.
         self._nonce: bytes = os.urandom(32)
+        # H4: Thread-safety lock — protects all cache state mutations.
+        self._lock = threading.Lock()
 
     def _key(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes) -> bytes:
         """Compute a unique cache key from the verification triple.
@@ -63,13 +66,14 @@ class SignatureCache:
     def lookup(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes) -> bool | None:
         """Check if a verification result is cached. Returns None on miss."""
         key = self._key(msg_hash, sig_hash, pub_key)
-        if key in self._cache:
-            result, cached_version = self._cache[key]
-            if cached_version == self._version:
-                self._cache.move_to_end(key)
-                return result
-            # Stale entry from prior version — treat as miss
-            del self._cache[key]
+        with self._lock:
+            if key in self._cache:
+                result, cached_version = self._cache[key]
+                if cached_version == self._version:
+                    self._cache.move_to_end(key)
+                    return result
+                # Stale entry from prior version — treat as miss
+                del self._cache[key]
         return None
 
     def store(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes, result: bool):
@@ -83,12 +87,13 @@ class SignatureCache:
         if not result:
             return  # never cache negative results — prevents cache poisoning
         key = self._key(msg_hash, sig_hash, pub_key)
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return
-        if len(self._cache) >= self.max_size:
-            self._cache.popitem(last=False)
-        self._cache[key] = (result, self._version)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return
+            if len(self._cache) >= self.max_size:
+                self._cache.popitem(last=False)
+            self._cache[key] = (result, self._version)
 
     def invalidate(self, block_hashes: set[bytes] | None = None):
         """Invalidate cache entries.
@@ -97,32 +102,30 @@ class SignatureCache:
         are removed (partial invalidation for shallow reorgs). Otherwise, the
         entire cache is cleared.
         """
-        if block_hashes is None:
-            # Full invalidation: clear everything and bump version.
-            # Version bump ensures any concurrent lookups in progress
-            # won't return stale results from the prior epoch.
-            self._cache.clear()
-            self._block_keys.clear()
-            self._version += 1
-        else:
-            # Partial invalidation: only remove entries for specific blocks.
-            # No version bump needed — unaffected entries remain valid.
-            for bh in block_hashes:
-                for key in self._block_keys.pop(bh, []):
-                    self._cache.pop(key, None)
+        with self._lock:
+            if block_hashes is None:
+                self._cache.clear()
+                self._block_keys.clear()
+                self._version += 1
+            else:
+                for bh in block_hashes:
+                    for key in self._block_keys.pop(bh, []):
+                        self._cache.pop(key, None)
 
     def associate_block(self, msg_hash: bytes, sig_hash: bytes, pub_key: bytes, block_hash: bytes):
         """Associate a cached entry with a block for partial invalidation."""
         key = self._key(msg_hash, sig_hash, pub_key)
-        if block_hash not in self._block_keys:
-            self._block_keys[block_hash] = []
-        self._block_keys[block_hash].append(key)
-        # Bound _block_keys to prevent unbounded memory growth. When full,
-        # prune the oldest half (FIFO by insertion order, which is block order).
-        if len(self._block_keys) > self.max_size:
-            keys_to_drop = list(self._block_keys.keys())[:len(self._block_keys) // 2]
-            for k in keys_to_drop:
-                del self._block_keys[k]
+        with self._lock:
+            if block_hash not in self._block_keys:
+                self._block_keys[block_hash] = []
+            self._block_keys[block_hash].append(key)
+            # M5: When pruning _block_keys, also remove orphaned cache entries
+            # so they can still be invalidated if needed during deep reorgs.
+            if len(self._block_keys) > self.max_size:
+                keys_to_drop = list(self._block_keys.keys())[:len(self._block_keys) // 2]
+                for k in keys_to_drop:
+                    for cache_key in self._block_keys.pop(k, []):
+                        self._cache.pop(cache_key, None)
 
     def __len__(self) -> int:
         return len(self._cache)
@@ -130,11 +133,14 @@ class SignatureCache:
 
 # Global singleton
 _global_cache: SignatureCache | None = None
+_global_cache_lock = threading.Lock()
 
 
 def get_global_cache() -> SignatureCache:
     """Get or create the global signature cache."""
     global _global_cache
     if _global_cache is None:
-        _global_cache = SignatureCache()
+        with _global_cache_lock:
+            if _global_cache is None:
+                _global_cache = SignatureCache()
     return _global_cache

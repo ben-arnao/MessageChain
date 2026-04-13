@@ -124,11 +124,25 @@ class FinalityTracker:
         attestation: Attestation,
         validator_stake: int,
         total_stake: int,
+        public_keys: dict[bytes, bytes] | None = None,
     ) -> bool:
-        """Record an attestation. Returns True if the block becomes justified."""
+        """Record an attestation. Returns True if the block becomes justified.
+
+        If public_keys is provided, the attestation signature is verified
+        before counting. Unverifiable attestations are rejected.
+        """
         bh = attestation.block_hash
         vid = attestation.validator_id
         height = attestation.block_number
+
+        # H2: Verify attestation signature if public keys are available.
+        # This prevents forged attestations from reaching finality.
+        if public_keys is not None:
+            pub = public_keys.get(vid)
+            if pub is None:
+                return False  # unknown validator
+            if not verify_attestation(attestation, pub):
+                return False  # bad signature
 
         if bh not in self.attestations:
             self.attestations[bh] = set()
@@ -190,6 +204,25 @@ class FinalityTracker:
         evidence = list(self.pending_slashing_evidence)
         self.pending_slashing_evidence.clear()
         return evidence
+
+    def prune(self, below_height: int):
+        """Remove attestation data for blocks below the given height.
+
+        Prevents unbounded memory growth over the chain's lifetime.
+        """
+        keys_to_remove = [
+            k for k in self._attestation_by_height if k[1] < below_height
+        ]
+        for k in keys_to_remove:
+            bh = self._attestation_by_height.pop(k, None)
+            self._attestation_objects.pop(k, None)
+            # Clean up block-level tracking if no more attestations reference it
+            if bh is not None and bh in self.attestations:
+                vid = k[0]
+                self.attestations[bh].discard(vid)
+                if not self.attestations[bh]:
+                    del self.attestations[bh]
+                    self.attested_stake.pop(bh, None)
 
     def get_attested_stake_ratio(self, block_hash: bytes, total_stake: int) -> float:
         """Return the fraction of stake that has attested to this block."""

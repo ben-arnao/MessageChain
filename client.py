@@ -34,6 +34,10 @@ def rpc_call(host: str, port: int, method: str, params: dict) -> dict:
         # Read response
         length_bytes = _recv_exact(sock, 4)
         length = struct.unpack(">I", length_bytes)[0]
+        # M13: Reject oversized responses to prevent memory exhaustion
+        MAX_RESPONSE_LENGTH = 10_000_000  # 10 MB
+        if length > MAX_RESPONSE_LENGTH:
+            raise ValueError(f"Response too large: {length} bytes (max {MAX_RESPONSE_LENGTH})")
         data = _recv_exact(sock, length)
         return json.loads(data.decode("utf-8"))
     finally:

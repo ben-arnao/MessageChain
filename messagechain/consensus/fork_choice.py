@@ -90,6 +90,7 @@ def find_common_ancestor(
     chain_a_tip: bytes,
     chain_b_tip: bytes,
     get_block: callable,
+    finalized_hashes: set[bytes] | None = None,
 ) -> tuple[bytes | None, list[Block], list[Block]]:
     """
     Find the common ancestor of two chain tips.
@@ -120,6 +121,17 @@ def find_common_ancestor(
         if a_hash == b_hash:
             # Found common ancestor
             return a_hash, chain_a_blocks, chain_b_blocks
+
+        # H3: Reject reorgs past finalized blocks. If any block we would
+        # roll back is finalized, the reorg is invalid.
+        if finalized_hashes:
+            for blk in chain_a_blocks:
+                if blk.block_hash in finalized_hashes:
+                    logger.warning(
+                        f"Reorg rejected: would roll back finalized block "
+                        f"{blk.block_hash.hex()[:16]} at height {blk.header.block_number}"
+                    )
+                    return None, [], []
 
         # Check if a's current hash is in b's history
         if a_hash in b_hashes:

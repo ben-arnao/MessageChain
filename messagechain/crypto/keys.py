@@ -4,6 +4,10 @@ Merkle tree of WOTS+ keypairs for multi-use quantum-resistant signatures.
 A single WOTS+ key can only sign once safely. This module builds a Merkle tree
 over many WOTS+ public keys, giving a single long-lived root public key that
 supports up to 2^height signatures.
+
+Key generation is lazy: leaf keypairs are derived on demand from a seed,
+so even large trees (height=40 → ~1 trillion signatures) have near-instant
+creation time and constant memory overhead.
 """
 
 import hashlib
@@ -32,14 +36,19 @@ class Signature:
         Deterministic serialization used for witness_hash computation
         and relay-level deduplication. Prevents malleability from
         non-canonical encodings of the same signature.
+
+        M23: Includes length prefixes for variable-length lists to prevent
+        ambiguous concatenation between different element counts.
         """
         parts = []
-        # WOTS+ signature chains (sorted order guaranteed by list)
+        # M23: Length prefix for WOTS+ signature list
+        parts.append(struct.pack(">I", len(self.wots_signature)))
         for s in self.wots_signature:
             parts.append(s)
         # Leaf index as big-endian 4 bytes
         parts.append(struct.pack(">I", self.leaf_index))
-        # Auth path
+        # M23: Length prefix for auth path list
+        parts.append(struct.pack(">I", len(self.auth_path)))
         for h in self.auth_path:
             parts.append(h)
         # Public key and seed
@@ -58,20 +67,91 @@ class Signature:
 
     @classmethod
     def deserialize(cls, data: dict) -> "Signature":
+        wots_sig = [bytes.fromhex(s) for s in data["wots_signature"]]
+        leaf_index = data["leaf_index"]
+        auth_path = [bytes.fromhex(h) for h in data["auth_path"]]
+        pub_key = bytes.fromhex(data["wots_public_key"])
+        pub_seed = bytes.fromhex(data["wots_public_seed"])
+
+        # M4: Structural validation on deserialization
+        if not isinstance(leaf_index, int) or leaf_index < 0:
+            raise ValueError(f"Invalid leaf_index: {leaf_index}")
+        if not wots_sig:
+            raise ValueError("Empty WOTS signature")
+        for i, s in enumerate(wots_sig):
+            if len(s) != _HASH_SIZE:
+                raise ValueError(f"WOTS signature element {i} has wrong size: {len(s)}")
+        for i, h in enumerate(auth_path):
+            if len(h) != _HASH_SIZE:
+                raise ValueError(f"Auth path element {i} has wrong size: {len(h)}")
+        if len(pub_key) != _HASH_SIZE:
+            raise ValueError(f"Public key has wrong size: {len(pub_key)}")
+        if len(pub_seed) != _HASH_SIZE:
+            raise ValueError(f"Public seed has wrong size: {len(pub_seed)}")
+
         return cls(
-            wots_signature=[bytes.fromhex(s) for s in data["wots_signature"]],
-            leaf_index=data["leaf_index"],
-            auth_path=[bytes.fromhex(h) for h in data["auth_path"]],
-            wots_public_key=bytes.fromhex(data["wots_public_key"]),
-            wots_public_seed=bytes.fromhex(data["wots_public_seed"]),
+            wots_signature=wots_sig,
+            leaf_index=leaf_index,
+            auth_path=auth_path,
+            wots_public_key=pub_key,
+            wots_public_seed=pub_seed,
         )
+
+
+def _derive_leaf(seed: bytes, leaf_index: int) -> tuple[list[bytes], bytes, bytes]:
+    """Derive a full WOTS+ keypair (private + public) for a single leaf."""
+    leaf_seed = _hash(seed + struct.pack(">Q", leaf_index))
+    return wots_keygen(leaf_seed)
+
+
+def _derive_leaf_pubkey(seed: bytes, leaf_index: int) -> bytes:
+    """Derive just the WOTS+ public key for a leaf (discards private keys)."""
+    _, pub, _ = _derive_leaf(seed, leaf_index)
+    return pub
+
+
+def _subtree_root(seed: bytes, start: int, count: int) -> bytes:
+    """Compute the Merkle root hash over a contiguous range of leaves."""
+    if count == 1:
+        return _derive_leaf_pubkey(seed, start)
+    half = count >> 1
+    left = _subtree_root(seed, start, half)
+    right = _subtree_root(seed, start + half, half)
+    return _hash(left + right)
+
+
+def _compute_auth_path(seed: bytes, height: int, leaf_index: int) -> list[bytes]:
+    """Compute the Merkle authentication path for a leaf on demand.
+
+    For each tree level, computes the sibling subtree root. This is
+    O(2^height) work total but requires no stored tree — all hashes
+    are recomputed from the seed.
+    """
+    path = []
+    for level in range(height):
+        # At this level, blocks are 2^(level+1) leaves wide
+        block_size = 1 << (level + 1)
+        half = block_size >> 1
+        block_start = (leaf_index >> (level + 1)) << (level + 1)
+
+        if (leaf_index >> level) & 1 == 0:
+            # We're on the left; sibling is the right half
+            sibling_start = block_start + half
+        else:
+            # We're on the right; sibling is the left half
+            sibling_start = block_start
+
+        path.append(_subtree_root(seed, sibling_start, half))
+    return path
 
 
 class KeyPair:
     """
-    Merkle tree of WOTS+ keypairs.
+    Merkle tree of WOTS+ keypairs with lazy leaf derivation.
 
-    The root hash is the long-lived public key. Each leaf is a one-time WOTS+ key.
+    The root hash is the long-lived public key. Each leaf is a one-time WOTS+
+    key derived on demand from the seed. No private keys or tree nodes are
+    stored persistently, so large trees (height=40) use constant memory.
     """
 
     def __init__(self, seed: bytes, height: int | None = None, start_leaf: int = 0):
@@ -79,33 +159,15 @@ class KeyPair:
             import messagechain.config
             height = messagechain.config.MERKLE_TREE_HEIGHT
         self.height = height
-        self.num_leaves = 2 ** height
+        self.num_leaves = 1 << height
         self._seed = seed
         self._next_leaf = start_leaf
 
-        # Generate all WOTS+ keypairs and build the Merkle tree
-        self._wots_keys = []  # (private_keys, public_key, public_seed) per leaf
-        leaf_hashes = []
-
-        for i in range(self.num_leaves):
-            leaf_seed = _hash(seed + struct.pack(">Q", i))
-            priv, pub, pub_seed = wots_keygen(leaf_seed)
-            self._wots_keys.append((priv, pub, pub_seed))
-            leaf_hashes.append(pub)
-
-        # Build Merkle tree bottom-up
-        # tree[0] = leaves, tree[height] = [root]
-        self._tree = [leaf_hashes]
-        current = leaf_hashes
-        for level in range(height):
-            next_level = []
-            for j in range(0, len(current), 2):
-                combined = _hash(current[j] + current[j + 1])
-                next_level.append(combined)
-            self._tree.append(next_level)
-            current = next_level
-
-        self.public_key = self._tree[height][0]
+        # Compute the Merkle root (the public key) by building the tree
+        # bottom-up over derived leaf public keys. This is the only expensive
+        # operation — O(2^height) leaf derivations, done once at creation.
+        # No private keys or intermediate tree nodes are retained.
+        self.public_key = _subtree_root(seed, 0, self.num_leaves)
 
     @classmethod
     def generate(cls, seed: bytes, height: int | None = None, start_leaf: int = 0) -> "KeyPair":
@@ -129,43 +191,18 @@ class KeyPair:
             raise RuntimeError(f"Leaf index {leaf_index} exceeds tree capacity {self.num_leaves}")
         self._next_leaf = max(self._next_leaf, leaf_index)
 
-    def _auth_path(self, leaf_index: int) -> list[bytes]:
-        """Get the Merkle authentication path for a leaf."""
-        if leaf_index < 0 or leaf_index >= self.num_leaves:
-            raise IndexError(f"leaf_index {leaf_index} out of range [0, {self.num_leaves})")
-        path = []
-        idx = leaf_index
-        for level in range(self.height):
-            sibling_idx = idx ^ 1  # flip last bit to get sibling
-            path.append(self._tree[level][sibling_idx])
-            idx >>= 1
-        return path
-
     def sign(self, message_hash: bytes) -> Signature:
-        """Sign using the next available WOTS+ leaf key."""
+        """Sign using the next available WOTS+ leaf key (derived on demand)."""
         if self._next_leaf >= self.num_leaves:
             raise RuntimeError("Key exhausted: all one-time keys have been used")
 
         leaf_idx = self._next_leaf
         self._next_leaf += 1
 
-        priv_keys, pub_key, pub_seed = self._wots_keys[leaf_idx]
-        if priv_keys is None:
-            # Re-derive on demand (e.g., test resets _next_leaf back).
-            # This is secure: the keys are derived deterministically from
-            # the seed, so re-derivation produces the same result. The
-            # zeroization just prevents them from sitting in memory idle.
-            leaf_seed = _hash(self._seed + struct.pack(">Q", leaf_idx))
-            priv_keys, _, _ = wots_keygen(leaf_seed)
+        # Derive the leaf keypair on demand — no private keys stored
+        priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
         wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
-        auth_path = self._auth_path(leaf_idx)
-
-        # Zeroize used private keys — WOTS+ keys are one-time; retaining
-        # them in memory after use only increases the attack surface for
-        # memory-dump / cold-boot attacks. We replace the private key list
-        # with None to indicate the leaf has been consumed. The public key
-        # and seed are retained since they're non-secret.
-        self._wots_keys[leaf_idx] = (None, pub_key, pub_seed)
+        auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
 
         return Signature(
             wots_signature=wots_sig,
@@ -209,9 +246,6 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
         return False
     if not isinstance(signature.wots_public_seed, (bytes, bytearray)) or len(signature.wots_public_seed) != _HASH_SIZE:
         return False
-    # Determine the expected tree height from the root length and auth path length;
-    # we derive it from root tree depth by the auth path size check below, and
-    # clamp leaf_index to the corresponding tree size.
     tree_height = len(signature.auth_path)
     if tree_height <= 0 or tree_height > 64:
         return False

@@ -697,11 +697,20 @@ class GovernanceTracker:
 # --- Validation helpers ---
 
 
+MAX_PROPOSAL_TITLE_LENGTH = 200
+MAX_PROPOSAL_DESCRIPTION_LENGTH = 10_000
+
+
 def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
     """Verify a proposal transaction's signature."""
     if tx.fee < GOVERNANCE_PROPOSAL_FEE:
         return False
     if not tx.title:
+        return False
+    # M10: Bound title/description to prevent block bloat
+    if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
+        return False
+    if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
         return False
     if tx.reference_hash and len(tx.reference_hash) != 32:
         return False

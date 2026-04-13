@@ -335,11 +335,17 @@ class TestWOTSChecksumDigits(unittest.TestCase):
 class TestKeyZeroization(unittest.TestCase):
 
     def test_used_leaf_zeroed(self):
+        """With lazy keygen, private keys are never stored — they're derived
+        on demand and discarded after signing. Verify the keypair does NOT
+        retain private key material (no _wots_keys attribute)."""
         e = _make_entity()
-        idx = e.keypair._next_leaf
         e.keypair.sign(b"\xab" * 32)
-        priv = e.keypair._wots_keys[idx][0]
-        self.assertIsNone(priv, "Used WOTS+ private keys should be None after signing")
+        # Lazy keygen: no _wots_keys attribute at all — keys are derived
+        # on demand and immediately discarded after signing.
+        self.assertFalse(
+            hasattr(e.keypair, '_wots_keys'),
+            "Lazy keygen should not store private keys in _wots_keys"
+        )
 
 
 # ===========================================================================

@@ -29,7 +29,7 @@ class SignalTracker:
     feature_name: str
     start_height: int
     timeout_height: int
-    threshold: float
+    threshold: float  # kept for serialization compat; see threshold_numerator/denominator
     bit: int
     activation_delay: int = 10
     min_window: int = 10  # minimum blocks before evaluating threshold
@@ -57,10 +57,13 @@ class SignalTracker:
         if signals:
             self._signals += 1
 
-        # Check if we've reached threshold (require minimum window)
+        # M9: Use integer arithmetic for threshold comparison to avoid
+        # floating-point consensus divergence across different platforms.
+        # threshold is stored as float (e.g. 0.95) — convert to integer
+        # comparison: signals * 1000 >= total_blocks * (threshold * 1000)
         if self._total_blocks >= self.min_window:
-            ratio = self._signals / self._total_blocks
-            if ratio >= self.threshold:
+            threshold_millionths = int(self.threshold * 1_000_000)
+            if self._signals * 1_000_000 >= self._total_blocks * threshold_millionths:
                 self._locked_in = True
                 self._lock_in_height = block_height
 

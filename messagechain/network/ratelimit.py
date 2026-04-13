@@ -120,6 +120,8 @@ class RPCRateLimiter:
     the configured rate within the window.
     """
 
+    MAX_TRACKED_IPS = 1000
+
     def __init__(self, max_requests: int = 60, window_seconds: float = 60.0):
         self.max_requests = max_requests
         self.window_seconds = window_seconds
@@ -131,6 +133,13 @@ class RPCRateLimiter:
         cutoff = now - self.window_seconds
 
         if ip not in self._requests:
+            # M12: Cap tracked IPs to prevent unbounded memory growth
+            if len(self._requests) >= self.MAX_TRACKED_IPS:
+                self.cleanup_stale(max_age=60)
+                # If still over limit after cleanup, evict oldest
+                if len(self._requests) >= self.MAX_TRACKED_IPS:
+                    oldest_ip = min(self._requests, key=lambda k: self._requests[k][-1] if self._requests[k] else 0)
+                    del self._requests[oldest_ip]
             self._requests[ip] = []
 
         # Prune expired entries
