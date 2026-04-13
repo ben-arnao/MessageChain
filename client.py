@@ -79,6 +79,8 @@ def collect_private_key() -> bytes:
 
 def cmd_create_account(args):
     """Create a new account on the chain."""
+    from messagechain.crypto.hash_sig import _hash
+
     print("=== Create Account ===\n")
 
     private_key = collect_private_key()
@@ -87,12 +89,17 @@ def cmd_create_account(args):
     entity = Entity.create(private_key)
     print(f"\nYour entity ID: {entity.entity_id_hex}")
 
-    # Send ONLY the public entity_id and public_key to the server.
+    # Sign registration proof to demonstrate key ownership.
+    proof_msg = _hash(b"register" + entity.entity_id)
+    proof = entity.keypair.sign(proof_msg)
+
+    # Send public identity + proof to the server.
     # Private key never leaves the client.
     print(f"Registering with server at {args.host}:{args.rpc_port}...")
     response = rpc_call(args.host, args.rpc_port, "register_entity", {
         "entity_id": entity.entity_id_hex,
         "public_key": entity.public_key.hex(),
+        "registration_proof": proof.serialize(),
     })
 
     if response.get("ok"):

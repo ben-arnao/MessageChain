@@ -418,15 +418,23 @@ class Server:
         """Register a new entity from client-provided public identity.
 
         The client derives entity_id and public_key locally from their
-        private key, then sends ONLY the public values. The server never
-        sees private key material.
+        private key, then sends the public values plus a registration proof
+        (signature over SHA3-256("register" || entity_id)). The server
+        never sees private key material.
         """
         try:
+            from messagechain.crypto.keys import Signature
             entity_id = parse_hex(params.get("entity_id", ""))
             public_key = parse_hex(params.get("public_key", ""))
             if entity_id is None or public_key is None:
                 return {"ok": False, "error": "Invalid hex in entity_id or public_key"}
-            success, msg = self.blockchain.register_entity(entity_id, public_key)
+
+            proof_data = params.get("registration_proof")
+            proof = None
+            if proof_data is not None:
+                proof = Signature.deserialize(proof_data)
+
+            success, msg = self.blockchain.register_entity(entity_id, public_key, registration_proof=proof)
             if success:
                 return {
                     "ok": True,

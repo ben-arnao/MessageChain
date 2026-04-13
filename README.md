@@ -2,78 +2,241 @@
 
 A blockchain for sending messages. Quantum-resistant signatures, proof-of-stake consensus, and fee-based spam prevention. Designed to last centuries.
 
-## Send a Message
+## Getting Started: From Scratch to Sending a Message
+
+This guide walks you through the recommended cold storage workflow. Your private key is generated offline and never stored on a networked machine.
+
+### 1. Install
+
+```bash
+git clone https://github.com/YourUser/MessageChain.git
+cd MessageChain
+pip install -r requirements.txt
+```
+
+### 2. Disconnect from the internet
+
+Disable Wi-Fi, unplug Ethernet — make sure your machine has no network access. Your private key should never exist on a networked machine.
+
+### 3. Generate your key pair (offline)
 
 ```bash
 python -m messagechain generate-key
-python -m messagechain account
+```
+
+Output:
+
+```
+=== Key Pair Generated ===
+
+  Private key: 9a3f...c7d1
+  Public key:  b82e...4f90
+  Entity ID:   d41a...8e23
+```
+
+You now have three values:
+
+| Value | What it is | Who sees it |
+|---|---|---|
+| **Private key** | Your sole credential. Controls your account. | Only you. Never share. |
+| **Public key** | Your cryptographic identity (Merkle tree root). | Public — goes on-chain. |
+| **Entity ID** | Your wallet address (derived from public key). | Public — share freely. |
+
+### 4. Write down your private key
+
+Write the private key on paper or stamp it into metal. Make 2-3 copies and store them in separate secure locations (safe deposit box, fireproof safe, etc.).
+
+Do **not** save it to a file, do **not** photograph it, do **not** paste it into a notes app.
+
+### 5. Verify your backup (still offline)
+
+Before you delete anything, verify that your handwritten copy reproduces the same identity:
+
+```bash
+python -m messagechain verify-key
+```
+
+```
+Private key (hidden): ****
+  Public key:  b82e...4f90
+  Entity ID:   d41a...8e23
+```
+
+Confirm the public key and entity ID match what you wrote down in step 3. If they don't, you copied the private key wrong — go back to step 4.
+
+### 6. Sign your registration proof (still offline)
+
+This creates a signed proof that you own the key pair. You'll use it to register your account without exposing your private key on an online machine.
+
+```bash
+python -m messagechain sign-registration
+```
+
+```
+Private key (hidden): ****
+  Entity ID:  d41a...8e23
+  Proof file: registration_d41a...8e23.json
+```
+
+Copy the proof file (`registration_*.json`) to a USB drive. This file contains only public information and the signature — not your private key.
+
+### 7. Clear your traces and reconnect
+
+```bash
+history -c    # clear terminal history
+```
+
+Delete any temporary files. Reconnect to the internet.
+
+### 8. Register your account (online, no private key needed)
+
+Transfer the proof file from the USB drive, then register:
+
+```bash
+python -m messagechain account --proof registration_d41a...8e23.json
+```
+
+Your account is now on-chain. You can receive funds at your entity ID.
+
+### 9. Receive funds
+
+Share your entity ID with the sender. They transfer tokens to you — no action needed on your end.
+
+### 10. Send a message (private key needed briefly)
+
+When you want to send a message, you'll be prompted for your private key. Type it from your paper backup. It stays in memory only for the few seconds it takes to sign, then the process exits.
+
+```bash
 python -m messagechain send "Hello, MessageChain!"
 ```
 
-## Run a Validator
-
-```bash
-python -m messagechain generate-key
-python -m messagechain start --mine
+```
+Private key (hidden): ****
+Signing as: d41a...8e23...
+Message sent!
+  TX hash: 7f2c...
+  Fee:     5 tokens
 ```
 
-Anyone can start mining. Early on, staking requires just 1 token. As the network matures, the minimum increases (10 at block 50k, 100 at block 200k). Stake gives you voting power in governance and weight in block production:
+Your private key is not stored anywhere. The next time you send, you'll enter it again.
+
+### Summary
+
+| Step | Where | Private key needed? |
+|---|---|---|
+| Generate key pair | Offline | Produced here |
+| Verify backup | Offline | Yes |
+| Sign registration | Offline | Yes (last time offline) |
+| Register account | Online | No (proof file only) |
+| Receive funds | Online | No |
+| Send message/funds | Online | Yes (briefly in memory) |
+| Recovery | Offline | Paper backup |
+
+## Quick Reference
+
+### Check Your Balance
 
 ```bash
-python -m messagechain account
-python -m messagechain stake --amount 1
+python -m messagechain balance
 ```
 
-## Delegate Trust
+### Receive Funds
 
-Any user with tokens can signal which validators they trust. This influences governance votes and network security. Funds are not locked.
+Share your entity ID with the sender. They transfer tokens to you — no action needed on your end.
+
+### Send Funds
 
 ```bash
-# Trust a single validator
+python -m messagechain transfer --to <recipient_entity_id> --amount 100
+```
+
+Fee is auto-detected. Override with `--fee <amount>`.
+
+### Send a Message
+
+```bash
+python -m messagechain send "Hello, MessageChain!"
+```
+
+Messages are 280 characters max. Fee scales with message size.
+
+### Read Messages
+
+```bash
+python -m messagechain read              # last 10 messages
+python -m messagechain read --last 50    # last 50 messages
+```
+
+Output shows entity ID, timestamp, and message text.
+
+### Delegate Your Voting Power
+
+Non-validators can signal which validators they trust. This influences governance votes and network security. Funds are not locked.
+
+```bash
+# Delegate to a single validator
 python -m messagechain delegate --to <validator_id> --pct 100
 
-# Split trust across multiple validators
+# Split across multiple validators
 python -m messagechain delegate --to <id1> --pct 50 --to <id2> --pct 30 --to <id3> --pct 20
 
-# Revoke and return to default (automatic sqrt-weighted distribution)
+# Revoke delegation (revert to automatic distribution)
 python -m messagechain delegate --revoke
 ```
 
-If you don't delegate, your trust is automatically distributed across validators weighted by the square root of their stake.
+### Propose a Governance Vote
 
-## Governance
-
-Staked validators can propose and vote on protocol changes. Proposals require a fee to prevent spam. Voting power is proportional to staked amount.
+Staked validators can propose protocol changes. Proposals cost 1000 tokens to prevent spam.
 
 ```bash
-# Propose a vote (requires 1000 token fee)
 python -m messagechain propose --title "Increase block size" --description "Raise MAX_TXS_PER_BLOCK to 50"
+```
 
-# Vote on a proposal
+### Vote on a Proposal
+
+```bash
 python -m messagechain vote --proposal <proposal_id> --yes
 python -m messagechain vote --proposal <proposal_id> --no
 ```
 
-## Server Configuration
+Voting power is proportional to staked amount. Direct votes override delegation.
+
+### Run a Validator
+
+Start a node that produces blocks and earns rewards.
 
 ```bash
-# Custom ports
-python -m messagechain start --mine --port 9335 --rpc-port 9336
-
-# Connect to an existing network
-python -m messagechain start --mine --seed 192.168.1.10:9333
-
-# Custom data directory
-python -m messagechain start --data-dir ./mydata
+python -m messagechain start --mine
 ```
 
-## Other Commands
+You'll be prompted for your private key. To stake tokens (required for block production weight):
 
 ```bash
-python -m messagechain read          # Read recent messages
-python -m messagechain balance       # Check your balance
-python -m messagechain info          # Chain status from a running node
-python -m messagechain demo          # Try it locally, no network needed
+python -m messagechain stake --amount 100
+```
+
+Minimum stake: 100 tokens. Staking gives you block production weight and governance voting power.
+
+#### Connect to the Network
+
+```bash
+python -m messagechain start --mine --seed <host>:<port>
+```
+
+#### Custom Ports
+
+```bash
+python -m messagechain start --mine --port 9335 --rpc-port 9336
+```
+
+#### Validator Fallback
+
+If a validator misses their block slot, the next proposer is selected automatically via stake-weighted randomness. No manual configuration needed — the protocol handles liveness.
+
+### Show Chain Info
+
+```bash
+python -m messagechain info
 ```
 
 ## Running Tests
@@ -81,3 +244,11 @@ python -m messagechain demo          # Try it locally, no network needed
 ```bash
 python -m unittest discover tests/ -v
 ```
+
+## Architecture
+
+- **Consensus:** Proof-of-stake with stake-weighted proposer selection
+- **Cryptography:** Quantum-resistant WOTS+ signatures, SHA3-256 hashing
+- **Governance:** On-chain proposals and voting with delegated trust
+- **Fees:** Non-linear fee curve (base + per-byte + quadratic) to incentivize concise messages
+- **Token supply:** 1 billion genesis, block rewards halve every ~4 years with a floor of 4 tokens/block
