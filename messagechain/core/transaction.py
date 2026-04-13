@@ -2,15 +2,11 @@
 MessageTransaction - the fundamental unit of data on MessageChain.
 
 Each transaction represents one message posted by one entity. It contains:
-- The message content (up to MAX_MESSAGE_CHARS characters)
+- The message content (printable ASCII only, up to MAX_MESSAGE_CHARS characters)
 - The entity who posted it
 - A quantum-resistant signature
 - A user-set fee (BTC-style bidding: higher fee = higher block priority)
 - A timestamp
-
-The base layer stores raw message bytes with no content interpretation.
-L2 / third-party protocols can define message structure, chain messages
-together, link messages to threads, etc.
 """
 
 import hashlib
@@ -80,15 +76,14 @@ class MessageTransaction:
 
     @property
     def char_count(self) -> int:
-        """Count characters in the message."""
-        text = self.message.decode("utf-8", errors="replace")
-        return len(text)
+        """Count characters in the message (ASCII: 1 byte = 1 char)."""
+        return len(self.message)
 
     def serialize(self) -> dict:
         return {
             "version": self.version,
             "entity_id": self.entity_id.hex(),
-            "message": self.message.decode("utf-8", errors="replace"),
+            "message": self.message.decode("ascii", errors="replace"),
             "timestamp": self.timestamp,
             "nonce": self.nonce,
             "fee": self.fee,
@@ -102,7 +97,7 @@ class MessageTransaction:
         sig = Signature.deserialize(data["signature"])
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
-            message=data["message"].encode("utf-8"),
+            message=data["message"].encode("ascii"),
             timestamp=data["timestamp"],
             nonce=data["nonce"],
             fee=data["fee"],
@@ -136,10 +131,11 @@ def calculate_min_fee(message_bytes: bytes) -> int:
 
 
 def _validate_message(message: str) -> tuple[bool, str]:
-    """Check message is within character and byte limits."""
-    msg_bytes = message.encode("utf-8")
-    if len(msg_bytes) > MAX_MESSAGE_BYTES:
-        return False, f"Message exceeds {MAX_MESSAGE_BYTES} bytes ({len(msg_bytes)} bytes)"
+    """Check message contains only printable ASCII (32-126) and is within limits."""
+    for ch in message:
+        code = ord(ch)
+        if code < 32 or code > 126:
+            return False, f"Non-printable-ASCII character U+{code:04X} not allowed"
     if len(message) > MAX_MESSAGE_CHARS:
         return False, f"Message exceeds {MAX_MESSAGE_CHARS} characters"
     return True, "OK"
@@ -179,7 +175,7 @@ def create_transaction(
     if not valid:
         raise ValueError(reason)
 
-    msg_bytes = message.encode("utf-8")
+    msg_bytes = message.encode("ascii")
     min_required = calculate_min_fee(msg_bytes)
     if fee < min_required:
         raise ValueError(f"Fee must be at least {min_required} for this message ({len(msg_bytes)} bytes)")
@@ -209,6 +205,10 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
         return False
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
+    # Reject non-ASCII bytes in message payload
+    for byte in tx.message:
+        if byte < 32 or byte > 126:
+            return False
     if tx.fee < calculate_min_fee(tx.message):
         return False
     # Validate TTL bounds

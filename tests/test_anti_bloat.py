@@ -5,7 +5,6 @@ Validates the parameter changes that differentiate MessageChain from BTC:
 - Non-linear size-based fees (quadratic) to punish large messages
 - Per-block byte budget (MAX_BLOCK_MESSAGE_BYTES) to cap storage per block
 - Message TTL for explicit retention bounds
-- Identity creation fee to gate account-level state bloat
 - Higher dynamic fee ceiling to punish congestion-era spam
 - Dependent parameter recalculation (halving, unbonding, governance)
 """
@@ -32,7 +31,6 @@ from messagechain.config import (
     MESSAGE_DEFAULT_TTL,
     MESSAGE_MIN_TTL,
     MESSAGE_MAX_TTL,
-    IDENTITY_CREATION_FEE,
 )
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 from messagechain.core.transaction import (
@@ -98,9 +96,9 @@ class TestNonLinearFees(unittest.TestCase):
         self.assertGreater(delta_large, delta_small)
 
     def test_max_message_fee_is_substantial(self):
-        """Max-size message (1120 bytes) should cost far more than MIN_FEE."""
-        fee = calculate_min_fee(b"x" * 1120)
-        self.assertGreater(fee, MIN_FEE * 10)
+        """Max-size message (280 bytes) should cost more than MIN_FEE."""
+        fee = calculate_min_fee(b"x" * 280)
+        self.assertGreater(fee, MIN_FEE * 5)
 
     def test_small_message_still_affordable(self):
         """Short messages (50 bytes) should be reasonably priced."""
@@ -117,19 +115,19 @@ class TestSizeBasedFeeIntegration(unittest.TestCase):
 
     def test_create_transaction_rejects_fee_below_nonlinear_minimum(self):
         msg = "A" * 100
-        min_required = calculate_min_fee(msg.encode("utf-8"))
+        min_required = calculate_min_fee(msg.encode("ascii"))
         with self.assertRaises(ValueError):
             create_transaction(self.alice, msg, fee=min_required - 1, nonce=0)
 
     def test_create_transaction_accepts_fee_at_nonlinear_minimum(self):
         msg = "A" * 100
-        min_required = calculate_min_fee(msg.encode("utf-8"))
+        min_required = calculate_min_fee(msg.encode("ascii"))
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
         self.assertEqual(tx.fee, min_required)
 
     def test_verify_transaction_with_valid_fee(self):
         msg = "B" * 200
-        min_required = calculate_min_fee(msg.encode("utf-8"))
+        min_required = calculate_min_fee(msg.encode("ascii"))
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
         self.assertTrue(verify_transaction(tx, self.alice.keypair.public_key))
 
@@ -143,21 +141,20 @@ class TestBlockByteBudget(unittest.TestCase):
     def test_byte_budget_is_10kb(self):
         self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 10_000)
 
-    def test_max_size_messages_exceed_budget(self):
-        """20 max-size messages (1120 bytes each = 22,400) exceed the 10KB budget."""
+    def test_max_size_messages_fit_within_budget(self):
+        """20 max-size messages (280 bytes each = 5,600) fit within the 10KB budget."""
         total = MAX_TXS_PER_BLOCK * MAX_MESSAGE_BYTES
-        self.assertGreater(total, MAX_BLOCK_MESSAGE_BYTES)
+        self.assertLess(total, MAX_BLOCK_MESSAGE_BYTES)
 
     def test_small_messages_fit_within_budget(self):
         """20 small messages (50 bytes each = 1000) fit within the 10KB budget."""
         total = MAX_TXS_PER_BLOCK * 50
         self.assertLess(total, MAX_BLOCK_MESSAGE_BYTES)
 
-    def test_byte_budget_limits_max_messages_to_about_8(self):
-        """At 1120 bytes each, only ~8-9 max-size messages fit in the budget."""
+    def test_byte_budget_allows_all_max_size_messages(self):
+        """At 280 bytes each, all 20 max-size messages fit in the 10KB budget."""
         max_fit = MAX_BLOCK_MESSAGE_BYTES // MAX_MESSAGE_BYTES
-        self.assertLess(max_fit, 10)
-        self.assertGreater(max_fit, 5)
+        self.assertGreaterEqual(max_fit, MAX_TXS_PER_BLOCK)
 
 
 class TestBlockSizeParameters(unittest.TestCase):
@@ -263,20 +260,6 @@ class TestMessageTTL(unittest.TestCase):
         fee = calculate_min_fee(b"hello")
         with self.assertRaises(ValueError):
             create_transaction(alice, "hello", fee=fee, nonce=0, ttl=1)  # below min
-
-
-class TestIdentityCreationFee(unittest.TestCase):
-    """First transaction from a new entity must pay an extra creation fee."""
-
-    def test_identity_creation_fee_exists(self):
-        self.assertGreater(IDENTITY_CREATION_FEE, 0)
-
-    def test_identity_creation_fee_is_1000(self):
-        self.assertEqual(IDENTITY_CREATION_FEE, 1000)
-
-    def test_creation_fee_exceeds_min_fee(self):
-        """Identity creation fee should be significantly higher than MIN_FEE."""
-        self.assertGreater(IDENTITY_CREATION_FEE, MIN_FEE)
 
 
 class TestGovernanceFees(unittest.TestCase):

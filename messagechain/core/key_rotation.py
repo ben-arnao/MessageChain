@@ -1,10 +1,10 @@
 """
 Key rotation transaction for MessageChain.
 
-WOTS+ keys exhaust after 2^MERKLE_TREE_HEIGHT (1024) signatures. Without
-key rotation, an entity's funds and identity are permanently locked once
-all one-time keys are used. This module provides an on-chain mechanism to
-rotate to a fresh Merkle tree before exhaustion.
+WOTS+ keys exhaust after 2^MERKLE_TREE_HEIGHT signatures (default: 2^20 =
+1,048,576). Without key rotation, an entity's funds and identity are
+permanently locked once all one-time keys are used. This module provides
+an on-chain mechanism to rotate to a fresh Merkle tree before exhaustion.
 
 The rotation is authorized by the entity's CURRENT key — they sign the
 new public key with their old key, proving ownership. The chain then
