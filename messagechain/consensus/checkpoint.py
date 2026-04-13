@@ -73,31 +73,44 @@ def create_checkpoint(chain, block_number: int) -> WeakSubjectivityCheckpoint:
     )
 
 
-def load_checkpoints_file(path: str) -> list[WeakSubjectivityCheckpoint]:
+def load_checkpoints_file(
+    path: str, strict: bool = False,
+) -> list[WeakSubjectivityCheckpoint]:
     """Load trusted weak-subjectivity checkpoints from a JSON file.
 
     Operators ship this file out-of-band (e.g., alongside release binaries,
     fetched from a trusted source, or distributed via signed update).
-    Trust anchors in "operator placed this file here" — the loader does
-    not verify signatures on the file itself; that's a deployment concern.
 
-    File format: a JSON array of objects, each with fields
-        {"block_number": int, "block_hash": hex, "state_root": hex}
+    Args:
+        path: Path to the checkpoints JSON file.
+        strict: If True, raise on missing/malformed files instead of
+            returning an empty list.  Production nodes SHOULD use
+            strict=True so operators are forced to notice when the
+            checkpoint file is absent — a node without checkpoints is
+            vulnerable to long-range attacks.
 
-    Returns an empty list on missing/malformed files so a first-run node
-    still starts successfully — the operator is responsible for noticing
-    that checkpoints are absent and populating them.
+    Returns an empty list on missing/malformed files in permissive mode
+    so a first-run node still starts successfully.
     """
     try:
         with open(path, "r") as f:
             raw = json.load(f)
     except FileNotFoundError:
+        if strict:
+            raise ValueError(
+                f"Checkpoint file not found: {path}. "
+                "A node without checkpoints is vulnerable to long-range attacks."
+            )
         return []
     except (json.JSONDecodeError, OSError) as e:
+        if strict:
+            raise ValueError(f"Failed to read checkpoints file {path}: {e}")
         logger.warning(f"Failed to read checkpoints file {path}: {e}")
         return []
 
     if not isinstance(raw, list):
+        if strict:
+            raise ValueError(f"Checkpoints file {path}: expected a JSON array")
         logger.warning(f"Checkpoints file {path}: expected a JSON array")
         return []
 
@@ -106,6 +119,8 @@ def load_checkpoints_file(path: str) -> list[WeakSubjectivityCheckpoint]:
         try:
             result.append(WeakSubjectivityCheckpoint.deserialize(entry))
         except (KeyError, ValueError, TypeError) as e:
+            if strict:
+                raise ValueError(f"Malformed checkpoint entry in {path}: {e}")
             logger.warning(f"Skipping malformed checkpoint entry: {e}")
             continue
     logger.info(f"Loaded {len(result)} trusted checkpoint(s) from {path}")

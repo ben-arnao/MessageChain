@@ -18,8 +18,10 @@ Usage:
 
 import argparse
 import asyncio
+import hmac
 import json
 import logging
+import os
 import struct
 import time
 from collections import OrderedDict
@@ -141,6 +143,15 @@ class Server:
 
         # RPC rate limiting
         self.rpc_rate_limiter = RPCRateLimiter(max_requests=60, window_seconds=60.0)
+
+        # RPC authentication — generate a random token if none configured.
+        # Any RPC client must include {"auth": "<token>"} in requests.
+        from messagechain.config import RPC_AUTH_ENABLED, RPC_AUTH_TOKEN
+        self.rpc_auth_enabled = RPC_AUTH_ENABLED
+        if RPC_AUTH_ENABLED:
+            import os as _rng
+            self.rpc_auth_token = RPC_AUTH_TOKEN or _rng.urandom(32).hex()
+            logger.info(f"RPC auth enabled. Token: {self.rpc_auth_token[:8]}...")
 
         # inv/getdata: track recently seen tx hashes
         self._seen_txs: OrderedDict = OrderedDict()
@@ -303,6 +314,18 @@ class Server:
                 return
             data = await reader.readexactly(length)
             request = safe_json_loads(data.decode("utf-8"), max_depth=16)
+
+            # RPC authentication — constant-time comparison to prevent timing attacks
+            if self.rpc_auth_enabled:
+                token = request.get("auth", "")
+                if not isinstance(token, str) or not hmac.compare_digest(
+                    token.encode(), self.rpc_auth_token.encode()
+                ):
+                    resp = json.dumps({"ok": False, "error": "Authentication required"}).encode("utf-8")
+                    writer.write(struct.pack(">I", len(resp)))
+                    writer.write(resp)
+                    await writer.drain()
+                    return
 
             response = await self._process_rpc(request)
 

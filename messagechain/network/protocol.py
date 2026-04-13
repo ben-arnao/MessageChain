@@ -112,8 +112,21 @@ async def read_message(reader) -> NetworkMessage | None:
         return None
 
 
+# Timeout for P2P write operations — a stalled peer must not block the
+# async loop indefinitely.  Matches the read timeout (5s handshake +
+# 300s idle) but is tighter because a healthy peer should accept data
+# within seconds.
+P2P_WRITE_TIMEOUT = 10  # seconds
+
+
 async def write_message(writer, msg: NetworkMessage):
-    """Write a single length-prefixed message to an asyncio StreamWriter."""
+    """Write a single length-prefixed message to an asyncio StreamWriter.
+
+    Enforces P2P_WRITE_TIMEOUT to prevent slow-loris DoS where a peer
+    accepts the TCP connection but never reads data, causing the write
+    buffer to fill and drain() to block forever.
+    """
+    import asyncio
     encoded = encode_message(msg)
     writer.write(encoded)
-    await writer.drain()
+    await asyncio.wait_for(writer.drain(), timeout=P2P_WRITE_TIMEOUT)

@@ -156,20 +156,28 @@ class ProofOfStake:
 
         During bootstrap (no validators staked), this is permissive.
         """
-        if self.is_bootstrap_mode:
-            return True  # permissive only during initial bootstrap (one-way)
+        bootstrap = self.is_bootstrap_mode
 
         total = self.total_stake
-        if total == 0:
+        if total == 0 and not bootstrap:
             return False  # post-bootstrap with zero stake — cannot meet threshold
 
-        # Attestations in a block vote for the parent.
-        # SECURITY: we REQUIRE a public key to verify every attestation. If
-        # the caller has no public-key dict or the validator's key is absent,
-        # the attestation cannot be trusted and MUST NOT be counted. Earlier
-        # revisions silently skipped verification when keys were unavailable,
-        # which let an attacker forge attestations and cross the consensus
-        # threshold with unsigned votes.
+        # SECURITY: during bootstrap we relax the THRESHOLD requirement
+        # (accepting blocks with fewer attestations) but we still VERIFY
+        # SIGNATURES on any attestations that are present, when public keys
+        # are available.  Earlier revisions returned True immediately in
+        # bootstrap, which let forged attestations become "finalized" before
+        # the network hardened.
+        if public_keys is not None and block.attestations:
+            for att in block.attestations:
+                pub = public_keys.get(att.validator_id)
+                if pub is not None and not verify_attestation(att, pub):
+                    return False  # bad sig — reject even in bootstrap
+
+        if bootstrap:
+            return True  # threshold is relaxed, but sigs were checked above
+
+        # Post-bootstrap: require public keys for attestation counting.
         if public_keys is None:
             return False
 

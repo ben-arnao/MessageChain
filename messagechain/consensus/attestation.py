@@ -114,6 +114,10 @@ class FinalityTracker:
         # Track which block each validator attested to at each height
         # (validator_id, block_number) -> block_hash — prevents conflicting attestations
         self._attestation_by_height: dict[tuple[bytes, int], bytes] = {}
+        # (validator_id, block_number) -> Attestation — needed for auto-slashing evidence
+        self._attestation_objects: dict[tuple[bytes, int], Attestation] = {}
+        # Auto-generated slashing evidence for equivocating validators
+        self.pending_slashing_evidence: list = []
 
     def add_attestation(
         self,
@@ -136,14 +140,26 @@ class FinalityTracker:
 
         # Reject conflicting attestation: same validator, same height, different block.
         # This is a nothing-at-stake defense — validators must not vote on multiple forks.
+        # Auto-generate slashing evidence so the network can punish the equivocator
+        # without waiting for a third party to notice and submit evidence manually.
         key = (vid, height)
         if key in self._attestation_by_height:
             existing_bh = self._attestation_by_height[key]
             if existing_bh != bh:
-                # Conflicting attestation — reject silently (slashing handles punishment)
+                # Auto-generate slashing evidence
+                existing_att = self._attestation_objects.get(key)
+                if existing_att is not None:
+                    from messagechain.consensus.slashing import AttestationSlashingEvidence
+                    evidence = AttestationSlashingEvidence(
+                        offender_id=vid,
+                        attestation_a=existing_att,
+                        attestation_b=attestation,
+                    )
+                    self.pending_slashing_evidence.append(evidence)
                 return False
 
         self._attestation_by_height[key] = bh
+        self._attestation_objects[key] = attestation
         self.attestations[bh].add(vid)
         self.attested_stake[bh] = self.attested_stake.get(bh, 0) + validator_stake
 
@@ -164,6 +180,16 @@ class FinalityTracker:
 
     def is_finalized(self, block_hash: bytes) -> bool:
         return block_hash in self.finalized
+
+    def get_pending_slashing_evidence(self) -> list:
+        """Return and clear auto-generated slashing evidence.
+
+        Callers should broadcast the evidence as SlashTransactions so the
+        equivocating validator is penalized on-chain.
+        """
+        evidence = list(self.pending_slashing_evidence)
+        self.pending_slashing_evidence.clear()
+        return evidence
 
     def get_attested_stake_ratio(self, block_hash: bytes, total_stake: int) -> float:
         """Return the fraction of stake that has attested to this block."""

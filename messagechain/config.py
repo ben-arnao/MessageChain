@@ -211,3 +211,18 @@ GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power
 MAX_DELEGATION_TARGETS = 3            # max validators a user can delegate to
+
+# RPC authentication — prevents local privilege escalation where an
+# unprivileged process calls submit_transaction / stake / ban_peer.
+# The token is compared via constant-time HMAC to prevent timing attacks.
+# Set to None to auto-generate a random token at startup.
+RPC_AUTH_ENABLED = True
+RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
+
+# TLS encryption for P2P connections — prevents passive eavesdropping
+# and MITM attacks on transaction relay and validator identity.
+# Nodes generate a self-signed certificate on first run; peers verify
+# only that TLS is in use (no CA chain — blockchain identity is separate).
+P2P_TLS_ENABLED = True
+TLS_CERT_PATH: str | None = None  # auto-generated if None
+TLS_KEY_PATH: str | None = None   # auto-generated if None

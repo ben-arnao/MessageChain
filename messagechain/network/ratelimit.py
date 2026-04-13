@@ -22,6 +22,9 @@ RATE_GENERAL = (30, 100)    # 30 msg/sec, burst up to 100
 # small burst allowance. Strict because an attacker who can flood
 # address gossip can dominate our addrman and set up eclipse attacks.
 RATE_ADDR = (0.1, 10)       # 0.1 msg/sec, burst up to 10
+# Response messages (RESPONSE_HEADERS, RESPONSE_BLOCKS_BATCH) — a peer
+# sending unsolicited responses can exhaust CPU via deserialization.
+RATE_RESPONSE = (5, 20)     # 5 responses/sec, burst up to 20
 
 
 @dataclass
@@ -72,6 +75,7 @@ class PeerRateLimiter:
                 "headers_req": TokenBucket(rate=RATE_HEADERS_REQ[0], max_tokens=RATE_HEADERS_REQ[1]),
                 "general": TokenBucket(rate=RATE_GENERAL[0], max_tokens=RATE_GENERAL[1]),
                 "addr": TokenBucket(rate=RATE_ADDR[0], max_tokens=RATE_ADDR[1]),
+                "response": TokenBucket(rate=RATE_RESPONSE[0], max_tokens=RATE_RESPONSE[1]),
             }
 
     def check(self, address: str, category: str) -> bool:

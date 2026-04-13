@@ -37,4 +37,8 @@ def message_category(msg_type: MessageType) -> str:
         # ADDR-equivalent — strictly throttled to prevent eclipse-prep
         # flooding (BTC PR #22387).
         return "addr"
+    if msg_type in (MessageType.RESPONSE_HEADERS, MessageType.RESPONSE_BLOCKS_BATCH):
+        # Unsolicited response flooding: a peer can spam large response
+        # messages to exhaust CPU/memory without hitting request-side limits.
+        return "response"
     return "general"
