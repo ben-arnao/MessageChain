@@ -288,6 +288,61 @@ class TestValidatorEjectionExecution(unittest.TestCase):
         self.assertIn(self.bob.entity_id, self.pos.stakes)
 
 
+class TestEjectionAuditLog(unittest.TestCase):
+    """Successful ejections are recorded in an append-only audit log."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-audit".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-audit".ljust(32, b"\x00"))
+        cls.carol = Entity.create(b"carol-audit".ljust(32, b"\x00"))
+
+    def setUp(self):
+        for e in (self.alice, self.bob, self.carol):
+            e.keypair._next_leaf = 0
+        self.tracker = GovernanceTracker()
+        self.supply = SupplyTracker()
+        self.pos = ProofOfStake()
+        for e, amt in ((self.alice, 10_000), (self.bob, 10_000), (self.carol, 10_000)):
+            self.supply.staked[e.entity_id] = amt
+            self.pos.register_validator(e.entity_id, amt)
+
+    def test_successful_ejection_appended_to_log(self):
+        tx = create_validator_ejection_proposal(
+            self.alice, self.bob.entity_id, "Eject", "why",
+        )
+        proposal_block = 5
+        self.tracker.add_proposal(tx, block_height=proposal_block, supply_tracker=self.supply)
+        _cast_vote(self.tracker, self.alice.entity_id, tx.proposal_id, True, proposal_block + 1)
+        _cast_vote(self.tracker, self.carol.entity_id, tx.proposal_id, True, proposal_block + 1)
+        closed_block = proposal_block + GOVERNANCE_VOTING_WINDOW + 1
+
+        self.assertEqual(self.tracker.ejection_log, [])
+        self.tracker.execute_validator_ejection(
+            tx, self.supply, self.pos, current_block=closed_block,
+        )
+        self.assertEqual(len(self.tracker.ejection_log), 1)
+        entry = self.tracker.ejection_log[0]
+        self.assertEqual(entry["target_validator_id"], self.bob.entity_id.hex())
+        self.assertEqual(entry["stake_unbonded"], 10_000)
+        self.assertEqual(entry["execution_block"], closed_block)
+        self.assertEqual(entry["tx_hash"], tx.tx_hash.hex())
+
+    def test_failed_ejection_not_logged(self):
+        tx = create_validator_ejection_proposal(
+            self.alice, self.bob.entity_id, "Eject", "why",
+        )
+        proposal_block = 5
+        self.tracker.add_proposal(tx, block_height=proposal_block, supply_tracker=self.supply)
+        # Only alice votes yes — below 2/3 of eligible
+        _cast_vote(self.tracker, self.alice.entity_id, tx.proposal_id, True, proposal_block + 1)
+        closed_block = proposal_block + GOVERNANCE_VOTING_WINDOW + 1
+        self.tracker.execute_validator_ejection(
+            tx, self.supply, self.pos, current_block=closed_block,
+        )
+        self.assertEqual(self.tracker.ejection_log, [])
+
+
 class TestEjectionAboveExactSupermajority(unittest.TestCase):
     """A clear supermajority (>2/3) passes the ejection."""
 

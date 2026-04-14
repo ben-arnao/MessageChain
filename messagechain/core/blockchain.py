@@ -30,6 +30,9 @@ from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
 )
+from messagechain.core.authority_key import (
+    SetAuthorityKeyTransaction, verify_set_authority_key_transaction,
+)
 from messagechain.core.transfer import (
     TransferTransaction, verify_transfer_transaction,
 )
@@ -96,6 +99,12 @@ class Blockchain:
         # reorgs — a leaf that was ever published on any fork is permanently
         # burned because its private material is public knowledge.
         self.leaf_watermarks: dict[bytes, int] = {}
+        # Cold "authority" public key per entity, used to gate destructive
+        # operations (unstake, emergency revoke) separately from the 24/7
+        # hot signing key that lives on the validator server. If unset for
+        # an entity, the signing public_key is used as the authority key by
+        # default — backward compatible with the single-key identity model.
+        self.authority_keys: dict[bytes, bytes] = {}
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
@@ -161,6 +170,10 @@ class Blockchain:
         # Restore leaf-reuse watermarks
         if hasattr(self.db, 'get_all_leaf_watermarks'):
             self.leaf_watermarks = self.db.get_all_leaf_watermarks()
+
+        # Restore authority (cold) keys for hot/cold-separated validators
+        if hasattr(self.db, 'get_all_authority_keys'):
+            self.authority_keys = self.db.get_all_authority_keys()
 
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
@@ -230,6 +243,9 @@ class Blockchain:
             if hasattr(self.db, 'set_leaf_watermark'):
                 for eid, nxt in self.leaf_watermarks.items():
                     self.db.set_leaf_watermark(eid, nxt)
+            if hasattr(self.db, 'set_authority_key'):
+                for eid, ak in self.authority_keys.items():
+                    self.db.set_authority_key(eid, ak)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -316,6 +332,61 @@ class Blockchain:
             self._persist_state()
 
         return genesis_block
+
+    def get_authority_key(self, entity_id: bytes) -> bytes | None:
+        """Return the authority (cold) public key for an entity.
+
+        If the entity has never run SetAuthorityKey, the signing public_key
+        is returned — the chain treats the signing key as its own authority
+        by default. Returns None if the entity is not registered at all.
+        """
+        if entity_id in self.authority_keys:
+            return self.authority_keys[entity_id]
+        return self.public_keys.get(entity_id)
+
+    def validate_set_authority_key(
+        self, tx: SetAuthorityKeyTransaction,
+    ) -> tuple[bool, str]:
+        if tx.entity_id not in self.public_keys:
+            return False, "Unknown entity — must register first"
+
+        expected_nonce = self.nonces.get(tx.entity_id, 0)
+        if tx.nonce != expected_nonce:
+            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+
+        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
+            return False, f"Insufficient balance for fee of {tx.fee}"
+
+        if tx.signature.leaf_index < self.leaf_watermarks.get(tx.entity_id, 0):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"— leaf reuse rejected"
+            )
+
+        # Signed by the current signing key — the user is authenticating
+        # themselves before handing the authority role to the new cold key.
+        signing_pk = self.public_keys[tx.entity_id]
+        if not verify_set_authority_key_transaction(tx, signing_pk):
+            return False, "Invalid signature"
+
+        return True, "Valid"
+
+    def apply_set_authority_key(
+        self,
+        tx: SetAuthorityKeyTransaction,
+        proposer_id: bytes,
+    ) -> tuple[bool, str]:
+        ok, reason = self.validate_set_authority_key(tx)
+        if not ok:
+            return False, reason
+
+        self.supply.pay_fee_with_burn(
+            tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
+        )
+        self.authority_keys[tx.entity_id] = tx.new_authority_key
+        self.nonces[tx.entity_id] = tx.nonce + 1
+        self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
+        return True, "Authority key updated"
 
     def get_leaf_watermark(self, entity_id: bytes) -> int:
         """Return the next-safe WOTS+ leaf index for this entity.

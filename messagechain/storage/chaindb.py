@@ -100,6 +100,11 @@ class ChainDB:
                 next_leaf INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS authority_keys (
+                entity_id BLOB PRIMARY KEY,
+                authority_public_key BLOB NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -425,6 +430,26 @@ class ChainDB:
     def get_all_leaf_watermarks(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, next_leaf FROM leaf_watermarks")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Authority Keys (cold-key withdrawal gating) ──────
+
+    def get_authority_key(self, entity_id: bytes) -> bytes | None:
+        cur = self._conn.execute(
+            "SELECT authority_public_key FROM authority_keys WHERE entity_id = ?",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        return bytes(row[0]) if row else None
+
+    def set_authority_key(self, entity_id: bytes, authority_public_key: bytes):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO authority_keys (entity_id, authority_public_key) VALUES (?, ?)",
+            (entity_id, authority_public_key),
+        )
+
+    def get_all_authority_keys(self) -> dict[bytes, bytes]:
+        cur = self._conn.execute("SELECT entity_id, authority_public_key FROM authority_keys")
+        return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
 
     # ── Supply Meta ──────────────────────────────────────────────
 

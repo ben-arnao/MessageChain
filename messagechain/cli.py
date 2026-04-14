@@ -120,6 +120,25 @@ def build_parser() -> argparse.ArgumentParser:
     unstake.add_argument("--fee", type=int, default=None, help="Transaction fee")
     unstake.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- set-authority-key ---
+    set_auth = sub.add_parser(
+        "set-authority-key",
+        help="Promote a cold key for withdrawal/revoke operations",
+        description=(
+            "Designate a separately-generated public key as the cold 'authority' "
+            "key for this entity. After this runs, unstake (and emergency revoke) "
+            "must be signed by the authority key rather than the hot signing key. "
+            "Use this to separate validator block-production keys (hot, on the "
+            "server) from withdrawal keys (cold, offline)."
+        ),
+    )
+    set_auth.add_argument(
+        "--authority-pubkey", required=True,
+        help="New authority public key (hex). Generate offline.",
+    )
+    set_auth.add_argument("--fee", type=int, default=None, help="Transaction fee")
+    set_auth.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- delegate ---
     delegate = sub.add_parser(
         "delegate",
@@ -723,6 +742,63 @@ def cmd_unstake(args):
         sys.exit(1)
 
 
+def cmd_set_authority_key(args):
+    """Promote a cold authority key for this entity."""
+    from messagechain.identity.identity import Entity
+    from messagechain.core.authority_key import create_set_authority_key_transaction
+
+    print("=== Set Authority Key ===\n")
+    print("This designates a cold public key that will gate your unstake and")
+    print("emergency-revoke operations. Your hot signing key (the one you're")
+    print("about to enter) continues to handle block production and attestations.\n")
+
+    try:
+        authority_pubkey = bytes.fromhex(args.authority_pubkey.strip())
+    except ValueError:
+        print("Error: --authority-pubkey must be valid hex.")
+        sys.exit(1)
+    if len(authority_pubkey) != 32:
+        print(f"Error: authority public key must be 32 bytes, got {len(authority_pubkey)}.")
+        sys.exit(1)
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
+
+    fee = args.fee if args.fee is not None else 500
+    tx = create_set_authority_key_transaction(
+        entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee,
+    )
+
+    response = rpc_call(host, port, "set_authority_key", {
+        "transaction": tx.serialize(),
+    })
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nAuthority key set!")
+        print(f"  Entity ID:     {result['entity_id']}")
+        print(f"  Authority key: {result['authority_key']}")
+        print(f"  TX hash:       {result['tx_hash']}")
+        print(f"\nFuture unstake and emergency-revoke operations must be signed")
+        print("by the authority (cold) key you just designated.")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_delegate(args):
     """Delegate voting power to trusted validators."""
     from messagechain.identity.identity import Entity
@@ -1012,6 +1088,7 @@ def main():
         "balance": cmd_balance,
         "stake": cmd_stake,
         "unstake": cmd_unstake,
+        "set-authority-key": cmd_set_authority_key,
         "delegate": cmd_delegate,
         "propose": cmd_propose,
         "vote": cmd_vote,

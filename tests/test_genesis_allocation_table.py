@@ -282,6 +282,47 @@ class TestTreasurySpend(unittest.TestCase):
         self.assertTrue(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
         self.assertFalse(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
 
+    def test_treasury_auto_delegation_capture_prevented(self):
+        """A lone validator cannot drain the treasury by harvesting passive stake.
+
+        Binding outcomes (treasury spends, ejections) use `_tally_binding`,
+        which disables auto-delegation and requires yes to clear 2/3 of
+        TOTAL eligible stake — not just participating weight.  Without this,
+        a single voter during apathy could pass any treasury spend
+        unilaterally via auto-delegation routing.
+        """
+        from messagechain.config import TREASURY_ENTITY_ID, GOVERNANCE_VOTING_WINDOW
+        from messagechain.governance.governance import (
+            GovernanceTracker, create_treasury_spend_proposal, VoteTransaction,
+        )
+        chain = self._setup_chain_with_treasury()
+        tracker = GovernanceTracker()
+        # Three validators, only alice votes yes.  Bob and carol stay silent.
+        # Under old tally: alice + auto-delegated bob + carol = 100% -> PASSES.
+        # Under binding tally: alice has 1/3 of eligible stake -> FAILS.
+        chain.supply.staked[self.alice.entity_id] = 1000
+        chain.supply.staked[self.bob.entity_id] = 1000
+        chain.supply.staked[self.carol.entity_id] = 1000
+
+        tx = create_treasury_spend_proposal(
+            self.alice, self.bob.entity_id, 500, "Drain", "Capture attempt",
+        )
+        proposal_block = 5
+        tracker.add_proposal(tx, block_height=proposal_block, supply_tracker=chain.supply)
+        vote = VoteTransaction(
+            voter_id=self.alice.entity_id,
+            proposal_id=tx.proposal_id,
+            approve=True,
+            timestamp=1.0,
+            fee=100,
+            signature=None,
+        )
+        vote.tx_hash = vote._compute_hash()
+        tracker.add_vote(vote, current_block=proposal_block + 1)
+        closed_block = proposal_block + GOVERNANCE_VOTING_WINDOW + 1
+        result = tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block)
+        self.assertFalse(result)
+
     def test_treasury_spend_serialization_roundtrip(self):
         """Treasury spend proposals serialize and deserialize correctly."""
         from messagechain.governance.governance import (

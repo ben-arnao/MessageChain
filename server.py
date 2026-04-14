@@ -384,6 +384,18 @@ class Server:
             watermark = self.blockchain.get_leaf_watermark(entity_id)
             return {"ok": True, "result": {"leaf_watermark": watermark}}
 
+        elif method == "get_authority_key":
+            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            if entity_id is None:
+                return {"ok": False, "error": "Invalid entity_id hex"}
+            ak = self.blockchain.get_authority_key(entity_id)
+            return {"ok": True, "result": {
+                "authority_key": ak.hex() if ak else None,
+            }}
+
+        elif method == "set_authority_key":
+            return self._rpc_set_authority_key(request["params"])
+
         elif method == "get_sync_status":
             return {"ok": True, "result": self.syncer.get_sync_status()}
 
@@ -548,9 +560,13 @@ class Server:
             if entity_id not in self.blockchain.public_keys:
                 return {"ok": False, "error": "Unknown entity"}
 
-            public_key = self.blockchain.public_keys[entity_id]
-            if not verify_unstake_transaction(tx, public_key):
-                return {"ok": False, "error": "Invalid unstake transaction signature"}
+            # Unstake is an authority-gated operation: it requires the cold
+            # authority key, not the hot signing key. If the entity has not
+            # promoted a separate cold key, authority_key == signing key and
+            # this resolves to the same behavior as before.
+            authority_key = self.blockchain.get_authority_key(entity_id)
+            if not verify_unstake_transaction(tx, authority_key):
+                return {"ok": False, "error": "Invalid unstake signature — unstake must be signed by the authority (cold) key"}
 
             # Validate nonce
             expected_nonce = self.blockchain.nonces.get(entity_id, 0)
@@ -575,6 +591,33 @@ class Server:
                 "entity_id": entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
                 "status": "pending — will be included in next block",
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_set_authority_key(self, params: dict) -> dict:
+        """Accept a SetAuthorityKey transaction, promoting a cold key for the entity.
+
+        Applied to state immediately (not queued via the block pipeline)
+        because there is no stake-weight or ordering-dependent side effect —
+        the only change is a dictionary field in chain state, protected by
+        the signing-key signature on the tx itself.
+        """
+        try:
+            from messagechain.core.authority_key import SetAuthorityKeyTransaction
+            tx = SetAuthorityKeyTransaction.deserialize(params["transaction"])
+            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
+            ok, reason = self.blockchain.apply_set_authority_key(tx, proposer_id)
+            if not ok:
+                return {"ok": False, "error": reason}
+            # Persist authority-keys table so the change survives restart.
+            if self.blockchain.db is not None and hasattr(self.blockchain.db, 'set_authority_key'):
+                self.blockchain.db.set_authority_key(tx.entity_id, tx.new_authority_key)
+                self.blockchain.db.flush_state()
+            return {"ok": True, "result": {
+                "entity_id": tx.entity_id.hex(),
+                "authority_key": tx.new_authority_key.hex(),
+                "tx_hash": tx.tx_hash.hex(),
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}

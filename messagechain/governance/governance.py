@@ -6,6 +6,17 @@ and results on-chain. Stake-holders vote using their staked tokens as
 voting weight. Only entities with skin in the game (staked tokens) can
 influence vote outcomes.
 
+TERMINOLOGY — "delegation" in this module refers strictly to GOVERNANCE
+delegation: a trust signal that routes a holder's VOTING WEIGHT to
+chosen validators for proposal tallies.  It does NOT move, lock, or
+bond any tokens, and it does NOT grant the delegate any consensus
+weight (proposer selection or block finality).  Consensus weight is
+determined solely by an entity's own staked balance.  This project
+deliberately does NOT implement DPoS-style bonded delegation, where
+delegated tokens would count toward a validator's consensus weight;
+that model concentrates power into a small set of staking pools and
+introduces slashing-cascade complexity without commensurate benefit.
+
 What happens downstream of the vote results is out of scope — this
 module provides a tamper-proof record of votes, nothing more.
 
@@ -623,6 +634,12 @@ class GovernanceTracker:
         self.delegations: dict[bytes, list[tuple[bytes, int]]] = {}
         self._executed_treasury_spends: set[bytes] = set()  # replay protection
         self._executed_ejections: set[bytes] = set()  # replay protection
+        # Append-only audit logs — every successful binding execution is
+        # recorded with tx_hash, execution_block, and outcome-specific
+        # fields.  These survive proposal pruning so post-hoc accountability
+        # ("show me every treasury spend that ever executed") always works.
+        self.treasury_spend_log: list[dict] = []
+        self.ejection_log: list[dict] = []
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
         """Register a new proposal and snapshot current stake + balance distribution.
@@ -890,8 +907,11 @@ class GovernanceTracker:
         status = self.get_proposal_status(tx.proposal_id, current_block)
         if status != ProposalStatus.CLOSED:
             return False
-        # Require approval threshold: yes * DENOM > total * NUM
-        yes_weight, total_weight = self.tally(tx.proposal_id)
+        # Binding-outcome approval: yes must clear 2/3 of TOTAL ELIGIBLE
+        # stake (not just participants).  This closes the auto-delegation
+        # capture vector — silence cannot be harvested into approval —
+        # and provides an implicit 2/3 turnout floor.
+        yes_weight, total_weight = self._tally_binding(tx.proposal_id)
         if total_weight == 0:
             return False
         if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
@@ -900,30 +920,41 @@ class GovernanceTracker:
         result = supply_tracker.treasury_spend(tx.recipient_id, tx.amount)
         if result:
             self._executed_treasury_spends.add(tx.tx_hash)
+            self.treasury_spend_log.append({
+                "tx_hash": tx.tx_hash.hex(),
+                "proposal_id": tx.proposal_id.hex(),
+                "recipient_id": tx.recipient_id.hex(),
+                "amount": tx.amount,
+                "execution_block": current_block,
+                "yes_weight": yes_weight,
+                "total_eligible_weight": total_weight,
+            })
         return result
 
-    def _tally_ejection(
-        self, proposal_id: bytes, target_id: bytes,
+    def _tally_binding(
+        self, proposal_id: bytes, exclude: bytes | None = None,
     ) -> tuple[int, int]:
-        """Tally for validator ejection: stricter than general governance.
+        """Stricter tally used for BINDING governance outcomes (treasury
+        spends, validator ejections).  Differs from the general `tally`:
 
-        Differences from the general `tally`:
-        1. The target validator is excluded entirely — they do not vote in
-           their own trial, nor does their stake appear anywhere.
+        1. Optional `exclude` entity is removed entirely — used by ejection
+           so the target does not vote in their own trial, and their stake
+           does not appear anywhere.  Treasury spends pass exclude=None.
         2. Auto-delegation is disabled.  Only DIRECT votes and EXPLICIT
            delegations count toward `yes_weight`.
         3. The denominator is the TOTAL ELIGIBLE VOTING POWER (all snapshot
-           entities except the target), not just participating weight.
+           entities except `exclude`), not just participating weight.
            Silence counts as "no" — a deliberate bias toward the status quo
-           for a security-critical decision.
+           for security-critical decisions.
 
-        Why the stricter rule: a single motivated validator must not be
-        able to eject peers by themselves.  Under the general tally, auto-
-        delegation would let one voter harvest everyone else's passive
-        stake.  Even disabling auto-delegation isn't enough: if only one
-        voter participates, yes/total = 100% trivially.  Requiring the
-        numerator to clear 2/3 of the full eligible electorate forces
-        broad active engagement — ejection should be hard by design.
+        Why the stricter rule: under the general tally, auto-delegation
+        lets one motivated voter harvest everyone else's passive stake
+        during periods of apathy.  For binding outcomes that move funds
+        or reshape the validator set, requiring the numerator to clear
+        2/3 of the FULL eligible electorate (not just participants)
+        forces broad active engagement.  This rule also gives an implicit
+        quorum for free: yes can't reach 2/3 of eligible without at least
+        2/3 turnout participating in favor.
         """
         state = self.proposals.get(proposal_id)
         if state is None:
@@ -933,7 +964,7 @@ class GovernanceTracker:
         balance_snapshot = state.balance_snapshot
         direct_votes = {
             vid: approve for vid, approve in state.votes.items()
-            if vid != target_id
+            if vid != exclude
         }
 
         all_entities: set[bytes] = (
@@ -953,9 +984,9 @@ class GovernanceTracker:
                     (delegator_id, pct)
                 )
 
-        # Denominator: total eligible voting power (everyone except target).
+        # Denominator: total eligible voting power (everyone except exclude).
         total_weight = sum(
-            power for eid, power in vp.items() if eid != target_id
+            power for eid, power in vp.items() if eid != exclude
         )
 
         yes_weight = 0
@@ -968,7 +999,7 @@ class GovernanceTracker:
             for delegator_id, pct in reverse_delegations.get(voter_id, []):
                 if delegator_id in direct_votes:
                     continue  # delegator voted directly — their power counted only if they voted yes
-                if delegator_id == target_id:
+                if delegator_id == exclude:
                     continue
                 delegator_power = vp.get(delegator_id, 0)
                 yes_weight += delegator_power * pct // 100
@@ -1008,7 +1039,7 @@ class GovernanceTracker:
         if status != ProposalStatus.CLOSED:
             return False
         target = tx.target_validator_id
-        yes_weight, total_weight = self._tally_ejection(tx.proposal_id, target)
+        yes_weight, total_weight = self._tally_binding(tx.proposal_id, exclude=target)
         if total_weight == 0:
             return False
         if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
@@ -1039,6 +1070,15 @@ class GovernanceTracker:
         pos_consensus.remove_validator(target)
         self.revoke_delegations_to(target)
         self._executed_ejections.add(tx.tx_hash)
+        self.ejection_log.append({
+            "tx_hash": tx.tx_hash.hex(),
+            "proposal_id": tx.proposal_id.hex(),
+            "target_validator_id": target.hex(),
+            "stake_unbonded": full_stake,
+            "execution_block": current_block,
+            "yes_weight": yes_weight,
+            "total_eligible_weight": total_weight,
+        })
         return True
 
     def get_proposal_info(

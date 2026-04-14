@@ -53,6 +53,30 @@ def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     return layer[0]
 
 
+def _deserialize_governance_tx(data: dict):
+    """Rehydrate a governance transaction based on its "type" tag.
+
+    Delegates to the concrete class's deserialize method so hash/signature
+    integrity checks run the same way they would for a standalone tx.
+    """
+    from messagechain.governance.governance import (
+        ProposalTransaction, VoteTransaction, DelegateTransaction,
+        TreasurySpendTransaction, ValidatorEjectionProposal,
+    )
+    tag = data.get("type")
+    if tag == "governance_proposal":
+        return ProposalTransaction.deserialize(data)
+    if tag == "governance_vote":
+        return VoteTransaction.deserialize(data)
+    if tag == "governance_delegate":
+        return DelegateTransaction.deserialize(data)
+    if tag == "treasury_spend":
+        return TreasurySpendTransaction.deserialize(data)
+    if tag == "validator_ejection":
+        return ValidatorEjectionProposal.deserialize(data)
+    raise ValueError(f"Unknown governance tx type: {tag!r}")
+
+
 def compute_state_root(
     balances: dict[bytes, int],
     nonces: dict[bytes, int],
@@ -139,6 +163,10 @@ class Block:
     slash_transactions: list = field(default_factory=list)  # list[SlashTransaction]
     attestations: list = field(default_factory=list)  # list[Attestation] for parent block
     transfer_transactions: list = field(default_factory=list)  # list[TransferTransaction]
+    # On-chain governance traffic: proposals, votes, delegations, treasury
+    # spend proposals, and validator-ejection proposals.  Each carries a
+    # "type" tag in its serialized form that the block pipeline dispatches on.
+    governance_txs: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -167,6 +195,8 @@ class Block:
             result["attestations"] = [att.serialize() for att in self.attestations]
         if self.transfer_transactions:
             result["transfer_transactions"] = [tx.serialize() for tx in self.transfer_transactions]
+        if self.governance_txs:
+            result["governance_txs"] = [tx.serialize() for tx in self.governance_txs]
         return result
 
     @classmethod
@@ -190,9 +220,12 @@ class Block:
         if data.get("transfer_transactions"):
             from messagechain.core.transfer import TransferTransaction
             transfer_txs = [TransferTransaction.deserialize(t) for t in data["transfer_transactions"]]
+        governance_txs = []
+        if data.get("governance_txs"):
+            governance_txs = [_deserialize_governance_tx(g) for g in data["governance_txs"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
-                    transfer_transactions=transfer_txs)
+                    transfer_transactions=transfer_txs, governance_txs=governance_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])
