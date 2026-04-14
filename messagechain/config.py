@@ -53,6 +53,17 @@ PROPOSER_REWARD_CAP = BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWAR
 # Non-linear size pricing: fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
 # This makes larger messages disproportionately expensive, incentivizing conciseness.
 MIN_FEE = 100  # absolute floor for base fee (spam deterrent)
+
+# Welcome grant — tokens given to each newly-registered entity from the
+# treasury. Enough to cover the minimum fee so that a brand-new user can
+# post their first message without needing an out-of-band funding step.
+# This is the bootstrap path for users arriving from scratch.
+#
+# Sybil resistance comes from the cost of generating a WOTS+/Merkle keypair
+# at production tree height (minutes of compute per identity), which bounds
+# the drain rate on the treasury.
+WELCOME_GRANT = 500  # enough for ~1-2 short messages at base fee
+
 FEE_PER_BYTE = 3  # per-byte fee component (3x higher than original — storage is expensive)
 FEE_QUADRATIC_COEFF = 2  # quadratic surcharge coefficient: (bytes^2 * 2) // 1000
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
@@ -202,12 +213,22 @@ FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= tota
 
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
-GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 1    # >50% of participating stake must approve
-GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 2  # Use integer arithmetic: yes * 2 > total * 1
+# Supermajority (2/3) required to approve any proposal.  Reasoning:
+# passive balance+stake auto-delegates to the validator set, which gives
+# validators disproportionate default voting power.  Requiring a 2/3
+# supermajority prevents validators from ramming through self-serving
+# proposals (rewards, minimum-stake changes, treasury drains) on passive
+# power alone.
+GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >=2/3 of participating weight must approve
+GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: yes * 3 >= total * 2
 GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent)
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power
 MAX_DELEGATION_TARGETS = 3            # max validators a user can delegate to
+# Balances below this threshold are ignored when snapshotting balances at
+# proposal-creation time.  Dust amounts contribute negligible voting power
+# after sqrt-squashing and would balloon snapshot size.
+GOVERNANCE_BALANCE_SNAPSHOT_DUST = 1
 
 # RPC authentication — prevents local privilege escalation where an
 # unprivileged process calls submit_transaction / stake / ban_peer.

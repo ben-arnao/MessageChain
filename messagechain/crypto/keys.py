@@ -110,13 +110,21 @@ def _derive_leaf_pubkey(seed: bytes, leaf_index: int) -> bytes:
     return pub
 
 
-def _subtree_root(seed: bytes, start: int, count: int) -> bytes:
-    """Compute the Merkle root hash over a contiguous range of leaves."""
+def _subtree_root(seed: bytes, start: int, count: int, progress=None) -> bytes:
+    """Compute the Merkle root hash over a contiguous range of leaves.
+
+    If `progress` is provided, it is called after each leaf derivation
+    with the leaf index that just completed. The callback is expected to
+    do its own throttling.
+    """
     if count == 1:
-        return _derive_leaf_pubkey(seed, start)
+        pk = _derive_leaf_pubkey(seed, start)
+        if progress is not None:
+            progress(start)
+        return pk
     half = count >> 1
-    left = _subtree_root(seed, start, half)
-    right = _subtree_root(seed, start + half, half)
+    left = _subtree_root(seed, start, half, progress)
+    right = _subtree_root(seed, start + half, half, progress)
     return _hash(left + right)
 
 
@@ -154,7 +162,13 @@ class KeyPair:
     stored persistently, so large trees (height=40) use constant memory.
     """
 
-    def __init__(self, seed: bytes, height: int | None = None, start_leaf: int = 0):
+    def __init__(
+        self,
+        seed: bytes,
+        height: int | None = None,
+        start_leaf: int = 0,
+        progress=None,
+    ):
         if height is None:
             import messagechain.config
             height = messagechain.config.MERKLE_TREE_HEIGHT
@@ -167,11 +181,21 @@ class KeyPair:
         # bottom-up over derived leaf public keys. This is the only expensive
         # operation — O(2^height) leaf derivations, done once at creation.
         # No private keys or intermediate tree nodes are retained.
-        self.public_key = _subtree_root(seed, 0, self.num_leaves)
+        #
+        # `progress`, if provided, is called with the leaf index each time a
+        # leaf is derived. Long-running keygen (height >= 20) can show a
+        # status indicator without the caller needing to know tree internals.
+        self.public_key = _subtree_root(seed, 0, self.num_leaves, progress)
 
     @classmethod
-    def generate(cls, seed: bytes, height: int | None = None, start_leaf: int = 0) -> "KeyPair":
-        return cls(seed, height, start_leaf=start_leaf)
+    def generate(
+        cls,
+        seed: bytes,
+        height: int | None = None,
+        start_leaf: int = 0,
+        progress=None,
+    ) -> "KeyPair":
+        return cls(seed, height, start_leaf=start_leaf, progress=progress)
 
     def advance_to_leaf(self, leaf_index: int):
         """Advance the next-leaf pointer to skip already-used leaves.

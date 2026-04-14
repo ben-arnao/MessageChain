@@ -91,6 +91,7 @@ class Entity:
         private_key: bytes,
         *,
         tree_height: int | None = None,
+        progress=None,
     ) -> "Entity":
         """
         Create an entity from a private key.
@@ -121,7 +122,7 @@ class Entity:
             from messagechain.config import MERKLE_TREE_HEIGHT as _h
             tree_height = _h
 
-        keypair = KeyPair.generate(seed, height=tree_height)
+        keypair = KeyPair.generate(seed, height=tree_height, progress=progress)
         entity_id = derive_entity_id(keypair.public_key)
 
         return cls(

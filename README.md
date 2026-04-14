@@ -78,11 +78,11 @@ python -m messagechain account
 
 You'll be prompted for your private key. Type it from your paper backup. It stays in memory only for the few seconds it takes to sign the registration, then the process exits.
 
-Your account is now on-chain. You can receive funds at your entity ID.
+Your account is now on-chain. Registration automatically deposits a small **welcome grant** from the treasury into your balance — enough to pay the fee on your first message. No out-of-band funding needed.
 
-### 8. Receive funds
+### 8. (Optional) Receive more funds
 
-Share your entity ID with the sender. They transfer tokens to you — no action needed on your end.
+Your welcome grant covers the basics. To receive more, share your entity ID. Others can transfer tokens to you — no action needed on your end.
 
 ### 9. Send a message
 
@@ -148,55 +148,102 @@ python -m messagechain read --last 50    # last 50 messages
 
 Output shows entity ID, timestamp, and message text.
 
-### Delegate Your Voting Power
+### Governance
 
-Non-validators can signal which validators they trust. This influences governance votes and network security. Funds are not locked.
+Every token holder has a voice. You can vote directly on a proposal, delegate your voting power to validators you trust, or let the default auto-mode distribute it across the validator set for you.
+
+#### Your voting power
+
+```
+voting_power = staked + sqrt(unstaked_balance)
+```
+
+Staked tokens count at full weight. Unstaked tokens count with sqrt-dampening. A whale holding 1M unstaked has ~1,000 voting power from that balance; a validator with 1M staked has 1,000,000. This rewards committed stakers while still giving liquid holders a meaningful voice.
+
+The 7-day unbonding period on staked tokens makes flash-loan governance attacks impractical — borrowed tokens can only vote at sqrt-dampened weight.
+
+#### Delegate your voting power (optional)
 
 ```bash
 # Delegate to a single validator
 python -m messagechain delegate --to <validator_id> --pct 100
 
-# Split across multiple validators
+# Split across multiple validators (up to 3, percentages must sum to 100)
 python -m messagechain delegate --to <id1> --pct 50 --to <id2> --pct 30 --to <id3> --pct 20
 
-# Revoke delegation (revert to automatic distribution)
+# Revoke — your voting power reverts to auto-mode
 python -m messagechain delegate --revoke
 ```
 
-### Propose a Governance Vote
+If you don't delegate, your voting power automatically distributes across the validator set, weighted by `sqrt(validator_stake)`. Only validators who actually vote on a proposal receive a share — your power flows to the ones actively securing the chain.
 
-Staked validators can propose protocol changes. Proposals cost 1000 tokens to prevent spam.
+Explicit delegation stays with your chosen validators until they're removed from the network (slashed or fully unstaked), at which point your trust reverts to auto-mode.
+
+#### Propose a vote
+
+Any staked entity can propose. Proposals cost 1000 tokens (spam deterrent).
 
 ```bash
 python -m messagechain propose --title "Increase block size" --description "Raise MAX_TXS_PER_BLOCK to 50"
 ```
 
-### Vote on a Proposal
+#### Vote on a proposal
 
 ```bash
 python -m messagechain vote --proposal <proposal_id> --yes
 python -m messagechain vote --proposal <proposal_id> --no
 ```
 
-Voting power is proportional to staked amount. Direct votes override delegation.
+A direct vote uses your full voting power and overrides any delegation for that proposal.
+
+**Approval requires a 2/3 supermajority.** This prevents validators — who absorb passive auto-delegated power — from ramming through self-serving proposals on passive votes alone.
+
+#### Snapshot semantics
+
+Both stake and balance are snapshotted at proposal-creation time. Moving tokens or staking/unstaking after a proposal is open does not change its tally. Flash loans, late staking, and last-minute transfers cannot manipulate votes.
 
 ### Run a Validator
 
-Start a node that produces blocks and earns rewards.
+A validator produces blocks and earns rewards. Unlike a message sender, a validator's private key must stay loaded in a running process — this is the trade-off for 24/7 block production.
+
+#### Operational security
+
+Because the key stays hot, use a **dedicated machine** (VPS, home server, or similar) that you physically control and keep patched. Don't use a laptop you carry around. Periodically sweep earnings to a separate cold-storage identity to limit exposure.
+
+#### Start a validator interactively
 
 ```bash
 python -m messagechain start --mine
 ```
 
-You'll be prompted for your private key. To stake tokens (required for block production weight):
+You'll be prompted for your private key once at startup.
+
+#### Start a validator unattended (systemd, Docker, reboot-safe)
+
+Save the key to a file with restrictive permissions and pass `--keyfile`:
+
+```bash
+# One-time setup
+echo "<your_checksummed_private_key>" > /etc/messagechain/validator.key
+chmod 0600 /etc/messagechain/validator.key
+
+# Start
+python -m messagechain start --mine --keyfile /etc/messagechain/validator.key
+```
+
+The key file uses the same checksummed format as the CLI — a corrupted or truncated file will fail the checksum at startup rather than silently running as the wrong identity.
+
+#### Stake
 
 ```bash
 python -m messagechain stake --amount 100
 ```
 
-Minimum stake: 100 tokens. Staking gives you block production weight and governance voting power.
+Minimum stake: 100 tokens. Staking gives you block production weight and governance voting power. Unstaking has a **7-day unbonding period**.
 
 #### Connect to the Network
+
+By default the node uses the seed nodes from config. Override with:
 
 ```bash
 python -m messagechain start --mine --seed <host>:<port>

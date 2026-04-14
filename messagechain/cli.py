@@ -14,6 +14,7 @@ import asyncio
 import getpass
 import logging
 import os
+import stat
 import sys
 
 from messagechain.config import DEFAULT_PORT
@@ -41,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument(
         "--mine", action="store_true",
         help="Produce blocks and earn rewards (requires private key)",
+    )
+    start.add_argument(
+        "--keyfile", type=str, default=None,
+        help="Path to file containing the checksummed private key. "
+             "Enables unattended restart (e.g. from systemd). "
+             "Ensure file permissions are 0600.",
     )
     start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
@@ -225,18 +232,134 @@ def _parse_server(server_str: str) -> tuple[str, int]:
     return server_str, 9334
 
 
+def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
+    """Build a progress callback for KeyPair generation.
+
+    At production tree height (20 = 1M leaves), keygen takes a long time.
+    Without feedback, users kill the process thinking it hung. This
+    callback prints a single-line progress percentage to stderr roughly
+    every 5% so the output is readable but not spammy. Returns None if
+    the tree is small enough that progress is unnecessary.
+    """
+    # Skip for small trees (tests, small configs) — the overhead of
+    # printing exceeds the wait time.
+    if total_leaves < 4096:
+        return None
+
+    # Throttle to ~20 updates total
+    step = max(1, total_leaves // 20)
+    state = {"next": step, "done": 0}
+
+    def report(_leaf_index: int):
+        state["done"] += 1
+        done = state["done"]
+        if done >= state["next"] or done == total_leaves:
+            pct = int(100 * done / total_leaves)
+            print(
+                f"\r{label}: {pct}% ({done:,}/{total_leaves:,} leaves)",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+            state["next"] += step
+            if done == total_leaves:
+                print("", file=sys.stderr)  # newline after final update
+
+    return report
+
+
+class KeyFileError(Exception):
+    """Raised when a --keyfile cannot be loaded (missing, empty, bad checksum)."""
+
+
+def _load_key_from_file(path: str) -> bytes:
+    """Load and verify a checksummed private key from a file.
+
+    Returns the raw 32-byte private key. Raises KeyFileError on any
+    problem so that validators fail loudly at startup rather than silently
+    running as the wrong identity.
+
+    On POSIX systems, warns if the file is group/world-readable. We do
+    NOT refuse to load — operators may have valid reasons (e.g. container
+    secrets) for wider perms — but we surface the risk.
+    """
+    from messagechain.identity.key_encoding import (
+        decode_private_key,
+        InvalidKeyChecksumError,
+        InvalidKeyFormatError,
+    )
+
+    try:
+        with open(path, "r") as f:
+            contents = f.read()
+    except FileNotFoundError:
+        raise KeyFileError(f"Key file not found: {path}")
+    except OSError as e:
+        raise KeyFileError(f"Cannot read key file {path}: {e}")
+
+    if not contents.strip():
+        raise KeyFileError(f"Key file is empty: {path}")
+
+    try:
+        key = decode_private_key(contents)
+    except InvalidKeyChecksumError:
+        raise KeyFileError(
+            f"Key file checksum failed: {path}. "
+            "The file may be corrupted or truncated."
+        )
+    except InvalidKeyFormatError as e:
+        raise KeyFileError(f"Key file has invalid format: {path}: {e}")
+
+    # Warn about permissive permissions (POSIX only — Windows stat is different).
+    if hasattr(os, "getuid"):
+        try:
+            mode = os.stat(path).st_mode
+            if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
+                print(
+                    f"WARNING: key file {path} is readable by group/others. "
+                    "Recommended: chmod 0600 to restrict access."
+                )
+        except OSError:
+            pass
+
+    return key
+
+
 def _collect_private_key():
-    """Collect private key from the user."""
+    """Collect a checksummed private key from the user.
+
+    The displayed key format includes a short checksum so that
+    transcription errors (wrong character from paper backup) are
+    detected immediately rather than silently deriving a different
+    identity.
+
+    Returns the raw 32-byte private key.
+    """
+    from messagechain.identity.key_encoding import (
+        decode_private_key,
+        InvalidKeyChecksumError,
+        InvalidKeyFormatError,
+    )
+
     print("Authenticate with your private key.")
     print("Your private key is your identity — guard it carefully.\n")
 
-    private_key = getpass.getpass("Private key (hidden): ").encode("utf-8")
+    entered = getpass.getpass("Private key (hidden): ")
 
-    if not private_key:
+    if not entered:
         print("Error: Private key is required.")
         sys.exit(1)
 
-    return private_key
+    try:
+        return decode_private_key(entered)
+    except InvalidKeyChecksumError:
+        print("\nError: Private key checksum failed.")
+        print("This usually means you mistyped a character from your backup.")
+        print("Double-check each character and try again.")
+        sys.exit(1)
+    except InvalidKeyFormatError as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
 
 
 def cmd_start(args):
@@ -251,6 +374,15 @@ def cmd_start(args):
         for s in args.seed:
             host, port = s.split(":")
             seed_nodes.append((host, int(port)))
+    else:
+        # Fall back to the shipped default seeds from config, so users
+        # don't need to know a peer host:port out of band.
+        from messagechain.config import SEED_NODES
+        seed_nodes = list(SEED_NODES)
+        if seed_nodes:
+            seed_str = ", ".join(f"{h}:{p}" for h, p in seed_nodes)
+            print(f"Using default seed nodes: {seed_str}")
+            print("(override with --seed <host>:<port>)\n")
 
     # Import server here to avoid circular imports and keep startup fast
     from server import Server
@@ -265,9 +397,20 @@ def cmd_start(args):
     entity = None
     if args.mine:
         print("=== Start Mining Node ===\n")
-        print("To produce blocks and earn rewards, authenticate with your private key.\n")
-        private_key = _collect_private_key()
-        entity = Entity.create(private_key)
+        if args.keyfile:
+            print(f"Loading validator key from {args.keyfile}\n")
+            try:
+                private_key = _load_key_from_file(args.keyfile)
+            except KeyFileError as e:
+                print(f"Error: {e}")
+                sys.exit(1)
+        else:
+            print("To produce blocks and earn rewards, authenticate with your private key.")
+            print("(tip: use --keyfile <path> for unattended restart)\n")
+            private_key = _collect_private_key()
+        from messagechain.config import MERKLE_TREE_HEIGHT
+        progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Loading key tree")
+        entity = Entity.create(private_key, progress=progress)
 
         # Advance keypair past used leaves
         leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
@@ -734,14 +877,20 @@ def cmd_generate_key(_args):
     """Generate a full key pair offline (private key, public key, entity ID)."""
     import os
     from messagechain.identity.identity import Entity
+    from messagechain.identity.key_encoding import encode_private_key
+    from messagechain.config import MERKLE_TREE_HEIGHT
 
     key = os.urandom(32)
-    entity = Entity.create(key)
+    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
+    entity = Entity.create(key, progress=progress)
+    encoded = encode_private_key(key)
 
     print("=== Key Pair Generated ===\n")
-    print(f"  Private key: {key.hex()}")
+    print(f"  Private key: {encoded}")
     print(f"  Public key:  {entity.public_key.hex()}")
     print(f"  Entity ID:   {entity.entity_id_hex}")
+    print(f"\n  The private key includes a checksum — a transcription error")
+    print("  will be detected when you type it back.")
     print(f"\n  IMPORTANT: Verify your backup before deleting this key.")
     print("  Run: messagechain verify-key")
     print(f"\n  WARNING: Save your private key securely. It is your sole credential.")
@@ -756,15 +905,12 @@ def cmd_verify_key(_args):
     print("=== Verify Key Backup ===\n")
     print("Enter your private key to verify it derives the expected identity.\n")
 
-    private_key_hex = getpass.getpass("Private key (hidden): ")
-    try:
-        private_key = bytes.fromhex(private_key_hex)
-    except ValueError:
-        print("Error: Invalid hex. Private key must be a hex string.")
-        sys.exit(1)
+    from messagechain.config import MERKLE_TREE_HEIGHT
+    private_key = _collect_private_key()
+    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Rebuilding key tree")
 
     try:
-        entity = Entity.create(private_key)
+        entity = Entity.create(private_key, progress=progress)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)

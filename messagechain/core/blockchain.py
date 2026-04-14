@@ -339,10 +339,22 @@ class Blockchain:
         self.public_keys[entity_id] = public_key
         self.nonces[entity_id] = 0
 
+        # Welcome grant: give a small treasury-funded allocation so the
+        # new entity can afford their first message fee without needing
+        # an out-of-band funding step. Grants whatever the treasury can
+        # afford (possibly zero).
+        from messagechain.config import WELCOME_GRANT, TREASURY_ENTITY_ID
+        self.supply.welcome_grant(entity_id, WELCOME_GRANT)
+
         if self.db is not None:
             self.db.set_public_key(entity_id, public_key)
             self.db.set_nonce(entity_id, 0)
             self.db.set_balance(entity_id, self.supply.get_balance(entity_id))
+            # Treasury balance decreased by the grant — persist it too
+            self.db.set_balance(
+                TREASURY_ENTITY_ID,
+                self.supply.get_balance(TREASURY_ENTITY_ID),
+            )
             self.db.flush_state()
 
         return True, "Entity registered"
@@ -619,6 +631,12 @@ class Blockchain:
         )
         self.slashed_validators.add(tx.evidence.offender_id)
         self._processed_evidence.add(tx.evidence.evidence_hash)
+
+        # Revoke delegations pointing to the slashed validator — delegators
+        # revert to auto-mode.  The validator is "completely kicked from the
+        # network" so the user's explicit trust choice is no longer honorable.
+        if hasattr(self, "governance") and self.governance is not None:
+            self.governance.revoke_delegations_to(tx.evidence.offender_id)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -1314,6 +1332,10 @@ class Blockchain:
             self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
+            # Revoke delegations pointing to the slashed validator — delegators
+            # revert to auto-mode when their chosen validator is kicked.
+            if hasattr(self, "governance") and self.governance is not None:
+                self.governance.revoke_delegations_to(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )

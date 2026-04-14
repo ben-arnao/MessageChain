@@ -18,7 +18,7 @@ from messagechain.config import HASH_ALGO
 from messagechain.crypto.keys import KeyPair, verify_signature
 from messagechain.crypto.hash_sig import _hash
 from messagechain.identity.identity import Entity, derive_entity_id
-from messagechain.cli import cmd_generate_key, cmd_verify_key
+from messagechain.cli import cmd_generate_key, cmd_verify_key, _collect_private_key
 
 
 class TestOfflineKeyGeneration(unittest.TestCase):
@@ -42,8 +42,9 @@ class TestVerifyBackup(unittest.TestCase):
     @patch("sys.stdout", new_callable=io.StringIO)
     def test_verify_key_shows_derived_identity(self, mock_stdout):
         """verify-key should derive and display public key + entity ID."""
+        from messagechain.identity.key_encoding import encode_private_key
         private_key = os.urandom(32)
-        with patch("getpass.getpass", return_value=private_key.hex()):
+        with patch("getpass.getpass", return_value=encode_private_key(private_key)):
             cmd_verify_key(None)
         output = mock_stdout.getvalue()
         self.assertIn("Public key:", output)
@@ -52,6 +53,7 @@ class TestVerifyBackup(unittest.TestCase):
     @patch("sys.stdout", new_callable=io.StringIO)
     def test_verify_key_matches_generate_key(self, mock_stdout):
         """verify-key output should match what generate-key produced."""
+        from messagechain.identity.key_encoding import encode_private_key
         private_key = os.urandom(32)
 
         # Generate
@@ -63,7 +65,7 @@ class TestVerifyBackup(unittest.TestCase):
         mock_stdout.seek(0)
 
         # Verify
-        with patch("getpass.getpass", return_value=private_key.hex()):
+        with patch("getpass.getpass", return_value=encode_private_key(private_key)):
             cmd_verify_key(None)
         verify_output = mock_stdout.getvalue()
 
@@ -85,10 +87,11 @@ class TestVerifyBackup(unittest.TestCase):
     @patch("sys.stdout", new_callable=io.StringIO)
     def test_verify_key_works_offline(self, mock_stdout):
         """verify-key must work without any network access."""
+        from messagechain.identity.key_encoding import encode_private_key
         private_key = os.urandom(32)
         with patch("socket.socket") as mock_socket:
             mock_socket.side_effect = RuntimeError("No network")
-            with patch("getpass.getpass", return_value=private_key.hex()):
+            with patch("getpass.getpass", return_value=encode_private_key(private_key)):
                 cmd_verify_key(None)
         output = mock_stdout.getvalue()
         self.assertIn("Public key:", output)
@@ -155,6 +158,47 @@ class TestRegistrationProof(unittest.TestCase):
         )
         self.assertFalse(success)
         self.assertIn("Invalid registration proof", msg)
+
+
+class TestRoundTrip(unittest.TestCase):
+    """The entity shown by generate-key must match what you get when you type
+    the displayed key into any other command."""
+
+    @patch("sys.stdout", new_callable=io.StringIO)
+    def test_entity_shown_matches_entity_from_collect(self, mock_stdout):
+        """
+        User runs generate-key, sees Entity ID X.
+        Types the displayed private key into a command that calls
+        _collect_private_key, derives entity from that. Must be Entity ID X.
+        """
+        fixed_key = os.urandom(32)
+
+        # Run generate-key and capture the shown entity_id
+        with patch("os.urandom", return_value=fixed_key):
+            cmd_generate_key(None)
+        out = mock_stdout.getvalue()
+
+        shown_entity_id = None
+        shown_private_key = None
+        for line in out.splitlines():
+            if "Entity ID:" in line:
+                shown_entity_id = line.split("Entity ID:")[1].strip()
+            if "Private key:" in line:
+                shown_private_key = line.split("Private key:")[1].strip()
+
+        self.assertIsNotNone(shown_entity_id)
+        self.assertIsNotNone(shown_private_key)
+
+        # Now simulate user typing the displayed key into a command
+        with patch("getpass.getpass", return_value=shown_private_key):
+            key_bytes = _collect_private_key()
+        entity = Entity.create(key_bytes)
+
+        self.assertEqual(
+            entity.entity_id_hex, shown_entity_id,
+            "Entity shown by generate-key must match entity derived when the "
+            "same printed key is typed into another command."
+        )
 
 
 class TestDeterministicDerivation(unittest.TestCase):

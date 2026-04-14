@@ -316,8 +316,8 @@ class SupplyTracker:
     def treasury_spend(self, recipient_id: bytes, amount: int) -> bool:
         """Move funds from treasury to recipient (governance-authorized only).
 
-        This is the ONLY way to debit the treasury. Callers must ensure
-        governance approval before invoking this method.
+        This is the governance-authorized way to debit the treasury.
+        Callers must ensure governance approval before invoking.
         """
         if self.get_balance(TREASURY_ENTITY_ID) < amount:
             return False
@@ -326,6 +326,28 @@ class SupplyTracker:
         self.balances[TREASURY_ENTITY_ID] -= amount
         self.balances[recipient_id] = self.balances.get(recipient_id, 0) + amount
         return True
+
+    def welcome_grant(self, recipient_id: bytes, amount: int) -> int:
+        """Protocol-level grant from treasury to a newly-registered entity.
+
+        Unlike treasury_spend, this does not require governance approval
+        because it is bounded per-registration and gated by the cost of
+        generating a new entity keypair. Called once per entity at
+        registration time.
+
+        If the treasury cannot cover the full grant, transfers whatever
+        is available (including zero). Never raises. Returns the amount
+        actually granted.
+        """
+        if amount <= 0:
+            return 0
+        available = self.get_balance(TREASURY_ENTITY_ID)
+        granted = min(amount, available)
+        if granted == 0:
+            return 0
+        self.balances[TREASURY_ENTITY_ID] -= granted
+        self.balances[recipient_id] = self.balances.get(recipient_id, 0) + granted
+        return granted
 
     def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:
         """
