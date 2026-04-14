@@ -78,11 +78,11 @@ python -m messagechain account
 
 You'll be prompted for your private key. Type it from your paper backup. It stays in memory only for the few seconds it takes to sign the registration, then the process exits.
 
-Your account is now on-chain. Registration automatically deposits a small **welcome grant** from the treasury into your balance — enough to pay the fee on your first message. No out-of-band funding needed.
+Your account is now on-chain. You can receive funds at your entity ID.
 
-### 8. (Optional) Receive more funds
+### 8. Receive funds
 
-Your welcome grant covers the basics. To receive more, share your entity ID. Others can transfer tokens to you — no action needed on your end.
+Share your entity ID with the sender. They transfer tokens to you — no action needed on your end. (Note: MessageChain has no built-in faucet. To send a message, you need tokens from someone who already has them — for example, a friend, an exchange, or a validator paying out earnings.)
 
 ### 9. Send a message
 

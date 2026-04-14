@@ -53,17 +53,6 @@ PROPOSER_REWARD_CAP = BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWAR
 # Non-linear size pricing: fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
 # This makes larger messages disproportionately expensive, incentivizing conciseness.
 MIN_FEE = 100  # absolute floor for base fee (spam deterrent)
-
-# Welcome grant — tokens given to each newly-registered entity from the
-# treasury. Enough to cover the minimum fee so that a brand-new user can
-# post their first message without needing an out-of-band funding step.
-# This is the bootstrap path for users arriving from scratch.
-#
-# Sybil resistance comes from the cost of generating a WOTS+/Merkle keypair
-# at production tree height (minutes of compute per identity), which bounds
-# the drain rate on the treasury.
-WELCOME_GRANT = 500  # enough for ~1-2 short messages at base fee
-
 FEE_PER_BYTE = 3  # per-byte fee component (3x higher than original — storage is expensive)
 FEE_QUADRATIC_COEFF = 2  # quadratic surcharge coefficient: (bytes^2 * 2) // 1000
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)

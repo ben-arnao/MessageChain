@@ -339,22 +339,10 @@ class Blockchain:
         self.public_keys[entity_id] = public_key
         self.nonces[entity_id] = 0
 
-        # Welcome grant: give a small treasury-funded allocation so the
-        # new entity can afford their first message fee without needing
-        # an out-of-band funding step. Grants whatever the treasury can
-        # afford (possibly zero).
-        from messagechain.config import WELCOME_GRANT, TREASURY_ENTITY_ID
-        self.supply.welcome_grant(entity_id, WELCOME_GRANT)
-
         if self.db is not None:
             self.db.set_public_key(entity_id, public_key)
             self.db.set_nonce(entity_id, 0)
             self.db.set_balance(entity_id, self.supply.get_balance(entity_id))
-            # Treasury balance decreased by the grant — persist it too
-            self.db.set_balance(
-                TREASURY_ENTITY_ID,
-                self.supply.get_balance(TREASURY_ENTITY_ID),
-            )
             self.db.flush_state()
 
         return True, "Entity registered"
