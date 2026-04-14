@@ -405,6 +405,21 @@ class Server:
                 return {"ok": False, "error": "Invalid entity_id hex"}
             return {"ok": True, "result": {"revoked": self.blockchain.is_revoked(entity_id)}}
 
+        elif method == "rotate_key":
+            return self._rpc_rotate_key(request["params"])
+
+        elif method == "get_key_status":
+            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            if entity_id is None:
+                return {"ok": False, "error": "Invalid entity_id hex"}
+            # Current on-chain public key + rotation count + watermark together
+            # tell a client how far through its current tree it is.
+            return {"ok": True, "result": {
+                "public_key": self.blockchain.public_keys.get(entity_id, b"").hex(),
+                "rotation_number": self.blockchain.key_rotation_counts.get(entity_id, 0),
+                "leaf_watermark": self.blockchain.get_leaf_watermark(entity_id),
+            }}
+
         elif method == "get_sync_status":
             return {"ok": True, "result": self.syncer.get_sync_status()}
 
@@ -626,6 +641,29 @@ class Server:
             return {"ok": True, "result": {
                 "entity_id": tx.entity_id.hex(),
                 "authority_key": tx.new_authority_key.hex(),
+                "tx_hash": tx.tx_hash.hex(),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_rotate_key(self, params: dict) -> dict:
+        """Apply a KeyRotationTransaction, moving the entity to a fresh Merkle tree.
+
+        Applied immediately — the entity's identity (entity_id) is portable
+        across rotations, so the chain-state change is a simple field swap
+        protected by the old key's signature on the tx.
+        """
+        try:
+            from messagechain.core.key_rotation import KeyRotationTransaction
+            tx = KeyRotationTransaction.deserialize(params["transaction"])
+            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
+            ok, reason = self.blockchain.apply_key_rotation(tx, proposer_id)
+            if not ok:
+                return {"ok": False, "error": reason}
+            return {"ok": True, "result": {
+                "entity_id": tx.entity_id.hex(),
+                "new_public_key": tx.new_public_key.hex(),
+                "rotation_number": tx.rotation_number,
                 "tx_hash": tx.tx_hash.hex(),
             }}
         except Exception as e:

@@ -139,6 +139,28 @@ def build_parser() -> argparse.ArgumentParser:
     set_auth.add_argument("--fee", type=int, default=None, help="Transaction fee")
     set_auth.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- rotate-key ---
+    rotate = sub.add_parser(
+        "rotate-key",
+        help="Rotate to a fresh Merkle tree (leaf exhaustion recovery)",
+        description=(
+            "Move this entity to a freshly-derived Merkle tree of one-time "
+            "keys. Your entity ID (wallet address), balance, stake, delegations, "
+            "and authority-key binding all carry over unchanged — only the "
+            "underlying signing public key is replaced. Use when your leaf "
+            "watermark approaches the tree capacity, typically at ~80% usage."
+        ),
+    )
+    rotate.add_argument("--fee", type=int, default=None, help="Rotation fee")
+    rotate.add_argument("--server", type=str, default=None, help="Server address host:port")
+
+    # --- key-status ---
+    key_status = sub.add_parser(
+        "key-status",
+        help="Show current key state, leaf usage, and rotation number",
+    )
+    key_status.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- emergency-revoke ---
     revoke = sub.add_parser(
         "emergency-revoke",
@@ -820,6 +842,100 @@ def cmd_set_authority_key(args):
         sys.exit(1)
 
 
+def cmd_rotate_key(args):
+    """Rotate to a fresh Merkle tree, preserving entity_id and state."""
+    from messagechain.identity.identity import Entity
+    from messagechain.core.key_rotation import (
+        create_key_rotation, derive_rotated_keypair,
+    )
+    from messagechain.config import KEY_ROTATION_FEE, MERKLE_TREE_HEIGHT
+
+    print("=== Rotate Key ===\n")
+    print("This moves your entity to a freshly-derived Merkle tree.")
+    print("Your entity ID, balance, stake, and delegations are preserved.\n")
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    # Need current rotation_number from chain
+    status = rpc_call(host, port, "get_key_status", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not status.get("ok"):
+        print(f"Error: {status.get('error')}")
+        sys.exit(1)
+    current_rotation = status["result"]["rotation_number"]
+    watermark = status["result"]["leaf_watermark"]
+    entity.keypair.advance_to_leaf(watermark)
+
+    print(f"Current rotation number: {current_rotation}")
+    print(f"Current leaf watermark:  {watermark} / {1 << MERKLE_TREE_HEIGHT}")
+    print(f"\nDeriving fresh Merkle tree (rotation {current_rotation})...")
+    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building new tree")
+    new_kp = derive_rotated_keypair(entity, rotation_number=current_rotation)
+    progress.close() if hasattr(progress, "close") else None
+
+    fee = args.fee if args.fee is not None else KEY_ROTATION_FEE
+    rot_tx = create_key_rotation(
+        entity, new_kp, rotation_number=current_rotation, fee=fee,
+    )
+
+    response = rpc_call(host, port, "rotate_key", {
+        "transaction": rot_tx.serialize(),
+    })
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nKey rotated!")
+        print(f"  Entity ID:      {result['entity_id']}")
+        print(f"  New public key: {result['new_public_key']}")
+        print(f"  Rotation #:     {result['rotation_number']}")
+        print(f"\nYour entity ID is unchanged — wallet address, stake, and")
+        print("delegations all carry over. You can now continue signing with")
+        print("the fresh tree. Back up any new derivation metadata if needed.")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_key_status(args):
+    """Show the current key tree's rotation and leaf-consumption status."""
+    from messagechain.identity.identity import Entity
+    from messagechain.config import MERKLE_TREE_HEIGHT
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    status = rpc_call(host, port, "get_key_status", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not status.get("ok"):
+        print(f"Error: {status.get('error')}")
+        sys.exit(1)
+    result = status["result"]
+
+    capacity = 1 << MERKLE_TREE_HEIGHT
+    used = result["leaf_watermark"]
+    remaining = capacity - used
+    pct_used = (used * 100) // capacity if capacity else 0
+
+    print("\n=== Key Status ===\n")
+    print(f"  Entity ID:       {entity.entity_id_hex}")
+    print(f"  Public key:      {result['public_key']}")
+    print(f"  Rotation #:      {result['rotation_number']}")
+    print(f"  Leaves used:     {used} / {capacity} ({pct_used}%)")
+    print(f"  Leaves left:     {remaining}")
+    if pct_used >= 80:
+        print(f"\n  WARNING: over 80% used — schedule a rotation soon.")
+        print("  Run: messagechain rotate-key")
+
+
 def cmd_emergency_revoke(args):
     """Emergency revoke: disable a compromised validator using the cold key."""
     from messagechain.identity.identity import Entity
@@ -1169,6 +1285,8 @@ def main():
         "unstake": cmd_unstake,
         "set-authority-key": cmd_set_authority_key,
         "emergency-revoke": cmd_emergency_revoke,
+        "rotate-key": cmd_rotate_key,
+        "key-status": cmd_key_status,
         "delegate": cmd_delegate,
         "propose": cmd_propose,
         "vote": cmd_vote,

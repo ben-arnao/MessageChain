@@ -109,6 +109,11 @@ class ChainDB:
                 entity_id BLOB PRIMARY KEY
             );
 
+            CREATE TABLE IF NOT EXISTS key_rotation_counts (
+                entity_id BLOB PRIMARY KEY,
+                rotation_number INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -472,6 +477,28 @@ class ChainDB:
     def get_all_revoked(self) -> set[bytes]:
         cur = self._conn.execute("SELECT entity_id FROM revoked_entities")
         return {bytes(row[0]) for row in cur.fetchall()}
+
+    # ── State: Key Rotation Counts ──────────────────────────────
+
+    def get_key_rotation_count(self, entity_id: bytes) -> int:
+        cur = self._conn.execute(
+            "SELECT rotation_number FROM key_rotation_counts WHERE entity_id = ?",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def set_key_rotation_count(self, entity_id: bytes, rotation_number: int):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO key_rotation_counts (entity_id, rotation_number) VALUES (?, ?)",
+            (entity_id, rotation_number),
+        )
+
+    def get_all_key_rotation_counts(self) -> dict[bytes, int]:
+        cur = self._conn.execute(
+            "SELECT entity_id, rotation_number FROM key_rotation_counts"
+        )
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
     # ── Supply Meta ──────────────────────────────────────────────
 

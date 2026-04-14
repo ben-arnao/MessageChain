@@ -196,6 +196,11 @@ class Blockchain:
         if hasattr(self.db, 'get_all_revoked'):
             self.revoked_entities = self.db.get_all_revoked()
 
+        # Restore key-rotation counts so a restored client can re-derive
+        # the correct current rotated tree via rotation_number.
+        if hasattr(self.db, 'get_all_key_rotation_counts'):
+            self.key_rotation_counts = self.db.get_all_key_rotation_counts()
+
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
             self.slashed_validators = self.db.get_all_slashed()
@@ -270,6 +275,9 @@ class Blockchain:
             if hasattr(self.db, 'set_revoked'):
                 for eid in self.revoked_entities:
                     self.db.set_revoked(eid)
+            if hasattr(self.db, 'set_key_rotation_count'):
+                for eid, rn in self.key_rotation_counts.items():
+                    self.db.set_key_rotation_count(eid, rn)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -773,6 +781,10 @@ class Blockchain:
             self.db.set_public_key(tx.entity_id, tx.new_public_key)
             if hasattr(self.db, 'set_leaf_watermark'):
                 self.db.set_leaf_watermark(tx.entity_id, 0)
+            if hasattr(self.db, 'set_key_rotation_count'):
+                self.db.set_key_rotation_count(
+                    tx.entity_id, self.key_rotation_counts[tx.entity_id],
+                )
             self.db.flush_state()
 
         return True, "Key rotated successfully"
