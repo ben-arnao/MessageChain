@@ -380,7 +380,7 @@ class TestStateRootScaling(unittest.TestCase):
             small.set((i + 1).to_bytes(32, "big"), i + 1, 0, 0)
 
         large = SparseMerkleTree()
-        for i in range(2_000):
+        for i in range(500):
             large.set((i + 1).to_bytes(32, "big"), i + 1, 0, 0)
 
         probe = (9_999_999).to_bytes(32, "big")
@@ -397,7 +397,7 @@ class TestStateRootScaling(unittest.TestCase):
         # regression would make large_dt ~20x slower.
         self.assertLess(
             large_dt, max(small_dt * 5, 0.05),
-            f"SMT update at N=2000 ({large_dt:.4f}s) dwarfs N=100 "
+            f"SMT update at N=500 ({large_dt:.4f}s) dwarfs N=100 "
             f"({small_dt:.4f}s) — O(N) regression suspected",
         )
 

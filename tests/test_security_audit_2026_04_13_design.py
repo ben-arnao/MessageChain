@@ -62,7 +62,8 @@ class TestD1WriteTimeout(unittest.TestCase):
 
     def test_write_message_respects_timeout(self):
         """write_message must raise on a stalled writer."""
-        from messagechain.network.protocol import write_message, NetworkMessage, MessageType, P2P_WRITE_TIMEOUT
+        from messagechain.network import protocol
+        from messagechain.network.protocol import write_message, NetworkMessage, MessageType
 
         class StalledWriter:
             """Simulates a writer that never completes drain()."""
@@ -80,13 +81,16 @@ class TestD1WriteTimeout(unittest.TestCase):
             except (asyncio.TimeoutError, TimeoutError):
                 return True  # expected
 
+        original = protocol.P2P_WRITE_TIMEOUT
         loop = asyncio.new_event_loop()
         try:
+            protocol.P2P_WRITE_TIMEOUT = 1  # fast timeout for test
             result = loop.run_until_complete(
-                asyncio.wait_for(_test(), timeout=P2P_WRITE_TIMEOUT + 5)
+                asyncio.wait_for(_test(), timeout=protocol.P2P_WRITE_TIMEOUT + 2)
             )
             self.assertTrue(result, "write_message must raise TimeoutError on stall")
         finally:
+            protocol.P2P_WRITE_TIMEOUT = original
             loop.close()
 
 

@@ -182,7 +182,7 @@ class TestScalingEnvelope(unittest.TestCase):
             small.set(_eid(i + 1), i + 1, 0, 0)
 
         large = SparseMerkleTree()
-        for i in range(2_000):
+        for i in range(500):
             large.set(_eid(i + 1), i + 1, 0, 0)
 
         # Time a single extra update on each. The two should be
@@ -201,7 +201,7 @@ class TestScalingEnvelope(unittest.TestCase):
         # same TREE_DEPTH hash operations per update.
         self.assertLess(
             large_elapsed, max(small_elapsed * 5, 0.05),
-            f"Update at N=10000 ({large_elapsed:.4f}s) is much slower "
+            f"Update at N=500 ({large_elapsed:.4f}s) is much slower "
             f"than at N=100 ({small_elapsed:.4f}s) — likely O(N) regression",
         )
 

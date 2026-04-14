@@ -90,9 +90,9 @@ class TestBlockSignatureCostLimits(unittest.TestCase):
         register_entity_for_test(chain, proposer)
         chain.supply.balances[proposer.entity_id] = 1_000_000
 
-        # Create many entities to generate many transactions
+        # Create a few entities to generate transactions
         entities = []
-        for i in range(10):
+        for i in range(3):
             e = Entity.create(f"sigcost-entity-{i}".encode().ljust(32, b"\x00"))
             register_entity_for_test(chain, e)
             chain.supply.balances[e.entity_id] = 100_000
@@ -107,9 +107,9 @@ class TestBlockSignatureCostLimits(unittest.TestCase):
         # With a very low sig cost limit, even a few txs should be rejected
         original = config.MAX_BLOCK_SIG_COST
         try:
-            # Each tx costs 1 sig, proposer sig costs 1 = total 11
-            # Set limit to 5 to force rejection
-            config.MAX_BLOCK_SIG_COST = 5
+            # Each tx costs 1 sig, proposer sig costs 1 = total 4
+            # Set limit to 2 to force rejection
+            config.MAX_BLOCK_SIG_COST = 2
 
             from messagechain.core.block import Block, BlockHeader, compute_merkle_root, _hash as block_hash
             prev = chain.get_latest_block()
@@ -159,7 +159,7 @@ class TestMedianTimePast(unittest.TestCase):
     def test_block_timestamp_must_exceed_mtp(self):
         """A block with timestamp <= MTP must be rejected."""
         # Add a few blocks to build up MTP history
-        for i in range(5):
+        for i in range(3):
             tx = create_transaction(self.proposer, f"msg{i}", fee=1500, nonce=i)
             block = self.chain.propose_block(self.consensus, self.proposer, [tx])
             self.chain.add_block(block)

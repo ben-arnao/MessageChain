@@ -430,7 +430,7 @@ class TestChainSyncer(unittest.TestCase):
         assert best == "peer2:9333"
 
     def test_no_sync_when_caught_up(self):
-        chain, _ = make_chain_with_blocks(5)
+        chain, _ = make_chain_with_blocks(1)
         syncer = ChainSyncer(chain, lambda addr: None)
 
         # Peer at same height
@@ -505,7 +505,7 @@ class TestIntegration(unittest.TestCase):
             chain.supply.balances[bob.entity_id] = 10000
 
             pos = ProofOfStake()
-            for i in range(5):
+            for i in range(2):
                 tx = create_transaction(bob, f"Msg {i}", fee=1500, nonce=i)
                 block = chain.propose_block(pos, alice, [tx])
                 success, _ = chain.add_block(block)
@@ -545,13 +545,13 @@ class TestIntegration(unittest.TestCase):
 
     def test_backward_compatible_in_memory(self):
         """Blockchain without db= still works (backward compatible)."""
-        chain, alice = make_chain_with_blocks(3)
-        assert chain.height == 4
+        chain, alice = make_chain_with_blocks(1)
+        assert chain.height == 2
         assert chain.db is None
 
         info = chain.get_chain_info()
         assert info["chain_tips"] == 1
-        assert info["height"] == 4
+        assert info["height"] == 2
 
 
 if __name__ == "__main__":

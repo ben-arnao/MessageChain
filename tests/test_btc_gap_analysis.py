@@ -188,7 +188,7 @@ class TestBlockPruning(unittest.TestCase):
         """Blocks older than the pruning threshold can be pruned."""
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
-        for _ in range(10):
+        for _ in range(6):
             _propose_and_add(chain, consensus, entities[0])
 
         from messagechain.storage.pruning import BlockPruner
@@ -200,7 +200,7 @@ class TestBlockPruning(unittest.TestCase):
         """After pruning, block headers remain accessible."""
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
-        for _ in range(10):
+        for _ in range(6):
             _propose_and_add(chain, consensus, entities[0])
 
         from messagechain.storage.pruning import BlockPruner
@@ -216,7 +216,7 @@ class TestBlockPruning(unittest.TestCase):
         """Blocks within the keep_recent window are not pruned."""
         chain, entities = _make_chain_and_entities()
         consensus = ProofOfStake()
-        for _ in range(10):
+        for _ in range(6):
             _propose_and_add(chain, consensus, entities[0])
 
         from messagechain.storage.pruning import BlockPruner

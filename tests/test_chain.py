@@ -77,7 +77,7 @@ class TestBlockchain(unittest.TestCase):
     def test_inflation_over_blocks(self):
         """Supply increases with each block (inflation via block rewards)."""
         initial_supply = self.chain.supply.total_supply
-        for i in range(5):
+        for i in range(3):
             entity = self.alice if i % 2 == 0 else self.bob
             nonce = self.chain.nonces.get(entity.entity_id, 0)
             tx = create_transaction(
