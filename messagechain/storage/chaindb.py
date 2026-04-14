@@ -95,6 +95,11 @@ class ChainDB:
                 count INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS leaf_watermarks (
+                entity_id BLOB PRIMARY KEY,
+                next_leaf INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -401,6 +406,26 @@ class ChainDB:
         cur = self._conn.execute("SELECT entity_id, count FROM proposer_sig_counts")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
+    # ── State: Leaf Watermarks (WOTS+ reuse prevention) ─────────
+
+    def get_leaf_watermark(self, entity_id: bytes) -> int:
+        cur = self._conn.execute(
+            "SELECT next_leaf FROM leaf_watermarks WHERE entity_id = ?",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def set_leaf_watermark(self, entity_id: bytes, next_leaf: int):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO leaf_watermarks (entity_id, next_leaf) VALUES (?, ?)",
+            (entity_id, next_leaf),
+        )
+
+    def get_all_leaf_watermarks(self) -> dict[bytes, int]:
+        cur = self._conn.execute("SELECT entity_id, next_leaf FROM leaf_watermarks")
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
     # ── Supply Meta ──────────────────────────────────────────────
 
     def get_supply_meta(self, key: str) -> int:
@@ -475,6 +500,7 @@ class ChainDB:
             "public_keys": self.get_all_public_keys(),
             "message_counts": self.get_all_message_counts(),
             "proposer_sig_counts": self.get_all_proposer_sig_counts(),
+            "leaf_watermarks": self.get_all_leaf_watermarks(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),

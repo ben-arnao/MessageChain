@@ -150,10 +150,6 @@ def cmd_send_message(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    # Advance keypair past already-used one-time keys to prevent WOTS+ reuse.
-    # The nonce equals the number of signatures already made, so we skip that many leaves.
-    # +1 accounts for the genesis block signature if this entity proposed it.
-    entity.keypair.advance_to_leaf(nonce)
 
     # Get fee estimate
     fee = args.fee
@@ -201,7 +197,11 @@ def cmd_transfer(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    # Position keypair past every leaf the chain has ever seen from this
+    # entity — nonce alone is insufficient because block/attestation/
+    # registration signatures also consume leaves without a nonce bump.
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee else 1
     recipient_id = bytes.fromhex(args.to)
@@ -260,7 +260,11 @@ def cmd_stake(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    # Position keypair past every leaf the chain has ever seen from this
+    # entity — nonce alone is insufficient because block/attestation/
+    # registration signatures also consume leaves without a nonce bump.
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee else 1
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
@@ -295,7 +299,11 @@ def cmd_unstake(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    # Position keypair past every leaf the chain has ever seen from this
+    # entity — nonce alone is insufficient because block/attestation/
+    # registration signatures also consume leaves without a nonce bump.
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee else 1
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)

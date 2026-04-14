@@ -368,7 +368,21 @@ class Server:
             if entity_id is None:
                 return {"ok": False, "error": "Invalid entity_id hex"}
             nonce = self.blockchain.nonces.get(entity_id, 0)
-            return {"ok": True, "result": {"nonce": nonce}}
+            watermark = self.blockchain.get_leaf_watermark(entity_id)
+            # Return both together so clients only need one roundtrip to
+            # safely position their WOTS+ keypair before signing. The
+            # leaf watermark is the authoritative source of truth for
+            # "next safe leaf index" — the nonce is not, because some
+            # operations (registration, block production, attestations)
+            # consume leaves without incrementing the nonce.
+            return {"ok": True, "result": {"nonce": nonce, "leaf_watermark": watermark}}
+
+        elif method == "get_leaf_watermark":
+            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            if entity_id is None:
+                return {"ok": False, "error": "Invalid entity_id hex"}
+            watermark = self.blockchain.get_leaf_watermark(entity_id)
+            return {"ok": True, "result": {"leaf_watermark": watermark}}
 
         elif method == "get_sync_status":
             return {"ok": True, "result": self.syncer.get_sync_status()}
@@ -499,6 +513,9 @@ class Server:
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
 
+            if tx.signature.leaf_index < self.blockchain.get_leaf_watermark(entity_id):
+                return {"ok": False, "error": "WOTS+ leaf already consumed — leaf reuse rejected"}
+
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
                 return {"ok": False, "error": "Insufficient balance for staking + fee"}
 
@@ -539,6 +556,9 @@ class Server:
             expected_nonce = self.blockchain.nonces.get(entity_id, 0)
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
+
+            if tx.signature.leaf_index < self.blockchain.get_leaf_watermark(entity_id):
+                return {"ok": False, "error": "WOTS+ leaf already consumed — leaf reuse rejected"}
 
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}

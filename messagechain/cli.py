@@ -513,7 +513,8 @@ def cmd_send(args):
     nonce = nonce_resp["result"]["nonce"]
 
     # Advance keypair past used leaves
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     # Auto-detect fee (or use explicit)
     fee = args.fee
@@ -566,7 +567,8 @@ def cmd_transfer(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     # Auto-detect fee
     fee = args.fee
@@ -649,7 +651,8 @@ def cmd_stake(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee is not None else 1
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
@@ -694,7 +697,8 @@ def cmd_unstake(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee is not None else 1
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
@@ -760,7 +764,8 @@ def cmd_delegate(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee is not None else GOVERNANCE_DELEGATE_FEE
     tx = create_delegation(entity, targets, fee=fee)
@@ -805,7 +810,8 @@ def cmd_propose(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     fee = args.fee if args.fee is not None else GOVERNANCE_PROPOSAL_FEE
     tx = create_proposal(entity, args.title, args.description, fee=fee)
@@ -848,7 +854,8 @@ def cmd_vote(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    entity.keypair.advance_to_leaf(nonce)
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(watermark)
 
     from messagechain.validation import parse_hex
     proposal_id = parse_hex(args.proposal)

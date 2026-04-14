@@ -90,6 +90,12 @@ class Blockchain:
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
         self.attestation_sig_counts: dict[bytes, int] = {}  # entity_id -> attestation signatures made
         self.slash_sig_counts: dict[bytes, int] = {}  # entity_id -> slash submission signatures made
+        # Next-safe WOTS+ leaf index per entity. Every chain-verified signature
+        # bumps this forward; validation rejects any tx whose leaf_index is at
+        # or below the watermark. Ratchet-only: never decreases, even across
+        # reorgs — a leaf that was ever published on any fork is permanently
+        # burned because its private material is public knowledge.
+        self.leaf_watermarks: dict[bytes, int] = {}
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
@@ -151,6 +157,10 @@ class Blockchain:
         # Restore proposer signature counts (for WOTS+ leaf tracking)
         if hasattr(self.db, 'get_all_proposer_sig_counts'):
             self.proposer_sig_counts = self.db.get_all_proposer_sig_counts()
+
+        # Restore leaf-reuse watermarks
+        if hasattr(self.db, 'get_all_leaf_watermarks'):
+            self.leaf_watermarks = self.db.get_all_leaf_watermarks()
 
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
@@ -217,6 +227,9 @@ class Blockchain:
                 self.db.set_message_count(eid, cnt)
             for eid, cnt in self.proposer_sig_counts.items():
                 self.db.set_proposer_sig_count(eid, cnt)
+            if hasattr(self.db, 'set_leaf_watermark'):
+                for eid, nxt in self.leaf_watermarks.items():
+                    self.db.set_leaf_watermark(eid, nxt)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -304,6 +317,28 @@ class Blockchain:
 
         return genesis_block
 
+    def get_leaf_watermark(self, entity_id: bytes) -> int:
+        """Return the next-safe WOTS+ leaf index for this entity.
+
+        Clients must call advance_to_leaf(watermark) on their local KeyPair
+        before signing, and sign with a leaf_index >= watermark. Any tx whose
+        leaf_index is below the watermark is rejected as a reuse attempt.
+        """
+        return self.leaf_watermarks.get(entity_id, 0)
+
+    def _bump_watermark(self, entity_id: bytes, leaf_index: int) -> None:
+        """Ratchet the per-entity watermark to one past the supplied leaf.
+
+        Invariant: the stored value only ever increases. This makes WOTS+
+        leaf reuse impossible from the chain's perspective — once a leaf
+        has been seen, no later tx signed at that leaf (or below) will
+        ever pass validation.
+        """
+        nxt = leaf_index + 1
+        current = self.leaf_watermarks.get(entity_id, 0)
+        if nxt > current:
+            self.leaf_watermarks[entity_id] = nxt
+
     def register_entity(
         self,
         entity_id: bytes,
@@ -336,8 +371,15 @@ class Blockchain:
         if not verify_signature(proof_msg, registration_proof, public_key):
             return False, "Invalid registration proof — signature does not match public key"
 
+        # Leaf-reuse guard: a registration proof signed with a leaf at or
+        # below the current watermark (e.g., an entity trying to re-register
+        # with a rewound keypair) is rejected.
+        if registration_proof.leaf_index < self.leaf_watermarks.get(entity_id, 0):
+            return False, "Registration proof reuses an already-consumed WOTS+ leaf"
+
         self.public_keys[entity_id] = public_key
         self.nonces[entity_id] = 0
+        self._bump_watermark(entity_id, registration_proof.leaf_index)
 
         if self.db is not None:
             self.db.set_public_key(entity_id, public_key)
@@ -456,6 +498,12 @@ class Blockchain:
         if self.get_spendable_balance(tx.entity_id) < tx.fee:
             return False, f"Insufficient spendable balance for fee of {tx.fee}"
 
+        if tx.signature.leaf_index < self.leaf_watermarks.get(tx.entity_id, 0):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
+            )
+
         public_key = self.public_keys[tx.entity_id]
         if not verify_transaction(tx, public_key):
             return False, "Invalid signature"
@@ -481,6 +529,12 @@ class Blockchain:
         if self.get_spendable_balance(tx.entity_id) < tx.amount + tx.fee:
             return False, f"Insufficient spendable balance for transfer of {tx.amount} + fee {tx.fee}"
 
+        if tx.signature.leaf_index < self.leaf_watermarks.get(tx.entity_id, 0):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
+            )
+
         public_key = self.public_keys[tx.entity_id]
         if not verify_transfer_transaction(tx, public_key):
             return False, "Invalid signature"
@@ -494,6 +548,7 @@ class Blockchain:
         self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tx.fee
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
+        self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
 
     def validate_key_rotation(self, tx: KeyRotationTransaction) -> tuple[bool, str]:
         """Validate a key rotation transaction against current chain state."""
@@ -517,6 +572,12 @@ class Blockchain:
         if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
             return False, f"Insufficient balance for rotation fee of {tx.fee}"
 
+        if tx.signature.leaf_index < self.leaf_watermarks.get(tx.entity_id, 0):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
+            )
+
         if not verify_key_rotation(tx, current_pk):
             return False, "Invalid key rotation signature or parameters"
 
@@ -531,6 +592,13 @@ class Blockchain:
         # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
         self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, self.supply.base_fee)
 
+        # Rotation installs a fresh Merkle tree whose leaf indices re-count
+        # from 0, independent of the old tree. Reset the watermark to 0 so
+        # the new tree starts clean. The old tree's leaves (including the
+        # one consumed to sign this rotation) are permanently unusable
+        # regardless, because that key is no longer bound to this entity.
+        self.leaf_watermarks[tx.entity_id] = 0
+
         # Update the entity's public key
         self.public_keys[tx.entity_id] = tx.new_public_key
         self.key_rotation_counts[tx.entity_id] = tx.rotation_number + 1
@@ -538,6 +606,8 @@ class Blockchain:
         # Persist
         if self.db is not None:
             self.db.set_public_key(tx.entity_id, tx.new_public_key)
+            if hasattr(self.db, 'set_leaf_watermark'):
+                self.db.set_leaf_watermark(tx.entity_id, 0)
             self.db.flush_state()
 
         return True, "Key rotated successfully"
@@ -1312,9 +1382,11 @@ class Blockchain:
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
             )
+            self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
         # Apply transfer transactions (also with burn)
         for ttx in block.transfer_transactions:
             self._apply_transfer_with_burn(ttx, proposer_id, current_base_fee)
+            self._bump_watermark(ttx.entity_id, ttx.signature.leaf_index)
         # Apply slash transactions
         for stx in block.slash_transactions:
             self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
@@ -1327,6 +1399,7 @@ class Blockchain:
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
+            self._bump_watermark(stx.submitter_id, stx.signature.leaf_index)
 
         # Build attestor stakes map for reward distribution
         attestor_stakes = {}
@@ -1365,11 +1438,14 @@ class Blockchain:
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1
         )
+        if block.header.proposer_signature is not None:
+            self._bump_watermark(proposer_id, block.header.proposer_signature.leaf_index)
         # Track attestation signatures (each consumes a WOTS+ leaf from the validator)
         for att in block.attestations:
             self.attestation_sig_counts[att.validator_id] = (
                 self.attestation_sig_counts.get(att.validator_id, 0) + 1
             )
+            self._bump_watermark(att.validator_id, att.signature.leaf_index)
         # Release matured pending unstakes
         self.supply.process_pending_unstakes(block.header.block_number)
 
