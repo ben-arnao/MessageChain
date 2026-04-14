@@ -139,6 +139,27 @@ def build_parser() -> argparse.ArgumentParser:
     set_auth.add_argument("--fee", type=int, default=None, help="Transaction fee")
     set_auth.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- emergency-revoke ---
+    revoke = sub.add_parser(
+        "emergency-revoke",
+        help="Kill-switch for a compromised validator (cold key required)",
+        description=(
+            "Immediately disable a validator whose hot signing key is "
+            "suspected compromised. Signed by the cold authority key (NOT "
+            "the hot signing key). After this runs: the validator can no "
+            "longer propose blocks or attest, and all active stake enters "
+            "the normal 7-day unbonding queue so the legitimate operator "
+            "recovers the funds. Keep a pre-signed revoke tx on paper for "
+            "rapid response."
+        ),
+    )
+    revoke.add_argument(
+        "--entity-id", required=True,
+        help="Hex entity ID of the compromised validator",
+    )
+    revoke.add_argument("--fee", type=int, default=None, help="Transaction fee")
+    revoke.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- delegate ---
     delegate = sub.add_parser(
         "delegate",
@@ -799,6 +820,64 @@ def cmd_set_authority_key(args):
         sys.exit(1)
 
 
+def cmd_emergency_revoke(args):
+    """Emergency revoke: disable a compromised validator using the cold key."""
+    from messagechain.identity.identity import Entity
+    from messagechain.core.emergency_revoke import create_revoke_transaction
+
+    print("=== Emergency Revoke ===\n")
+    print("Authenticate with your COLD (authority) key — NOT the hot signing")
+    print("key that lives on the validator server. The whole point of revoke")
+    print("is that an attacker holding only the hot key cannot do this.\n")
+
+    try:
+        target_entity_id = bytes.fromhex(args.entity_id.strip())
+    except ValueError:
+        print("Error: --entity-id must be valid hex.")
+        sys.exit(1)
+    if len(target_entity_id) != 32:
+        print(f"Error: entity ID must be 32 bytes, got {len(target_entity_id)}.")
+        sys.exit(1)
+
+    private_key = _collect_private_key()
+    cold = Entity.create(private_key)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    # The cold entity may or may not be registered — watermark is on the
+    # hot entity_id, which is the revoke target. The cold key's own leaf
+    # index is determined locally by its KeyPair state (fresh: starts at 0).
+    fee = args.fee if args.fee is not None else 500
+    # Revoke uses nonce from the TARGET entity (the hot identity), not the signer.
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": target_entity_id.hex(),
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+
+    tx = create_revoke_transaction(
+        cold, nonce=nonce, fee=fee, entity_id=target_entity_id,
+    )
+
+    print(f"Broadcasting revoke for {target_entity_id.hex()[:16]}...")
+    response = rpc_call(host, port, "emergency_revoke", {
+        "transaction": tx.serialize(),
+    })
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nRevoke applied!")
+        print(f"  Entity ID: {result['entity_id']}")
+        print(f"  TX hash:   {result['tx_hash']}")
+        print(f"\nThe validator can no longer propose blocks. Staked funds")
+        print("will release to your balance after the 7-day unbonding period.")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_delegate(args):
     """Delegate voting power to trusted validators."""
     from messagechain.identity.identity import Entity
@@ -1089,6 +1168,7 @@ def main():
         "stake": cmd_stake,
         "unstake": cmd_unstake,
         "set-authority-key": cmd_set_authority_key,
+        "emergency-revoke": cmd_emergency_revoke,
         "delegate": cmd_delegate,
         "propose": cmd_propose,
         "vote": cmd_vote,

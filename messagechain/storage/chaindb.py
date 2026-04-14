@@ -105,6 +105,10 @@ class ChainDB:
                 authority_public_key BLOB NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS revoked_entities (
+                entity_id BLOB PRIMARY KEY
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -450,6 +454,24 @@ class ChainDB:
     def get_all_authority_keys(self) -> dict[bytes, bytes]:
         cur = self._conn.execute("SELECT entity_id, authority_public_key FROM authority_keys")
         return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
+
+    # ── State: Revoked Entities (emergency kill-switch) ─────────
+
+    def set_revoked(self, entity_id: bytes):
+        self._conn.execute(
+            "INSERT OR IGNORE INTO revoked_entities (entity_id) VALUES (?)",
+            (entity_id,),
+        )
+
+    def is_revoked(self, entity_id: bytes) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM revoked_entities WHERE entity_id = ?", (entity_id,),
+        )
+        return cur.fetchone() is not None
+
+    def get_all_revoked(self) -> set[bytes]:
+        cur = self._conn.execute("SELECT entity_id FROM revoked_entities")
+        return {bytes(row[0]) for row in cur.fetchall()}
 
     # ── Supply Meta ──────────────────────────────────────────────
 

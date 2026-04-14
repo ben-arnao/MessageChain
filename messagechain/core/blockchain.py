@@ -33,6 +33,9 @@ from messagechain.core.key_rotation import (
 from messagechain.core.authority_key import (
     SetAuthorityKeyTransaction, verify_set_authority_key_transaction,
 )
+from messagechain.core.emergency_revoke import (
+    RevokeTransaction, verify_revoke_transaction,
+)
 from messagechain.core.transfer import (
     TransferTransaction, verify_transfer_transaction,
 )
@@ -68,6 +71,7 @@ def compute_block_sig_cost(block) -> int:
         len(block.transactions)
         + len(block.transfer_transactions)
         + len(block.slash_transactions)
+        + len(block.governance_txs)
         + 1  # proposer signature
         + len(block.attestations)
     )
@@ -105,10 +109,23 @@ class Blockchain:
         # an entity, the signing public_key is used as the authority key by
         # default — backward compatible with the single-key identity model.
         self.authority_keys: dict[bytes, bytes] = {}
+        # Revoked entities (emergency kill-switch, signed by cold key).
+        # Block validation rejects blocks proposed by these entities; their
+        # attestations are also rejected. Existing stake has already been
+        # pushed into pending_unstakes at revoke time, so the cold-key
+        # holder recovers funds through the normal unbonding path.
+        self.revoked_entities: set[bytes] = set()
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
+        # On-chain governance state: proposals, votes, delegations, and
+        # append-only audit logs for executed binding outcomes.  Block
+        # processing calls _apply_governance_block(block) which dispatches
+        # governance txs into this tracker, auto-executes closed binding
+        # proposals, and prunes expired state.
+        from messagechain.governance.governance import GovernanceTracker
+        self.governance = GovernanceTracker()
         self._block_by_hash: dict[bytes, Block] = {}  # in-memory block index
         # Per-block stake snapshots. Maps block_number -> {validator_id: stake}
         # as of the END of that block. Used when processing attestations
@@ -174,6 +191,10 @@ class Blockchain:
         # Restore authority (cold) keys for hot/cold-separated validators
         if hasattr(self.db, 'get_all_authority_keys'):
             self.authority_keys = self.db.get_all_authority_keys()
+
+        # Restore emergency-revoked entities
+        if hasattr(self.db, 'get_all_revoked'):
+            self.revoked_entities = self.db.get_all_revoked()
 
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
@@ -246,6 +267,9 @@ class Blockchain:
             if hasattr(self.db, 'set_authority_key'):
                 for eid, ak in self.authority_keys.items():
                     self.db.set_authority_key(eid, ak)
+            if hasattr(self.db, 'set_revoked'):
+                for eid in self.revoked_entities:
+                    self.db.set_revoked(eid)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -387,6 +411,76 @@ class Blockchain:
         self.nonces[tx.entity_id] = tx.nonce + 1
         self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
         return True, "Authority key updated"
+
+    def is_revoked(self, entity_id: bytes) -> bool:
+        """True if this entity has been emergency-revoked by its cold key."""
+        return entity_id in self.revoked_entities
+
+    def validate_revoke(self, tx: RevokeTransaction) -> tuple[bool, str]:
+        if tx.entity_id not in self.public_keys:
+            return False, "Unknown entity"
+        if tx.entity_id in self.revoked_entities:
+            return False, "Entity already revoked"
+
+        expected_nonce = self.nonces.get(tx.entity_id, 0)
+        if tx.nonce != expected_nonce:
+            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+
+        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
+            return False, f"Insufficient balance for fee of {tx.fee}"
+
+        # Authority-gated: signature must verify under the cold key.
+        authority_pk = self.get_authority_key(tx.entity_id)
+        if authority_pk is None or not verify_revoke_transaction(tx, authority_pk):
+            return False, (
+                "Invalid signature — revoke must be signed by the authority "
+                "(cold) key. The hot signing key cannot self-revoke."
+            )
+        return True, "Valid"
+
+    def apply_revoke(
+        self,
+        tx: RevokeTransaction,
+        proposer_id: bytes,
+        current_block: int | None = None,
+    ) -> tuple[bool, str]:
+        """Apply an emergency revoke: flag entity, unbond all stake, burn fee."""
+        ok, reason = self.validate_revoke(tx)
+        if not ok:
+            return False, reason
+
+        self.supply.pay_fee_with_burn(
+            tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
+        )
+
+        # Push all active stake into the 7-day unbonding queue. Do NOT
+        # release it immediately — in-flight slashing evidence must still
+        # be able to reach it during the unbonding window.
+        active_stake = self.supply.get_staked(tx.entity_id)
+        if active_stake > 0:
+            block_height = current_block if current_block is not None else self.height
+            self.supply.unstake(
+                tx.entity_id,
+                active_stake,
+                current_block=block_height,
+                bootstrap_ended=False,  # don't fail revoke on min-stake check
+            )
+
+        self.revoked_entities.add(tx.entity_id)
+        self.nonces[tx.entity_id] = tx.nonce + 1
+
+        # The revoke signature consumed a leaf from the COLD key tree.
+        # The hot-key watermark is unaffected, so we deliberately do not
+        # bump self.leaf_watermarks[entity_id] here — that watermark
+        # tracks the hot tree, which may continue to be used up until
+        # the chain enforces a full halt of the revoked entity.
+
+        # Persist revocation immediately — this is a security-critical flag.
+        if self.db is not None and hasattr(self.db, 'set_revoked'):
+            self.db.set_revoked(tx.entity_id)
+            self.db.flush_state()
+
+        return True, "Entity revoked"
 
     def get_leaf_watermark(self, entity_id: bytes) -> int:
         """Return the next-safe WOTS+ leaf index for this entity.
@@ -984,6 +1078,7 @@ class Blockchain:
         attestations: list[Attestation] | None = None,
         transfer_transactions: list[TransferTransaction] | None = None,
         slash_transactions: list | None = None,
+        governance_txs: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1015,6 +1110,7 @@ class Blockchain:
             state_root=state_root, attestations=attestations,
             transfer_transactions=transfer_transactions,
             slash_transactions=slash_transactions,
+            governance_txs=governance_txs,
             timestamp=timestamp,
         )
 
@@ -1110,6 +1206,15 @@ class Blockchain:
         if block.header.version != 1:
             return False, f"Unknown block version {block.header.version}"
 
+        # Reject blocks proposed by emergency-revoked validators.  The cold-
+        # key holder has declared this hot key compromised; the network
+        # must stop honoring its block proposals immediately, regardless of
+        # whether the signature technically verifies.
+        if block.header.proposer_id in self.revoked_entities:
+            return False, (
+                f"Proposer {block.header.proposer_id.hex()[:16]}... is revoked"
+            )
+
         # Check prev_hash links
         if block.header.prev_hash != latest.block_hash:
             return False, "Invalid prev_hash"
@@ -1155,13 +1260,13 @@ class Blockchain:
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
-        # Verify merkle root. Includes message txs, transfer txs, AND
-        # slash txs — committing slash txs cryptographically prevents a
-        # byzantine relayer from stripping them in transit (previously a
-        # real gap: slash_transactions lived outside merkle_root).
+        # Verify merkle root. Includes message txs, transfer txs, slash txs,
+        # and governance txs — committing each cryptographically prevents a
+        # byzantine relayer from stripping them in transit.
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
+            + [tx.tx_hash for tx in block.governance_txs]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1311,6 +1416,55 @@ class Blockchain:
             if not valid:
                 return False, f"Invalid slash tx: {reason}"
 
+        # Validate governance transactions.  Each carries its own signature
+        # and minimum-fee rules; we only check the proposer/voter/delegator
+        # is known and the signature verifies.  Application-layer semantics
+        # (proposal-exists, voting-window-open, duplicate vote) are enforced
+        # in _apply_block_state against the GovernanceTracker.
+        for gtx in block.governance_txs:
+            valid, reason = self._validate_governance_tx(gtx)
+            if not valid:
+                return False, f"Invalid governance tx: {reason}"
+
+        return True, "Valid"
+
+    def _validate_governance_tx(self, gtx) -> tuple[bool, str]:
+        """Verify a governance transaction's signature and author.
+
+        Rejects txs whose sender is unknown to the chain or whose
+        cryptographic signature does not verify.  Does NOT enforce
+        application-layer rules (proposal-exists, window-closed, etc.) —
+        those are handled by the GovernanceTracker at apply time so that
+        benign-but-rejected txs (e.g., votes on an expired proposal) do
+        not invalidate an otherwise well-formed block.
+        """
+        from messagechain.governance.governance import (
+            ProposalTransaction, VoteTransaction, DelegateTransaction,
+            TreasurySpendTransaction, ValidatorEjectionProposal,
+            verify_proposal, verify_vote, verify_delegation,
+            verify_treasury_spend, verify_validator_ejection,
+        )
+        if isinstance(gtx, ProposalTransaction):
+            sender = gtx.proposer_id
+            verifier = verify_proposal
+        elif isinstance(gtx, VoteTransaction):
+            sender = gtx.voter_id
+            verifier = verify_vote
+        elif isinstance(gtx, DelegateTransaction):
+            sender = gtx.delegator_id
+            verifier = verify_delegation
+        elif isinstance(gtx, TreasurySpendTransaction):
+            sender = gtx.proposer_id
+            verifier = verify_treasury_spend
+        elif isinstance(gtx, ValidatorEjectionProposal):
+            sender = gtx.proposer_id
+            verifier = verify_validator_ejection
+        else:
+            return False, f"Unknown governance tx type {type(gtx).__name__}"
+        if sender not in self.public_keys:
+            return False, f"Unknown sender {sender.hex()[:16]}"
+        if not verifier(gtx, self.public_keys[sender]):
+            return False, "Invalid signature or fields"
         return True, "Valid"
 
     def validate_block_standalone(self, block: Block, parent: Block) -> tuple[bool, str]:
@@ -1358,14 +1512,21 @@ class Blockchain:
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds limit"
 
-        # Merkle root
+        # Merkle root — includes governance_txs so a relayer can't strip them
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
+            + [tx.tx_hash for tx in block.governance_txs]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
+
+        # Governance txs — signature + sender checks (same as validate_block)
+        for gtx in block.governance_txs:
+            valid, reason = self._validate_governance_tx(gtx)
+            if not valid:
+                return False, f"Invalid governance tx: {reason}"
 
         # Proposer signature (mandatory)
         if block.header.proposer_id not in self.public_keys:
@@ -1528,9 +1689,100 @@ class Blockchain:
         # Release matured pending unstakes
         self.supply.process_pending_unstakes(block.header.block_number)
 
+        # Apply governance transactions after economic state has settled.
+        # Lets auto-executed binding outcomes (treasury spends, ejections)
+        # act on the fully-updated supply/stakes.
+        self._apply_governance_block(block)
+
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
+
+    def _apply_governance_block(self, block: Block):
+        """Dispatch governance txs, auto-execute closed binding proposals,
+        and prune expired state.
+
+        Three phases, in order:
+
+        1. REGISTER — for each governance tx in the block, update the
+           tracker: proposals/treasury-spends/ejections are snapshotted;
+           votes are recorded; delegations are installed.  Fees follow the
+           normal burn-and-tip path.  Application-layer failures (vote on
+           unknown proposal, etc.) are silently dropped — the tx was
+           already block-level valid, so the block is not invalidated.
+
+        2. AUTO-EXECUTE — binding proposals (treasury spends, validator
+           ejections) whose voting window has closed by this block height
+           are executed automatically.  No separate "execute" tx required,
+           which eliminates a griefing vector where a passing proposal
+           could be indefinitely ignored.
+
+        3. PRUNE — closed proposals are dropped from the tracker to bound
+           memory growth.  The audit log in `treasury_spend_log` /
+           `ejection_log` survives pruning so post-hoc accountability
+           does not depend on proposal retention.
+        """
+        if not hasattr(self, "governance") or self.governance is None:
+            return
+        from messagechain.governance.governance import (
+            ProposalTransaction, VoteTransaction, DelegateTransaction,
+            TreasurySpendTransaction, ValidatorEjectionProposal,
+        )
+        from messagechain.config import GOVERNANCE_VOTING_WINDOW
+
+        tracker = self.governance
+        current_block = block.header.block_number
+        proposer_id = block.header.proposer_id
+        current_base_fee = self.supply.base_fee
+
+        # Phase 1: register
+        for gtx in block.governance_txs:
+            if isinstance(gtx, (ProposalTransaction, TreasurySpendTransaction,
+                                ValidatorEjectionProposal)):
+                self.supply.pay_fee_with_burn(
+                    gtx.proposer_id, proposer_id, gtx.fee, current_base_fee,
+                )
+                tracker.add_proposal(
+                    gtx, block_height=current_block, supply_tracker=self.supply,
+                )
+                self._bump_watermark(gtx.proposer_id, gtx.signature.leaf_index)
+            elif isinstance(gtx, VoteTransaction):
+                self.supply.pay_fee_with_burn(
+                    gtx.voter_id, proposer_id, gtx.fee, current_base_fee,
+                )
+                tracker.add_vote(gtx, current_block=current_block)
+                self._bump_watermark(gtx.voter_id, gtx.signature.leaf_index)
+            elif isinstance(gtx, DelegateTransaction):
+                self.supply.pay_fee_with_burn(
+                    gtx.delegator_id, proposer_id, gtx.fee, current_base_fee,
+                )
+                tracker.set_delegation(gtx.delegator_id, gtx.targets)
+                self._bump_watermark(gtx.delegator_id, gtx.signature.leaf_index)
+
+        # Phase 2: auto-execute binding proposals whose window has closed
+        for pid, state in list(tracker.proposals.items()):
+            proposal = state.proposal
+            if not isinstance(proposal, (TreasurySpendTransaction,
+                                         ValidatorEjectionProposal)):
+                continue
+            if current_block - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
+                continue
+            if isinstance(proposal, TreasurySpendTransaction):
+                tracker.execute_treasury_spend(
+                    proposal, self.supply, current_block=current_block,
+                )
+            else:
+                # pos_consensus=None: Blockchain uses supply.staked directly
+                # as the authoritative validator set.  Any external node-
+                # level ProofOfStake instance is re-synced via
+                # sync_consensus_stakes.
+                tracker.execute_validator_ejection(
+                    proposal, self.supply,
+                    current_block=current_block,
+                )
+
+        # Phase 3: prune
+        tracker.prune_closed_proposals(current_block)
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""

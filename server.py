@@ -396,6 +396,15 @@ class Server:
         elif method == "set_authority_key":
             return self._rpc_set_authority_key(request["params"])
 
+        elif method == "emergency_revoke":
+            return self._rpc_emergency_revoke(request["params"])
+
+        elif method == "is_revoked":
+            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            if entity_id is None:
+                return {"ok": False, "error": "Invalid entity_id hex"}
+            return {"ok": True, "result": {"revoked": self.blockchain.is_revoked(entity_id)}}
+
         elif method == "get_sync_status":
             return {"ok": True, "result": self.syncer.get_sync_status()}
 
@@ -618,6 +627,29 @@ class Server:
                 "entity_id": tx.entity_id.hex(),
                 "authority_key": tx.new_authority_key.hex(),
                 "tx_hash": tx.tx_hash.hex(),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_emergency_revoke(self, params: dict) -> dict:
+        """Apply an emergency RevokeTransaction signed by the cold authority key.
+
+        Applied immediately to chain state (same as SetAuthorityKey) rather
+        than queued — a validator operator has declared the hot key
+        compromised, and every second the revoke stays pending is another
+        second the attacker can sign blocks.
+        """
+        try:
+            from messagechain.core.emergency_revoke import RevokeTransaction
+            tx = RevokeTransaction.deserialize(params["transaction"])
+            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
+            ok, reason = self.blockchain.apply_revoke(tx, proposer_id)
+            if not ok:
+                return {"ok": False, "error": reason}
+            return {"ok": True, "result": {
+                "entity_id": tx.entity_id.hex(),
+                "tx_hash": tx.tx_hash.hex(),
+                "revoked": True,
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}

@@ -1010,7 +1010,7 @@ class GovernanceTracker:
         self,
         tx: ValidatorEjectionProposal,
         supply_tracker,
-        pos_consensus,
+        pos_consensus=None,
         current_block: int = 0,
     ) -> bool:
         """Execute an approved validator ejection. Returns False if rejected.
@@ -1055,7 +1055,16 @@ class GovernanceTracker:
         # would drop the network below MIN_TOTAL_STAKE.  Failing safely here
         # is the right call: a chain that can't maintain liveness is worse
         # than leaving a bad actor in place until more validators join.
-        bootstrap_ended = not pos_consensus.is_bootstrap_mode
+        #
+        # When pos_consensus is None (block-pipeline path), derive bootstrap
+        # state from the supply directly: we consider bootstrap ended if the
+        # active validator count meets the exit threshold.
+        if pos_consensus is not None:
+            bootstrap_ended = not pos_consensus.is_bootstrap_mode
+        else:
+            from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+            active_count = sum(1 for s in supply_tracker.staked.values() if s > 0)
+            bootstrap_ended = active_count >= MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         projected_total = sum(supply_tracker.staked.values()) - full_stake
         unstaked = supply_tracker.unstake(
             target,
@@ -1067,7 +1076,8 @@ class GovernanceTracker:
         if not unstaked:
             return False
 
-        pos_consensus.remove_validator(target)
+        if pos_consensus is not None:
+            pos_consensus.remove_validator(target)
         self.revoke_delegations_to(target)
         self._executed_ejections.add(tx.tx_hash)
         self.ejection_log.append({

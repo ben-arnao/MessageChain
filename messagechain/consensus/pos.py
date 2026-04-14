@@ -221,6 +221,7 @@ class ProofOfStake:
         attestations: list[Attestation] | None = None,
         transfer_transactions: list | None = None,
         slash_transactions: list | None = None,
+        governance_txs: list | None = None,
         timestamp: float | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
@@ -246,10 +247,12 @@ class ProofOfStake:
             msg_bytes_used += tx_msg_size
         transfer_txs = (transfer_transactions or [])[:MAX_TXS_PER_BLOCK]
         slash_txs = list(slash_transactions or [])
+        gov_txs = list(governance_txs or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
             + [tx.tx_hash for tx in transfer_txs]
             + [tx.tx_hash for tx in slash_txs]
+            + [tx.tx_hash for tx in gov_txs]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -283,6 +286,7 @@ class ProofOfStake:
             attestations=attestations or [],
             transfer_transactions=transfer_txs,
             slash_transactions=slash_txs,
+            governance_txs=gov_txs,
         )
         block.block_hash = block._compute_hash()
         return block
