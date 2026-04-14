@@ -350,22 +350,22 @@ class TestStakeUnstakeOnChain(unittest.TestCase):
 class TestGenesisNotHardcoded(unittest.TestCase):
     """Fix #6: Genesis entity must not use publicly-known hardcoded keys."""
 
-    def test_genesis_uses_random_key(self):
-        """Two server instances must produce different genesis entities."""
-        # The old code used hardcoded deterministic keys which are public.
-        # The fix should use os.urandom.
-        # We verify by checking the code doesn't pass hardcoded byte literals to Entity.create
+    def test_genesis_uses_operator_wallet(self):
+        """Genesis must use the operator's wallet entity, not hardcoded keys."""
+        # The genesis block is signed by the operator's wallet entity (set via
+        # set_wallet_entity before start()).  This ensures the genesis key is
+        # user-controlled, not a throwaway or hardcoded value.
         import inspect
         import server as server_module
         source = inspect.getsource(server_module.Server.start)
-        # Check that the actual Entity.create call doesn't use hardcoded strings
+        # Must not use hardcoded byte literals
         self.assertNotIn('b"genesis-key"', source,
             "Server must not use hardcoded genesis keys")
         self.assertNotIn("b'genesis-key'", source,
             "Server must not use hardcoded genesis keys")
-        # Verify os.urandom is used instead
-        self.assertIn("os.urandom", source,
-            "Server must use os.urandom for genesis key")
+        # Must use self.wallet_entity for genesis
+        self.assertIn("self.wallet_entity", source,
+            "Server must use operator's wallet entity for genesis")
 
 
 class TestAttestationSlashGossip(unittest.TestCase):

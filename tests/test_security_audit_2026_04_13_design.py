@@ -261,13 +261,27 @@ class TestD5DelegationProportionalWeight(unittest.TestCase):
 
         yes_weight, total_weight = tracker.tally(actual_pid)
 
-        # v1's own stake = 1000 (direct vote)
-        # Delegated weight from delegator: only v1's share = 34% of 3000 = 1020
-        # Total should be 1000 + 1020 = 2020 (NOT 1000 + 3000)
+        # Semantic invariant preserved: the *explicit* delegation to non-voting
+        # targets (v2, v3) must NOT be redistributed to the voter (v1).  Only
+        # v1's 34% share of delegator's power counts; 66% (v2+v3 shares) are
+        # lost.
+        #
+        # Under the 2026-04-14 redesign, v2 and v3 themselves are passive (no
+        # direct vote, no explicit delegation) so their own stakes auto-
+        # delegate via sqrt-weighting to voting validators (only v1).
+        #
+        # Breakdown:
+        #   v1 direct          = 1000
+        #   delegator→v1 (34%) = 3000 * 34 // 100 = 1020
+        #     [delegator's v2 and v3 shares — 33% each — are lost, NOT
+        #      redistributed, which is the D5 invariant]
+        #   v2 auto-delegation = 1000 (only voter is v1, so full share goes there)
+        #   v3 auto-delegation = 1000 (same)
+        #   total              = 1000 + 1020 + 1000 + 1000 = 4020
         expected_delegated = 3000 * 34 // 100  # 1020
-        expected_total = 1000 + expected_delegated
+        expected_total = 1000 + expected_delegated + 1000 + 1000
         self.assertEqual(total_weight, expected_total,
-            f"Delegation to non-voting targets must not be redistributed to voters. "
+            f"Explicit delegation to non-voting targets must not be redistributed to voters. "
             f"Got {total_weight}, expected {expected_total}")
 
 

@@ -37,6 +37,7 @@ from messagechain.config import (
     GOVERNANCE_DELEGATE_FEE,
     GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR,
     GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR,
+    GOVERNANCE_BALANCE_SNAPSHOT_DUST,
     MAX_DELEGATION_TARGETS,
     MIN_FEE,
     TREASURY_ENTITY_ID,
@@ -46,6 +47,32 @@ from messagechain.crypto.keys import Signature, verify_signature
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
+
+
+def voting_power(staked: int, unstaked: int) -> int:
+    """Compute an entity's raw voting power from staked + unstaked tokens.
+
+    Rule:
+        voting_power = staked + isqrt(unstaked)
+
+    Rationale:
+    - Staked tokens get LINEAR weight.  You locked them, you accepted the
+      7-day unbonding period, you have skin in the game — you get full voice.
+    - Unstaked tokens get SQRT-DAMPENED weight.  Liquid holders still have
+      influence (you're a bag holder, you want the network to succeed), but
+      whales don't dominate proportionally.  A 1M-token wallet earns
+      sqrt(1M) = 1,000 voting power unstaked vs. 1,000,000 staked — a strong
+      incentive to stake if you want real voice.
+    - Flash-loan governance attacks are largely neutralized: an attacker
+      who borrows 10M tokens gets sqrt(10M) ≈ 3,162 voting weight from
+      those unstaked tokens, not 10M.  Staking requires a 7-day unbond
+      so borrowed tokens cannot cheaply be staked-for-a-vote-and-returned.
+
+    Integer sqrt is used throughout for determinism across platforms.
+    """
+    staked_part = staked if staked > 0 else 0
+    unstaked_part = math.isqrt(unstaked) if unstaked > 0 else 0
+    return staked_part + unstaked_part
 
 
 # --- Transaction types ---
@@ -451,12 +478,22 @@ class ProposalStatus(Enum):
 
 @dataclass
 class ProposalState:
-    """Tracks the on-chain state of a proposal."""
+    """Tracks the on-chain state of a proposal.
+
+    Snapshots captured at proposal creation time and frozen thereafter.
+    This prevents manipulation by last-minute staking or balance movement.
+
+    stake_snapshot: validator entity_id -> staked tokens at proposal creation
+    balance_snapshot: entity_id -> unstaked balance at proposal creation
+        (only entities with balance > GOVERNANCE_BALANCE_SNAPSHOT_DUST are
+        included — dust amounts contribute negligible sqrt-voting power)
+    """
     proposal: ProposalTransaction
     created_at_block: int
     stake_snapshot: dict  # entity_id -> staked amount at proposal creation
     total_eligible_stake: int
     votes: dict = field(default_factory=dict)  # voter_id -> bool
+    balance_snapshot: dict = field(default_factory=dict)  # entity_id -> unstaked
 
 
 # --- Governance tracker ---
@@ -478,14 +515,32 @@ class GovernanceTracker:
         self._executed_treasury_spends: set[bytes] = set()  # replay protection
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
-        """Register a new proposal and snapshot current stake distribution."""
-        snapshot = dict(supply_tracker.staked)
-        total = sum(snapshot.values())
+        """Register a new proposal and snapshot current stake + balance distribution.
+
+        Snapshots:
+        - stake_snapshot: every entity with staked > 0 (these are the validators)
+        - balance_snapshot: every entity with unstaked balance above dust threshold
+
+        Both are captured as of block_height.  Tally uses snapshots only, never
+        live state — so moving tokens after proposal creation cannot swing votes.
+        """
+        stake_snapshot = {
+            eid: amount
+            for eid, amount in supply_tracker.staked.items()
+            if amount > 0
+        }
+        balance_snapshot = {
+            eid: bal
+            for eid, bal in supply_tracker.balances.items()
+            if bal > GOVERNANCE_BALANCE_SNAPSHOT_DUST
+        }
+        total = sum(stake_snapshot.values())
         self.proposals[tx.proposal_id] = ProposalState(
             proposal=tx,
             created_at_block=block_height,
-            stake_snapshot=snapshot,
+            stake_snapshot=stake_snapshot,
             total_eligible_stake=total,
+            balance_snapshot=balance_snapshot,
         )
 
     def prune_closed_proposals(self, current_block: int) -> int:
@@ -540,7 +595,23 @@ class GovernanceTracker:
         return True
 
     def revoke_delegations_to(self, validator_id: bytes):
-        """Revoke all delegations pointing to a validator (e.g. after slashing)."""
+        """Revoke all delegations pointing to a validator.
+
+        Called when the validator is "completely kicked from the network":
+        - Slashed (stake forcibly confiscated), or
+        - Fully unstaked (stake dropped to 0 voluntarily)
+
+        After revocation, the delegators automatically revert to auto-mode
+        (sqrt-weighted distribution across current validators) for future
+        tallies.  In-flight proposals also reflect the revocation: the
+        delegation relationship is LIVE state, not snapshotted.
+
+        Temporary offline does NOT trigger revocation — the user explicitly
+        chose this validator and we respect that choice until they're
+        permanently removed.  An offline validator's delegated power simply
+        doesn't count for proposals the validator misses (since they didn't
+        vote); this is the right incentive.
+        """
         to_remove = []
         for delegator_id, targets in self.delegations.items():
             if any(did == validator_id for did, _ in targets):
@@ -563,62 +634,120 @@ class GovernanceTracker:
         return ProposalStatus.OPEN
 
     def tally(self, proposal_id: bytes) -> tuple[int, int]:
-        """Tally votes for a proposal, weighted by snapshotted stake.
+        """Tally votes for a proposal, weighted by voting power.
 
         Returns (yes_weight, total_participating_weight).
 
-        Uses the stake snapshot captured at proposal creation — not live
-        state — so late staking cannot manipulate results.
+        Voting power for entity E at snapshot time:
+            vp(E) = staked(E) + isqrt(unstaked_balance(E))
+
+        Staked tokens count linearly (full weight); unstaked tokens count
+        with sqrt-dampening.  This rewards committed stakers while still
+        letting liquid holders participate at a dampened level.
+
+        Snapshot-based — uses the stake and balance captured at proposal
+        creation, NOT live state.  Prevents manipulation by late
+        staking/transferring.
 
         Delegation rules:
-        - Explicit delegation: weight is split proportionally across targets
-          who voted. If a target didn't vote, that portion is not counted.
-        - Default delegation (no explicit delegation): weight is distributed
-          to voters using sqrt(stake) weighting.
-        - Direct vote always overrides any delegation.
-        - Single-hop only: no transitive delegation.
+        1. Direct vote: voter's full voting power counts.  Overrides any
+           delegation for that proposal.
+        2. Explicit delegation: delegator's voting power is split across
+           their chosen validators per their declared percentages.  If a
+           chosen validator did not vote, that portion is not counted.
+        3. Auto-delegation (no explicit delegation, no direct vote): the
+           entity's voting power is distributed across the validator set
+           (from the snapshot), weighted by sqrt(validator_stake), so
+           each voting validator receives a share.  Non-voting validators
+           receive nothing — passive power only counts via validators who
+           actually voted.
+        4. Single-hop only — validators' own delegations (if any) do not
+           cascade.
+
+        Rationale for auto-delegation via sqrt-weighted validator set:
+        big-bag holders want the network to succeed even if they don't
+        follow every proposal; their default voice should flow to the
+        validators who are actively securing the chain.  sqrt-weighting
+        prevents a single mega-validator from absorbing all passive power.
         """
         state = self.proposals.get(proposal_id)
         if state is None:
             return 0, 0
 
-        snapshot = state.stake_snapshot
+        stake_snapshot = state.stake_snapshot
+        balance_snapshot = state.balance_snapshot
         direct_votes = dict(state.votes)
 
-        # Build reverse delegation map: delegate_id -> [(delegator_id, pct)]
+        # --- Build voting power per entity at snapshot time ---
+        all_entities: set[bytes] = set(stake_snapshot.keys()) | set(balance_snapshot.keys())
+        vp: dict[bytes, int] = {}
+        for eid in all_entities:
+            vp[eid] = voting_power(
+                stake_snapshot.get(eid, 0),
+                balance_snapshot.get(eid, 0),
+            )
+
+        # --- Build reverse explicit-delegation map ---
         reverse_delegations: dict[bytes, list[tuple[bytes, int]]] = {}
         explicitly_delegated: set[bytes] = set()
         for delegator_id, targets in self.delegations.items():
             explicitly_delegated.add(delegator_id)
             for delegate_id, pct in targets:
-                if delegate_id not in reverse_delegations:
-                    reverse_delegations[delegate_id] = []
-                reverse_delegations[delegate_id].append((delegator_id, pct))
+                reverse_delegations.setdefault(delegate_id, []).append(
+                    (delegator_id, pct)
+                )
 
         yes_weight = 0
         total_weight = 0
 
-        # Count direct votes + explicit delegations
+        # --- 1 & 2: direct votes + explicit delegations flowing into voters ---
         for voter_id, approve in direct_votes.items():
-            stake = snapshot.get(voter_id, 0)
-            total_weight += stake
+            power = vp.get(voter_id, 0)
+            total_weight += power
             if approve:
-                yes_weight += stake
+                yes_weight += power
 
-            # Add explicitly delegated weight (proportional)
+            # Add explicitly delegated weight flowing to this voter
             for delegator_id, pct in reverse_delegations.get(voter_id, []):
-                if delegator_id not in direct_votes:
-                    delegator_stake = snapshot.get(delegator_id, 0)
-                    portion = delegator_stake * pct // 100
-                    total_weight += portion
-                    if approve:
-                        yes_weight += portion
+                if delegator_id in direct_votes:
+                    continue  # direct vote overrides delegation
+                delegator_power = vp.get(delegator_id, 0)
+                portion = delegator_power * pct // 100
+                total_weight += portion
+                if approve:
+                    yes_weight += portion
 
-        # Passive entities (non-voting, non-delegating) are NOT counted.
-        # Auto-assigning passive stake to active voters would let a small
-        # number of voters capture the full weight of all offline
-        # stakeholders — a governance capture vector. Only explicit votes
-        # and explicit delegations count.
+        # --- 3: auto-delegation for passive entities ---
+        # Distribute passive voting power across validators who voted,
+        # weighted by sqrt(validator_stake_at_snapshot).
+        #
+        # Only validators present in the snapshot are eligible recipients
+        # — new validators who registered after proposal creation cannot
+        # absorb passive power.
+        voting_validators = {
+            v for v in stake_snapshot.keys() if v in direct_votes
+        }
+        sqrt_weights: dict[bytes, int] = {}
+        for v in voting_validators:
+            sqrt_weights[v] = math.isqrt(stake_snapshot.get(v, 0))
+        total_sqrt = sum(sqrt_weights.values())
+
+        if total_sqrt > 0:
+            for entity_id, power in vp.items():
+                if power == 0:
+                    continue
+                if entity_id in direct_votes:
+                    continue  # direct vote handled above
+                if entity_id in explicitly_delegated:
+                    continue  # explicit delegation handled above
+                # Distribute across voting validators, sqrt-weighted
+                for v, sw in sqrt_weights.items():
+                    share = power * sw // total_sqrt
+                    if share == 0:
+                        continue
+                    total_weight += share
+                    if direct_votes[v]:
+                        yes_weight += share
 
         return yes_weight, total_weight
 

@@ -382,33 +382,6 @@ class TestKeyRotationNoDuplicatePK(unittest.TestCase):
 
 
 # ===========================================================================
-# M12: Default delegation should not auto-assign passive stake
-# ===========================================================================
-
-
-class TestNoDefaultDelegation(unittest.TestCase):
-
-    def test_passive_stake_not_auto_delegated(self):
-        supply = SupplyTracker()
-        gov = GovernanceTracker()
-        voter = _make_entity()
-        passive = _make_entity()
-        supply.staked[voter.entity_id] = 100
-        supply.staked[passive.entity_id] = 10_000
-
-        tx = create_proposal(voter, "test", "desc")
-        gov.add_proposal(tx, 0, supply)
-        vote = create_vote(voter, tx.proposal_id, approve=True)
-        gov.add_vote(vote, 1)
-
-        yes, total = gov.tally(tx.proposal_id)
-        # Only the voter's stake should count — passive entity should NOT
-        # have their weight auto-distributed
-        self.assertEqual(yes, 100)
-        self.assertEqual(total, 100)
-
-
-# ===========================================================================
 # H6: Slashing evidence must have an expiration window
 # ===========================================================================
 
