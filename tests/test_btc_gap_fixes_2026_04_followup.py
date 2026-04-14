@@ -453,7 +453,7 @@ class TestFinalityStakeSnapshot(unittest.TestCase):
         # Capture what add_attestation receives
         calls = []
         original_add = bc.finality.add_attestation
-        def spy(attestation, validator_stake, total_stake):
+        def spy(attestation, validator_stake, total_stake, **_kwargs):
             calls.append((validator_stake, total_stake))
             return False
         bc.finality.add_attestation = spy

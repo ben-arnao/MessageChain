@@ -995,6 +995,7 @@ class Blockchain:
         We consult _stake_snapshots[N-1] and fall back to `stakes` only
         when no snapshot is available (bootstrap / loaded-from-db edge).
         """
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         for att in block.attestations:
             target_block = att.block_number
             pinned = self._stake_snapshots.get(target_block)
@@ -1004,7 +1005,14 @@ class Blockchain:
                 stakes_for_att = stakes
             validator_stake = stakes_for_att.get(att.validator_id, 0)
             total_stake = sum(stakes_for_att.values())
-            justified = self.finality.add_attestation(att, validator_stake, total_stake)
+            # Post-bootstrap safety floor: finalization additionally requires
+            # the active validator count to meet the same threshold used to
+            # exit bootstrap. Prevents a thinned-out post-bootstrap chain
+            # from finalizing blocks via a single validator.
+            justified = self.finality.add_attestation(
+                att, validator_stake, total_stake,
+                min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+            )
             if justified:
                 logger.info(
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "

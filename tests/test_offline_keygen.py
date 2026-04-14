@@ -19,7 +19,7 @@ class TestOfflineKeyPairGeneration(unittest.TestCase):
         with patch("os.urandom", return_value=fixed_key):
             cmd_generate_key(None)
         output = mock_stdout.getvalue()
-        self.assertIn("Private key:", output)
+        self.assertIn("Recovery phrase", output)
         self.assertIn("Public key:", output)
         # Public key should be a 64-char hex string (32 bytes)
         for line in output.splitlines():
@@ -76,7 +76,7 @@ class TestOfflineKeyPairGeneration(unittest.TestCase):
             mock_socket.side_effect = RuntimeError("No network allowed")
             cmd_generate_key(None)
         output = mock_stdout.getvalue()
-        self.assertIn("Private key:", output)
+        self.assertIn("Recovery phrase", output)
         self.assertIn("Public key:", output)
         self.assertIn("Entity ID:", output)
 

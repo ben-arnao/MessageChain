@@ -793,10 +793,16 @@ class Node:
             )
             return
 
-        # Record in finality tracker
+        # Record in finality tracker.  Post-bootstrap safety floor: the
+        # active set must still meet the exit-threshold validator count,
+        # or finality halts (see FinalityTracker.add_attestation).
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         validator_stake = self.blockchain.supply.get_staked(att.validator_id)
         total_stake = sum(self.blockchain.supply.staked.values())
-        self.blockchain.finality.add_attestation(att, validator_stake, total_stake)
+        self.blockchain.finality.add_attestation(
+            att, validator_stake, total_stake,
+            min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+        )
 
         logger.debug(f"Received attestation from {att.validator_id.hex()[:16]} for block #{att.block_number}")
 

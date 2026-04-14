@@ -125,11 +125,21 @@ class FinalityTracker:
         validator_stake: int,
         total_stake: int,
         public_keys: dict[bytes, bytes] | None = None,
+        min_validator_count: int = 0,
     ) -> bool:
         """Record an attestation. Returns True if the block becomes justified.
 
         If public_keys is provided, the attestation signature is verified
         before counting. Unverifiable attestations are rejected.
+
+        If min_validator_count > 0, finalization additionally requires that
+        at least that many distinct validators have attested for the block.
+        This is the post-bootstrap safety floor: bootstrap exit is one-way,
+        but if validators later leave and the active set thins out, the
+        surviving one or two must NOT be able to finalize blocks alone
+        (they would trivially hold 100% of remaining stake).  Finality
+        simply halts in that regime — liveness degrades, but irreversibility
+        is preserved.
         """
         bh = attestation.block_hash
         vid = attestation.validator_id
@@ -180,10 +190,12 @@ class FinalityTracker:
         # Check justification threshold
         # Integer arithmetic to avoid floating-point rounding errors.
         # attested/total >= NUM/DEN  ↔  attested * DEN >= total * NUM
-        if total_stake > 0 and (
+        stake_ok = total_stake > 0 and (
             self.attested_stake[bh] * FINALITY_THRESHOLD_DENOMINATOR
             >= total_stake * FINALITY_THRESHOLD_NUMERATOR
-        ):
+        )
+        count_ok = len(self.attestations[bh]) >= min_validator_count
+        if stake_ok and count_ok:
             if bh not in self.finalized:
                 self.finalized.add(bh)
                 if attestation.block_number > self.finalized_height:

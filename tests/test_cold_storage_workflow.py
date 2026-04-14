@@ -31,7 +31,7 @@ class TestOfflineKeyGeneration(unittest.TestCase):
             mock_socket.side_effect = RuntimeError("No network")
             cmd_generate_key(None)
         output = mock_stdout.getvalue()
-        self.assertIn("Private key:", output)
+        self.assertIn("Recovery phrase", output)
         self.assertIn("Public key:", output)
         self.assertIn("Entity ID:", output)
 
@@ -179,18 +179,18 @@ class TestRoundTrip(unittest.TestCase):
         out = mock_stdout.getvalue()
 
         shown_entity_id = None
-        shown_private_key = None
+        shown_hex_key = None
         for line in out.splitlines():
             if "Entity ID:" in line:
                 shown_entity_id = line.split("Entity ID:")[1].strip()
-            if "Private key:" in line:
-                shown_private_key = line.split("Private key:")[1].strip()
+            if "Hex form" in line:
+                shown_hex_key = line.split("Hex form (alternative):")[1].strip()
 
         self.assertIsNotNone(shown_entity_id)
-        self.assertIsNotNone(shown_private_key)
+        self.assertIsNotNone(shown_hex_key)
 
         # Now simulate user typing the displayed key into a command
-        with patch("getpass.getpass", return_value=shown_private_key):
+        with patch("getpass.getpass", return_value=shown_hex_key):
             key_bytes = _collect_private_key()
         entity = Entity.create(key_bytes)
 

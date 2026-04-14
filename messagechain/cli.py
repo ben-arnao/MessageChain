@@ -326,12 +326,12 @@ def _load_key_from_file(path: str) -> bytes:
 
 
 def _collect_private_key():
-    """Collect a checksummed private key from the user.
+    """Collect a private key from the user.
 
-    The displayed key format includes a short checksum so that
-    transcription errors (wrong character from paper backup) are
-    detected immediately rather than silently deriving a different
-    identity.
+    Accepts either a 24-word BIP-39 recovery phrase (preferred) or the
+    72-char hex-checksummed form. Both formats carry a checksum, so a
+    transcription error from a paper backup is detected immediately
+    rather than silently deriving a different identity.
 
     Returns the raw 32-byte private key.
     """
@@ -341,21 +341,24 @@ def _collect_private_key():
         InvalidKeyFormatError,
     )
 
-    print("Authenticate with your private key.")
-    print("Your private key is your identity — guard it carefully.\n")
+    print("Authenticate with your recovery phrase or private key.")
+    print("This is your identity — guard it carefully.\n")
 
-    entered = getpass.getpass("Private key (hidden): ")
+    entered = getpass.getpass("Recovery phrase or private key (hidden): ")
 
     if not entered:
-        print("Error: Private key is required.")
+        print("Error: Recovery phrase or private key is required.")
         sys.exit(1)
 
     try:
         return decode_private_key(entered)
     except InvalidKeyChecksumError:
-        print("\nError: Private key checksum failed.")
-        print("This usually means you mistyped a character from your backup.")
-        print("Double-check each character and try again.")
+        print("\nError: Checksum failed.")
+        print("This usually means you mistyped a word or character from your backup.")
+        print("Double-check each word/character and try again.")
+        sys.exit(1)
+    except InvalidKeyFormatError as e:
+        print(f"\nError: {e}")
         sys.exit(1)
     except InvalidKeyFormatError as e:
         print(f"\nError: {e}")
@@ -885,24 +888,38 @@ def cmd_generate_key(_args):
     import os
     from messagechain.identity.identity import Entity
     from messagechain.identity.key_encoding import encode_private_key
+    from messagechain.identity.mnemonic import encode_to_mnemonic
     from messagechain.config import MERKLE_TREE_HEIGHT
 
     key = os.urandom(32)
     progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
     entity = Entity.create(key, progress=progress)
-    encoded = encode_private_key(key)
+    mnemonic = encode_to_mnemonic(key)
+    encoded_hex = encode_private_key(key)
+
+    # Format the 24 words as a 4x6 grid so it's easy to copy onto paper
+    # or stamp into metal without losing place.
+    words = mnemonic.split()
+    rows = []
+    for row_idx in range(4):
+        row_words = words[row_idx * 6 : (row_idx + 1) * 6]
+        numbered = [f"{row_idx * 6 + i + 1:>2}. {w}" for i, w in enumerate(row_words)]
+        rows.append("  " + "   ".join(numbered))
 
     print("=== Key Pair Generated ===\n")
-    print(f"  Private key: {encoded}")
-    print(f"  Public key:  {entity.public_key.hex()}")
+    print("  Recovery phrase (24 words — write these down IN ORDER):\n")
+    for row in rows:
+        print(row)
+    print(f"\n  Hex form (alternative): {encoded_hex}")
+    print(f"\n  Public key:  {entity.public_key.hex()}")
     print(f"  Entity ID:   {entity.entity_id_hex}")
-    print(f"\n  The private key includes a checksum — a transcription error")
-    print("  will be detected when you type it back.")
+    print(f"\n  The recovery phrase follows BIP-39 — every word comes from a")
+    print("  known 2048-word list, with a built-in checksum that detects")
+    print("  single-word transcription errors when you type it back.")
     print(f"\n  IMPORTANT: Verify your backup before deleting this key.")
     print("  Run: messagechain verify-key")
-    print(f"\n  WARNING: Save your private key securely. It is your sole credential.")
-    print("  Anyone with this key controls your account. There is no recovery.")
-    print("  This key will NOT be shown again.")
+    print(f"\n  WARNING: Anyone with these words controls your account.")
+    print("  There is no recovery. This phrase will NOT be shown again.")
 
 
 def cmd_verify_key(_args):
