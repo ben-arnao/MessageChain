@@ -4,7 +4,7 @@ A blockchain for sending messages. Quantum-resistant signatures, proof-of-stake 
 
 ## Getting Started: From Scratch to Sending a Message
 
-This guide walks you through the recommended cold storage workflow. Your private key is generated offline and never stored on a networked machine.
+Your private key is generated offline and stored on paper. It only enters a networked machine briefly, in memory, when you sign a transaction.
 
 ### 1. Install
 
@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ### 2. Disconnect from the internet
 
-Disable Wi-Fi, unplug Ethernet — make sure your machine has no network access. Your private key should never exist on a networked machine.
+Disable Wi-Fi, unplug Ethernet. Your private key should never be generated on a networked machine.
 
 ### 3. Generate your key pair (offline)
 
@@ -40,17 +40,15 @@ You now have three values:
 |---|---|---|
 | **Private key** | Your sole credential. Controls your account. | Only you. Never share. |
 | **Public key** | Your cryptographic identity (Merkle tree root). | Public — goes on-chain. |
-| **Entity ID** | Your wallet address (derived from public key). | Public — share freely. |
+| **Entity ID** | Your wallet address. | Public — share freely. |
 
 ### 4. Write down your private key
 
-Write the private key on paper or stamp it into metal. Make 2-3 copies and store them in separate secure locations (safe deposit box, fireproof safe, etc.).
-
-Do **not** save it to a file, do **not** photograph it, do **not** paste it into a notes app.
+Write it on paper (or stamp it into metal). Make 2-3 copies, store them in separate secure locations. Do **not** save it to a file, photograph it, or paste it into a notes app.
 
 ### 5. Verify your backup (still offline)
 
-Before you delete anything, verify that your handwritten copy reproduces the same identity:
+Before you close the terminal, verify that your handwritten copy reproduces the same identity:
 
 ```bash
 python -m messagechain verify-key
@@ -62,53 +60,37 @@ Private key (hidden): ****
   Entity ID:   d41a...8e23
 ```
 
-Confirm the public key and entity ID match what you wrote down in step 3. If they don't, you copied the private key wrong — go back to step 4.
+Confirm both values match what you just generated. If they don't, you copied the private key wrong — try again before losing the original.
 
-### 6. Sign your registration proof (still offline)
-
-This creates a signed proof that you own the key pair. You'll use it to register your account without exposing your private key on an online machine.
-
-```bash
-python -m messagechain sign-registration
-```
-
-```
-Private key (hidden): ****
-  Entity ID:  d41a...8e23
-  Proof file: registration_d41a...8e23.json
-```
-
-Copy the proof file (`registration_*.json`) to a USB drive. This file contains only public information and the signature — not your private key.
-
-### 7. Clear your traces and reconnect
+### 6. Clear your traces and reconnect
 
 ```bash
 history -c    # clear terminal history
 ```
 
-Delete any temporary files. Reconnect to the internet.
+Close the terminal. Reconnect to the internet.
 
-### 8. Register your account (online, no private key needed)
-
-Transfer the proof file from the USB drive, then register:
+### 7. Register your account
 
 ```bash
-python -m messagechain account --proof registration_d41a...8e23.json
+python -m messagechain account
 ```
+
+You'll be prompted for your private key. Type it from your paper backup. It stays in memory only for the few seconds it takes to sign the registration, then the process exits.
 
 Your account is now on-chain. You can receive funds at your entity ID.
 
-### 9. Receive funds
+### 8. Receive funds
 
 Share your entity ID with the sender. They transfer tokens to you — no action needed on your end.
 
-### 10. Send a message (private key needed briefly)
-
-When you want to send a message, you'll be prompted for your private key. Type it from your paper backup. It stays in memory only for the few seconds it takes to sign, then the process exits.
+### 9. Send a message
 
 ```bash
 python -m messagechain send "Hello, MessageChain!"
 ```
+
+You'll be prompted for your private key again. Same as registration: briefly in memory, then gone.
 
 ```
 Private key (hidden): ****
@@ -118,18 +100,15 @@ Message sent!
   Fee:     5 tokens
 ```
 
-Your private key is not stored anywhere. The next time you send, you'll enter it again.
-
 ### Summary
 
-| Step | Where | Private key needed? |
+| Step | Where | Private key |
 |---|---|---|
 | Generate key pair | Offline | Produced here |
-| Verify backup | Offline | Yes |
-| Sign registration | Offline | Yes (last time offline) |
-| Register account | Online | No (proof file only) |
-| Receive funds | Online | No |
-| Send message/funds | Online | Yes (briefly in memory) |
+| Verify backup | Offline | Entered briefly |
+| Register account | Online | Entered briefly |
+| Receive funds | Online | Not needed |
+| Send message/funds | Online | Entered briefly |
 | Recovery | Offline | Paper backup |
 
 ## Quick Reference

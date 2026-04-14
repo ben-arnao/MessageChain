@@ -51,15 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     account = sub.add_parser(
         "account",
         help="Create an account",
-        description="Create a new account. Use --public-key and --proof for cold storage registration.",
-    )
-    account.add_argument(
-        "--public-key", type=str, default=None,
-        help="Register using a public key (hex) instead of entering a private key.",
-    )
-    account.add_argument(
-        "--proof", type=str, default=None,
-        help="Registration proof file (from sign-registration). Required with --public-key.",
+        description="Create a new account using your private key.",
     )
     account.add_argument(
         "--server", type=str, default=None,
@@ -178,13 +170,6 @@ def build_parser() -> argparse.ArgumentParser:
         "verify-key",
         help="Verify a private key backup (offline)",
         description="Re-derive public key and entity ID from a private key to verify your backup.",
-    )
-
-    # --- sign-registration ---
-    sub.add_parser(
-        "sign-registration",
-        help="Sign a registration proof (offline)",
-        description="Sign a registration proof offline. Output can be used to register without the private key.",
     )
 
     # --- read ---
@@ -313,68 +298,29 @@ def cmd_start(args):
 
 
 def cmd_account(args):
-    """Create a new account.
-
-    Two modes:
-    1. Default: enter private key, sign proof, register.
-    2. Cold storage: --proof <file> from sign-registration (no private key needed).
-    """
-    import json
-    from messagechain.identity.identity import Entity, derive_entity_id
+    """Create a new account. Enter private key, sign proof, register."""
+    from messagechain.identity.identity import Entity
     from messagechain.crypto.hash_sig import _hash
-    from messagechain.crypto.keys import Signature
 
     print("=== Create Account ===\n")
 
-    if args.proof:
-        # Cold storage mode: load registration proof from file
-        try:
-            with open(args.proof, "r") as f:
-                reg_data = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            print(f"Error reading proof file: {e}")
-            sys.exit(1)
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
 
-        entity_id_hex = reg_data["entity_id"]
-        public_key_hex = reg_data["public_key"]
-        proof_data = reg_data["registration_proof"]
+    # Sign registration proof to demonstrate key ownership.
+    proof_msg = _hash(b"register" + entity.entity_id)
+    proof = entity.keypair.sign(proof_msg)
 
-        # Validate entity_id matches public_key
-        public_key = bytes.fromhex(public_key_hex)
-        expected_eid = derive_entity_id(public_key)
-        if expected_eid.hex() != entity_id_hex:
-            print("Error: Entity ID does not match public key. File may be corrupt.")
-            sys.exit(1)
-
-        print(f"  Entity ID: {entity_id_hex}")
-        print(f"  (from proof file: {args.proof})")
-
-    elif args.public_key:
-        print("Error: --public-key requires --proof. Use sign-registration to create a proof file.")
-        sys.exit(1)
-
-    else:
-        # Standard mode: enter private key, sign proof on the spot
-        private_key = _collect_private_key()
-        entity = Entity.create(private_key)
-
-        proof_msg = _hash(b"register" + entity.entity_id)
-        proof = entity.keypair.sign(proof_msg)
-
-        entity_id_hex = entity.entity_id_hex
-        public_key_hex = entity.public_key.hex()
-        proof_data = proof.serialize()
-
-    print(f"\nYour entity ID: {entity_id_hex}")
+    print(f"\nYour entity ID: {entity.entity_id_hex}")
 
     host, port = _parse_server(args.server)
     print(f"Registering with server at {host}:{port}...")
 
     from client import rpc_call
     response = rpc_call(host, port, "register_entity", {
-        "entity_id": entity_id_hex,
-        "public_key": public_key_hex,
-        "registration_proof": proof_data,
+        "entity_id": entity.entity_id_hex,
+        "public_key": entity.public_key.hex(),
+        "registration_proof": proof.serialize(),
     })
 
     if response.get("ok"):
@@ -383,6 +329,7 @@ def cmd_account(args):
         print(f"  Entity ID: {result['entity_id']}")
         print(f"  Balance:   {result['initial_balance']} tokens")
         print(f"\nSave your entity ID — this is your wallet address.")
+        print("Your private key is your sole credential. Never share it.")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -827,49 +774,6 @@ def cmd_verify_key(_args):
     print(f"\n  Confirm these match your records.")
 
 
-def cmd_sign_registration(_args):
-    """Sign a registration proof offline for later submission."""
-    import json
-    from messagechain.identity.identity import Entity
-    from messagechain.crypto.hash_sig import _hash
-
-    print("=== Sign Registration Proof (Offline) ===\n")
-    print("This creates a signed proof that you own the key pair.")
-    print("You can use the output file to register without your private key.\n")
-
-    private_key_hex = getpass.getpass("Private key (hidden): ")
-    try:
-        private_key = bytes.fromhex(private_key_hex)
-    except ValueError:
-        print("Error: Invalid hex. Private key must be a hex string.")
-        sys.exit(1)
-
-    try:
-        entity = Entity.create(private_key)
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-
-    proof_msg = _hash(b"register" + entity.entity_id)
-    proof = entity.keypair.sign(proof_msg)
-
-    registration_data = {
-        "entity_id": entity.entity_id_hex,
-        "public_key": entity.public_key.hex(),
-        "registration_proof": proof.serialize(),
-    }
-
-    filename = f"registration_{entity.entity_id_hex[:16]}.json"
-    with open(filename, "w") as f:
-        json.dump(registration_data, f, indent=2)
-
-    print(f"\n  Entity ID:  {entity.entity_id_hex}")
-    print(f"  Public key: {entity.public_key.hex()}")
-    print(f"  Proof file: {filename}")
-    print(f"\n  Transfer this file to your online machine, then run:")
-    print(f"  messagechain account --proof {filename}")
-
-
 def cmd_read(args):
     """Read recent messages from the chain."""
     host, port = _parse_server(args.server)
@@ -943,7 +847,6 @@ def main():
         "vote": cmd_vote,
         "generate-key": cmd_generate_key,
         "verify-key": cmd_verify_key,
-        "sign-registration": cmd_sign_registration,
         "read": cmd_read,
         "demo": cmd_demo,
         "info": cmd_info,
