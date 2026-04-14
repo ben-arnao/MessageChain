@@ -297,6 +297,92 @@ class DelegateTransaction:
 
 
 @dataclass
+class ValidatorEjectionProposal:
+    """Proposal to eject a validator from the active set.
+
+    Any holder (validator or liquid) can propose ejection; any holder can
+    vote using the standard governance voting-power formula.  On approval
+    by 2/3 supermajority after the voting window, the target's stake is
+    queued for unbonding and the validator is removed from proposer/
+    attester duty.  Ejection is the penalty — no additional slashing.
+
+    This is the on-chain lever for the community to remove a misbehaving
+    validator without giving liquid holders direct weight in sub-second
+    block confirmation (which would expose consensus to flash-loan attacks).
+
+    Fields:
+        proposer_id: entity creating the proposal
+        target_validator_id: validator to eject
+        title: short subject
+        description: justification (typically cites off-chain evidence)
+        timestamp: creation time
+        fee: must be >= GOVERNANCE_PROPOSAL_FEE
+        signature: proposer's quantum-resistant signature
+    """
+    proposer_id: bytes
+    target_validator_id: bytes
+    title: str
+    description: str
+    timestamp: float
+    fee: int
+    signature: Signature
+    tx_hash: bytes = b""
+
+    def __post_init__(self):
+        if not self.tx_hash:
+            self.tx_hash = self._compute_hash()
+
+    def _signable_data(self) -> bytes:
+        return (
+            b"validator_ejection"
+            + self.proposer_id
+            + self.target_validator_id
+            + self.title.encode("utf-8")
+            + self.description.encode("utf-8")
+            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", self.fee)
+        )
+
+    def _compute_hash(self) -> bytes:
+        return _hash(self._signable_data())
+
+    @property
+    def proposal_id(self) -> bytes:
+        return self.tx_hash
+
+    def serialize(self) -> dict:
+        return {
+            "type": "validator_ejection",
+            "proposer_id": self.proposer_id.hex(),
+            "target_validator_id": self.target_validator_id.hex(),
+            "title": self.title,
+            "description": self.description,
+            "timestamp": self.timestamp,
+            "fee": self.fee,
+            "signature": self.signature.serialize(),
+            "tx_hash": self.tx_hash.hex(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "ValidatorEjectionProposal":
+        sig = Signature.deserialize(data["signature"])
+        tx = cls(
+            proposer_id=bytes.fromhex(data["proposer_id"]),
+            target_validator_id=bytes.fromhex(data["target_validator_id"]),
+            title=data["title"],
+            description=data["description"],
+            timestamp=data["timestamp"],
+            fee=data["fee"],
+            signature=sig,
+        )
+        expected_hash = tx._compute_hash()
+        declared_hash = bytes.fromhex(data["tx_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError("Validator ejection tx hash mismatch")
+        return tx
+
+
+@dataclass
 class TreasurySpendTransaction:
     """Proposal to transfer funds from the governance-controlled treasury.
 
@@ -449,6 +535,29 @@ def create_treasury_spend_proposal(
     return tx
 
 
+def create_validator_ejection_proposal(
+    proposer_entity,
+    target_validator_id: bytes,
+    title: str,
+    description: str,
+    fee: int = GOVERNANCE_PROPOSAL_FEE,
+) -> ValidatorEjectionProposal:
+    """Create and sign a validator ejection proposal."""
+    tx = ValidatorEjectionProposal(
+        proposer_id=proposer_entity.entity_id,
+        target_validator_id=target_validator_id,
+        title=title,
+        description=description,
+        timestamp=time.time(),
+        fee=fee,
+        signature=Signature([], 0, [], b"", b""),  # placeholder
+    )
+    msg_hash = _hash(tx._signable_data())
+    tx.signature = proposer_entity.keypair.sign(msg_hash)
+    tx.tx_hash = tx._compute_hash()
+    return tx
+
+
 def create_delegation(
     delegator_entity,
     targets: list[tuple[bytes, int]],
@@ -513,6 +622,7 @@ class GovernanceTracker:
         # delegator_id -> list of (delegate_id, weight_pct) — pcts must sum to 100
         self.delegations: dict[bytes, list[tuple[bytes, int]]] = {}
         self._executed_treasury_spends: set[bytes] = set()  # replay protection
+        self._executed_ejections: set[bytes] = set()  # replay protection
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
         """Register a new proposal and snapshot current stake + balance distribution.
@@ -792,6 +902,145 @@ class GovernanceTracker:
             self._executed_treasury_spends.add(tx.tx_hash)
         return result
 
+    def _tally_ejection(
+        self, proposal_id: bytes, target_id: bytes,
+    ) -> tuple[int, int]:
+        """Tally for validator ejection: stricter than general governance.
+
+        Differences from the general `tally`:
+        1. The target validator is excluded entirely — they do not vote in
+           their own trial, nor does their stake appear anywhere.
+        2. Auto-delegation is disabled.  Only DIRECT votes and EXPLICIT
+           delegations count toward `yes_weight`.
+        3. The denominator is the TOTAL ELIGIBLE VOTING POWER (all snapshot
+           entities except the target), not just participating weight.
+           Silence counts as "no" — a deliberate bias toward the status quo
+           for a security-critical decision.
+
+        Why the stricter rule: a single motivated validator must not be
+        able to eject peers by themselves.  Under the general tally, auto-
+        delegation would let one voter harvest everyone else's passive
+        stake.  Even disabling auto-delegation isn't enough: if only one
+        voter participates, yes/total = 100% trivially.  Requiring the
+        numerator to clear 2/3 of the full eligible electorate forces
+        broad active engagement — ejection should be hard by design.
+        """
+        state = self.proposals.get(proposal_id)
+        if state is None:
+            return 0, 0
+
+        stake_snapshot = state.stake_snapshot
+        balance_snapshot = state.balance_snapshot
+        direct_votes = {
+            vid: approve for vid, approve in state.votes.items()
+            if vid != target_id
+        }
+
+        all_entities: set[bytes] = (
+            set(stake_snapshot.keys()) | set(balance_snapshot.keys())
+        )
+        vp: dict[bytes, int] = {}
+        for eid in all_entities:
+            vp[eid] = voting_power(
+                stake_snapshot.get(eid, 0),
+                balance_snapshot.get(eid, 0),
+            )
+
+        reverse_delegations: dict[bytes, list[tuple[bytes, int]]] = {}
+        for delegator_id, targets in self.delegations.items():
+            for delegate_id, pct in targets:
+                reverse_delegations.setdefault(delegate_id, []).append(
+                    (delegator_id, pct)
+                )
+
+        # Denominator: total eligible voting power (everyone except target).
+        total_weight = sum(
+            power for eid, power in vp.items() if eid != target_id
+        )
+
+        yes_weight = 0
+        for voter_id, approve in direct_votes.items():
+            if not approve:
+                continue
+            power = vp.get(voter_id, 0)
+            yes_weight += power
+
+            for delegator_id, pct in reverse_delegations.get(voter_id, []):
+                if delegator_id in direct_votes:
+                    continue  # delegator voted directly — their power counted only if they voted yes
+                if delegator_id == target_id:
+                    continue
+                delegator_power = vp.get(delegator_id, 0)
+                yes_weight += delegator_power * pct // 100
+
+        return yes_weight, total_weight
+
+    def execute_validator_ejection(
+        self,
+        tx: ValidatorEjectionProposal,
+        supply_tracker,
+        pos_consensus,
+        current_block: int = 0,
+    ) -> bool:
+        """Execute an approved validator ejection. Returns False if rejected.
+
+        Rejects if:
+        - Ejection has already been executed (replay protection)
+        - Proposal does not exist on-chain
+        - Voting window is still open
+        - Proposal did not reach the approval threshold
+        - Target is not an active validator
+        - SupplyTracker refuses the unstake (e.g., would drop total network
+          stake below the safety floor — better to fail safely than break
+          liveness; the community can re-propose once more validators join)
+
+        On success:
+        - Target's full stake enters the normal unbonding queue
+        - Target removed from the active validator set
+        - Any delegations pointing at the target are revoked
+        """
+        if tx.tx_hash in self._executed_ejections:
+            return False
+        state = self.proposals.get(tx.proposal_id)
+        if state is None:
+            return False
+        status = self.get_proposal_status(tx.proposal_id, current_block)
+        if status != ProposalStatus.CLOSED:
+            return False
+        target = tx.target_validator_id
+        yes_weight, total_weight = self._tally_ejection(tx.proposal_id, target)
+        if total_weight == 0:
+            return False
+        if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
+                <= total_weight * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR):
+            return False
+
+        full_stake = supply_tracker.get_staked(target)
+        if full_stake <= 0:
+            return False
+
+        # Move entire stake into unbonding.  We pass bootstrap_ended + the
+        # projected post-unstake total so SupplyTracker can refuse if this
+        # would drop the network below MIN_TOTAL_STAKE.  Failing safely here
+        # is the right call: a chain that can't maintain liveness is worse
+        # than leaving a bad actor in place until more validators join.
+        bootstrap_ended = not pos_consensus.is_bootstrap_mode
+        projected_total = sum(supply_tracker.staked.values()) - full_stake
+        unstaked = supply_tracker.unstake(
+            target,
+            full_stake,
+            current_block=current_block,
+            total_staked_after_check=projected_total,
+            bootstrap_ended=bootstrap_ended,
+        )
+        if not unstaked:
+            return False
+
+        pos_consensus.remove_validator(target)
+        self.revoke_delegations_to(target)
+        self._executed_ejections.add(tx.tx_hash)
+        return True
+
     def get_proposal_info(
         self, proposal_id: bytes, current_block: int,
     ) -> dict:
@@ -869,6 +1118,26 @@ def verify_treasury_spend(tx: TreasurySpendTransaction, public_key: bytes) -> bo
         return False
     if tx.recipient_id == TREASURY_ENTITY_ID:
         return False  # treasury cannot send to itself
+    msg_hash = _hash(tx._signable_data())
+    return verify_signature(msg_hash, tx.signature, public_key)
+
+
+def verify_validator_ejection(
+    tx: ValidatorEjectionProposal, public_key: bytes,
+) -> bool:
+    """Verify an ejection proposal's signature and fields."""
+    if tx.fee < GOVERNANCE_PROPOSAL_FEE:
+        return False
+    if not tx.title:
+        return False
+    if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
+        return False
+    if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
+        return False
+    if not tx.target_validator_id:
+        return False
+    if tx.target_validator_id == tx.proposer_id:
+        return False  # proposer cannot eject themselves via this path
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)
 
