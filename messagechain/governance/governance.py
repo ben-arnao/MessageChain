@@ -49,7 +49,6 @@ from messagechain.config import (
     GOVERNANCE_DELEGATE_FEE,
     GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR,
     GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR,
-    GOVERNANCE_BALANCE_SNAPSHOT_DUST,
     MAX_DELEGATION_TARGETS,
     MIN_FEE,
     TREASURY_ENTITY_ID,
@@ -610,8 +609,6 @@ class ProposalState:
 
     stake_snapshot: validator entity_id -> staked tokens at proposal creation
     balance_snapshot: entity_id -> unstaked balance at proposal creation
-        (only entities with balance > GOVERNANCE_BALANCE_SNAPSHOT_DUST are
-        included — dust amounts contribute negligible sqrt-voting power)
     """
     proposal: ProposalTransaction
     created_at_block: int
@@ -664,7 +661,7 @@ class GovernanceTracker:
         balance_snapshot = {
             eid: bal
             for eid, bal in supply_tracker.balances.items()
-            if bal > GOVERNANCE_BALANCE_SNAPSHOT_DUST
+            if bal > 0
         }
         total = sum(stake_snapshot.values())
         self.proposals[tx.proposal_id] = ProposalState(
