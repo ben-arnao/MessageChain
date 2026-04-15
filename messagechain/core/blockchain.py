@@ -163,6 +163,17 @@ class Blockchain:
         from messagechain.consensus.bootstrap_gradient import RatchetState
         self._bootstrap_ratchet: RatchetState = RatchetState()
 
+        # Attester-reward escrow (stage 3).  Bootstrap-era committee
+        # rewards sit here for escrow_blocks_for_progress(progress)
+        # blocks before unlocking to spendable balance.  Slashable
+        # during the window.  The ledger is in-memory; its contents are
+        # deterministic from chain replay.  Balance itself is updated
+        # at reward time (so the tokens exist in the state tree), but
+        # spendable balance subtracts both immature + escrow so the
+        # validator can't move the locked portion.
+        from messagechain.economics.escrow import EscrowLedger
+        self._escrow: EscrowLedger = EscrowLedger()
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -999,16 +1010,32 @@ class Blockchain:
             if eid == entity_id and current_height - height < COINBASE_MATURITY
         )
 
-    def get_spendable_balance(self, entity_id: bytes) -> int:
-        """Get spendable balance (total balance minus immature rewards).
+    def get_escrowed_balance(self, entity_id: bytes) -> int:
+        """Total attester rewards currently held in the escrow lock.
 
-        Floor at 0 — immature tracking corruption must never produce a
-        negative spendable balance that could be misinterpreted as a
-        large positive value by callers expecting unsigned semantics.
+        Escrow is a parallel lock on top of balance — the tokens have
+        been credited to `supply.balances` (so they're in the state
+        tree), but they are not spendable until the escrow window
+        elapses or a stage-4 slashing event burns them.
+        """
+        return self._escrow.total_escrowed(entity_id)
+
+    def get_spendable_balance(self, entity_id: bytes) -> int:
+        """Spendable balance = balance minus (immature + escrow) locks.
+
+        Three concurrent lock sources, all subtracted:
+          * immature: coinbase-maturity lock, 10 blocks, ~100 min
+          * escrow:   bootstrap-era slashing window, up to 12,960 blocks
+          * (stake is already excluded — `balance` only holds liquid tokens)
+
+        Floor at 0 — tracking corruption must never produce a negative
+        spendable balance that could be misinterpreted as a large
+        positive value by callers expecting unsigned semantics.
         """
         total = self.supply.get_balance(entity_id)
         immature = self.get_immature_balance(entity_id)
-        return max(0, total - immature)
+        escrowed = self.get_escrowed_balance(entity_id)
+        return max(0, total - immature - escrowed)
 
     def _touch_state(self, entity_ids):
         """Sync the state tree with current dicts for the given entities.
@@ -2646,6 +2673,40 @@ class Blockchain:
             (h, eid, amt) for h, eid, amt in self._immature_rewards
             if h > cutoff
         ]
+
+        # Escrow: attester rewards are slashable for
+        # escrow_blocks_for_progress(progress) blocks before becoming
+        # fully liquid.  At progress=1.0 the escrow window collapses to
+        # 0 (matches post-bootstrap normal PoS — no additional lock).
+        # Balance is already credited via mint_block_reward; escrow is
+        # a parallel lock recorded so (a) spendable balance reflects
+        # the lock, and (b) slashing can burn the locked amount.
+        from messagechain.consensus.bootstrap_gradient import (
+            escrow_blocks_for_progress,
+        )
+        from messagechain.config import ATTESTER_ESCROW_BLOCKS
+        escrow_len = escrow_blocks_for_progress(
+            self.bootstrap_progress,
+            max_escrow_blocks=ATTESTER_ESCROW_BLOCKS,
+        )
+        if escrow_len > 0:
+            current_h = block.header.block_number
+            unlock_at = current_h + escrow_len
+            for att_id, att_reward in result["attestor_rewards"].items():
+                if att_reward > 0 and att_id != proposer_id:
+                    # Proposer-as-committee-member share is clawed back
+                    # into proposer_reward by the PROPOSER_REWARD_CAP
+                    # path in mint_block_reward, so we don't re-escrow
+                    # it here — only pure-committee earnings.
+                    self._escrow.add(
+                        entity_id=att_id, amount=att_reward,
+                        earned_at=current_h, unlock_at=unlock_at,
+                    )
+
+        # Unlock matured escrow — no balance change (tokens were already
+        # credited at mint time), just lifting the spendable-balance
+        # restriction.
+        self._escrow.pop_matured(block.header.block_number)
         # Track proposer's block signature count (WOTS+ leaf consumed)
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1

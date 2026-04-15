@@ -125,6 +125,18 @@ CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fract
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 
+# Attester-reward escrow window (stage 3).  Rewards earned while
+# bootstrap_progress < 1.0 sit in escrow for this many blocks before
+# unlocking to spendable balance.  During the window they are
+# slashable — any stage-4 slashing event burns accumulated escrow.
+# 12,960 blocks at BLOCK_TIME_TARGET=600s ≈ 90 days, which is the
+# "sliding slashing window" from the design math: long enough to deter
+# coordinated attacks, short enough not to punish honest newcomers
+# with excessive wait before their first liquid tokens.  Actual escrow
+# length at any moment is computed from bootstrap_progress via
+# escrow_blocks_for_progress() — this is the max value at progress=0.
+ATTESTER_ESCROW_BLOCKS = 12_960
+
 # Minimum number of distinct validators needed to exit bootstrap mode.
 # Bootstrap mode is permissive (allows any node to propose, skips
 # attestation thresholds). The chain stays in bootstrap until at least
