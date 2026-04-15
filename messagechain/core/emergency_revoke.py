@@ -16,9 +16,18 @@ holder broadcasts a RevokeTransaction. Immediately upon inclusion:
 
 The revoke tx is signed by the authority (cold) key. The whole point
 is that the attacker does NOT have this key — it lives offline, and
-is only used for this emergency path and for unstaking. Operators
-should keep a pre-computed revoke tx on paper or in a dedicated cold
-environment so recovery takes minutes, not hours.
+is only used for this emergency path and for unstaking.
+
+## Why no nonce
+
+Revoke is intentionally *nonce-free* and idempotent.  apply_revoke
+rejects re-submission of an already-revoked entity, so the only
+meaningful side effect is the one-way flip of a flag.  Dropping the
+nonce lets operators pre-sign a revoke offline (on paper, in a cold
+environment) without needing to know the live nonce — the whole point
+of an emergency kill-switch is that it's ready to broadcast the
+moment a compromise is suspected, not to wait while the operator
+queries a trusted node for a counter value.
 """
 
 import hashlib
@@ -41,9 +50,13 @@ def _hash(data: bytes) -> bytes:
 
 @dataclass
 class RevokeTransaction:
-    """Signed by the cold authority key; flips the entity to revoked state."""
+    """Signed by the cold authority key; flips the entity to revoked state.
+
+    No nonce field: revoke is idempotent (apply_revoke rejects already-
+    revoked entities), so replay protection is unnecessary and the lack
+    of a nonce is what makes pre-signing offline practical.
+    """
     entity_id: bytes
-    nonce: int
     timestamp: float
     fee: int
     signature: Signature
@@ -58,7 +71,6 @@ class RevokeTransaction:
             CHAIN_ID
             + b"revoke"
             + self.entity_id
-            + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
@@ -70,7 +82,6 @@ class RevokeTransaction:
         return {
             "type": "revoke",
             "entity_id": self.entity_id.hex(),
-            "nonce": self.nonce,
             "timestamp": self.timestamp,
             "fee": self.fee,
             "signature": self.signature.serialize(),
@@ -82,7 +93,6 @@ class RevokeTransaction:
         sig = Signature.deserialize(data["signature"])
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
-            nonce=data["nonce"],
             timestamp=data["timestamp"],
             fee=data["fee"],
             signature=sig,
@@ -99,21 +109,22 @@ class RevokeTransaction:
 
 def create_revoke_transaction(
     signer,
-    nonce: int,
     fee: int = MIN_FEE,
     entity_id: bytes | None = None,
 ) -> RevokeTransaction:
     """Build and sign a revoke tx.
 
-    By default `entity_id` is the signer's own entity_id (useful for tests
-    and for single-key setups where the signer IS the validator). For the
-    canonical cold/hot split, pass `entity_id=hot.entity_id` so the cold
-    signer can revoke the hot identity.
+    No nonce — see module docstring. Pre-signing on paper / offline is
+    the intended workflow: fix the fee, sign once, store until needed.
+
+    By default `entity_id` is the signer's own entity_id (single-key
+    setups where the signer IS the validator). For the canonical cold/
+    hot split, pass `entity_id=hot.entity_id` so the cold signer can
+    revoke the hot identity.
     """
     target = entity_id if entity_id is not None else signer.entity_id
     tx = RevokeTransaction(
         entity_id=target,
-        nonce=nonce,
         timestamp=time.time(),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),
@@ -128,7 +139,13 @@ def verify_revoke_transaction(
     tx: RevokeTransaction,
     authority_public_key: bytes,
 ) -> bool:
-    """Verify structural fields and the authority-key signature."""
+    """Verify structural fields and the authority-key signature.
+
+    Past timestamps are accepted without bound — a pre-signed revoke
+    kept on paper for months should still apply when needed. Only
+    future timestamps beyond MAX_TIMESTAMP_DRIFT are rejected, to
+    prevent a malicious proposer from pre-dating an attack.
+    """
     if tx.fee < MIN_FEE:
         return False
     if tx.timestamp <= 0:

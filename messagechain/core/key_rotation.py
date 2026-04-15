@@ -153,16 +153,25 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
     return verify_signature(msg_hash, tx.signature, current_public_key)
 
 
-def derive_rotated_keypair(entity: Entity, rotation_number: int) -> KeyPair:
+def derive_rotated_keypair(
+    entity: Entity,
+    rotation_number: int,
+    progress=None,
+) -> KeyPair:
     """
     Derive a new KeyPair for key rotation.
 
     Uses the entity's seed + rotation number to deterministically generate
     a fresh Merkle tree. Same private key + same rotation number = same new keys.
     This means the entity can always re-derive their rotated keys from their key.
+
+    `progress`, if provided, is called with each leaf index as it is derived —
+    the same callback shape KeyPair.generate accepts. Use this to drive a
+    status indicator during rotations on full-height trees (MERKLE_TREE_HEIGHT
+    = 20 means ~1M derivations, minutes of work with no visible output).
     """
     rotation_seed = hashlib.new(
         HASH_ALGO,
         entity._seed + struct.pack(">Q", rotation_number),
     ).digest()
-    return KeyPair.generate(rotation_seed)
+    return KeyPair.generate(rotation_seed, progress=progress)

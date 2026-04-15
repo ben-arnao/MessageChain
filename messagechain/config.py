@@ -15,6 +15,17 @@ MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
 GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
 
+# Canonical genesis block hash.  When set (bytes, length 32), nodes MUST NOT
+# mint their own genesis — they sync block 0 from peers and reject any block
+# whose hash doesn't match this pin.  Only the single bootstrap node that
+# produced the pinned block may call initialize_genesis and have it succeed.
+#
+# Left as None in this prototype/devnet build so a first-time operator can
+# still create a genesis and then record its hash here.  Production networks
+# MUST pin this — otherwise two nodes on empty data dirs each mint their own
+# incompatible block 0, creating permanently bifurcated chains.
+PINNED_GENESIS_HASH: bytes | None = None
+
 # Treasury — a governance-controlled fund for community spending.
 # The treasury entity has a well-known deterministic ID (no private key exists).
 # Funds can only leave the treasury via approved governance proposals.

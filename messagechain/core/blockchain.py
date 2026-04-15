@@ -326,6 +326,22 @@ class Blockchain:
                 )
 
         genesis_block = create_genesis_block(genesis_entity)
+
+        # If a canonical genesis hash is pinned in config, refuse to
+        # initialize unless this entity happens to produce the exact same
+        # block.  Prevents two nodes on fresh data directories from each
+        # minting their own genesis and creating permanently bifurcated
+        # chains that can never reconcile.
+        import messagechain.config as _cfg
+        pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+        if pinned is not None and pinned != genesis_block.block_hash:
+            raise RuntimeError(
+                f"Refusing to mint a local genesis: pinned genesis hash is "
+                f"{pinned.hex()[:16]}..., this entity would produce "
+                f"{genesis_block.block_hash.hex()[:16]}... instead. "
+                f"Sync block 0 from a peer that has the canonical chain."
+            )
+
         self.chain.append(genesis_block)
         self._block_by_hash[genesis_block.block_hash] = genesis_block
 
@@ -430,14 +446,14 @@ class Blockchain:
         if tx.entity_id in self.revoked_entities:
             return False, "Entity already revoked"
 
-        expected_nonce = self.nonces.get(tx.entity_id, 0)
-        if tx.nonce != expected_nonce:
-            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
-
         if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
             return False, f"Insufficient balance for fee of {tx.fee}"
 
         # Authority-gated: signature must verify under the cold key.
+        # Deliberately no nonce check — revoke is idempotent and the tx is
+        # designed to be pre-signable offline, where the live nonce is
+        # unavailable.  Replay protection comes from the "already revoked"
+        # guard above: any second submission with the same effect is a no-op.
         authority_pk = self.get_authority_key(tx.entity_id)
         if authority_pk is None or not verify_revoke_transaction(tx, authority_pk):
             return False, (
@@ -475,7 +491,9 @@ class Blockchain:
             )
 
         self.revoked_entities.add(tx.entity_id)
-        self.nonces[tx.entity_id] = tx.nonce + 1
+        # Deliberately no nonce bump: revoke has no nonce (pre-signable on
+        # paper offline).  The "already revoked" guard in validate_revoke
+        # is the replay defense.
 
         # The revoke signature consumed a leaf from the COLD key tree.
         # The hot-key watermark is unaffected, so we deliberately do not
@@ -1846,6 +1864,18 @@ class Blockchain:
                 return False, f"First block must be block 0, got {block.header.block_number}"
             if block.header.prev_hash != b"\x00" * 32:
                 return False, "Genesis block must have zero prev_hash"
+            # Canonical genesis pin: if the network has a declared block-0
+            # hash, any incoming block 0 from a peer must match it.  Stops
+            # a malicious or misconfigured peer from feeding us a
+            # forked-genesis chain that would never reconcile.
+            import messagechain.config as _cfg
+            pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+            if pinned is not None and pinned != block.block_hash:
+                return False, (
+                    f"Rejecting block 0: its hash "
+                    f"{block.block_hash.hex()[:16]}... does not match the "
+                    f"pinned genesis {pinned.hex()[:16]}..."
+                )
             self.chain.append(block)
             self._block_by_hash[block.block_hash] = block
             self.fork_choice.add_tip(block.block_hash, 0, 0)

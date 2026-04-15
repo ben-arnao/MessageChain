@@ -71,10 +71,10 @@ class TestRevokeSignedByColdKey(_Base):
         )
         chain.apply_set_authority_key(set_tx, proposer_id=hot.entity_id)
 
-        # Build revoke tx signed by cold key (on behalf of hot entity id)
+        # Build revoke tx signed by cold key (on behalf of hot entity id).
+        # No nonce — revoke is nonce-free so it can be pre-signed offline.
         revoke = RevokeTransaction(
             entity_id=hot.entity_id,
-            nonce=1,
             timestamp=time.time(),
             fee=500,
             signature=Signature([], 0, [], b"", b""),
@@ -101,7 +101,7 @@ class TestRevokeSignedByColdKey(_Base):
         chain.apply_set_authority_key(set_tx, proposer_id=hot.entity_id)
 
         # Attacker holds only the hot key and tries to revoke
-        revoke = create_revoke_transaction(hot, nonce=1, fee=500)
+        revoke = create_revoke_transaction(hot, fee=500)
         ok, reason = chain.apply_revoke(revoke, proposer_id=hot.entity_id)
         self.assertFalse(ok)
 
@@ -124,7 +124,6 @@ class TestRevokeEffects(_Base):
         # Sign revoke with cold key
         revoke = RevokeTransaction(
             entity_id=hot.entity_id,
-            nonce=1,
             timestamp=time.time(),
             fee=500,
             signature=Signature([], 0, [], b"", b""),
@@ -159,7 +158,6 @@ class TestRevokeEffects(_Base):
         cold.keypair._next_leaf = 0
         revoke = RevokeTransaction(
             entity_id=hot.entity_id,
-            nonce=2,
             timestamp=time.time(),
             fee=500,
             signature=Signature([], 0, [], b"", b""),
@@ -177,7 +175,6 @@ class TestVerifyRevokeTransaction(_Base):
         cold = _entity(b"cold")
         tx = RevokeTransaction(
             entity_id=b"\x01" * 32,
-            nonce=5,
             timestamp=time.time(),
             fee=500,
             signature=Signature([], 0, [], b"", b""),
@@ -189,7 +186,7 @@ class TestVerifyRevokeTransaction(_Base):
     def test_verify_returns_false_for_wrong_key(self):
         cold = _entity(b"cold")
         other = _entity(b"other")
-        tx = create_revoke_transaction(cold, nonce=0, fee=500)
+        tx = create_revoke_transaction(cold, fee=500)
         self.assertFalse(verify_revoke_transaction(tx, other.public_key))
 
 
