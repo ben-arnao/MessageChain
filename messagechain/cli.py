@@ -268,6 +268,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
 
+    # --- proposals ---
+    proposals = sub.add_parser(
+        "proposals",
+        help="List governance proposals",
+        description="Show open proposals with current tally and blocks remaining.",
+    )
+    proposals.add_argument("--server", type=str, default=None, help="Server address host:port")
+
+    # --- validators ---
+    validators = sub.add_parser(
+        "validators",
+        help="List the current validator set",
+        description="Show staked validators with stake share, blocks produced, and entity ID.",
+    )
+    validators.add_argument("--server", type=str, default=None, help="Server address host:port")
+
+    # --- estimate-fee ---
+    estimate_fee = sub.add_parser(
+        "estimate-fee",
+        help="Estimate the fee for a prospective message or transfer",
+        description="Query the node for the recommended fee without submitting.",
+    )
+    fee_mode = estimate_fee.add_mutually_exclusive_group(required=True)
+    fee_mode.add_argument("--message", type=str, help="Message text to price")
+    fee_mode.add_argument("--transfer", action="store_true", help="Price a funds transfer")
+    estimate_fee.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     return parser
 
 
@@ -1317,6 +1344,78 @@ def cmd_info(args):
         sys.exit(1)
 
 
+def cmd_proposals(args):
+    """List governance proposals with current tally."""
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    response = rpc_call(host, port, "list_proposals", {})
+
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    proposals = response["result"]["proposals"]
+    if not proposals:
+        print("No proposals on chain.")
+        return
+
+    print(f"=== Proposals ({len(proposals)}) ===\n")
+    for p in proposals:
+        print(f"  {p['proposal_id'][:16]}...  [{p['status'].upper()}]  {p['title']}")
+        print(f"    proposer: {p['proposer_id'][:16]}...")
+        print(f"    votes: {p['vote_count']} cast  |  yes {p['yes_weight']} / total {p['total_weight']}")
+        if p["status"] == "open":
+            print(f"    {p['blocks_remaining']} blocks remaining")
+        print()
+
+
+def cmd_validators(args):
+    """List the current validator set."""
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    response = rpc_call(host, port, "list_validators", {})
+
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    validators = response["result"]["validators"]
+    if not validators:
+        print("No staked validators on chain.")
+        return
+
+    print(f"=== Validators ({len(validators)}) ===\n")
+    print(f"  {'Entity':<20} {'Stake':>14} {'Share':>8} {'Blocks':>8}")
+    for v in validators:
+        eid = v["entity_id"][:16] + "..."
+        print(f"  {eid:<20} {v['staked']:>14} {v['stake_pct']:>7.2f}% {v['blocks_produced']:>8}")
+
+
+def cmd_estimate_fee(args):
+    """Estimate fee for a message or funds transfer."""
+    host, port = _parse_server(args.server)
+
+    if args.transfer:
+        params = {"kind": "transfer"}
+    else:
+        params = {"kind": "message", "message": args.message}
+
+    from client import rpc_call
+    response = rpc_call(host, port, "estimate_fee", params)
+
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    result = response["result"]
+    print("=== Fee Estimate ===\n")
+    print(f"  Recommended fee:    {result['recommended_fee']}")
+    print(f"  Protocol minimum:   {result['min_fee']}")
+    print(f"  Mempool suggestion: {result['mempool_fee']}")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -1347,6 +1446,9 @@ def main():
         "read": cmd_read,
         "demo": cmd_demo,
         "info": cmd_info,
+        "proposals": cmd_proposals,
+        "validators": cmd_validators,
+        "estimate-fee": cmd_estimate_fee,
     }
 
     handler = commands.get(args.command)

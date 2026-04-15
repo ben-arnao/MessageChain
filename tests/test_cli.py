@@ -75,6 +75,32 @@ class TestCLIParser(unittest.TestCase):
         args = self.parser.parse_args(["info"])
         self.assertEqual(args.command, "info")
 
+    def test_proposals_command(self):
+        """'proposals' lists open governance proposals."""
+        args = self.parser.parse_args(["proposals"])
+        self.assertEqual(args.command, "proposals")
+
+    def test_validators_command(self):
+        """'validators' lists the current validator set."""
+        args = self.parser.parse_args(["validators"])
+        self.assertEqual(args.command, "validators")
+
+    def test_estimate_fee_message(self):
+        """'estimate-fee --message' prices a prospective message."""
+        args = self.parser.parse_args(["estimate-fee", "--message", "hi"])
+        self.assertEqual(args.command, "estimate-fee")
+        self.assertEqual(args.message, "hi")
+
+    def test_estimate_fee_transfer(self):
+        """'estimate-fee --transfer' prices a funds transfer."""
+        args = self.parser.parse_args(["estimate-fee", "--transfer"])
+        self.assertTrue(args.transfer)
+
+    def test_estimate_fee_requires_mode(self):
+        """'estimate-fee' with no --message or --transfer fails."""
+        with self.assertRaises(SystemExit):
+            self.parser.parse_args(["estimate-fee"])
+
 
 class TestResolveDefaults(unittest.TestCase):
     """Test that resolve_defaults fills in sensible values."""

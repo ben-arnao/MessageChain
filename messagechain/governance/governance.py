@@ -765,6 +765,36 @@ class GovernanceTracker:
 
         return ProposalStatus.OPEN
 
+    def list_proposals(self, current_block: int) -> list[dict]:
+        """Return a JSON-friendly snapshot of every tracked proposal.
+
+        Used by the CLI's `proposals` command so operators can see what's
+        open, how many blocks remain, and the current tally without
+        needing to decode state manually.
+        """
+        rows = []
+        for pid, state in self.proposals.items():
+            yes_weight, total_weight = self.tally(pid)
+            status = self.get_proposal_status(pid, current_block)
+            blocks_remaining = max(
+                0,
+                GOVERNANCE_VOTING_WINDOW - (current_block - state.created_at_block),
+            )
+            rows.append({
+                "proposal_id": pid.hex(),
+                "proposer_id": state.proposal.proposer_id.hex(),
+                "title": state.proposal.title,
+                "created_at_block": state.created_at_block,
+                "blocks_remaining": blocks_remaining,
+                "status": status.value,
+                "yes_weight": yes_weight,
+                "total_weight": total_weight,
+                "total_eligible_stake": state.total_eligible_stake,
+                "vote_count": len(state.votes),
+            })
+        rows.sort(key=lambda r: r["created_at_block"], reverse=True)
+        return rows
+
     def tally(self, proposal_id: bytes) -> tuple[int, int]:
         """Tally votes for a proposal, weighted by voting power.
 

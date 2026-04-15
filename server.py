@@ -466,6 +466,16 @@ class Server:
             messages = self.blockchain.get_recent_messages(count)
             return {"ok": True, "result": {"messages": messages}}
 
+        elif method == "list_proposals":
+            proposals = self.blockchain.governance.list_proposals(self.blockchain.height)
+            return {"ok": True, "result": {"proposals": proposals}}
+
+        elif method == "list_validators":
+            return {"ok": True, "result": {"validators": self.blockchain.list_validators()}}
+
+        elif method == "estimate_fee":
+            return self._rpc_estimate_fee(request.get("params", {}))
+
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
@@ -815,6 +825,38 @@ class Server:
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_estimate_fee(self, params: dict) -> dict:
+        """Price a prospective message or transfer without submitting.
+
+        Returns three numbers:
+          - min_fee: protocol floor from the size-based curve
+          - mempool_fee: median of pending-tx fees (demand signal)
+          - recommended_fee: max(min_fee, mempool_fee) — safe to submit now
+
+        For `kind=message`, the size curve dominates on long messages.
+        For `kind=transfer`, only MIN_FEE applies; mempool pressure can
+        push the recommendation up during congestion.
+        """
+        from messagechain.core.transaction import calculate_min_fee
+        from messagechain.config import MIN_FEE
+        kind = params.get("kind", "message")
+        if kind == "message":
+            msg = params.get("message", "")
+            if not isinstance(msg, str):
+                return {"ok": False, "error": "message must be a string"}
+            min_fee = calculate_min_fee(msg.encode("utf-8"))
+        elif kind == "transfer":
+            min_fee = MIN_FEE
+        else:
+            return {"ok": False, "error": f"Unknown fee kind: {kind}"}
+
+        mempool_fee = self.mempool.get_fee_estimate()
+        return {"ok": True, "result": {
+            "min_fee": min_fee,
+            "mempool_fee": mempool_fee,
+            "recommended_fee": max(min_fee, mempool_fee),
+        }}
 
     def _rpc_submit_transfer(self, params: dict) -> dict:
         """Accept a signed transfer transaction from a client."""
