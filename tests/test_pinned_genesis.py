@@ -56,20 +56,23 @@ class TestPinnedGenesisEnforced(_Base):
 
     def test_initialize_genesis_accepted_when_hash_matches(self):
         """The single bootstrap node whose genesis happens to match the pin
-        is allowed through."""
-        chain = Blockchain()
-        entity = _entity(b"bootstrap")
-        # Mint once unpinned to discover what its hash would be
-        config.PINNED_GENESIS_HASH = None
-        genesis = chain.initialize_genesis(entity)
-        expected_hash = genesis.block_hash
+        is allowed through.  The genesis block's timestamp comes from
+        time.time() inside create_genesis_block, so we pin wall-clock time
+        to make the block hash reproducible across the two mints below."""
+        from unittest.mock import patch
+        with patch("messagechain.core.block.time.time", return_value=1_700_000_000.0), \
+             patch("messagechain.consensus.pos.time.time", return_value=1_700_000_000.0):
+            chain = Blockchain()
+            entity = _entity(b"bootstrap")
+            config.PINNED_GENESIS_HASH = None
+            genesis = chain.initialize_genesis(entity)
+            expected_hash = genesis.block_hash
 
-        # Fresh chain with the hash pinned to that exact value — should work.
-        chain2 = Blockchain()
-        config.PINNED_GENESIS_HASH = expected_hash
-        entity2 = _entity(b"bootstrap")  # same seed = same identity
-        g2 = chain2.initialize_genesis(entity2)
-        self.assertEqual(g2.block_hash, expected_hash)
+            chain2 = Blockchain()
+            config.PINNED_GENESIS_HASH = expected_hash
+            entity2 = _entity(b"bootstrap")  # same seed = same identity
+            g2 = chain2.initialize_genesis(entity2)
+            self.assertEqual(g2.block_hash, expected_hash)
 
 
 if __name__ == "__main__":

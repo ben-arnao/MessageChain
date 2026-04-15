@@ -34,6 +34,15 @@ class MessageType(Enum):
     # Slashing evidence relay
     ANNOUNCE_SLASH = "announce_slash"
 
+    # Non-message-tx gossip: stake / unstake / authority-tx (SetAuthorityKey,
+    # Revoke, KeyRotation) / governance txs. Without this, a pending tx
+    # submitted to one node would only land in a block if that specific
+    # node became proposer — other nodes couldn't see it.  Payload shape:
+    #     {"kind": "stake" | "unstake" | "authority" | "governance", "tx": <serialized>}
+    # The "kind" tag tells the peer which class to deserialize and which
+    # pending pool to enqueue into.
+    ANNOUNCE_PENDING_TX = "announce_pending_tx"
+
     # IBD / Sync messages (headers-first)
     REQUEST_HEADERS = "request_headers"
     RESPONSE_HEADERS = "response_headers"

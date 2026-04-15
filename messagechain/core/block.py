@@ -103,6 +103,12 @@ def compute_state_root(
     balances: dict[bytes, int],
     nonces: dict[bytes, int],
     staked: dict[bytes, int],
+    *,
+    authority_keys: dict[bytes, bytes] | None = None,
+    public_keys: dict[bytes, bytes] | None = None,
+    leaf_watermarks: dict[bytes, int] | None = None,
+    key_rotation_counts: dict[bytes, int] | None = None,
+    revoked_entities: "set[bytes] | frozenset[bytes] | None" = None,
 ) -> bytes:
     """Compute a Merkle commitment to the full account state.
 
@@ -119,7 +125,14 @@ def compute_state_root(
     # Lazy import to avoid a circular dependency with state_tree which
     # needs nothing from block.py — keeps the module graph acyclic.
     from messagechain.core.state_tree import compute_state_root as _impl
-    return _impl(balances, nonces, staked)
+    return _impl(
+        balances, nonces, staked,
+        authority_keys=authority_keys,
+        public_keys=public_keys,
+        leaf_watermarks=leaf_watermarks,
+        key_rotation_counts=key_rotation_counts,
+        revoked_entities=revoked_entities,
+    )
 
 
 @dataclass
@@ -201,6 +214,11 @@ class Block:
     # set — previously the RPC path queued these in server-local state and
     # they never propagated, breaking consensus on who can propose/attest.
     stake_transactions: list = field(default_factory=list)
+    # Unstake txs are on-chain because unbonding releases stake weight
+    # deterministically across all peers — the validator set must agree
+    # on who is unbonding and when.  Same block-pipeline shape as
+    # stake_transactions but dispatched to supply.unstake on apply.
+    unstake_transactions: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -235,6 +253,8 @@ class Block:
             result["authority_txs"] = [tx.serialize() for tx in self.authority_txs]
         if self.stake_transactions:
             result["stake_transactions"] = [tx.serialize() for tx in self.stake_transactions]
+        if self.unstake_transactions:
+            result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
         return result
 
     @classmethod
@@ -268,10 +288,15 @@ class Block:
         if data.get("stake_transactions"):
             from messagechain.core.staking import StakeTransaction
             stake_txs = [StakeTransaction.deserialize(s) for s in data["stake_transactions"]]
+        unstake_txs = []
+        if data.get("unstake_transactions"):
+            from messagechain.core.staking import UnstakeTransaction
+            unstake_txs = [UnstakeTransaction.deserialize(s) for s in data["unstake_transactions"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
-                    authority_txs=authority_txs, stake_transactions=stake_txs)
+                    authority_txs=authority_txs, stake_transactions=stake_txs,
+                    unstake_transactions=unstake_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])
