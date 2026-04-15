@@ -962,12 +962,24 @@ class Server:
         # the single node that received the RPC.
         pending_authority = getattr(self, "_pending_authority_txs", {})
         authority_txs = list(pending_authority.values())
+        # Pull staged stake + governance txs submitted via RPC.  Without
+        # these being included, `messagechain stake` and every governance
+        # submission would be silently dropped — the server accepts them
+        # into _pending_* dicts but nothing would ever include them in a
+        # block, so chain state never mutates.  Cap at MAX_TXS_PER_BLOCK
+        # each to keep block size bounded.
+        pending_stake = getattr(self, "_pending_stake_txs", {})
+        stake_txs = list(pending_stake.values())[:MAX_TXS_PER_BLOCK]
+        pending_gov = getattr(self, "_pending_governance_txs", {})
+        governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
 
         block = self.blockchain.propose_block(
             self.consensus, self.wallet_entity, txs,
             transfer_transactions=transfer_txs,
             slash_transactions=slash_txs,
             authority_txs=authority_txs,
+            stake_transactions=stake_txs,
+            governance_txs=governance_txs,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -981,6 +993,12 @@ class Server:
             if authority_txs:
                 for ah in [a.tx_hash for a in authority_txs]:
                     pending_authority.pop(ah, None)
+            if stake_txs:
+                for sh in [s.tx_hash for s in stake_txs]:
+                    pending_stake.pop(sh, None)
+            if governance_txs:
+                for gh in [g.tx_hash for g in governance_txs]:
+                    pending_gov.pop(gh, None)
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(

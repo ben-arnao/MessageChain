@@ -36,23 +36,41 @@ SEED_GENESIS = SEED_STAKE + SEED_FEE_BUDGET
 WALLET_LIQUID = 5_000
 
 
-def _build_four_entities():
-    """Generate the four entities the operator would generate offline:
-    three seed hot-keys + one cold wallet."""
+def _build_entities():
+    """Generate entities the operator would generate offline.
+
+    Three seed hot-keys PLUS three distinct cold-authority keys — one per
+    seed — because the chain enforces uniqueness on authority keys across
+    entities (see Blockchain.validate_set_authority_key).  Using one cold
+    key for all seeds would let a chain observer collapse all three
+    seeds' trust into a single key anyway, so per-seed cold keys are also
+    better security: compromising one cold key compromises one seed, not
+    the whole validator set.  Store all three cold mnemonics in the safe.
+    """
     return {
         "seed1": Entity.create(b"rehearsal-seed-1".ljust(32, b"\x00")),
         "seed2": Entity.create(b"rehearsal-seed-2".ljust(32, b"\x00")),
         "seed3": Entity.create(b"rehearsal-seed-3".ljust(32, b"\x00")),
-        "cold":  Entity.create(b"rehearsal-cold".ljust(32, b"\x00")),
+        "cold1": Entity.create(b"rehearsal-cold-1".ljust(32, b"\x00")),
+        "cold2": Entity.create(b"rehearsal-cold-2".ljust(32, b"\x00")),
+        "cold3": Entity.create(b"rehearsal-cold-3".ljust(32, b"\x00")),
     }
 
 
+# Keep the legacy name working for any external caller.
+def _build_four_entities():
+    return _build_entities()
+
+
 def _fresh_chain(entities: dict) -> Blockchain:
-    """Initialise a chain with the 4-entity genesis allocation table.
+    """Initialise a chain with the genesis allocation table.
 
     Matches the production runbook: treasury gets 4%, each seed gets its
-    stake amount pre-allocated as liquid balance, wallet gets a small
-    liquid amount.
+    stake amount pre-allocated as liquid balance.  Cold-wallet entities
+    are NOT allocated on chain and NOT registered — they live off-chain
+    entirely; only their public keys are pointed at as authority keys.
+    The operator can fund a cold wallet separately later by transferring
+    rewards from the seeds.
     """
     chain = Blockchain()
     allocation = {
@@ -60,7 +78,6 @@ def _fresh_chain(entities: dict) -> Blockchain:
         entities["seed1"].entity_id: SEED_GENESIS,
         entities["seed2"].entity_id: SEED_GENESIS,
         entities["seed3"].entity_id: SEED_GENESIS,
-        entities["cold"].entity_id: WALLET_LIQUID,
     }
     # initialize_genesis registers the first entity and credits allocations.
     # We pass seed1 so it becomes the genesis proposer; the allocation
@@ -73,12 +90,17 @@ class TestBootstrapRehearsal(unittest.TestCase):
     """End-to-end bootstrap of 3 seeds against a real Blockchain."""
 
     def setUp(self):
-        self.entities = _build_four_entities()
+        self.entities = _build_entities()
         # Reset keypair leaf cursors for deterministic signing
         for e in self.entities.values():
             e.keypair._next_leaf = 0
         self.chain = _fresh_chain(self.entities)
-        self.cold_pk = self.entities["cold"].public_key
+        # Map each seed to its unique cold key.
+        self.cold_pks = {
+            "seed1": self.entities["cold1"].public_key,
+            "seed2": self.entities["cold2"].public_key,
+            "seed3": self.entities["cold3"].public_key,
+        }
 
     def _bootstrap_all(self):
         """Run bootstrap_seed_local for each of the 3 seeds."""
@@ -87,7 +109,7 @@ class TestBootstrapRehearsal(unittest.TestCase):
             ok, log = bootstrap_seed_local(
                 self.chain,
                 self.entities[name],
-                cold_authority_pubkey=self.cold_pk,
+                cold_authority_pubkey=self.cold_pks[name],
                 stake_amount=SEED_STAKE,
             )
             results[name] = (ok, log)
@@ -117,9 +139,9 @@ class TestBootstrapRehearsal(unittest.TestCase):
             eid = self.entities[name].entity_id
             authority = self.chain.get_authority_key(eid)
             self.assertEqual(
-                authority, self.cold_pk,
-                f"{name} authority key is NOT the cold key — hot-key "
-                f"compromise would be fatal",
+                authority, self.cold_pks[name],
+                f"{name} authority key is NOT the matching cold key — "
+                f"hot-key compromise would be fatal",
             )
             self.assertNotEqual(
                 authority, self.entities[name].public_key,
@@ -159,7 +181,7 @@ class TestBootstrapRehearsal(unittest.TestCase):
         from messagechain.core.staking import verify_unstake_transaction
         # Verify directly against the authority (cold) key — must FAIL
         self.assertFalse(
-            verify_unstake_transaction(malicious_unstake, self.cold_pk),
+            verify_unstake_transaction(malicious_unstake, self.cold_pks["seed1"]),
             "Unstake signed by hot key must not verify under cold authority",
         )
         # Sanity: it would have verified under the hot key
@@ -238,7 +260,7 @@ class TestBootstrapRehearsal(unittest.TestCase):
         ok, log = bootstrap_seed_local(
             self.chain,
             self.entities["seed1"],
-            cold_authority_pubkey=self.cold_pk,
+            cold_authority_pubkey=self.cold_pks["seed1"],
             stake_amount=SEED_STAKE,
         )
         self.assertFalse(ok)

@@ -196,6 +196,11 @@ class Block:
     # would never propagate to the rest of the network, defeating the
     # security model entirely.
     authority_txs: list = field(default_factory=list)
+    # On-chain staking traffic: StakeTransaction locks a validator's liquid
+    # tokens as stake.  Block-included so every peer agrees on the validator
+    # set — previously the RPC path queued these in server-local state and
+    # they never propagated, breaking consensus on who can propose/attest.
+    stake_transactions: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -228,6 +233,8 @@ class Block:
             result["governance_txs"] = [tx.serialize() for tx in self.governance_txs]
         if self.authority_txs:
             result["authority_txs"] = [tx.serialize() for tx in self.authority_txs]
+        if self.stake_transactions:
+            result["stake_transactions"] = [tx.serialize() for tx in self.stake_transactions]
         return result
 
     @classmethod
@@ -257,10 +264,14 @@ class Block:
         authority_txs = []
         if data.get("authority_txs"):
             authority_txs = [_deserialize_authority_tx(a) for a in data["authority_txs"]]
+        stake_txs = []
+        if data.get("stake_transactions"):
+            from messagechain.core.staking import StakeTransaction
+            stake_txs = [StakeTransaction.deserialize(s) for s in data["stake_transactions"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
-                    authority_txs=authority_txs)
+                    authority_txs=authority_txs, stake_transactions=stake_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

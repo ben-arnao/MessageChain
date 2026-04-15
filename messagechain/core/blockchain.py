@@ -72,6 +72,8 @@ def compute_block_sig_cost(block) -> int:
         + len(block.transfer_transactions)
         + len(block.slash_transactions)
         + len(block.governance_txs)
+        + len(getattr(block, "authority_txs", []))
+        + len(getattr(block, "stake_transactions", []))
         + 1  # proposer signature
         + len(block.attestations)
     )
@@ -1025,6 +1027,7 @@ class Blockchain:
         transfer_transactions: list[TransferTransaction] | None = None,
         attestations: list[Attestation] | None = None,
         authority_txs: list | None = None,
+        stake_transactions: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -1082,6 +1085,23 @@ class Blockchain:
                 # Rotation swaps the public_key but does NOT touch nonces,
                 # balances (beyond the fee above), or staked amounts.
                 pass
+
+        # Simulate stake transactions — fee (burn + tip), nonce bump, and
+        # the actual stake movement from liquid balance to staked balance.
+        # Must mirror the apply path exactly; any drift here and validators
+        # reject otherwise-valid blocks with a state_root mismatch.
+        # Clamp at 0 when the sender lacks balance — validate_block's
+        # `_validate_stake_tx_in_block` will reject such a tx.  Clamping
+        # here keeps the simulation from raising (e.g., on struct-packing
+        # a negative value) when a dishonest proposer includes a bad tx.
+        for stx in (stake_transactions or []):
+            effective_base_fee = min(current_base_fee, stx.fee)
+            tip = stx.fee - effective_base_fee
+            new_bal = sim_balances.get(stx.entity_id, 0) - stx.fee - stx.amount
+            sim_balances[stx.entity_id] = max(new_bal, 0)
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            sim_staked[stx.entity_id] = sim_staked.get(stx.entity_id, 0) + stx.amount
+            sim_nonces[stx.entity_id] = stx.nonce + 1
 
         # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
@@ -1148,6 +1168,7 @@ class Blockchain:
         slash_transactions: list | None = None,
         governance_txs: list | None = None,
         authority_txs: list | None = None,
+        stake_transactions: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1168,6 +1189,7 @@ class Blockchain:
             transfer_transactions=transfer_transactions,
             attestations=attestations,
             authority_txs=authority_txs,
+            stake_transactions=stake_transactions,
         )
         mtp = self.get_median_time_past()
         # A small epsilon greater than the minimum float resolution the
@@ -1182,6 +1204,7 @@ class Blockchain:
             slash_transactions=slash_transactions,
             governance_txs=governance_txs,
             authority_txs=authority_txs,
+            stake_transactions=stake_transactions,
             timestamp=timestamp,
         )
 
@@ -1383,6 +1406,10 @@ class Blockchain:
                 ok, reason = _check_leaf(atx.entity_id, atx.signature.leaf_index, "authority tx")
             if not ok:
                 return False, reason
+        for stx in getattr(block, "stake_transactions", []):
+            ok, reason = _check_leaf(stx.entity_id, stx.signature.leaf_index, "stake tx")
+            if not ok:
+                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -1407,6 +1434,7 @@ class Blockchain:
             + [tx.tx_hash for tx in block.slash_transactions]
             + [tx.tx_hash for tx in block.governance_txs]
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
+            + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1557,15 +1585,124 @@ class Blockchain:
                 return False, f"Invalid slash tx: {reason}"
 
         # Validate governance transactions.  Each carries its own signature
-        # and minimum-fee rules; we only check the proposer/voter/delegator
-        # is known and the signature verifies.  Application-layer semantics
-        # (proposal-exists, voting-window-open, duplicate vote) are enforced
-        # in _apply_block_state against the GovernanceTracker.
+        # and minimum-fee rules; we check the sender is known, the signature
+        # verifies, and the sender can afford the fee CUMULATIVELY with
+        # other fee-paying txs from the same sender earlier in this block
+        # (shares pending_balance_spent with message/transfer txs above).
+        # Application-layer semantics (proposal-exists, voting-window-open,
+        # duplicate vote) are enforced in _apply_block_state against the
+        # GovernanceTracker.
         for gtx in block.governance_txs:
-            valid, reason = self._validate_governance_tx(gtx)
+            valid, reason = self._validate_governance_tx_in_block(
+                gtx, pending_balance_spent,
+            )
             if not valid:
                 return False, f"Invalid governance tx: {reason}"
 
+        # Validate stake transactions — full check: signature, sender
+        # registered, nonce, amount meets the graduated minimum, and the
+        # sender can afford stake + fee.  Nonce and balance are tracked
+        # cumulatively with message/transfer txs earlier in this block.
+        for stx in getattr(block, "stake_transactions", []):
+            ok, reason = self._validate_stake_tx_in_block(
+                stx, pending_nonces, pending_balance_spent,
+            )
+            if not ok:
+                return False, f"Invalid stake tx: {reason}"
+
+        return True, "Valid"
+
+    def _validate_stake_tx_in_block(
+        self, stx,
+        pending_nonces: dict[bytes, int],
+        pending_balance_spent: dict[bytes, int],
+    ) -> tuple[bool, str]:
+        """Validate a StakeTransaction within a block being proposed/received.
+
+        Uses the cumulative (pending_nonces, pending_balance_spent) tracked
+        alongside message and transfer txs so that a single block containing
+        multiple fee-paying txs from the same sender is validated against
+        the cumulative spend, not the pre-block balance.
+        """
+        from messagechain.core.staking import (
+            StakeTransaction, verify_stake_transaction,
+        )
+        from messagechain.consensus.pos import graduated_min_stake
+        if not isinstance(stx, StakeTransaction):
+            return False, f"Unexpected type {type(stx).__name__}"
+        if stx.entity_id not in self.public_keys:
+            return False, f"Unknown sender {stx.entity_id.hex()[:16]}"
+        pk = self.public_keys[stx.entity_id]
+        if not verify_stake_transaction(stx, pk, block_height=self.height):
+            return False, "Invalid signature or fields"
+
+        expected_nonce = pending_nonces.get(
+            stx.entity_id, self.nonces.get(stx.entity_id, 0),
+        )
+        if stx.nonce != expected_nonce:
+            return False, f"Invalid nonce: expected {expected_nonce}, got {stx.nonce}"
+
+        # Amount must meet the graduated validator minimum for the current
+        # block height so a new validator cannot slip in under-staked.
+        min_stake = graduated_min_stake(self.height)
+        if stx.amount < min_stake:
+            return False, f"Stake amount {stx.amount} below graduated minimum {min_stake}"
+
+        spent_so_far = pending_balance_spent.get(stx.entity_id, 0)
+        needed = spent_so_far + stx.fee + stx.amount
+        if self.get_spendable_balance(stx.entity_id) < needed:
+            return False, (
+                f"Insufficient balance for stake {stx.amount} + fee {stx.fee} "
+                f"(cumulative with other txs in this block)"
+            )
+
+        pending_nonces[stx.entity_id] = expected_nonce + 1
+        pending_balance_spent[stx.entity_id] = needed
+        return True, "Valid"
+
+    def _validate_stake_tx(self, stx) -> tuple[bool, str]:
+        """Standalone (non-cumulative) validation for validate_block_standalone.
+
+        Mirrors _validate_stake_tx_in_block but treats each tx independently
+        against the current on-chain balance/nonce, since standalone validation
+        is used in fork validation where cumulative tracking is unnecessary.
+        """
+        empty_nonces: dict[bytes, int] = {}
+        empty_spent: dict[bytes, int] = {}
+        return self._validate_stake_tx_in_block(stx, empty_nonces, empty_spent)
+
+    def _validate_governance_tx_in_block(
+        self, gtx,
+        pending_balance_spent: dict[bytes, int],
+    ) -> tuple[bool, str]:
+        """Governance tx validation with cumulative balance tracking.
+
+        Delegates signature/sender/min-fee checks to `_validate_governance_tx`,
+        then adds a cumulative-balance guard: the sender's spendable balance
+        must cover (prior-txs-in-block-spent + this-tx-fee).  This prevents
+        silent fee drops when a sender puts several governance txs (or a
+        mix of message/transfer + governance) from the same account in the
+        same block.
+        """
+        ok, reason = self._validate_governance_tx(gtx)
+        if not ok:
+            return False, reason
+        if hasattr(gtx, "voter_id"):
+            sender = gtx.voter_id
+        elif hasattr(gtx, "delegator_id"):
+            sender = gtx.delegator_id
+        elif hasattr(gtx, "proposer_id"):
+            sender = gtx.proposer_id
+        else:
+            return False, "Could not resolve sender for cumulative check"
+        spent_so_far = pending_balance_spent.get(sender, 0)
+        needed = spent_so_far + gtx.fee
+        if self.get_spendable_balance(sender) < needed:
+            return False, (
+                f"Insufficient cumulative balance: spent_so_far {spent_so_far} "
+                f"+ fee {gtx.fee} exceeds spendable"
+            )
+        pending_balance_spent[sender] = needed
         return True, "Valid"
 
     def _validate_governance_tx(self, gtx) -> tuple[bool, str]:
@@ -1659,11 +1796,14 @@ class Blockchain:
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds limit"
 
-        # Merkle root — includes governance_txs so a relayer can't strip them
+        # Merkle root — includes governance, authority, and stake txs so a
+        # relayer cannot strip them.
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
             + [tx.tx_hash for tx in block.governance_txs]
+            + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
+            + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1674,6 +1814,12 @@ class Blockchain:
             valid, reason = self._validate_governance_tx(gtx)
             if not valid:
                 return False, f"Invalid governance tx: {reason}"
+
+        # Stake txs — signature + sender + fee + amount checks
+        for stx in getattr(block, "stake_transactions", []):
+            valid, reason = self._validate_stake_tx(stx)
+            if not valid:
+                return False, f"Invalid stake tx: {reason}"
 
         # Proposer signature (mandatory)
         if block.header.proposer_id not in self.public_keys:
@@ -1813,6 +1959,8 @@ class Blockchain:
             affected.add(att.validator_id)
         for atx in getattr(block, "authority_txs", []):
             affected.add(atx.entity_id)
+        for stx in getattr(block, "stake_transactions", []):
+            affected.add(stx.entity_id)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -1856,6 +2004,25 @@ class Blockchain:
         # revoke, and key rotation consensus-visible across all peers.
         for atx in getattr(block, "authority_txs", []):
             self._apply_authority_tx(atx, proposer_id, current_base_fee)
+
+        # Apply stake transactions.  validate_block already verified the
+        # sender has sufficient balance and the amount meets the graduated
+        # minimum, so both calls below must succeed.
+        for stx in getattr(block, "stake_transactions", []):
+            self.supply.pay_fee_with_burn(
+                stx.entity_id, proposer_id, stx.fee, current_base_fee,
+            )
+            staked_ok = self.supply.stake(stx.entity_id, stx.amount)
+            if not staked_ok:
+                # Only reachable if validate_block was bypassed — keep a loud
+                # log rather than raising so a single malformed tx does not
+                # abort the rest of the block.
+                logger.error(
+                    f"Stake tx {stx.tx_hash.hex()[:16]} failed at apply-time "
+                    f"despite passing validate_block; chain state may be drift."
+                )
+            self.nonces[stx.entity_id] = stx.nonce + 1
+            self._bump_watermark(stx.entity_id, stx.signature.leaf_index)
 
         # Build attestor stakes map for reward distribution
         attestor_stakes = {}
@@ -2106,6 +2273,7 @@ class Blockchain:
                     transfer_transactions=block.transfer_transactions,
                     attestations=block.attestations,
                     authority_txs=getattr(block, "authority_txs", []),
+                    stake_transactions=getattr(block, "stake_transactions", []),
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and

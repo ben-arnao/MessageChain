@@ -114,7 +114,10 @@ MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 # this many validators have registered, so we never end up with a
 # 1-validator post-bootstrap chain that has a single point of failure.
 # Set to 1 in tests via tests/__init__.py for backward compatibility.
-MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 4
+# Production: 3 matches the planned 3-seed launch.  A thinner set than
+# this risks a single-point-of-failure post-bootstrap chain; a larger
+# set means bootstrap doesn't end until more external validators join.
+MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 3
 
 # Slot-timing enforcement — if True, validate_block rejects blocks whose
 # timestamp is less than BLOCK_TIME_TARGET seconds after the parent's.
