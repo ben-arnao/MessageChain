@@ -8,7 +8,6 @@ D1   P2P write_message calls must have a timeout
 D2   RESPONSE_HEADERS/RESPONSE_BLOCKS_BATCH must be rate-limited
 D3   Checkpoint loading must fail loudly on missing/corrupt files
 D4   Bootstrap mode must still verify attestation signatures
-D5   Governance delegation tally must weight ALL targets proportionally
 D6   Fork choice must use historical (snapshotted) stake, not live
 D7   Conflicting attestations must auto-generate slashing evidence
 D8   RPC must require authentication
