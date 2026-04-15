@@ -376,11 +376,20 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
         )
 
     def test_attestors_receive_rewards(self):
-        """Attestors receive a share of the block reward."""
-        # Pick the deterministically-selected proposer for each block
+        """Both attesters receive flat per-slot rewards via the committee.
+
+        Under the committee reward model, every committee member earns
+        ATTESTER_REWARD_PER_SLOT (flat 1 token) — stake affects selection
+        probability, not payout size.  With only two candidates (Bob,
+        Carol) and committee_size >= 2, both are selected every block,
+        so both earn the slot reward.  The old "pro-rata by stake"
+        invariant no longer applies.
+        """
+        from messagechain.consensus.attester_committee import (
+            ATTESTER_REWARD_PER_SLOT,
+        )
         candidates = [self.alice, self.bob, self.carol]
 
-        # First block (no attestations possible yet)
         proposer1 = pick_selected_proposer(self.chain, candidates)
         block1 = self._make_block(proposer1, [])
         ok, reason = self.chain.add_block(block1)
@@ -389,11 +398,9 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
         bob_before = self.chain.supply.get_balance(self.bob.entity_id)
         carol_before = self.chain.supply.get_balance(self.carol.entity_id)
 
-        # Create attestations for block1
         att_bob = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att_carol = create_attestation(self.carol, block1.block_hash, block1.header.block_number)
 
-        # Block2 includes attestations — attestors should earn rewards
         proposer2 = pick_selected_proposer(self.chain, candidates)
         block2 = self._make_block(proposer2, [], attestations=[att_bob, att_carol])
         success, reason = self.chain.add_block(block2)
@@ -402,28 +409,26 @@ class TestAttestationRewardsIntegration(unittest.TestCase):
         bob_after = self.chain.supply.get_balance(self.bob.entity_id)
         carol_after = self.chain.supply.get_balance(self.carol.entity_id)
 
-        # Both attestors gained tokens
-        self.assertGreater(bob_after, bob_before)
-        self.assertGreater(carol_after, carol_before)
-
-        # Bob staked 3x more and should get a strictly larger attestation
-        # reward than Carol. The exact ratio depends on whether Bob is
-        # also the proposer — if so, the proposer-reward cap claws back
-        # part of his combined share, compressing the ratio below 3:1.
-        # The directional invariant (bob_gain > carol_gain) holds either
-        # way; a strict 3:1 assertion is only meaningful when neither
-        # attestor is the proposer.
-        bob_gain = bob_after - bob_before
-        carol_gain = carol_after - carol_before
-        self.assertGreater(
-            bob_gain, carol_gain,
-            "higher stake should produce strictly higher attestation reward",
-        )
-        # When Bob is not the proposer, his full 3/4 share is preserved
-        # and the ratio should be near 3:1.
-        if proposer2.entity_id != self.bob.entity_id and carol_gain > 0:
-            ratio = bob_gain / carol_gain
-            self.assertAlmostEqual(ratio, 3.0, delta=1.0)
+        # Whichever of {bob, carol} is NOT the proposer2 must have
+        # gained exactly ATTESTER_REWARD_PER_SLOT from the committee.
+        # The one who IS the proposer gained proposer_share +
+        # committee slot (capped by PROPOSER_REWARD_CAP).
+        if proposer2.entity_id == self.bob.entity_id:
+            # Carol is pure committee member
+            self.assertEqual(
+                carol_after - carol_before, ATTESTER_REWARD_PER_SLOT,
+            )
+            # Bob got proposer share too — strictly more than Carol
+            self.assertGreater(bob_after - bob_before, carol_after - carol_before)
+        elif proposer2.entity_id == self.carol.entity_id:
+            self.assertEqual(
+                bob_after - bob_before, ATTESTER_REWARD_PER_SLOT,
+            )
+            self.assertGreater(carol_after - carol_before, bob_after - bob_before)
+        else:
+            # Alice proposed; both Bob and Carol are pure committee members
+            self.assertEqual(bob_after - bob_before, ATTESTER_REWARD_PER_SLOT)
+            self.assertEqual(carol_after - carol_before, ATTESTER_REWARD_PER_SLOT)
 
 
 class TestLongTermEconomics(unittest.TestCase):
