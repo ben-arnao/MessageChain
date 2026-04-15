@@ -20,6 +20,13 @@ from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _h
 # Hash output size for SHA3-256, used for strict size validation on signatures.
 _HASH_SIZE = 32
 
+# Upper bound on the Merkle auth_path length a deserialized Signature
+# may carry.  Every extra element costs a hash op in verify_signature, so
+# an unbounded path is a trivial DoS.  64 covers 2^64 leaves per key —
+# well beyond any sane MERKLE_TREE_HEIGHT (current prod = 20) and still
+# small enough that the verify loop stays cheap on adversarial input.
+MAX_AUTH_PATH_LEN = 64
+
 
 @dataclass
 class Signature:
@@ -73,17 +80,39 @@ class Signature:
         pub_key = bytes.fromhex(data["wots_public_key"])
         pub_seed = bytes.fromhex(data["wots_public_seed"])
 
-        # M4: Structural validation on deserialization
+        # M4: Structural validation on deserialization.  Every check here
+        # runs BEFORE verify_signature sees the input, so malformed blobs
+        # never reach the hash-heavy verify path — a cheap DoS guard.
         if not isinstance(leaf_index, int) or leaf_index < 0:
             raise ValueError(f"Invalid leaf_index: {leaf_index}")
-        if not wots_sig:
-            raise ValueError("Empty WOTS signature")
+        # WOTS+ signatures always carry exactly WOTS_KEY_CHAINS chains.
+        # Anything else cannot be a valid signature under this scheme —
+        # rejecting here prevents wasted hashing in wots_verify.
+        if len(wots_sig) != WOTS_KEY_CHAINS:
+            raise ValueError(
+                f"WOTS signature must have exactly {WOTS_KEY_CHAINS} chains, "
+                f"got {len(wots_sig)}"
+            )
         for i, s in enumerate(wots_sig):
             if len(s) != _HASH_SIZE:
                 raise ValueError(f"WOTS signature element {i} has wrong size: {len(s)}")
+        # auth_path length is unbounded by the wire format — cap it before
+        # verify runs a rehash-per-level loop on adversarial input.
+        if len(auth_path) > MAX_AUTH_PATH_LEN:
+            raise ValueError(
+                f"Auth path too long: {len(auth_path)} > {MAX_AUTH_PATH_LEN}"
+            )
         for i, h in enumerate(auth_path):
             if len(h) != _HASH_SIZE:
                 raise ValueError(f"Auth path element {i} has wrong size: {len(h)}")
+        # A path of length N addresses exactly 2^N leaves; any leaf_index
+        # outside that range cannot point at a real position in the tree.
+        max_leaf_index = (1 << len(auth_path)) - 1
+        if leaf_index > max_leaf_index:
+            raise ValueError(
+                f"leaf_index {leaf_index} outside tree coverage "
+                f"(auth_path len {len(auth_path)} → max index {max_leaf_index})"
+            )
         if len(pub_key) != _HASH_SIZE:
             raise ValueError(f"Public key has wrong size: {len(pub_key)}")
         if len(pub_seed) != _HASH_SIZE:

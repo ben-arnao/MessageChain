@@ -91,9 +91,15 @@ class TestSignatureCanonicalization(unittest.TestCase):
         self.assertEqual(wh1, wh2)
 
     def test_signature_serialize_roundtrip_canonical(self):
-        """Serialized + deserialized signature produces same canonical_bytes."""
+        """Serialized + deserialized signature produces same canonical_bytes.
+
+        Must carry a full WOTS_KEY_CHAINS-sized signature: deserialize now
+        enforces exact chain count as a structural guard against malformed
+        or DoS-shaped signatures (see test_signature_deserialize_bounds).
+        """
+        from messagechain.config import WOTS_KEY_CHAINS
         sig = Signature(
-            wots_signature=[b"\xaa" * 32, b"\xbb" * 32],
+            wots_signature=[b"\xaa" * 32] * WOTS_KEY_CHAINS,
             leaf_index=3,
             auth_path=[b"\xcc" * 32, b"\xdd" * 32],
             wots_public_key=b"\xee" * 32,

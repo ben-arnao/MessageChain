@@ -94,6 +94,23 @@ WOTS_KEY_CHAINS = 64  # number of hash chains per WOTS keypair
 WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
 MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (production)
 # Tests override this to 4 (16 leaves) via tests/__init__.py for fast execution.
+#
+# Leaf exhaustion cadence — an active validator consumes one leaf per
+# block proposed AND one leaf per attestation issued.  At BLOCK_TIME=600s
+# (~525,600 blocks/year), the math works out to roughly:
+#
+#       leaves/year ≈ 525,600 / N  (proposals)  +  525,600  (attestations)
+#
+# where N is the validator count.  For any N in the tens-to-hundreds
+# range, attestations dominate and per-validator leaf use converges to
+# ~530,000/yr — so 1M leaves gives ~2 years of runtime per hot key.
+#
+# Implication: KeyRotation is a MANDATORY operational task, not a
+# "rotate if you feel like it" feature.  Validators must rotate every
+# ~1.5 years (safety margin) or risk hitting the "Key exhausted" error
+# mid-slot, missing proposals, and bleeding stake to slashing /
+# inactivity penalties.  Operators should schedule rotations well
+# ahead of exhaustion — ideally at the halfway mark.
 
 # Consensus — graduated minimum stake
 # Early network is accessible (1 token), matures into higher barrier.
@@ -159,6 +176,16 @@ MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
 MEMPOOL_PER_SENDER_LIMIT = 5  # max pending txs per entity (tight to throttle burst spam)
 MEMPOOL_MAX_ANCESTORS = 5     # max unconfirmed tx chain depth per entity
+
+# Per-pool cap on non-message-tx pending pools maintained by Server
+# (_pending_stake_txs, _pending_unstake_txs, _pending_authority_txs,
+# _pending_governance_txs).  Without a cap, a funded attacker could fill
+# memory with validly-signed junk.  At 1024 entries per pool, all four
+# top out at a few MB — the right trade-off for a chain that targets
+# low-throughput, high-durability operation.  When a pool is full, a
+# new tx only lands if its fee beats the lowest-fee pending tx, which
+# is then evicted (same shape as Mempool's fee-based eviction).
+PENDING_POOL_MAX_SIZE = 1024
 
 # Address manager (Sybil/eclipse resistance)
 ADDRMAN_NEW_BUCKET_COUNT = 256      # buckets in the "new" table
