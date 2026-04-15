@@ -1265,6 +1265,48 @@ class Blockchain:
                 return False, f"Duplicate transaction {tx.tx_hash.hex()[:16]} in block"
             seen_tx_hashes.add(tx.tx_hash)
 
+        # WOTS+ leaf-reuse defense at the block level.  The per-tx watermark
+        # check in validate_transaction reads chain state that hasn't been
+        # bumped yet when the second tx is validated, so two txs sharing a
+        # (entity_id, leaf_index) pair can both pass individual validation.
+        # Reject the whole block if any such collision appears — reusing a
+        # WOTS+ leaf leaks the private key, so this MUST be impossible.
+        seen_leaves: set[tuple[bytes, int]] = set()
+        def _check_leaf(entity_id: bytes, leaf_index: int, kind: str) -> tuple[bool, str]:
+            key = (entity_id, leaf_index)
+            if key in seen_leaves:
+                return False, (
+                    f"Block contains duplicate WOTS+ leaf use for entity "
+                    f"{entity_id.hex()[:16]} at leaf {leaf_index} ({kind}) — "
+                    "leaf reuse rejected"
+                )
+            seen_leaves.add(key)
+            return True, ""
+        for tx in block.transactions:
+            ok, reason = _check_leaf(tx.entity_id, tx.signature.leaf_index, "message tx")
+            if not ok:
+                return False, reason
+        for ttx in block.transfer_transactions:
+            ok, reason = _check_leaf(ttx.entity_id, ttx.signature.leaf_index, "transfer tx")
+            if not ok:
+                return False, reason
+        for stx in block.slash_transactions:
+            ok, reason = _check_leaf(stx.submitter_id, stx.signature.leaf_index, "slash tx")
+            if not ok:
+                return False, reason
+        for att in block.attestations:
+            ok, reason = _check_leaf(att.validator_id, att.signature.leaf_index, "attestation")
+            if not ok:
+                return False, reason
+        if block.header.proposer_signature is not None:
+            ok, reason = _check_leaf(
+                block.header.proposer_id,
+                block.header.proposer_signature.leaf_index,
+                "proposer signature",
+            )
+            if not ok:
+                return False, reason
+
         # Check total signature verification cost (sigops-style limit)
         # Counts all tx sigs + proposer sig + attestation sigs + slash sigs
         import messagechain.config

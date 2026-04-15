@@ -172,11 +172,18 @@ class Mempool:
         return True
 
     def get_fee_estimate(self) -> int:
-        """Estimate fee needed to get into the next block (median of pending)."""
+        """Estimate fee needed to get into the next block.
+
+        Returns the median fee of pending txs, floored at MIN_FEE. Never
+        suggests a value the chain would reject. Message txs have an
+        additional size-dependent minimum (see calculate_min_fee); clients
+        should use max(this, local_min) for their actual fee.
+        """
+        from messagechain.config import MIN_FEE
         if not self.pending:
-            return 1
+            return MIN_FEE
         fees = sorted([tx.fee for tx in self.pending.values()], reverse=True)
-        return fees[len(fees) // 2]
+        return max(MIN_FEE, fees[len(fees) // 2])
 
     def save_to_file(self, path: str) -> int:
         """Save mempool contents to disk for persistence across restarts.

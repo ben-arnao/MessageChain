@@ -581,13 +581,29 @@ def cmd_send(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    # Auto-detect fee (or use explicit)
+    # Auto-detect fee (or use explicit). The actual minimum for a message
+    # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
+    # always take max(local_min, server_suggestion) to avoid silently
+    # submitting a tx the chain will reject.
+    from messagechain.core.transaction import calculate_min_fee
+    msg_bytes = args.message.encode("ascii")
+    local_min = calculate_min_fee(msg_bytes)
     fee = args.fee
     if fee is None:
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
-        fee = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 5
-        print(f"Fee: {fee} tokens (auto)")
+        server_suggested = (
+            est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
+        )
+        fee = max(local_min, server_suggested)
+        note = " (auto — server floor)" if server_suggested >= local_min else " (auto — size floor)"
+        print(f"Fee: {fee} tokens{note}")
     else:
+        if fee < local_min:
+            print(
+                f"Error: fee {fee} is below the minimum {local_min} for "
+                f"a {len(msg_bytes)}-byte message. Raise the fee or drop --fee."
+            )
+            sys.exit(1)
         print(f"Fee: {fee} tokens")
 
     # Create, sign, submit
@@ -612,18 +628,54 @@ def cmd_transfer(args):
     """Transfer tokens to another entity."""
     from messagechain.identity.identity import Entity
     from messagechain.core.transfer import create_transfer_transaction
+    from messagechain.config import MIN_FEE
+    from messagechain.validation import parse_hex
 
     print("=== Transfer Tokens ===\n")
+
+    # Validate recipient BEFORE prompting for the private key — a typo
+    # is a permanent loss risk, so we want the user to fix it without
+    # having re-entered credentials.
+    recipient_id = parse_hex(args.to)
+    if recipient_id is None or len(recipient_id) != 32:
+        print(f"Error: recipient entity ID must be 64 hex chars (32 bytes).")
+        print(f"  Got: {args.to}")
+        sys.exit(1)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    # Check the recipient is actually registered on-chain.  Transferring
+    # to an unregistered (or mistyped) address would be rejected by the
+    # server, but we want a clean error path without having typed the
+    # private key yet.
+    recipient_info = rpc_call(host, port, "get_entity", {
+        "entity_id": recipient_id.hex(),
+    })
+    if not recipient_info.get("ok"):
+        print(f"Error: recipient not registered on this chain.")
+        print(f"  Entity ID: {recipient_id.hex()}")
+        print(f"  This is usually a typo. Double-check the address with")
+        print(f"  the recipient before continuing.")
+        sys.exit(1)
+
+    # Confirmation step — last chance before the key is handled. Shows
+    # both ends of the address so a single-character typo is visible.
+    head = recipient_id.hex()[:8]
+    tail = recipient_id.hex()[-8:]
+    print(f"About to transfer:")
+    print(f"  Amount:    {args.amount} tokens")
+    print(f"  Recipient: {head}...{tail}")
+    print(f"             (full: {recipient_id.hex()})")
+    confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
+    if confirm != "yes":
+        print("Transfer cancelled.")
+        sys.exit(0)
 
     private_key = _collect_private_key()
     entity = Entity.create(private_key)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
 
-    host, port = _parse_server(args.server)
-
-    from client import rpc_call
-
-    # Get nonce
     nonce_resp = rpc_call(host, port, "get_nonce", {
         "entity_id": entity.entity_id_hex,
     })
@@ -631,24 +683,24 @@ def cmd_transfer(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    # Auto-detect fee
+    # Fee: never below MIN_FEE. Use max(local_min, server_suggestion).
     fee = args.fee
     if fee is None:
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
-        fee = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 1
-
-    from messagechain.validation import parse_hex
-    recipient_id = parse_hex(args.to)
-    if recipient_id is None:
-        print(f"Error: Invalid recipient ID (not valid hex): {args.to}")
+        server_suggested = (
+            est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
+        )
+        fee = max(MIN_FEE, server_suggested)
+    elif fee < MIN_FEE:
+        print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
         sys.exit(1)
+
     tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
 
-    print(f"Transferring {args.amount} tokens to {args.to[:16]}... (fee: {fee})")
+    print(f"Transferring {args.amount} tokens (fee: {fee})...")
 
     response = rpc_call(host, port, "submit_transfer", {
         "transaction": tx.serialize(),

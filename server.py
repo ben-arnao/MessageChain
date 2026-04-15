@@ -151,7 +151,7 @@ class Server:
         if RPC_AUTH_ENABLED:
             import os as _rng
             self.rpc_auth_token = RPC_AUTH_TOKEN or _rng.urandom(32).hex()
-            logger.info(f"RPC auth enabled. Token: {self.rpc_auth_token[:8]}...")
+            self._log_rpc_auth_status()
 
         # inv/getdata: track recently seen tx hashes
         self._seen_txs: OrderedDict = OrderedDict()

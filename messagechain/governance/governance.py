@@ -40,6 +40,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+from messagechain import config
 from messagechain.config import (
     HASH_ALGO,
     GOVERNANCE_VOTING_WINDOW,
@@ -117,7 +118,8 @@ class ProposalTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"governance_proposal"
+            config.CHAIN_ID
+            + b"governance_proposal"
             + self.proposer_id
             + self.title.encode("utf-8")
             + self.description.encode("utf-8")
@@ -194,7 +196,8 @@ class VoteTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"governance_vote"
+            config.CHAIN_ID
+            + b"governance_vote"
             + self.voter_id
             + self.proposal_id
             + struct.pack(">?", self.approve)
@@ -262,7 +265,7 @@ class DelegateTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
-        parts = b"governance_delegate" + self.delegator_id
+        parts = config.CHAIN_ID + b"governance_delegate" + self.delegator_id
         for delegate_id, pct in sorted(self.targets, key=lambda x: x[0]):
             parts += delegate_id + struct.pack(">B", pct)
         parts += struct.pack(">d", self.timestamp)
@@ -345,7 +348,8 @@ class ValidatorEjectionProposal:
 
     def _signable_data(self) -> bytes:
         return (
-            b"validator_ejection"
+            config.CHAIN_ID
+            + b"validator_ejection"
             + self.proposer_id
             + self.target_validator_id
             + self.title.encode("utf-8")
@@ -423,7 +427,8 @@ class TreasurySpendTransaction:
 
     def _signable_data(self) -> bytes:
         return (
-            b"treasury_spend"
+            config.CHAIN_ID
+            + b"treasury_spend"
             + self.proposer_id
             + self.recipient_id
             + struct.pack(">Q", self.amount)

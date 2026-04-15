@@ -203,7 +203,11 @@ def cmd_transfer(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee else 1
+    from messagechain.config import MIN_FEE
+    fee = args.fee if args.fee else MIN_FEE
+    if fee < MIN_FEE:
+        print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
+        sys.exit(1)
     recipient_id = bytes.fromhex(args.to)
     tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
 
