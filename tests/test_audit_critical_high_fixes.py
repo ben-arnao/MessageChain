@@ -2,9 +2,9 @@
 Regression tests for the 2026-04-14 critical/high audit findings.
 
 Covers:
-  C1 — governance txs (Proposal/Vote/Delegate/ValidatorEjection/TreasurySpend)
-       must include CHAIN_ID in their signable data to prevent cross-fork
-       signature replay.
+  C1 — governance txs (Proposal/Vote/Delegate/TreasurySpend) must include
+       CHAIN_ID in their signable data to prevent cross-fork signature
+       replay.
   H1 — RPC auth token bytes must not be logged, not even a prefix.
   H2 — reorg snapshot/restore must cover authority_keys so that rolling back
        a block containing a SetAuthorityKey tx reverts the authority key.
@@ -21,18 +21,15 @@ from messagechain.governance.governance import (
     ProposalTransaction,
     VoteTransaction,
     DelegateTransaction,
-    ValidatorEjectionProposal,
     TreasurySpendTransaction,
     create_proposal,
     create_vote,
     create_delegation,
     create_treasury_spend_proposal,
-    create_validator_ejection_proposal,
     verify_proposal,
     verify_vote,
     verify_delegation,
     verify_treasury_spend,
-    verify_validator_ejection,
 )
 from messagechain.identity.identity import Entity
 
@@ -66,12 +63,6 @@ class TestGovernanceTxsBindChainId(unittest.TestCase):
 
     def test_delegate_signable_data_includes_chain_id(self):
         tx = create_delegation(self.alice, [(self.bob.entity_id, 100)])
-        self.assertTrue(tx._signable_data().startswith(config.CHAIN_ID))
-
-    def test_validator_ejection_signable_data_includes_chain_id(self):
-        tx = create_validator_ejection_proposal(
-            self.alice, self.bob.entity_id, "t", "d",
-        )
         self.assertTrue(tx._signable_data().startswith(config.CHAIN_ID))
 
     def test_treasury_spend_signable_data_includes_chain_id(self):
@@ -114,14 +105,6 @@ class TestGovernanceTxsBindChainId(unittest.TestCase):
         )
         self._verify_rejects_foreign_chain_sig(
             tx, verify_treasury_spend, self.alice.public_key,
-        )
-
-    def test_validator_ejection_cross_fork_replay_rejected(self):
-        tx = create_validator_ejection_proposal(
-            self.alice, self.bob.entity_id, "t", "d",
-        )
-        self._verify_rejects_foreign_chain_sig(
-            tx, verify_validator_ejection, self.alice.public_key,
         )
 
 

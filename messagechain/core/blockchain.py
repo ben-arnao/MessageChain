@@ -1444,7 +1444,7 @@ class Blockchain:
             from messagechain.config import GOVERNANCE_VOTING_WINDOW
             from messagechain.governance.governance import (
                 ProposalTransaction, VoteTransaction, DelegateTransaction,
-                TreasurySpendTransaction, ValidatorEjectionProposal,
+                TreasurySpendTransaction,
             )
 
             sim_supply = _copy.copy(self.supply)
@@ -1461,8 +1461,7 @@ class Blockchain:
             # and burn/pay fees through the sim supply.
             for gtx in (governance_txs or []):
                 if isinstance(gtx, (ProposalTransaction,
-                                    TreasurySpendTransaction,
-                                    ValidatorEjectionProposal)):
+                                    TreasurySpendTransaction)):
                     sender = gtx.proposer_id
                 elif isinstance(gtx, VoteTransaction):
                     sender = gtx.voter_id
@@ -1475,8 +1474,7 @@ class Blockchain:
                 )
                 _bump_wm(sender, gtx.signature.leaf_index)
                 if isinstance(gtx, (ProposalTransaction,
-                                    TreasurySpendTransaction,
-                                    ValidatorEjectionProposal)):
+                                    TreasurySpendTransaction)):
                     sim_tracker.add_proposal(
                         gtx, block_height=block_height,
                         supply_tracker=sim_supply,
@@ -1486,24 +1484,17 @@ class Blockchain:
                 elif isinstance(gtx, DelegateTransaction):
                     sim_tracker.set_delegation(gtx.delegator_id, gtx.targets)
 
-            # Phase 2: auto-execute closed binding proposals (treasury
-            # spends + validator ejections).  Must mirror the apply-path
-            # ordering and predicates exactly.
+            # Phase 2: auto-execute closed treasury spends.  Must mirror
+            # the apply-path ordering and predicates exactly.
             for pid, state in list(sim_tracker.proposals.items()):
                 proposal = state.proposal
-                if not isinstance(proposal, (TreasurySpendTransaction,
-                                             ValidatorEjectionProposal)):
+                if not isinstance(proposal, TreasurySpendTransaction):
                     continue
                 if block_height - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
                     continue
-                if isinstance(proposal, TreasurySpendTransaction):
-                    sim_tracker.execute_treasury_spend(
-                        proposal, sim_supply, current_block=block_height,
-                    )
-                else:
-                    sim_tracker.execute_validator_ejection(
-                        proposal, sim_supply, current_block=block_height,
-                    )
+                sim_tracker.execute_treasury_spend(
+                    proposal, sim_supply, current_block=block_height,
+                )
 
             # Read the post-governance state back into sim_* for state_root
             sim_balances = dict(sim_supply.balances)
@@ -2269,9 +2260,9 @@ class Blockchain:
         """
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, DelegateTransaction,
-            TreasurySpendTransaction, ValidatorEjectionProposal,
+            TreasurySpendTransaction,
             verify_proposal, verify_vote, verify_delegation,
-            verify_treasury_spend, verify_validator_ejection,
+            verify_treasury_spend,
         )
         if isinstance(gtx, ProposalTransaction):
             sender = gtx.proposer_id
@@ -2285,9 +2276,6 @@ class Blockchain:
         elif isinstance(gtx, TreasurySpendTransaction):
             sender = gtx.proposer_id
             verifier = verify_treasury_spend
-        elif isinstance(gtx, ValidatorEjectionProposal):
-            sender = gtx.proposer_id
-            verifier = verify_validator_ejection
         else:
             return False, f"Unknown governance tx type {type(gtx).__name__}"
         if sender not in self.public_keys:
@@ -2789,15 +2777,15 @@ class Blockchain:
            could be indefinitely ignored.
 
         3. PRUNE — closed proposals are dropped from the tracker to bound
-           memory growth.  The audit log in `treasury_spend_log` /
-           `ejection_log` survives pruning so post-hoc accountability
-           does not depend on proposal retention.
+           memory growth.  The audit log in `treasury_spend_log` survives
+           pruning so post-hoc accountability does not depend on proposal
+           retention.
         """
         if not hasattr(self, "governance") or self.governance is None:
             return
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, DelegateTransaction,
-            TreasurySpendTransaction, ValidatorEjectionProposal,
+            TreasurySpendTransaction,
         )
         from messagechain.config import GOVERNANCE_VOTING_WINDOW
 
@@ -2808,8 +2796,7 @@ class Blockchain:
 
         # Phase 1: register
         for gtx in block.governance_txs:
-            if isinstance(gtx, (ProposalTransaction, TreasurySpendTransaction,
-                                ValidatorEjectionProposal)):
+            if isinstance(gtx, (ProposalTransaction, TreasurySpendTransaction)):
                 self.supply.pay_fee_with_burn(
                     gtx.proposer_id, proposer_id, gtx.fee, current_base_fee,
                 )
@@ -2830,27 +2817,16 @@ class Blockchain:
                 tracker.set_delegation(gtx.delegator_id, gtx.targets)
                 self._bump_watermark(gtx.delegator_id, gtx.signature.leaf_index)
 
-        # Phase 2: auto-execute binding proposals whose window has closed
+        # Phase 2: auto-execute binding treasury spends whose window has closed
         for pid, state in list(tracker.proposals.items()):
             proposal = state.proposal
-            if not isinstance(proposal, (TreasurySpendTransaction,
-                                         ValidatorEjectionProposal)):
+            if not isinstance(proposal, TreasurySpendTransaction):
                 continue
             if current_block - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
                 continue
-            if isinstance(proposal, TreasurySpendTransaction):
-                tracker.execute_treasury_spend(
-                    proposal, self.supply, current_block=current_block,
-                )
-            else:
-                # pos_consensus=None: Blockchain uses supply.staked directly
-                # as the authoritative validator set.  Any external node-
-                # level ProofOfStake instance is re-synced via
-                # sync_consensus_stakes.
-                tracker.execute_validator_ejection(
-                    proposal, self.supply,
-                    current_block=current_block,
-                )
+            tracker.execute_treasury_spend(
+                proposal, self.supply, current_block=current_block,
+            )
 
         # Phase 3: prune
         tracker.prune_closed_proposals(current_block)

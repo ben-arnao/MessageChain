@@ -83,7 +83,7 @@ def _deserialize_governance_tx(data: dict):
     """
     from messagechain.governance.governance import (
         ProposalTransaction, VoteTransaction, DelegateTransaction,
-        TreasurySpendTransaction, ValidatorEjectionProposal,
+        TreasurySpendTransaction,
     )
     tag = data.get("type")
     if tag == "governance_proposal":
@@ -94,8 +94,6 @@ def _deserialize_governance_tx(data: dict):
         return DelegateTransaction.deserialize(data)
     if tag == "treasury_spend":
         return TreasurySpendTransaction.deserialize(data)
-    if tag == "validator_ejection":
-        return ValidatorEjectionProposal.deserialize(data)
     raise ValueError(f"Unknown governance tx type: {tag!r}")
 
 

@@ -5,8 +5,8 @@ between block processing and the GovernanceTracker.  It:
 
 1. Registers proposals / votes / delegations from each block's governance_txs
 2. Pays the fee via the normal burn-and-tip path
-3. Auto-executes binding proposals (treasury spends, ejections) whose
-   voting window has closed as of the current block height
+3. Auto-executes binding proposals (treasury spends) whose voting
+   window has closed as of the current block height
 4. Prunes expired proposals to bound tracker memory
 
 These tests exercise the dispatcher directly with crafted mock-blocks,
@@ -20,7 +20,7 @@ from messagechain.core.blockchain import Blockchain
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.governance.governance import (
     create_proposal, create_vote, create_delegation,
-    create_treasury_spend_proposal, create_validator_ejection_proposal,
+    create_treasury_spend_proposal,
     VoteTransaction,
 )
 from messagechain.identity.identity import Entity
@@ -112,32 +112,6 @@ class TestGovernancePipeline(unittest.TestCase):
         self.assertEqual(bob_after - bob_before, 5_000)
         # Audit log records the spend
         self.assertEqual(len(self.chain.governance.treasury_spend_log), 1)
-
-    def test_ejection_auto_executes_and_unbonds_stake(self):
-        ejection = create_validator_ejection_proposal(
-            self.alice, self.bob.entity_id, "Eject Bob", "Justified",
-        )
-        proposal_block = 5
-        b1 = _make_block(proposal_block, self.alice.entity_id, [ejection])
-        self.chain._apply_governance_block(b1)
-
-        for voter in (self.alice, self.carol):
-            vote = create_vote(voter, ejection.proposal_id, True)
-            b = _make_block(proposal_block + 1, self.alice.entity_id, [vote])
-            self.chain._apply_governance_block(b)
-
-        # Advance past window — ejection auto-executes
-        closed_block = proposal_block + GOVERNANCE_VOTING_WINDOW + 1
-        self.chain._apply_governance_block(
-            _make_block(closed_block, self.alice.entity_id, [])
-        )
-
-        self.assertEqual(self.chain.supply.get_staked(self.bob.entity_id), 0)
-        self.assertEqual(
-            self.chain.supply.get_pending_unstake(self.bob.entity_id),
-            10_000,
-        )
-        self.assertEqual(len(self.chain.governance.ejection_log), 1)
 
     def test_closed_proposals_pruned(self):
         proposal = create_proposal(
