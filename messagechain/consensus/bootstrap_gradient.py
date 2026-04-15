@@ -78,6 +78,77 @@ def compute_bootstrap_progress(
     return max(height_component, stake_component)
 
 
+def min_stake_for_progress(
+    bootstrap_progress: float,
+    *,
+    full_min_stake: int,
+    inflection: float = 0.5,
+) -> int:
+    """Minimum stake required to register as a validator, by progress.
+
+    Formula:
+        0                                              if progress < inflection
+        full_min_stake * (progress - inflection) / (1 - inflection)  otherwise
+
+    With the default inflection = 0.5, the first half of bootstrap
+    allows truly zero-stake validator registration — honest newcomers
+    with no tokens can start earning via the attester committee and
+    accumulate stake organically.  The second half ramps linearly to
+    `full_min_stake` at progress = 1.0, at which point normal PoS
+    economics apply.
+
+    `full_min_stake` is normally `config.VALIDATOR_MIN_STAKE`.  Passed
+    as a kwarg so the formula is testable in isolation without
+    importing the full config.
+
+    Returns an integer (token count), floor-rounded from the linear
+    ramp so a stake at exactly the threshold still passes.
+    """
+    if not (0.0 <= bootstrap_progress <= 1.0):
+        raise ValueError(
+            f"bootstrap_progress must be in [0, 1], got {bootstrap_progress}"
+        )
+    if not (0.0 <= inflection < 1.0):
+        raise ValueError(
+            f"inflection must be in [0, 1), got {inflection}"
+        )
+    if full_min_stake < 0:
+        raise ValueError(f"full_min_stake must be >= 0, got {full_min_stake}")
+
+    if bootstrap_progress < inflection:
+        return 0
+    ramp = (bootstrap_progress - inflection) / (1.0 - inflection)
+    return int(full_min_stake * ramp)
+
+
+def escrow_blocks_for_progress(
+    bootstrap_progress: float,
+    *,
+    max_escrow_blocks: int,
+) -> int:
+    """Attester-reward escrow window length as a function of progress.
+
+    Linear from `max_escrow_blocks` at progress=0 to 0 at progress=1.
+    Rewards earned during bootstrap sit in escrow — slashable if the
+    validator misbehaves — and unlock after this many blocks.
+
+    At progress=1.0 the escrow collapses to zero: rewards credit
+    straight to balance, matching normal post-bootstrap behavior.
+
+    `max_escrow_blocks` is typically `ATTESTER_ESCROW_BLOCKS` from
+    config (12,960 blocks = 90 days at 600s).
+    """
+    if not (0.0 <= bootstrap_progress <= 1.0):
+        raise ValueError(
+            f"bootstrap_progress must be in [0, 1], got {bootstrap_progress}"
+        )
+    if max_escrow_blocks < 0:
+        raise ValueError(
+            f"max_escrow_blocks must be >= 0, got {max_escrow_blocks}"
+        )
+    return int(max_escrow_blocks * (1.0 - bootstrap_progress))
+
+
 class RatchetState:
     """In-memory monotonic accumulator for bootstrap_progress.
 

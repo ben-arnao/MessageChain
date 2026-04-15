@@ -2045,13 +2045,27 @@ class Blockchain:
         from messagechain.core.staking import (
             StakeTransaction, verify_stake_transaction,
         )
-        from messagechain.consensus.pos import graduated_min_stake
+        from messagechain.consensus.bootstrap_gradient import (
+            min_stake_for_progress,
+        )
+        from messagechain.config import VALIDATOR_MIN_STAKE
         if not isinstance(stx, StakeTransaction):
             return False, f"Unexpected type {type(stx).__name__}"
         if stx.entity_id not in self.public_keys:
             return False, f"Unknown sender {stx.entity_id.hex()[:16]}"
         pk = self.public_keys[stx.entity_id]
-        if not verify_stake_transaction(stx, pk, block_height=self.height):
+        # verify_stake_transaction applies its own independent min-stake
+        # check that we want to bypass during bootstrap (it uses the legacy
+        # height-tier table, not the bootstrap_progress gradient).  Pass
+        # the progress-derived min explicitly so the transaction-level
+        # signature/structure verification uses the same threshold as the
+        # block-level validation below.
+        progress_min = min_stake_for_progress(
+            self.bootstrap_progress, full_min_stake=VALIDATOR_MIN_STAKE,
+        )
+        if not verify_stake_transaction(
+            stx, pk, block_height=self.height, min_stake_override=progress_min,
+        ):
             return False, "Invalid signature or fields"
 
         expected_nonce = pending_nonces.get(
@@ -2060,11 +2074,17 @@ class Blockchain:
         if stx.nonce != expected_nonce:
             return False, f"Invalid nonce: expected {expected_nonce}, got {stx.nonce}"
 
-        # Amount must meet the graduated validator minimum for the current
-        # block height so a new validator cannot slip in under-staked.
-        min_stake = graduated_min_stake(self.height)
-        if stx.amount < min_stake:
-            return False, f"Stake amount {stx.amount} below graduated minimum {min_stake}"
+        # Amount must meet the progress-derived minimum so under-bootstrap
+        # newcomers can stake any positive amount, while post-bootstrap
+        # new validators must clear VALIDATOR_MIN_STAKE.  The same gate is
+        # applied at tx-level verification above; duplicated here so
+        # callers that go directly through validate_block still see the
+        # check even if verify_stake_transaction was short-circuited.
+        if stx.amount < progress_min:
+            return False, (
+                f"Stake amount {stx.amount} below bootstrap-progress "
+                f"minimum {progress_min}"
+            )
 
         spent_so_far = pending_balance_spent.get(stx.entity_id, 0)
         needed = spent_so_far + stx.fee + stx.amount

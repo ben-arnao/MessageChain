@@ -199,18 +199,34 @@ def create_unstake_transaction(
     return tx
 
 
-def verify_stake_transaction(tx: StakeTransaction, public_key: bytes, block_height: int = 0) -> bool:
+def verify_stake_transaction(
+    tx: StakeTransaction,
+    public_key: bytes,
+    block_height: int = 0,
+    *,
+    min_stake_override: int | None = None,
+) -> bool:
     """Verify a stake transaction's signature and structural fields.
 
     Mirrors the uniform timestamp/amount validation applied to message and
     transfer transactions so that no transaction type has a weaker check
     than another.
+
+    `min_stake_override`: if provided, the caller (typically Blockchain,
+    which has access to `bootstrap_progress`) dictates the minimum stake
+    amount.  When None, falls back to the legacy height-tier table
+    (graduated_min_stake) for backward compatibility with tests that do
+    not drive a full blockchain context.
     """
-    from messagechain.consensus.pos import graduated_min_stake
     if tx.amount <= 0:
         return False
-    if tx.amount < graduated_min_stake(block_height):
-        return False
+    if min_stake_override is not None:
+        if tx.amount < min_stake_override:
+            return False
+    else:
+        from messagechain.consensus.pos import graduated_min_stake
+        if tx.amount < graduated_min_stake(block_height):
+            return False
     if tx.fee < MIN_FEE:
         return False
     if tx.timestamp <= 0:
