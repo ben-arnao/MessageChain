@@ -280,24 +280,15 @@ FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= tota
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 # Supermajority (2/3) required to approve a BINDING proposal (treasury
-# spend).  Denominator is TOTAL ELIGIBLE voting weight (staked validators
-# plus aged delegators), not just participants — silence counts as "no".
-# This gives an implicit 2/3 turnout floor for binding outcomes and keeps
-# self-serving proposals from sliding through on a quiet week.
+# spend).  Denominator is TOTAL ELIGIBLE voting weight (sum of every
+# snapshotted validator's own stake), not just participants — silence
+# counts as "no".  This gives an implicit 2/3 turnout floor for binding
+# outcomes and keeps self-serving proposals from sliding through on a
+# quiet week.
 GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >=2/3 of total eligible weight must approve
 GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: yes * 3 > total * 2
 GOVERNANCE_PROPOSAL_FEE = 10_000      # fee to create a proposal (spam deterrent)
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
-GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power
-MAX_DELEGATION_TARGETS = 3            # max validators a user can delegate to
-# Delegation "aging" — flash-loan defense for governance.  A delegation
-# counts toward a proposal's tally only if it was registered at least this
-# many blocks before the proposal's creation.  Fresh delegations are
-# silently ignored for that proposal.  Defaults to the voting window so an
-# attacker who borrows tokens would need to hold them for at least the
-# entire voting period before the next proposal — at which point they have
-# real skin in the game, which is exactly the property we want.
-GOVERNANCE_DELEGATION_AGING_BLOCKS = GOVERNANCE_VOTING_WINDOW
 
 # RPC authentication — prevents local privilege escalation where an
 # unprivileged process calls submit_transaction / stake / ban_peer.
