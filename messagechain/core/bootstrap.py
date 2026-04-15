@@ -164,7 +164,26 @@ def bootstrap_seed_local(
 # reasons (security + optics + bootstrap runway).
 # ───────────────────────────────────────────────────────────────────────
 
-RECOMMENDED_STAKE_PER_SEED: int = 250_000
+# Each seed stakes ~1/30 of total supply.  With 3 seeds = ~10% of supply
+# staked at genesis by the founder, chosen so the founder holds a durable
+# 2/3+ supermajority of stake throughout the bootstrap window even after
+# thousands of zero-funds validators accumulate escrow-era rewards.
+#
+# Napkin math for the security floor:
+#   * BOOTSTRAP_END_HEIGHT ≈ 105K blocks → ≈ 1.68M tokens total minted
+#     during bootstrap (16 tokens/block × 105K).
+#   * Even if 100% of minted tokens are captured by non-seed validators
+#     and immediately staked, that's ≤ 2M of non-seed stake.
+#   * With 3 seeds × 33M = 99M seed stake, seed share stays above
+#     99M / (99M + 2M) = 98%.  Comfortable headroom against Sybil
+#     stake accumulation AND against the founder wanting to move
+#     some allocation (e.g. treasury grants, early backers) without
+#     losing >2/3 control.
+#
+# This is the "founder secures the chain during bootstrap" constant.
+# Smaller values weaken Sybil resistance; larger values over-concentrate
+# supply.  100M total (10%) is the pragmatic sweet spot.
+RECOMMENDED_STAKE_PER_SEED: int = 33_000_000
 RECOMMENDED_FEE_BUFFER: int = MIN_FEE * 10          # 1_000
 RECOMMENDED_GENESIS_PER_SEED: int = (
     RECOMMENDED_STAKE_PER_SEED + RECOMMENDED_FEE_BUFFER

@@ -197,19 +197,35 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
             sweep_amount,
         )
 
-    def test_founder_token_concentration_below_one_tenth_of_one_percent(self):
-        """Optics check: founder visible allocation stays 'invisibly small'.
+    def test_founder_token_concentration_within_security_and_optics_bounds(self):
+        """Founder allocation sits above the security floor and below the
+        optics ceiling.
 
-        3 seeds × 251,000 = 753,000 tokens at genesis, against
-        GENESIS_SUPPLY = 1,000,000,000.  That's 0.0753% — comfortably
-        under the 'not-scary' threshold discussed in the runbook.  The
-        treasury allocation is 4% but it's governance-controlled and
-        flows via proposals, not to the founder.
+        Security floor (≥5% of supply): the founder must hold enough
+        stake to retain a 2/3 supermajority of consensus weight during
+        bootstrap, even after zero-funds validators accumulate tokens via
+        escrow-era committee rewards.  Below 5%, a modestly funded Sybil
+        swarm can outweigh the seeds.
+
+        Optics ceiling (≤15% of supply): hoarding more than this signals
+        an extractive genesis distribution and deters outside validators
+        from participating.  The treasury (4%) is excluded from this
+        calculation — it's governance-controlled and flows via proposals.
         """
         from messagechain.config import GENESIS_SUPPLY
         founder_total = 3 * RECOMMENDED_GENESIS_PER_SEED
         pct = founder_total / GENESIS_SUPPLY
-        self.assertLess(pct, 0.001, f"founder concentration is {pct:.4%}")
+        self.assertGreaterEqual(
+            pct, 0.05,
+            f"founder concentration is {pct:.4%} — below the 5% security "
+            f"floor; zero-funds validators could outweigh the seeds "
+            f"during bootstrap",
+        )
+        self.assertLessEqual(
+            pct, 0.15,
+            f"founder concentration is {pct:.4%} — above the 15% optics "
+            f"ceiling; hoarding at this level looks extractive",
+        )
 
 
 if __name__ == "__main__":
