@@ -65,11 +65,6 @@ class TestCLIParser(unittest.TestCase):
         args = self.parser.parse_args(["send", "Hi", "--server", "10.0.0.1:9334"])
         self.assertEqual(args.server, "10.0.0.1:9334")
 
-    def test_demo_command(self):
-        """'demo' runs the demo mode."""
-        args = self.parser.parse_args(["demo"])
-        self.assertEqual(args.command, "demo")
-
     def test_info_command(self):
         """'info' shows chain info."""
         args = self.parser.parse_args(["info"])

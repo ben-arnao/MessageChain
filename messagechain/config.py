@@ -129,7 +129,7 @@ ENFORCE_SLOT_TIMING = True
 
 # Network
 DEFAULT_PORT = 9333
-SEED_NODES = [("127.0.0.1", 9333)]
+SEED_NODES: list[tuple[str, int]] = []
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 5  # seconds
 

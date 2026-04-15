@@ -5,7 +5,6 @@ Unified CLI for MessageChain.
     messagechain start --mine       # Run a node and produce blocks
     messagechain account            # Create an account
     messagechain send "Hello!"      # Send a message
-    messagechain demo               # Run local demo
     messagechain info               # Show chain info
 """
 
@@ -281,13 +280,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     read.add_argument("--last", type=int, default=10, help="Number of messages (default: 10)")
     read.add_argument("--server", type=str, default=None, help="Server address host:port")
-
-    # --- demo ---
-    sub.add_parser(
-        "demo",
-        help="Run a local demo",
-        description="Run a full local demo of the protocol.",
-    )
 
     # --- info ---
     info = sub.add_parser(
@@ -1515,12 +1507,6 @@ def cmd_read(args):
         sys.exit(1)
 
 
-def cmd_demo(_args):
-    """Run local demo."""
-    from run_node import run_demo
-    run_demo()
-
-
 def cmd_info(args):
     """Show chain info from a running node."""
     host, port = _parse_server(args.server)
@@ -1640,7 +1626,6 @@ def main():
         "generate-key": cmd_generate_key,
         "verify-key": cmd_verify_key,
         "read": cmd_read,
-        "demo": cmd_demo,
         "info": cmd_info,
         "proposals": cmd_proposals,
         "validators": cmd_validators,

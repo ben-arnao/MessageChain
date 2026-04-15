@@ -31,7 +31,9 @@ python -m messagechain start             # sync the full chain — leave running
 
 `start` is a foreground process; open a second terminal for the commands below. `account` briefly loads your key in memory to sign — unavoidable, so only run it on a trusted machine.
 
-> **Before it'll work:** the shipped seed list is a `127.0.0.1` placeholder. Until a public seed is announced, pass `--seed <host>:<port>` from someone on the network, or `start` will idle with zero peers. New wallets also start at **0 balance** — there is no faucet, so `send` / `transfer` / `stake` need someone to fund you first.
+Chain data lives at `~/.messagechain/chaindata/` by default (override with `--data-dir <path>`). Delete it to wipe local state and re-sync from peers.
+
+> **Before it'll work:** the shipped seed list is empty pending public launch. Pass `--seed <host>:<port>` with an announced seed, or `start` will idle with zero peers. New wallets also start at **0 balance** — there is no faucet, so `send` / `transfer` / `stake` need someone to fund you first.
 
 ## Everyday commands
 
@@ -77,14 +79,16 @@ Use a dedicated, patched machine you physically control — not a daily-driver l
 Linux / macOS:
 
 ```bash
-echo "<checksummed_private_key>" > /etc/messagechain/validator.key
-chmod 0600 /etc/messagechain/validator.key
+sudo mkdir -p /etc/messagechain
+echo "<checksummed_private_key>" | sudo tee /etc/messagechain/validator.key > /dev/null
+sudo chmod 0600 /etc/messagechain/validator.key
 python -m messagechain start --mine --keyfile /etc/messagechain/validator.key
 ```
 
 Windows (PowerShell, admin):
 
 ```powershell
+New-Item -ItemType Directory -Force -Path "$env:ProgramData\MessageChain" | Out-Null
 Set-Content -Path "$env:ProgramData\MessageChain\validator.key" -Value "<checksummed_private_key>" -NoNewline
 icacls "$env:ProgramData\MessageChain\validator.key" /inheritance:r /grant:r "$env:USERNAME:(R)"
 python -m messagechain start --mine --keyfile "$env:ProgramData\MessageChain\validator.key"
