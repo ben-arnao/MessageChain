@@ -163,6 +163,17 @@ class Blockchain:
         from messagechain.consensus.bootstrap_gradient import RatchetState
         self._bootstrap_ratchet: RatchetState = RatchetState()
 
+        # Attester-reward escrow (stage 3).  Bootstrap-era committee
+        # rewards sit here for escrow_blocks_for_progress(progress)
+        # blocks before unlocking to spendable balance.  Slashable
+        # during the window.  The ledger is in-memory; its contents are
+        # deterministic from chain replay.  Balance itself is updated
+        # at reward time (so the tokens exist in the state tree), but
+        # spendable balance subtracts both immature + escrow so the
+        # validator can't move the locked portion.
+        from messagechain.economics.escrow import EscrowLedger
+        self._escrow: EscrowLedger = EscrowLedger()
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -955,7 +966,25 @@ class Blockchain:
         # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
         self.supply.pay_fee_with_burn(tx.submitter_id, proposer_id, tx.fee, self.supply.base_fee)
 
-        # Slash the offender
+        # Slash the offender: burn stake, burn bootstrap-era escrow.
+        # Escrow burn happens BEFORE the stake burn returns so the
+        # logged totals reflect the full penalty.  Bootstrap escrow
+        # captures rewards earned during the slashable window — if the
+        # offender was accumulating honest-looking rewards while also
+        # equivocating, those rewards evaporate.  Tokens previously
+        # credited to supply.balances are reclaimed via the supply
+        # tracker's reduction path.
+        escrow_burned = self._escrow.slash_all(tx.evidence.offender_id)
+        if escrow_burned > 0:
+            # Reduce both balance (tokens were credited there at mint)
+            # and total_supply (escrow-burn is a permanent destruction,
+            # same as stake-burn).
+            cur_balance = self.supply.balances.get(tx.evidence.offender_id, 0)
+            self.supply.balances[tx.evidence.offender_id] = max(
+                0, cur_balance - escrow_burned,
+            )
+            self.supply.total_supply -= escrow_burned
+
         slashed, finder_reward = self.supply.slash_validator(
             tx.evidence.offender_id, tx.submitter_id
         )
@@ -970,10 +999,16 @@ class Blockchain:
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
-            f"burned={slashed - finder_reward}, finder_reward={finder_reward}"
+            f"stake_burned={slashed - finder_reward}, "
+            f"escrow_burned={escrow_burned}, "
+            f"finder_reward={finder_reward}"
         )
 
-        return True, f"Validator slashed (total={slashed}, reward={finder_reward})"
+        return True, (
+            f"Validator slashed "
+            f"(stake={slashed}, escrow={escrow_burned}, "
+            f"reward={finder_reward})"
+        )
 
     def get_median_time_past(self) -> float:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
@@ -999,16 +1034,32 @@ class Blockchain:
             if eid == entity_id and current_height - height < COINBASE_MATURITY
         )
 
-    def get_spendable_balance(self, entity_id: bytes) -> int:
-        """Get spendable balance (total balance minus immature rewards).
+    def get_escrowed_balance(self, entity_id: bytes) -> int:
+        """Total attester rewards currently held in the escrow lock.
 
-        Floor at 0 — immature tracking corruption must never produce a
-        negative spendable balance that could be misinterpreted as a
-        large positive value by callers expecting unsigned semantics.
+        Escrow is a parallel lock on top of balance — the tokens have
+        been credited to `supply.balances` (so they're in the state
+        tree), but they are not spendable until the escrow window
+        elapses or a stage-4 slashing event burns them.
+        """
+        return self._escrow.total_escrowed(entity_id)
+
+    def get_spendable_balance(self, entity_id: bytes) -> int:
+        """Spendable balance = balance minus (immature + escrow) locks.
+
+        Three concurrent lock sources, all subtracted:
+          * immature: coinbase-maturity lock, 10 blocks, ~100 min
+          * escrow:   bootstrap-era slashing window, up to 12,960 blocks
+          * (stake is already excluded — `balance` only holds liquid tokens)
+
+        Floor at 0 — tracking corruption must never produce a negative
+        spendable balance that could be misinterpreted as a large
+        positive value by callers expecting unsigned semantics.
         """
         total = self.supply.get_balance(entity_id)
         immature = self.get_immature_balance(entity_id)
-        return max(0, total - immature)
+        escrowed = self.get_escrowed_balance(entity_id)
+        return max(0, total - immature - escrowed)
 
     def _touch_state(self, entity_ids):
         """Sync the state tree with current dicts for the given entities.
@@ -1601,10 +1652,13 @@ class Blockchain:
                 stakes_for_att = stakes
             validator_stake = stakes_for_att.get(att.validator_id, 0)
             total_stake = sum(stakes_for_att.values())
-            # Post-bootstrap safety floor: finalization additionally requires
-            # the active validator count to meet the same threshold used to
-            # exit bootstrap. Prevents a thinned-out post-bootstrap chain
-            # from finalizing blocks via a single validator.
+            # Finality safety floor: independent of bootstrap_progress,
+            # finalization always requires the active validator count
+            # to meet the minimum.  Prevents a thinned-out chain from
+            # finalizing via a single validator — 2/3 of tiny stake is
+            # not a meaningful commitment.  See config comment: the
+            # historical name reflects the old binary bootstrap flag;
+            # the canonical bootstrap signal is bootstrap_progress.
             justified = self.finality.add_attestation(
                 att, validator_stake, total_stake,
                 min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
@@ -2494,9 +2548,20 @@ class Blockchain:
         for ttx in block.transfer_transactions:
             self._apply_transfer_with_burn(ttx, proposer_id, current_base_fee)
             self._bump_watermark(ttx.entity_id, ttx.signature.leaf_index)
-        # Apply slash transactions
+        # Apply slash transactions.  Burns stake + accumulated escrow;
+        # escrow burn runs first so any bootstrap-era rewards the
+        # offender had built up also evaporate.  Matches the policy
+        # from apply_slash_transaction (which is the other entry point
+        # for slashing — kept semantically identical to avoid drift).
         for stx in block.slash_transactions:
             self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
+            escrow_burned = self._escrow.slash_all(stx.evidence.offender_id)
+            if escrow_burned > 0:
+                cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
+                self.supply.balances[stx.evidence.offender_id] = max(
+                    0, cur_balance - escrow_burned,
+                )
+                self.supply.total_supply -= escrow_burned
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
             # Revoke delegations pointing to the slashed validator — delegators
@@ -2646,6 +2711,40 @@ class Blockchain:
             (h, eid, amt) for h, eid, amt in self._immature_rewards
             if h > cutoff
         ]
+
+        # Escrow: attester rewards are slashable for
+        # escrow_blocks_for_progress(progress) blocks before becoming
+        # fully liquid.  At progress=1.0 the escrow window collapses to
+        # 0 (matches post-bootstrap normal PoS — no additional lock).
+        # Balance is already credited via mint_block_reward; escrow is
+        # a parallel lock recorded so (a) spendable balance reflects
+        # the lock, and (b) slashing can burn the locked amount.
+        from messagechain.consensus.bootstrap_gradient import (
+            escrow_blocks_for_progress,
+        )
+        from messagechain.config import ATTESTER_ESCROW_BLOCKS
+        escrow_len = escrow_blocks_for_progress(
+            self.bootstrap_progress,
+            max_escrow_blocks=ATTESTER_ESCROW_BLOCKS,
+        )
+        if escrow_len > 0:
+            current_h = block.header.block_number
+            unlock_at = current_h + escrow_len
+            for att_id, att_reward in result["attestor_rewards"].items():
+                if att_reward > 0 and att_id != proposer_id:
+                    # Proposer-as-committee-member share is clawed back
+                    # into proposer_reward by the PROPOSER_REWARD_CAP
+                    # path in mint_block_reward, so we don't re-escrow
+                    # it here — only pure-committee earnings.
+                    self._escrow.add(
+                        entity_id=att_id, amount=att_reward,
+                        earned_at=current_h, unlock_at=unlock_at,
+                    )
+
+        # Unlock matured escrow — no balance change (tokens were already
+        # credited at mint time), just lifting the spendable-balance
+        # restriction.
+        self._escrow.pop_matured(block.header.block_number)
         # Track proposer's block signature count (WOTS+ leaf consumed)
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1

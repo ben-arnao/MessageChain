@@ -1,7 +1,7 @@
 """
 Slashing for MessageChain.
 
-Two slashable offenses:
+Two slashable offenses currently implemented:
 
 1. **Double-proposal**: Signing two different block headers at the same height.
    A proposer who equivocates is attacking consensus.
@@ -10,7 +10,15 @@ Two slashable offenses:
    same height. A validator who votes for conflicting blocks is attacking
    finality (nothing-at-stake).
 
-Both offenses carry the same penalty: 100% stake destruction.
+Both offenses carry the same penalty: 100% stake destruction AND
+full burn of the offender's bootstrap-era escrow (see stage 3 /
+`Blockchain._escrow`).  Burning escrow matters because during the
+free-entry bootstrap window an attacker can earn substantial rewards
+with minimal stake — without escrow burn, the stake-only penalty is
+a negligible deterrent.  Escrow burn is applied by the Blockchain
+(apply_slash_transaction and the slash_transactions loop in
+_apply_block_state); the SupplyTracker-level slash_validator handles
+only the stake portion.
 
 Evidence is self-contained: two conflicting signed messages from the same
 validator at the same height. Anyone can verify the evidence using only the
@@ -18,6 +26,26 @@ offender's public key — no external state required.
 
 Anyone can submit evidence. The submitter receives a finder's reward
 (a percentage of the slashed stake) to incentivize monitoring.
+
+---
+
+**Not yet implemented: censorship evidence.**  The design math called
+for a third slashable offense: a proposer who excludes a transaction
+from the mempool above the fee floor for more than N blocks (see
+design discussion).  This is deferred because a correct, adversary-
+resistant implementation requires:
+
+  * Global mempool consensus (different nodes have different mempool
+    views, so "proposer saw the tx" is not universally observable).
+  * An anti-grief mechanism (malicious actors shouldn't be able to
+    hide a tx locally then accuse a proposer of excluding it).
+  * Clear policy for "full block" / "proposer's block was at size cap"
+    cases where exclusion was legitimate.
+
+Equivocation and double-attestation cover the most dangerous
+misbehaviors (liveness + finality attacks).  Censorship is a
+resilience enhancement, not a safety requirement, and ships cleanly
+as follow-up work once the fee-floor semantics stabilize.
 """
 
 import hashlib
