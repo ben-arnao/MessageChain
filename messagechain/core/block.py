@@ -109,6 +109,7 @@ def compute_state_root(
     leaf_watermarks: dict[bytes, int] | None = None,
     key_rotation_counts: dict[bytes, int] | None = None,
     revoked_entities: "set[bytes] | frozenset[bytes] | None" = None,
+    slashed_validators: "set[bytes] | frozenset[bytes] | None" = None,
 ) -> bytes:
     """Compute a Merkle commitment to the full account state.
 
@@ -132,6 +133,7 @@ def compute_state_root(
         leaf_watermarks=leaf_watermarks,
         key_rotation_counts=key_rotation_counts,
         revoked_entities=revoked_entities,
+        slashed_validators=slashed_validators,
     )
 
 

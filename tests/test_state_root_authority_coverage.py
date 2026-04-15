@@ -131,5 +131,26 @@ class TestStateRootCoversRotationCount(_Base):
         )
 
 
+class TestStateRootCoversSlashed(_Base):
+    """slashed_validators must be inside the leaf commitment for the
+    same reason revoked_entities is: the "already slashed" guard in
+    apply_slash_transaction reads from this set, so two nodes with
+    diverging sets could accept/reject the same double-slash tx
+    differently.  Rare in practice (reorg restores it properly), but
+    the invariant "state_root pins down all consensus-critical state"
+    must not depend on that.
+    """
+
+    def test_slashed_entity_changes_state_root(self):
+        a, b, alice = self._twin_chains(b"alice-sl")
+        a.slashed_validators.add(alice.entity_id)
+        a._touch_state({alice.entity_id})
+        self.assertNotEqual(
+            a.compute_current_state_root(),
+            b.compute_current_state_root(),
+            "state_root must differ when slashed_validators differs",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

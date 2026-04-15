@@ -90,6 +90,7 @@ def _leaf_value(
     leaf_watermark: int = 0,
     rotation_count: int = 0,
     is_revoked: bool = False,
+    is_slashed: bool = False,
 ) -> bytes:
     """Commitment hash for a single account's full state.
 
@@ -97,13 +98,16 @@ def _leaf_value(
     tx nonce, active stake, the hot signing key (public_key — changed by
     KeyRotation), the cold authority key (authority_key — changed by
     SetAuthorityKey), the WOTS+ leaf watermark (bumped on every
-    signature), the rotation counter (bumped on every KeyRotation), and
-    the revoked flag.
+    signature), the rotation counter (bumped on every KeyRotation), the
+    revoked flag, and the slashed flag.
 
     Without all of these inside the leaf, two honest nodes could disagree
-    on who is revoked / whose cold key is what / whose rotation
+    on who is revoked / slashed / whose cold key is what / whose rotation
     happened, yet still compute matching state roots — defeating the
-    whole point of the commitment.
+    whole point of the commitment.  is_slashed in particular gates the
+    "already slashed" check in apply_slash_transaction, so divergence
+    could let two nodes accept/reject the same double-slash tx
+    differently.
 
     All variable-length byte fields (authority_key, public_key) are
     prefixed with a 2-byte length so b"" vs b"\\x00\\x00" cannot collide.
@@ -120,6 +124,7 @@ def _leaf_value(
         + struct.pack(">Q", leaf_watermark)
         + struct.pack(">Q", rotation_count)
         + (b"\x01" if is_revoked else b"\x00")
+        + (b"\x01" if is_slashed else b"\x00")
     )
 
 
@@ -142,8 +147,9 @@ class SparseMerkleTree:
     # Matches the defaults of _leaf_value so leaves stay identical to
     # the pre-authority-coverage layout for accounts that never set a
     # cold key, rotated, or got revoked.  Fields:
-    #   (authority_key, public_key, leaf_watermark, rotation_count, revoked)
-    _DEFAULT_AUTH = (b"", b"", 0, 0, False)
+    #   (authority_key, public_key, leaf_watermark, rotation_count,
+    #    revoked, slashed)
+    _DEFAULT_AUTH = (b"", b"", 0, 0, False, False)
 
     def __init__(self):
         # (level, path_int) -> non-default node hash at that position.
@@ -151,12 +157,12 @@ class SparseMerkleTree:
         self._nodes: dict[tuple[int, int], bytes] = {}
         # entity_id -> full committed tuple:
         #   (balance, nonce, stake, authority_key, public_key,
-        #    leaf_watermark, rotation_count, is_revoked)
+        #    leaf_watermark, rotation_count, is_revoked, is_slashed)
         # The tree itself doesn't store accounts, only their committed
         # hashes, so we keep this side-index for reads and for rebuild
         # from persistence.
         self._accounts: dict[
-            bytes, tuple[int, int, int, bytes, bytes, int, int, bool]
+            bytes, tuple[int, int, int, bytes, bytes, int, int, bool, bool]
         ] = {}
         # Cached current root — invalidated on any write.
         self._root_cache: bytes | None = EMPTY_ROOT
@@ -214,7 +220,7 @@ class SparseMerkleTree:
 
         Tuple layout:
             (balance, nonce, stake, authority_key, public_key,
-             leaf_watermark, rotation_count, is_revoked)
+             leaf_watermark, rotation_count, is_revoked, is_slashed)
         """
         return self._accounts.get(entity_id)
 
@@ -243,25 +249,27 @@ class SparseMerkleTree:
         leaf_watermark: int = 0,
         rotation_count: int = 0,
         is_revoked: bool = False,
+        is_slashed: bool = False,
     ):
         """Upsert an account's committed state.
 
         Idempotent: setting the same record twice is a no-op after the
         first call.  An account whose entire record matches the default
-        (all zero / empty / not-revoked) is treated as absent so genuine
-        empty accounts don't contribute to the commitment.
+        (all zero / empty / not-revoked / not-slashed) is treated as
+        absent so genuine empty accounts don't contribute to the
+        commitment.
 
         The authority fields are keyword-only so existing call sites that
         pass only (balance, nonce, stake) continue to mean "empty
         authority record" — i.e., no cold key, default public key, no
-        revoke, no rotations.  Blockchain._touch_state is the canonical
-        caller and passes every field explicitly.
+        revoke, no slash, no rotations.  Blockchain._touch_state is the
+        canonical caller and passes every field explicitly.
         """
         ak = authority_key or b""
         pk = public_key or b""
         new_tuple = (
             balance, nonce, stake, ak, pk,
-            leaf_watermark, rotation_count, is_revoked,
+            leaf_watermark, rotation_count, is_revoked, is_slashed,
         )
         old_tuple = self._accounts.get(entity_id)
         if new_tuple == old_tuple:
@@ -270,7 +278,7 @@ class SparseMerkleTree:
             balance == 0 and nonce == 0 and stake == 0
             and ak == b"" and pk == b""
             and leaf_watermark == 0 and rotation_count == 0
-            and not is_revoked
+            and not is_revoked and not is_slashed
         )
         if is_default:
             self.remove(entity_id)
@@ -284,6 +292,7 @@ class SparseMerkleTree:
             leaf_watermark=leaf_watermark,
             rotation_count=rotation_count,
             is_revoked=is_revoked,
+            is_slashed=is_slashed,
         )
         changes = self._set_leaf(key, leaf)
 
@@ -367,7 +376,7 @@ class SparseMerkleTree:
         replay the accounts into a fresh tree and the root will match.
         """
         return {
-            "version": 2,
+            "version": 3,
             "accounts": [
                 {
                     "entity_id": eid.hex(),
@@ -379,8 +388,9 @@ class SparseMerkleTree:
                     "leaf_watermark": wm,
                     "rotation_count": rc,
                     "is_revoked": rev,
+                    "is_slashed": sl,
                 }
-                for eid, (bal, nonce, stake, ak, pk, wm, rc, rev)
+                for eid, (bal, nonce, stake, ak, pk, wm, rc, rev, sl)
                 in self._accounts.items()
             ],
         }
@@ -399,6 +409,7 @@ class SparseMerkleTree:
                 leaf_watermark=entry.get("leaf_watermark", 0),
                 rotation_count=entry.get("rotation_count", 0),
                 is_revoked=entry.get("is_revoked", False),
+                is_slashed=entry.get("is_slashed", False),
             )
         return tree
 
@@ -413,6 +424,7 @@ def compute_state_root(
     leaf_watermarks: dict[bytes, int] | None = None,
     key_rotation_counts: dict[bytes, int] | None = None,
     revoked_entities: set[bytes] | frozenset[bytes] | None = None,
+    slashed_validators: set[bytes] | frozenset[bytes] | None = None,
 ) -> bytes:
     """Pure-function Merkle commitment over all per-entity state.
 
@@ -431,6 +443,7 @@ def compute_state_root(
     leaf_watermarks = leaf_watermarks or {}
     key_rotation_counts = key_rotation_counts or {}
     revoked_entities = revoked_entities or set()
+    slashed_validators = slashed_validators or set()
 
     tree = SparseMerkleTree()
     # Union every per-entity key set so an entity that shows up only in,
@@ -441,7 +454,7 @@ def compute_state_root(
         set(balances) | set(nonces) | set(staked)
         | set(authority_keys) | set(public_keys)
         | set(leaf_watermarks) | set(key_rotation_counts)
-        | set(revoked_entities)
+        | set(revoked_entities) | set(slashed_validators)
     )
     for eid in all_keys:
         tree.set(
@@ -454,5 +467,6 @@ def compute_state_root(
             leaf_watermark=leaf_watermarks.get(eid, 0),
             rotation_count=key_rotation_counts.get(eid, 0),
             is_revoked=eid in revoked_entities,
+            is_slashed=eid in slashed_validators,
         )
     return tree.root()

@@ -394,6 +394,10 @@ class TestSlashTransaction(unittest.TestCase):
         # Proposer's block signature will consume their keypair's next
         # leaf — peek before the block is signed.
         _bump(proposer_id, proposer_entity.keypair._next_leaf)
+        # Slashing flips is_slashed for the offender — the leaf commits
+        # to that flag, so the sim set must include them.
+        sim_slashed = set(self.chain.slashed_validators)
+        sim_slashed.add(slash_tx.evidence.offender_id)
         state_root = compute_state_root(
             sim_balances, sim_nonces, sim_staked,
             authority_keys=self.chain.authority_keys,
@@ -401,6 +405,7 @@ class TestSlashTransaction(unittest.TestCase):
             leaf_watermarks=sim_wm,
             key_rotation_counts=self.chain.key_rotation_counts,
             revoked_entities=self.chain.revoked_entities,
+            slashed_validators=sim_slashed,
         )
 
         # Slash txs are now committed in the merkle_root, so they must be

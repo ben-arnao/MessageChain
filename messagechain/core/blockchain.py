@@ -981,6 +981,7 @@ class Blockchain:
                 leaf_watermark=self.leaf_watermarks.get(eid, 0),
                 rotation_count=self.key_rotation_counts.get(eid, 0),
                 is_revoked=(eid in self.revoked_entities),
+                is_slashed=(eid in self.slashed_validators),
             )
 
     def _rebuild_state_tree(self):
@@ -1003,14 +1004,16 @@ class Blockchain:
           * reorg rollback (hot path, many changes)
         """
         # Union every source of per-entity state so an entity that shows
-        # up only in authority_keys or revoked_entities still lands in
-        # the tree.  Otherwise a post-rebuild root would omit that leaf
-        # and differ from the incremental root validators compute.
+        # up only in authority_keys, revoked_entities, or slashed_validators
+        # still lands in the tree.  Otherwise a post-rebuild root would
+        # omit that leaf and differ from the incremental root validators
+        # compute.
         live_keys = (
             set(self.supply.balances) | set(self.nonces)
             | set(self.supply.staked) | set(self.authority_keys)
             | set(self.public_keys) | set(self.leaf_watermarks)
             | set(self.key_rotation_counts) | set(self.revoked_entities)
+            | set(self.slashed_validators)
         )
         # Drop entries the tree holds that have been deleted from live.
         tree_keys = set(self.state_tree._accounts.keys())
@@ -1028,6 +1031,7 @@ class Blockchain:
                 leaf_watermark=self.leaf_watermarks.get(eid, 0),
                 rotation_count=self.key_rotation_counts.get(eid, 0),
                 is_revoked=(eid in self.revoked_entities),
+                is_slashed=(eid in self.slashed_validators),
             )
 
     def compute_current_state_root(self) -> bytes:
@@ -1108,6 +1112,7 @@ class Blockchain:
         sim_leaf_watermarks = dict(self.leaf_watermarks)
         sim_rotation_counts = dict(self.key_rotation_counts)
         sim_revoked = set(self.revoked_entities)
+        sim_slashed = set(self.slashed_validators)
         current_base_fee = self.supply.base_fee
 
         def _bump_wm(eid: bytes, leaf_index: int) -> None:
@@ -1390,6 +1395,7 @@ class Blockchain:
             leaf_watermarks=sim_leaf_watermarks,
             key_rotation_counts=sim_rotation_counts,
             revoked_entities=sim_revoked,
+            slashed_validators=sim_slashed,
         )
 
     def propose_block(
