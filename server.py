@@ -677,6 +677,98 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
+    def _sweep_stale_pending_txs(self) -> int:
+        """Drop pool entries that can no longer land in a block.
+
+        A pending tx becomes permanently unmineable if the entity's
+        current chain nonce has moved past it, the sender is revoked,
+        the signature leaf is below the current watermark, or the tx
+        is older than PENDING_TX_TTL seconds.  Without this sweep, junk
+        accumulates (protected by the pool-cap eviction policy because
+        it often has high fees) and pushes legitimate new txs out.
+
+        Returns the total number of entries dropped across all pools.
+        Safe to call frequently — O(pool entries) which is bounded by
+        PENDING_POOL_MAX_SIZE × number of pools.
+        """
+        from messagechain.config import PENDING_TX_TTL
+        import time as _time
+
+        now = _time.time()
+        dropped = 0
+
+        def _signer_id(tx):
+            for attr in (
+                "entity_id", "proposer_id", "voter_id",
+                "delegator_id", "submitter_id",
+            ):
+                eid = getattr(tx, attr, None)
+                if eid is not None:
+                    return eid
+            return None
+
+        def _is_stale(tx) -> bool:
+            eid = _signer_id(tx)
+            if eid is None:
+                return True  # can't identify sender — drop
+
+            # Revoked sender: any pending tx they signed with the hot
+            # key is doomed.  RevokeTransaction targets an entity_id
+            # that the authority key signs over; if the target is
+            # already in revoked_entities the revoke is redundant.
+            if eid in self.blockchain.revoked_entities:
+                return True
+
+            # Timestamp expiry — tx.timestamp is a float seconds.
+            ts = getattr(tx, "timestamp", None)
+            if ts is not None and now - ts > PENDING_TX_TTL:
+                return True
+
+            # Leaf below watermark — signature leaf_index already
+            # consumed, tx can never pass validate_block.  Only applies
+            # to txs that live in the HOT leaf namespace (entity_id
+            # keyed).  Cold-signed txs (Revoke, Unstake when a
+            # separate cold key exists) use a different watermark so
+            # we skip the check for them.
+            sig = getattr(tx, "signature", None)
+            cls_name = tx.__class__.__name__
+            is_cold_signed = (
+                cls_name == "RevokeTransaction"
+                or (
+                    cls_name == "UnstakeTransaction"
+                    and self.blockchain.get_authority_key(eid)
+                    != self.blockchain.public_keys.get(eid)
+                )
+            )
+            if sig is not None and not is_cold_signed:
+                wm = self.blockchain.leaf_watermarks.get(eid, 0)
+                if sig.leaf_index < wm:
+                    return True
+
+            # Nonce-stale — only for txs that carry a nonce.  Revoke
+            # is nonce-free and handled above.
+            tx_nonce = getattr(tx, "nonce", None)
+            if tx_nonce is not None:
+                chain_nonce = self.blockchain.nonces.get(eid, 0)
+                if tx_nonce < chain_nonce:
+                    return True
+
+            return False
+
+        for pool_attr in (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+        ):
+            pool = getattr(self, pool_attr, None)
+            if not pool:
+                continue
+            for h in [
+                h for h, tx in pool.items() if _is_stale(tx)
+            ]:
+                del pool[h]
+                dropped += 1
+        return dropped
+
     def _admit_to_pool(self, pool_attr: str, tx) -> bool:
         """Insert `tx` into a capped per-type pending pool with fee-based
         eviction, mirroring Mempool's admission policy.
@@ -1192,6 +1284,12 @@ class Server:
         # reaches the same authority-state result.  Without this drain,
         # the hot/cold split and emergency revoke would only take effect on
         # the single node that received the RPC.
+        # Sweep stale/unmineable pending txs before draining.  Catches
+        # nonce-passed, revoked-sender, leaf-burned, and expired entries
+        # so they don't ride along into a block (where they'd fail
+        # validate_block and either drop the whole block or force a
+        # per-tx reject in the apply loop).
+        self._sweep_stale_pending_txs()
         pending_authority = getattr(self, "_pending_authority_txs", {})
         authority_txs = list(pending_authority.values())
         # Pull staged stake + governance txs submitted via RPC.  Without

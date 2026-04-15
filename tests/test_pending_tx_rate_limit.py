@@ -93,31 +93,46 @@ class TestGossipReceiverEnforcesRateLimit(_Base):
 
     def test_over_rate_gossip_dropped_and_scored(self):
         """After the burst is exhausted, subsequent gossip is rejected
-        and the peer accumulates ban score."""
+        and the peer accumulates ban score.
+
+        The bucket refills at RATE_PENDING_TX[0] tokens/sec, and WOTS+
+        signing each tx takes real wall-clock time — if the test fires
+        `burst + K` messages it can accidentally get enough refill
+        tokens to avoid a drop.  We side-step that by draining the
+        bucket directly with cheap malformed-payload messages (which
+        consume a token before any validation) and firing a single
+        valid tx afterwards to confirm the drop path is hit.
+        """
         srv = _build_server()
         alice = _entity(b"alice")
         self._register(srv.blockchain, alice)
         srv.blockchain.supply.balances[alice.entity_id] = 10_000_000
         peer = _FakePeer()
 
-        # Drain the bucket — the burst cap is RATE_PENDING_TX[1] (= 20).
+        # Drain the bucket with malformed payloads.  These are rejected
+        # BEFORE the slow signature-verify path so bucket refill between
+        # calls is negligible.  Use float("inf") iteration-bounded by
+        # bucket exhaustion.
         burst = RATE_PENDING_TX[1]
-        # Fire burst+5 gossip messages; each needs a unique leaf, so we
-        # use distinct nonces to generate distinct txs.
-        leaves_bumped = 0
-        for n in range(burst + 5):
-            alice.keypair._next_leaf = n
-            tx = create_stake_transaction(alice, amount=100, nonce=n, fee=500)
-            srv._handle_announce_pending_tx(
-                {"kind": "stake", "tx": tx.serialize()}, peer,
-            )
+        for _ in range(burst + 50):
+            srv._handle_announce_pending_tx({"kind": "bogus"}, peer)
 
-        # The over-rate arrivals were dropped — ban manager shows at
-        # least one offense under OFFENSE_RATE_LIMIT.
+        # Now a valid gossip — should be dropped because the bucket is
+        # drained, and the drop path records OFFENSE_RATE_LIMIT.
+        tx = create_stake_transaction(alice, amount=100, nonce=0, fee=500)
+        srv._handle_announce_pending_tx(
+            {"kind": "stake", "tx": tx.serialize()}, peer,
+        )
+        self.assertNotIn(
+            tx.tx_hash, getattr(srv, "_pending_stake_txs", {}),
+            "Rate-limited valid tx must not land in the pool.",
+        )
+
+        # Ban score bumped from all the refused traffic.
         score = srv.ban_manager.get_score(peer.address)
         self.assertGreater(
             score, 0,
-            "Over-rate ANNOUNCE_PENDING_TX should increment ban score.",
+            "Over-rate / malformed ANNOUNCE_PENDING_TX should increment ban score.",
         )
 
     def test_malformed_payload_scored_under_protocol_violation(self):

@@ -186,6 +186,11 @@ MEMPOOL_MAX_ANCESTORS = 5     # max unconfirmed tx chain depth per entity
 # new tx only lands if its fee beats the lowest-fee pending tx, which
 # is then evicted (same shape as Mempool's fee-based eviction).
 PENDING_POOL_MAX_SIZE = 1024
+# Pending-tx TTL: pool entries older than this are swept as stale.  Long
+# enough to survive genuine network lag but short enough that a junk tx
+# can't clog a pool for long.  1 hour is plenty — on a ~10-min block
+# cadence that's 6 chances to land.
+PENDING_TX_TTL = 3600
 
 # Address manager (Sybil/eclipse resistance)
 ADDRMAN_NEW_BUCKET_COUNT = 256      # buckets in the "new" table
