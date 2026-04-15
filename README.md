@@ -19,14 +19,22 @@ python -m messagechain generate-key      # prints private key — write it on pa
 python -m messagechain verify-key        # re-enter by hand; confirms the backup is correct
 ```
 
-Clear your terminal history.
+Clear your shell history file, not just the visible buffer:
+- Linux/macOS: `cat /dev/null > ~/.bash_history && history -c` (or `~/.zsh_history`)
+- Windows PowerShell: `Remove-Item (Get-PSReadlineOption).HistorySavePath`
 
 **🔌 Reconnect to the internet.**
 
 ```bash
-python -m messagechain account           # register your wallet on-chain
+python -m messagechain account           # register your wallet on-chain (signs once, online)
 python -m messagechain start             # sync the full chain (leave running)
 ```
+
+`account` necessarily loads your key in memory briefly to sign — unavoidable. That's why the machine must be trusted (no clipboard managers syncing to cloud, no untrusted extensions).
+
+**First-run gotchas:**
+- `start` needs reachable peers. The shipped seed list is a placeholder (`127.0.0.1:9333`); until a public seed is announced, pass `--seed <host>:<port>` from someone already on the network, or `start` will idle with zero peers.
+- New wallets start at **0 balance**. There is no faucet — `stake`, `transfer`, and `send` all require someone to fund you first, or a genesis allocation if you're bootstrapping a local chain.
 
 You're done. Commands below operate against your running node.
 
