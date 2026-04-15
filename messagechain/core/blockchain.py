@@ -155,6 +155,14 @@ class Blockchain:
         self.assume_valid_hash: bytes | None = ASSUME_VALID_BLOCK_HASH
         self._assume_valid_height: int | None = None
 
+        # Bootstrap gradient: pinned seed identity + monotonic progress
+        # metric.  Populated in initialize_genesis from allocation_table
+        # (treasury excluded).  Empty frozenset for the backward-compat
+        # path where no allocation_table is supplied.
+        self.seed_entity_ids: frozenset[bytes] = frozenset()
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet: RatchetState = RatchetState()
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -370,8 +378,19 @@ class Blockchain:
                 self.supply.balances[entity_id] = (
                     self.supply.balances.get(entity_id, 0) + amount
                 )
+            # Pin seed identity at genesis: every entity in the allocation
+            # table EXCEPT the treasury is a seed.  Treasury is excluded
+            # because it is a protocol-owned address, not a validator.
+            # Frozenset: "who is a seed" has exactly one answer for the
+            # life of the chain and must never be mutated post-genesis.
+            from messagechain.config import TREASURY_ENTITY_ID
+            self.seed_entity_ids = frozenset(
+                eid for eid in allocation_table.keys()
+                if eid != TREASURY_ENTITY_ID
+            )
         else:
-            # Backward-compatible single-entity allocation
+            # Backward-compatible single-entity allocation — no seed set
+            # is pinned (seed_entity_ids stays as the initial frozenset()).
             self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
 
         # Track as chain tip
@@ -693,6 +712,37 @@ class Blockchain:
     @property
     def height(self) -> int:
         return len(self.chain)
+
+    @property
+    def bootstrap_progress(self) -> float:
+        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+
+        Computed from current chain state (height + stake distribution)
+        then ratcheted against the in-memory peak — never regresses.
+        Downstream code uses this to smoothly interpolate bootstrap-era
+        parameters (attester committee selection weight, min-stake
+        requirement, escrow window, seed exclusion).  See
+        messagechain.consensus.bootstrap_gradient for the design.
+        """
+        from messagechain.consensus.bootstrap_gradient import (
+            compute_bootstrap_progress,
+        )
+        seed_stake = sum(
+            self.supply.get_staked(eid) for eid in self.seed_entity_ids
+        )
+        non_seed_stake = 0
+        for eid, amount in self.supply.staked.items():
+            if amount <= 0:
+                continue
+            if eid in self.seed_entity_ids:
+                continue
+            non_seed_stake += amount
+        raw = compute_bootstrap_progress(
+            height=self.height,
+            seed_stake=seed_stake,
+            non_seed_stake=non_seed_stake,
+        )
+        return self._bootstrap_ratchet.observe(raw)
 
     def has_block(self, block_hash: bytes) -> bool:
         if block_hash in self._block_by_hash:
