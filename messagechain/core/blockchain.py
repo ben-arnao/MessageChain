@@ -399,9 +399,33 @@ class Blockchain:
                 eid for eid in allocation_table.keys()
                 if eid != TREASURY_ENTITY_ID
             )
+            if not self.seed_entity_ids:
+                # Allocation table supplied but contained ONLY the treasury.
+                # Bootstrap seed-exclusion rules will have no effect, which
+                # is almost never what the operator wants.  Loud warning
+                # rather than hard error — tests may legitimately do this.
+                logger.warning(
+                    "initialize_genesis: allocation_table has no seed "
+                    "entities (only TREASURY_ENTITY_ID present).  "
+                    "seed_entity_ids will be empty, so bootstrap-era "
+                    "seed-exclusion from the attester committee will "
+                    "silently no-op.  Use bootstrap.build_launch_allocation() "
+                    "for production deployments."
+                )
         else:
-            # Backward-compatible single-entity allocation — no seed set
-            # is pinned (seed_entity_ids stays as the initial frozenset()).
+            # Backward-compatible single-entity allocation.  No seed set
+            # is pinned (seed_entity_ids stays as frozenset()) — this is
+            # intended for tests and dev scaffolding, NOT production.
+            # Log a warning so operators catch accidental production use
+            # of this code path (every bootstrap gradient mechanism that
+            # depends on identifying seeds silently no-ops otherwise).
+            logger.warning(
+                "initialize_genesis called without allocation_table — "
+                "seed_entity_ids will be empty, so bootstrap-era "
+                "seed-exclusion rules will silently no-op.  Use "
+                "bootstrap.build_launch_allocation() or pass an "
+                "explicit allocation_table for production deployments."
+            )
             self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
 
         # Track as chain tip
@@ -724,16 +748,15 @@ class Blockchain:
     def height(self) -> int:
         return len(self.chain)
 
-    @property
-    def bootstrap_progress(self) -> float:
-        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+    def _raw_bootstrap_progress(self) -> float:
+        """Compute the un-ratcheted bootstrap_progress from current state.
 
-        Computed from current chain state (height + stake distribution)
-        then ratcheted against the in-memory peak — never regresses.
-        Downstream code uses this to smoothly interpolate bootstrap-era
-        parameters (attester committee selection weight, min-stake
-        requirement, escrow window, seed exclusion).  See
-        messagechain.consensus.bootstrap_gradient for the design.
+        NEVER call this from read-side code paths.  The raw value can
+        regress as stake fluctuates, which is exactly what the ratchet
+        exists to guard against.  Only the apply path (`_apply_block_state`
+        → `_update_bootstrap_ratchet`) is allowed to observe this value;
+        every other caller should go through the `bootstrap_progress`
+        property which returns the already-ratcheted max.
         """
         from messagechain.consensus.bootstrap_gradient import (
             compute_bootstrap_progress,
@@ -748,12 +771,42 @@ class Blockchain:
             if eid in self.seed_entity_ids:
                 continue
             non_seed_stake += amount
-        raw = compute_bootstrap_progress(
+        return compute_bootstrap_progress(
             height=self.height,
             seed_stake=seed_stake,
             non_seed_stake=non_seed_stake,
         )
-        return self._bootstrap_ratchet.observe(raw)
+
+    @property
+    def bootstrap_progress(self) -> float:
+        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+
+        Ratcheted at block-apply time only (see `_update_bootstrap_ratchet`,
+        called once at the end of `_apply_block_state`).  This property
+        is a pure reader with no side effects, so two nodes with
+        identical chain history always return the same value regardless
+        of query timing — load-bearing because this value drives
+        attester-committee selection.  A side-effectful read (the old
+        behavior) could let two honest nodes latch onto different
+        ratchet peaks based on when they queried, which would fork
+        the chain on state_root.
+
+        Downstream code uses this to smoothly interpolate bootstrap-era
+        parameters (committee selection weight, min-stake requirement,
+        escrow window, seed exclusion).  See
+        messagechain.consensus.bootstrap_gradient for the design.
+        """
+        return self._bootstrap_ratchet.max_progress
+
+    def _update_bootstrap_ratchet(self) -> None:
+        """Observe current raw progress and ratchet it up.
+
+        Called once per block apply (at the end of `_apply_block_state`),
+        so the ratchet reflects post-apply chain state.  Every node
+        applying the same block reaches the same ratchet value — this
+        is what makes `bootstrap_progress` deterministic across nodes.
+        """
+        self._bootstrap_ratchet.observe(self._raw_bootstrap_progress())
 
     def has_block(self, block_hash: bytes) -> bool:
         if block_hash in self._block_by_hash:
@@ -1353,17 +1406,24 @@ class Blockchain:
                     (att.validator_id, sim_staked.get(att.validator_id, 0))
                 )
 
-        # Randomness for deterministic committee selection must be
-        # identical on sim and apply paths, so use the parent block's
-        # hash (known at both call sites: block.header.prev_hash at
-        # apply, self.chain[-1].block_hash at sim).
-        parent_hash = self.chain[-1].block_hash if self.chain else b"\x00" * 32
+        # Randomness for deterministic committee selection.  Uses the
+        # parent block's randao_mix rather than its full block_hash:
+        # randao_mix is an accumulator specifically designed for
+        # unpredictable randomness (hashed forward through every
+        # proposer's signature), so a single parent proposer can't
+        # grind their block contents to shape the next block's
+        # committee nearly as freely.  Available at both call sites
+        # (sim here, apply below) via the parent block in self.chain.
+        parent_randao = (
+            self.chain[-1].header.randao_mix
+            if self.chain else b"\x00" * 32
+        )
         committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
         attester_committee = select_attester_committee(
             candidates=attester_candidates,
             seed_entity_ids=self.seed_entity_ids,
             bootstrap_progress=self.bootstrap_progress,
-            randomness=parent_hash,
+            randomness=parent_randao,
             committee_size=committee_size,
         ) if attester_candidates else []
 
@@ -2677,14 +2737,24 @@ class Blockchain:
             block_reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         )
         committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
-        # Randomness must be identical on sim and apply paths.  Use the
-        # parent block's hash — available as block.header.prev_hash here
-        # and as self.chain[-1].block_hash during block proposal sim.
+        # Randomness for committee selection: use parent block's
+        # randao_mix rather than prev_hash.  Randao accumulates entropy
+        # through every proposer's signature over the chain's history,
+        # so a single parent proposer grinding their block contents
+        # cannot cheaply shape which attesters get paid next block.
+        # Must be identical on sim and apply paths — both derive it
+        # from the parent block (at apply time, the current block has
+        # not yet been appended to self.chain, so self.chain[-1] is
+        # the parent — same indexing as the sim path).
+        parent_randao = (
+            self.chain[-1].header.randao_mix
+            if self.chain else b"\x00" * 32
+        )
         attester_committee = select_attester_committee(
             candidates=attester_candidates,
             seed_entity_ids=self.seed_entity_ids,
             bootstrap_progress=self.bootstrap_progress,
-            randomness=block.header.prev_hash,
+            randomness=parent_randao,
             committee_size=committee_size,
         )
 
@@ -2768,6 +2838,15 @@ class Blockchain:
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
+
+        # Update bootstrap_progress ratchet.  Deliberately the LAST step
+        # of apply so every upstream state mutation (balances, stakes,
+        # escrow unlocks, governance-driven stake changes) is reflected
+        # in the computed raw progress.  Called once per block —
+        # `bootstrap_progress` is a pure reader elsewhere so committee
+        # selection and the sim path see a consistent value until the
+        # next apply ticks the ratchet forward.
+        self._update_bootstrap_ratchet()
 
     def _apply_governance_block(self, block: Block):
         """Dispatch governance txs, auto-execute closed binding proposals,
@@ -3265,6 +3344,13 @@ class Blockchain:
         self.public_keys = {}
         self.slashed_validators = set()
         self._immature_rewards = []
+        # Reset the bootstrap ratchet — it will rebuild deterministically
+        # as blocks replay via _update_bootstrap_ratchet.  Every node
+        # replaying the same chain reaches the same ratchet peak.
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet = RatchetState()
+        from messagechain.economics.escrow import EscrowLedger
+        self._escrow = EscrowLedger()
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -3313,6 +3399,12 @@ class Blockchain:
                 eid: list(entries)
                 for eid, entries in self.supply.pending_unstakes.items()
             },
+            # Bootstrap ratchet.  Snapshotted so reorg rollback restores
+            # the same peak the chain had before the reorg — the ratchet
+            # is strictly monotonic within the canonical chain's history
+            # and must not silently regress across a reorg that undoes
+            # and re-applies blocks.
+            "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
         }
         # Snapshot governance state if tracker is attached
         if hasattr(self, "governance") and self.governance is not None:
@@ -3345,6 +3437,16 @@ class Blockchain:
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
         self._processed_evidence = snapshot.get("processed_evidence", set())
+        # Restore bootstrap ratchet.  Default 0.0 matches a freshly-
+        # built Blockchain (pre-any-block) and is safe for snapshots
+        # that predate this field.  The ratchet is otherwise strictly
+        # monotonic within the canonical chain, so any snapshot taken
+        # at height H has the correct peak for block H.
+        ratchet_value = snapshot.get("bootstrap_ratchet_max", 0.0)
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet = RatchetState()
+        if ratchet_value > 0.0:
+            self._bootstrap_ratchet.observe(ratchet_value)
         if "authority_keys" in snapshot:
             self.authority_keys = dict(snapshot["authority_keys"])
         if "pending_unstakes" in snapshot:

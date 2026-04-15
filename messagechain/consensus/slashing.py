@@ -29,23 +29,38 @@ Anyone can submit evidence. The submitter receives a finder's reward
 
 ---
 
-**Not yet implemented: censorship evidence.**  The design math called
-for a third slashable offense: a proposer who excludes a transaction
-from the mempool above the fee floor for more than N blocks (see
-design discussion).  This is deferred because a correct, adversary-
-resistant implementation requires:
+**Deliberately NOT implemented: censorship as a slashable offense.**
 
-  * Global mempool consensus (different nodes have different mempool
-    views, so "proposer saw the tx" is not universally observable).
-  * An anti-grief mechanism (malicious actors shouldn't be able to
-    hide a tx locally then accuse a proposer of excluding it).
-  * Clear policy for "full block" / "proposer's block was at size cap"
-    cases where exclusion was legitimate.
+An earlier design draft considered a third slashable offense — a
+proposer excluding a fee-paying tx from their block despite having
+room.  We decided NOT to add this, for two reasons:
 
-Equivocation and double-attestation cover the most dangerous
-misbehaviors (liveness + finality attacks).  Censorship is a
-resilience enhancement, not a safety requirement, and ships cleanly
-as follow-up work once the fee-floor semantics stabilize.
+1. Censorship is inherent to permissionless block production.
+   Every blockchain gives the proposer of block N unilateral
+   discretion over block contents.  Removing that discretion means
+   someone ELSE dictates contents, and that someone becomes a new
+   censor.  A proposer's ability to skip a tx once is a property,
+   not a bug.
+
+2. Censorship is self-limiting by redundancy.  Validators rotate
+   through proposer slots; a hostile proposer only produces their
+   stake-weighted fraction of blocks.  The next honest proposer
+   happily includes the skipped tx (and collects the tip for it).
+   Expected inclusion delay with a single censor is 1-2 blocks.
+   Adding a slashing rule buys very little because the behavior
+   is already self-correcting.
+
+The real consensus-critical misbehaviors are equivocation
+(attacking liveness by signing two blocks at the same height) and
+double-attestation (attacking finality by voting for conflicting
+blocks).  Both corrupt consensus state itself — that's why they
+ARE slashable here.  Sustained censorship by a colluding majority
+falls under the 51% attack class and is handled by stake economics
+(the attackers lose stake faster than they can maintain the
+attack), not by a dedicated evidence type.
+
+Users who worry about delivery timing raise the fee to make their
+tx more attractive to the next honest proposer.
 """
 
 import hashlib
