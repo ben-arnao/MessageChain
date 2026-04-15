@@ -74,6 +74,7 @@ def compute_block_sig_cost(block) -> int:
         + len(block.governance_txs)
         + len(getattr(block, "authority_txs", []))
         + len(getattr(block, "stake_transactions", []))
+        + len(getattr(block, "unstake_transactions", []))
         + 1  # proposer signature
         + len(block.attestations)
     )
@@ -350,8 +351,17 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
-        # Genesis block was signed — track the WOTS+ leaf consumed
+        # Genesis block was signed — track the WOTS+ leaf consumed and
+        # advance the leaf watermark so the state commitment reflects the
+        # used leaf.  Without this, a fresh chain's state_root would lag
+        # the genesis signer's keypair by one leaf, and every subsequent
+        # block's sim would mispredict the next proposer leaf_index.
         self.proposer_sig_counts[genesis_entity.entity_id] = 1
+        if genesis_block.header.proposer_signature is not None:
+            self._bump_watermark(
+                genesis_entity.entity_id,
+                genesis_block.header.proposer_signature.leaf_index,
+            )
 
         # Distribute genesis allocation
         if allocation_table is not None:
@@ -952,11 +962,12 @@ class Blockchain:
     def _touch_state(self, entity_ids):
         """Sync the state tree with current dicts for the given entities.
 
-        Called whenever code mutates supply.balances / supply.staked /
-        nonces. Cheap — O(len(entity_ids) * TREE_DEPTH). The SMT is
-        the authoritative state commitment, but the balance/nonce/stake
-        dicts remain the source of truth for *values* — the tree just
-        commits to them.
+        Called whenever code mutates any per-entity state — balances,
+        nonces, stake, cold authority key, signing public key, WOTS+
+        leaf watermark, rotation count, or revoked flag.  All of these
+        are inside the leaf commitment, so any mutation must end in a
+        _touch_state call or the block's state_root will not match what
+        validators reconstruct.  Cheap — O(len(entity_ids) * TREE_DEPTH).
         """
         for eid in entity_ids:
             self.state_tree.set(
@@ -964,6 +975,11 @@ class Blockchain:
                 self.supply.balances.get(eid, 0),
                 self.nonces.get(eid, 0),
                 self.supply.staked.get(eid, 0),
+                authority_key=self.authority_keys.get(eid, b""),
+                public_key=self.public_keys.get(eid, b""),
+                leaf_watermark=self.leaf_watermarks.get(eid, 0),
+                rotation_count=self.key_rotation_counts.get(eid, 0),
+                is_revoked=(eid in self.revoked_entities),
             )
 
     def _rebuild_state_tree(self):
@@ -985,18 +1001,32 @@ class Blockchain:
           * compute_current_state_root (warm path, reuses cached nodes)
           * reorg rollback (hot path, many changes)
         """
-        live_keys = set(self.supply.balances) | set(self.nonces) | set(self.supply.staked)
+        # Union every source of per-entity state so an entity that shows
+        # up only in authority_keys or revoked_entities still lands in
+        # the tree.  Otherwise a post-rebuild root would omit that leaf
+        # and differ from the incremental root validators compute.
+        live_keys = (
+            set(self.supply.balances) | set(self.nonces)
+            | set(self.supply.staked) | set(self.authority_keys)
+            | set(self.public_keys) | set(self.leaf_watermarks)
+            | set(self.key_rotation_counts) | set(self.revoked_entities)
+        )
         # Drop entries the tree holds that have been deleted from live.
         tree_keys = set(self.state_tree._accounts.keys())
         for eid in tree_keys - live_keys:
             self.state_tree.remove(eid)
-        # Upsert everything else; set() is idempotent on unchanged triples.
+        # Upsert everything else; set() is idempotent on unchanged tuples.
         for eid in live_keys:
             self.state_tree.set(
                 eid,
                 self.supply.balances.get(eid, 0),
                 self.nonces.get(eid, 0),
                 self.supply.staked.get(eid, 0),
+                authority_key=self.authority_keys.get(eid, b""),
+                public_key=self.public_keys.get(eid, b""),
+                leaf_watermark=self.leaf_watermarks.get(eid, 0),
+                rotation_count=self.key_rotation_counts.get(eid, 0),
+                is_revoked=(eid in self.revoked_entities),
             )
 
     def compute_current_state_root(self) -> bytes:
@@ -1028,6 +1058,9 @@ class Blockchain:
         attestations: list[Attestation] | None = None,
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
+        unstake_transactions: list | None = None,
+        governance_txs: list | None = None,
+        proposer_signature_leaf_index: int | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -1042,7 +1075,22 @@ class Blockchain:
         sim_balances = dict(self.supply.balances)
         sim_nonces = dict(self.nonces)
         sim_staked = dict(self.supply.staked)
+        # Authority-side state — included in the leaf commitment, so the
+        # simulation must track every mutation path that _apply_block_state
+        # performs.  Missing a field here means honest validators reject
+        # otherwise-valid blocks with a state_root mismatch.
+        sim_authority_keys = dict(self.authority_keys)
+        sim_public_keys = dict(self.public_keys)
+        sim_leaf_watermarks = dict(self.leaf_watermarks)
+        sim_rotation_counts = dict(self.key_rotation_counts)
+        sim_revoked = set(self.revoked_entities)
         current_base_fee = self.supply.base_fee
+
+        def _bump_wm(eid: bytes, leaf_index: int) -> None:
+            """Mirror Blockchain._bump_watermark: monotonic next-leaf cursor."""
+            nxt = leaf_index + 1
+            if nxt > sim_leaf_watermarks.get(eid, 0):
+                sim_leaf_watermarks[eid] = nxt
 
         # Simulate fee payments for message transactions (with burn)
         for tx in transactions:
@@ -1053,6 +1101,7 @@ class Blockchain:
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             # base_fee is burned — not added to any balance
             sim_nonces[tx.entity_id] = tx.nonce + 1
+            _bump_wm(tx.entity_id, tx.signature.leaf_index)
 
         # Simulate transfer transactions (with burn)
         for ttx in (transfer_transactions or []):
@@ -1062,12 +1111,13 @@ class Blockchain:
             sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
+            _bump_wm(ttx.entity_id, ttx.signature.leaf_index)
 
-        # Simulate authority transactions — they all pay a fee (burn + tip)
-        # and some bump the signer's nonce.  Keep in lockstep with the
-        # equivalent paths in _apply_authority_tx, otherwise state_root
-        # diverges from the actual post-apply state and validators reject
-        # otherwise-valid blocks.
+        # Simulate authority transactions — fee-with-burn plus each
+        # type's distinctive authority-state mutation.  Keep in lockstep
+        # with _apply_authority_tx: any field the apply path mutates MUST
+        # be mutated here too, or the post-apply state_root won't match
+        # and honest validators reject the block.
         for atx in (authority_txs or []):
             effective_base_fee = min(current_base_fee, atx.fee)
             tip = atx.fee - effective_base_fee
@@ -1076,15 +1126,23 @@ class Blockchain:
             cls_name = atx.__class__.__name__
             if cls_name == "SetAuthorityKeyTransaction":
                 sim_nonces[atx.entity_id] = atx.nonce + 1
+                sim_authority_keys[atx.entity_id] = atx.new_authority_key
+                _bump_wm(atx.entity_id, atx.signature.leaf_index)
             elif cls_name == "RevokeTransaction":
-                # Revoke pushes all active stake into pending unbonding.
-                # Stake state-root contribution goes to 0 immediately.
+                # Revoke: active stake → pending unbonding, revoked flag
+                # set.  Nonce-free.  Signature consumed a leaf in the COLD
+                # tree, so the apply path deliberately does NOT bump the
+                # hot-key watermark — mirror that.
                 sim_staked[atx.entity_id] = 0
-                # No nonce bump for revoke (nonce-free tx).
+                sim_revoked.add(atx.entity_id)
             elif cls_name == "KeyRotationTransaction":
-                # Rotation swaps the public_key but does NOT touch nonces,
-                # balances (beyond the fee above), or staked amounts.
-                pass
+                # Rotation swaps the signing key and resets the hot-key
+                # watermark (new key = fresh leaf namespace).  Rotation
+                # counter bumps so the next rotation must reference a
+                # higher number.
+                sim_public_keys[atx.entity_id] = atx.new_public_key
+                sim_rotation_counts[atx.entity_id] = atx.rotation_number + 1
+                sim_leaf_watermarks[atx.entity_id] = 0
 
         # Simulate stake transactions — fee (burn + tip), nonce bump, and
         # the actual stake movement from liquid balance to staked balance.
@@ -1102,6 +1160,36 @@ class Blockchain:
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_staked[stx.entity_id] = sim_staked.get(stx.entity_id, 0) + stx.amount
             sim_nonces[stx.entity_id] = stx.nonce + 1
+            _bump_wm(stx.entity_id, stx.signature.leaf_index)
+
+        # Simulate unstake transactions: fee burn, stake moves to pending
+        # unbond (out of the active stake set for finality purposes, not
+        # yet liquid).  State root only commits to active staked amount,
+        # so subtracting from sim_staked is all we need.  Liquid balance
+        # only changes when unbonding matures UNBONDING_PERIOD blocks
+        # later (release_pending_unstakes) — not affected here.
+        for utx in (unstake_transactions or []):
+            effective_base_fee = min(current_base_fee, utx.fee)
+            tip = utx.fee - effective_base_fee
+            sim_balances[utx.entity_id] = max(
+                sim_balances.get(utx.entity_id, 0) - utx.fee, 0
+            )
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            current_staked = sim_staked.get(utx.entity_id, 0)
+            sim_staked[utx.entity_id] = max(current_staked - utx.amount, 0)
+            sim_nonces[utx.entity_id] = utx.nonce + 1
+            # Hot watermark bumps when the unstake was signed by the hot
+            # key (single-key mode) — mirrors _apply_authority_tx's
+            # conditional bump.
+            ak_sim = sim_authority_keys.get(
+                utx.entity_id, self.authority_keys.get(utx.entity_id, b""),
+            )
+            pk_sim = sim_public_keys.get(
+                utx.entity_id, self.public_keys.get(utx.entity_id, b""),
+            )
+            if (ak_sim == b"" and pk_sim != b"") or ak_sim == pk_sim:
+                _bump_wm(utx.entity_id, utx.signature.leaf_index)
+            _bump_wm(utx.entity_id, utx.signature.leaf_index)
 
         # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
@@ -1156,7 +1244,121 @@ class Blockchain:
             if treasury_excess > 0:
                 sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
-        return compute_state_root(sim_balances, sim_nonces, sim_staked)
+        # Apply-path parity for signature-driven watermark bumps.  Order
+        # matters: attestations run first because the same entity can be
+        # both a proposer and an attestor — chronologically they sign the
+        # attestation, then sign the block, so the proposer sig consumes
+        # a later leaf than any of their own attestations.  Bumping
+        # attestations first makes the proposer's "next leaf" default
+        # (read below) reflect those already-consumed leaves.
+        #
+        # The apply path itself is order-insensitive (_bump_watermark
+        # takes a max), so either ordering produces identical results on
+        # the apply side — this ordering only matters for the sim's
+        # default prediction.
+        for att in (attestations or []):
+            _bump_wm(att.validator_id, att.signature.leaf_index)
+        # Proposer's block signature — at propose time the block hasn't
+        # been signed yet, so callers who know the upcoming leaf
+        # (propose_block: proposer.keypair._next_leaf; validate path:
+        # block.header.proposer_signature.leaf_index) pass it explicitly.
+        # When unspecified we fall back to the live watermark — the
+        # canonical value for a proposer signing one block per slot.
+        if proposer_signature_leaf_index is None:
+            proposer_signature_leaf_index = sim_leaf_watermarks.get(
+                proposer_id, 0,
+            )
+        _bump_wm(proposer_id, proposer_signature_leaf_index)
+
+        # Simulate governance-tx fees + auto-executed binding proposals.
+        # _apply_governance_block runs AFTER block-reward mint, so this
+        # block simulates the same order.  We reuse the live GovernanceTracker
+        # and SupplyTracker via shallow clones so the simulation paths call
+        # the same tally/execute code that the apply path runs — no risk of
+        # the two drifting.
+        gov_present = (
+            (governance_txs and len(governance_txs) > 0)
+            or (hasattr(self, "governance") and self.governance is not None
+                and len(self.governance.proposals) > 0)
+        )
+        if gov_present:
+            import copy as _copy
+            from messagechain.config import GOVERNANCE_VOTING_WINDOW
+            from messagechain.governance.governance import (
+                ProposalTransaction, VoteTransaction, DelegateTransaction,
+                TreasurySpendTransaction, ValidatorEjectionProposal,
+            )
+
+            sim_supply = _copy.copy(self.supply)
+            sim_supply.balances = dict(sim_balances)
+            sim_supply.staked = dict(sim_staked)
+            sim_supply.pending_unstakes = {
+                k: list(v) for k, v in self.supply.pending_unstakes.items()
+            }
+            sim_supply.base_fee = current_base_fee
+
+            sim_tracker = _copy.deepcopy(self.governance)
+
+            # Phase 1: register this block's governance txs on the sim tracker
+            # and burn/pay fees through the sim supply.
+            for gtx in (governance_txs or []):
+                if isinstance(gtx, (ProposalTransaction,
+                                    TreasurySpendTransaction,
+                                    ValidatorEjectionProposal)):
+                    sender = gtx.proposer_id
+                elif isinstance(gtx, VoteTransaction):
+                    sender = gtx.voter_id
+                elif isinstance(gtx, DelegateTransaction):
+                    sender = gtx.delegator_id
+                else:
+                    continue
+                sim_supply.pay_fee_with_burn(
+                    sender, proposer_id, gtx.fee, sim_supply.base_fee,
+                )
+                _bump_wm(sender, gtx.signature.leaf_index)
+                if isinstance(gtx, (ProposalTransaction,
+                                    TreasurySpendTransaction,
+                                    ValidatorEjectionProposal)):
+                    sim_tracker.add_proposal(
+                        gtx, block_height=block_height,
+                        supply_tracker=sim_supply,
+                    )
+                elif isinstance(gtx, VoteTransaction):
+                    sim_tracker.add_vote(gtx, current_block=block_height)
+                elif isinstance(gtx, DelegateTransaction):
+                    sim_tracker.set_delegation(gtx.delegator_id, gtx.targets)
+
+            # Phase 2: auto-execute closed binding proposals (treasury
+            # spends + validator ejections).  Must mirror the apply-path
+            # ordering and predicates exactly.
+            for pid, state in list(sim_tracker.proposals.items()):
+                proposal = state.proposal
+                if not isinstance(proposal, (TreasurySpendTransaction,
+                                             ValidatorEjectionProposal)):
+                    continue
+                if block_height - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
+                    continue
+                if isinstance(proposal, TreasurySpendTransaction):
+                    sim_tracker.execute_treasury_spend(
+                        proposal, sim_supply, current_block=block_height,
+                    )
+                else:
+                    sim_tracker.execute_validator_ejection(
+                        proposal, sim_supply, current_block=block_height,
+                    )
+
+            # Read the post-governance state back into sim_* for state_root
+            sim_balances = dict(sim_supply.balances)
+            sim_staked = dict(sim_supply.staked)
+
+        return compute_state_root(
+            sim_balances, sim_nonces, sim_staked,
+            authority_keys=sim_authority_keys,
+            public_keys=sim_public_keys,
+            leaf_watermarks=sim_leaf_watermarks,
+            key_rotation_counts=sim_rotation_counts,
+            revoked_entities=sim_revoked,
+        )
 
     def propose_block(
         self,
@@ -1169,6 +1371,7 @@ class Blockchain:
         governance_txs: list | None = None,
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
+        unstake_transactions: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1184,12 +1387,23 @@ class Blockchain:
         """
         prev = self.get_latest_block()
         block_height = prev.header.block_number + 1
+        # The proposer's next signature will consume _next_leaf from their
+        # keypair.  Read it BEFORE computing the state root so the sim
+        # knows which watermark-bump the apply path will make after the
+        # block is signed.  Without this, the committed state_root lags
+        # the post-apply leaf_watermark by one and validators reject.
+        expected_proposer_leaf = getattr(
+            proposer_entity.keypair, "_next_leaf", None,
+        )
         state_root = self.compute_post_state_root(
             transactions, proposer_entity.entity_id, block_height,
             transfer_transactions=transfer_transactions,
             attestations=attestations,
             authority_txs=authority_txs,
             stake_transactions=stake_transactions,
+            unstake_transactions=unstake_transactions,
+            governance_txs=governance_txs,
+            proposer_signature_leaf_index=expected_proposer_leaf,
         )
         mtp = self.get_median_time_past()
         # A small epsilon greater than the minimum float resolution the
@@ -1205,6 +1419,7 @@ class Blockchain:
             governance_txs=governance_txs,
             authority_txs=authority_txs,
             stake_transactions=stake_transactions,
+            unstake_transactions=unstake_transactions,
             timestamp=timestamp,
         )
 
@@ -1410,6 +1625,16 @@ class Blockchain:
             ok, reason = _check_leaf(stx.entity_id, stx.signature.leaf_index, "stake tx")
             if not ok:
                 return False, reason
+        for utx in getattr(block, "unstake_transactions", []):
+            # Unstake is authority-gated (signed by the cold key when one
+            # has been promoted), so its leaf lives in the cold tree —
+            # namespaced the same way revoke is to avoid false positives
+            # with the hot tree.
+            authority_pk = self.get_authority_key(utx.entity_id)
+            signer_key = authority_pk if authority_pk is not None else utx.entity_id
+            ok, reason = _check_leaf(signer_key, utx.signature.leaf_index, "unstake tx")
+            if not ok:
+                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -1435,6 +1660,7 @@ class Blockchain:
             + [tx.tx_hash for tx in block.governance_txs]
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
+            + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1610,6 +1836,17 @@ class Blockchain:
             if not ok:
                 return False, f"Invalid stake tx: {reason}"
 
+        # Validate unstake transactions.  Authority-gated: signature must
+        # verify under the cold key (which defaults to the signing key for
+        # entities that haven't promoted one).  Amount must not exceed
+        # current stake.  Nonce is cumulative with other fee-paying txs.
+        for utx in getattr(block, "unstake_transactions", []):
+            ok, reason = self._validate_unstake_tx_in_block(
+                utx, pending_nonces, pending_balance_spent,
+            )
+            if not ok:
+                return False, f"Invalid unstake tx: {reason}"
+
         return True, "Valid"
 
     def _validate_stake_tx_in_block(
@@ -1670,6 +1907,64 @@ class Blockchain:
         empty_nonces: dict[bytes, int] = {}
         empty_spent: dict[bytes, int] = {}
         return self._validate_stake_tx_in_block(stx, empty_nonces, empty_spent)
+
+    def _validate_unstake_tx_in_block(
+        self, utx,
+        pending_nonces: dict[bytes, int],
+        pending_balance_spent: dict[bytes, int],
+    ) -> tuple[bool, str]:
+        """Validate an UnstakeTransaction within a block.
+
+        Authority-gated: verified against the entity's cold authority key.
+        Amount must not exceed the entity's current stake.  Fee is
+        tracked cumulatively with the block's other fee-paying txs.
+        """
+        from messagechain.core.staking import (
+            UnstakeTransaction, verify_unstake_transaction,
+        )
+        if not isinstance(utx, UnstakeTransaction):
+            return False, f"Unexpected type {type(utx).__name__}"
+        if utx.entity_id not in self.public_keys:
+            return False, f"Unknown sender {utx.entity_id.hex()[:16]}"
+        if utx.entity_id in self.revoked_entities:
+            # Revoked entities can't unstake through this path — their
+            # stake is already unbonding from the revoke tx itself.
+            return False, f"Entity {utx.entity_id.hex()[:16]} is revoked"
+
+        # Authority-gated signature check.
+        authority_pk = self.get_authority_key(utx.entity_id)
+        if authority_pk is None or not verify_unstake_transaction(utx, authority_pk):
+            return False, (
+                "Invalid signature — unstake must be signed by the authority "
+                "(cold) key. The hot signing key cannot authorize withdrawal."
+            )
+
+        expected_nonce = pending_nonces.get(
+            utx.entity_id, self.nonces.get(utx.entity_id, 0),
+        )
+        if utx.nonce != expected_nonce:
+            return False, f"Invalid nonce: expected {expected_nonce}, got {utx.nonce}"
+
+        if self.supply.get_staked(utx.entity_id) < utx.amount:
+            return False, (
+                f"Unstake {utx.amount} exceeds current stake "
+                f"{self.supply.get_staked(utx.entity_id)}"
+            )
+
+        spent_so_far = pending_balance_spent.get(utx.entity_id, 0)
+        needed = spent_so_far + utx.fee
+        if self.get_spendable_balance(utx.entity_id) < needed:
+            return False, f"Insufficient balance for unstake fee {utx.fee}"
+
+        pending_nonces[utx.entity_id] = expected_nonce + 1
+        pending_balance_spent[utx.entity_id] = needed
+        return True, "Valid"
+
+    def _validate_unstake_tx(self, utx) -> tuple[bool, str]:
+        """Standalone unstake validation for validate_block_standalone."""
+        empty_nonces: dict[bytes, int] = {}
+        empty_spent: dict[bytes, int] = {}
+        return self._validate_unstake_tx_in_block(utx, empty_nonces, empty_spent)
 
     def _validate_governance_tx_in_block(
         self, gtx,
@@ -1804,6 +2099,7 @@ class Blockchain:
             + [tx.tx_hash for tx in block.governance_txs]
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
+            + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1961,6 +2257,8 @@ class Blockchain:
             affected.add(atx.entity_id)
         for stx in getattr(block, "stake_transactions", []):
             affected.add(stx.entity_id)
+        for utx in getattr(block, "unstake_transactions", []):
+            affected.add(utx.entity_id)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -2023,6 +2321,34 @@ class Blockchain:
                 )
             self.nonces[stx.entity_id] = stx.nonce + 1
             self._bump_watermark(stx.entity_id, stx.signature.leaf_index)
+
+        # Apply unstake transactions.  Authority-gated; queues stake into
+        # the UNBONDING_PERIOD unbond queue (not immediately spendable) so
+        # in-flight slashing evidence stays effective during unbonding.
+        for utx in getattr(block, "unstake_transactions", []):
+            self.supply.pay_fee_with_burn(
+                utx.entity_id, proposer_id, utx.fee, current_base_fee,
+            )
+            unbond_ok = self.supply.unstake(
+                utx.entity_id, utx.amount,
+                current_block=block.header.block_number,
+                bootstrap_ended=False,
+            )
+            if not unbond_ok:
+                logger.error(
+                    f"Unstake tx {utx.tx_hash.hex()[:16]} failed at apply-time "
+                    f"despite passing validate_block; chain state may drift."
+                )
+            self.nonces[utx.entity_id] = utx.nonce + 1
+            # Bump the hot-key watermark ONLY when the unstake was signed
+            # by the hot signing key (single-key setup with no separate
+            # cold key promoted).  When a dedicated cold key signed it,
+            # the leaf lives in the cold tree's own namespace and must
+            # not pollute the hot-tree watermark for this entity_id.
+            authority_pk = self.get_authority_key(utx.entity_id)
+            signing_pk = self.public_keys.get(utx.entity_id)
+            if authority_pk == signing_pk:
+                self._bump_watermark(utx.entity_id, utx.signature.leaf_index)
 
         # Build attestor stakes map for reward distribution
         attestor_stakes = {}
@@ -2266,6 +2592,11 @@ class Blockchain:
         # rely on the snapshot/rollback safety net further down.
         if not block.slash_transactions:
             try:
+                proposer_sig_leaf = (
+                    block.header.proposer_signature.leaf_index
+                    if block.header.proposer_signature is not None
+                    else None
+                )
                 simulated_root = self.compute_post_state_root(
                     transactions=block.transactions,
                     proposer_id=block.header.proposer_id,
@@ -2274,6 +2605,9 @@ class Blockchain:
                     attestations=block.attestations,
                     authority_txs=getattr(block, "authority_txs", []),
                     stake_transactions=getattr(block, "stake_transactions", []),
+                    unstake_transactions=getattr(block, "unstake_transactions", []),
+                    governance_txs=getattr(block, "governance_txs", []),
+                    proposer_signature_leaf_index=proposer_sig_leaf,
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and
