@@ -40,12 +40,22 @@ class _Base(unittest.TestCase):
 
     def _bootstrap(self, extras=()):
         """Chain + staked proposer + genesis. Returns (chain, proposer,
-        consensus, extras_dict)."""
+        consensus, extras_dict).
+
+        NOTE: proposer stake is set high (500M) so stake-weighted
+        proposer selection in _selected_proposer_for_slot reliably
+        picks `proposer` even when `extras` includes other staked
+        entities.  `create_genesis_block` uses time.time(), so
+        genesis block_hash is non-deterministic across runs — a
+        dominant proposer stake drops the "wrong proposer for slot"
+        flake rate from percent-scale to sub-permille.  See the
+        equivalent fix in test_authority_tx_block_pipeline.py.
+        """
         chain = Blockchain()
         proposer = _entity(b"proposer")
         self._register(chain, proposer)
-        chain.supply.balances[proposer.entity_id] = 1_000_000
-        chain.supply.staked[proposer.entity_id] = 500_000
+        chain.supply.balances[proposer.entity_id] = 1_000_000_000
+        chain.supply.staked[proposer.entity_id] = 500_000_000
         extras_d = {}
         for seed, balance, stake in extras:
             e = _entity(seed)
@@ -56,7 +66,7 @@ class _Base(unittest.TestCase):
             extras_d[seed] = e
         chain.initialize_genesis(proposer)
         consensus = ProofOfStake()
-        consensus.register_validator(proposer.entity_id, stake_amount=500_000)
+        consensus.register_validator(proposer.entity_id, stake_amount=500_000_000)
         return chain, proposer, consensus, extras_d
 
 

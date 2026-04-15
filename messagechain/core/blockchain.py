@@ -399,9 +399,33 @@ class Blockchain:
                 eid for eid in allocation_table.keys()
                 if eid != TREASURY_ENTITY_ID
             )
+            if not self.seed_entity_ids:
+                # Allocation table supplied but contained ONLY the treasury.
+                # Bootstrap seed-exclusion rules will have no effect, which
+                # is almost never what the operator wants.  Loud warning
+                # rather than hard error — tests may legitimately do this.
+                logger.warning(
+                    "initialize_genesis: allocation_table has no seed "
+                    "entities (only TREASURY_ENTITY_ID present).  "
+                    "seed_entity_ids will be empty, so bootstrap-era "
+                    "seed-exclusion from the attester committee will "
+                    "silently no-op.  Use bootstrap.build_launch_allocation() "
+                    "for production deployments."
+                )
         else:
-            # Backward-compatible single-entity allocation — no seed set
-            # is pinned (seed_entity_ids stays as the initial frozenset()).
+            # Backward-compatible single-entity allocation.  No seed set
+            # is pinned (seed_entity_ids stays as frozenset()) — this is
+            # intended for tests and dev scaffolding, NOT production.
+            # Log a warning so operators catch accidental production use
+            # of this code path (every bootstrap gradient mechanism that
+            # depends on identifying seeds silently no-ops otherwise).
+            logger.warning(
+                "initialize_genesis called without allocation_table — "
+                "seed_entity_ids will be empty, so bootstrap-era "
+                "seed-exclusion rules will silently no-op.  Use "
+                "bootstrap.build_launch_allocation() or pass an "
+                "explicit allocation_table for production deployments."
+            )
             self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
 
         # Track as chain tip
