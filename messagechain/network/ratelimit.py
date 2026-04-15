@@ -25,6 +25,14 @@ RATE_ADDR = (0.1, 10)       # 0.1 msg/sec, burst up to 10
 # Response messages (RESPONSE_HEADERS, RESPONSE_BLOCKS_BATCH) — a peer
 # sending unsolicited responses can exhaust CPU via deserialization.
 RATE_RESPONSE = (5, 20)     # 5 responses/sec, burst up to 20
+# Non-message-tx gossip (ANNOUNCE_PENDING_TX carrying stake / unstake /
+# authority / governance txs).  In legitimate use these are rare (a
+# validator rotating a key, a user setting a cold-key binding, a
+# governance vote) — so the rate is tight.  Each one carries a WOTS+
+# signature to verify, so a flood is disproportionately expensive to
+# process.  2/sec with a burst of 20 accommodates normal bursty usage
+# while making a spam flood economically visible in peer scoring.
+RATE_PENDING_TX = (2, 20)
 
 
 @dataclass
@@ -76,6 +84,9 @@ class PeerRateLimiter:
                 "general": TokenBucket(rate=RATE_GENERAL[0], max_tokens=RATE_GENERAL[1]),
                 "addr": TokenBucket(rate=RATE_ADDR[0], max_tokens=RATE_ADDR[1]),
                 "response": TokenBucket(rate=RATE_RESPONSE[0], max_tokens=RATE_RESPONSE[1]),
+                "pending_tx": TokenBucket(
+                    rate=RATE_PENDING_TX[0], max_tokens=RATE_PENDING_TX[1],
+                ),
             }
 
     def check(self, address: str, category: str) -> bool:

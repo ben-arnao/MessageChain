@@ -1757,11 +1757,33 @@ class Server:
         The peer's admission path already did the fast local-state checks;
         we redo them ourselves because we don't trust peers.  Dedupe by
         tx_hash and leaf so a gossiped tx doesn't re-broadcast forever.
+
+        Rate-limited per-peer under the "pending_tx" category: a flooder
+        is cheaply dropped before the expensive signature-verify path,
+        and their ban score bumps so repeated abuse earns a disconnect.
         """
         try:
+            # Rate-limit BEFORE any deserialization / signature verify —
+            # those are the costly operations we want to protect from spam.
+            peer_address = getattr(peer, "address", None)
+            if peer_address and not self.rate_limiter.check(
+                peer_address, "pending_tx",
+            ):
+                self.ban_manager.record_offense(
+                    peer_address,
+                    OFFENSE_RATE_LIMIT,
+                    "pending_tx_rate_limit",
+                )
+                return
             kind = payload.get("kind")
             tx_data = payload.get("tx")
             if not isinstance(kind, str) or not isinstance(tx_data, dict):
+                if peer_address:
+                    self.ban_manager.record_offense(
+                        peer_address,
+                        OFFENSE_PROTOCOL_VIOLATION,
+                        "pending_tx_malformed",
+                    )
                 return
             if kind == "authority":
                 from messagechain.core.block import _deserialize_authority_tx
