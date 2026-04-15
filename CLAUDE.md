@@ -15,3 +15,4 @@
 - **Test-driven development** — This is a TDD environment. Write tests first, then implement the code to make them pass.
 - **Always commit and push when done with a task. Do not ask — just do it.** This is standing authorization.
 - All tests must pass at all times. Run `python -m unittest discover tests/` to verify.
+- **Parallel-friendly worktrees** — For any code changes, start a new branch off the current branch and run in an isolated git worktree (use the Agent tool's `isolation: "worktree"` option, or `git worktree add` manually). This lets multiple agents work in parallel without stepping on each other. Do the work on the branch, commit there, push the branch, then merge back into the parent branch and push — same end result as working directly, just parallel-safe.
