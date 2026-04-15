@@ -97,11 +97,53 @@ class TestCrossPoolLeafDedupe(_Base):
         utx.tx_hash = utx._compute_hash()
 
         self.assertFalse(
-            srv._check_leaf_across_all_pools(
-                alice.entity_id, utx.signature.leaf_index,
-            ),
+            srv._check_leaf_across_all_pools(utx),
             "Cross-pool dedupe must reject a second tx at a leaf already "
             "used by a pending tx from the same entity.",
+        )
+
+    def test_cold_key_unstake_not_false_positive_against_hot_leaf(self):
+        """A cold-signed unstake at leaf N is NOT a collision with a pending
+        hot-signed stake at leaf N — they're in different leaf namespaces.
+
+        Before the fix, cross-pool dedupe keyed by entity_id would reject
+        this as a false positive.  Correct behavior: the cold key's leaf
+        space is independent of the hot key's, so no collision.
+        """
+        from messagechain.core.authority_key import (
+            create_set_authority_key_transaction,
+        )
+        srv = _build_server()
+        hot = _entity(b"hot")
+        cold = _entity(b"cold")
+        self._register(srv.blockchain, hot)
+        srv.blockchain.supply.balances[hot.entity_id] = 100_000
+        srv.blockchain.supply.staked[hot.entity_id] = 10_000
+        # Cold key promoted
+        srv.blockchain.authority_keys[hot.entity_id] = cold.public_key
+
+        # Hot-signed stake tx lands in the pool at some leaf index.
+        hot_stake = create_stake_transaction(hot, amount=100, nonce=0, fee=500)
+        srv._pending_stake_txs = {hot_stake.tx_hash: hot_stake}
+
+        # Build a cold-signed unstake that happens to sit at THE SAME
+        # leaf_index in the COLD tree — different namespace, should pass.
+        target_leaf = hot_stake.signature.leaf_index
+        cold.keypair._next_leaf = target_leaf
+        utx = UnstakeTransaction(
+            entity_id=hot.entity_id, amount=50, nonce=1,
+            timestamp=time.time(), fee=500,
+            signature=Signature([], 0, [], b"", b""),
+        )
+        utx.signature = cold.keypair.sign(_hash(utx._signable_data()))
+        utx.tx_hash = utx._compute_hash()
+        self.assertEqual(utx.signature.leaf_index, target_leaf)
+
+        self.assertTrue(
+            srv._check_leaf_across_all_pools(utx),
+            "Cold-signed unstake at leaf N must not be flagged as a "
+            "collision with a hot-signed tx at leaf N — different keys, "
+            "different leaf namespaces.",
         )
 
 

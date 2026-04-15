@@ -483,38 +483,72 @@ class Server:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
     def _rpc_register_entity(self, params: dict) -> dict:
-        """Register a new entity from client-provided public identity.
+        """Accept a new-entity registration.
 
-        The client derives entity_id and public_key locally from their
-        private key, then sends the public values plus a registration proof
-        (signature over SHA3-256("register" || entity_id)). The server
-        never sees private key material.
+        The client sends entity_id + public_key + registration_proof.
+        The server wraps them in a RegistrationTransaction and queues
+        it for the next block — state is only mutated when the block
+        containing this tx is produced and validated, so every peer
+        converges on the same public_keys map.  Prior design applied
+        the registration directly to local state, which made the first
+        transfer from a newly-registered entity fail across multi-node
+        deployments (peer nodes rejected the block because they had
+        never seen the registration).
         """
         try:
+            import time as _time
             from messagechain.crypto.keys import Signature
+            from messagechain.core.registration import (
+                RegistrationTransaction, verify_registration_transaction,
+            )
             entity_id = parse_hex(params.get("entity_id", ""))
             public_key = parse_hex(params.get("public_key", ""))
             if entity_id is None or public_key is None:
                 return {"ok": False, "error": "Invalid hex in entity_id or public_key"}
 
             proof_data = params.get("registration_proof")
-            proof = None
-            if proof_data is not None:
-                proof = Signature.deserialize(proof_data)
+            if proof_data is None:
+                return {"ok": False, "error": "Registration proof required"}
+            proof = Signature.deserialize(proof_data)
 
-            success, msg = self.blockchain.register_entity(entity_id, public_key, registration_proof=proof)
-            if success:
-                return {
-                    "ok": True,
-                    "result": {
-                        "entity_id": params["entity_id"],
-                        "public_key": params["public_key"],
-                        "message": msg,
-                        "initial_balance": 0,
-                    },
-                }
-            else:
-                return {"ok": False, "error": msg}
+            if entity_id in self.blockchain.public_keys:
+                return {"ok": False, "error": "Entity already registered"}
+
+            tx = RegistrationTransaction(
+                entity_id=entity_id,
+                public_key=public_key,
+                registration_proof=proof,
+                timestamp=_time.time(),
+            )
+            tx.tx_hash = tx._compute_hash()
+
+            ok, reason = verify_registration_transaction(tx)
+            if not ok:
+                return {"ok": False, "error": reason}
+
+            if not hasattr(self, "_pending_registration_txs"):
+                self._pending_registration_txs = {}
+            # Reject a duplicate pending registration for the same entity
+            # so repeated CLI calls don't queue multiple txs (the block-
+            # level dedupe would catch it but it's clearer to fail early).
+            for pending in self._pending_registration_txs.values():
+                if pending.entity_id == entity_id:
+                    return {
+                        "ok": False,
+                        "error": "Registration already pending for this entity",
+                    }
+            self._pending_registration_txs[tx.tx_hash] = tx
+
+            return {
+                "ok": True,
+                "result": {
+                    "entity_id": params["entity_id"],
+                    "public_key": params["public_key"],
+                    "tx_hash": tx.tx_hash.hex(),
+                    "status": "pending — will be included in the next block",
+                    "initial_balance": 0,
+                },
+            }
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
@@ -573,7 +607,7 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
                 return {"ok": False, "error": "Insufficient balance for staking + fee"}
 
-            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+            if not self._check_leaf_across_all_pools(tx):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -628,7 +662,7 @@ class Server:
             if self.blockchain.supply.get_staked(entity_id) < tx.amount:
                 return {"ok": False, "error": "Insufficient staked amount"}
 
-            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+            if not self._check_leaf_across_all_pools(tx):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -645,48 +679,119 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
-    def _check_leaf_across_all_pools(
-        self, entity_id: bytes, leaf_index: int,
-    ) -> bool:
-        """Return True if no currently-pending tx from the same entity shares
-        this leaf_index.  Queried by every RPC admission path so a rapid-fire
-        client can't land two txs at the same WOTS+ leaf — either both would
-        fail in the block-level dedupe and the whole block would be rejected,
-        or if they split across blocks the second would leak the private key
-        for that leaf.  Catching it here errors the second RPC immediately.
-        """
-        def _signer_id(tx):
-            # Different tx types name their sender field differently.
-            # Try the common ones in order of specificity so governance /
-            # slashing txs contribute their signer to the dedupe.
-            for attr in (
-                "entity_id", "proposer_id", "voter_id", "delegator_id",
-                "submitter_id",
-            ):
-                eid = getattr(tx, attr, None)
-                if eid is not None:
-                    return eid
-            return None
+    def _tx_signer_pubkey(self, tx) -> bytes | None:
+        """Return the public key that `tx`'s signature verifies under.
 
-        def _scan(pool):
-            for existing in pool.values():
-                sig = getattr(existing, "signature", None)
-                eid = _signer_id(existing)
-                if sig is None or eid is None:
-                    continue
-                if eid == entity_id and sig.leaf_index == leaf_index:
-                    return False
-            return True
+        This is the correct dedupe key for WOTS+ leaf reuse: two
+        signatures share a leaf namespace only when they were produced
+        by the same key.  For hot-signed txs (message, transfer, stake,
+        SetAuthorityKey, KeyRotation, governance) that's the entity's
+        public_key.  For cold-key-gated txs (unstake, revoke) it's the
+        authority_key — which may be identical to the public_key when
+        no cold key has been promoted, or may be a totally different
+        key in its own leaf namespace.
+
+        Returning None means "can't resolve" — caller should skip this
+        tx rather than fall back to a potentially-wrong key comparison.
+        """
+        # Cold-key-gated paths first: authority_key is the signer even
+        # when it differs from the hot signing key.
+        cls_name = tx.__class__.__name__
+        if cls_name in ("RevokeTransaction", "UnstakeTransaction"):
+            eid = getattr(tx, "entity_id", None)
+            if eid is None:
+                return None
+            return self.blockchain.get_authority_key(eid)
+
+        # Everything else signs with the entity's hot public_key.  Each
+        # tx type names its sender field differently; try the common
+        # ones in order of specificity.
+        for attr in (
+            "entity_id", "proposer_id", "voter_id", "delegator_id",
+            "submitter_id",
+        ):
+            eid = getattr(tx, attr, None)
+            if eid is not None:
+                return self.blockchain.public_keys.get(eid)
+        return None
+
+    def _check_leaf_across_all_pools(
+        self, incoming_tx, leaf_index: int | None = None,
+    ) -> bool:
+        """Return True if no currently-pending tx shares this signer key
+        and leaf_index with the incoming one.
+
+        The dedupe key is (signer_public_key, leaf_index) — not
+        (entity_id, leaf_index), because cold-key-signed txs (unstake,
+        revoke) live in a different leaf namespace from hot-key-signed
+        txs on the same entity.  Using entity_id would fire false
+        positives when a hot-key tx and a cold-key tx happen to pick
+        the same leaf_index, which is fine because they're in different
+        trees.
+
+        Backwards-compat: callers may pass a raw (entity_id_bytes,
+        leaf_index) pair instead of a tx object — in that case we fall
+        back to the entity_id-keyed comparison.  This keeps older call
+        sites working while new ones (and the gossip receiver) get the
+        stronger signer-key-based check.
+        """
+        if isinstance(incoming_tx, (bytes, bytearray)):
+            # Legacy call shape: (entity_id, leaf_index).
+            return self._check_leaf_by_entity_id(incoming_tx, leaf_index)
+
+        incoming_signer = self._tx_signer_pubkey(incoming_tx)
+        incoming_leaf = incoming_tx.signature.leaf_index
+        if incoming_signer is None:
+            # Unknown key — can't dedupe safely.  Reject to fail closed.
+            return False
 
         for pool_attr in (
             "_pending_stake_txs", "_pending_unstake_txs",
             "_pending_authority_txs", "_pending_governance_txs",
         ):
             pool = getattr(self, pool_attr, {})
-            if not _scan(pool):
-                return False
-        # Mempool's internal guard already covers message and transfer
-        # txs; nothing extra to check there.
+            for existing in pool.values():
+                sig = getattr(existing, "signature", None)
+                if sig is None:
+                    continue
+                existing_signer = self._tx_signer_pubkey(existing)
+                if existing_signer is None:
+                    continue
+                if (
+                    existing_signer == incoming_signer
+                    and sig.leaf_index == incoming_leaf
+                ):
+                    return False
+        # Mempool's internal guard covers message and transfer txs and
+        # is already signer-agnostic (same-entity hot-only).
+        return True
+
+    def _check_leaf_by_entity_id(
+        self, entity_id: bytes, leaf_index: int,
+    ) -> bool:
+        """Legacy entity-id-based dedupe path kept for call sites that
+        don't have a tx object in hand.  Conservatively scans every
+        pool for a matching (entity_id, leaf_index) pair regardless of
+        whether the signer is hot or cold."""
+        for pool_attr in (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+        ):
+            pool = getattr(self, pool_attr, {})
+            for existing in pool.values():
+                sig = getattr(existing, "signature", None)
+                for attr in (
+                    "entity_id", "proposer_id", "voter_id",
+                    "delegator_id", "submitter_id",
+                ):
+                    eid = getattr(existing, attr, None)
+                    if eid is not None:
+                        break
+                if sig is None or eid is None:
+                    continue
+                if eid == entity_id and sig.leaf_index == leaf_index:
+                    return False
+        return True
         return True
 
     def _queue_authority_tx(self, tx, *, validate_fn) -> tuple[bool, str]:
@@ -699,7 +804,7 @@ class Server:
         ok, reason = validate_fn(tx)
         if not ok:
             return False, reason
-        if not self._check_leaf_across_all_pools(tx.entity_id, tx.signature.leaf_index):
+        if not self._check_leaf_across_all_pools(tx):
             return False, "WOTS+ leaf already used by another pending tx — leaf reuse rejected"
         if not hasattr(self, "_pending_authority_txs"):
             self._pending_authority_txs = {}
@@ -805,7 +910,7 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+            if not self._check_leaf_across_all_pools(tx):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -851,7 +956,7 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+            if not self._check_leaf_across_all_pools(tx):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -894,7 +999,7 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
-            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+            if not self._check_leaf_across_all_pools(tx):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -1076,6 +1181,8 @@ class Server:
         unstake_txs = list(pending_unstake.values())[:MAX_TXS_PER_BLOCK]
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
+        pending_registration = getattr(self, "_pending_registration_txs", {})
+        registration_txs = list(pending_registration.values())[:MAX_TXS_PER_BLOCK]
 
         block = self.blockchain.propose_block(
             self.consensus, self.wallet_entity, txs,
@@ -1085,6 +1192,7 @@ class Server:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             governance_txs=governance_txs,
+            registration_transactions=registration_txs,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -1107,6 +1215,9 @@ class Server:
             if governance_txs:
                 for gh in [g.tx_hash for g in governance_txs]:
                     pending_gov.pop(gh, None)
+            if registration_txs:
+                for rh in [r.tx_hash for r in registration_txs]:
+                    pending_registration.pop(rh, None)
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(
@@ -1641,9 +1752,7 @@ class Server:
                     return
                 if not ok:
                     return
-                if not self._check_leaf_across_all_pools(
-                    tx.entity_id, tx.signature.leaf_index,
-                ):
+                if not self._check_leaf_across_all_pools(tx):
                     return
                 pool = getattr(self, "_pending_authority_txs", None)
                 if pool is None:
@@ -1661,9 +1770,7 @@ class Server:
                     tx, pk, block_height=self.blockchain.height,
                 ):
                     return
-                if not self._check_leaf_across_all_pools(
-                    tx.entity_id, tx.signature.leaf_index,
-                ):
+                if not self._check_leaf_across_all_pools(tx):
                     return
                 pool = getattr(self, "_pending_stake_txs", None)
                 if pool is None:
@@ -1681,9 +1788,7 @@ class Server:
                     tx, authority_pk,
                 ):
                     return
-                if not self._check_leaf_across_all_pools(
-                    tx.entity_id, tx.signature.leaf_index,
-                ):
+                if not self._check_leaf_across_all_pools(tx):
                     return
                 pool = getattr(self, "_pending_unstake_txs", None)
                 if pool is None:
@@ -1701,9 +1806,7 @@ class Server:
                 )
                 if signer_id is None or signer_id not in self.blockchain.public_keys:
                     return
-                if not self._check_leaf_across_all_pools(
-                    signer_id, tx.signature.leaf_index,
-                ):
+                if not self._check_leaf_across_all_pools(tx):
                     return
                 pool = getattr(self, "_pending_governance_txs", None)
                 if pool is None:
