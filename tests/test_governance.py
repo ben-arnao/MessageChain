@@ -415,6 +415,58 @@ class TestDelegationBasics(unittest.TestCase):
         # Eligible: bob stake 500 + alice aged balance 1000 = 1500.
         self.assertEqual(eligible, 1500)
 
+    def test_delegation_at_exact_aging_boundary_counts(self):
+        """A delegation whose age is EXACTLY the aging threshold counts.
+
+        This pins the boundary precisely: age >= threshold ages in.  An
+        off-by-one that excluded delegations at the exact threshold
+        would let an attacker guarantee their delegation NEVER ages
+        (submit at block N, wait N+aging, submit again at N+aging — it
+        would always be excluded at the moment of freshness).
+        """
+        self.supply.staked[self.bob.entity_id] = 500
+        self.supply.balances[self.alice.entity_id] = 1000
+        # Delegation at block 100; proposal at block 100 + aging.  Delta
+        # = aging (exactly), which is >= aging → must age in.
+        self.tracker.set_delegation(
+            self.alice.entity_id, [(self.bob.entity_id, 100)],
+            current_block=100,
+        )
+        proposal = self._add_proposal_aged(
+            self.bob, proposal_block=100 + AGED_OFFSET,
+        )
+        self.tracker.add_vote(
+            create_vote(self.bob, proposal.proposal_id, True),
+            current_block=100 + AGED_OFFSET + 1,
+        )
+        yes, _no, _participating, eligible = self.tracker.tally(proposal.proposal_id)
+        # Bob direct 500 + alice aged-delegated 1000 = 1500.
+        self.assertEqual(yes, 1500)
+        self.assertEqual(eligible, 1500)
+
+    def test_delegation_one_block_below_boundary_excluded(self):
+        """A delegation one block short of the aging threshold is
+        excluded.  Complement to the boundary-inclusive test above."""
+        self.supply.staked[self.bob.entity_id] = 500
+        self.supply.balances[self.alice.entity_id] = 1000
+        # Delegation at block 101; proposal at block 100 + aging.  Delta
+        # = aging - 1 (one short) → must be excluded.
+        self.tracker.set_delegation(
+            self.alice.entity_id, [(self.bob.entity_id, 100)],
+            current_block=101,
+        )
+        proposal = self._add_proposal_aged(
+            self.bob, proposal_block=100 + AGED_OFFSET,
+        )
+        self.tracker.add_vote(
+            create_vote(self.bob, proposal.proposal_id, True),
+            current_block=100 + AGED_OFFSET + 1,
+        )
+        yes, _no, _participating, eligible = self.tracker.tally(proposal.proposal_id)
+        # Bob direct 500 only; alice's delegation silent.
+        self.assertEqual(yes, 500)
+        self.assertEqual(eligible, 500)
+
     def test_non_aged_delegation_ignored(self):
         """A delegation registered too recently is excluded from this
         proposal's snapshot."""
