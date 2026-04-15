@@ -966,7 +966,25 @@ class Blockchain:
         # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
         self.supply.pay_fee_with_burn(tx.submitter_id, proposer_id, tx.fee, self.supply.base_fee)
 
-        # Slash the offender
+        # Slash the offender: burn stake, burn bootstrap-era escrow.
+        # Escrow burn happens BEFORE the stake burn returns so the
+        # logged totals reflect the full penalty.  Bootstrap escrow
+        # captures rewards earned during the slashable window — if the
+        # offender was accumulating honest-looking rewards while also
+        # equivocating, those rewards evaporate.  Tokens previously
+        # credited to supply.balances are reclaimed via the supply
+        # tracker's reduction path.
+        escrow_burned = self._escrow.slash_all(tx.evidence.offender_id)
+        if escrow_burned > 0:
+            # Reduce both balance (tokens were credited there at mint)
+            # and total_supply (escrow-burn is a permanent destruction,
+            # same as stake-burn).
+            cur_balance = self.supply.balances.get(tx.evidence.offender_id, 0)
+            self.supply.balances[tx.evidence.offender_id] = max(
+                0, cur_balance - escrow_burned,
+            )
+            self.supply.total_supply -= escrow_burned
+
         slashed, finder_reward = self.supply.slash_validator(
             tx.evidence.offender_id, tx.submitter_id
         )
@@ -981,10 +999,16 @@ class Blockchain:
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
-            f"burned={slashed - finder_reward}, finder_reward={finder_reward}"
+            f"stake_burned={slashed - finder_reward}, "
+            f"escrow_burned={escrow_burned}, "
+            f"finder_reward={finder_reward}"
         )
 
-        return True, f"Validator slashed (total={slashed}, reward={finder_reward})"
+        return True, (
+            f"Validator slashed "
+            f"(stake={slashed}, escrow={escrow_burned}, "
+            f"reward={finder_reward})"
+        )
 
     def get_median_time_past(self) -> float:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
@@ -2521,9 +2545,20 @@ class Blockchain:
         for ttx in block.transfer_transactions:
             self._apply_transfer_with_burn(ttx, proposer_id, current_base_fee)
             self._bump_watermark(ttx.entity_id, ttx.signature.leaf_index)
-        # Apply slash transactions
+        # Apply slash transactions.  Burns stake + accumulated escrow;
+        # escrow burn runs first so any bootstrap-era rewards the
+        # offender had built up also evaporate.  Matches the policy
+        # from apply_slash_transaction (which is the other entry point
+        # for slashing — kept semantically identical to avoid drift).
         for stx in block.slash_transactions:
             self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
+            escrow_burned = self._escrow.slash_all(stx.evidence.offender_id)
+            if escrow_burned > 0:
+                cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
+                self.supply.balances[stx.evidence.offender_id] = max(
+                    0, cur_balance - escrow_burned,
+                )
+                self.supply.total_supply -= escrow_burned
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
             # Revoke delegations pointing to the slashed validator — delegators
