@@ -20,6 +20,8 @@ python -m messagechain generate-key      # prints private key — write it on pa
 python -m messagechain verify-key        # re-enter by hand; confirms the backup is correct
 ```
 
+**Why paper, not a file?** Any file gets swept up by cloud-sync (iCloud/OneDrive/Dropbox), system backups, disk forensics, or a single malware hit that greps for key-shaped blobs. Paper can only be stolen by physical access or a camera in the room. The `--keyfile` flow further down is a controlled exception for unattended validators on dedicated, locked-down machines.
+
 Close the terminal window when done — that discards the scrollback showing your key. Don't copy-paste; clipboard managers log history.
 
 **🔌 Reconnect to the internet.** In a new terminal:
