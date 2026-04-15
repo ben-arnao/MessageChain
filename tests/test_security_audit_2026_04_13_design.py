@@ -8,7 +8,6 @@ D1   P2P write_message calls must have a timeout
 D2   RESPONSE_HEADERS/RESPONSE_BLOCKS_BATCH must be rate-limited
 D3   Checkpoint loading must fail loudly on missing/corrupt files
 D4   Bootstrap mode must still verify attestation signatures
-D5   Governance delegation tally must weight ALL targets proportionally
 D6   Fork choice must use historical (snapshotted) stake, not live
 D7   Conflicting attestations must auto-generate slashing evidence
 D8   RPC must require authentication
@@ -209,80 +208,6 @@ class TestD4BootstrapAttestationVerification(unittest.TestCase):
                 "Bootstrap mode must verify attestation signatures when keys are available")
         finally:
             cfg.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = original
-
-
-# ─────────────────────────────────────────────────────────────────────
-# D5: Governance delegation proportional weight
-# ─────────────────────────────────────────────────────────────────────
-
-class TestD5DelegationProportionalWeight(unittest.TestCase):
-    """Delegated weight must be distributed proportionally to ALL targets,
-    not just those who voted."""
-
-    def test_non_voting_delegate_weight_excluded(self):
-        """If a delegator targets 3 validators (33% each) and only 1 voted,
-        the delegated weight counted should be 33%, not 100%."""
-        from messagechain.governance.governance import (
-            GovernanceTracker, ProposalTransaction, VoteTransaction,
-        )
-        from messagechain.economics.inflation import SupplyTracker
-        from messagechain.crypto.keys import Signature
-
-        tracker = GovernanceTracker()
-        supply = SupplyTracker()
-        dummy_sig = Signature([], 0, [], b"\x00" * 32, b"\x00" * 32)
-
-        # Three validators with equal stake
-        v1, v2, v3 = os.urandom(32), os.urandom(32), os.urandom(32)
-        supply.staked = {v1: 1000, v2: 1000, v3: 1000}
-
-        # A delegator with 3000 stake delegates equally to v1, v2, v3
-        delegator = os.urandom(32)
-        supply.staked[delegator] = 3000
-
-        # Create proposal
-        pid = os.urandom(32)
-        ptx = ProposalTransaction(
-            proposer_id=v1, title="Test", description="test",
-            timestamp=time.time(), fee=cfg.GOVERNANCE_PROPOSAL_FEE,
-            signature=dummy_sig,
-        )
-        ptx.tx_hash = pid
-        # Manually override proposal_id for lookup
-        tracker.add_proposal(ptx, block_height=0, supply_tracker=supply)
-        # Get the actual proposal_id
-        actual_pid = ptx.tx_hash
-
-        # Set delegation: delegator -> v1(34%), v2(33%), v3(33%)
-        tracker.set_delegation(delegator, [(v1, 34), (v2, 33), (v3, 33)])
-
-        # Only v1 votes yes
-        tracker.proposals[actual_pid].votes[v1] = True
-
-        yes_weight, total_weight = tracker.tally(actual_pid)
-
-        # Semantic invariant preserved: the *explicit* delegation to non-voting
-        # targets (v2, v3) must NOT be redistributed to the voter (v1).  Only
-        # v1's 34% share of delegator's power counts; 66% (v2+v3 shares) are
-        # lost.
-        #
-        # Under the 2026-04-14 redesign, v2 and v3 themselves are passive (no
-        # direct vote, no explicit delegation) so their own stakes auto-
-        # delegate via sqrt-weighting to voting validators (only v1).
-        #
-        # Breakdown:
-        #   v1 direct          = 1000
-        #   delegator→v1 (34%) = 3000 * 34 // 100 = 1020
-        #     [delegator's v2 and v3 shares — 33% each — are lost, NOT
-        #      redistributed, which is the D5 invariant]
-        #   v2 auto-delegation = 1000 (only voter is v1, so full share goes there)
-        #   v3 auto-delegation = 1000 (same)
-        #   total              = 1000 + 1020 + 1000 + 1000 = 4020
-        expected_delegated = 3000 * 34 // 100  # 1020
-        expected_total = 1000 + expected_delegated + 1000 + 1000
-        self.assertEqual(total_weight, expected_total,
-            f"Explicit delegation to non-voting targets must not be redistributed to voters. "
-            f"Got {total_weight}, expected {expected_total}")
 
 
 # ─────────────────────────────────────────────────────────────────────

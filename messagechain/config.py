@@ -279,22 +279,16 @@ FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= tota
 
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
-# Supermajority (2/3) required to approve any proposal.  Reasoning:
-# passive balance+stake auto-delegates to the validator set, which gives
-# validators disproportionate default voting power.  Requiring a 2/3
-# supermajority prevents validators from ramming through self-serving
-# proposals (rewards, minimum-stake changes, treasury drains) on passive
-# power alone.
-GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >=2/3 of participating weight must approve
-GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: yes * 3 >= total * 2
-GOVERNANCE_PROPOSAL_FEE = 1000        # fee to create a proposal (spam deterrent)
+# Supermajority (2/3) required to approve a BINDING proposal (treasury
+# spend).  Denominator is TOTAL ELIGIBLE voting weight (sum of every
+# snapshotted validator's own stake), not just participants — silence
+# counts as "no".  This gives an implicit 2/3 turnout floor for binding
+# outcomes and keeps self-serving proposals from sliding through on a
+# quiet week.
+GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >=2/3 of total eligible weight must approve
+GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: yes * 3 > total * 2
+GOVERNANCE_PROPOSAL_FEE = 10_000      # fee to create a proposal (spam deterrent)
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
-GOVERNANCE_DELEGATE_FEE = 100         # fee to delegate/revoke voting power
-MAX_DELEGATION_TARGETS = 3            # max validators a user can delegate to
-# Balances below this threshold are ignored when snapshotting balances at
-# proposal-creation time.  Dust amounts contribute negligible voting power
-# after sqrt-squashing and would balloon snapshot size.
-GOVERNANCE_BALANCE_SNAPSHOT_DUST = 1
 
 # RPC authentication — prevents local privilege escalation where an
 # unprivileged process calls submit_transaction / stake / ban_peer.

@@ -451,9 +451,6 @@ class Server:
         elif method == "submit_transfer":
             return self._rpc_submit_transfer(request["params"])
 
-        elif method == "submit_delegation":
-            return self._rpc_submit_delegation(request["params"])
-
         elif method == "submit_proposal":
             return self._rpc_submit_proposal(request["params"])
 
@@ -699,8 +696,7 @@ class Server:
 
         def _signer_id(tx):
             for attr in (
-                "entity_id", "proposer_id", "voter_id",
-                "delegator_id", "submitter_id",
+                "entity_id", "proposer_id", "voter_id", "submitter_id",
             ):
                 eid = getattr(tx, attr, None)
                 if eid is not None:
@@ -828,8 +824,7 @@ class Server:
         # tx type names its sender field differently; try the common
         # ones in order of specificity.
         for attr in (
-            "entity_id", "proposer_id", "voter_id", "delegator_id",
-            "submitter_id",
+            "entity_id", "proposer_id", "voter_id", "submitter_id",
         ):
             eid = getattr(tx, attr, None)
             if eid is not None:
@@ -902,8 +897,7 @@ class Server:
             for existing in pool.values():
                 sig = getattr(existing, "signature", None)
                 for attr in (
-                    "entity_id", "proposer_id", "voter_id",
-                    "delegator_id", "submitter_id",
+                    "entity_id", "proposer_id", "voter_id", "submitter_id",
                 ):
                     eid = getattr(existing, attr, None)
                     if eid is not None:
@@ -1001,51 +995,6 @@ class Server:
             return {"ok": True, "result": {
                 "entity_id": tx.entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
-                "status": "pending — will be included in next block",
-            }}
-        except Exception as e:
-            return {"ok": False, "error": sanitize_error(str(e))}
-
-    def _rpc_submit_delegation(self, params: dict) -> dict:
-        """Accept a signed delegation transaction from a client.
-
-        Validates the transaction and queues it for inclusion in the next
-        block. State is only mutated when the block containing this
-        transaction is produced and validated — never directly from RPC.
-        """
-        try:
-            from messagechain.governance.governance import (
-                DelegateTransaction, verify_delegation,
-            )
-            tx = DelegateTransaction.deserialize(params["transaction"])
-            entity_id = tx.delegator_id
-
-            if entity_id not in self.blockchain.public_keys:
-                return {"ok": False, "error": "Entity not registered"}
-
-            public_key = self.blockchain.public_keys[entity_id]
-            if not verify_delegation(tx, public_key):
-                return {"ok": False, "error": "Invalid delegation transaction"}
-
-            if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
-                return {"ok": False, "error": "Insufficient balance for fee"}
-
-            if not self._check_leaf_across_all_pools(tx):
-                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
-
-            # Queue for block inclusion — do NOT mutate state directly.
-            if not self._admit_to_pool("_pending_governance_txs", tx):
-                return {"ok": False, "error": "Governance pool full — raise fee to evict a lower-priced pending tx"}
-            self._schedule_pending_tx_gossip("governance", tx)
-
-            targets_info = [
-                {"delegate_id": did.hex(), "pct": pct}
-                for did, pct in tx.targets
-            ]
-            return {"ok": True, "result": {
-                "entity_id": entity_id.hex(),
-                "tx_hash": tx.tx_hash.hex(),
-                "targets": targets_info,
                 "status": "pending — will be included in next block",
             }}
         except Exception as e:
@@ -1935,7 +1884,6 @@ class Server:
                 signer_id = (
                     getattr(tx, "proposer_id", None)
                     or getattr(tx, "voter_id", None)
-                    or getattr(tx, "delegator_id", None)
                 )
                 if signer_id is None or signer_id not in self.blockchain.public_keys:
                     return

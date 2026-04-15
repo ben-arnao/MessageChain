@@ -282,14 +282,13 @@ class TestTreasurySpend(unittest.TestCase):
         self.assertTrue(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
         self.assertFalse(tracker.execute_treasury_spend(tx, chain.supply, current_block=closed_block))
 
-    def test_treasury_auto_delegation_capture_prevented(self):
-        """A lone validator cannot drain the treasury by harvesting passive stake.
+    def test_treasury_single_voter_capture_prevented(self):
+        """A lone validator cannot drain the treasury by harvesting silence.
 
-        Binding outcomes (treasury spends, ejections) use `_tally_binding`,
-        which disables auto-delegation and requires yes to clear 2/3 of
-        TOTAL eligible stake — not just participating weight.  Without this,
-        a single voter during apathy could pass any treasury spend
-        unilaterally via auto-delegation routing.
+        The binding tally requires yes to clear 2/3 of TOTAL eligible
+        stake (all snapshotted validators, voter or silent).  Silence
+        counts as "no".  Without this, a single voter during apathy could
+        pass any treasury spend unilaterally.
         """
         from messagechain.config import TREASURY_ENTITY_ID, GOVERNANCE_VOTING_WINDOW
         from messagechain.governance.governance import (
@@ -298,8 +297,7 @@ class TestTreasurySpend(unittest.TestCase):
         chain = self._setup_chain_with_treasury()
         tracker = GovernanceTracker()
         # Three validators, only alice votes yes.  Bob and carol stay silent.
-        # Under old tally: alice + auto-delegated bob + carol = 100% -> PASSES.
-        # Under binding tally: alice has 1/3 of eligible stake -> FAILS.
+        # Under stakers-only tally: alice has 1/3 of eligible stake -> FAILS.
         chain.supply.staked[self.alice.entity_id] = 1000
         chain.supply.staked[self.bob.entity_id] = 1000
         chain.supply.staked[self.carol.entity_id] = 1000

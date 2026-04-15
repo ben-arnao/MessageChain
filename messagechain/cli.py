@@ -176,8 +176,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rotate to a fresh Merkle tree (leaf exhaustion recovery)",
         description=(
             "Move this entity to a freshly-derived Merkle tree of one-time "
-            "keys. Your entity ID (wallet address), balance, stake, delegations, "
-            "and authority-key binding all carry over unchanged — only the "
+            "keys. Your entity ID (wallet address), balance, stake, and "
+            "authority-key binding all carry over unchanged — only the "
             "underlying signing public key is replaced. Use when your leaf "
             "watermark approaches the tree capacity, typically at ~80% usage."
         ),
@@ -212,27 +212,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revoke.add_argument("--fee", type=int, default=None, help="Transaction fee")
     revoke.add_argument("--server", type=str, default=None, help="Server address host:port")
-
-    # --- delegate ---
-    delegate = sub.add_parser(
-        "delegate",
-        help="Delegate trust to validators",
-        description="Delegate voting power to up to 3 validators you trust.",
-    )
-    delegate.add_argument(
-        "--to", action="append", dest="delegates",
-        help="Validator entity ID (hex). Can specify up to 3.",
-    )
-    delegate.add_argument(
-        "--pct", action="append", dest="pcts", type=int,
-        help="Percentage for each --to (must sum to 100).",
-    )
-    delegate.add_argument(
-        "--revoke", action="store_true",
-        help="Revoke all delegations.",
-    )
-    delegate.add_argument("--fee", type=int, default=None, help="Transaction fee")
-    delegate.add_argument("--server", type=str, default=None, help="Server address host:port")
 
     # --- propose ---
     propose = sub.add_parser(
@@ -1320,7 +1299,7 @@ def cmd_rotate_key(args):
 
     print("=== Rotate Key ===\n")
     print("This moves your entity to a freshly-derived Merkle tree.")
-    print("Your entity ID, balance, stake, and delegations are preserved.\n")
+    print("Your entity ID, balance, and stake are preserved.\n")
 
     private_key = _collect_private_key()
     entity = Entity.create(private_key)
@@ -1362,9 +1341,9 @@ def cmd_rotate_key(args):
         print(f"  Entity ID:      {result['entity_id']}")
         print(f"  New public key: {result['new_public_key']}")
         print(f"  Rotation #:     {result['rotation_number']}")
-        print(f"\nYour entity ID is unchanged — wallet address, stake, and")
-        print("delegations all carry over. You can now continue signing with")
-        print("the fresh tree. Back up any new derivation metadata if needed.")
+        print(f"\nYour entity ID is unchanged — wallet address and stake all")
+        print("carry over. You can now continue signing with the fresh tree.")
+        print("Back up any new derivation metadata if needed.")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -1449,72 +1428,6 @@ def cmd_emergency_revoke(args):
         print(f"  TX hash:   {result['tx_hash']}")
         print(f"\nThe validator can no longer propose blocks. Staked funds")
         print("will release to your balance after the 7-day unbonding period.")
-    else:
-        print(f"\nFailed: {response.get('error')}")
-        sys.exit(1)
-
-
-def cmd_delegate(args):
-    """Delegate voting power to trusted validators."""
-    from messagechain.identity.identity import Entity
-    from messagechain.governance.governance import create_delegation
-    from messagechain.config import GOVERNANCE_DELEGATE_FEE
-
-    if args.revoke:
-        print("=== Revoke Delegation ===\n")
-        targets = []
-    else:
-        print("=== Delegate Trust ===\n")
-        if not args.delegates:
-            print("Error: Specify at least one --to <validator_id>")
-            sys.exit(1)
-        if not args.pcts or len(args.pcts) != len(args.delegates):
-            print("Error: Each --to must have a matching --pct")
-            sys.exit(1)
-        if sum(args.pcts) != 100:
-            print(f"Error: Percentages must sum to 100 (got {sum(args.pcts)})")
-            sys.exit(1)
-
-        from messagechain.validation import parse_hex
-        targets = []
-        for delegate_hex, pct in zip(args.delegates, args.pcts):
-            did = parse_hex(delegate_hex)
-            if did is None:
-                print(f"Error: Invalid hex: {delegate_hex}")
-                sys.exit(1)
-            targets.append((did, pct))
-
-    private_key = _collect_private_key()
-    entity = Entity.create(private_key)
-    print(f"\nDelegating as: {entity.entity_id_hex[:16]}...")
-
-    host, port = _parse_server(args.server)
-    from client import rpc_call
-
-    nonce_resp = rpc_call(host, port, "get_nonce", {
-        "entity_id": entity.entity_id_hex,
-    })
-    if not nonce_resp.get("ok"):
-        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
-        sys.exit(1)
-    nonce = nonce_resp["result"]["nonce"]
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
-
-    fee = args.fee if args.fee is not None else GOVERNANCE_DELEGATE_FEE
-    tx = create_delegation(entity, targets, fee=fee)
-
-    response = rpc_call(host, port, "submit_delegation", {
-        "transaction": tx.serialize(),
-    })
-
-    if response.get("ok"):
-        if args.revoke:
-            print("\nDelegation revoked!")
-        else:
-            for delegate_hex, pct in zip(args.delegates, args.pcts):
-                print(f"  {delegate_hex[:16]}... — {pct}%")
-            print("\nDelegation submitted!")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -1849,7 +1762,6 @@ def main():
         "emergency-revoke": cmd_emergency_revoke,
         "rotate-key": cmd_rotate_key,
         "key-status": cmd_key_status,
-        "delegate": cmd_delegate,
         "propose": cmd_propose,
         "vote": cmd_vote,
         "generate-key": cmd_generate_key,

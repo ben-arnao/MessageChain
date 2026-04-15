@@ -76,15 +76,6 @@ python -m messagechain vote --proposal <id> --yes        # or --no
 python -m messagechain proposals                         # status, tally, blocks remaining
 ```
 
-### Delegate voting power
-
-Up to 3 validators. Percentages must sum to 100.
-
-```bash
-python -m messagechain delegate --to <val1> --pct 70 --to <val2> --pct 30
-python -m messagechain delegate --revoke
-```
-
 ### Run a validator (stake + mine)
 
 Validator must keep `start --mine` running continuously. Use a dedicated machine.

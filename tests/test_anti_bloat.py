@@ -23,7 +23,6 @@ from messagechain.config import (
     GOVERNANCE_VOTING_WINDOW,
     GOVERNANCE_PROPOSAL_FEE,
     GOVERNANCE_VOTE_FEE,
-    GOVERNANCE_DELEGATE_FEE,
     KEY_ROTATION_FEE,
     FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF,
@@ -266,13 +265,13 @@ class TestGovernanceFees(unittest.TestCase):
     """Governance fees scaled appropriately."""
 
     def test_governance_proposal_fee(self):
-        self.assertEqual(GOVERNANCE_PROPOSAL_FEE, 1000)
+        # Raised from 1000 to 10_000 in the 2026-04-15 redesign:
+        # anyone can propose (no validator gate), so the spam brake is
+        # priced at the fee instead.
+        self.assertEqual(GOVERNANCE_PROPOSAL_FEE, 10_000)
 
     def test_governance_vote_fee(self):
         self.assertEqual(GOVERNANCE_VOTE_FEE, 100)
-
-    def test_governance_delegate_fee(self):
-        self.assertEqual(GOVERNANCE_DELEGATE_FEE, 100)
 
     def test_key_rotation_fee(self):
         self.assertEqual(KEY_ROTATION_FEE, 1000)

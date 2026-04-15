@@ -4,17 +4,16 @@ state_root commitment correctly predicted by compute_post_state_root.
 
 Prior to this, `compute_post_state_root` simulated message/transfer/
 authority/stake/unstake but NOT governance.  A block containing any
-governance tx (or triggering an auto-executed treasury-spend or
-validator-ejection) hit a state_root mismatch and was rejected — even
-by its own proposer.  Governance was effectively library-only despite
-the rest of the plumbing being there.
+governance tx (or triggering an auto-executed treasury-spend) hit a
+state_root mismatch and was rejected — even by its own proposer.
+Governance was effectively library-only despite the rest of the plumbing
+being there.
 
 These tests prove the end-to-end block pipeline:
 1. A block carrying a ProposalTransaction commits to the right state_root
 2. A block carrying a VoteTransaction commits to the right state_root
 3. A block whose block_height closes a binding proposal's window auto-
    executes the treasury spend and the state_root matches.
-4. Same for ValidatorEjectionProposal auto-execution.
 """
 
 import unittest
@@ -22,7 +21,7 @@ from messagechain.core.blockchain import Blockchain
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.governance.governance import (
     create_proposal, create_vote,
-    create_treasury_spend_proposal, create_validator_ejection_proposal,
+    create_treasury_spend_proposal,
 )
 from messagechain.identity.identity import Entity
 from messagechain.config import (
@@ -190,37 +189,6 @@ class TestAutoExecuteThroughBlock(_Base):
         entry = chain.governance.treasury_spend_log[0]
         self.assertEqual(entry["recipient_id"], bob.entity_id.hex())
         self.assertEqual(entry["amount"], 5_000)
-
-    def test_ejection_auto_executes_through_block_pipeline(self):
-        chain, alice, bob, carol = self._make_three_validator_chain()
-        consensus = ProofOfStake()
-        candidates = [alice, bob, carol]
-
-        ejection = create_validator_ejection_proposal(
-            alice, bob.entity_id,
-            "Eject Bob", "Bob misbehaved",
-        )
-        p1 = pick_selected_proposer(chain, candidates)
-        b1 = chain.propose_block(consensus, p1, [], governance_txs=[ejection])
-        ok, reason = chain.add_block(b1)
-        self.assertTrue(ok, f"b1 rejected: {reason}")
-
-        # Only alice + carol vote yes (bob excluded from tally as target)
-        votes = [
-            create_vote(alice, ejection.proposal_id, True),
-            create_vote(carol, ejection.proposal_id, True),
-        ]
-        p2 = pick_selected_proposer(chain, candidates)
-        b2 = chain.propose_block(consensus, p2, [], governance_txs=votes)
-        ok, reason = chain.add_block(b2)
-        self.assertTrue(ok, f"b2 rejected: {reason}")
-
-        # Advance past voting window — ejection auto-executes, state_root
-        # must predict bob's staked -> 0.
-        self._advance(chain, consensus, candidates, _window() + 1)
-        self.assertEqual(chain.supply.get_staked(bob.entity_id), 0)
-        self.assertEqual(len(chain.governance.ejection_log), 1)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,20 +82,16 @@ def _deserialize_governance_tx(data: dict):
     integrity checks run the same way they would for a standalone tx.
     """
     from messagechain.governance.governance import (
-        ProposalTransaction, VoteTransaction, DelegateTransaction,
-        TreasurySpendTransaction, ValidatorEjectionProposal,
+        ProposalTransaction, VoteTransaction,
+        TreasurySpendTransaction,
     )
     tag = data.get("type")
     if tag == "governance_proposal":
         return ProposalTransaction.deserialize(data)
     if tag == "governance_vote":
         return VoteTransaction.deserialize(data)
-    if tag == "governance_delegate":
-        return DelegateTransaction.deserialize(data)
     if tag == "treasury_spend":
         return TreasurySpendTransaction.deserialize(data)
-    if tag == "validator_ejection":
-        return ValidatorEjectionProposal.deserialize(data)
     raise ValueError(f"Unknown governance tx type: {tag!r}")
 
 
@@ -200,9 +196,9 @@ class Block:
     slash_transactions: list = field(default_factory=list)  # list[SlashTransaction]
     attestations: list = field(default_factory=list)  # list[Attestation] for parent block
     transfer_transactions: list = field(default_factory=list)  # list[TransferTransaction]
-    # On-chain governance traffic: proposals, votes, delegations, treasury
-    # spend proposals, and validator-ejection proposals.  Each carries a
-    # "type" tag in its serialized form that the block pipeline dispatches on.
+    # On-chain governance traffic: proposals, votes, and treasury-spend
+    # proposals.  Each carries a "type" tag in its serialized form that
+    # the block pipeline dispatches on.
     governance_txs: list = field(default_factory=list)
     # Authority-key traffic: SetAuthorityKey (hot -> cold promotion), Revoke
     # (emergency kill-switch, signed by cold), KeyRotation (leaf-exhaustion
