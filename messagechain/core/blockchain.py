@@ -1482,7 +1482,10 @@ class Blockchain:
                 elif isinstance(gtx, VoteTransaction):
                     sim_tracker.add_vote(gtx, current_block=block_height)
                 elif isinstance(gtx, DelegateTransaction):
-                    sim_tracker.set_delegation(gtx.delegator_id, gtx.targets)
+                    sim_tracker.set_delegation(
+                        gtx.delegator_id, gtx.targets,
+                        current_block=block_height,
+                    )
 
             # Phase 2: auto-execute closed treasury spends.  Must mirror
             # the apply-path ordering and predicates exactly.
@@ -2814,7 +2817,10 @@ class Blockchain:
                 self.supply.pay_fee_with_burn(
                     gtx.delegator_id, proposer_id, gtx.fee, current_base_fee,
                 )
-                tracker.set_delegation(gtx.delegator_id, gtx.targets)
+                tracker.set_delegation(
+                    gtx.delegator_id, gtx.targets,
+                    current_block=current_block,
+                )
                 self._bump_watermark(gtx.delegator_id, gtx.signature.leaf_index)
 
         # Phase 2: auto-execute binding treasury spends whose window has closed

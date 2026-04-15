@@ -68,7 +68,10 @@ class TestListProposals(unittest.TestCase):
 
         p = self.chain.governance.list_proposals(current_block=3)[0]
         self.assertGreater(p["yes_weight"], 0)
-        self.assertEqual(p["yes_weight"], p["total_weight"])
+        # Bob's 10_000 stake goes fully yes; alice's 10_000 is silent.
+        # total_participating = bob's weight; total_eligible = both.
+        self.assertEqual(p["yes_weight"], p["total_participating"])
+        self.assertGreater(p["total_eligible"], p["total_participating"])
 
     def test_status_flips_to_closed_after_window(self):
         tx = create_proposal(self.alice, "Test", "D")

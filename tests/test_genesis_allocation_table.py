@@ -285,11 +285,10 @@ class TestTreasurySpend(unittest.TestCase):
     def test_treasury_auto_delegation_capture_prevented(self):
         """A lone validator cannot drain the treasury by harvesting passive stake.
 
-        Binding outcomes (treasury spends, ejections) use `_tally_binding`,
-        which disables auto-delegation and requires yes to clear 2/3 of
-        TOTAL eligible stake — not just participating weight.  Without this,
-        a single voter during apathy could pass any treasury spend
-        unilaterally via auto-delegation routing.
+        The unified tally requires yes to clear 2/3 of TOTAL eligible
+        weight (stake + aged-delegation balance) — not just participating
+        weight.  Silence counts as "no".  Without this, a single voter
+        during apathy could try to pass any treasury spend unilaterally.
         """
         from messagechain.config import TREASURY_ENTITY_ID, GOVERNANCE_VOTING_WINDOW
         from messagechain.governance.governance import (

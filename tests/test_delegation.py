@@ -79,19 +79,27 @@ class TestDelegatedVoteTally(unittest.TestCase):
     """Delegated voting power splits proportionally across targets."""
 
     def setUp(self):
+        from messagechain.config import GOVERNANCE_DELEGATION_AGING_BLOCKS
+        self._aging = GOVERNANCE_DELEGATION_AGING_BLOCKS
         self.tracker = GovernanceTracker()
         self.supply = SupplyTracker()
-        # Only stake entities relevant to each test
         self.proposer = b"\x01" * 32  # creates proposals, not staked
         self.v1 = b"\x02" * 32
         self.v2 = b"\x03" * 32
         self.delegator = b"\x04" * 32
         self.supply.staked[self.v1] = 1000
         self.supply.staked[self.v2] = 1000
-        self.supply.staked[self.delegator] = 1000
+        # Delegator is NOT a staker — delegation routes liquid balance.
+        self.supply.balances[self.delegator] = 1000
 
-    def _create_proposal(self):
-        """Helper to add a proposal and return its ID."""
+    def _create_proposal(self, block_height: int | None = None):
+        """Helper to add a proposal and return its ID.
+
+        Defaults to block_height = aging + 1 so any delegation registered
+        at block 0 is already aged.
+        """
+        if block_height is None:
+            block_height = self._aging + 1
         tx = ProposalTransaction(
             proposer_id=self.proposer,
             title="Test",
@@ -101,86 +109,96 @@ class TestDelegatedVoteTally(unittest.TestCase):
             signature=None,  # not verified in tracker
         )
         tx.tx_hash = tx._compute_hash()
-        self.tracker.add_proposal(tx, block_height=0, supply_tracker=self.supply)
-        return tx.proposal_id
+        self.tracker.add_proposal(
+            tx, block_height=block_height, supply_tracker=self.supply,
+        )
+        return tx.proposal_id, block_height
 
     def test_single_delegate_gets_full_weight(self):
-        """100% delegation to one validator gives them full weight."""
-        # Remove v2 stake so default delegation doesn't interfere
-        del self.supply.staked[self.v2]
-        pid = self._create_proposal()
-        self.tracker.set_delegation(self.delegator, [(self.v1, 100)])
-        # v1 votes yes — should include delegator's full stake
+        """100% delegation of liquid balance to one validator adds linearly."""
+        del self.supply.staked[self.v2]  # v2 not a validator for this test
+        self.tracker.set_delegation(
+            self.delegator, [(self.v1, 100)], current_block=0,
+        )
+        pid, block = self._create_proposal()
         from messagechain.governance.governance import VoteTransaction
         vote = VoteTransaction(
             voter_id=self.v1, proposal_id=pid, approve=True,
             timestamp=1.0, fee=100, signature=None,
         )
         vote.tx_hash = vote._compute_hash()
-        self.tracker.add_vote(vote, current_block=0)
+        self.tracker.add_vote(vote, current_block=block)
 
-        yes_weight, total_weight = self.tracker.tally(pid)
-        # v1's own stake (1000) + delegator's stake (1000) = 2000
-        self.assertEqual(yes_weight, 2000)
-        self.assertEqual(total_weight, 2000)
+        yes, no, participating, eligible = self.tracker.tally(pid)
+        # v1 own stake 1000 + delegator's liquid 1000 = 2000 yes.
+        self.assertEqual(yes, 2000)
+        self.assertEqual(no, 0)
+        self.assertEqual(participating, 2000)
+        self.assertEqual(eligible, 2000)
 
     def test_split_delegation_divides_weight(self):
-        """50/50 delegation splits voting weight between two validators."""
-        pid = self._create_proposal()
-        self.tracker.set_delegation(self.delegator, [(self.v1, 50), (self.v2, 50)])
-
+        """50/50 delegation splits liquid balance between two validators."""
+        self.tracker.set_delegation(
+            self.delegator, [(self.v1, 50), (self.v2, 50)],
+            current_block=0,
+        )
+        pid, block = self._create_proposal()
         from messagechain.governance.governance import VoteTransaction
-        # v1 votes yes
-        vote1 = VoteTransaction(
+        v1_vote = VoteTransaction(
             voter_id=self.v1, proposal_id=pid, approve=True,
             timestamp=1.0, fee=100, signature=None,
         )
-        vote1.tx_hash = vote1._compute_hash()
-        self.tracker.add_vote(vote1, current_block=0)
-
-        # v2 votes no
-        vote2 = VoteTransaction(
+        v1_vote.tx_hash = v1_vote._compute_hash()
+        self.tracker.add_vote(v1_vote, current_block=block)
+        v2_vote = VoteTransaction(
             voter_id=self.v2, proposal_id=pid, approve=False,
             timestamp=2.0, fee=100, signature=None,
         )
-        vote2.tx_hash = vote2._compute_hash()
-        self.tracker.add_vote(vote2, current_block=0)
+        v2_vote.tx_hash = v2_vote._compute_hash()
+        self.tracker.add_vote(v2_vote, current_block=block)
 
-        yes_weight, total_weight = self.tracker.tally(pid)
-        # v1: own 1000 + 50% of delegator's 1000 = 1500 (yes)
-        # v2: own 1000 + 50% of delegator's 1000 = 1500 (no)
-        self.assertEqual(yes_weight, 1500)
-        self.assertEqual(total_weight, 3000)
+        yes, no, participating, eligible = self.tracker.tally(pid)
+        # v1 own 1000 + delegator's 50% (500) = 1500 yes.
+        # v2 own 1000 + delegator's 50% (500) = 1500 no.
+        self.assertEqual(yes, 1500)
+        self.assertEqual(no, 1500)
+        self.assertEqual(participating, 3000)
+        # Eligible: v1 1000 + v2 1000 + delegator liquid 1000 = 3000
+        self.assertEqual(eligible, 3000)
 
-    def test_direct_vote_overrides_delegation(self):
-        """If delegator votes directly, delegation is ignored for that proposal."""
-        # Remove v2 stake so default delegation doesn't interfere
+    def test_non_staker_delegator_cannot_vote_directly(self):
+        """A pure-liquid delegator cannot vote directly — they must
+        participate via delegation."""
         del self.supply.staked[self.v2]
-        pid = self._create_proposal()
-        self.tracker.set_delegation(self.delegator, [(self.v1, 100)])
+        self.tracker.set_delegation(
+            self.delegator, [(self.v1, 100)], current_block=0,
+        )
+        pid, block = self._create_proposal()
 
         from messagechain.governance.governance import VoteTransaction
         # v1 votes yes
-        vote1 = VoteTransaction(
+        v1_vote = VoteTransaction(
             voter_id=self.v1, proposal_id=pid, approve=True,
             timestamp=1.0, fee=100, signature=None,
         )
-        vote1.tx_hash = vote1._compute_hash()
-        self.tracker.add_vote(vote1, current_block=0)
+        v1_vote.tx_hash = v1_vote._compute_hash()
+        self.tracker.add_vote(v1_vote, current_block=block)
 
-        # Delegator votes no directly — overrides delegation
-        vote2 = VoteTransaction(
+        # Delegator tries to vote directly — rejected (not a staker)
+        delegator_vote = VoteTransaction(
             voter_id=self.delegator, proposal_id=pid, approve=False,
             timestamp=2.0, fee=100, signature=None,
         )
-        vote2.tx_hash = vote2._compute_hash()
-        self.tracker.add_vote(vote2, current_block=0)
+        delegator_vote.tx_hash = delegator_vote._compute_hash()
+        self.assertFalse(
+            self.tracker.add_vote(delegator_vote, current_block=block),
+        )
 
-        yes_weight, total_weight = self.tracker.tally(pid)
-        # v1: own 1000 (yes), delegator voted directly so no delegation
-        # delegator: own 1000 (no)
-        self.assertEqual(yes_weight, 1000)
-        self.assertEqual(total_weight, 2000)
+        yes, no, participating, _eligible = self.tracker.tally(pid)
+        # Only v1's tally matters; delegator flows to v1 yes.
+        self.assertEqual(yes, 2000)  # 1000 v1 own + 1000 delegator
+        self.assertEqual(no, 0)
+        self.assertEqual(participating, 2000)
 
 
 class TestSlashedValidatorDelegation(unittest.TestCase):

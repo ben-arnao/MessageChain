@@ -217,13 +217,14 @@ class TestD4BootstrapAttestationVerification(unittest.TestCase):
 
 class TestD5DelegationProportionalWeight(unittest.TestCase):
     """Delegated weight must be distributed proportionally to ALL targets,
-    not just those who voted."""
+    not just those who voted.  Non-voting delegate's share is silent (not
+    redirected)."""
 
     def test_non_voting_delegate_weight_excluded(self):
-        """If a delegator targets 3 validators (33% each) and only 1 voted,
-        the delegated weight counted should be 33%, not 100%."""
+        """If a delegator targets 3 validators (34/33/33) and only 1 voted,
+        the delegated weight counted should be 34%, not 100%."""
         from messagechain.governance.governance import (
-            GovernanceTracker, ProposalTransaction, VoteTransaction,
+            GovernanceTracker, ProposalTransaction,
         )
         from messagechain.economics.inflation import SupplyTracker
         from messagechain.crypto.keys import Signature
@@ -236,53 +237,43 @@ class TestD5DelegationProportionalWeight(unittest.TestCase):
         v1, v2, v3 = os.urandom(32), os.urandom(32), os.urandom(32)
         supply.staked = {v1: 1000, v2: 1000, v3: 1000}
 
-        # A delegator with 3000 stake delegates equally to v1, v2, v3
+        # A delegator with 3000 LIQUID BALANCE (not staked) delegates
+        # equally across v1/v2/v3.  In the new model, delegation routes
+        # liquid balance, not stake.
         delegator = os.urandom(32)
-        supply.staked[delegator] = 3000
+        supply.balances[delegator] = 3000
 
-        # Create proposal
-        pid = os.urandom(32)
+        # Set delegation at block 0, aged for proposals at 10_000+
+        tracker.set_delegation(
+            delegator, [(v1, 34), (v2, 33), (v3, 33)], current_block=0,
+        )
+
+        # Create proposal at block 10_000 so the delegation is aged
         ptx = ProposalTransaction(
             proposer_id=v1, title="Test", description="test",
             timestamp=time.time(), fee=cfg.GOVERNANCE_PROPOSAL_FEE,
             signature=dummy_sig,
         )
-        ptx.tx_hash = pid
-        # Manually override proposal_id for lookup
-        tracker.add_proposal(ptx, block_height=0, supply_tracker=supply)
-        # Get the actual proposal_id
+        tracker.add_proposal(ptx, block_height=10_000, supply_tracker=supply)
         actual_pid = ptx.tx_hash
-
-        # Set delegation: delegator -> v1(34%), v2(33%), v3(33%)
-        tracker.set_delegation(delegator, [(v1, 34), (v2, 33), (v3, 33)])
 
         # Only v1 votes yes
         tracker.proposals[actual_pid].votes[v1] = True
 
-        yes_weight, total_weight = tracker.tally(actual_pid)
+        yes_weight, no_weight, participating, eligible = tracker.tally(actual_pid)
 
-        # Semantic invariant preserved: the *explicit* delegation to non-voting
-        # targets (v2, v3) must NOT be redistributed to the voter (v1).  Only
-        # v1's 34% share of delegator's power counts; 66% (v2+v3 shares) are
-        # lost.
-        #
-        # Under the 2026-04-14 redesign, v2 and v3 themselves are passive (no
-        # direct vote, no explicit delegation) so their own stakes auto-
-        # delegate via sqrt-weighting to voting validators (only v1).
-        #
-        # Breakdown:
-        #   v1 direct          = 1000
-        #   delegator→v1 (34%) = 3000 * 34 // 100 = 1020
-        #     [delegator's v2 and v3 shares — 33% each — are lost, NOT
-        #      redistributed, which is the D5 invariant]
-        #   v2 auto-delegation = 1000 (only voter is v1, so full share goes there)
-        #   v3 auto-delegation = 1000 (same)
-        #   total              = 1000 + 1020 + 1000 + 1000 = 4020
-        expected_delegated = 3000 * 34 // 100  # 1020
-        expected_total = 1000 + expected_delegated + 1000 + 1000
-        self.assertEqual(total_weight, expected_total,
-            f"Explicit delegation to non-voting targets must not be redistributed to voters. "
-            f"Got {total_weight}, expected {expected_total}")
+        # D5 invariant: delegator's v2 and v3 shares are SILENT (not
+        # redirected to v1).
+        #   yes  = v1 own stake 1000 + delegator's v1-slice 1020 = 2020
+        #   no   = 0
+        #   participating = 2020
+        #   eligible = sum(validator stakes) + delegator liquid balance
+        #            = 3000 + 3000 = 6000
+        expected_yes = 1000 + 3000 * 34 // 100  # 1020 → total 2020
+        self.assertEqual(yes_weight, expected_yes)
+        self.assertEqual(no_weight, 0)
+        self.assertEqual(participating, expected_yes)
+        self.assertEqual(eligible, 6000)
 
 
 # ─────────────────────────────────────────────────────────────────────

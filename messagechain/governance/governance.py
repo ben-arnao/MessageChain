@@ -1,37 +1,75 @@
 """
 On-chain voting for MessageChain.
 
-A general-purpose secure voting system that records proposals, votes,
-and results on-chain. Stake-holders vote using their staked tokens as
-voting weight. Only entities with skin in the game (staked tokens) can
-influence vote outcomes.
+Model (2026-04-15 redesign — simplified):
 
-TERMINOLOGY — "delegation" in this module refers strictly to GOVERNANCE
-delegation: a trust signal that routes a holder's VOTING WEIGHT to
-chosen validators for proposal tallies.  It does NOT move, lock, or
-bond any tokens, and it does NOT grant the delegate any consensus
-weight (proposer selection or block finality).  Consensus weight is
-determined solely by an entity's own staked balance.  This project
-deliberately does NOT implement DPoS-style bonded delegation, where
-delegated tokens would count toward a validator's consensus weight;
-that model concentrates power into a small set of staking pools and
-introduces slashing-cascade complexity without commensurate benefit.
+- **Stakers vote directly.**  A VoteTransaction is accepted into the
+  tally only if the voter has own-stake > 0 at proposal creation time.
+  Non-stakers cannot vote directly.
 
-What happens downstream of the vote results is out of scope — this
-module provides a tamper-proof record of votes, nothing more.
+- **Holders participate by delegating.**  A holder (validator or liquid-
+  balance holder) submits a DelegateTransaction naming 1–3 validators
+  with percentages summing to 100.  The delegator's LIQUID BALANCE (not
+  stake) is then added LINEARLY to the chosen validator(s) when they
+  vote.  No sqrt dampening.  No auto-delegation.  A validator who
+  doesn't vote does not harvest their delegators' weight — silence is
+  silence.
+
+- **Delegation aging is the flash-loan defense.**  A delegation counts
+  toward a proposal's tally only if it was registered at least
+  GOVERNANCE_DELEGATION_AGING_BLOCKS (default = voting window, 1008
+  blocks / ~7 days) before the proposal's creation block.  A fresh
+  re-delegation resets the age clock.  Flash-loan attackers would need
+  to hold the borrowed tokens for a full voting window before the
+  *next* proposal — by which point they have real skin in the game.
+
+- **Unified tally.**  For each validator V who cast a direct vote:
+      V_weight = own_stake(V) + sum over aged delegators D
+                 of (D.liquid_balance × pct_to_V ÷ 100)
+      yes_weight += V_weight if V voted yes, else no_weight += V_weight.
+  total_participating = yes + no.
+  total_eligible       = sum(all validator own-stakes) +
+                         sum(all aged delegator liquid balances).
+  Non-participating validators and unchosen delegators are silent but
+  still count in total_eligible — silence is treated as "no" for
+  binding outcomes.
+
+- **General proposals are advisory.**  The tally is recorded on-chain
+  for off-chain process to interpret; there is no on-chain effect.
+
+- **Treasury spends are binding.**  A TreasurySpendTransaction
+  auto-executes after its voting window closes iff
+      yes_weight * 3 > total_eligible * 2
+  i.e., strict supermajority of TOTAL ELIGIBLE (not participating).
+  Silence counts as "no"; there is an implicit 2/3 turnout floor.
+
+- **Delegation splits apply per validator.**  If D allocates 50/50 to
+  V1 and V2 and V1 votes yes while V2 votes no, 50% of D's balance
+  goes to yes and 50% to no.  If V2 doesn't vote, V2's share is silent
+  but still appears in total_eligible.
 
 Transaction types:
-- ProposalTransaction: create a proposal (title + description + optional reference hash)
-- VoteTransaction: cast a stake-weighted yes/no vote on a proposal
-- DelegateTransaction: delegate voting power to another entity (single-hop)
+- ProposalTransaction       — advisory proposal with title/description
+- TreasurySpendTransaction  — binding proposal to transfer from treasury
+- VoteTransaction           — staker's yes/no (non-stakers ignored)
+- DelegateTransaction       — route liquid balance to up to 3 validators
 
 Rules:
-- Voting power = entity staked amount at proposal creation (snapshot)
-- Votes are immutable — first vote wins, duplicates rejected
-- Votes on closed proposals are rejected
-- Delegation is single-hop (no transitive chains) and revocable
-- A direct vote always overrides delegation for that proposal
-- Proposals close after GOVERNANCE_VOTING_WINDOW blocks
+- Snapshots captured at proposal creation, frozen thereafter.
+- Votes are immutable — first vote wins, duplicates rejected.
+- Votes on closed proposals are rejected.
+- Delegation is single-hop (no chains).
+- A direct vote always overrides delegation from the same entity for
+  that proposal.
+- Proposals close after GOVERNANCE_VOTING_WINDOW blocks.
+
+TERMINOLOGY — "delegation" here is strictly GOVERNANCE delegation: a
+signal routing a holder's VOTING WEIGHT to chosen validators.  It does
+NOT move, lock, or bond any tokens, and it does NOT grant the delegate
+any consensus weight (proposer selection / block finality).  Consensus
+weight is determined solely by own staked balance.  MessageChain
+deliberately does NOT implement DPoS-style bonded delegation, which
+concentrates power and introduces slashing-cascade complexity.
 """
 
 import hashlib
@@ -39,7 +77,6 @@ import struct
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-import math
 from messagechain import config
 from messagechain.config import (
     HASH_ALGO,
@@ -49,6 +86,7 @@ from messagechain.config import (
     GOVERNANCE_DELEGATE_FEE,
     GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR,
     GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR,
+    GOVERNANCE_DELEGATION_AGING_BLOCKS,
     MAX_DELEGATION_TARGETS,
     MIN_FEE,
     TREASURY_ENTITY_ID,
@@ -58,32 +96,6 @@ from messagechain.crypto.keys import Signature, verify_signature
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
-
-
-def voting_power(staked: int, unstaked: int) -> int:
-    """Compute an entity's raw voting power from staked + unstaked tokens.
-
-    Rule:
-        voting_power = staked + isqrt(unstaked)
-
-    Rationale:
-    - Staked tokens get LINEAR weight.  You locked them, you accepted the
-      7-day unbonding period, you have skin in the game — you get full voice.
-    - Unstaked tokens get SQRT-DAMPENED weight.  Liquid holders still have
-      influence (you're a bag holder, you want the network to succeed), but
-      whales don't dominate proportionally.  A 1M-token wallet earns
-      sqrt(1M) = 1,000 voting power unstaked vs. 1,000,000 staked — a strong
-      incentive to stake if you want real voice.
-    - Flash-loan governance attacks are largely neutralized: an attacker
-      who borrows 10M tokens gets sqrt(10M) ≈ 3,162 voting weight from
-      those unstaked tokens, not 10M.  Staking requires a 7-day unbond
-      so borrowed tokens cannot cheaply be staked-for-a-vote-and-returned.
-
-    Integer sqrt is used throughout for determinism across platforms.
-    """
-    staked_part = staked if staked > 0 else 0
-    unstaked_part = math.isqrt(unstaked) if unstaked > 0 else 0
-    return staked_part + unstaked_part
 
 
 # --- Transaction types ---
@@ -495,17 +507,37 @@ class ProposalState:
     """Tracks the on-chain state of a proposal.
 
     Snapshots captured at proposal creation time and frozen thereafter.
-    This prevents manipulation by last-minute staking or balance movement.
+    This prevents manipulation by last-minute staking, balance movement,
+    or last-minute delegation (aging gate in add_proposal).
 
-    stake_snapshot: validator entity_id -> staked tokens at proposal creation
-    balance_snapshot: entity_id -> unstaked balance at proposal creation
+    Fields:
+        stake_snapshot: {validator_id -> own_stake} for every entity
+            with staked > 0 at proposal creation.  This is the direct-
+            voting electorate.
+        delegation_snapshot: {delegator_id -> (targets, liquid_balance)}
+            for every delegator whose current delegation was registered
+            at least GOVERNANCE_DELEGATION_AGING_BLOCKS before this
+            proposal's creation block.  Fresh delegations are absent
+            (flash-loan defense).  `targets` is the list of
+            (validator_id, pct) at snapshot time; `liquid_balance` is
+            the delegator's unstaked balance at snapshot time.
+        total_eligible_stake: sum of stake_snapshot values — kept for
+            backward-compatible reporting.  The full 2/3 denominator
+            for binding outcomes is computed in tally() and combines
+            stake + aged-delegation balance.
+        votes: {voter_id -> approve_bool} — direct votes accepted so
+            far.  Only entities with stake_snapshot[voter_id] > 0
+            register in the tally; non-stakers' votes are silently
+            dropped by add_vote().
     """
     proposal: ProposalTransaction
     created_at_block: int
     stake_snapshot: dict  # entity_id -> staked amount at proposal creation
     total_eligible_stake: int
+    # {delegator_id -> (list[(validator_id, pct)], liquid_balance_snapshot)}
+    # captured only for delegations that satisfy the aging requirement.
+    delegation_snapshot: dict = field(default_factory=dict)
     votes: dict = field(default_factory=dict)  # voter_id -> bool
-    balance_snapshot: dict = field(default_factory=dict)  # entity_id -> unstaked
 
 
 # --- Governance tracker ---
@@ -524,6 +556,11 @@ class GovernanceTracker:
         self.proposals: dict[bytes, ProposalState] = {}  # proposal_id -> state
         # delegator_id -> list of (delegate_id, weight_pct) — pcts must sum to 100
         self.delegations: dict[bytes, list[tuple[bytes, int]]] = {}
+        # delegator_id -> block_height at which current delegation was set.
+        # Used by add_proposal() to apply the delegation-aging gate.  Any
+        # re-delegation (set_delegation with non-empty targets) resets this.
+        # Revocation removes the entry entirely.
+        self.delegation_set_at: dict[bytes, int] = {}
         self._executed_treasury_spends: set[bytes] = set()  # replay protection
         # Append-only audit log — every successful binding execution is
         # recorded with tx_hash, execution_block, and outcome-specific
@@ -532,32 +569,57 @@ class GovernanceTracker:
         self.treasury_spend_log: list[dict] = []
 
     def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
-        """Register a new proposal and snapshot current stake + balance distribution.
+        """Register a new proposal and snapshot current stake + aged-delegation state.
 
-        Snapshots:
-        - stake_snapshot: every entity with staked > 0 (these are the validators)
-        - balance_snapshot: every entity with unstaked balance above dust threshold
+        Snapshots captured as of `block_height` and frozen thereafter:
 
-        Both are captured as of block_height.  Tally uses snapshots only, never
-        live state — so moving tokens after proposal creation cannot swing votes.
+        - stake_snapshot: {validator_id -> own_stake} for every entity with
+          staked > 0.  This is the direct-voting electorate.
+        - delegation_snapshot: {delegator_id -> (targets, liquid_balance)}
+          for each delegator whose current delegation was registered at
+          least GOVERNANCE_DELEGATION_AGING_BLOCKS before `block_height`.
+          Fresh delegations are EXCLUDED — this is the flash-loan defense.
+
+        Tally uses these snapshots only, never live state.  Moving tokens,
+        staking, or delegating after proposal creation cannot swing the
+        vote.
         """
         stake_snapshot = {
             eid: amount
             for eid, amount in supply_tracker.staked.items()
             if amount > 0
         }
-        balance_snapshot = {
-            eid: bal
-            for eid, bal in supply_tracker.balances.items()
-            if bal > 0
-        }
-        total = sum(stake_snapshot.values())
+        # Capture only AGED delegations.  An "aged" delegation is one whose
+        # delegation_set_at is at least GOVERNANCE_DELEGATION_AGING_BLOCKS
+        # before block_height.  Fresh delegations are silently excluded
+        # for this proposal (but remain in self.delegations, and will age
+        # in for future proposals).
+        delegation_snapshot: dict[bytes, tuple[list[tuple[bytes, int]], int]] = {}
+        for delegator_id, targets in self.delegations.items():
+            set_at = self.delegation_set_at.get(delegator_id)
+            if set_at is None:
+                continue  # no timestamp recorded — treat as not-yet-aged
+            if block_height - set_at < GOVERNANCE_DELEGATION_AGING_BLOCKS:
+                continue  # too fresh — flash-loan defense
+            liquid_balance = supply_tracker.balances.get(delegator_id, 0)
+            if liquid_balance <= 0:
+                # Delegator has no liquid balance to contribute — skip.
+                # (Keeping them out of the snapshot also keeps them out of
+                # total_eligible, so they don't pad the denominator.)
+                continue
+            # Deep-copy the targets list so later mutation of
+            # self.delegations can't retroactively affect this snapshot.
+            delegation_snapshot[delegator_id] = (
+                [(did, pct) for did, pct in targets],
+                liquid_balance,
+            )
+        total_stake = sum(stake_snapshot.values())
         self.proposals[tx.proposal_id] = ProposalState(
             proposal=tx,
             created_at_block=block_height,
             stake_snapshot=stake_snapshot,
-            total_eligible_stake=total,
-            balance_snapshot=balance_snapshot,
+            total_eligible_stake=total_stake,
+            delegation_snapshot=delegation_snapshot,
         )
 
     def prune_closed_proposals(self, current_block: int) -> int:
@@ -575,7 +637,16 @@ class GovernanceTracker:
         return len(to_remove)
 
     def add_vote(self, tx: VoteTransaction, current_block: int) -> bool:
-        """Record a vote. Returns False if rejected (closed or duplicate)."""
+        """Record a vote. Returns False if rejected.
+
+        Rejected when:
+        - The proposal does not exist (or has already been pruned)
+        - The voting window has closed
+        - The voter has already voted on this proposal (first-vote-wins)
+        - The voter has own_stake == 0 in the snapshot (non-stakers cannot
+          vote directly; they must delegate).  A non-staker's VoteTx stays
+          in the block but is silently dropped from the tally.
+        """
         state = self.proposals.get(tx.proposal_id)
         if state is None:
             return False
@@ -585,20 +656,39 @@ class GovernanceTracker:
         # Reject duplicate votes (immutable — first vote wins)
         if tx.voter_id in state.votes:
             return False
+        # Staker-only direct voting.  Non-stakers must participate via
+        # delegation, not direct vote.  Dropping silently keeps the block
+        # valid but stops non-stakers from bloating the vote record with
+        # zero-weight entries.
+        if state.stake_snapshot.get(tx.voter_id, 0) <= 0:
+            return False
         state.votes[tx.voter_id] = tx.approve
         return True
 
     def set_delegation(
-        self, delegator_id: bytes, targets: list[tuple[bytes, int]],
+        self,
+        delegator_id: bytes,
+        targets: list[tuple[bytes, int]],
+        current_block: int | None = None,
     ) -> bool:
         """Set or revoke delegation to up to MAX_DELEGATION_TARGETS validators.
 
-        targets: list of (delegate_id, weight_pct) pairs. Percentages must
-        sum to 100. Empty list revokes all delegations.
-        Returns False if validation fails.
+        targets: list of (delegate_id, weight_pct) pairs.  Percentages must
+        sum to 100.  Empty list revokes all delegations.  Returns False
+        if validation fails.
+
+        current_block: the block height at which this delegation was
+        registered.  Stored so that add_proposal() can apply the
+        delegation-aging gate (GOVERNANCE_DELEGATION_AGING_BLOCKS).  Any
+        re-delegation RESETS the age clock — an attacker cannot amass
+        stake over time and then re-aim it fresh without forfeiting the
+        next proposal cycle.  `None` is accepted for test/utility paths
+        that don't care about aging (aging then treats the delegation as
+        "never aged" for any future proposal, which is the safe default).
         """
         if not targets:
             self.delegations.pop(delegator_id, None)
+            self.delegation_set_at.pop(delegator_id, None)
             return True
         if len(targets) > MAX_DELEGATION_TARGETS:
             return False
@@ -609,6 +699,13 @@ class GovernanceTracker:
         if any(pct <= 0 for _, pct in targets):
             return False
         self.delegations[delegator_id] = targets
+        if current_block is not None:
+            self.delegation_set_at[delegator_id] = current_block
+        else:
+            # Callers that omit current_block get no aging — the
+            # delegation will be ignored for every future proposal.
+            # This is the safe default for setup helpers / tests.
+            self.delegation_set_at.pop(delegator_id, None)
         return True
 
     def revoke_delegations_to(self, validator_id: bytes):
@@ -636,6 +733,7 @@ class GovernanceTracker:
                 to_remove.append(delegator_id)
         for delegator_id in to_remove:
             del self.delegations[delegator_id]
+            self.delegation_set_at.pop(delegator_id, None)
 
     def get_proposal_status(
         self, proposal_id: bytes, current_block: int,
@@ -660,7 +758,7 @@ class GovernanceTracker:
         """
         rows = []
         for pid, state in self.proposals.items():
-            yes_weight, total_weight = self.tally(pid)
+            yes_w, no_w, participating, eligible = self.tally(pid)
             status = self.get_proposal_status(pid, current_block)
             blocks_remaining = max(
                 0,
@@ -673,131 +771,106 @@ class GovernanceTracker:
                 "created_at_block": state.created_at_block,
                 "blocks_remaining": blocks_remaining,
                 "status": status.value,
-                "yes_weight": yes_weight,
-                "total_weight": total_weight,
-                "total_eligible_stake": state.total_eligible_stake,
+                "yes_weight": yes_w,
+                "no_weight": no_w,
+                "total_participating": participating,
+                "total_eligible": eligible,
                 "vote_count": len(state.votes),
             })
         rows.sort(key=lambda r: r["created_at_block"], reverse=True)
         return rows
 
-    def tally(self, proposal_id: bytes) -> tuple[int, int]:
-        """Tally votes for a proposal, weighted by voting power.
+    def tally(self, proposal_id: bytes) -> tuple[int, int, int, int]:
+        """Unified tally for a proposal.
 
-        Returns (yes_weight, total_participating_weight).
+        Returns (yes_weight, no_weight, total_participating, total_eligible).
 
-        Voting power for entity E at snapshot time:
-            vp(E) = staked(E) + isqrt(unstaked_balance(E))
+        Voting rules (from the 2026-04-15 redesign):
 
-        Staked tokens count linearly (full weight); unstaked tokens count
-        with sqrt-dampening.  This rewards committed stakers while still
-        letting liquid holders participate at a dampened level.
+        - Only STAKERS (entities with stake_snapshot[v] > 0) can register
+          a direct vote.  Non-stakers are rejected by add_vote.
+        - Each voting validator V contributes:
+              V_weight = own_stake(V)
+                       + sum over aged delegators D of
+                         (D.liquid_balance × pct_to_V ÷ 100)
+          If V voted yes → yes_weight += V_weight.
+          If V voted no  → no_weight  += V_weight.
+        - total_eligible = sum(all own-stakes) + sum(all aged delegators'
+          liquid balances).  This includes validators who did not vote
+          and delegations pointing at validators who did not vote — their
+          weight is silent (not counted in yes/no) but still sits in the
+          denominator so silence can count as "no" for binding outcomes.
 
-        Snapshot-based — uses the stake and balance captured at proposal
-        creation, NOT live state.  Prevents manipulation by late
-        staking/transferring.
-
-        Delegation rules:
-        1. Direct vote: voter's full voting power counts.  Overrides any
-           delegation for that proposal.
-        2. Explicit delegation: delegator's voting power is split across
-           their chosen validators per their declared percentages.  If a
-           chosen validator did not vote, that portion is not counted.
-        3. Auto-delegation (no explicit delegation, no direct vote): the
-           entity's voting power is distributed across the validator set
-           (from the snapshot), weighted by sqrt(validator_stake), so
-           each voting validator receives a share.  Non-voting validators
-           receive nothing — passive power only counts via validators who
-           actually voted.
-        4. Single-hop only — validators' own delegations (if any) do not
-           cascade.
-
-        Rationale for auto-delegation via sqrt-weighted validator set:
-        big-bag holders want the network to succeed even if they don't
-        follow every proposal; their default voice should flow to the
-        validators who are actively securing the chain.  sqrt-weighting
-        prevents a single mega-validator from absorbing all passive power.
+        All arithmetic is integer, iteration over snapshots is
+        order-independent (sums), and floor-division matches across
+        implementations — tally results are deterministic across nodes.
         """
         state = self.proposals.get(proposal_id)
         if state is None:
-            return 0, 0
+            return 0, 0, 0, 0
 
         stake_snapshot = state.stake_snapshot
-        balance_snapshot = state.balance_snapshot
-        direct_votes = dict(state.votes)
-
-        # --- Build voting power per entity at snapshot time ---
-        all_entities: set[bytes] = set(stake_snapshot.keys()) | set(balance_snapshot.keys())
-        vp: dict[bytes, int] = {}
-        for eid in all_entities:
-            vp[eid] = voting_power(
-                stake_snapshot.get(eid, 0),
-                balance_snapshot.get(eid, 0),
-            )
-
-        # --- Build reverse explicit-delegation map ---
-        reverse_delegations: dict[bytes, list[tuple[bytes, int]]] = {}
-        explicitly_delegated: set[bytes] = set()
-        for delegator_id, targets in self.delegations.items():
-            explicitly_delegated.add(delegator_id)
-            for delegate_id, pct in targets:
-                reverse_delegations.setdefault(delegate_id, []).append(
-                    (delegator_id, pct)
-                )
+        delegation_snapshot = state.delegation_snapshot
+        direct_votes = state.votes  # voter_id -> bool
 
         yes_weight = 0
-        total_weight = 0
+        no_weight = 0
 
-        # --- 1 & 2: direct votes + explicit delegations flowing into voters ---
-        for voter_id, approve in direct_votes.items():
-            power = vp.get(voter_id, 0)
-            total_weight += power
-            if approve:
-                yes_weight += power
-
-            # Add explicitly delegated weight flowing to this voter
-            for delegator_id, pct in reverse_delegations.get(voter_id, []):
-                if delegator_id in direct_votes:
-                    continue  # direct vote overrides delegation
-                delegator_power = vp.get(delegator_id, 0)
-                portion = delegator_power * pct // 100
-                total_weight += portion
-                if approve:
-                    yes_weight += portion
-
-        # --- 3: auto-delegation for passive entities ---
-        # Distribute passive voting power across validators who voted,
-        # weighted by sqrt(validator_stake_at_snapshot).
+        # 1. Each voting validator contributes their own stake plus their
+        #    slice of every aged delegator's balance.
         #
-        # Only validators present in the snapshot are eligible recipients
-        # — new validators who registered after proposal creation cannot
-        # absorb passive power.
-        voting_validators = {
-            v for v in stake_snapshot.keys() if v in direct_votes
-        }
-        sqrt_weights: dict[bytes, int] = {}
-        for v in voting_validators:
-            sqrt_weights[v] = math.isqrt(stake_snapshot.get(v, 0))
-        total_sqrt = sum(sqrt_weights.values())
+        #    We iterate delegators once and route each percentage share
+        #    to its validator's tally.  A single delegator can split
+        #    across up to MAX_DELEGATION_TARGETS validators; different
+        #    validators can vote differently, which cleanly routes each
+        #    slice to yes / no / silent.
+        for voter_id, approve in direct_votes.items():
+            own_stake = stake_snapshot.get(voter_id, 0)
+            if own_stake <= 0:
+                # add_vote() should have rejected this, but be defensive:
+                # a zero-stake voter in the record contributes nothing.
+                continue
+            if approve:
+                yes_weight += own_stake
+            else:
+                no_weight += own_stake
 
-        if total_sqrt > 0:
-            for entity_id, power in vp.items():
-                if power == 0:
+        # 2. Aged delegators: route each (delegator, validator, pct) slice
+        #    to yes / no / silent based on the validator's direct vote.
+        for delegator_id, (targets, liquid_balance) in delegation_snapshot.items():
+            if liquid_balance <= 0:
+                continue
+            for validator_id, pct in targets:
+                share = liquid_balance * pct // 100
+                if share == 0:
                     continue
-                if entity_id in direct_votes:
-                    continue  # direct vote handled above
-                if entity_id in explicitly_delegated:
-                    continue  # explicit delegation handled above
-                # Distribute across voting validators, sqrt-weighted
-                for v, sw in sqrt_weights.items():
-                    share = power * sw // total_sqrt
-                    if share == 0:
-                        continue
-                    total_weight += share
-                    if direct_votes[v]:
-                        yes_weight += share
+                approve = direct_votes.get(validator_id)
+                if approve is True:
+                    yes_weight += share
+                elif approve is False:
+                    no_weight += share
+                # else: validator did not vote — share is silent
+                #       (not in yes/no, but still in total_eligible below).
 
-        return yes_weight, total_weight
+        total_participating = yes_weight + no_weight
+
+        # 3. total_eligible = all snapshotted stake + all snapshotted aged
+        #    delegation balance, regardless of whether the delegate voted.
+        #    Note: a delegator's entire balance is counted once here even
+        #    when split across multiple validators — percentages sum to
+        #    100 by validation, so floor-division on individual shares
+        #    can produce at most (n_targets - 1) lost units per delegator.
+        #    We compute the denominator from raw balances to avoid that
+        #    rounding leak in the floor.  Total yes+no+silent shares may
+        #    be slightly less than total_eligible due to floor-division;
+        #    this is deterministic and intentional (strict inequality in
+        #    the approval check means it's always conservative).
+        total_eligible = sum(stake_snapshot.values())
+        for _, (_, liquid_balance) in delegation_snapshot.items():
+            if liquid_balance > 0:
+                total_eligible += liquid_balance
+
+        return yes_weight, no_weight, total_participating, total_eligible
 
     def execute_treasury_spend(
         self,
@@ -813,7 +886,9 @@ class GovernanceTracker:
         - Spend has already been executed (replay protection)
         - Proposal does not exist on-chain
         - Voting window is still open
-        - Proposal did not reach the approval threshold
+        - yes_weight does not clear strict 2/3 of TOTAL ELIGIBLE weight
+          (stake + aged-delegation balance).  Silence counts as "no" — a
+          sleepy electorate defaults to status quo.
         """
         if tx.amount <= 0:
             return False
@@ -828,15 +903,14 @@ class GovernanceTracker:
         status = self.get_proposal_status(tx.proposal_id, current_block)
         if status != ProposalStatus.CLOSED:
             return False
-        # Binding-outcome approval: yes must clear 2/3 of TOTAL ELIGIBLE
-        # stake (not just participants).  This closes the auto-delegation
-        # capture vector — silence cannot be harvested into approval —
-        # and provides an implicit 2/3 turnout floor.
-        yes_weight, total_weight = self._tally_binding(tx.proposal_id)
-        if total_weight == 0:
+        yes_weight, _no_weight, _participating, total_eligible = self.tally(
+            tx.proposal_id,
+        )
+        if total_eligible == 0:
             return False
+        # Strict supermajority of the full electorate: yes * 3 > total * 2.
         if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
-                <= total_weight * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR):
+                <= total_eligible * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR):
             return False
         result = supply_tracker.treasury_spend(tx.recipient_id, tx.amount)
         if result:
@@ -848,84 +922,9 @@ class GovernanceTracker:
                 "amount": tx.amount,
                 "execution_block": current_block,
                 "yes_weight": yes_weight,
-                "total_eligible_weight": total_weight,
+                "total_eligible_weight": total_eligible,
             })
         return result
-
-    def _tally_binding(
-        self, proposal_id: bytes, exclude: bytes | None = None,
-    ) -> tuple[int, int]:
-        """Stricter tally used for BINDING governance outcomes (treasury
-        spends, validator ejections).  Differs from the general `tally`:
-
-        1. Optional `exclude` entity is removed entirely — used by ejection
-           so the target does not vote in their own trial, and their stake
-           does not appear anywhere.  Treasury spends pass exclude=None.
-        2. Auto-delegation is disabled.  Only DIRECT votes and EXPLICIT
-           delegations count toward `yes_weight`.
-        3. The denominator is the TOTAL ELIGIBLE VOTING POWER (all snapshot
-           entities except `exclude`), not just participating weight.
-           Silence counts as "no" — a deliberate bias toward the status quo
-           for security-critical decisions.
-
-        Why the stricter rule: under the general tally, auto-delegation
-        lets one motivated voter harvest everyone else's passive stake
-        during periods of apathy.  For binding outcomes that move funds
-        or reshape the validator set, requiring the numerator to clear
-        2/3 of the FULL eligible electorate (not just participants)
-        forces broad active engagement.  This rule also gives an implicit
-        quorum for free: yes can't reach 2/3 of eligible without at least
-        2/3 turnout participating in favor.
-        """
-        state = self.proposals.get(proposal_id)
-        if state is None:
-            return 0, 0
-
-        stake_snapshot = state.stake_snapshot
-        balance_snapshot = state.balance_snapshot
-        direct_votes = {
-            vid: approve for vid, approve in state.votes.items()
-            if vid != exclude
-        }
-
-        all_entities: set[bytes] = (
-            set(stake_snapshot.keys()) | set(balance_snapshot.keys())
-        )
-        vp: dict[bytes, int] = {}
-        for eid in all_entities:
-            vp[eid] = voting_power(
-                stake_snapshot.get(eid, 0),
-                balance_snapshot.get(eid, 0),
-            )
-
-        reverse_delegations: dict[bytes, list[tuple[bytes, int]]] = {}
-        for delegator_id, targets in self.delegations.items():
-            for delegate_id, pct in targets:
-                reverse_delegations.setdefault(delegate_id, []).append(
-                    (delegator_id, pct)
-                )
-
-        # Denominator: total eligible voting power (everyone except exclude).
-        total_weight = sum(
-            power for eid, power in vp.items() if eid != exclude
-        )
-
-        yes_weight = 0
-        for voter_id, approve in direct_votes.items():
-            if not approve:
-                continue
-            power = vp.get(voter_id, 0)
-            yes_weight += power
-
-            for delegator_id, pct in reverse_delegations.get(voter_id, []):
-                if delegator_id in direct_votes:
-                    continue  # delegator voted directly — their power counted only if they voted yes
-                if delegator_id == exclude:
-                    continue
-                delegator_power = vp.get(delegator_id, 0)
-                yes_weight += delegator_power * pct // 100
-
-        return yes_weight, total_weight
 
     def get_proposal_info(
         self, proposal_id: bytes, current_block: int,
@@ -935,24 +934,39 @@ class GovernanceTracker:
         if state is None:
             raise ValueError("Unknown proposal")
 
-        yes_weight, total_weight = self.tally(proposal_id)
+        yes_w, no_w, participating, eligible = self.tally(proposal_id)
         status = self.get_proposal_status(proposal_id, current_block)
         blocks_remaining = max(
             0,
             GOVERNANCE_VOTING_WINDOW - (current_block - state.created_at_block),
+        )
+        participation_pct = (
+            participating / eligible * 100 if eligible > 0 else 0
+        )
+        approval_pct_of_participating = (
+            yes_w / participating * 100 if participating > 0 else 0
+        )
+        approval_pct_of_eligible = (
+            yes_w / eligible * 100 if eligible > 0 else 0
         )
 
         return {
             "proposal_id": proposal_id.hex(),
             "title": state.proposal.title,
             "description": state.proposal.description,
-            "reference_hash": state.proposal.reference_hash.hex() if state.proposal.reference_hash else "",
+            "reference_hash": (
+                state.proposal.reference_hash.hex()
+                if state.proposal.reference_hash else ""
+            ),
             "proposer": state.proposal.proposer_id.hex(),
             "status": status.value,
-            "yes_weight": yes_weight,
-            "total_weight": total_weight,
-            "total_eligible_stake": state.total_eligible_stake,
-            "approval_pct": (yes_weight / total_weight * 100) if total_weight > 0 else 0,
+            "yes_weight": yes_w,
+            "no_weight": no_w,
+            "total_participating": participating,
+            "total_eligible": eligible,
+            "participation_pct": participation_pct,
+            "approval_pct_of_participating": approval_pct_of_participating,
+            "approval_pct_of_eligible": approval_pct_of_eligible,
             "blocks_remaining": blocks_remaining,
             "direct_votes": len(state.votes),
         }
