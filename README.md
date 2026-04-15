@@ -19,26 +19,20 @@ python -m messagechain generate-key      # prints private key — write it on pa
 python -m messagechain verify-key        # re-enter by hand; confirms the backup is correct
 ```
 
-Clear your shell history file, not just the visible buffer:
-- Linux/macOS: `cat /dev/null > ~/.bash_history && history -c` (or `~/.zsh_history`)
-- Windows PowerShell: `Remove-Item (Get-PSReadlineOption).HistorySavePath`
+Close the terminal window when done — that discards the scrollback showing your key. Don't copy-paste; clipboard managers log history.
 
-**🔌 Reconnect to the internet.**
+**🔌 Reconnect to the internet.** In a new terminal:
 
 ```bash
 python -m messagechain account           # register your wallet on-chain (signs once, online)
-python -m messagechain start             # sync the full chain (leave running)
+python -m messagechain start             # sync the full chain — leave running in this terminal
 ```
 
-`account` necessarily loads your key in memory briefly to sign — unavoidable. That's why the machine must be trusted (no clipboard managers syncing to cloud, no untrusted extensions).
+`start` is a foreground process; open a second terminal for the commands below. `account` briefly loads your key in memory to sign — unavoidable, so only run it on a trusted machine.
 
-**First-run gotchas:**
-- `start` needs reachable peers. The shipped seed list is a placeholder (`127.0.0.1:9333`); until a public seed is announced, pass `--seed <host>:<port>` from someone already on the network, or `start` will idle with zero peers.
-- New wallets start at **0 balance**. There is no faucet — `stake`, `transfer`, and `send` all require someone to fund you first, or a genesis allocation if you're bootstrapping a local chain.
+> **Before it'll work:** the shipped seed list is a `127.0.0.1` placeholder. Until a public seed is announced, pass `--seed <host>:<port>` from someone on the network, or `start` will idle with zero peers. New wallets also start at **0 balance** — there is no faucet, so `send` / `transfer` / `stake` need someone to fund you first.
 
-You're done. Commands below operate against your running node.
-
-## Cheat sheet
+## Everyday commands
 
 ```bash
 # Messaging & funds
@@ -47,15 +41,6 @@ python -m messagechain transfer --to <id> --amount 100       # send funds
 python -m messagechain balance                               # check your balance
 python -m messagechain read --last 50                        # last 50 messages
 python -m messagechain estimate-fee --message "hi"           # fee preview (or --transfer)
-
-# Validating (stake + mine)
-python -m messagechain start --mine                          # run as validator
-python -m messagechain stake --amount 100                    # min stake: 100, 7-day unbond
-python -m messagechain validators                            # stake %, blocks mined
-python -m messagechain key-status                            # leaf usage — rotate before full
-python -m messagechain rotate-key                            # roll signing key (ID unchanged)
-python -m messagechain set-authority-key --authority-pubkey <hex>   # cold key for unstake/revoke
-python -m messagechain emergency-revoke --entity-id <hex>    # disable a compromised validator
 
 # Governance
 python -m messagechain propose --title "..." --description "..."
@@ -67,11 +52,48 @@ python -m messagechain delegate --to <validator_id> --pct 100
 python -m messagechain info                                  # chain info
 ```
 
-To **receive funds**, share the `Address` line printed by `account` / `balance` — that's the `mc1…` checksummed form of your entity ID. It catches single-character transcription typos before a transfer is submitted. The raw 64-hex entity ID is still accepted.
+To **receive funds**, share the `mc1…` address printed by `account` / `balance` — the checksummed form catches transcription typos. Raw 64-hex entity IDs still work.
 
-Signing commands prompt for your private key; it stays in memory only long enough to sign. Override the target node with `--server host:port`.
+Signing commands prompt for your private key interactively. Override the target node with `--server host:port`.
 
-**Cold key (validators):** generate a second key offline (same `generate-key` drill), then run `set-authority-key` with its pubkey. After that, `unstake` and `emergency-revoke` must be signed by the cold key — so a compromised hot key can't drain your stake. Keep a pre-signed `emergency-revoke` on paper for rapid response.
+## Running a validator
+
+Earn block rewards by staking. Validator must keep `start --mine` running continuously.
+
+```bash
+python -m messagechain start --mine                          # run as validator (foreground)
+python -m messagechain stake --amount 100                    # min stake: 100 tokens
+python -m messagechain unstake --amount 100                  # 7-day unbonding before withdrawable
+python -m messagechain validators                            # stake %, blocks mined per validator
+```
+
+Use a dedicated, patched machine you physically control — not a daily-driver laptop.
+
+## Advanced / validator ops
+
+**Unattended start** (systemd, Docker — no interactive key prompt):
+
+```bash
+echo "<checksummed_private_key>" > /etc/messagechain/validator.key
+chmod 0600 /etc/messagechain/validator.key
+python -m messagechain start --mine --keyfile /etc/messagechain/validator.key
+```
+
+**Key rotation** — WOTS+ signatures burn leaves. Rotate before the tree fills (typically ~80%):
+
+```bash
+python -m messagechain key-status                            # leaf usage
+python -m messagechain rotate-key                            # roll signing key (entity ID unchanged)
+```
+
+**Cold-key separation** — bind a second, offline-generated key as the withdrawal authority. After this, `unstake` and `emergency-revoke` require the cold key, so a compromised hot key can't drain your stake.
+
+```bash
+python -m messagechain set-authority-key --authority-pubkey <hex>
+python -m messagechain emergency-revoke --entity-id <hex>    # kill-switch for a compromised validator
+```
+
+Keep a pre-signed `emergency-revoke` on paper for rapid response.
 
 ## Tests
 
