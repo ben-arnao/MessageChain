@@ -5,10 +5,17 @@ rewards per block. This breaks the compounding loop where large stakers
 earn proportionally more, accumulate more stake, and dominate further.
 
 Excess rewards go to the treasury for community use.
+
+Reward distribution is now committee-based (see
+messagechain/consensus/attester_committee.py): each committee slot pays
+ATTESTER_REWARD_PER_SLOT = 1 token, and the proposer's combined earnings
+(proposer share + slot if they're on the committee) still respect
+PROPOSER_REWARD_CAP.
 """
 
 import unittest
 from messagechain.economics.inflation import SupplyTracker
+from messagechain.consensus.attester_committee import ATTESTER_REWARD_PER_SLOT
 from messagechain.config import (
     BLOCK_REWARD, PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
     TREASURY_ENTITY_ID, PROPOSER_REWARD_CAP,
@@ -26,49 +33,47 @@ class TestRewardCap(unittest.TestCase):
     def test_small_reward_not_capped(self):
         """Rewards below the cap are paid in full."""
         result = self.supply.mint_block_reward(self.proposer, block_height=0)
-        # Full reward with no attestors = 16 tokens
-        # If 16 <= cap, proposer should get full reward
         if BLOCK_REWARD <= PROPOSER_REWARD_CAP:
             self.assertEqual(result["proposer_reward"], BLOCK_REWARD)
 
-    def test_proposer_share_capped_with_attestors(self):
-        """When proposer's share exceeds cap, excess goes to treasury."""
+    def test_proposer_share_capped_when_also_in_committee(self):
+        """Proposer-share + committee-slot combined respects the cap."""
         supply = SupplyTracker()
         proposer = b"p" * 32
+        att = b"a" * 32
         supply.balances[proposer] = 0
+        supply.balances[att] = 0
         supply.balances[TREASURY_ENTITY_ID] = 0
 
-        # Give proposer a huge attestor stake to earn most of the attestor pool too
-        # Use a scenario where proposer is also an attestor with large stake
-        attestor_stakes = {proposer: 10_000, b"a" * 32: 1}
-        supply.balances[b"a" * 32] = 0
-
-        result = supply.mint_block_reward(proposer, block_height=0, attestor_stakes=attestor_stakes)
-
-        # Proposer earns: proposer_share + their attestor pro-rata share
-        # Both combined should not exceed cap
-        total_proposer_earned = result["proposer_reward"] + result["attestor_rewards"].get(proposer, 0)
+        # Proposer is on the committee AND is the proposer.
+        result = supply.mint_block_reward(
+            proposer, block_height=0, attester_committee=[proposer, att],
+        )
+        total_proposer_earned = (
+            result["proposer_reward"]
+            + result["attestor_rewards"].get(proposer, 0)
+        )
         self.assertLessEqual(total_proposer_earned, PROPOSER_REWARD_CAP)
 
-    def test_excess_goes_to_treasury(self):
-        """Capped excess is redirected to treasury."""
+    def test_excess_goes_to_treasury_no_committee(self):
+        """Capped excess when there's no committee (pure proposer path)."""
         supply = SupplyTracker()
         proposer = b"p" * 32
         supply.balances[proposer] = 0
         treasury_before = supply.balances.get(TREASURY_ENTITY_ID, 0)
 
-        # No attestors — proposer would get full reward (16 tokens)
-        # If cap < 16, excess should go to treasury
         result = supply.mint_block_reward(proposer, block_height=0)
 
         if BLOCK_REWARD > PROPOSER_REWARD_CAP:
             treasury_after = supply.balances.get(TREASURY_ENTITY_ID, 0)
             self.assertGreater(treasury_after, treasury_before)
             self.assertEqual(result["proposer_reward"], PROPOSER_REWARD_CAP)
-            self.assertEqual(result["treasury_excess"], BLOCK_REWARD - PROPOSER_REWARD_CAP)
+            self.assertEqual(
+                result["treasury_excess"], BLOCK_REWARD - PROPOSER_REWARD_CAP,
+            )
 
-    def test_cap_does_not_affect_attestor_rewards(self):
-        """Non-proposer attestors are not subject to the proposer cap."""
+    def test_cap_does_not_affect_committee_members(self):
+        """Non-proposer committee members always get their 1-token slot."""
         supply = SupplyTracker()
         proposer = b"p" * 32
         att1 = b"a" * 32
@@ -77,15 +82,14 @@ class TestRewardCap(unittest.TestCase):
         supply.balances[att1] = 0
         supply.balances[att2] = 0
 
-        attestor_stakes = {att1: 500, att2: 500}
-        result = supply.mint_block_reward(proposer, block_height=0, attestor_stakes=attestor_stakes)
-
-        # Attestors split 3/4 of reward equally
-        attestor_pool = BLOCK_REWARD - (BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR)
-        expected_each = attestor_pool // 2
-
-        # Attestor rewards should not be reduced by the cap
-        self.assertEqual(result["attestor_rewards"][att1], expected_each)
+        # Two non-proposer committee members.
+        result = supply.mint_block_reward(
+            proposer, block_height=0, attester_committee=[att1, att2],
+        )
+        # Each non-proposer slot pays the flat ATTESTER_REWARD_PER_SLOT.
+        # No stake-weighted pro-rata; cap does not apply.
+        self.assertEqual(result["attestor_rewards"][att1], ATTESTER_REWARD_PER_SLOT)
+        self.assertEqual(result["attestor_rewards"][att2], ATTESTER_REWARD_PER_SLOT)
 
     def test_reward_cap_config_exists(self):
         """PROPOSER_REWARD_CAP is defined and reasonable."""
@@ -101,7 +105,6 @@ class TestRewardCap(unittest.TestCase):
 
         supply.mint_block_reward(proposer, block_height=0)
 
-        # Total supply should increase by full block reward regardless of cap
         self.assertEqual(supply.total_supply, supply_before + BLOCK_REWARD)
 
 

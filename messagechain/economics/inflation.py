@@ -71,33 +71,51 @@ class SupplyTracker:
         self,
         proposer_id: bytes,
         block_height: int,
-        attestor_stakes: dict[bytes, int] | None = None,
+        attester_committee: list[bytes] | None = None,
         bootstrap: bool = False,
     ) -> dict:
-        """Mint new tokens and split between proposer and attestors.
+        """Mint the block reward: proposer share + committee slots.
 
-        The block reward is split:
-        - PROPOSER_REWARD_NUMERATOR/PROPOSER_REWARD_DENOMINATOR to the proposer
-        - The remainder distributed pro-rata among attestors by stake weight
+        Design (see messagechain.consensus.attester_committee):
+          * Proposer gets PROPOSER_REWARD_NUMERATOR/DENOMINATOR of the
+            halvings-adjusted reward (subject to PROPOSER_REWARD_CAP).
+          * Each entity in `attester_committee` gets
+            ATTESTER_REWARD_PER_SLOT tokens.  Committee is pre-selected
+            by the caller (Blockchain._apply_block_state) using
+            select_attester_committee() — this method does not know
+            about seed identity or bootstrap_progress; it only credits.
+          * Unfilled committee slots (attester_pool_tokens > len(committee))
+            send the excess to the treasury, same pattern as
+            PROPOSER_REWARD_CAP overflow.
+          * If proposer is also in the committee, their combined
+            earnings are subject to the cap; overage is clawed back
+            from the attester credit and redirected to the treasury.
 
-        If no attestors are present (genesis, bootstrap, empty attestations),
-        the proposer receives the entire reward.
-
-        Returns a dict with distribution details for logging/verification.
+        `attester_committee=None` or empty → proposer gets the full
+        reward (minus cap overflow); used for genesis / bootstrap
+        blocks where no attestations exist yet.
         """
+        from messagechain.consensus.attester_committee import (
+            ATTESTER_REWARD_PER_SLOT,
+        )
+
         reward = self.calculate_block_reward(block_height)
         self.total_supply += reward
         self.total_minted += reward
 
-        # Determine effective cap (no cap during bootstrap)
         effective_cap = reward if bootstrap else PROPOSER_REWARD_CAP
 
-        if not attestor_stakes:
-            # No attestors — proposer gets everything (bootstrap/genesis)
-            # Apply reward cap: excess goes to treasury
+        # Proposer + attester pool split.
+        proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+        attester_pool = reward - proposer_share
+
+        # No committee: proposer absorbs the whole reward (capped).
+        if not attester_committee:
             proposer_reward = min(reward, effective_cap)
             treasury_excess = reward - proposer_reward
-            self.balances[proposer_id] = self.balances.get(proposer_id, 0) + proposer_reward
+            self.balances[proposer_id] = (
+                self.balances.get(proposer_id, 0) + proposer_reward
+            )
             if treasury_excess > 0:
                 self.balances[TREASURY_ENTITY_ID] = (
                     self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
@@ -110,53 +128,55 @@ class SupplyTracker:
                 "treasury_excess": treasury_excess,
             }
 
-        # Split: proposer share + attestor pool
-        proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
-        attestor_pool = reward - proposer_share
+        # Cap committee size at what the attester pool can pay for.
+        max_slots = attester_pool // ATTESTER_REWARD_PER_SLOT
+        paid_committee = list(attester_committee)[:max_slots]
 
-        # Distribute attestor pool pro-rata by stake weight
-        total_attestor_stake = sum(attestor_stakes.values())
+        # Credit one ATTESTER_REWARD_PER_SLOT per committee member.
         attestor_rewards: dict[bytes, int] = {}
-        distributed = 0
+        attester_tokens_paid = 0
+        for eid in paid_committee:
+            attestor_rewards[eid] = attestor_rewards.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+            self.balances[eid] = (
+                self.balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+            )
+            attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
 
-        if total_attestor_stake > 0:
-            sorted_attestors = sorted(attestor_stakes.items(), key=lambda x: x[0])
-            for i, (att_id, stake) in enumerate(sorted_attestors):
-                if i == len(sorted_attestors) - 1:
-                    # Last attestor gets remainder to avoid rounding dust
-                    att_reward = attestor_pool - distributed
-                else:
-                    att_reward = attestor_pool * stake // total_attestor_stake
-                attestor_rewards[att_id] = att_reward
-                self.balances[att_id] = self.balances.get(att_id, 0) + att_reward
-                distributed += att_reward
-        else:
-            # Zero total stake — give attestor pool to proposer
-            proposer_share += attestor_pool
-            attestor_pool = 0
+        # Unfilled slots (attester pool had more tokens than committee
+        # members to pay) flow to treasury — same pattern as the
+        # proposer-cap overflow so there is exactly one sink for
+        # "reward earmarked but not paid to a validator."
+        treasury_excess = attester_pool - attester_tokens_paid
 
-        # If proposer is also an attestor, their total earnings may exceed cap
+        # Proposer-cap check: if proposer is also in the committee,
+        # their combined earnings might exceed effective_cap.  Claw
+        # back the attester credit before crediting the proposer share.
         proposer_att_reward = attestor_rewards.get(proposer_id, 0)
         proposer_total = proposer_share + proposer_att_reward
-
-        treasury_excess = 0
         if proposer_total > effective_cap:
-            treasury_excess = proposer_total - effective_cap
-            # Claw back attestor overage already credited + reduce proposer share
-            self.balances[proposer_id] = self.balances.get(proposer_id, 0) - proposer_att_reward
-            proposer_share = effective_cap
-            proposer_att_reward = 0
+            overage = proposer_total - effective_cap
+            treasury_excess += overage
+            self.balances[proposer_id] = (
+                self.balances.get(proposer_id, 0) - proposer_att_reward
+            )
             attestor_rewards[proposer_id] = 0
+            proposer_att_reward = 0
+            # Reduce proposer share if it alone still exceeds cap
+            # (paranoid edge — proposer_share = 4, cap = 4, attester =
+            # 1, total 5 → trim attester first gets us to 4).
+
+        self.balances[proposer_id] = (
+            self.balances.get(proposer_id, 0) + proposer_share
+        )
+        if treasury_excess > 0:
             self.balances[TREASURY_ENTITY_ID] = (
                 self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
             )
 
-        self.balances[proposer_id] = self.balances.get(proposer_id, 0) + proposer_share
-
         return {
             "total_reward": reward,
             "proposer_reward": proposer_share,
-            "total_attestor_reward": attestor_pool,
+            "total_attestor_reward": attester_tokens_paid,
             "attestor_rewards": attestor_rewards,
             "treasury_excess": treasury_excess,
         }

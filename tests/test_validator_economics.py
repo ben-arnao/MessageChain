@@ -68,61 +68,67 @@ class TestBlockRewardFloor(unittest.TestCase):
 
 
 class TestAttestationRewards(unittest.TestCase):
-    """Block reward is split between proposer and attestors."""
+    """Block reward is split between proposer and attester committee.
+
+    Reward distribution is committee-based: each committee slot pays
+    ATTESTER_REWARD_PER_SLOT (1 token), independent of stake.  See
+    messagechain/consensus/attester_committee.py for selection.
+    """
 
     def test_config_split_is_valid(self):
         """Proposer share must be < 100% (leaving room for attestors)."""
         self.assertLess(PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR)
 
-    def test_no_attestors_proposer_gets_capped_reward(self):
-        """When no attestors are present, proposer gets reward up to cap."""
+    def test_no_committee_proposer_gets_capped_reward(self):
+        """When no committee is supplied, proposer gets reward up to cap."""
         from messagechain.config import PROPOSER_REWARD_CAP
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         reward = tracker.calculate_block_reward(1)
-        distributed = tracker.mint_block_reward(proposer, 1, attestor_stakes={})
+        distributed = tracker.mint_block_reward(proposer, 1, attester_committee=[])
         expected = min(reward, PROPOSER_REWARD_CAP)
         self.assertEqual(distributed["proposer_reward"], expected)
         self.assertEqual(distributed["total_attestor_reward"], 0)
         self.assertEqual(tracker.get_balance(proposer), expected)
 
-    def test_reward_split_with_attestors(self):
-        """Proposer gets 1/4, attestors share 3/4."""
+    def test_reward_split_with_committee(self):
+        """Proposer gets 1/4; each committee slot pays 1 token."""
+        from messagechain.consensus.attester_committee import ATTESTER_REWARD_PER_SLOT
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         att_a = b"\x02" * 32
         att_b = b"\x03" * 32
-        attestor_stakes = {att_a: 300, att_b: 100}
 
         reward = tracker.calculate_block_reward(1)
-        result = tracker.mint_block_reward(proposer, 1, attestor_stakes=attestor_stakes)
+        result = tracker.mint_block_reward(
+            proposer, 1, attester_committee=[att_a, att_b],
+        )
 
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
-        attestor_pool = reward - proposer_share
-
         self.assertEqual(result["proposer_reward"], proposer_share)
-        self.assertEqual(result["total_attestor_reward"], attestor_pool)
-        self.assertGreater(result["total_attestor_reward"], result["proposer_reward"])
+        self.assertEqual(
+            result["total_attestor_reward"], 2 * ATTESTER_REWARD_PER_SLOT,
+        )
 
-    def test_attestor_rewards_proportional_to_stake(self):
-        """Attestors with more stake get proportionally more reward."""
+    def test_committee_rewards_are_flat_per_slot(self):
+        """Every committee member earns the same flat per-slot reward.
+
+        Under the committee model, stake matters for *selection probability*
+        (handled upstream by select_attester_committee), not for the
+        payout size.  Once selected, everyone gets the same slot reward.
+        """
+        from messagechain.consensus.attester_committee import ATTESTER_REWARD_PER_SLOT
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         att_big = b"\x02" * 32
         att_small = b"\x03" * 32
-        # 3:1 stake ratio
-        attestor_stakes = {att_big: 300, att_small: 100}
 
-        tracker.mint_block_reward(proposer, 1, attestor_stakes=attestor_stakes)
+        tracker.mint_block_reward(
+            proposer, 1, attester_committee=[att_big, att_small],
+        )
 
-        big_balance = tracker.get_balance(att_big)
-        small_balance = tracker.get_balance(att_small)
-        # big should get ~3x more than small (integer math may cause slight rounding)
-        self.assertGreater(big_balance, small_balance)
-        # Within rounding tolerance: big/small should be close to 3
-        if small_balance > 0:
-            ratio = big_balance / small_balance
-            self.assertAlmostEqual(ratio, 3.0, delta=0.5)
+        self.assertEqual(tracker.get_balance(att_big), ATTESTER_REWARD_PER_SLOT)
+        self.assertEqual(tracker.get_balance(att_small), ATTESTER_REWARD_PER_SLOT)
 
     def test_total_minted_equals_reward(self):
         """Total tokens distributed = block reward (no tokens created or lost)."""
@@ -131,15 +137,16 @@ class TestAttestationRewards(unittest.TestCase):
         proposer = b"\x01" * 32
         att_a = b"\x02" * 32
         att_b = b"\x03" * 32
-        attestor_stakes = {att_a: 200, att_b: 200}
 
         initial_supply = tracker.total_supply
         reward = tracker.calculate_block_reward(1)
-        tracker.mint_block_reward(proposer, 1, attestor_stakes=attestor_stakes)
+        tracker.mint_block_reward(
+            proposer, 1, attester_committee=[att_a, att_b],
+        )
 
-        # Supply increased by exactly the reward
+        # Supply increased by exactly the reward.
         self.assertEqual(tracker.total_supply, initial_supply + reward)
-        # All minted tokens are accounted for in balances (including treasury)
+        # All minted tokens accounted for across validators + treasury.
         total_distributed = (
             tracker.get_balance(proposer)
             + tracker.get_balance(att_a)
@@ -148,26 +155,27 @@ class TestAttestationRewards(unittest.TestCase):
         )
         self.assertEqual(total_distributed, reward)
 
-    def test_proposer_who_is_also_attestor_is_capped(self):
-        """If proposer is also an attestor, their total is capped."""
+    def test_proposer_on_committee_is_capped(self):
+        """Proposer-share + committee-slot combined respects the cap."""
         from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
-        other_att = b"\x02" * 32
-        attestor_stakes = {proposer: 100, other_att: 100}
+        other = b"\x02" * 32
 
         reward = tracker.calculate_block_reward(1)
-        tracker.mint_block_reward(proposer, 1, attestor_stakes=attestor_stakes)
+        tracker.mint_block_reward(
+            proposer, 1, attester_committee=[proposer, other],
+        )
 
         proposer_balance = tracker.get_balance(proposer)
-        other_balance = tracker.get_balance(other_att)
+        other_balance = tracker.get_balance(other)
         treasury_balance = tracker.get_balance(TREASURY_ENTITY_ID)
-        # Proposer's total (proposer share + attestor share) is capped
         self.assertLessEqual(proposer_balance, PROPOSER_REWARD_CAP)
-        # Other attestor gets their full share (not affected by cap)
         self.assertGreater(other_balance, 0)
-        # All tokens accounted for (proposer + other + treasury = reward)
-        self.assertEqual(proposer_balance + other_balance + treasury_balance, reward)
+        # Nothing is created or destroyed.
+        self.assertEqual(
+            proposer_balance + other_balance + treasury_balance, reward,
+        )
 
 
 class TestBaseFee(unittest.TestCase):

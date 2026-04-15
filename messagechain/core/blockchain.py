@@ -155,6 +155,14 @@ class Blockchain:
         self.assume_valid_hash: bytes | None = ASSUME_VALID_BLOCK_HASH
         self._assume_valid_height: int | None = None
 
+        # Bootstrap gradient: pinned seed identity + monotonic progress
+        # metric.  Populated in initialize_genesis from allocation_table
+        # (treasury excluded).  Empty frozenset for the backward-compat
+        # path where no allocation_table is supplied.
+        self.seed_entity_ids: frozenset[bytes] = frozenset()
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet: RatchetState = RatchetState()
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -370,8 +378,19 @@ class Blockchain:
                 self.supply.balances[entity_id] = (
                     self.supply.balances.get(entity_id, 0) + amount
                 )
+            # Pin seed identity at genesis: every entity in the allocation
+            # table EXCEPT the treasury is a seed.  Treasury is excluded
+            # because it is a protocol-owned address, not a validator.
+            # Frozenset: "who is a seed" has exactly one answer for the
+            # life of the chain and must never be mutated post-genesis.
+            from messagechain.config import TREASURY_ENTITY_ID
+            self.seed_entity_ids = frozenset(
+                eid for eid in allocation_table.keys()
+                if eid != TREASURY_ENTITY_ID
+            )
         else:
-            # Backward-compatible single-entity allocation
+            # Backward-compatible single-entity allocation — no seed set
+            # is pinned (seed_entity_ids stays as the initial frozenset()).
             self.supply.balances[genesis_entity.entity_id] = GENESIS_ALLOCATION
 
         # Track as chain tip
@@ -693,6 +712,37 @@ class Blockchain:
     @property
     def height(self) -> int:
         return len(self.chain)
+
+    @property
+    def bootstrap_progress(self) -> float:
+        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+
+        Computed from current chain state (height + stake distribution)
+        then ratcheted against the in-memory peak — never regresses.
+        Downstream code uses this to smoothly interpolate bootstrap-era
+        parameters (attester committee selection weight, min-stake
+        requirement, escrow window, seed exclusion).  See
+        messagechain.consensus.bootstrap_gradient for the design.
+        """
+        from messagechain.consensus.bootstrap_gradient import (
+            compute_bootstrap_progress,
+        )
+        seed_stake = sum(
+            self.supply.get_staked(eid) for eid in self.seed_entity_ids
+        )
+        non_seed_stake = 0
+        for eid, amount in self.supply.staked.items():
+            if amount <= 0:
+                continue
+            if eid in self.seed_entity_ids:
+                continue
+            non_seed_stake += amount
+        raw = compute_bootstrap_progress(
+            height=self.height,
+            seed_stake=seed_stake,
+            non_seed_stake=non_seed_stake,
+        )
+        return self._bootstrap_ratchet.observe(raw)
 
     def has_block(self, block_hash: bytes) -> bool:
         if block_hash in self._block_by_hash:
@@ -1228,53 +1278,73 @@ class Blockchain:
             sim_nonces[rtx.entity_id] = 0
             _bump_wm(rtx.entity_id, rtx.registration_proof.leaf_index)
 
-        # Simulate block reward with attestation split and reward cap
+        # Simulate block reward: committee-based attester distribution +
+        # proposer share + PROPOSER_REWARD_CAP overflow.  Must mirror
+        # mint_block_reward byte-for-byte; any divergence here produces
+        # an "Invalid state_root" rejection on add_block.
+        from messagechain.consensus.attester_committee import (
+            ATTESTER_REWARD_PER_SLOT, select_attester_committee,
+        )
         reward = self.supply.calculate_block_reward(block_height)
         is_bootstrap = not any(s > 0 for s in sim_staked.values())
         effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
+        proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+        attester_pool = reward - proposer_share
 
-        attestor_stakes = {}
+        # Candidate pool (who attested) with their current stake.  Zero
+        # stake is allowed — early-bootstrap validators register without
+        # staking.  weights_for_progress falls back to uniform when all
+        # stakes are zero.
+        attester_candidates: list[tuple[bytes, int]] = []
         if attestations:
             for att in attestations:
-                stake = sim_staked.get(att.validator_id, 0)
-                if stake > 0:
-                    attestor_stakes[att.validator_id] = stake
+                attester_candidates.append(
+                    (att.validator_id, sim_staked.get(att.validator_id, 0))
+                )
 
-        if attestor_stakes:
-            proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
-            attestor_pool = reward - proposer_share
-            total_att_stake = sum(attestor_stakes.values())
-            sorted_atts = sorted(attestor_stakes.items(), key=lambda x: x[0])
-            attestor_rewards = {}
-            distributed = 0
-            for i, (att_id, stake) in enumerate(sorted_atts):
-                if i == len(sorted_atts) - 1:
-                    att_reward = attestor_pool - distributed
-                else:
-                    att_reward = attestor_pool * stake // total_att_stake
-                attestor_rewards[att_id] = att_reward
-                sim_balances[att_id] = sim_balances.get(att_id, 0) + att_reward
-                distributed += att_reward
+        # Randomness for deterministic committee selection must be
+        # identical on sim and apply paths, so use the parent block's
+        # hash (known at both call sites: block.header.prev_hash at
+        # apply, self.chain[-1].block_hash at sim).
+        parent_hash = self.chain[-1].block_hash if self.chain else b"\x00" * 32
+        committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
+        attester_committee = select_attester_committee(
+            candidates=attester_candidates,
+            seed_entity_ids=self.seed_entity_ids,
+            bootstrap_progress=self.bootstrap_progress,
+            randomness=parent_hash,
+            committee_size=committee_size,
+        ) if attester_candidates else []
 
-            # Apply reward cap to proposer. Must mirror mint_block_reward's
-            # claw-back path exactly, otherwise the committed state_root
-            # diverges from the actual post-application state. The claw-back
-            # removes the proposer's attestor share from their balance, then
-            # credits them the full effective_cap as proposer_share. The
-            # earlier simpler formulation (leave the attestor share in place
-            # and reduce proposer_share) produced different sim_balances
-            # when proposer == attestor.
-            proposer_att_reward = attestor_rewards.get(proposer_id, 0)
+        if attester_committee:
+            # Credit 1 ATTESTER_REWARD_PER_SLOT per committee member.
+            attester_tokens_paid = 0
+            for eid in attester_committee[:committee_size]:
+                sim_balances[eid] = sim_balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+                attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
+            treasury_excess = attester_pool - attester_tokens_paid
+
+            # Proposer-cap check (matches mint_block_reward).
+            proposer_att_reward = (
+                ATTESTER_REWARD_PER_SLOT if proposer_id in attester_committee else 0
+            )
             proposer_total = proposer_share + proposer_att_reward
             if proposer_total > effective_cap:
-                treasury_excess = proposer_total - effective_cap
-                sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) - proposer_att_reward
-                proposer_share = effective_cap
-                sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+                overage = proposer_total - effective_cap
+                treasury_excess += overage
+                sim_balances[proposer_id] = (
+                    sim_balances.get(proposer_id, 0) - proposer_att_reward
+                )
 
-            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_share
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + proposer_share
+            )
+            if treasury_excess > 0:
+                sim_balances[TREASURY_ENTITY_ID] = (
+                    sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+                )
         else:
-            # No attestors — apply cap
+            # No attesters — proposer absorbs whole reward (capped).
             proposer_reward = min(reward, effective_cap)
             treasury_excess = reward - proposer_reward
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
@@ -2486,20 +2556,57 @@ class Blockchain:
                 rtx.entity_id, rtx.registration_proof.leaf_index,
             )
 
-        # Build attestor stakes map for reward distribution
-        attestor_stakes = {}
+        # Candidate attesters for the reward committee: everyone whose
+        # attestation was included in this block.  Stake is 0 during
+        # early bootstrap where newcomers register without locking any
+        # tokens — that's fine, the committee selection handles zero
+        # stake naturally (weights fall back to uniform when total
+        # stake is 0, see weights_for_progress).
+        attester_candidates: list[tuple[bytes, int]] = []
         for att in block.attestations:
             stake = self.supply.get_staked(att.validator_id)
-            if stake > 0:
-                attestor_stakes[att.validator_id] = stake
+            attester_candidates.append((att.validator_id, stake))
 
-        # Bootstrap mode: no validators have staked yet
+        # Bootstrap mode flag: preserves the existing "no reward cap
+        # during pre-stake bootstrap" semantics separately from the
+        # bootstrap_progress gradient.  When no validator has any
+        # stake at all (pure genesis), the PROPOSER_REWARD_CAP is
+        # bypassed so genesis rewards aren't silently drained to
+        # treasury on a network with no real validators yet.
         is_bootstrap = not any(s > 0 for s in self.supply.staked.values())
 
-        # Mint block reward split between proposer and attestors
+        # Select the committee that will actually be paid.  Up to
+        # attester_pool tokens' worth of slots, 1 token each.  Seeds
+        # are excluded during the first half of bootstrap (see
+        # attester_committee.py); selection weight blends uniform and
+        # stake-weighted by bootstrap_progress.
+        from messagechain.consensus.attester_committee import (
+            ATTESTER_REWARD_PER_SLOT,
+            select_attester_committee,
+        )
+        from messagechain.config import (
+            PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
+        )
+        block_reward = self.supply.calculate_block_reward(block.header.block_number)
+        attester_pool_tokens = block_reward - (
+            block_reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+        )
+        committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
+        # Randomness must be identical on sim and apply paths.  Use the
+        # parent block's hash — available as block.header.prev_hash here
+        # and as self.chain[-1].block_hash during block proposal sim.
+        attester_committee = select_attester_committee(
+            candidates=attester_candidates,
+            seed_entity_ids=self.seed_entity_ids,
+            bootstrap_progress=self.bootstrap_progress,
+            randomness=block.header.prev_hash,
+            committee_size=committee_size,
+        )
+
+        # Mint block reward: proposer share + committee slots
         result = self.supply.mint_block_reward(
             proposer_id, block.header.block_number,
-            attestor_stakes=attestor_stakes,
+            attester_committee=attester_committee,
             bootstrap=is_bootstrap,
         )
 
