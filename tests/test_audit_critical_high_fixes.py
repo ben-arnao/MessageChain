@@ -2,7 +2,7 @@
 Regression tests for the 2026-04-14 critical/high audit findings.
 
 Covers:
-  C1 — governance txs (Proposal/Vote/Delegate/TreasurySpend) must include
+  C1 — governance txs (Proposal/Vote/TreasurySpend) must include
        CHAIN_ID in their signable data to prevent cross-fork signature
        replay.
   H1 — RPC auth token bytes must not be logged, not even a prefix.
@@ -20,15 +20,12 @@ from messagechain.core.blockchain import Blockchain
 from messagechain.governance.governance import (
     ProposalTransaction,
     VoteTransaction,
-    DelegateTransaction,
     TreasurySpendTransaction,
     create_proposal,
     create_vote,
-    create_delegation,
     create_treasury_spend_proposal,
     verify_proposal,
     verify_vote,
-    verify_delegation,
     verify_treasury_spend,
 )
 from messagechain.identity.identity import Entity
@@ -40,8 +37,8 @@ def _entity(seed: bytes) -> Entity:
 
 class TestGovernanceTxsBindChainId(unittest.TestCase):
     """C1: every governance tx type must prepend CHAIN_ID to its signable
-    data. Otherwise a signed vote/proposal/delegation from one fork can be
-    byte-for-byte replayed on a sibling fork that shares the proposer key.
+    data. Otherwise a signed vote/proposal from one fork can be byte-for-
+    byte replayed on a sibling fork that shares the proposer key.
     """
 
     @classmethod
@@ -59,10 +56,6 @@ class TestGovernanceTxsBindChainId(unittest.TestCase):
 
     def test_vote_signable_data_includes_chain_id(self):
         tx = create_vote(self.alice, b"\x11" * 32, approve=True)
-        self.assertTrue(tx._signable_data().startswith(config.CHAIN_ID))
-
-    def test_delegate_signable_data_includes_chain_id(self):
-        tx = create_delegation(self.alice, [(self.bob.entity_id, 100)])
         self.assertTrue(tx._signable_data().startswith(config.CHAIN_ID))
 
     def test_treasury_spend_signable_data_includes_chain_id(self):
@@ -91,12 +84,6 @@ class TestGovernanceTxsBindChainId(unittest.TestCase):
         tx = create_vote(self.alice, b"\x22" * 32, approve=False)
         self._verify_rejects_foreign_chain_sig(
             tx, verify_vote, self.alice.public_key,
-        )
-
-    def test_delegate_cross_fork_replay_rejected(self):
-        tx = create_delegation(self.alice, [(self.bob.entity_id, 100)])
-        self._verify_rejects_foreign_chain_sig(
-            tx, verify_delegation, self.alice.public_key,
         )
 
     def test_treasury_spend_cross_fork_replay_rejected(self):

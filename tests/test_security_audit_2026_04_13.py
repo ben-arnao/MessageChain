@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 from messagechain.config import (
     HASH_ALGO, MERKLE_TREE_HEIGHT, MIN_FEE, GENESIS_SUPPLY,
-    GOVERNANCE_PROPOSAL_FEE, GOVERNANCE_VOTE_FEE, GOVERNANCE_DELEGATE_FEE,
+    GOVERNANCE_PROPOSAL_FEE, GOVERNANCE_VOTE_FEE,
     BASE_FEE_INITIAL, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR,
 )
 
@@ -44,30 +44,6 @@ def _make_chain_with_entity():
 class TestC1GovernanceConsensus(unittest.TestCase):
     """C1: Governance RPC handlers must queue transactions for block inclusion,
     not apply state directly."""
-
-    def test_server_delegation_queued_not_applied(self):
-        """Delegation via RPC should be queued, not applied immediately."""
-        from server import Server
-        s = Server(p2p_port=19333, rpc_port=19334, seed_nodes=[])
-        entity = _make_entity()
-        s.wallet_id = entity.entity_id
-        s.wallet_entity = entity
-        # Register via the server's blockchain (which checks public_keys dict)
-        s.blockchain.public_keys[entity.entity_id] = entity.keypair.public_key
-        s.blockchain.supply.balances[entity.entity_id] = 1_000_000
-
-        delegate = _make_entity()
-        s.blockchain.public_keys[delegate.entity_id] = delegate.keypair.public_key
-
-        from messagechain.governance.governance import create_delegation
-        tx = create_delegation(entity, [(delegate.entity_id, 100)])
-
-        result = s._rpc_submit_delegation({"transaction": tx.serialize()})
-        self.assertTrue(result["ok"], result.get("error"))
-
-        # The delegation should be queued, NOT applied to governance state
-        self.assertTrue(hasattr(s, '_pending_governance_txs'))
-        self.assertIn(tx.tx_hash, s._pending_governance_txs)
 
     def test_server_proposal_queued_not_applied(self):
         """Proposal via RPC should be queued, not applied immediately."""
@@ -527,9 +503,12 @@ class TestM8PayFeeWithBurn(unittest.TestCase):
         """Server governance handlers should not call pay_fee directly."""
         from server import Server
         import inspect
-        source = inspect.getsource(Server._rpc_submit_delegation)
-        # Should not contain pay_fee (should queue instead)
-        self.assertNotIn("pay_fee(", source)
+        # Check proposal and vote submit handlers — these are the
+        # remaining governance tx types after the delegation removal.
+        for method_name in ("_rpc_submit_proposal", "_rpc_submit_vote"):
+            source = inspect.getsource(getattr(Server, method_name))
+            # Should not contain pay_fee (should queue instead)
+            self.assertNotIn("pay_fee(", source, method_name)
 
 
 # ─── M9: Signaling threshold uses integer arithmetic ────
@@ -706,33 +685,6 @@ class TestM19RequestHeadersValidation(unittest.TestCase):
             "isinstance" in source or "int" in source.lower(),
             "start_height should be type-checked"
         )
-
-
-# ─── M20: Delegation weight per-target <= 100 ────
-
-class TestM20DelegationWeightValidation(unittest.TestCase):
-    """M20: Each delegation target percentage must be <= 100."""
-
-    def test_delegation_pct_over_100_rejected(self):
-        """Individual delegation percentage > 100 should be rejected."""
-        from messagechain.governance.governance import verify_delegation, DelegateTransaction
-        from messagechain.crypto.keys import Signature
-
-        entity = _make_entity()
-        # This should fail because pct > 100 for one target
-        # (even though they can't sum to 100 with pct > 100 and only 1 target,
-        # the per-target check should still exist)
-        fake_sig = Signature([], 0, [], b"\x00" * 32, b"\x00" * 32)
-        tx = DelegateTransaction(
-            delegator_id=entity.entity_id,
-            targets=[(b"\x01" * 32, 150)],  # 150% — invalid
-            timestamp=time.time(),
-            fee=GOVERNANCE_DELEGATE_FEE,
-            signature=fake_sig,
-        )
-        # Should fail validation (sum != 100 and pct > 100)
-        result = verify_delegation(tx, entity.keypair.public_key)
-        self.assertFalse(result)
 
 
 # ─── M21: Global sig cache thread-safe init ────

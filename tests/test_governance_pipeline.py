@@ -3,7 +3,7 @@
 The dispatcher (`Blockchain._apply_governance_block`) is the bridge
 between block processing and the GovernanceTracker.  It:
 
-1. Registers proposals / votes / delegations from each block's governance_txs
+1. Registers proposals / votes from each block's governance_txs
 2. Pays the fee via the normal burn-and-tip path
 3. Auto-executes binding proposals (treasury spends) whose voting
    window has closed as of the current block height
@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 from messagechain.core.blockchain import Blockchain
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.governance.governance import (
-    create_proposal, create_vote, create_delegation,
+    create_proposal, create_vote,
     create_treasury_spend_proposal,
     VoteTransaction,
 )
@@ -74,14 +74,6 @@ class TestGovernancePipeline(unittest.TestCase):
         state = self.chain.governance.proposals[proposal.proposal_id]
         self.assertIn(self.bob.entity_id, state.votes)
         self.assertTrue(state.votes[self.bob.entity_id])
-
-    def test_delegation_applied_from_block(self):
-        delegation = create_delegation(
-            self.bob, [(self.alice.entity_id, 100)],
-        )
-        block = _make_block(1, self.alice.entity_id, [delegation])
-        self.chain._apply_governance_block(block)
-        self.assertIn(self.bob.entity_id, self.chain.governance.delegations)
 
     def test_treasury_spend_auto_executes_after_window(self):
         # Seed treasury
