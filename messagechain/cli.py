@@ -607,10 +607,14 @@ def cmd_account(args):
 
     if response.get("ok"):
         result = response["result"]
+        from messagechain.identity.address import encode_address
         print(f"\nAccount created!")
-        print(f"  Entity ID: {result['entity_id']}")
-        print(f"  Balance:   {result['initial_balance']} tokens")
-        print(f"\nSave your entity ID — this is your wallet address.")
+        print(f"  Entity ID:  {result['entity_id']}")
+        print(f"  Address:    {encode_address(entity.entity_id)}")
+        print(f"  Balance:    {result['initial_balance']} tokens")
+        print(f"\nShare the 'Address' form when receiving funds — it has a")
+        print("built-in checksum that catches single-character transcription")
+        print("errors. The raw 'Entity ID' is still accepted for compatibility.")
         print("Your private key is your sole credential. Never share it.")
     else:
         print(f"\nFailed: {response.get('error')}")
@@ -710,9 +714,23 @@ def cmd_transfer(args):
     # Validate recipient BEFORE prompting for the private key — a typo
     # is a permanent loss risk, so we want the user to fix it without
     # having re-entered credentials.
-    recipient_id = parse_hex(args.to)
-    if recipient_id is None or len(recipient_id) != 32:
-        print(f"Error: recipient entity ID must be 64 hex chars (32 bytes).")
+    # Accept either the checksummed "mc1..." display form (preferred,
+    # catches single-character typos offline) or the raw 64-char hex
+    # form (backward-compatible, no typo protection).
+    from messagechain.identity.address import (
+        decode_address,
+        InvalidAddressChecksumError,
+        InvalidAddressError,
+    )
+    try:
+        recipient_id = decode_address(args.to)
+    except InvalidAddressChecksumError as e:
+        print(f"Error: {e}")
+        print(f"  Got: {args.to}")
+        print("  Re-check each character with the sender before retrying.")
+        sys.exit(1)
+    except InvalidAddressError as e:
+        print(f"Error: invalid recipient address — {e}")
         print(f"  Got: {args.to}")
         sys.exit(1)
 
@@ -734,13 +752,16 @@ def cmd_transfer(args):
         sys.exit(1)
 
     # Confirmation step — last chance before the key is handled. Shows
-    # both ends of the address so a single-character typo is visible.
+    # both ends of the address so a single-character typo is visible, plus
+    # the checksummed display form.
+    from messagechain.identity.address import encode_address
     head = recipient_id.hex()[:8]
     tail = recipient_id.hex()[-8:]
     print(f"About to transfer:")
     print(f"  Amount:    {args.amount} tokens")
     print(f"  Recipient: {head}...{tail}")
-    print(f"             (full: {recipient_id.hex()})")
+    print(f"             (full:       {recipient_id.hex()})")
+    print(f"             (checksummed: {encode_address(recipient_id)})")
     confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
     if confirm != "yes":
         print("Transfer cancelled.")
@@ -809,7 +830,9 @@ def cmd_balance(args):
 
     if response.get("ok"):
         info = response["result"]
+        from messagechain.identity.address import encode_address
         print(f"  Entity ID:       {info['entity_id']}")
+        print(f"  Address:         {encode_address(bytes.fromhex(info['entity_id']))}")
         print(f"  Balance:         {info['balance']} tokens")
         print(f"  Staked:          {info['staked']} tokens")
         print(f"  Messages posted: {info['messages_posted']}")

@@ -634,45 +634,60 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
+    def _queue_authority_tx(self, tx, *, validate_fn) -> tuple[bool, str]:
+        """Shared admission path for SetAuthorityKey / Revoke / KeyRotation.
+
+        Validates the tx against current chain state (so mempool rejection
+        gives a clear error), then enqueues it for inclusion in the next
+        block.  The block pipeline applies it to state and gossips it to
+        peers so every node reaches the same authority-state result.
+        """
+        ok, reason = validate_fn(tx)
+        if not ok:
+            return False, reason
+        if not hasattr(self, "_pending_authority_txs"):
+            self._pending_authority_txs = {}
+        self._pending_authority_txs[tx.tx_hash] = tx
+        return True, "queued"
+
     def _rpc_set_authority_key(self, params: dict) -> dict:
         """Accept a SetAuthorityKey transaction, promoting a cold key for the entity.
 
-        Applied to state immediately (not queued via the block pipeline)
-        because there is no stake-weight or ordering-dependent side effect —
-        the only change is a dictionary field in chain state, protected by
-        the signing-key signature on the tx itself.
+        Queued for block inclusion — the state change (cold-key binding)
+        must be consensus-visible across every peer, otherwise an attacker
+        who later compromises the hot key can unstake via any node that
+        hasn't seen the promotion.
         """
         try:
             from messagechain.core.authority_key import SetAuthorityKeyTransaction
             tx = SetAuthorityKeyTransaction.deserialize(params["transaction"])
-            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
-            ok, reason = self.blockchain.apply_set_authority_key(tx, proposer_id)
+            ok, reason = self._queue_authority_tx(
+                tx, validate_fn=self.blockchain.validate_set_authority_key,
+            )
             if not ok:
                 return {"ok": False, "error": reason}
-            # Persist authority-keys table so the change survives restart.
-            if self.blockchain.db is not None and hasattr(self.blockchain.db, 'set_authority_key'):
-                self.blockchain.db.set_authority_key(tx.entity_id, tx.new_authority_key)
-                self.blockchain.db.flush_state()
             return {"ok": True, "result": {
                 "entity_id": tx.entity_id.hex(),
                 "authority_key": tx.new_authority_key.hex(),
                 "tx_hash": tx.tx_hash.hex(),
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_rotate_key(self, params: dict) -> dict:
-        """Apply a KeyRotationTransaction, moving the entity to a fresh Merkle tree.
+        """Accept a KeyRotationTransaction for block-pipeline inclusion.
 
-        Applied immediately — the entity's identity (entity_id) is portable
-        across rotations, so the chain-state change is a simple field swap
-        protected by the old key's signature on the tx.
+        Must be block-included so every peer updates its public_key
+        mapping in lockstep — otherwise the owner's signatures under the
+        new key would be rejected by peers still holding the old key.
         """
         try:
             from messagechain.core.key_rotation import KeyRotationTransaction
             tx = KeyRotationTransaction.deserialize(params["transaction"])
-            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
-            ok, reason = self.blockchain.apply_key_rotation(tx, proposer_id)
+            ok, reason = self._queue_authority_tx(
+                tx, validate_fn=self.blockchain.validate_key_rotation,
+            )
             if not ok:
                 return {"ok": False, "error": reason}
             return {"ok": True, "result": {
@@ -680,29 +695,31 @@ class Server:
                 "new_public_key": tx.new_public_key.hex(),
                 "rotation_number": tx.rotation_number,
                 "tx_hash": tx.tx_hash.hex(),
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_emergency_revoke(self, params: dict) -> dict:
-        """Apply an emergency RevokeTransaction signed by the cold authority key.
+        """Accept an emergency RevokeTransaction signed by the cold authority key.
 
-        Applied immediately to chain state (same as SetAuthorityKey) rather
-        than queued — a validator operator has declared the hot key
-        compromised, and every second the revoke stays pending is another
-        second the attacker can sign blocks.
+        Queued for the next block. Without block-level propagation a
+        revoke on one node would leave the compromised validator free
+        to keep proposing blocks that other peers happily accept —
+        the whole point of the kill-switch is network-wide effect.
         """
         try:
             from messagechain.core.emergency_revoke import RevokeTransaction
             tx = RevokeTransaction.deserialize(params["transaction"])
-            proposer_id = parse_hex(params.get("proposer_id", "")) or tx.entity_id
-            ok, reason = self.blockchain.apply_revoke(tx, proposer_id)
+            ok, reason = self._queue_authority_tx(
+                tx, validate_fn=self.blockchain.validate_revoke,
+            )
             if not ok:
                 return {"ok": False, "error": reason}
             return {"ok": True, "result": {
                 "entity_id": tx.entity_id.hex(),
                 "tx_hash": tx.tx_hash.hex(),
-                "revoked": True,
+                "status": "pending — will be included in next block",
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
@@ -937,11 +954,20 @@ class Server:
         txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
         transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
         slash_txs = self.mempool.get_slash_transactions()
+        # Drain pending authority txs (SetAuthorityKey / Revoke / KeyRotation)
+        # into this block.  Queued by their respective RPC handlers; applied
+        # through _apply_block_state so every peer processing the block
+        # reaches the same authority-state result.  Without this drain,
+        # the hot/cold split and emergency revoke would only take effect on
+        # the single node that received the RPC.
+        pending_authority = getattr(self, "_pending_authority_txs", {})
+        authority_txs = list(pending_authority.values())
 
         block = self.blockchain.propose_block(
             self.consensus, self.wallet_entity, txs,
             transfer_transactions=transfer_txs,
             slash_transactions=slash_txs,
+            authority_txs=authority_txs,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -952,6 +978,9 @@ class Server:
                 self.mempool.remove_slash_transactions(
                     [s.tx_hash for s in slash_txs]
                 )
+            if authority_txs:
+                for ah in [a.tx_hash for a in authority_txs]:
+                    pending_authority.pop(ah, None)
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(

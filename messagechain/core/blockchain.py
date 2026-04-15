@@ -1010,6 +1010,7 @@ class Blockchain:
         block_height: int,
         transfer_transactions: list[TransferTransaction] | None = None,
         attestations: list[Attestation] | None = None,
+        authority_txs: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -1044,6 +1045,29 @@ class Blockchain:
             sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
+
+        # Simulate authority transactions — they all pay a fee (burn + tip)
+        # and some bump the signer's nonce.  Keep in lockstep with the
+        # equivalent paths in _apply_authority_tx, otherwise state_root
+        # diverges from the actual post-apply state and validators reject
+        # otherwise-valid blocks.
+        for atx in (authority_txs or []):
+            effective_base_fee = min(current_base_fee, atx.fee)
+            tip = atx.fee - effective_base_fee
+            sim_balances[atx.entity_id] = sim_balances.get(atx.entity_id, 0) - atx.fee
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            cls_name = atx.__class__.__name__
+            if cls_name == "SetAuthorityKeyTransaction":
+                sim_nonces[atx.entity_id] = atx.nonce + 1
+            elif cls_name == "RevokeTransaction":
+                # Revoke pushes all active stake into pending unbonding.
+                # Stake state-root contribution goes to 0 immediately.
+                sim_staked[atx.entity_id] = 0
+                # No nonce bump for revoke (nonce-free tx).
+            elif cls_name == "KeyRotationTransaction":
+                # Rotation swaps the public_key but does NOT touch nonces,
+                # balances (beyond the fee above), or staked amounts.
+                pass
 
         # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
@@ -1109,6 +1133,7 @@ class Blockchain:
         transfer_transactions: list[TransferTransaction] | None = None,
         slash_transactions: list | None = None,
         governance_txs: list | None = None,
+        authority_txs: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1128,6 +1153,7 @@ class Blockchain:
             transactions, proposer_entity.entity_id, block_height,
             transfer_transactions=transfer_transactions,
             attestations=attestations,
+            authority_txs=authority_txs,
         )
         mtp = self.get_median_time_past()
         # A small epsilon greater than the minimum float resolution the
@@ -1141,6 +1167,7 @@ class Blockchain:
             transfer_transactions=transfer_transactions,
             slash_transactions=slash_transactions,
             governance_txs=governance_txs,
+            authority_txs=authority_txs,
             timestamp=timestamp,
         )
 
@@ -1164,6 +1191,15 @@ class Blockchain:
             # Must be from a registered entity
             if att.validator_id not in self.public_keys:
                 return False, f"Attestation from unknown entity {att.validator_id.hex()[:16]}"
+
+            # Reject attestations from emergency-revoked validators. The
+            # cold-key holder has declared this hot key compromised; we
+            # block its attestations for the same reason we block its
+            # block proposals (see validate_block).  Without this a
+            # revoked validator could still participate in finality and
+            # move the justified/finalized tip while the operator watches.
+            if att.validator_id in self.revoked_entities:
+                return False, f"Attestation from revoked validator {att.validator_id.hex()[:16]}"
 
             # No duplicate attestations from same validator in one block
             if att.validator_id in seen_validators:
@@ -1316,6 +1352,23 @@ class Blockchain:
             ok, reason = _check_leaf(att.validator_id, att.signature.leaf_index, "attestation")
             if not ok:
                 return False, reason
+        for atx in getattr(block, "authority_txs", []):
+            # authority txs (SetAuthorityKey, Revoke, KeyRotation) each carry a
+            # signature keyed by their respective entity field.  Dispatch to
+            # the right signer so the (entity_id, leaf_index) dedupe key is
+            # accurate.  Revoke is signed by the COLD key, so its leaf does
+            # not collide with any hot-key leaf from the same entity_id —
+            # we treat the cold key's leaf-space as namespaced by the
+            # authority-key bytes to prevent false positives between hot
+            # and cold trees on the same entity.
+            if atx.__class__.__name__ == "RevokeTransaction":
+                authority_pk = self.get_authority_key(atx.entity_id)
+                signer_key = authority_pk if authority_pk is not None else atx.entity_id
+                ok, reason = _check_leaf(signer_key, atx.signature.leaf_index, "revoke tx")
+            else:
+                ok, reason = _check_leaf(atx.entity_id, atx.signature.leaf_index, "authority tx")
+            if not ok:
+                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -1333,12 +1386,13 @@ class Blockchain:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
         # Verify merkle root. Includes message txs, transfer txs, slash txs,
-        # and governance txs — committing each cryptographically prevents a
-        # byzantine relayer from stripping them in transit.
+        # governance txs, and authority txs — committing each cryptographically
+        # prevents a byzantine relayer from stripping them in transit.
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
             + [tx.tx_hash for tx in block.governance_txs]
+            + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -1501,10 +1555,12 @@ class Blockchain:
         return True, "Valid"
 
     def _validate_governance_tx(self, gtx) -> tuple[bool, str]:
-        """Verify a governance transaction's signature and author.
+        """Verify a governance transaction's signature, author, and fee balance.
 
-        Rejects txs whose sender is unknown to the chain or whose
-        cryptographic signature does not verify.  Does NOT enforce
+        Rejects txs whose sender is unknown to the chain, whose signature
+        does not verify, or whose sender cannot afford the declared fee.
+        The fee-balance check at validate time means `_apply_governance_block`
+        can trust that pay_fee_with_burn will succeed.  Does NOT enforce
         application-layer rules (proposal-exists, window-closed, etc.) —
         those are handled by the GovernanceTracker at apply time so that
         benign-but-rejected txs (e.g., votes on an expired proposal) do
@@ -1537,6 +1593,11 @@ class Blockchain:
             return False, f"Unknown sender {sender.hex()[:16]}"
         if not verifier(gtx, self.public_keys[sender]):
             return False, "Invalid signature or fields"
+        if not self.supply.can_afford_fee(sender, gtx.fee):
+            return False, (
+                f"Insufficient balance for fee {gtx.fee} "
+                f"from sender {sender.hex()[:16]}"
+            )
         return True, "Valid"
 
     def validate_block_standalone(self, block: Block, parent: Block) -> tuple[bool, str]:
@@ -1636,6 +1697,65 @@ class Blockchain:
 
         return True, "Valid"
 
+    def _apply_authority_tx(self, atx, proposer_id: bytes, base_fee: int) -> None:
+        """Dispatch an authority tx from within _apply_block_state.
+
+        Validates first — a block containing an invalid authority tx is a
+        bug in block production, but we degrade gracefully by skipping
+        the bad tx rather than corrupting state.  Fee-with-burn and leaf
+        watermark bump happen uniformly; the per-type side effects
+        (promote cold key / flip revoked / swap public_key) run inline.
+        """
+        cls_name = atx.__class__.__name__
+        if cls_name == "SetAuthorityKeyTransaction":
+            ok, _ = self.validate_set_authority_key(atx)
+            if not ok:
+                return
+            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            self.authority_keys[atx.entity_id] = atx.new_authority_key
+            self.nonces[atx.entity_id] = atx.nonce + 1
+            self._bump_watermark(atx.entity_id, atx.signature.leaf_index)
+            if self.db is not None and hasattr(self.db, "set_authority_key"):
+                self.db.set_authority_key(atx.entity_id, atx.new_authority_key)
+        elif cls_name == "RevokeTransaction":
+            ok, _ = self.validate_revoke(atx)
+            if not ok:
+                return
+            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            active_stake = self.supply.get_staked(atx.entity_id)
+            if active_stake > 0:
+                self.supply.unstake(
+                    atx.entity_id,
+                    active_stake,
+                    current_block=self.height,
+                    bootstrap_ended=False,
+                )
+            self.revoked_entities.add(atx.entity_id)
+            # Revoke is nonce-free; do NOT bump self.nonces.
+            # Revoke signature consumed a leaf in the COLD tree — we
+            # deliberately do not bump the hot-key watermark here.
+            if self.db is not None and hasattr(self.db, "set_revoked"):
+                self.db.set_revoked(atx.entity_id)
+        elif cls_name == "KeyRotationTransaction":
+            ok, _ = self.validate_key_rotation(atx)
+            if not ok:
+                return
+            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            self.public_keys[atx.entity_id] = atx.new_public_key
+            self.key_rotation_counts[atx.entity_id] = atx.rotation_number + 1
+            # New Merkle tree = independent leaf namespace, so reset.
+            self.leaf_watermarks[atx.entity_id] = 0
+            if self.db is not None:
+                self.db.set_public_key(atx.entity_id, atx.new_public_key)
+                if hasattr(self.db, "set_leaf_watermark"):
+                    self.db.set_leaf_watermark(atx.entity_id, 0)
+                if hasattr(self.db, "set_key_rotation_count"):
+                    self.db.set_key_rotation_count(
+                        atx.entity_id, self.key_rotation_counts[atx.entity_id],
+                    )
+        # Unknown class: silently skip. deserialize() would have rejected
+        # an unknown type before reaching here, so this branch is defensive.
+
     def _apply_transfer_with_burn(self, tx, proposer_id: bytes, base_fee: int):
         """Apply a transfer transaction with EIP-1559 fee burning."""
         # M1: Clamp base_fee to the actual fee to prevent negative tip
@@ -1677,6 +1797,8 @@ class Blockchain:
             affected.add(stx.submitter_id)
         for att in block.attestations:
             affected.add(att.validator_id)
+        for atx in getattr(block, "authority_txs", []):
+            affected.add(atx.entity_id)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -1712,6 +1834,14 @@ class Blockchain:
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
             self._bump_watermark(stx.submitter_id, stx.signature.leaf_index)
+
+        # Apply authority transactions (SetAuthorityKey / Revoke / KeyRotation).
+        # These all carry block-level state changes that previously only
+        # applied on the node receiving the RPC — committing them through
+        # the block pipeline is what makes the hot/cold split, emergency
+        # revoke, and key rotation consensus-visible across all peers.
+        for atx in getattr(block, "authority_txs", []):
+            self._apply_authority_tx(atx, proposer_id, current_base_fee)
 
         # Build attestor stakes map for reward distribution
         attestor_stakes = {}
@@ -1961,6 +2091,7 @@ class Blockchain:
                     block_height=block.header.block_number,
                     transfer_transactions=block.transfer_transactions,
                     attestations=block.attestations,
+                    authority_txs=getattr(block, "authority_txs", []),
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and

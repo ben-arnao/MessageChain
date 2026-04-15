@@ -59,7 +59,7 @@ python -m messagechain delegate --to <validator_id> --pct 100
 python -m messagechain info                                  # chain info
 ```
 
-To **receive funds**, share your entity ID.
+To **receive funds**, share the `Address` line printed by `account` / `balance` — that's the `mc1…` checksummed form of your entity ID. It catches single-character transcription typos before a transfer is submitted. The raw 64-hex entity ID is still accepted.
 
 Signing commands prompt for your private key; it stays in memory only long enough to sign. Override the target node with `--server host:port`.
 

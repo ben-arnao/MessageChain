@@ -53,6 +53,28 @@ def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     return layer[0]
 
 
+def _deserialize_authority_tx(data: dict):
+    """Rehydrate an authority-related transaction by its "type" tag.
+
+    Authority txs are consensus-visible operations on an entity's key
+    material: set-authority-key (promote cold key), revoke (emergency
+    kill-switch), and key-rotation (leaf-exhaustion recovery). They
+    share a block slot so peers learn about key-state changes through
+    the same gossip path as message and transfer txs.
+    """
+    from messagechain.core.authority_key import SetAuthorityKeyTransaction
+    from messagechain.core.emergency_revoke import RevokeTransaction
+    from messagechain.core.key_rotation import KeyRotationTransaction
+    tag = data.get("type")
+    if tag == "set_authority_key":
+        return SetAuthorityKeyTransaction.deserialize(data)
+    if tag == "revoke":
+        return RevokeTransaction.deserialize(data)
+    if tag == "key_rotation":
+        return KeyRotationTransaction.deserialize(data)
+    raise ValueError(f"Unknown authority tx type: {tag!r}")
+
+
 def _deserialize_governance_tx(data: dict):
     """Rehydrate a governance transaction based on its "type" tag.
 
@@ -167,6 +189,13 @@ class Block:
     # spend proposals, and validator-ejection proposals.  Each carries a
     # "type" tag in its serialized form that the block pipeline dispatches on.
     governance_txs: list = field(default_factory=list)
+    # Authority-key traffic: SetAuthorityKey (hot -> cold promotion), Revoke
+    # (emergency kill-switch, signed by cold), KeyRotation (leaf-exhaustion
+    # migration). Block-included so every peer applies the same state
+    # transitions — without this, a SetAuthorityKey or Revoke on one node
+    # would never propagate to the rest of the network, defeating the
+    # security model entirely.
+    authority_txs: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -197,6 +226,8 @@ class Block:
             result["transfer_transactions"] = [tx.serialize() for tx in self.transfer_transactions]
         if self.governance_txs:
             result["governance_txs"] = [tx.serialize() for tx in self.governance_txs]
+        if self.authority_txs:
+            result["authority_txs"] = [tx.serialize() for tx in self.authority_txs]
         return result
 
     @classmethod
@@ -223,9 +254,13 @@ class Block:
         governance_txs = []
         if data.get("governance_txs"):
             governance_txs = [_deserialize_governance_tx(g) for g in data["governance_txs"]]
+        authority_txs = []
+        if data.get("authority_txs"):
+            authority_txs = [_deserialize_authority_tx(a) for a in data["authority_txs"]]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
-                    transfer_transactions=transfer_txs, governance_txs=governance_txs)
+                    transfer_transactions=transfer_txs, governance_txs=governance_txs,
+                    authority_txs=authority_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

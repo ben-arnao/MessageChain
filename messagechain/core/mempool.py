@@ -66,6 +66,19 @@ class Mempool:
         if self._is_expired(tx):
             return False
 
+        # WOTS+ leaf-reuse defense at admission: if another pending tx from
+        # the same entity already uses this leaf_index, reject. Without this
+        # guard, two rapid sends from the same wallet (same watermark
+        # observation) can both slip through validate_transaction (chain
+        # state hasn't bumped yet) and force the block-level dedupe to
+        # reject the WHOLE block. Catching it here errors the client
+        # immediately on the second attempt instead.
+        incoming_leaf = tx.signature.leaf_index
+        for existing in self.pending.values():
+            if (existing.entity_id == tx.entity_id
+                    and existing.signature.leaf_index == incoming_leaf):
+                return False
+
         # M4: Enforce dynamic minimum relay fee based on mempool pressure
         min_relay_fee = self.fee_policy.get_min_relay_fee(len(self.pending), self.max_size)
         if tx.fee < min_relay_fee:
