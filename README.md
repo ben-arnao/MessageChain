@@ -5,7 +5,7 @@ A blockchain for sending messages. Quantum-resistant, proof-of-stake, built to l
 ## Install
 
 ```bash
-git clone https://github.com/YourUser/MessageChain.git
+git clone https://github.com/ben-arnao/MessageChain.git
 cd MessageChain
 pip install -r requirements.txt
 ```
@@ -46,6 +46,8 @@ python -m messagechain stake --amount 100                    # min stake: 100, 7
 python -m messagechain validators                            # stake %, blocks mined
 python -m messagechain key-status                            # leaf usage — rotate before full
 python -m messagechain rotate-key                            # roll signing key (ID unchanged)
+python -m messagechain set-authority-key --authority-pubkey <hex>   # cold key for unstake/revoke
+python -m messagechain emergency-revoke --entity-id <hex>    # disable a compromised validator
 
 # Governance
 python -m messagechain propose --title "..." --description "..."
@@ -60,6 +62,8 @@ python -m messagechain info                                  # chain info
 To **receive funds**, share your entity ID.
 
 Signing commands prompt for your private key; it stays in memory only long enough to sign. Override the target node with `--server host:port`.
+
+**Cold key (validators):** generate a second key offline (same `generate-key` drill), then run `set-authority-key` with its pubkey. After that, `unstake` and `emergency-revoke` must be signed by the cold key — so a compromised hot key can't drain your stake. Keep a pre-signed `emergency-revoke` on paper for rapid response.
 
 ## Tests
 
