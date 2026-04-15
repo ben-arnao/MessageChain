@@ -724,16 +724,15 @@ class Blockchain:
     def height(self) -> int:
         return len(self.chain)
 
-    @property
-    def bootstrap_progress(self) -> float:
-        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+    def _raw_bootstrap_progress(self) -> float:
+        """Compute the un-ratcheted bootstrap_progress from current state.
 
-        Computed from current chain state (height + stake distribution)
-        then ratcheted against the in-memory peak — never regresses.
-        Downstream code uses this to smoothly interpolate bootstrap-era
-        parameters (attester committee selection weight, min-stake
-        requirement, escrow window, seed exclusion).  See
-        messagechain.consensus.bootstrap_gradient for the design.
+        NEVER call this from read-side code paths.  The raw value can
+        regress as stake fluctuates, which is exactly what the ratchet
+        exists to guard against.  Only the apply path (`_apply_block_state`
+        → `_update_bootstrap_ratchet`) is allowed to observe this value;
+        every other caller should go through the `bootstrap_progress`
+        property which returns the already-ratcheted max.
         """
         from messagechain.consensus.bootstrap_gradient import (
             compute_bootstrap_progress,
@@ -748,12 +747,42 @@ class Blockchain:
             if eid in self.seed_entity_ids:
                 continue
             non_seed_stake += amount
-        raw = compute_bootstrap_progress(
+        return compute_bootstrap_progress(
             height=self.height,
             seed_stake=seed_stake,
             non_seed_stake=non_seed_stake,
         )
-        return self._bootstrap_ratchet.observe(raw)
+
+    @property
+    def bootstrap_progress(self) -> float:
+        """Monotonic value in [0, 1] driving the bootstrap-phase gradient.
+
+        Ratcheted at block-apply time only (see `_update_bootstrap_ratchet`,
+        called once at the end of `_apply_block_state`).  This property
+        is a pure reader with no side effects, so two nodes with
+        identical chain history always return the same value regardless
+        of query timing — load-bearing because this value drives
+        attester-committee selection.  A side-effectful read (the old
+        behavior) could let two honest nodes latch onto different
+        ratchet peaks based on when they queried, which would fork
+        the chain on state_root.
+
+        Downstream code uses this to smoothly interpolate bootstrap-era
+        parameters (committee selection weight, min-stake requirement,
+        escrow window, seed exclusion).  See
+        messagechain.consensus.bootstrap_gradient for the design.
+        """
+        return self._bootstrap_ratchet.max_progress
+
+    def _update_bootstrap_ratchet(self) -> None:
+        """Observe current raw progress and ratchet it up.
+
+        Called once per block apply (at the end of `_apply_block_state`),
+        so the ratchet reflects post-apply chain state.  Every node
+        applying the same block reaches the same ratchet value — this
+        is what makes `bootstrap_progress` deterministic across nodes.
+        """
+        self._bootstrap_ratchet.observe(self._raw_bootstrap_progress())
 
     def has_block(self, block_hash: bytes) -> bool:
         if block_hash in self._block_by_hash:
@@ -2769,6 +2798,15 @@ class Blockchain:
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
 
+        # Update bootstrap_progress ratchet.  Deliberately the LAST step
+        # of apply so every upstream state mutation (balances, stakes,
+        # escrow unlocks, governance-driven stake changes) is reflected
+        # in the computed raw progress.  Called once per block —
+        # `bootstrap_progress` is a pure reader elsewhere so committee
+        # selection and the sim path see a consistent value until the
+        # next apply ticks the ratchet forward.
+        self._update_bootstrap_ratchet()
+
     def _apply_governance_block(self, block: Block):
         """Dispatch governance txs, auto-execute closed binding proposals,
         and prune expired state.
@@ -3265,6 +3303,13 @@ class Blockchain:
         self.public_keys = {}
         self.slashed_validators = set()
         self._immature_rewards = []
+        # Reset the bootstrap ratchet — it will rebuild deterministically
+        # as blocks replay via _update_bootstrap_ratchet.  Every node
+        # replaying the same chain reaches the same ratchet peak.
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet = RatchetState()
+        from messagechain.economics.escrow import EscrowLedger
+        self._escrow = EscrowLedger()
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -3313,6 +3358,12 @@ class Blockchain:
                 eid: list(entries)
                 for eid, entries in self.supply.pending_unstakes.items()
             },
+            # Bootstrap ratchet.  Snapshotted so reorg rollback restores
+            # the same peak the chain had before the reorg — the ratchet
+            # is strictly monotonic within the canonical chain's history
+            # and must not silently regress across a reorg that undoes
+            # and re-applies blocks.
+            "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
         }
         # Snapshot governance state if tracker is attached
         if hasattr(self, "governance") and self.governance is not None:
@@ -3345,6 +3396,16 @@ class Blockchain:
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
         self._processed_evidence = snapshot.get("processed_evidence", set())
+        # Restore bootstrap ratchet.  Default 0.0 matches a freshly-
+        # built Blockchain (pre-any-block) and is safe for snapshots
+        # that predate this field.  The ratchet is otherwise strictly
+        # monotonic within the canonical chain, so any snapshot taken
+        # at height H has the correct peak for block H.
+        ratchet_value = snapshot.get("bootstrap_ratchet_max", 0.0)
+        from messagechain.consensus.bootstrap_gradient import RatchetState
+        self._bootstrap_ratchet = RatchetState()
+        if ratchet_value > 0.0:
+            self._bootstrap_ratchet.observe(ratchet_value)
         if "authority_keys" in snapshot:
             self.authority_keys = dict(snapshot["authority_keys"])
         if "pending_unstakes" in snapshot:
