@@ -4,10 +4,11 @@ A blockchain for sending messages. Quantum-resistant, proof-of-stake, built to l
 
 ## Install
 
+Requires **Python 3.10+** (uses `X | Y` union syntax). No third-party dependencies.
+
 ```bash
 git clone https://github.com/ben-arnao/MessageChain.git
 cd MessageChain
-pip install -r requirements.txt
 ```
 
 ## Quickstart
@@ -73,10 +74,20 @@ Use a dedicated, patched machine you physically control — not a daily-driver l
 
 **Unattended start** (systemd, Docker — no interactive key prompt):
 
+Linux / macOS:
+
 ```bash
 echo "<checksummed_private_key>" > /etc/messagechain/validator.key
 chmod 0600 /etc/messagechain/validator.key
 python -m messagechain start --mine --keyfile /etc/messagechain/validator.key
+```
+
+Windows (PowerShell, admin):
+
+```powershell
+Set-Content -Path "$env:ProgramData\MessageChain\validator.key" -Value "<checksummed_private_key>" -NoNewline
+icacls "$env:ProgramData\MessageChain\validator.key" /inheritance:r /grant:r "$env:USERNAME:(R)"
+python -m messagechain start --mine --keyfile "$env:ProgramData\MessageChain\validator.key"
 ```
 
 **Key rotation** — WOTS+ signatures burn leaves. Rotate before the tree fills (typically ~80%):
