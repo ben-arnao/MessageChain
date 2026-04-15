@@ -225,6 +225,7 @@ class ProofOfStake:
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
+        registration_transactions: list | None = None,
         timestamp: float | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
@@ -254,6 +255,7 @@ class ProofOfStake:
         auth_txs = list(authority_txs or [])
         stake_txs = list(stake_transactions or [])
         unstake_txs = list(unstake_transactions or [])
+        registration_txs = list(registration_transactions or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
             + [tx.tx_hash for tx in transfer_txs]
@@ -262,6 +264,7 @@ class ProofOfStake:
             + [tx.tx_hash for tx in auth_txs]
             + [tx.tx_hash for tx in stake_txs]
             + [tx.tx_hash for tx in unstake_txs]
+            + [tx.tx_hash for tx in registration_txs]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -299,6 +302,7 @@ class ProofOfStake:
             authority_txs=auth_txs,
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
+            registration_transactions=registration_txs,
         )
         block.block_hash = block._compute_hash()
         return block

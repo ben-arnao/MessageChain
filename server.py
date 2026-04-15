@@ -613,9 +613,8 @@ class Server:
             # Queue for block inclusion — do NOT mutate state directly.
             # State changes only happen when a block containing this tx is
             # produced and validated, ensuring all peers see the same state.
-            if not hasattr(self, '_pending_stake_txs'):
-                self._pending_stake_txs = {}
-            self._pending_stake_txs[tx.tx_hash] = tx
+            if not self._admit_to_pool("_pending_stake_txs", tx):
+                return {"ok": False, "error": "Stake pool full — raise fee to evict a lower-priced pending tx"}
             self._schedule_pending_tx_gossip("stake", tx)
 
             return {"ok": True, "result": {
@@ -666,9 +665,8 @@ class Server:
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
-            if not hasattr(self, '_pending_unstake_txs'):
-                self._pending_unstake_txs = {}
-            self._pending_unstake_txs[tx.tx_hash] = tx
+            if not self._admit_to_pool("_pending_unstake_txs", tx):
+                return {"ok": False, "error": "Unstake pool full — raise fee to evict a lower-priced pending tx"}
             self._schedule_pending_tx_gossip("unstake", tx)
 
             return {"ok": True, "result": {
@@ -678,6 +676,37 @@ class Server:
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _admit_to_pool(self, pool_attr: str, tx) -> bool:
+        """Insert `tx` into a capped per-type pending pool with fee-based
+        eviction, mirroring Mempool's admission policy.
+
+        Returns True if the tx landed.  Returns False when the pool is
+        full AND the incoming fee does not beat the lowest-fee pending
+        tx — caller surfaces this as "pool full, raise your fee".
+
+        Uniform across every non-message-tx pool so an attacker can't
+        fill any single pool with cheap junk: they'd have to keep
+        raising fees to maintain position.
+        """
+        from messagechain.config import PENDING_POOL_MAX_SIZE
+        pool = getattr(self, pool_attr, None)
+        if pool is None:
+            pool = {}
+            setattr(self, pool_attr, pool)
+        if tx.tx_hash in pool:
+            return True  # idempotent re-admit
+        if len(pool) >= PENDING_POOL_MAX_SIZE:
+            min_tx = min(
+                pool.values(),
+                key=lambda t: getattr(t, "fee", 0),
+            )
+            incoming_fee = getattr(tx, "fee", 0)
+            if incoming_fee <= getattr(min_tx, "fee", 0):
+                return False
+            del pool[min_tx.tx_hash]
+        pool[tx.tx_hash] = tx
+        return True
 
     def _tx_signer_pubkey(self, tx) -> bytes | None:
         """Return the public key that `tx`'s signature verifies under.
@@ -806,9 +835,8 @@ class Server:
             return False, reason
         if not self._check_leaf_across_all_pools(tx):
             return False, "WOTS+ leaf already used by another pending tx — leaf reuse rejected"
-        if not hasattr(self, "_pending_authority_txs"):
-            self._pending_authority_txs = {}
-        self._pending_authority_txs[tx.tx_hash] = tx
+        if not self._admit_to_pool("_pending_authority_txs", tx):
+            return False, "Authority-tx pool full — raise fee to evict a lower-priced pending tx"
         self._schedule_pending_tx_gossip("authority", tx)
         return True, "queued"
 
@@ -914,9 +942,8 @@ class Server:
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
-            if not hasattr(self, '_pending_governance_txs'):
-                self._pending_governance_txs = {}
-            self._pending_governance_txs[tx.tx_hash] = tx
+            if not self._admit_to_pool("_pending_governance_txs", tx):
+                return {"ok": False, "error": "Governance pool full — raise fee to evict a lower-priced pending tx"}
             self._schedule_pending_tx_gossip("governance", tx)
 
             targets_info = [
@@ -960,9 +987,8 @@ class Server:
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
-            if not hasattr(self, '_pending_governance_txs'):
-                self._pending_governance_txs = {}
-            self._pending_governance_txs[tx.tx_hash] = tx
+            if not self._admit_to_pool("_pending_governance_txs", tx):
+                return {"ok": False, "error": "Governance pool full — raise fee to evict a lower-priced pending tx"}
             self._schedule_pending_tx_gossip("governance", tx)
 
             return {"ok": True, "result": {
@@ -1003,9 +1029,8 @@ class Server:
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
 
             # Queue for block inclusion — do NOT mutate state directly.
-            if not hasattr(self, '_pending_governance_txs'):
-                self._pending_governance_txs = {}
-            self._pending_governance_txs[tx.tx_hash] = tx
+            if not self._admit_to_pool("_pending_governance_txs", tx):
+                return {"ok": False, "error": "Governance pool full — raise fee to evict a lower-priced pending tx"}
             self._schedule_pending_tx_gossip("governance", tx)
 
             return {"ok": True, "result": {
@@ -1754,12 +1779,8 @@ class Server:
                     return
                 if not self._check_leaf_across_all_pools(tx):
                     return
-                pool = getattr(self, "_pending_authority_txs", None)
-                if pool is None:
-                    self._pending_authority_txs = pool = {}
-                if tx.tx_hash in pool:
+                if not self._admit_to_pool("_pending_authority_txs", tx):
                     return
-                pool[tx.tx_hash] = tx
             elif kind == "stake":
                 from messagechain.core.staking import (
                     StakeTransaction, verify_stake_transaction,
@@ -1772,12 +1793,8 @@ class Server:
                     return
                 if not self._check_leaf_across_all_pools(tx):
                     return
-                pool = getattr(self, "_pending_stake_txs", None)
-                if pool is None:
-                    self._pending_stake_txs = pool = {}
-                if tx.tx_hash in pool:
+                if not self._admit_to_pool("_pending_stake_txs", tx):
                     return
-                pool[tx.tx_hash] = tx
             elif kind == "unstake":
                 from messagechain.core.staking import (
                     UnstakeTransaction, verify_unstake_transaction,
@@ -1790,12 +1807,8 @@ class Server:
                     return
                 if not self._check_leaf_across_all_pools(tx):
                     return
-                pool = getattr(self, "_pending_unstake_txs", None)
-                if pool is None:
-                    self._pending_unstake_txs = pool = {}
-                if tx.tx_hash in pool:
+                if not self._admit_to_pool("_pending_unstake_txs", tx):
                     return
-                pool[tx.tx_hash] = tx
             elif kind == "governance":
                 from messagechain.core.block import _deserialize_governance_tx
                 tx = _deserialize_governance_tx(tx_data)
@@ -1808,12 +1821,8 @@ class Server:
                     return
                 if not self._check_leaf_across_all_pools(tx):
                     return
-                pool = getattr(self, "_pending_governance_txs", None)
-                if pool is None:
-                    self._pending_governance_txs = pool = {}
-                if tx.tx_hash in pool:
+                if not self._admit_to_pool("_pending_governance_txs", tx):
                     return
-                pool[tx.tx_hash] = tx
             else:
                 return
             # Relay to other peers (best-effort).  Gossip is idempotent —

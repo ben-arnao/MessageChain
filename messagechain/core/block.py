@@ -219,6 +219,13 @@ class Block:
     # on who is unbonding and when.  Same block-pipeline shape as
     # stake_transactions but dispatched to supply.unstake on apply.
     unstake_transactions: list = field(default_factory=list)
+    # Entity registrations: self-authenticating txs that add a new
+    # (entity_id -> public_key) mapping to chain state.  Block-included
+    # so peers learn about new entities through consensus rather than
+    # via the isolated RPC path — prevents "registered on seed A,
+    # unknown to seeds B/C" splits that would cause peer nodes to
+    # reject blocks containing that entity's first transfer.
+    registration_transactions: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -255,6 +262,8 @@ class Block:
             result["stake_transactions"] = [tx.serialize() for tx in self.stake_transactions]
         if self.unstake_transactions:
             result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
+        if self.registration_transactions:
+            result["registration_transactions"] = [tx.serialize() for tx in self.registration_transactions]
         return result
 
     @classmethod
@@ -292,11 +301,19 @@ class Block:
         if data.get("unstake_transactions"):
             from messagechain.core.staking import UnstakeTransaction
             unstake_txs = [UnstakeTransaction.deserialize(s) for s in data["unstake_transactions"]]
+        registration_txs = []
+        if data.get("registration_transactions"):
+            from messagechain.core.registration import RegistrationTransaction
+            registration_txs = [
+                RegistrationTransaction.deserialize(r)
+                for r in data["registration_transactions"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
-                    unstake_transactions=unstake_txs)
+                    unstake_transactions=unstake_txs,
+                    registration_transactions=registration_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

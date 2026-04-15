@@ -75,6 +75,7 @@ def compute_block_sig_cost(block) -> int:
         + len(getattr(block, "authority_txs", []))
         + len(getattr(block, "stake_transactions", []))
         + len(getattr(block, "unstake_transactions", []))
+        + len(getattr(block, "registration_transactions", []))
         + 1  # proposer signature
         + len(block.attestations)
     )
@@ -1060,6 +1061,7 @@ class Blockchain:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         governance_txs: list | None = None,
+        registration_transactions: list | None = None,
         proposer_signature_leaf_index: int | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
@@ -1067,6 +1069,28 @@ class Blockchain:
         Used by block proposers to compute the correct post-state commitment
         without actually mutating chain state. The block header commits to
         the post-application state so validators can verify consistency.
+
+        `proposer_signature_leaf_index` is a heuristic.  The proposer's
+        block signature consumes a WOTS+ leaf, and the apply path bumps
+        the proposer's leaf_watermark to (leaf_index + 1).  That mutation
+        lives inside the state_root commitment, so the sim has to predict
+        it before the block is actually signed.
+
+        Two callers always know the right value and pass it explicitly:
+          * propose_block → proposer_entity.keypair._next_leaf
+          * validate (add_block pre-check) → block.header.proposer_signature.leaf_index
+
+        Callers who don't supply it (older test helpers that build a
+        block via consensus.create_block directly) hit the default
+        below: "the proposer's upcoming signature will consume the next
+        leaf after the live watermark."  That's the canonical case — a
+        proposer signing one block per slot with nothing else in flight.
+        It breaks if a proposer has consumed keypair leaves out-of-band
+        (e.g., pre-signing messages or extra governance txs not yet in
+        the chain).  The mismatch surfaces as a state_root rejection at
+        add_block, not silent corruption, so the blast radius is
+        "callers must pass the explicit index in those edge cases," not
+        a consensus hazard.
         """
         from messagechain.config import (
             PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
@@ -1189,7 +1213,15 @@ class Blockchain:
             )
             if (ak_sim == b"" and pk_sim != b"") or ak_sim == pk_sim:
                 _bump_wm(utx.entity_id, utx.signature.leaf_index)
-            _bump_wm(utx.entity_id, utx.signature.leaf_index)
+
+        # Simulate registrations — install (entity_id -> public_key) and
+        # initialize nonce.  Fee-free, no balance movement.  Bump the
+        # leaf watermark with the proof's leaf index so a post-reg tx
+        # cannot reuse leaf 0.
+        for rtx in (registration_transactions or []):
+            sim_public_keys[rtx.entity_id] = rtx.public_key
+            sim_nonces[rtx.entity_id] = 0
+            _bump_wm(rtx.entity_id, rtx.registration_proof.leaf_index)
 
         # Simulate block reward with attestation split and reward cap
         reward = self.supply.calculate_block_reward(block_height)
@@ -1372,6 +1404,7 @@ class Blockchain:
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
+        registration_transactions: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1403,6 +1436,7 @@ class Blockchain:
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
             governance_txs=governance_txs,
+            registration_transactions=registration_transactions,
             proposer_signature_leaf_index=expected_proposer_leaf,
         )
         mtp = self.get_median_time_past()
@@ -1420,6 +1454,7 @@ class Blockchain:
             authority_txs=authority_txs,
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
+            registration_transactions=registration_transactions,
             timestamp=timestamp,
         )
 
@@ -1635,6 +1670,18 @@ class Blockchain:
             ok, reason = _check_leaf(signer_key, utx.signature.leaf_index, "unstake tx")
             if not ok:
                 return False, reason
+        for rtx in getattr(block, "registration_transactions", []):
+            # Registration proof is signed by the entity's own hot key at
+            # its lowest-index leaf (typically leaf 0).  Dedupe against
+            # (entity_id, leaf_index) to catch two registrations re-using
+            # the same leaf — validate_block also rejects duplicate
+            # entity_ids outright, but the leaf-reuse dedupe is defense
+            # in depth.
+            ok, reason = _check_leaf(
+                rtx.entity_id, rtx.registration_proof.leaf_index, "registration tx",
+            )
+            if not ok:
+                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -1661,10 +1708,22 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
+            + [tx.tx_hash for tx in getattr(block, "registration_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
+
+        # Registration txs — self-authenticating (bundle their own pubkey).
+        # Duplicate-registration check uses pending_registrations so two
+        # registrations of the same entity in one block are caught.
+        pending_registrations: set[bytes] = set()
+        for rtx in getattr(block, "registration_transactions", []):
+            valid, reason = self._validate_registration_tx(
+                rtx, pending_registrations,
+            )
+            if not valid:
+                return False, f"Invalid registration tx: {reason}"
 
         # Verify proposer signature (mandatory — unsigned blocks are rejected)
         if block.header.proposer_id not in self.public_keys:
@@ -1847,6 +1906,52 @@ class Blockchain:
             if not ok:
                 return False, f"Invalid unstake tx: {reason}"
 
+        # Validate registration transactions.  Self-authenticating + no
+        # nonce / no fee, so cumulative tracking isn't needed — we only
+        # check that entity_id isn't already registered or being
+        # registered twice in this same block.
+        pending_registrations: set[bytes] = set()
+        for rtx in getattr(block, "registration_transactions", []):
+            ok, reason = self._validate_registration_tx(
+                rtx, pending_registrations,
+            )
+            if not ok:
+                return False, f"Invalid registration tx: {reason}"
+
+        return True, "Valid"
+
+    def _validate_registration_tx(
+        self, rtx,
+        pending_registrations: set[bytes],
+    ) -> tuple[bool, str]:
+        """Validate a RegistrationTransaction in the context of a block.
+
+        Registration is self-authenticating: the tx bundles its own
+        public_key and a proof signed by the matching private key.  We
+        verify the proof, confirm the entity isn't already registered
+        (either on chain or earlier in this same block), and track
+        pending_registrations to catch two registrations of the same
+        entity_id in one block.
+        """
+        from messagechain.core.registration import (
+            RegistrationTransaction, verify_registration_transaction,
+        )
+        if not isinstance(rtx, RegistrationTransaction):
+            return False, f"Unexpected type {type(rtx).__name__}"
+        ok, reason = verify_registration_transaction(rtx)
+        if not ok:
+            return False, reason
+        if rtx.entity_id in self.public_keys:
+            return False, (
+                f"Entity {rtx.entity_id.hex()[:16]} already registered — "
+                f"duplicate registration rejected"
+            )
+        if rtx.entity_id in pending_registrations:
+            return False, (
+                f"Entity {rtx.entity_id.hex()[:16]} registered twice in the "
+                f"same block — duplicate rejected"
+            )
+        pending_registrations.add(rtx.entity_id)
         return True, "Valid"
 
     def _validate_stake_tx_in_block(
@@ -2100,10 +2205,20 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
+            + [tx.tx_hash for tx in getattr(block, "registration_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
+
+        # Registration txs — self-authenticating, duplicate guard
+        pending_registrations: set[bytes] = set()
+        for rtx in getattr(block, "registration_transactions", []):
+            valid, reason = self._validate_registration_tx(
+                rtx, pending_registrations,
+            )
+            if not valid:
+                return False, f"Invalid registration tx: {reason}"
 
         # Governance txs — signature + sender checks (same as validate_block)
         for gtx in block.governance_txs:
@@ -2259,6 +2374,8 @@ class Blockchain:
             affected.add(stx.entity_id)
         for utx in getattr(block, "unstake_transactions", []):
             affected.add(utx.entity_id)
+        for rtx in getattr(block, "registration_transactions", []):
+            affected.add(rtx.entity_id)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -2349,6 +2466,19 @@ class Blockchain:
             signing_pk = self.public_keys.get(utx.entity_id)
             if authority_pk == signing_pk:
                 self._bump_watermark(utx.entity_id, utx.signature.leaf_index)
+
+        # Apply registration transactions.  Fee-free, nonce-free; simply
+        # installs (entity_id -> public_key) and initializes nonce to 0.
+        # The proof's leaf index bumps the watermark — a re-registration
+        # attempt at the same leaf is structurally impossible (duplicate
+        # entity_id would be caught first) but we still advance the
+        # watermark so a later rotate / reset cannot reuse it.
+        for rtx in getattr(block, "registration_transactions", []):
+            self.public_keys[rtx.entity_id] = rtx.public_key
+            self.nonces[rtx.entity_id] = 0
+            self._bump_watermark(
+                rtx.entity_id, rtx.registration_proof.leaf_index,
+            )
 
         # Build attestor stakes map for reward distribution
         attestor_stakes = {}
@@ -2607,6 +2737,7 @@ class Blockchain:
                     stake_transactions=getattr(block, "stake_transactions", []),
                     unstake_transactions=getattr(block, "unstake_transactions", []),
                     governance_txs=getattr(block, "governance_txs", []),
+                    registration_transactions=getattr(block, "registration_transactions", []),
                     proposer_signature_leaf_index=proposer_sig_leaf,
                 )
             except Exception:
