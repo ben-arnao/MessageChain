@@ -120,6 +120,38 @@ def build_parser() -> argparse.ArgumentParser:
     unstake.add_argument("--fee", type=int, default=None, help="Transaction fee")
     unstake.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- bootstrap-seed ---
+    bootstrap = sub.add_parser(
+        "bootstrap-seed",
+        help="One-shot: register + set cold authority + stake a seed validator",
+        description=(
+            "Perform the full seed-validator bootstrap sequence on a running node:\n"
+            "  1. register-entity (hot key proves ownership)\n"
+            "  2. set-authority-key (promote the cold wallet pubkey)\n"
+            "  3. stake (lock the validator stake)\n"
+            "\n"
+            "Submits each tx to the local server and prints a summary.  Run this "
+            "once per seed during initial network bootstrap.  Confirm with "
+            "`messagechain info <entity_id>` after the next block lands."
+        ),
+    )
+    bootstrap.add_argument(
+        "--authority-pubkey", required=True,
+        help="Cold wallet public key (hex). Generate offline with `generate-key`.",
+    )
+    bootstrap.add_argument(
+        "--stake-amount", type=int, required=True,
+        help="Amount to stake (tokens). Your recommended seed stake.",
+    )
+    bootstrap.add_argument(
+        "--fee", type=int, default=None,
+        help="Per-tx fee (default: MIN_FEE for each step).",
+    )
+    bootstrap.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: localhost)",
+    )
+
     # --- set-authority-key ---
     set_auth = sub.add_parser(
         "set-authority-key",
@@ -511,6 +543,21 @@ def cmd_start(args):
 
         server.set_wallet_entity(entity)
         print(f"\nMining as: {entity.entity_id_hex[:16]}...")
+
+        # Nudge: if this validator has no separate cold authority key,
+        # every destructive path (unstake, emergency revoke) is controlled
+        # by the hot signing key loaded on this server. Compromise of this
+        # box = total loss. Warn once at startup so operators don't default
+        # into the less-safe mode without knowing.
+        authority_pk = server.blockchain.get_authority_key(entity.entity_id)
+        if authority_pk is None or authority_pk == entity.public_key:
+            print()
+            print("  ⚠  Single-key model: this server holds the only key that")
+            print("     controls your stake. Compromise = drained funds and")
+            print("     stolen governance voting power until slow recovery.")
+            print("     Harden by promoting an offline-generated cold key:")
+            print("       messagechain set-authority-key --authority-pubkey <hex>")
+            print("     (from a separately-generated keypair, kept offline).")
     else:
         print("=== Start Relay Node ===\n")
         print("Running as relay-only (no block production).")
@@ -864,6 +911,139 @@ def cmd_unstake(args):
         sys.exit(1)
 
 
+def cmd_bootstrap_seed(args):
+    """One-shot bootstrap for a seed validator: register + set-authority + stake.
+
+    Mirrors the sequence tested in tests/test_bootstrap_rehearsal.py, but
+    against a live server via RPC.  Prompts for the hot private key ONCE
+    and runs all three operations back-to-back.  Each step fails loudly
+    on error rather than silently leaving the validator mis-configured.
+    """
+    from messagechain.identity.identity import Entity
+    from messagechain.crypto.hash_sig import _hash
+    from messagechain.core.authority_key import create_set_authority_key_transaction
+    from messagechain.core.staking import create_stake_transaction
+
+    print("=== Bootstrap Seed Validator ===\n")
+    print("This performs the full seed-validator setup in one pass:")
+    print("  1. Register entity (hot key)")
+    print("  2. Set cold authority key (so unstake/revoke need the cold key)")
+    print("  3. Stake the validator amount\n")
+
+    try:
+        authority_pubkey = bytes.fromhex(args.authority_pubkey.strip())
+    except ValueError:
+        print("Error: --authority-pubkey must be valid hex.")
+        sys.exit(1)
+    if len(authority_pubkey) != 32:
+        print(f"Error: authority public key must be 32 bytes, got {len(authority_pubkey)}.")
+        sys.exit(1)
+
+    if args.stake_amount <= 0:
+        print("Error: --stake-amount must be positive.")
+        sys.exit(1)
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+    print(f"\nSeed entity: {entity.entity_id_hex}")
+    print(f"Cold authority: {authority_pubkey.hex()}")
+    print(f"Stake amount: {args.stake_amount}\n")
+
+    host, port = _parse_server(args.server)
+    print(f"Server: {host}:{port}\n")
+
+    from client import rpc_call
+    fee_default = args.fee if args.fee is not None else 100  # MIN_FEE equivalent
+
+    def _fatal(step: str, err: str):
+        print(f"\n[{step}] FAILED: {err}")
+        print("Bootstrap aborted.  Chain state may be partially updated — ")
+        print("re-run `messagechain bootstrap-seed ...` to resume from where you stopped.")
+        sys.exit(1)
+
+    def _fetch_state():
+        resp = rpc_call(host, port, "get_entity", {"entity_id": entity.entity_id_hex})
+        return resp.get("result") if resp.get("ok") else None
+
+    def _fetch_authority():
+        resp = rpc_call(host, port, "get_authority_key", {"entity_id": entity.entity_id_hex})
+        if not resp.get("ok"):
+            return None
+        ak = resp["result"].get("authority_key")
+        return bytes.fromhex(ak) if ak else None
+
+    def _refresh_nonce_and_leaf():
+        """Re-fetch nonce + leaf watermark and advance the keypair."""
+        resp = rpc_call(host, port, "get_nonce", {"entity_id": entity.entity_id_hex})
+        if not resp.get("ok"):
+            return None, None
+        n = resp["result"]["nonce"]
+        w = resp["result"].get("leaf_watermark", n)
+        entity.keypair.advance_to_leaf(w)
+        return n, w
+
+    # ── Step 1: register ────────────────────────────────────────────
+    print("[1/3] Registering entity...")
+    existing = _fetch_state()
+    if existing is not None:
+        print("      already registered; skipping")
+    else:
+        proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
+        resp = rpc_call(host, port, "register_entity", {
+            "entity_id": entity.entity_id_hex,
+            "public_key": entity.public_key.hex(),
+            "registration_proof": proof.serialize(),
+        })
+        if not resp.get("ok"):
+            _fatal("1/3 register", resp.get("error", "unknown"))
+        print(f"      OK: {resp['result']}")
+
+    # ── Step 2: set authority key (cold) ────────────────────────────
+    print("\n[2/3] Setting cold authority key...")
+    current_authority = _fetch_authority()
+    if current_authority == authority_pubkey:
+        print("      already set to cold key; skipping")
+    else:
+        nonce, _ = _refresh_nonce_and_leaf()
+        if nonce is None:
+            _fatal("2/3 set-authority", "could not fetch nonce")
+        tx = create_set_authority_key_transaction(
+            entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee_default,
+        )
+        resp = rpc_call(host, port, "set_authority_key", {"transaction": tx.serialize()})
+        if not resp.get("ok"):
+            _fatal("2/3 set-authority", resp.get("error", "unknown"))
+        print(f"      submitted: {resp['result']}")
+
+    # ── Step 3: stake ───────────────────────────────────────────────
+    print(f"\n[3/3] Staking {args.stake_amount} tokens...")
+    state = _fetch_state()
+    staked = state.get("staked", 0) if state else 0
+    if staked >= args.stake_amount:
+        print(f"      already staked {staked} (>= target); skipping")
+    else:
+        needed = args.stake_amount - staked
+        nonce, _ = _refresh_nonce_and_leaf()
+        if nonce is None:
+            _fatal("3/3 stake", "could not fetch nonce")
+        stake_tx = create_stake_transaction(entity, amount=needed, nonce=nonce, fee=fee_default)
+        resp = rpc_call(host, port, "stake", {"transaction": stake_tx.serialize()})
+        if not resp.get("ok"):
+            _fatal("3/3 stake", resp.get("error", "unknown"))
+        print(f"      submitted: {resp['result']}")
+
+    print("\n=== All three steps submitted ===")
+    print("Stake and set-authority-key take effect when the next block is produced.")
+    print(f"\nVerify with:")
+    print(f"  messagechain info --entity-id {entity.entity_id_hex} --server {host}:{port}")
+    print("\nThe verification must show:")
+    print(f"  staked         >= {args.stake_amount}")
+    print(f"  authority_key  == {authority_pubkey.hex()}")
+    print("\nIf either is missing after a block or two, investigate before ")
+    print("treating this seed as operational.  A silently-wrong bootstrap is ")
+    print("the worst-case security failure.")
+
+
 def cmd_set_authority_key(args):
     """Promote a cold authority key for this entity."""
     from messagechain.identity.identity import Entity
@@ -955,8 +1135,9 @@ def cmd_rotate_key(args):
     print(f"Current leaf watermark:  {watermark} / {1 << MERKLE_TREE_HEIGHT}")
     print(f"\nDeriving fresh Merkle tree (rotation {current_rotation})...")
     progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building new tree")
-    new_kp = derive_rotated_keypair(entity, rotation_number=current_rotation)
-    progress.close() if hasattr(progress, "close") else None
+    new_kp = derive_rotated_keypair(
+        entity, rotation_number=current_rotation, progress=progress,
+    )
 
     fee = args.fee if args.fee is not None else KEY_ROTATION_FEE
     rot_tx = create_key_rotation(
@@ -1040,21 +1221,12 @@ def cmd_emergency_revoke(args):
     host, port = _parse_server(args.server)
     from client import rpc_call
 
-    # The cold entity may or may not be registered — watermark is on the
-    # hot entity_id, which is the revoke target. The cold key's own leaf
-    # index is determined locally by its KeyPair state (fresh: starts at 0).
+    # Revoke is nonce-free — no RPC roundtrip required to sign, which is
+    # what makes the "keep a pre-signed revoke tx on paper" workflow
+    # practical. The cold key's leaf index is local to its own KeyPair.
     fee = args.fee if args.fee is not None else 500
-    # Revoke uses nonce from the TARGET entity (the hot identity), not the signer.
-    nonce_resp = rpc_call(host, port, "get_nonce", {
-        "entity_id": target_entity_id.hex(),
-    })
-    if not nonce_resp.get("ok"):
-        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
-        sys.exit(1)
-    nonce = nonce_resp["result"]["nonce"]
-
     tx = create_revoke_transaction(
-        cold, nonce=nonce, fee=fee, entity_id=target_entity_id,
+        cold, fee=fee, entity_id=target_entity_id,
     )
 
     print(f"Broadcasting revoke for {target_entity_id.hex()[:16]}...")
@@ -1435,6 +1607,7 @@ def main():
         "stake": cmd_stake,
         "unstake": cmd_unstake,
         "set-authority-key": cmd_set_authority_key,
+        "bootstrap-seed": cmd_bootstrap_seed,
         "emergency-revoke": cmd_emergency_revoke,
         "rotate-key": cmd_rotate_key,
         "key-status": cmd_key_status,
