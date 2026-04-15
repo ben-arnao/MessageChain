@@ -227,13 +227,22 @@ class TestOrphanBlockPool(unittest.TestCase):
         for _ in range(3):
             _propose_and_add(chain, consensus, entities[0])
 
-        # Save state snapshot after block 3
+        # Save state snapshot after block 3.  Every per-entity field the
+        # state_root now commits to must be part of the snapshot — a
+        # partial rollback that leaves, say, leaf_watermarks pointing at
+        # "future" values would silently diverge sim from apply when
+        # block4 is re-added.
         snapshot = {
             "balances": dict(chain.supply.balances),
             "staked": dict(chain.supply.staked),
             "nonces": dict(chain.nonces),
             "proposer_sig_counts": dict(chain.proposer_sig_counts),
             "immature_rewards": list(chain._immature_rewards),
+            "leaf_watermarks": dict(chain.leaf_watermarks),
+            "authority_keys": dict(chain.authority_keys),
+            "public_keys": dict(chain.public_keys),
+            "key_rotation_counts": dict(chain.key_rotation_counts),
+            "revoked_entities": set(chain.revoked_entities),
             "chain_len": len(chain.chain),
         }
 
@@ -256,6 +265,14 @@ class TestOrphanBlockPool(unittest.TestCase):
         chain.nonces = snapshot["nonces"]
         chain.proposer_sig_counts = snapshot["proposer_sig_counts"]
         chain._immature_rewards = snapshot["immature_rewards"]
+        chain.leaf_watermarks = snapshot["leaf_watermarks"]
+        chain.authority_keys = snapshot["authority_keys"]
+        chain.public_keys = snapshot["public_keys"]
+        chain.key_rotation_counts = snapshot["key_rotation_counts"]
+        chain.revoked_entities = snapshot["revoked_entities"]
+        # State tree was last synced against the "after block 5" dicts —
+        # rebuild it to reflect the rolled-back dicts we just restored.
+        chain._rebuild_state_tree()
 
         # Add block5 first (orphan — parent block4 not in chain)
         chain.add_block(block5)

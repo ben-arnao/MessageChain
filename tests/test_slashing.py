@@ -377,7 +377,31 @@ class TestSlashTransaction(unittest.TestCase):
         sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
         if treasury_excess > 0:
             sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
-        state_root = compute_state_root(sim_balances, sim_nonces, sim_staked)
+        # State root now commits to authority fields too; pass them
+        # through from the live chain (slashing doesn't mutate keys or
+        # revoke state).  Leaf watermarks advance on EVERY signature the
+        # block carries: slash-tx submitter sig, proposer block sig, and
+        # any attestation sigs.  Pre-bump sim watermarks for each so the
+        # sim matches what _apply_block_state will do.
+        sim_wm = dict(self.chain.leaf_watermarks)
+
+        def _bump(eid, leaf_index):
+            nxt = leaf_index + 1
+            if nxt > sim_wm.get(eid, 0):
+                sim_wm[eid] = nxt
+
+        _bump(slash_tx.submitter_id, slash_tx.signature.leaf_index)
+        # Proposer's block signature will consume their keypair's next
+        # leaf — peek before the block is signed.
+        _bump(proposer_id, proposer_entity.keypair._next_leaf)
+        state_root = compute_state_root(
+            sim_balances, sim_nonces, sim_staked,
+            authority_keys=self.chain.authority_keys,
+            public_keys=self.chain.public_keys,
+            leaf_watermarks=sim_wm,
+            key_rotation_counts=self.chain.key_rotation_counts,
+            revoked_entities=self.chain.revoked_entities,
+        )
 
         # Slash txs are now committed in the merkle_root, so they must be
         # passed at construction time — post-hoc attachment would break

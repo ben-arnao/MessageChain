@@ -129,8 +129,10 @@ class TestJournalRollback(unittest.TestCase):
         tree.rollback()
 
         self.assertEqual(tree.root(), baseline)
-        self.assertEqual(tree.get(_eid(1)), (100, 0, 0))
-        self.assertEqual(tree.get(_eid(2)), (200, 1, 0))
+        # Tree now stores an 8-tuple; slice to the (balance, nonce, stake)
+        # prefix since the rollback test doesn't exercise authority fields.
+        self.assertEqual(tree.get(_eid(1))[:3], (100, 0, 0))
+        self.assertEqual(tree.get(_eid(2))[:3], (200, 1, 0))
         self.assertIsNone(tree.get(_eid(3)))
 
     def test_commit_keeps_changes(self):
@@ -140,7 +142,7 @@ class TestJournalRollback(unittest.TestCase):
         tree.set(_eid(1), 999, 5, 0)
         tree.commit()
         tree.rollback()  # no-op, journal already cleared
-        self.assertEqual(tree.get(_eid(1)), (999, 5, 0))
+        self.assertEqual(tree.get(_eid(1))[:3], (999, 5, 0))
 
     def test_nested_begin_raises(self):
         tree = SparseMerkleTree()
