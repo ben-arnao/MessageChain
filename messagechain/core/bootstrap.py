@@ -145,3 +145,64 @@ def bootstrap_seed_local(
         f"authority={cold_authority_pubkey.hex()[:16]}"
     )
     return True, log
+
+
+# ───────────────────────────────────────────────────────────────────────
+# Recommended launch plan for the 3-seed + shared-payout layout.
+#
+# Encodes the decisions documented in the operator runbook so operators
+# don't have to re-derive them (and can't silently under-budget fees or
+# mis-size stake):
+#   * Each seed stakes 250,000 tokens.
+#   * Each seed is allocated 251,000 liquid at genesis (stake + fee
+#     buffer for set-authority-key + bootstrap retries + initial ops).
+#   * Treasury allocation is 4% of supply per the existing default.
+#   * Payout entity is registered post-genesis via the block pipeline.
+#
+# Tweak the constants below if you have a different scale in mind, but
+# check the README operator runbook first — the numbers are there for
+# reasons (security + optics + bootstrap runway).
+# ───────────────────────────────────────────────────────────────────────
+
+RECOMMENDED_STAKE_PER_SEED: int = 250_000
+RECOMMENDED_FEE_BUFFER: int = MIN_FEE * 10          # 1_000
+RECOMMENDED_GENESIS_PER_SEED: int = (
+    RECOMMENDED_STAKE_PER_SEED + RECOMMENDED_FEE_BUFFER
+)
+
+
+def build_launch_allocation(
+    seed_entity_ids: list[bytes],
+    stake_per_seed: int = RECOMMENDED_STAKE_PER_SEED,
+    fee_buffer: int = RECOMMENDED_FEE_BUFFER,
+) -> dict[bytes, int]:
+    """Build the genesis allocation table for a seed-validator launch.
+
+    Credits each seed with `stake_per_seed + fee_buffer` liquid at
+    genesis, plus the standard treasury allocation.  Payout entities
+    are NOT pre-allocated — they register post-genesis via the normal
+    RegistrationTransaction pipeline and accumulate balance from
+    subsequent transfers.
+
+    Requires exactly 3 seed entity_ids so the caller can't accidentally
+    launch with one (single-point-of-failure) or two (can't hit the
+    MIN_VALIDATORS_TO_EXIT_BOOTSTRAP=3 threshold).  If you want a
+    different shape, build the dict yourself.
+    """
+    from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
+    if len(seed_entity_ids) != 3:
+        raise ValueError(
+            f"Recommended launch plan requires exactly 3 seed entity_ids, "
+            f"got {len(seed_entity_ids)}.  Build the allocation table "
+            f"manually if you need a different shape."
+        )
+    if len(set(seed_entity_ids)) != 3:
+        raise ValueError("seed entity_ids must be distinct")
+    if stake_per_seed <= 0 or fee_buffer < 0:
+        raise ValueError("stake_per_seed must be positive, fee_buffer non-negative")
+
+    per_seed = stake_per_seed + fee_buffer
+    allocation = {TREASURY_ENTITY_ID: TREASURY_ALLOCATION}
+    for eid in seed_entity_ids:
+        allocation[eid] = per_seed
+    return allocation

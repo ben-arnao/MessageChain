@@ -114,62 +114,139 @@ Keep a pre-signed `emergency-revoke` on paper for rapid response.
 
 ## Operator runbook: genesis launch with 3 seeds
 
-Before touching real hardware, rehearse locally:
+### Rehearse locally first
+
 ```bash
-python -m unittest tests.test_bootstrap_rehearsal
+python -m unittest tests.test_genesis_launch_plan tests.test_bootstrap_rehearsal
 ```
 
-This exercises the exact sequence three seed validators perform on
-first launch — register, set-authority-key, stake — plus the post-
-conditions a production setup must verify.
+These drive the recommended 3-seed + shared-payout layout end-to-end
+(genesis allocation, each seed registering + setting authority + staking,
+payout entity registering via the block pipeline, a reward sweep).
+If they pass on your build, production wiring is sound; what's left is
+pure operator ops.
 
-**Entity layout per seed:** one hot signing key (lives on the validator
-server) + one *separate* cold authority key (offline, stored in a safe).
-Reusing the same cold key across seeds is rejected by the chain — it
-would collapse all three seeds' trust into a single secret, so use
-three distinct cold keys (three separate mnemonics).
+### Keys to generate (offline, airgap)
 
-**Genesis allocation must cover stake PLUS fee padding.** Each seed
-consumes `MIN_FEE` (~100 tokens) during bootstrap to pay for the
-`set-authority-key` transaction, and subsequent ops will consume more.
-Budget `stake + ~10 × MIN_FEE` of liquid balance per seed at genesis so
-an under-estimate doesn't silently leave you unstaked. Example for a
-250,000-token target stake:
+Seven keypairs total.  Generate each with `messagechain generate-key`
+and write the 24-word mnemonic down:
+
+| Keypair | Where the private key lives | On-chain? |
+|---|---|---|
+| `seed1_hot` | on validator server #1 | yes, registered |
+| `seed2_hot` | on validator server #2 | yes, registered |
+| `seed3_hot` | on validator server #3 | yes, registered |
+| `cold1` | in the safe | no — authority-key binding only |
+| `cold2` | in the safe | no — authority-key binding only |
+| `cold3` | in the safe | no — authority-key binding only |
+| `payout` | in the safe | yes, registered post-genesis |
+
+The three cold keys must be distinct — the chain rejects two entities
+sharing the same authority public key (that would collapse three
+seeds' trust into one secret).  The payout is a single shared entity
+that all three seeds sweep rewards to.
+
+### Genesis allocation
+
+Use the helper rather than computing by hand; it encodes the
+recommended numbers and rejects obvious mis-configurations (wrong
+seed count, non-distinct seed IDs):
+
+```python
+from messagechain.core.bootstrap import build_launch_allocation
+from messagechain.core.blockchain import Blockchain
+
+allocation = build_launch_allocation([
+    seed1.entity_id, seed2.entity_id, seed3.entity_id,
+])
+# => {TREASURY_ENTITY_ID: 40_000_000,
+#     seed1.entity_id:    251_000,   # 250K stake + 1K fee buffer
+#     seed2.entity_id:    251_000,
+#     seed3.entity_id:    251_000}
+
+chain = Blockchain()
+chain.initialize_genesis(seed1, allocation_table=allocation)
 ```
-seed_genesis = 250_000 + 1_000  # = 251,000 liquid
+
+Founder-visible supply = 753,000 tokens = **0.0753 %** of the 1 B
+genesis cap.  Small enough that nobody can credibly claim "founder
+concentration."  The 40 M treasury is governance-controlled, not the
+founder's.
+
+The payout entity is NOT in the genesis allocation — it registers
+post-genesis by submitting a `RegistrationTransaction` through the
+normal block pipeline.
+
+### Seed endpoint config
+
+Before deploying, edit
+[`messagechain/config.py`](messagechain/config.py)
+`CLIENT_SEED_ENDPOINTS` to your three seed IPs:
+
+```python
+CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
+    ("seed1.example.com", 9333),
+    ("seed2.example.com", 9333),
+    ("seed3.example.com", 9333),
+]
 ```
 
-**Reward sweeps require a separate payout entity.** The chain enforces
-that cold authority keys cannot match any registered entity's signing
-key.  That means you cannot send rewards from a seed "back to the cold
-wallet" if the cold wallet is registered — and you cannot receive
-transfers at an unregistered entity.  Two workable patterns:
+CLI clients contact one of these seeds at random for their first
+RPC.  Once non-seed validators come online and are reachable, clients
+automatically switch to `sqrt(stake)`-weighted random routing across
+the full validator set.  Seeds stay available as entry points but
+stop monopolizing client load.  Users can override per-command with
+`--server host:port`.
 
-1. **Three entities per seed: hot + cold + payout.**  Hot signs blocks,
-   cold gates unstake/revoke, payout is a separately registered
-   on-chain entity that receives swept rewards.  Keep the payout
-   private key cold (airgap) and register it on chain once, pre-launch.
-2. **Accept that the cold authority key is also the payout key.**  To
-   receive rewards you must register it — which forbids using it as
-   anyone's authority key.  Simplest option but slightly less isolated.
+### Per-seed launch commands
 
-Most operators want pattern (1).  If you don't need cold authority
-coverage, pattern (2) is fine.
+On each VPS (after `messagechain start --mine` is running):
 
-**Seed endpoint configuration.**  Before deploy, edit
-[`messagechain/config.py`](messagechain/config.py) `CLIENT_SEED_ENDPOINTS`
-to list your three seed IPs.  These are the hardcoded entry points
-CLI clients use until the network has enough non-seed validators to
-route via sqrt(stake)-weighted selection.  Clients fall through to
-the dev-only `127.0.0.1:9333` if all seeds are unreachable — that's
-a bootstrap convenience, not a production fallback.
+```bash
+messagechain bootstrap-seed \
+    --authority-pubkey <cold_N_public_key_hex> \
+    --stake-amount 250000 \
+    --server localhost:9333
+```
 
-**Post-launch routing** — once external validators come online AND a
-seed's `peers` map knows their advertised entity IDs, CLI clients
-automatically switch from "always use a seed" to a sqrt(stake)-weighted
-random pick across all reachable validators.  The seeds stay available
-as entry points but stop monopolizing client load.  Users can manually
-override per-command with `--server host:port`.
+This submits three transactions in sequence — `register_entity`,
+`set-authority-key`, `stake` — and reports status.  Verify afterwards:
+
+```bash
+messagechain info --entity-id <seed_N_entity_id>
+# Must show: staked >= 250000 AND authority_key == <cold_N_public_key>
+```
+
+### Register the shared payout
+
+Once any seed is running, from the box that holds the payout
+mnemonic (airgap until this moment, then network-connected for a
+single RPC):
+
+```bash
+messagechain account    # prompts for the payout mnemonic, builds and
+                        # submits RegistrationTransaction
+```
+
+The registration lands in the next block and propagates to every
+peer.  The payout private key can return to the safe immediately
+afterwards — receiving transfers does not require its signature.
+
+### Periodic reward sweep
+
+From each seed server, after block rewards have matured
+(`COINBASE_MATURITY` = 10 blocks ≈ 100 minutes):
+
+```bash
+messagechain transfer \
+    --to <payout_entity_id> \
+    --amount <matured_rewards>
+```
+
+The transfer is signed by the **seed's hot key** — the key that's
+already online.  Rewards consolidate on the payout address.  The
+payout private key stays cold; you only bring it online if and when
+you eventually want to move funds out of the payout wallet.
 
 ## Tests
 
