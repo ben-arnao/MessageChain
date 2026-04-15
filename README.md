@@ -112,6 +112,65 @@ python -m messagechain emergency-revoke --entity-id <hex>    # kill-switch for a
 
 Keep a pre-signed `emergency-revoke` on paper for rapid response.
 
+## Operator runbook: genesis launch with 3 seeds
+
+Before touching real hardware, rehearse locally:
+```bash
+python -m unittest tests.test_bootstrap_rehearsal
+```
+
+This exercises the exact sequence three seed validators perform on
+first launch — register, set-authority-key, stake — plus the post-
+conditions a production setup must verify.
+
+**Entity layout per seed:** one hot signing key (lives on the validator
+server) + one *separate* cold authority key (offline, stored in a safe).
+Reusing the same cold key across seeds is rejected by the chain — it
+would collapse all three seeds' trust into a single secret, so use
+three distinct cold keys (three separate mnemonics).
+
+**Genesis allocation must cover stake PLUS fee padding.** Each seed
+consumes `MIN_FEE` (~100 tokens) during bootstrap to pay for the
+`set-authority-key` transaction, and subsequent ops will consume more.
+Budget `stake + ~10 × MIN_FEE` of liquid balance per seed at genesis so
+an under-estimate doesn't silently leave you unstaked. Example for a
+250,000-token target stake:
+```
+seed_genesis = 250_000 + 1_000  # = 251,000 liquid
+```
+
+**Reward sweeps require a separate payout entity.** The chain enforces
+that cold authority keys cannot match any registered entity's signing
+key.  That means you cannot send rewards from a seed "back to the cold
+wallet" if the cold wallet is registered — and you cannot receive
+transfers at an unregistered entity.  Two workable patterns:
+
+1. **Three entities per seed: hot + cold + payout.**  Hot signs blocks,
+   cold gates unstake/revoke, payout is a separately registered
+   on-chain entity that receives swept rewards.  Keep the payout
+   private key cold (airgap) and register it on chain once, pre-launch.
+2. **Accept that the cold authority key is also the payout key.**  To
+   receive rewards you must register it — which forbids using it as
+   anyone's authority key.  Simplest option but slightly less isolated.
+
+Most operators want pattern (1).  If you don't need cold authority
+coverage, pattern (2) is fine.
+
+**Seed endpoint configuration.**  Before deploy, edit
+[`messagechain/config.py`](messagechain/config.py) `CLIENT_SEED_ENDPOINTS`
+to list your three seed IPs.  These are the hardcoded entry points
+CLI clients use until the network has enough non-seed validators to
+route via sqrt(stake)-weighted selection.  Clients fall through to
+the dev-only `127.0.0.1:9333` if all seeds are unreachable — that's
+a bootstrap convenience, not a production fallback.
+
+**Post-launch routing** — once external validators come online AND a
+seed's `peers` map knows their advertised entity IDs, CLI clients
+automatically switch from "always use a seed" to a sqrt(stake)-weighted
+random pick across all reachable validators.  The seeds stay available
+as entry points but stop monopolizing client load.  Users can manually
+override per-command with `--server host:port`.
+
 ## Tests
 
 ```bash

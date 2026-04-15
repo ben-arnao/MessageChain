@@ -130,6 +130,23 @@ ENFORCE_SLOT_TIMING = True
 # Network
 DEFAULT_PORT = 9333
 SEED_NODES: list[tuple[str, int]] = []
+
+# Hardcoded entry-point endpoints for CLI clients.  The three genesis-
+# launch validators live here; the CLI uses them to make its initial
+# RPC connection.  Once connected, the CLI calls get_network_validators
+# to discover the rest of the network and — if non-seed validators with
+# known endpoints exist — routes subsequent calls via a sqrt(stake)-
+# weighted random pick so load doesn't perpetually concentrate on the
+# seeds.  Users can override per-command with `--server host:port`.
+#
+# REPLACE the placeholder entries below before launch.  Leaving them
+# unreachable will force every unconfigured CLI invocation to fall
+# through to the "seed of last resort" = localhost:9333.
+CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
+    ("seed1.messagechain.invalid", DEFAULT_PORT),
+    ("seed2.messagechain.invalid", DEFAULT_PORT),
+    ("seed3.messagechain.invalid", DEFAULT_PORT),
+]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 5  # seconds
 

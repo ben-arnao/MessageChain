@@ -473,6 +473,9 @@ class Server:
         elif method == "list_validators":
             return {"ok": True, "result": {"validators": self.blockchain.list_validators()}}
 
+        elif method == "get_network_validators":
+            return {"ok": True, "result": self._rpc_get_network_validators()}
+
         elif method == "estimate_fee":
             return self._rpc_estimate_fee(request.get("params", {}))
 
@@ -570,12 +573,16 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
                 return {"ok": False, "error": "Insufficient balance for staking + fee"}
 
+            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+
             # Queue for block inclusion — do NOT mutate state directly.
             # State changes only happen when a block containing this tx is
             # produced and validated, ensuring all peers see the same state.
             if not hasattr(self, '_pending_stake_txs'):
                 self._pending_stake_txs = {}
             self._pending_stake_txs[tx.tx_hash] = tx
+            self._schedule_pending_tx_gossip("stake", tx)
 
             return {"ok": True, "result": {
                 "entity_id": entity_id.hex(),
@@ -621,10 +628,14 @@ class Server:
             if self.blockchain.supply.get_staked(entity_id) < tx.amount:
                 return {"ok": False, "error": "Insufficient staked amount"}
 
+            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+
             # Queue for block inclusion — do NOT mutate state directly.
             if not hasattr(self, '_pending_unstake_txs'):
                 self._pending_unstake_txs = {}
             self._pending_unstake_txs[tx.tx_hash] = tx
+            self._schedule_pending_tx_gossip("unstake", tx)
 
             return {"ok": True, "result": {
                 "entity_id": entity_id.hex(),
@@ -634,20 +645,66 @@ class Server:
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
+    def _check_leaf_across_all_pools(
+        self, entity_id: bytes, leaf_index: int,
+    ) -> bool:
+        """Return True if no currently-pending tx from the same entity shares
+        this leaf_index.  Queried by every RPC admission path so a rapid-fire
+        client can't land two txs at the same WOTS+ leaf — either both would
+        fail in the block-level dedupe and the whole block would be rejected,
+        or if they split across blocks the second would leak the private key
+        for that leaf.  Catching it here errors the second RPC immediately.
+        """
+        def _signer_id(tx):
+            # Different tx types name their sender field differently.
+            # Try the common ones in order of specificity so governance /
+            # slashing txs contribute their signer to the dedupe.
+            for attr in (
+                "entity_id", "proposer_id", "voter_id", "delegator_id",
+                "submitter_id",
+            ):
+                eid = getattr(tx, attr, None)
+                if eid is not None:
+                    return eid
+            return None
+
+        def _scan(pool):
+            for existing in pool.values():
+                sig = getattr(existing, "signature", None)
+                eid = _signer_id(existing)
+                if sig is None or eid is None:
+                    continue
+                if eid == entity_id and sig.leaf_index == leaf_index:
+                    return False
+            return True
+
+        for pool_attr in (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+        ):
+            pool = getattr(self, pool_attr, {})
+            if not _scan(pool):
+                return False
+        # Mempool's internal guard already covers message and transfer
+        # txs; nothing extra to check there.
+        return True
+
     def _queue_authority_tx(self, tx, *, validate_fn) -> tuple[bool, str]:
         """Shared admission path for SetAuthorityKey / Revoke / KeyRotation.
 
         Validates the tx against current chain state (so mempool rejection
-        gives a clear error), then enqueues it for inclusion in the next
-        block.  The block pipeline applies it to state and gossips it to
-        peers so every node reaches the same authority-state result.
+        gives a clear error), enqueues it for the next block, and gossips
+        it to peers so a non-proposing receiver doesn't strand the tx.
         """
         ok, reason = validate_fn(tx)
         if not ok:
             return False, reason
+        if not self._check_leaf_across_all_pools(tx.entity_id, tx.signature.leaf_index):
+            return False, "WOTS+ leaf already used by another pending tx — leaf reuse rejected"
         if not hasattr(self, "_pending_authority_txs"):
             self._pending_authority_txs = {}
         self._pending_authority_txs[tx.tx_hash] = tx
+        self._schedule_pending_tx_gossip("authority", tx)
         return True, "queued"
 
     def _rpc_set_authority_key(self, params: dict) -> dict:
@@ -748,10 +805,14 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
+            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+
             # Queue for block inclusion — do NOT mutate state directly.
             if not hasattr(self, '_pending_governance_txs'):
                 self._pending_governance_txs = {}
             self._pending_governance_txs[tx.tx_hash] = tx
+            self._schedule_pending_tx_gossip("governance", tx)
 
             targets_info = [
                 {"delegate_id": did.hex(), "pct": pct}
@@ -790,10 +851,14 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
+            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+
             # Queue for block inclusion — do NOT mutate state directly.
             if not hasattr(self, '_pending_governance_txs'):
                 self._pending_governance_txs = {}
             self._pending_governance_txs[tx.tx_hash] = tx
+            self._schedule_pending_tx_gossip("governance", tx)
 
             return {"ok": True, "result": {
                 "proposal_id": tx.proposal_id.hex(),
@@ -829,10 +894,14 @@ class Server:
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
 
+            if not self._check_leaf_across_all_pools(entity_id, tx.signature.leaf_index):
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+
             # Queue for block inclusion — do NOT mutate state directly.
             if not hasattr(self, '_pending_governance_txs'):
                 self._pending_governance_txs = {}
             self._pending_governance_txs[tx.tx_hash] = tx
+            self._schedule_pending_tx_gossip("governance", tx)
 
             return {"ok": True, "result": {
                 "tx_hash": tx.tx_hash.hex(),
@@ -908,6 +977,39 @@ class Server:
             return {"ok": False, "error": "Entity not found"}
         return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}
 
+    def _rpc_get_network_validators(self) -> dict:
+        """Return validators with their client-reachable RPC endpoints.
+
+        Joins on-chain stake data (validator_id + stake amount) with the
+        server's live peer map (peer.entity_id -> peer.host:peer.port).
+        Used by CLI clients to discover non-seed validators and route
+        subsequent calls via sqrt(stake)-weighted random selection once
+        the network has post-bootstrap participation.
+
+        Validators with no currently-connected peer entry are returned
+        without an endpoint — clients cannot route to them directly,
+        but they still appear in the total stake denominator.
+
+        Design note: IPs live in server memory (and optionally addrman),
+        NOT on chain.  list_validators deliberately omits endpoints to
+        keep targeting data off the permanent record; this RPC surfaces
+        it only to actively-connected clients.
+        """
+        # Build peer.entity_id -> (host, port) map from currently-tracked peers
+        peer_endpoints: dict[str, tuple[str, int]] = {}
+        for peer in self.peers.values():
+            if getattr(peer, "entity_id", None):
+                # Peer port from handshake payload might differ from connection
+                # port; prefer the advertised port when known.
+                peer_endpoints[peer.entity_id] = (peer.host, peer.port)
+
+        rows = self.blockchain.list_validators()
+        for row in rows:
+            endpoint = peer_endpoints.get(row.get("entity_id"))
+            row["rpc_host"] = endpoint[0] if endpoint else None
+            row["rpc_port"] = endpoint[1] if endpoint else None
+        return {"validators": rows}
+
     # ── Block Production ────────────────────────────────────────────
 
     async def _block_production_loop(self):
@@ -970,6 +1072,8 @@ class Server:
         # each to keep block size bounded.
         pending_stake = getattr(self, "_pending_stake_txs", {})
         stake_txs = list(pending_stake.values())[:MAX_TXS_PER_BLOCK]
+        pending_unstake = getattr(self, "_pending_unstake_txs", {})
+        unstake_txs = list(pending_unstake.values())[:MAX_TXS_PER_BLOCK]
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
 
@@ -979,6 +1083,7 @@ class Server:
             slash_transactions=slash_txs,
             authority_txs=authority_txs,
             stake_transactions=stake_txs,
+            unstake_transactions=unstake_txs,
             governance_txs=governance_txs,
         )
 
@@ -996,6 +1101,9 @@ class Server:
             if stake_txs:
                 for sh in [s.tx_hash for s in stake_txs]:
                     pending_stake.pop(sh, None)
+            if unstake_txs:
+                for uh in [u.tx_hash for u in unstake_txs]:
+                    pending_unstake.pop(uh, None)
             if governance_txs:
                 for gh in [g.tx_hash for g in governance_txs]:
                     pending_gov.pop(gh, None)
@@ -1265,6 +1373,9 @@ class Server:
         elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
             await self._handle_announce_slash(msg.payload, peer)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_PENDING_TX:
+            self._handle_announce_pending_tx(msg.payload, peer)
+
         # ── Sync messages ──
         elif msg.msg_type == MessageType.REQUEST_HEADERS:
             await self._serve_headers(msg.payload, peer)
@@ -1504,9 +1615,144 @@ class Server:
         if peer.writer:
             await write_message(peer.writer, response)
 
+    def _handle_announce_pending_tx(self, payload: dict, peer) -> None:
+        """Receive a non-message tx gossiped by a peer; validate + queue.
+
+        The peer's admission path already did the fast local-state checks;
+        we redo them ourselves because we don't trust peers.  Dedupe by
+        tx_hash and leaf so a gossiped tx doesn't re-broadcast forever.
+        """
+        try:
+            kind = payload.get("kind")
+            tx_data = payload.get("tx")
+            if not isinstance(kind, str) or not isinstance(tx_data, dict):
+                return
+            if kind == "authority":
+                from messagechain.core.block import _deserialize_authority_tx
+                tx = _deserialize_authority_tx(tx_data)
+                cls_name = tx.__class__.__name__
+                if cls_name == "SetAuthorityKeyTransaction":
+                    ok, _ = self.blockchain.validate_set_authority_key(tx)
+                elif cls_name == "RevokeTransaction":
+                    ok, _ = self.blockchain.validate_revoke(tx)
+                elif cls_name == "KeyRotationTransaction":
+                    ok, _ = self.blockchain.validate_key_rotation(tx)
+                else:
+                    return
+                if not ok:
+                    return
+                if not self._check_leaf_across_all_pools(
+                    tx.entity_id, tx.signature.leaf_index,
+                ):
+                    return
+                pool = getattr(self, "_pending_authority_txs", None)
+                if pool is None:
+                    self._pending_authority_txs = pool = {}
+                if tx.tx_hash in pool:
+                    return
+                pool[tx.tx_hash] = tx
+            elif kind == "stake":
+                from messagechain.core.staking import (
+                    StakeTransaction, verify_stake_transaction,
+                )
+                tx = StakeTransaction.deserialize(tx_data)
+                pk = self.blockchain.public_keys.get(tx.entity_id)
+                if pk is None or not verify_stake_transaction(
+                    tx, pk, block_height=self.blockchain.height,
+                ):
+                    return
+                if not self._check_leaf_across_all_pools(
+                    tx.entity_id, tx.signature.leaf_index,
+                ):
+                    return
+                pool = getattr(self, "_pending_stake_txs", None)
+                if pool is None:
+                    self._pending_stake_txs = pool = {}
+                if tx.tx_hash in pool:
+                    return
+                pool[tx.tx_hash] = tx
+            elif kind == "unstake":
+                from messagechain.core.staking import (
+                    UnstakeTransaction, verify_unstake_transaction,
+                )
+                tx = UnstakeTransaction.deserialize(tx_data)
+                authority_pk = self.blockchain.get_authority_key(tx.entity_id)
+                if authority_pk is None or not verify_unstake_transaction(
+                    tx, authority_pk,
+                ):
+                    return
+                if not self._check_leaf_across_all_pools(
+                    tx.entity_id, tx.signature.leaf_index,
+                ):
+                    return
+                pool = getattr(self, "_pending_unstake_txs", None)
+                if pool is None:
+                    self._pending_unstake_txs = pool = {}
+                if tx.tx_hash in pool:
+                    return
+                pool[tx.tx_hash] = tx
+            elif kind == "governance":
+                from messagechain.core.block import _deserialize_governance_tx
+                tx = _deserialize_governance_tx(tx_data)
+                signer_id = (
+                    getattr(tx, "proposer_id", None)
+                    or getattr(tx, "voter_id", None)
+                    or getattr(tx, "delegator_id", None)
+                )
+                if signer_id is None or signer_id not in self.blockchain.public_keys:
+                    return
+                if not self._check_leaf_across_all_pools(
+                    signer_id, tx.signature.leaf_index,
+                ):
+                    return
+                pool = getattr(self, "_pending_governance_txs", None)
+                if pool is None:
+                    self._pending_governance_txs = pool = {}
+                if tx.tx_hash in pool:
+                    return
+                pool[tx.tx_hash] = tx
+            else:
+                return
+            # Relay to other peers (best-effort).  Gossip is idempotent —
+            # peers that already have the tx will drop it via the
+            # tx_hash-seen guards above.
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._broadcast(
+                    NetworkMessage(MessageType.ANNOUNCE_PENDING_TX, payload),
+                ))
+            except RuntimeError:
+                pass
+        except Exception as e:
+            logger.debug(f"rejected malformed gossip pending tx: {e}")
+
     async def _broadcast_block(self, block: Block):
         msg = NetworkMessage(MessageType.ANNOUNCE_BLOCK, block.serialize())
         await self._broadcast(msg)
+
+    def _schedule_pending_tx_gossip(self, kind: str, tx) -> None:
+        """Fire-and-forget gossip of a newly-admitted non-message tx.
+
+        Non-message txs (stake / unstake / authority / governance) land in
+        per-type pending pools on the node that received the RPC.  Without
+        gossip, they only make it into a block if THAT node happens to be
+        the next proposer.  Broadcasting to peers lets any proposer pick
+        them up, bounding the "stuck in one node's pool" window to the
+        network-wide gossip latency rather than a full block-time.
+        """
+        try:
+            msg = NetworkMessage(
+                MessageType.ANNOUNCE_PENDING_TX,
+                {"kind": kind, "tx": tx.serialize()},
+            )
+        except Exception as e:
+            logger.debug(f"could not serialize pending tx for gossip: {e}")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no async context — likely a unit test; nothing to do
+        loop.create_task(self._broadcast(msg))
 
     async def _broadcast(self, msg: NetworkMessage):
         for addr, peer in self.peers.items():

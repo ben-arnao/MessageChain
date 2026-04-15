@@ -112,14 +112,17 @@ class TestResolveDefaults(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["send", "Hello"])
         resolved = resolve_defaults(args)
-        # Server defaults to localhost
-        self.assertEqual(resolved.server, "127.0.0.1:9334")
+        # resolve_defaults intentionally leaves --server as None so that
+        # _parse_server can run the auto-discovery path (seed probe +
+        # sqrt(stake) weighted pick) at call time.  An explicit override
+        # via --server host:port bypasses that.
+        self.assertIsNone(resolved.server)
 
     def test_account_defaults(self):
         parser = build_parser()
         args = parser.parse_args(["account"])
         resolved = resolve_defaults(args)
-        self.assertEqual(resolved.server, "127.0.0.1:9334")
+        self.assertIsNone(resolved.server)
 
     def test_start_data_dir_auto(self):
         """If no --data-dir, should auto-create a default path."""

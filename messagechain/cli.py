@@ -326,10 +326,8 @@ def resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
     """Fill in sensible defaults so users don't have to think about config."""
     cmd = args.command
 
-    # Server address defaults
-    if hasattr(args, "server") and args.server is None:
-        args.server = "127.0.0.1:9334"
-
+    # Server address: explicit override wins.  Otherwise leave None so
+    # _parse_server can run the seed-pick + sqrt(stake) routing.
     # Data dir defaults for node
     if cmd == "start" and args.data_dir is None:
         args.data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
@@ -337,12 +335,142 @@ def resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def _parse_server(server_str: str) -> tuple[str, int]:
-    """Parse 'host:port' into (host, port)."""
-    if ":" in server_str:
-        host, port = server_str.rsplit(":", 1)
-        return host, int(port)
-    return server_str, 9334
+def _parse_server(server_str):
+    """Resolve a --server value to a (host, port) tuple.
+
+    When the user passes --server host:port, parse and return it.  When
+    --server is unset (None), run the auto-discovery path:
+
+    1. Try `CLIENT_SEED_ENDPOINTS` in random order, pick the first that
+       accepts a TCP connection.  The seeds are the only hardcoded
+       entry points the CLI knows about.
+    2. Once connected to a seed, ask for `get_network_validators`.
+       If any *non-seed* validator reports a reachable RPC endpoint,
+       pick one weighted by sqrt(stake) and route the actual command
+       there.  This is the "graceful post-bootstrap switch": while
+       the network is just the seeds, clients stick to them; once
+       outside validators come online and are reachable, load spreads
+       across the network.
+    3. If no non-seed validators have endpoints yet, stay on the seed.
+    4. Final fallback: localhost:9333 (useful for dev).
+
+    Users always retain manual override via `--server`.
+    """
+    if server_str is not None and server_str != "":
+        if ":" in server_str:
+            host, port = server_str.rsplit(":", 1)
+            return host, int(port)
+        from messagechain.config import DEFAULT_PORT
+        return server_str, DEFAULT_PORT
+
+    endpoint = _auto_pick_endpoint()
+    if endpoint is not None:
+        return endpoint
+    # Last-resort dev fallback so a local unconfigured node still works.
+    return "127.0.0.1", 9333
+
+
+def _try_tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Quick liveness probe — returns True if we can open a socket."""
+    import socket as _socket
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _auto_pick_endpoint():
+    """Discover a reachable RPC endpoint following the two-stage model.
+
+    Returns (host, port) or None if nothing responds.  Keeps logic here
+    (not in every command handler) so all CLI commands share the same
+    routing behavior.
+    """
+    import random
+    from messagechain.config import CLIENT_SEED_ENDPOINTS
+
+    # Stage 1: find a reachable seed.
+    reachable_seed = None
+    candidates = list(CLIENT_SEED_ENDPOINTS)
+    random.shuffle(candidates)
+    for host, port in candidates:
+        if _try_tcp_open(host, port):
+            reachable_seed = (host, port)
+            break
+
+    if reachable_seed is None:
+        return None
+
+    # Stage 2: ask the seed for the wider validator set.  If any
+    # non-seed validator has a reachable endpoint, pick one weighted
+    # by sqrt(stake) so load spreads without letting mega-validators
+    # monopolize client traffic.
+    try:
+        import json
+        import socket as _socket
+        import struct as _struct
+        seed_hostport = set(CLIENT_SEED_ENDPOINTS)
+        req = json.dumps({
+            "method": "get_network_validators", "params": {},
+        }).encode("utf-8")
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        try:
+            s.connect(reachable_seed)
+            s.sendall(_struct.pack(">I", len(req)))
+            s.sendall(req)
+            length = _struct.unpack(">I", _recv_n(s, 4))[0]
+            resp = json.loads(_recv_n(s, length).decode("utf-8"))
+        finally:
+            s.close()
+        if not resp.get("ok"):
+            return reachable_seed
+        validators = resp["result"].get("validators", []) or []
+        non_seed = []
+        for v in validators:
+            host, port = v.get("rpc_host"), v.get("rpc_port")
+            if host is None or port is None:
+                continue
+            if (host, port) in seed_hostport:
+                continue
+            stake = v.get("stake", 0)
+            if stake <= 0:
+                continue
+            non_seed.append((host, port, stake))
+        if not non_seed:
+            return reachable_seed
+
+        import math
+        weights = [math.isqrt(max(s, 1)) for _, _, s in non_seed]
+        total_w = sum(weights)
+        if total_w == 0:
+            return reachable_seed
+        pick = random.randint(1, total_w)
+        cumulative = 0
+        for (host, port, _), w in zip(non_seed, weights):
+            cumulative += w
+            if pick <= cumulative:
+                return (host, port)
+        return (non_seed[-1][0], non_seed[-1][1])
+    except Exception:
+        # Any discovery failure -> fall back to the reachable seed.  A
+        # broken discovery path must never brick the CLI.
+        return reachable_seed
+
+
+def _recv_n(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        buf += chunk
+    return buf
 
 
 def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
