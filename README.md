@@ -91,7 +91,7 @@ Validator must keep `start --mine` running continuously. Use a dedicated machine
 
 ```bash
 python -m messagechain start --mine                  # foreground; also syncs the chain
-python -m messagechain stake --amount 100            # min 100; 7-day unbonding to withdraw
+python -m messagechain stake --amount 100            # min stake graduates 1→10→100 with chain height; 7-day unbonding
 python -m messagechain unstake --amount 100
 ```
 
