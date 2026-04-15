@@ -132,12 +132,23 @@ class TestAuthorityTxApplyThroughBlock(_Base):
     def _bootstrap(self, include=()):
         """Build a chain with a staked proposer, genesis, and any extra
         registrations/balances the caller needs. Returns (chain, proposer,
-        consensus, extras)."""
+        consensus, extras).
+
+        NOTE: proposer stake is set high (100M) so that stake-weighted
+        random proposer selection in `_selected_proposer_for_slot`
+        reliably picks `proposer` even when the `include=` list
+        registers additional staked entities.  `create_genesis_block`
+        uses `time.time()`, so genesis block_hash — and therefore the
+        RNG seed for proposer selection at block 1 — is non-deterministic
+        across runs.  A dominant proposer stake turns a ~5% flake
+        (100k vs 5k stake) into ~0.005% (100M vs 5k).  The real fix is
+        deterministic genesis timestamps, but that is a larger change.
+        """
         chain = Blockchain()
         proposer = _entity(b"proposer")
         self._register(chain, proposer)
-        chain.supply.balances[proposer.entity_id] = 200_000
-        chain.supply.staked[proposer.entity_id] = 100_000
+        chain.supply.balances[proposer.entity_id] = 200_000_000
+        chain.supply.staked[proposer.entity_id] = 100_000_000
         extras = {}
         for seed, balance, stake in include:
             e = _entity(seed)
@@ -148,7 +159,7 @@ class TestAuthorityTxApplyThroughBlock(_Base):
             extras[seed] = e
         chain.initialize_genesis(proposer)
         consensus = ProofOfStake()
-        consensus.register_validator(proposer.entity_id, stake_amount=100_000)
+        consensus.register_validator(proposer.entity_id, stake_amount=100_000_000)
         return chain, proposer, consensus, extras
 
     def test_set_authority_key_applied_through_block(self):

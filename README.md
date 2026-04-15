@@ -11,7 +11,12 @@ git clone https://github.com/ben-arnao/MessageChain.git
 cd MessageChain
 ```
 
-## Quickstart
+## Quickstart — send messages, transfer tokens
+
+You do **not** need to run a node. The CLI is a light client: every
+command talks over RPC to a seed validator. Running your own node
+is only necessary if you want to validate (see "Running a validator"
+below).
 
 **🔌 Disconnect from the internet before running the next two commands.**
 
@@ -27,15 +32,16 @@ Close the terminal window when done — that discards the scrollback showing you
 **🔌 Reconnect to the internet.** In a new terminal:
 
 ```bash
+python -m messagechain ping              # confirm a seed validator is reachable
 python -m messagechain account           # register your wallet on-chain (signs once, online)
-python -m messagechain start             # sync the full chain — leave running in this terminal
+python -m messagechain send "hello"      # post your first message
 ```
 
-`start` is a foreground process; open a second terminal for the commands below. `account` briefly loads your key in memory to sign — unavoidable, so only run it on a trusted machine.
+`account` briefly loads your key in memory to sign — unavoidable, so only run it on a trusted machine.
 
-Chain data lives at `~/.messagechain/chaindata/` by default (override with `--data-dir <path>`). Delete it to wipe local state and re-sync from peers.
-
-> **Before it'll work:** the shipped seed list is empty pending public launch. Pass `--seed <host>:<port>` with an announced seed, or `start` will idle with zero peers. New wallets also start at **0 balance** — there is no faucet, so `send` / `transfer` / `stake` need someone to fund you first.
+> **Before it'll work:** the shipped seed list is empty pending public launch. Until public seeds are announced, pass `--server <host>:<port>` on each command or edit `CLIENT_SEED_ENDPOINTS` in [`messagechain/config.py`](messagechain/config.py); otherwise `ping` / `send` / `balance` will tell you no node is reachable.
+>
+> New wallets also start at **0 balance** — there is no faucet, so `send` / `transfer` / `stake` need someone to fund you first. To earn tokens yourself, run a validator (below).
 
 ## Everyday commands
 
@@ -54,14 +60,27 @@ python -m messagechain proposals                             # status + tally
 python -m messagechain delegate --to <validator_id> --pct 100
 
 # Info
+python -m messagechain ping                                  # connectivity + resolved endpoint
 python -m messagechain info                                  # chain info
 ```
 
 To **receive funds**, share the `mc1…` address printed by `account` / `balance` — the checksummed form catches transcription typos. Raw 64-hex entity IDs still work.
 
-Signing commands prompt for your private key interactively. Override the target node with `--server host:port`.
+Signing commands prompt for your private key interactively. Override the target node with `--server host:port` — or let the CLI auto-pick a seed (see "Light-client routing" below).
+
+### Light-client routing
+
+With no `--server` flag, the CLI:
+
+1. Picks a live endpoint from `CLIENT_SEED_ENDPOINTS` (random order).
+2. Asks that seed for the current validator set and, once non-seed validators exist, routes to one weighted by `sqrt(stake)` so load spreads across the network.
+3. If nothing is reachable, `ping` / `send` / `balance` emit an actionable error (configure seeds, pass `--server`, or run a local validator) — not a raw socket exception.
+
+No local chain sync, no local `start` process, no disk growth on the client. This is how a non-validator user should operate.
 
 ## Running a validator
+
+Only relevant if you want to produce blocks and earn rewards. Regular users do not need this — see the Quickstart above.
 
 Earn block rewards by staking. Validator must keep `start --mine` running continuously.
 
@@ -71,6 +90,8 @@ python -m messagechain stake --amount 100                    # min stake: 100 to
 python -m messagechain unstake --amount 100                  # 7-day unbonding before withdrawable
 python -m messagechain validators                            # stake %, blocks mined per validator
 ```
+
+Chain data lives at `~/.messagechain/chaindata/` by default (override with `--data-dir <path>`). Delete it to wipe local state and re-sync from peers.
 
 Use a dedicated, patched machine you physically control — not a daily-driver laptop.
 

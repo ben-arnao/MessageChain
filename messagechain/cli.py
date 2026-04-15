@@ -319,6 +319,18 @@ def build_parser() -> argparse.ArgumentParser:
     fee_mode.add_argument("--transfer", action="store_true", help="Price a funds transfer")
     estimate_fee.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- ping ---
+    ping = sub.add_parser(
+        "ping",
+        help="Check connectivity to a MessageChain node (first-run sanity check)",
+        description=(
+            "Resolve the RPC endpoint (seed auto-discovery or --server "
+            "override) and print chain height, validator count, and the "
+            "host:port we actually landed on.  No private key required."
+        ),
+    )
+    ping.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     return parser
 
 
@@ -461,6 +473,60 @@ def _auto_pick_endpoint():
         # Any discovery failure -> fall back to the reachable seed.  A
         # broken discovery path must never brick the CLI.
         return reachable_seed
+
+
+def _rpc_call_or_friendly_exit(
+    host: str,
+    port: int,
+    method: str,
+    params: dict,
+    *,
+    server_was_explicit: bool,
+):
+    """Call `client.rpc_call` and convert connection failures to a clean exit.
+
+    Without this wrapper, a user with an empty / stale CLIENT_SEED_ENDPOINTS
+    config (or a typo in --server) sees a raw socket stack trace when they
+    run any CLI command.  That is actively misleading: it suggests the
+    problem is on their machine when the actual cause is usually "no
+    node reachable."
+
+    The recovery advice differs by how we got here:
+      - explicit --server: the user picked the address; just tell them it
+        is unreachable.  Do not lecture them about CLIENT_SEED_ENDPOINTS
+        — they already bypassed it on purpose.
+      - auto-discovery: list all three recovery paths so a newcomer with
+        a default config can figure out what to do.
+    """
+    import socket as _socket
+
+    try:
+        from client import rpc_call
+        return rpc_call(host, port, method, params)
+    except (ConnectionRefusedError, ConnectionError, _socket.timeout,
+            _socket.gaierror, OSError) as exc:
+        target = f"{host}:{port}"
+        if server_was_explicit:
+            print(
+                f"Error: cannot reach the node you specified ({target}).\n"
+                f"  Reason: {exc}\n"
+                f"  Check the address and that the node's RPC port is open.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"Error: no MessageChain node reachable "
+                f"(tried {target} last).\n"
+                f"  Reason: {exc}\n"
+                f"\n"
+                f"  To fix this, do one of:\n"
+                f"    1. Pass --server <host>:<port> to point at a known node.\n"
+                f"    2. Configure CLIENT_SEED_ENDPOINTS in messagechain/config.py\n"
+                f"       with one or more seed validators.\n"
+                f"    3. Run a local validator node: messagechain start --mine",
+                file=sys.stderr,
+            )
+        sys.exit(1)
 
 
 def _recv_n(sock, n: int) -> bytes:
@@ -1725,6 +1791,41 @@ def cmd_estimate_fee(args):
     print(f"  Mempool suggestion: {result['mempool_fee']}")
 
 
+def cmd_ping(args):
+    """Light-client sanity check: resolve endpoint and report chain status.
+
+    Exists specifically for the first-run experience of a non-validator
+    user who just wants to confirm their `messagechain` install is wired
+    to a live network before they touch any key material.  Cheap, safe,
+    and read-only.
+    """
+    server_was_explicit = args.server is not None and args.server != ""
+    host, port = _parse_server(args.server)
+
+    response = _rpc_call_or_friendly_exit(
+        host, port, "get_chain_info", {},
+        server_was_explicit=server_was_explicit,
+    )
+
+    if not response.get("ok"):
+        print(f"Error: node at {host}:{port} rejected request: "
+              f"{response.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+    info = response["result"]
+    print(f"=== Connected to {host}:{port} ===\n")
+    # Surface the fields a first-run user actually cares about.  Keep
+    # the key names literal so scripts can grep for them.
+    interesting_keys = (
+        "height", "best_hash", "validator_count", "total_supply",
+        "block_number", "supply", "sync_status",
+    )
+    for key in interesting_keys:
+        if key in info:
+            label = key.replace("_", " ").title()
+            print(f"  {label}: {info[key]}")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -1758,6 +1859,7 @@ def main():
         "proposals": cmd_proposals,
         "validators": cmd_validators,
         "estimate-fee": cmd_estimate_fee,
+        "ping": cmd_ping,
     }
 
     handler = commands.get(args.command)
