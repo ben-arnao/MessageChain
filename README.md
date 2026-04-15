@@ -1,6 +1,6 @@
 # MessageChain
 
-A blockchain for sending messages. Quantum-resistant signatures, proof-of-stake consensus, fee-based spam prevention. Designed to last centuries.
+A blockchain for sending messages. Quantum-resistant, proof-of-stake, built to last centuries.
 
 ## Install
 
@@ -10,71 +10,58 @@ cd MessageChain
 pip install -r requirements.txt
 ```
 
-## Commands
+## Quickstart
 
-All commands target a local node at `127.0.0.1:9334`; override with `--server host:port`. Signing commands prompt for your private key interactively; it lives in memory only long enough to sign.
-
-| You want to... | Command |
-|---|---|
-| Generate a private key (offline) | `python -m messagechain generate-key` |
-| Verify a written-down key (offline) | `python -m messagechain verify-key` |
-| Register your wallet on-chain | `python -m messagechain account` |
-| Connect to the network and sync the full chain | `python -m messagechain start` |
-| Run a validator (sync + mine blocks) | `python -m messagechain start --mine` |
-| Stake funds to earn block rewards | `python -m messagechain stake --amount 100` |
-| Post a message | `python -m messagechain send "hello"` |
-| Send funds | `python -m messagechain transfer --to <entity_id> --amount 100` |
-| Receive funds | Share your entity ID — no action on your end. |
-| Check your balance | `python -m messagechain balance` |
-| Read the last N messages | `python -m messagechain read --last 50` |
-| List validators (stake, share %, blocks mined) | `python -m messagechain validators` |
-| Estimate a fee before sending | `python -m messagechain estimate-fee --message "hi"` or `--transfer` |
-| Propose a governance vote | `python -m messagechain propose --title "..." --description "..."` |
-| Vote on a proposal | `python -m messagechain vote --proposal <id> --yes` (or `--no`) |
-| Check proposal status + tally | `python -m messagechain proposals` |
-| Delegate voting power (up to 3 validators) | `python -m messagechain delegate --to <validator_id> --pct 100` |
-| Show chain info | `python -m messagechain info` |
-
-## Key handling
-
-Your private key is generated **offline** and stored on paper. It only enters a networked machine briefly, in memory, when you sign.
-
-1. Disconnect from the internet. `generate-key` → write the key on paper, 2–3 copies in separate secure locations. Do not save it digitally.
-2. `verify-key` → re-enter by hand; confirm the derived public key and entity ID match.
-3. Clear terminal history, reconnect, `account`.
-
-Validators need the signing key loaded in a running process — use a dedicated, patched machine. For unattended starts:
+**🔌 Disconnect from the internet before running the next two commands.**
 
 ```bash
-echo "<checksummed_private_key>" > /etc/messagechain/validator.key
-chmod 0600 /etc/messagechain/validator.key
-python -m messagechain start --mine --keyfile /etc/messagechain/validator.key
+python -m messagechain generate-key      # prints private key — write it on paper, 2–3 copies
+python -m messagechain verify-key        # re-enter by hand; confirms the backup is correct
 ```
 
-Rotate before your WOTS+ leaf watermark nears tree capacity:
+Clear your terminal history.
+
+**🔌 Reconnect to the internet.**
 
 ```bash
-python -m messagechain key-status     # check leaf usage
-python -m messagechain rotate-key     # roll signing key (entity ID unchanged)
+python -m messagechain account           # register your wallet on-chain
+python -m messagechain start             # sync the full chain (leave running)
 ```
 
-For hot/cold separation, bind a cold key as your withdrawal authority — unstake and emergency-revoke then require the cold key:
+You're done. Commands below operate against your running node.
+
+## Cheat sheet
 
 ```bash
-python -m messagechain set-authority-key --authority-pubkey <hex>
+# Messaging & funds
+python -m messagechain send "hello"                          # post a message
+python -m messagechain transfer --to <id> --amount 100       # send funds
+python -m messagechain balance                               # check your balance
+python -m messagechain read --last 50                        # last 50 messages
+python -m messagechain estimate-fee --message "hi"           # fee preview (or --transfer)
+
+# Validating (stake + mine)
+python -m messagechain start --mine                          # run as validator
+python -m messagechain stake --amount 100                    # min stake: 100, 7-day unbond
+python -m messagechain validators                            # stake %, blocks mined
+python -m messagechain key-status                            # leaf usage — rotate before full
+python -m messagechain rotate-key                            # roll signing key (ID unchanged)
+
+# Governance
+python -m messagechain propose --title "..." --description "..."
+python -m messagechain vote --proposal <id> --yes            # or --no
+python -m messagechain proposals                             # status + tally
+python -m messagechain delegate --to <validator_id> --pct 100
+
+# Info
+python -m messagechain info                                  # chain info
 ```
 
-## Staking & governance
+To **receive funds**, share your entity ID.
 
-Minimum stake is 100 tokens; unstaking has a 7-day unbonding period.
+Signing commands prompt for your private key; it stays in memory only long enough to sign. Override the target node with `--server host:port`.
 
-Voting power: `staked + sqrt(unstaked_balance)`. Approval requires a 2/3 supermajority; stake and balance snapshot at proposal creation. Proposals cost 1000 tokens. If you don't delegate, your passive voting power auto-distributes across validators who vote, weighted by `sqrt(validator_stake)`.
-
-## Fees
-
-Fees auto-detect inside `send` and `transfer`; override with `--fee <amount>`. Messages pay a size-based curve, transfers pay a flat minimum. Use `estimate-fee` to preview.
-
-## Testing
+## Tests
 
 ```bash
 python -m unittest discover tests/
