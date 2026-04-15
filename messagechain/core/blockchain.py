@@ -1382,17 +1382,24 @@ class Blockchain:
                     (att.validator_id, sim_staked.get(att.validator_id, 0))
                 )
 
-        # Randomness for deterministic committee selection must be
-        # identical on sim and apply paths, so use the parent block's
-        # hash (known at both call sites: block.header.prev_hash at
-        # apply, self.chain[-1].block_hash at sim).
-        parent_hash = self.chain[-1].block_hash if self.chain else b"\x00" * 32
+        # Randomness for deterministic committee selection.  Uses the
+        # parent block's randao_mix rather than its full block_hash:
+        # randao_mix is an accumulator specifically designed for
+        # unpredictable randomness (hashed forward through every
+        # proposer's signature), so a single parent proposer can't
+        # grind their block contents to shape the next block's
+        # committee nearly as freely.  Available at both call sites
+        # (sim here, apply below) via the parent block in self.chain.
+        parent_randao = (
+            self.chain[-1].header.randao_mix
+            if self.chain else b"\x00" * 32
+        )
         committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
         attester_committee = select_attester_committee(
             candidates=attester_candidates,
             seed_entity_ids=self.seed_entity_ids,
             bootstrap_progress=self.bootstrap_progress,
-            randomness=parent_hash,
+            randomness=parent_randao,
             committee_size=committee_size,
         ) if attester_candidates else []
 
@@ -2706,14 +2713,24 @@ class Blockchain:
             block_reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         )
         committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
-        # Randomness must be identical on sim and apply paths.  Use the
-        # parent block's hash — available as block.header.prev_hash here
-        # and as self.chain[-1].block_hash during block proposal sim.
+        # Randomness for committee selection: use parent block's
+        # randao_mix rather than prev_hash.  Randao accumulates entropy
+        # through every proposer's signature over the chain's history,
+        # so a single parent proposer grinding their block contents
+        # cannot cheaply shape which attesters get paid next block.
+        # Must be identical on sim and apply paths — both derive it
+        # from the parent block (at apply time, the current block has
+        # not yet been appended to self.chain, so self.chain[-1] is
+        # the parent — same indexing as the sim path).
+        parent_randao = (
+            self.chain[-1].header.randao_mix
+            if self.chain else b"\x00" * 32
+        )
         attester_committee = select_attester_committee(
             candidates=attester_candidates,
             seed_entity_ids=self.seed_entity_ids,
             bootstrap_progress=self.bootstrap_progress,
-            randomness=block.header.prev_hash,
+            randomness=parent_randao,
             committee_size=committee_size,
         )
 
