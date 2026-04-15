@@ -156,6 +156,11 @@ class Server:
         # inv/getdata: track recently seen tx hashes
         self._seen_txs: OrderedDict = OrderedDict()
 
+    def _log_rpc_auth_status(self):
+        # Never log any portion of the token. Operators retrieve it via
+        # the configured RPC_AUTH_TOKEN env var or the keyfile, not logs.
+        logger.info("RPC auth enabled")
+
     def _track_seen_tx(self, tx_hash_hex: str):
         if tx_hash_hex in self._seen_txs:
             self._seen_txs.move_to_end(tx_hash_hex)

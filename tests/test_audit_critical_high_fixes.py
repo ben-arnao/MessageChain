@@ -155,7 +155,7 @@ class TestRpcAuthTokenNotLogged(unittest.TestCase):
         logged = []
         with mock.patch.object(server_mod.logger, "info",
                                side_effect=lambda m: logged.append(m)):
-            server_mod.MessageChainNode._log_rpc_auth_status(dummy)
+            server_mod.Server._log_rpc_auth_status(dummy)
 
         self.assertTrue(logged, "expected an auth-enabled log line")
         for msg in logged:

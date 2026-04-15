@@ -2236,6 +2236,14 @@ class Blockchain:
 
         Includes governance state (delegations, votes) so that chain
         reorganizations properly revert governance side-effects.
+
+        Fields that are DELIBERATELY NOT snapshotted (security-ratchet):
+        - leaf_watermarks: a WOTS+ leaf that was ever published on any
+          fork is permanently burned because its private material is
+          public knowledge. Rolling it back would re-enable reuse.
+        - revoked_entities: emergency revocation is an authority-key-signed
+          kill-switch. Once broadcast it represents a clear authorized
+          intent to disable the entity; we preserve it across reorgs.
         """
         snapshot = {
             "balances": dict(self.supply.balances),
@@ -2247,6 +2255,11 @@ class Blockchain:
             "attestation_sig_counts": dict(self.attestation_sig_counts),
             "slash_sig_counts": dict(self.slash_sig_counts),
             "key_rotation_counts": dict(self.key_rotation_counts),
+            # Cold authority keys are set via a SetAuthorityKey tx that
+            # lives inside a block. If that block is rolled back the
+            # authority binding must also revert, otherwise a reorged-out
+            # cold-key assignment would persist with no on-chain record.
+            "authority_keys": dict(self.authority_keys),
             "total_supply": self.supply.total_supply,
             "total_minted": self.supply.total_minted,
             "total_fees_collected": self.supply.total_fees_collected,
@@ -2292,6 +2305,8 @@ class Blockchain:
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
         self._processed_evidence = snapshot.get("processed_evidence", set())
+        if "authority_keys" in snapshot:
+            self.authority_keys = dict(snapshot["authority_keys"])
         if "pending_unstakes" in snapshot:
             self.supply.pending_unstakes = {
                 eid: list(entries)
@@ -2361,3 +2376,27 @@ class Blockchain:
             "best_tip_weight": best_tip[2] if best_tip else 0,
             **self.supply.get_supply_stats(self.height),
         }
+
+    def list_validators(self) -> list[dict]:
+        """Return the staked validator set, sorted by stake desc.
+
+        On-chain data only: entity ID, stake, blocks produced.
+        Network-layer details (IP, uptime) are intentionally excluded —
+        broadcasting those aids targeting and has no consensus purpose.
+        """
+        staked = {
+            eid: amount
+            for eid, amount in self.supply.staked.items()
+            if amount > 0
+        }
+        total_stake = sum(staked.values())
+        rows = []
+        for eid, amount in staked.items():
+            rows.append({
+                "entity_id": eid.hex(),
+                "staked": amount,
+                "stake_pct": (100.0 * amount / total_stake) if total_stake else 0.0,
+                "blocks_produced": self.proposer_sig_counts.get(eid, 0),
+            })
+        rows.sort(key=lambda r: r["staked"], reverse=True)
+        return rows

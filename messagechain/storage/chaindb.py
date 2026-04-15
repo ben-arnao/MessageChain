@@ -566,7 +566,14 @@ class ChainDB:
     # ── Batch Operations (for state snapshots / reorgs) ──────────
 
     def save_state_snapshot(self) -> dict:
-        """Capture full state for rollback during reorg."""
+        """Capture full state for rollback during reorg.
+
+        leaf_watermarks is captured for the record but must not be
+        reduced on restore — WOTS+ leaves, once published, are burned
+        permanently regardless of whether the containing block survives.
+        authority_keys IS rolled back: a SetAuthorityKey tx that ends up
+        on a discarded fork must have its effect reverted.
+        """
         return {
             "balances": self.get_all_balances(),
             "staked": self.get_all_staked(),
@@ -575,6 +582,7 @@ class ChainDB:
             "message_counts": self.get_all_message_counts(),
             "proposer_sig_counts": self.get_all_proposer_sig_counts(),
             "leaf_watermarks": self.get_all_leaf_watermarks(),
+            "authority_keys": self.get_all_authority_keys(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -595,6 +603,11 @@ class ChainDB:
             conn.execute("DELETE FROM public_keys")
             conn.execute("DELETE FROM message_counts")
             conn.execute("DELETE FROM proposer_sig_counts")
+            # Authority keys revert with the block that set them. Keys set
+            # on a fork that lost the reorg must not persist silently.
+            conn.execute("DELETE FROM authority_keys")
+            # NOTE: leaf_watermarks and revoked_entities are intentionally
+            # NOT wiped — they are security ratchets that never decrease.
 
             for eid, bal in snapshot["balances"].items():
                 conn.execute("INSERT INTO balances (entity_id, balance) VALUES (?, ?)", (eid, bal))
@@ -608,6 +621,11 @@ class ChainDB:
                 conn.execute("INSERT INTO message_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
             for eid, cnt in snapshot.get("proposer_sig_counts", {}).items():
                 conn.execute("INSERT INTO proposer_sig_counts (entity_id, count) VALUES (?, ?)", (eid, cnt))
+            for eid, ak in snapshot.get("authority_keys", {}).items():
+                conn.execute(
+                    "INSERT INTO authority_keys (entity_id, authority_public_key) VALUES (?, ?)",
+                    (eid, ak),
+                )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
