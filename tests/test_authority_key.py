@@ -128,6 +128,50 @@ class TestSetAuthorityKey(unittest.TestCase):
         )
         self.assertTrue(verify_set_authority_key_transaction(tx, hot.public_key))
 
+    def test_rejects_authority_key_equal_to_own_signing_key(self):
+        """A cold key identical to the hot key is a no-op that looks like
+        protection — reject it so users cannot accidentally ship a chain
+        state where authority_keys[eid] == public_keys[eid] and believe
+        they have defense-in-depth.
+
+        Cross-entity reuse is NOT rejected on purpose: operators running a
+        validator cluster legitimately share one cold wallet across all of
+        their seeds.  Only the self-reuse case is always a mistake.
+        """
+        chain = Blockchain()
+        hot = _entity(b"validator-hot")
+        self._register(chain, hot)
+        chain.supply.balances[hot.entity_id] = 1000
+
+        tx = create_set_authority_key_transaction(
+            hot, new_authority_key=hot.public_key, nonce=0, fee=500,
+        )
+        ok, reason = chain.validate_set_authority_key(tx)
+        self.assertFalse(ok)
+        self.assertIn("signing key", reason.lower())
+
+    def test_allows_shared_cold_wallet_across_operator_cluster(self):
+        """A single operator running multiple validators sets all of them
+        to the same cold-wallet public key.  This is the standard cluster
+        pattern (see test_bootstrap_rehearsal) and MUST remain allowed."""
+        chain = Blockchain()
+        seed1 = _entity(b"cluster-seed-1")
+        seed2 = _entity(b"cluster-seed-2")
+        self._register(chain, seed1)
+        self._register(chain, seed2)
+        chain.supply.balances[seed1.entity_id] = 1000
+        chain.supply.balances[seed2.entity_id] = 1000
+
+        shared_cold = _entity(b"cluster-cold").public_key
+
+        for seed in (seed1, seed2):
+            tx = create_set_authority_key_transaction(
+                seed, new_authority_key=shared_cold, nonce=0, fee=500,
+            )
+            ok, reason = chain.apply_set_authority_key(tx, proposer_id=seed.entity_id)
+            self.assertTrue(ok, reason)
+            self.assertEqual(chain.get_authority_key(seed.entity_id), shared_cold)
+
 
 class TestUnstakeRequiresAuthorityKey(unittest.TestCase):
     """Once a cold key is promoted, unstake signatures must come from the cold key."""

@@ -417,6 +417,20 @@ class Blockchain:
         if not verify_set_authority_key_transaction(tx, signing_pk):
             return False, "Invalid signature"
 
+        # Reject the cold == hot no-op.  Operators legitimately share a
+        # single cold wallet across multiple validators they control (the
+        # standard cluster pattern), so we do NOT reject cross-entity
+        # reuse — the signer is explicitly handing authority to whoever
+        # holds that key, which is their call.  But setting the authority
+        # key to your own signing key is always a mistake: it looks like
+        # defense-in-depth without providing any, and there is no honest
+        # use case for it.
+        if tx.new_authority_key == signing_pk:
+            return False, (
+                "new_authority_key equals the entity's own signing key — "
+                "defeats hot/cold separation"
+            )
+
         return True, "Valid"
 
     def apply_set_authority_key(
