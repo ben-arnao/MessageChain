@@ -50,13 +50,23 @@ class ProofOfStake:
 
     @property
     def is_bootstrap_mode(self) -> bool:
-        """Bootstrap mode: permissive proposer + attestation rules.
+        """PoS-local "not enough validators yet" heuristic.
 
         Stays active until at least MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
-        distinct validators are registered, so we never end up with a
-        1-validator post-bootstrap chain that has a single point of
-        failure for both liveness and finality. Once exited, the flag
-        is one-way: we never re-enter bootstrap even if validators leave.
+        distinct validators are registered — once exited, the flag is
+        one-way.
+
+        This is NOT the canonical bootstrap state.  The canonical signal
+        is `Blockchain.bootstrap_progress` (a monotonic [0, 1] gradient
+        that drives min-stake, attester-committee weighting, escrow
+        window, and seed-exclusion rules — see
+        messagechain/consensus/bootstrap_gradient.py).  This property
+        survives as a local PoS-layer signal used by
+        `validate_block_attestations`, which does not have a Blockchain
+        reference and needs a local answer to "is the validator set
+        large enough for a 2/3-of-stake threshold to count as finality?"
+        The historical name is kept so dynamic test overrides continue
+        to work without churn (see tests/__init__.py).
         """
         if self._bootstrap_ended:
             return False
@@ -68,8 +78,10 @@ class ProofOfStake:
         if stake_amount < graduated_min_stake(block_height):
             return False
         self.stakes[entity_id] = self.stakes.get(entity_id, 0) + stake_amount
-        # Bootstrap mode ends only once we have enough distinct validators
-        # for the network to survive a single failure.
+        # Local bootstrap-heuristic ends once we have enough distinct
+        # validators for the finality floor.  This only flips a PoS-
+        # internal flag; the canonical bootstrap signal
+        # (Blockchain.bootstrap_progress) is independent.
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         if len(self.stakes) >= MIN_VALIDATORS_TO_EXIT_BOOTSTRAP:
             self._bootstrap_ended = True

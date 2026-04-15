@@ -137,15 +137,17 @@ MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 # escrow_blocks_for_progress() — this is the max value at progress=0.
 ATTESTER_ESCROW_BLOCKS = 12_960
 
-# Minimum number of distinct validators needed to exit bootstrap mode.
-# Bootstrap mode is permissive (allows any node to propose, skips
-# attestation thresholds). The chain stays in bootstrap until at least
-# this many validators have registered, so we never end up with a
-# 1-validator post-bootstrap chain that has a single point of failure.
-# Set to 1 in tests via tests/__init__.py for backward compatibility.
-# Production: 3 matches the planned 3-seed launch.  A thinner set than
-# this risks a single-point-of-failure post-bootstrap chain; a larger
-# set means bootstrap doesn't end until more external validators join.
+# Minimum number of distinct validators required for finality.
+#
+# Historical name "MIN_VALIDATORS_TO_EXIT_BOOTSTRAP" reflects the old
+# binary bootstrap flag; the canonical bootstrap signal is now the
+# `bootstrap_progress` gradient (see
+# messagechain/consensus/bootstrap_gradient.py), and this constant
+# survives only as the finality floor — 2/3 of stake is not meaningful
+# finality if only one or two validators exist.  Tests override this
+# dynamically to 1 for single-validator chains; keeping the old name
+# avoids breaking that pattern.  Reader should treat this name as
+# "min validators for finality."
 MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 3
 
 # Slot-timing enforcement — if True, validate_block rejects blocks whose

@@ -1091,9 +1091,11 @@ class GovernanceTracker:
         # is the right call: a chain that can't maintain liveness is worse
         # than leaving a bad actor in place until more validators join.
         #
-        # When pos_consensus is None (block-pipeline path), derive bootstrap
-        # state from the supply directly: we consider bootstrap ended if the
-        # active validator count meets the exit threshold.
+        # The "bootstrap_ended" gate here is a finality-floor concern:
+        # it asks whether the chain has enough validators that the
+        # MIN_TOTAL_STAKE check is meaningful.  When pos_consensus is
+        # provided (normal path), trust its view; otherwise fall back
+        # to counting active validators against the finality minimum.
         if pos_consensus is not None:
             bootstrap_ended = not pos_consensus.is_bootstrap_mode
         else:

@@ -1652,10 +1652,13 @@ class Blockchain:
                 stakes_for_att = stakes
             validator_stake = stakes_for_att.get(att.validator_id, 0)
             total_stake = sum(stakes_for_att.values())
-            # Post-bootstrap safety floor: finalization additionally requires
-            # the active validator count to meet the same threshold used to
-            # exit bootstrap. Prevents a thinned-out post-bootstrap chain
-            # from finalizing blocks via a single validator.
+            # Finality safety floor: independent of bootstrap_progress,
+            # finalization always requires the active validator count
+            # to meet the minimum.  Prevents a thinned-out chain from
+            # finalizing via a single validator — 2/3 of tiny stake is
+            # not a meaningful commitment.  See config comment: the
+            # historical name reflects the old binary bootstrap flag;
+            # the canonical bootstrap signal is bootstrap_progress.
             justified = self.finality.add_attestation(
                 att, validator_stake, total_stake,
                 min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
