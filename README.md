@@ -117,6 +117,33 @@ python -m messagechain rotate-key
 python -m messagechain start    # relay-only: downloads and verifies the full chain
 ```
 
+## Founder runbook (launching a new chain)
+
+If you are the first operator of a fresh MessageChain, the repo ships a
+single-command bootstrap script.  Everyone else — including any later
+validators — joins via the normal `start --mine` flow and syncs from
+your node.
+
+```bash
+# 1. Generate a 32-byte key offline, save hex to a 0600 file
+python -c "import os; print(os.urandom(32).hex())" > /etc/messagechain/keyfile
+chmod 600 /etc/messagechain/keyfile
+
+# 2. Mint genesis + stake in one shot
+python deploy/launch_single_validator.py \
+    --data-dir /var/lib/messagechain \
+    --keyfile /etc/messagechain/keyfile
+# → prints your address, block-0 hash, balance, stake
+
+# 3. Paste the block-0 hash into messagechain/config.py PINNED_GENESIS_HASH
+#    and commit.  This stops any future cloner from minting a competing
+#    genesis on their own machine.
+
+# 4. Start the server (systemd unit provided at deploy/systemd/)
+sudo cp deploy/systemd/messagechain-validator.service /etc/systemd/system/
+sudo systemctl enable --now messagechain-validator
+```
+
 ## Tests
 
 ```bash
