@@ -240,6 +240,7 @@ class ProofOfStake:
         registration_transactions: list | None = None,
         finality_votes: list | None = None,
         timestamp: float | None = None,
+        mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -283,6 +284,15 @@ class ProofOfStake:
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
+        # Inclusion attestation: commit to mempool state at proposal time.
+        if mempool_tx_hashes:
+            from messagechain.consensus.inclusion_attestation import (
+                compute_mempool_snapshot_root,
+            )
+            snapshot_root = compute_mempool_snapshot_root(mempool_tx_hashes)
+        else:
+            snapshot_root = b"\x00" * 32
+
         header = BlockHeader(
             version=1,
             block_number=prev_block.header.block_number + 1,
@@ -291,6 +301,7 @@ class ProofOfStake:
             timestamp=time.time() if timestamp is None else timestamp,
             proposer_id=proposer_entity.entity_id,
             state_root=state_root,
+            mempool_snapshot_root=snapshot_root,
         )
 
         # Proposer signs the block header. randao_mix is excluded from

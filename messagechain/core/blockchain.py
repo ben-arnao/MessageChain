@@ -1976,6 +1976,7 @@ class Blockchain:
         unstake_transactions: list | None = None,
         registration_transactions: list | None = None,
         finality_votes: list | None = None,
+        mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -2029,6 +2030,7 @@ class Blockchain:
             registration_transactions=registration_transactions,
             finality_votes=finality_votes,
             timestamp=timestamp,
+            mempool_tx_hashes=mempool_tx_hashes,
         )
 
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
