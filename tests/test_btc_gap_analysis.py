@@ -476,8 +476,9 @@ class TestSPVProofs(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 100000
         consensus = ProofOfStake()
 
+        # Use 3 txs (per-entity cap) instead of 4
         txs = []
-        for i in range(4):
+        for i in range(3):
             tx = create_transaction(entities[0], f"msg {i}", fee=1500, nonce=i)
             txs.append(tx)
         chain.nonces[entities[0].entity_id] = 0

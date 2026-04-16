@@ -134,6 +134,7 @@ MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current t
 # Block parameters
 BLOCK_TIME_TARGET = 600  # seconds between blocks (10 min, same as BTC — speed is not a priority)
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
+MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
 MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
 COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)

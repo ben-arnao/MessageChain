@@ -51,6 +51,7 @@ from typing import Callable, Optional
 from messagechain.config import (
     MAX_BLOCK_MESSAGE_BYTES,
     MAX_TXS_PER_BLOCK,
+    MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
 
 
@@ -103,6 +104,12 @@ def check_forced_inclusion(
     remaining_bytes = MAX_BLOCK_MESSAGE_BYTES - used_bytes
     remaining_count = MAX_TXS_PER_BLOCK - used_count
 
+    # Per-entity counts — a forced tx is excused if its entity already
+    # has MAX_TXS_PER_ENTITY_PER_BLOCK txs in this block.
+    entity_counts: dict[bytes, int] = {}
+    for tx in block.transactions:
+        entity_counts[tx.entity_id] = entity_counts.get(tx.entity_id, 0) + 1
+
     for ftx in forced:
         if ftx.tx_hash in included_hashes:
             continue  # proposer did the right thing
@@ -117,7 +124,11 @@ def check_forced_inclusion(
         if remaining_count <= 0:
             continue
 
-        # Valid excuse #3: tx is no longer includable per caller-supplied
+        # Valid excuse #3: per-entity cap reached for this tx's sender.
+        if entity_counts.get(ftx.entity_id, 0) >= MAX_TXS_PER_ENTITY_PER_BLOCK:
+            continue
+
+        # Valid excuse #4: tx is no longer includable per caller-supplied
         # validity oracle (nonce mismatch, insufficient balance, etc.).
         if is_includable is not None and not is_includable(ftx):
             continue

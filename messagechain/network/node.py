@@ -1421,7 +1421,7 @@ class Node:
 
         # Build and broadcast block. Empty mempool is fine — empty blocks
         # serve as heartbeat and carry attestations for the parent.
-        txs = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
+        txs = self.mempool.get_transactions_with_entity_cap(MAX_TXS_PER_BLOCK)
         # Pull any pending slash transactions received via ANNOUNCE_SLASH
         # gossip. Including them is the path by which third-party witnesses
         # collect the finder's reward — without this, slash txs relayed by
