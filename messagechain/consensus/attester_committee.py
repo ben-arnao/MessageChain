@@ -35,11 +35,32 @@ from messagechain.config import HASH_ALGO
 # Each committee slot pays exactly this many tokens.  Must be integer.
 ATTESTER_REWARD_PER_SLOT: int = 1
 
-# Below this bootstrap_progress value, seeds are excluded from the
-# attester committee.  Picked at 0.5 (midpoint) so the gradient
-# transitions smoothly: first half = pure newcomer faucet, second
-# half = everyone competes.
-SEED_EXCLUSION_THRESHOLD: float = 0.5
+# Seed exclusion is a smooth ramp, not a binary cliff.  Seed weight
+# is multiplied by `seed_weight_multiplier(progress)` — 0.0 at
+# progress=0 (fully excluded), rising linearly to 1.0 at progress=0.5
+# (fully rejoined on equal terms), flat 1.0 past the crossover.
+#
+# Replaces the earlier binary exclusion at progress=0.5.  The cliff
+# was user-observable: at progress=0.4999 newcomers had the entire
+# pool; at progress=0.5001 seeds abruptly reclaimed their stake-
+# weighted share and newcomer earnings halved in one block.  The
+# smooth ramp removes that discontinuity without changing the
+# crossover point.
+SEED_EXCLUSION_CROSSOVER: float = 0.5
+
+
+def seed_weight_multiplier(bootstrap_progress: float) -> float:
+    """Multiplier applied to a seed's attester-committee weight.
+
+    Linear ramp from 0.0 at progress=0 (fully excluded) to 1.0 at
+    progress >= SEED_EXCLUSION_CROSSOVER=0.5 (fully rejoined).
+
+    Deterministic and pure — every node computes the same value for
+    the same progress, so the consensus path stays byte-identical.
+    """
+    if bootstrap_progress >= SEED_EXCLUSION_CROSSOVER:
+        return 1.0
+    return bootstrap_progress / SEED_EXCLUSION_CROSSOVER
 
 
 def weights_for_progress(
@@ -90,17 +111,25 @@ def _deterministic_weighted_sample(
     k: int,
     randomness: bytes,
 ) -> list[bytes]:
-    """Deterministic weighted sampling without replacement.
+    """Deterministic weighted sampling without replacement (A-Res).
 
-    Uses the efficient "A-Res"-style algorithm adapted for a seeded
-    PRNG: for each item, compute a priority key derived from the
-    (randomness, item) hash modulated by its weight.  Higher priority
-    wins.  With identical inputs, every node arrives at the same k
-    items in the same order, which is what consensus needs.
+    Efraimidis-Spirakis weighted reservoir sampling, made deterministic
+    by seeding the per-item "uniform" from (randomness || item) rather
+    than drawing live randomness.  Every node computes the same keys
+    for the same inputs, so the committee is consensus-safe.
 
-    Priority = hash(randomness || item) / 2^256, scaled by 1/weight
-    (smaller = higher priority, since smaller random values among
-    heavier items are likelier under the scaling).
+    Algorithm: key_i = u_i^(1/w_i), select TOP-k by key.  Larger
+    weights push keys closer to 1; lighter items cluster near 0.
+    Selecting the k largest keys yields weighted sampling without
+    replacement — heavy items win proportionally more often.
+
+    Works in log-space to avoid precision issues: log(key_i) =
+    log(u_i) / w_i.  Since log(u_i) < 0 and w_i > 0, log-keys are
+    all negative; heaviest items have log-keys closest to 0 (least
+    negative), so we take the top-k by descending order.
+
+    Zero-weight items get log-key = -inf — selected only when there
+    are fewer than k eligible items to fill.
     """
     if k >= len(items):
         # All items selected regardless of weight; still sort for
@@ -112,20 +141,18 @@ def _deterministic_weighted_sample(
         h = hashlib.new(HASH_ALGO, randomness + item).digest()
         # Convert hash to a float in (0, 1] — avoid 0 for log-domain safety.
         u = (int.from_bytes(h[:8], "big") + 1) / (2**64)
-        # Use exponent 1/w so heavier items produce smaller priorities
-        # on average (and are thus more likely to be in the top-k).
-        # Mathematically: priority = u ^ (1 / w).  Take log to avoid
-        # floating-point issues for extreme weights.
         if w <= 0:
-            # Zero-weight items are last-resort; push priority to +inf.
-            pri = float("inf")
+            # Zero-weight items go last.  log-key = -inf pushes them
+            # below every positive-weight item in descending order.
+            pri = float("-inf")
         else:
             import math
-            pri = math.log(u) / w  # higher w → closer to 0, wins more often
+            pri = math.log(u) / w  # heavier items → closer to 0 → larger
         priorities.append((pri, item))
 
-    # Lowest k priorities win.
-    priorities.sort(key=lambda p: (p[0], p[1]))
+    # Take top-k: sort descending by priority, tiebreak ascending by
+    # item bytes so ties resolve deterministically.
+    priorities.sort(key=lambda p: (-p[0], p[1]))
     return [item for _, item in priorities[:k]]
 
 
@@ -143,8 +170,10 @@ def select_attester_committee(
         candidates: list of (entity_id, stake) tuples — everyone whose
             attestation was included in the block.
         seed_entity_ids: the pinned genesis-seed set (see
-            Blockchain.seed_entity_ids).  These are excluded from the
-            committee when bootstrap_progress < SEED_EXCLUSION_THRESHOLD.
+            Blockchain.seed_entity_ids).  Their committee weight is
+            tilted by seed_weight_multiplier(progress): fully excluded
+            at progress=0, fully rejoined at progress>=0.5, smoothly
+            ramped in between.
         bootstrap_progress: value in [0, 1] from Blockchain.bootstrap_progress.
             Drives both the seed-exclusion rule and the blend between
             uniform and stake-weighted selection.
@@ -161,23 +190,32 @@ def select_attester_committee(
     if committee_size <= 0:
         return []
 
-    # Apply seed exclusion
-    if bootstrap_progress < SEED_EXCLUSION_THRESHOLD:
-        pool = [(eid, stake) for eid, stake in candidates
-                if eid not in seed_entity_ids]
-    else:
-        pool = list(candidates)
-
-    if not pool:
+    if not candidates:
         return []
 
-    items = [eid for eid, _ in pool]
-    stakes = [stake for _, stake in pool]
+    # Seed exclusion: tilt seed weights by seed_weight_multiplier(progress)
+    # rather than a binary drop.  At progress=0 the multiplier is 0 so
+    # seeds are effectively excluded; by progress>=0.5 it's 1.0 so
+    # seeds fully rejoin.  Smooth in between.
+    mult = seed_weight_multiplier(bootstrap_progress)
+    items: list[bytes] = []
+    stakes: list[int] = []
+    tilt: list[float] = []
+    for eid, stake in candidates:
+        items.append(eid)
+        stakes.append(stake)
+        tilt.append(mult if eid in seed_entity_ids else 1.0)
 
-    if len(items) <= committee_size:
-        return sorted(items)
+    # If the effective pool (after tilt) has fewer distinct candidates
+    # than committee_size, just return everyone with a positive tilt.
+    effective_pool_size = sum(1 for t in tilt if t > 0.0)
+    if effective_pool_size <= committee_size:
+        return sorted(
+            eid for eid, t in zip(items, tilt) if t > 0.0
+        )
 
-    weights = weights_for_progress(stakes, bootstrap_progress)
+    base_weights = weights_for_progress(stakes, bootstrap_progress)
+    weights = [w * t for w, t in zip(base_weights, tilt)]
     picked = _deterministic_weighted_sample(
         items, weights, committee_size, randomness,
     )

@@ -174,6 +174,17 @@ class Blockchain:
         from messagechain.economics.escrow import EscrowLedger
         self._escrow: EscrowLedger = EscrowLedger()
 
+        # Reputation: accepted-attestation counter per validator.  The
+        # reputation-weighted bootstrap lottery reads this to pick a
+        # winner once per LOTTERY_INTERVAL blocks.  Mutation sites:
+        #   * _process_attestations: +1 per attestation in an applied
+        #     block (every node sees the same chain, so every node
+        #     agrees on the count).
+        #   * apply_slash_transaction: reset offender to 0.
+        # Deterministic from chain replay — not persisted to db,
+        # rebuilt from history on load.
+        self.reputation: dict[bytes, int] = {}
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -1043,6 +1054,11 @@ class Blockchain:
         )
         self.slashed_validators.add(tx.evidence.offender_id)
         self._processed_evidence.add(tx.evidence.evidence_hash)
+        # Reputation reset: a slashed validator forfeits all accumulated
+        # reputation and re-enters the lottery pool (if at all) as a
+        # zero-reputation newcomer.  Prevents the "misbehave once, earn
+        # back your reputation from cached history" attack.
+        self.reputation.pop(tx.evidence.offender_id, None)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -1456,6 +1472,35 @@ class Blockchain:
             if treasury_excess > 0:
                 sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
+        # Simulate bootstrap lottery.  Must byte-mirror apply path —
+        # at block_height % LOTTERY_INTERVAL == 0 while bootstrap is
+        # live, one non-seed validator wins LOTTERY_BOUNTY tokens
+        # credited to balance.  Reputation snapshot used here is the
+        # pre-attestation-of-this-block state (matches apply: lottery
+        # runs before _process_attestations updates self.reputation
+        # with the current block's attestations).
+        from messagechain.config import (
+            LOTTERY_INTERVAL as _LI,
+            LOTTERY_BOUNTY as _LB,
+            REPUTATION_CAP as _RC,
+        )
+        if (
+            block_height > 0
+            and block_height % _LI == 0
+            and self.bootstrap_progress < 1.0
+        ):
+            from messagechain.consensus.reputation_lottery import (
+                select_lottery_winner,
+            )
+            _winner = select_lottery_winner(
+                candidates=list(self.reputation.items()),
+                seed_entity_ids=self.seed_entity_ids,
+                randomness=parent_randao,
+                reputation_cap=_RC,
+            )
+            if _winner is not None:
+                sim_balances[_winner] = sim_balances.get(_winner, 0) + _LB
+
         # Apply-path parity for signature-driven watermark bumps.  Order
         # matters: attestations run first because the same entity can be
         # both a proposer and an attestor — chronologically they sign the
@@ -1685,6 +1730,14 @@ class Blockchain:
         """
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         for att in block.attestations:
+            # Reputation: +1 per accepted attestation in an applied
+            # block.  Deterministic (same chain → same counts on every
+            # node).  Read by the bootstrap lottery to pick a winner
+            # every LOTTERY_INTERVAL blocks; drives "honest behavior =
+            # real-time influence" during bootstrap.
+            self.reputation[att.validator_id] = (
+                self.reputation.get(att.validator_id, 0) + 1
+            )
             target_block = att.block_number
             pinned = self._stake_snapshots.get(target_block)
             if pinned is not None:
@@ -2597,6 +2650,9 @@ class Blockchain:
                 self.supply.total_supply -= escrow_burned
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
+            # Reputation reset: same policy as apply_slash_transaction;
+            # a slashed validator forfeits accumulated reputation.
+            self.reputation.pop(stx.evidence.offender_id, None)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
@@ -2779,6 +2835,53 @@ class Blockchain:
                         entity_id=att_id, amount=att_reward,
                         earned_at=current_h, unlock_at=unlock_at,
                     )
+
+        # Reputation-weighted bootstrap lottery.  Fires every
+        # LOTTERY_INTERVAL blocks while bootstrap_progress < 1.0.
+        # Winner receives LOTTERY_BOUNTY credited to balance AND held
+        # in escrow for the current escrow window — slashable if the
+        # winner then misbehaves.  Seeds are excluded; reputation = 0
+        # candidates can still win if nobody else has attested yet.
+        from messagechain.config import (
+            LOTTERY_INTERVAL, LOTTERY_BOUNTY,
+            REPUTATION_CAP,
+        )
+        current_h = block.header.block_number
+        if (
+            current_h > 0
+            and current_h % LOTTERY_INTERVAL == 0
+            and self.bootstrap_progress < 1.0
+        ):
+            from messagechain.consensus.reputation_lottery import (
+                select_lottery_winner,
+            )
+            candidates = list(self.reputation.items())
+            winner = select_lottery_winner(
+                candidates=candidates,
+                seed_entity_ids=self.seed_entity_ids,
+                randomness=parent_randao,
+                reputation_cap=REPUTATION_CAP,
+            )
+            if winner is not None:
+                # Credit bounty into balance + escrow (same pattern as
+                # attester rewards).  Mint is tracked against total_supply
+                # so the inflation accounting stays honest.
+                self.supply.balances[winner] = (
+                    self.supply.balances.get(winner, 0) + LOTTERY_BOUNTY
+                )
+                self.supply.total_supply += LOTTERY_BOUNTY
+                if escrow_len > 0:
+                    self._escrow.add(
+                        entity_id=winner, amount=LOTTERY_BOUNTY,
+                        earned_at=current_h,
+                        unlock_at=current_h + escrow_len,
+                    )
+                logger.info(
+                    f"LOTTERY: block #{current_h} — winner "
+                    f"{winner.hex()[:16]} received {LOTTERY_BOUNTY} tokens "
+                    f"(reputation={self.reputation.get(winner, 0)}, "
+                    f"escrow_blocks={escrow_len})"
+                )
 
         # Unlock matured escrow — no balance change (tokens were already
         # credited at mint time), just lifting the spendable-balance

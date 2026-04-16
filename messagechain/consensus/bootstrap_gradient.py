@@ -82,43 +82,38 @@ def min_stake_for_progress(
     bootstrap_progress: float,
     *,
     full_min_stake: int,
-    inflection: float = 0.5,
 ) -> int:
     """Minimum stake required to register as a validator, by progress.
 
-    Formula:
-        0                                              if progress < inflection
-        full_min_stake * (progress - inflection) / (1 - inflection)  otherwise
+    Formula: `full_min_stake * bootstrap_progress` (pure linear).
 
-    With the default inflection = 0.5, the first half of bootstrap
-    allows truly zero-stake validator registration — honest newcomers
-    with no tokens can start earning via the attester committee and
-    accumulate stake organically.  The second half ramps linearly to
-    `full_min_stake` at progress = 1.0, at which point normal PoS
-    economics apply.
+    At progress = 0.0 the minimum is 0 — honest newcomers with no tokens
+    can register for free at genesis and start earning via the attester
+    committee.  As bootstrap matures, the barrier rises smoothly (no
+    knee, no cliff) toward `full_min_stake` at progress = 1.0, at which
+    point normal PoS economics apply.
+
+    The earlier design had a knee at progress=0.5 (zero below, linear
+    above).  The knee was removed for smoother ramping — a progressive
+    barrier that rises monotonically from block 0 gives a cleaner
+    signal ("the longer you wait, the more you must stake") than a
+    piecewise step function.  Zero-funds registration still works at
+    launch; it only gets progressively stricter over the window.
 
     `full_min_stake` is normally `config.VALIDATOR_MIN_STAKE`.  Passed
     as a kwarg so the formula is testable in isolation without
     importing the full config.
 
-    Returns an integer (token count), floor-rounded from the linear
-    ramp so a stake at exactly the threshold still passes.
+    Returns an integer (token count), floor-rounded.
     """
     if not (0.0 <= bootstrap_progress <= 1.0):
         raise ValueError(
             f"bootstrap_progress must be in [0, 1], got {bootstrap_progress}"
         )
-    if not (0.0 <= inflection < 1.0):
-        raise ValueError(
-            f"inflection must be in [0, 1), got {inflection}"
-        )
     if full_min_stake < 0:
         raise ValueError(f"full_min_stake must be >= 0, got {full_min_stake}")
 
-    if bootstrap_progress < inflection:
-        return 0
-    ramp = (bootstrap_progress - inflection) / (1.0 - inflection)
-    return int(full_min_stake * ramp)
+    return int(full_min_stake * bootstrap_progress)
 
 
 def escrow_blocks_for_progress(
