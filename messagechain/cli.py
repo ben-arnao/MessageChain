@@ -310,6 +310,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ping.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- gen-tor-config ---
+    gen_tor = sub.add_parser(
+        "gen-tor-config",
+        help="Print a torrc snippet fronting this validator's RPC with a hidden service",
+        description=(
+            "Generate a torrc fragment that exposes the validator's local "
+            "RPC endpoint via a Tor hidden service (.onion) address. "
+            "Paste the output into /etc/tor/torrc, restart the tor daemon, "
+            "and share the hostname from the HiddenServiceDir with clients "
+            "in censored networks. MessageChain does not run Tor itself."
+        ),
+    )
+    gen_tor.add_argument(
+        "--rpc-bind", type=str, default="127.0.0.1",
+        help="RPC bind address on this validator (default: 127.0.0.1). "
+             "Must be a loopback address — hidden services forwarding to "
+             "a public interface defeat the point.",
+    )
+    gen_tor.add_argument(
+        "--rpc-port", type=int, default=9334,
+        help="RPC port on this validator (default: 9334)",
+    )
+    gen_tor.add_argument(
+        "--hidden-service-dir", type=str,
+        default="/var/lib/tor/messagechain/",
+        help="Filesystem path where tor will store the hidden-service "
+             "private key and hostname file (default: /var/lib/tor/messagechain/)",
+    )
+    gen_tor.add_argument(
+        "--external-port", type=int, default=None,
+        help="Port advertised on the .onion address (default: same as --rpc-port)",
+    )
+
     return parser
 
 
@@ -1744,6 +1777,48 @@ def cmd_ping(args):
             print(f"  {label}: {info[key]}")
 
 
+def cmd_gen_tor_config(args):
+    """Print a torrc snippet fronting this validator's RPC with a hidden service.
+
+    Censorship-resistance helper: an operator whose users face IP-level
+    blocking can expose their RPC over a Tor hidden service.  We don't
+    run Tor — we just print the config fragment.  Operator pipes output
+    into their torrc, restarts tor, then shares the generated .onion
+    hostname with users.
+
+    Refuses to emit a snippet if --rpc-bind is not a loopback address:
+    fronting a public-bound RPC with a hidden service exposes the node
+    at both addresses and trivially correlates the .onion to the
+    operator's real IP.
+    """
+    from messagechain.network.tor_config import (
+        generate_torrc_snippet,
+        InvalidTorBindError,
+    )
+
+    try:
+        snippet = generate_torrc_snippet(
+            rpc_bind_addr=args.rpc_bind,
+            rpc_port=args.rpc_port,
+            hidden_service_dir=args.hidden_service_dir,
+            external_port=args.external_port,
+        )
+    except InvalidTorBindError as e:
+        print(f"Refusing to generate torrc: {e}", file=sys.stderr)
+        sys.exit(2)
+    except ValueError as e:
+        print(f"Invalid argument: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    print(snippet)
+    print("# Next steps:", file=sys.stderr)
+    print("#   1. Append the above to /etc/tor/torrc", file=sys.stderr)
+    print("#   2. sudo systemctl restart tor", file=sys.stderr)
+    print(f"#   3. Read the .onion hostname from {args.hidden_service_dir.rstrip('/')}/hostname",
+          file=sys.stderr)
+    print("#   4. Share the hostname with clients in censored networks", file=sys.stderr)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -1777,6 +1852,7 @@ def main():
         "validators": cmd_validators,
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
+        "gen-tor-config": cmd_gen_tor_config,
     }
 
     handler = commands.get(args.command)

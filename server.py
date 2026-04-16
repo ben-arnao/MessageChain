@@ -2099,11 +2099,44 @@ async def run(args):
 
     await server.start()
 
+    submission_server = None
+    if args.submission_port is not None:
+        from messagechain.network.submission_server import SubmissionServer
+
+        def _relay_tx(tx):
+            # Schedule gossip relay on the main event loop.  Called
+            # from the HTTP handler thread — use run_coroutine_threadsafe.
+            try:
+                server._track_seen_tx(tx.tx_hash.hex())
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(
+                    server._relay_tx_inv([tx.tx_hash.hex()]), loop,
+                )
+            except Exception:
+                logger.exception("submission relay failed")
+
+        submission_server = SubmissionServer(
+            blockchain=server.blockchain,
+            mempool=server.mempool,
+            cert_path=args.submission_cert,
+            key_path=args.submission_key,
+            port=args.submission_port,
+            bind=args.submission_bind,
+            relay_callback=_relay_tx,
+        )
+        submission_server.start()
+        logger.info(
+            "Public HTTPS submission endpoint active on %s:%d",
+            args.submission_bind, args.submission_port,
+        )
+
     try:
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
         print("\nShutting down...")
+        if submission_server is not None:
+            submission_server.stop()
         await server.stop()
 
 
@@ -2126,7 +2159,40 @@ def main():
     parser.add_argument("--wallet", type=str, help="Wallet ID hex (skip interactive prompt)")
     parser.add_argument("--data-dir", type=str, help="Directory for persistent chain data (enables SQLite storage)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    # --- Censorship-resistance HTTPS submission endpoint (opt-in) ---
+    # Off by default.  Set --submission-port (typ. 8443) AND supply
+    # --submission-cert + --submission-key to expose a public POST
+    # /v1/submit endpoint that accepts binary-serialized signed
+    # transactions over TLS.  See messagechain/network/submission_server.py.
+    parser.add_argument(
+        "--submission-port", type=int, default=None,
+        help="If set, start a public HTTPS transaction-submission server "
+             "on this port. Requires --submission-cert and --submission-key.",
+    )
+    parser.add_argument(
+        "--submission-cert", type=str, default=None,
+        help="Path to TLS certificate (PEM) for the submission server. "
+             "Required when --submission-port is set.",
+    )
+    parser.add_argument(
+        "--submission-key", type=str, default=None,
+        help="Path to TLS private key (PEM) for the submission server. "
+             "Required when --submission-port is set.",
+    )
+    parser.add_argument(
+        "--submission-bind", type=str, default="0.0.0.0",
+        help="Bind address for the submission server (default: 0.0.0.0 — "
+             "this endpoint is intentionally public).",
+    )
     args = parser.parse_args()
+
+    if args.submission_port is not None:
+        if not args.submission_cert or not args.submission_key:
+            parser.error(
+                "--submission-port requires --submission-cert and "
+                "--submission-key (TLS is mandatory for the submission "
+                "endpoint; plaintext HTTP is not supported).",
+            )
 
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")

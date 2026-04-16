@@ -373,3 +373,27 @@ RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
 P2P_TLS_ENABLED = True
 TLS_CERT_PATH: str | None = None  # auto-generated if None
 TLS_KEY_PATH: str | None = None   # auto-generated if None
+
+# Public HTTPS submission endpoint — censorship resistance ingress.
+#
+# When enabled (CLI --submission-port), the validator exposes a single
+# POST endpoint: `POST /v1/submit` with a binary-serialized
+# MessageTransaction body.  TLS is mandatory (plaintext HTTP not
+# supported); operator provides cert/key via --submission-cert /
+# --submission-key.  Clients reach the chain directly over the public
+# internet even if their local peers drop their txs.
+#
+# The endpoint is public by design — anyone on the internet can POST.
+# Rate limiting and a hard body-size cap are the two layers keeping
+# this from being a DoS cannon:
+#   * Per-source-IP token bucket: at 2 tx/sec steady and a 10-tx burst,
+#     a single attacker fills a block every ~10s but pays base fees for
+#     every accepted tx (fee economics turn sustained spam into
+#     validator revenue).
+#   * Body cap at 16KB: safely larger than any real tx (a WOTS+
+#     signature at MERKLE_TREE_HEIGHT=20 plus a 280-byte message fits
+#     under 8KB) yet small enough to prevent memory-exhaustion via
+#     chunked giant posts.
+SUBMISSION_RATE_LIMIT_PER_SEC = 2
+SUBMISSION_BURST = 10
+MAX_SUBMISSION_BODY_BYTES = 16384
