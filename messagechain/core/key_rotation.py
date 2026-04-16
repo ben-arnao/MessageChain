@@ -76,13 +76,20 @@ class KeyRotationTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 entity_id | 32 old_pk | 32 new_pk | u64 rotation_number |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT entity_ref | 32 old_pk | 32 new_pk | u64 rotation_number |
         f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+
+        old_public_key and new_public_key are raw pubkeys, not entity
+        references — they do not resolve through the state's
+        entity_id↔entity_index registry.  The rotation tx carries both
+        keys directly so a verifier can confirm the signature without
+        any additional state lookup.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.entity_id,
+            encode_entity_ref(self.entity_id, state=state),
             self.old_public_key,
             self.new_public_key,
             struct.pack(">Q", self.rotation_number),
@@ -94,11 +101,12 @@ class KeyRotationTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "KeyRotationTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "KeyRotationTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 32 + 8 + 8 + 8 + 4 + 32:
+        if len(data) < 1 + 32 + 32 + 8 + 8 + 8 + 4 + 32:
             raise ValueError("KeyRotation blob too short")
-        entity_id = bytes(data[off:off + 32]); off += 32
+        entity_id, n = decode_entity_ref(data, off, state=state); off += n
         old_pk = bytes(data[off:off + 32]); off += 32
         new_pk = bytes(data[off:off + 32]); off += 32
         rotation_number = struct.unpack_from(">Q", data, off)[0]; off += 8

@@ -73,13 +73,18 @@ class Attestation:
             "signature": self.signature.serialize(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 validator_id | 32 block_hash | u64 block_number |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT validator_ref | 32 block_hash | u64 block_number |
         u32 sig_len | sig.
+
+        block_hash is a block identifier (32 bytes) not an entity id, so
+        it stays full-width.  validator_id goes through the entity-ref
+        encoder, so attestations from a known validator shrink by ~29 B.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.validator_id,
+            encode_entity_ref(self.validator_id, state=state),
             self.block_hash,
             struct.pack(">Q", self.block_number),
             struct.pack(">I", len(sig_blob)),
@@ -87,11 +92,12 @@ class Attestation:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Attestation":
+    def from_bytes(cls, data: bytes, state=None) -> "Attestation":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 8 + 4:
+        if len(data) < 1 + 32 + 8 + 4:
             raise ValueError("Attestation blob too short")
-        validator_id = bytes(data[off:off + 32]); off += 32
+        validator_id, n = decode_entity_ref(data, off, state=state); off += n
         block_hash = bytes(data[off:off + 32]); off += 32
         block_number = struct.unpack_from(">Q", data, off)[0]; off += 8
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4

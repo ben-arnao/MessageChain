@@ -136,8 +136,8 @@ class ProposalTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 proposer_id | u16 title_len | title utf8 | u32 desc_len |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT proposer_ref | u16 title_len | title utf8 | u32 desc_len |
         desc utf8 | u8 ref_len | ref_hash | f64 timestamp | u64 fee |
         u32 sig_len | sig | 32 tx_hash.
 
@@ -145,11 +145,12 @@ class ProposalTransaction:
         description uses u32 (bounded by MAX_PROPOSAL_DESCRIPTION_LENGTH = 10k).
         reference_hash is 0 or 32 bytes — u8 length lets us distinguish.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         title_b = self.title.encode("utf-8")
         desc_b = self.description.encode("utf-8")
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.proposer_id,
+            encode_entity_ref(self.proposer_id, state=state),
             struct.pack(">H", len(title_b)),
             title_b,
             struct.pack(">I", len(desc_b)),
@@ -164,11 +165,12 @@ class ProposalTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "ProposalTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "ProposalTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 2:
+        if len(data) < 1 + 2:
             raise ValueError("Proposal blob too short")
-        proposer_id = bytes(data[off:off + 32]); off += 32
+        proposer_id, n = decode_entity_ref(data, off, state=state); off += n
         title_len = struct.unpack_from(">H", data, off)[0]; off += 2
         if off + title_len + 4 > len(data):
             raise ValueError("Proposal truncated at title")
@@ -275,13 +277,18 @@ class VoteTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 voter_id | 32 proposal_id | u8 approve | f64 timestamp |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT voter_ref | 32 proposal_id | u8 approve | f64 timestamp |
         u64 fee | u32 sig_len | sig | 32 tx_hash.
+
+        proposal_id is the target ProposalTransaction's tx_hash (always
+        32 bytes), not an entity reference — it doesn't resolve through
+        the entity-index registry.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.voter_id,
+            encode_entity_ref(self.voter_id, state=state),
             self.proposal_id,
             struct.pack(">B", 1 if self.approve else 0),
             struct.pack(">d", float(self.timestamp)),
@@ -292,11 +299,12 @@ class VoteTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "VoteTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "VoteTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 1 + 8 + 8 + 4 + 32:
+        if len(data) < 1 + 32 + 1 + 8 + 8 + 4 + 32:
             raise ValueError("Vote blob too short")
-        voter_id = bytes(data[off:off + 32]); off += 32
+        voter_id, n = decode_entity_ref(data, off, state=state); off += n
         proposal_id = bytes(data[off:off + 32]); off += 32
         approve = struct.unpack_from(">B", data, off)[0] != 0; off += 1
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
@@ -401,17 +409,18 @@ class TreasurySpendTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 proposer_id | 32 recipient_id | u64 amount |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT proposer_ref | ENT recipient_ref | u64 amount |
         u16 title_len | title | u32 desc_len | desc | f64 timestamp |
         u64 fee | u32 sig_len | sig | 32 tx_hash.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         title_b = self.title.encode("utf-8")
         desc_b = self.description.encode("utf-8")
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.proposer_id,
-            self.recipient_id,
+            encode_entity_ref(self.proposer_id, state=state),
+            encode_entity_ref(self.recipient_id, state=state),
             struct.pack(">Q", self.amount),
             struct.pack(">H", len(title_b)),
             title_b,
@@ -425,12 +434,13 @@ class TreasurySpendTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "TreasurySpendTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "TreasurySpendTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 8 + 2:
+        if len(data) < 1 + 1 + 8 + 2:
             raise ValueError("TreasurySpend blob too short")
-        proposer_id = bytes(data[off:off + 32]); off += 32
-        recipient_id = bytes(data[off:off + 32]); off += 32
+        proposer_id, n = decode_entity_ref(data, off, state=state); off += n
+        recipient_id, n = decode_entity_ref(data, off, state=state); off += n
         amount = struct.unpack_from(">Q", data, off)[0]; off += 8
         title_len = struct.unpack_from(">H", data, off)[0]; off += 2
         if off + title_len + 4 > len(data):

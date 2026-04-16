@@ -134,6 +134,19 @@ class ChainDB:
                 header_data BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_headers_number ON block_headers(block_number);
+
+            -- Entity-index registry (bloat reduction).  Bidirectional
+            -- map entity_id <-> entity_index, assigned monotonically on
+            -- registration.  Persistence lets a restart rehydrate the
+            -- map without replaying every RegistrationTransaction from
+            -- genesis.  entity_index is UNIQUE so duplicate assignment
+            -- is impossible at the storage layer.
+            CREATE TABLE IF NOT EXISTS entity_indices (
+                entity_id BLOB PRIMARY KEY,
+                entity_index INTEGER NOT NULL UNIQUE
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_indices_index
+                ON entity_indices(entity_index);
         """)
         conn.commit()
 
@@ -394,6 +407,43 @@ class ChainDB:
     def get_all_public_keys(self) -> dict[bytes, bytes]:
         cur = self._conn.execute("SELECT entity_id, public_key FROM public_keys")
         return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
+
+    # ── State: Entity Index Registry (bloat reduction) ──────────
+
+    def set_entity_index(self, entity_id: bytes, entity_index: int):
+        """Persist a (entity_id, entity_index) pair.
+
+        Idempotent: INSERT OR IGNORE preserves the first assignment.
+        Indices are immutable once assigned — a second call with the
+        same entity_id must not rewrite the stored index.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO entity_indices (entity_id, entity_index) "
+            "VALUES (?, ?)",
+            (entity_id, entity_index),
+        )
+
+    def get_entity_index(self, entity_id: bytes) -> int | None:
+        cur = self._conn.execute(
+            "SELECT entity_index FROM entity_indices WHERE entity_id = ?",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def get_entity_id_by_index(self, entity_index: int) -> bytes | None:
+        cur = self._conn.execute(
+            "SELECT entity_id FROM entity_indices WHERE entity_index = ?",
+            (entity_index,),
+        )
+        row = cur.fetchone()
+        return bytes(row[0]) if row else None
+
+    def get_all_entity_indices(self) -> dict[bytes, int]:
+        cur = self._conn.execute(
+            "SELECT entity_id, entity_index FROM entity_indices"
+        )
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
     # ── State: Message Counts ────────────────────────────────────
 

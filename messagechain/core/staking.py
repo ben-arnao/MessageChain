@@ -32,18 +32,22 @@ def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
 
-def _decode_stake_like(cls, data: bytes, label: str):
+def _decode_stake_like(cls, data: bytes, label: str, state=None):
     """Shared binary decoder for StakeTransaction / UnstakeTransaction.
 
-    Both types have identical envelopes (entity_id | amount | nonce |
+    Both types have identical envelopes (entity_ref | amount | nonce |
     timestamp | fee | sig | tx_hash); only the _signable_data domain
     tag differs.  Sharing the decoder means an envelope change has
     exactly one implementation to touch.
+
+    `state` enables resolving varint-indexed entity references.
+    Without state, only legacy 32-byte-id blobs decode.
     """
+    from messagechain.core.entity_ref import decode_entity_ref
     off = 0
-    if len(data) < 32 + 8 + 8 + 8 + 8 + 4 + 32:
+    if len(data) < 1 + 8 + 8 + 8 + 8 + 4 + 32:
         raise ValueError(f"{label} blob too short")
-    entity_id = bytes(data[off:off + 32]); off += 32
+    entity_id, n = decode_entity_ref(data, off, state=state); off += n
     amount = struct.unpack_from(">Q", data, off)[0]; off += 8
     nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
     timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
@@ -66,6 +70,27 @@ def _decode_stake_like(cls, data: bytes, label: str):
             f"computed {expected.hex()[:16]}"
         )
     return tx
+
+
+def _encode_stake_like(tx, state=None) -> bytes:
+    """Shared binary encoder for StakeTransaction / UnstakeTransaction.
+
+    Factored so envelope changes (e.g., swapping 32-byte entity_id
+    for a varint entity_index) have a single implementation site.
+    """
+    import struct as _s
+    from messagechain.core.entity_ref import encode_entity_ref
+    sig_blob = tx.signature.to_bytes()
+    return b"".join([
+        encode_entity_ref(tx.entity_id, state=state),
+        _s.pack(">Q", tx.amount),
+        _s.pack(">Q", tx.nonce),
+        _s.pack(">d", float(tx.timestamp)),
+        _s.pack(">Q", tx.fee),
+        _s.pack(">I", len(sig_blob)),
+        sig_blob,
+        tx.tx_hash,
+    ])
 
 
 @dataclass
@@ -113,25 +138,20 @@ class StakeTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Compact binary: 32 entity_id | u64 amount | u64 nonce |
+    def to_bytes(self, state=None) -> bytes:
+        """Compact binary: ENT entity_ref | u64 amount | u64 nonce |
         f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+
+        With `state`, the entity reference is a 1-byte tag + varint
+        index (~3 B total), saving ~29 B vs the legacy 32-byte id.
         """
-        sig_blob = self.signature.to_bytes()
-        return b"".join([
-            self.entity_id,
-            struct.pack(">Q", self.amount),
-            struct.pack(">Q", self.nonce),
-            struct.pack(">d", float(self.timestamp)),
-            struct.pack(">Q", self.fee),
-            struct.pack(">I", len(sig_blob)),
-            sig_blob,
-            self.tx_hash,
-        ])
+        return _encode_stake_like(self, state=state)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "StakeTransaction":
-        return _decode_stake_like(cls, data, label="StakeTransaction")
+    def from_bytes(cls, data: bytes, state=None) -> "StakeTransaction":
+        return _decode_stake_like(
+            cls, data, label="StakeTransaction", state=state,
+        )
 
     @classmethod
     def deserialize(cls, data: dict) -> "StakeTransaction":
@@ -200,28 +220,20 @@ class UnstakeTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
+    def to_bytes(self, state=None) -> bytes:
         """Same layout as StakeTransaction — the distinguishing "stake" vs
         "unstake" discriminator lives in _signable_data (domain-separated
         hashing), not in the binary envelope.  Callers know which class
         to deserialize into from context (which block-level list it came
         out of).
         """
-        sig_blob = self.signature.to_bytes()
-        return b"".join([
-            self.entity_id,
-            struct.pack(">Q", self.amount),
-            struct.pack(">Q", self.nonce),
-            struct.pack(">d", float(self.timestamp)),
-            struct.pack(">Q", self.fee),
-            struct.pack(">I", len(sig_blob)),
-            sig_blob,
-            self.tx_hash,
-        ])
+        return _encode_stake_like(self, state=state)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "UnstakeTransaction":
-        return _decode_stake_like(cls, data, label="UnstakeTransaction")
+    def from_bytes(cls, data: bytes, state=None) -> "UnstakeTransaction":
+        return _decode_stake_like(
+            cls, data, label="UnstakeTransaction", state=state,
+        )
 
     @classmethod
     def deserialize(cls, data: dict) -> "UnstakeTransaction":

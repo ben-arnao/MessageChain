@@ -73,12 +73,12 @@ class TransferTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
+    def to_bytes(self, state=None) -> bytes:
         """Compact binary encoding for storage/wire.
 
         Layout (big-endian):
-            32   entity_id
-            32   recipient_id
+            ENT  sender entity reference
+            ENT  recipient entity reference
             u64  amount
             u64  nonce
             f64  timestamp
@@ -86,11 +86,17 @@ class TransferTransaction:
             u32  signature_blob_len
             M    signature_blob
             32   tx_hash
+
+        With `state` provided, both sender and recipient are encoded
+        as varint indices — a transfer tx saves ~58 B vs the legacy
+        two-32-byte-id form.  _signable_data still commits to the
+        full 32-byte ids so tx_hash is independent of the encoding.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.entity_id,
-            self.recipient_id,
+            encode_entity_ref(self.entity_id, state=state),
+            encode_entity_ref(self.recipient_id, state=state),
             struct.pack(">Q", self.amount),
             struct.pack(">Q", self.nonce),
             struct.pack(">d", float(self.timestamp)),
@@ -101,12 +107,13 @@ class TransferTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "TransferTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "TransferTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 8 + 8 + 8 + 8 + 4 + 32:
+        if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 32:
             raise ValueError("TransferTransaction blob too short")
-        entity_id = bytes(data[off:off + 32]); off += 32
-        recipient_id = bytes(data[off:off + 32]); off += 32
+        entity_id, n = decode_entity_ref(data, off, state=state); off += n
+        recipient_id, n = decode_entity_ref(data, off, state=state); off += n
         amount = struct.unpack_from(">Q", data, off)[0]; off += 8
         nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8

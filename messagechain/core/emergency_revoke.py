@@ -93,13 +93,14 @@ class RevokeTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 entity_id | f64 timestamp | u64 fee | u32 sig_len |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT entity_ref | f64 timestamp | u64 fee | u32 sig_len |
         sig | 32 tx_hash.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.entity_id,
+            encode_entity_ref(self.entity_id, state=state),
             struct.pack(">d", float(self.timestamp)),
             struct.pack(">Q", self.fee),
             struct.pack(">I", len(sig_blob)),
@@ -108,11 +109,12 @@ class RevokeTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "RevokeTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "RevokeTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 8 + 8 + 4 + 32:
+        if len(data) < 1 + 8 + 8 + 4 + 32:
             raise ValueError("RevokeTransaction blob too short")
-        entity_id = bytes(data[off:off + 32]); off += 32
+        entity_id, n = decode_entity_ref(data, off, state=state); off += n
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
         fee = struct.unpack_from(">Q", data, off)[0]; off += 8
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
