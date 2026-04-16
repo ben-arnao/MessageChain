@@ -86,6 +86,14 @@ class MessageType(Enum):
     MEMPOOL_DIGEST = "mempool_digest"
     REQUEST_MEMPOOL_TX = "request_mempool_tx"
 
+    # Witness separation — archive nodes serve witness data for finalized
+    # blocks that full nodes have stripped.  Full nodes request witnesses
+    # on demand when they need to audit old signatures.
+    #   REQUEST_WITNESS:  {"block_hash": <hex>}
+    #   RESPONSE_WITNESS: {"block_hash": <hex>, "witness_data": <hex>}
+    REQUEST_WITNESS = "request_witness"
+    RESPONSE_WITNESS = "response_witness"
+
 
 @dataclass
 class NetworkMessage:

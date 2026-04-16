@@ -112,6 +112,12 @@ class Signature:
         pre-migration blob as a post-migration signature would let an
         attacker forge a sig_version of their choosing via truncation.)
         """
+        # Placeholder / witness-stripped sentinel: empty signature encodes
+        # as zero bytes.  from_bytes(b"") decodes back to the placeholder.
+        # This enables stripped transactions to round-trip through binary
+        # serialization without carrying witness data.
+        if not self.wots_signature and not self.wots_public_key:
+            return b""
         parts = [struct.pack(">H", len(self.wots_signature))]
         parts.extend(self.wots_signature)
         parts.append(struct.pack(">I", self.leaf_index))

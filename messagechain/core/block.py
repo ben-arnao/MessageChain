@@ -142,6 +142,7 @@ class BlockHeader:
     timestamp: float
     proposer_id: bytes
     state_root: bytes = b"\x00" * 32  # Merkle root of account state
+    witness_root: bytes = b"\x00" * 32  # Merkle root over tx witness data (sigs + auth paths)
     randao_mix: bytes = b"\x00" * 32  # accumulated RANDAO entropy (post-sign derived)
     proposer_signature: Signature | None = None
     # Crypto-agility: identifies the hash algorithm used for this block's
@@ -167,6 +168,7 @@ class BlockHeader:
             + self.prev_hash
             + self.merkle_root
             + self.state_root
+            + self.witness_root
             + struct.pack(">Q", int(self.timestamp))
             + self.proposer_id
         )
@@ -179,6 +181,7 @@ class BlockHeader:
             "prev_hash": self.prev_hash.hex(),
             "merkle_root": self.merkle_root.hex(),
             "state_root": self.state_root.hex(),
+            "witness_root": self.witness_root.hex(),
             "timestamp": self.timestamp,
             "proposer_id": self.proposer_id.hex(),
             "randao_mix": self.randao_mix.hex(),
@@ -195,6 +198,7 @@ class BlockHeader:
             32   prev_hash
             32   merkle_root
             32   state_root
+            32   witness_root        <- Merkle root over tx witness data
             f64  timestamp
             32   proposer_id
             32   randao_mix
@@ -217,6 +221,7 @@ class BlockHeader:
             self.prev_hash,
             self.merkle_root,
             self.state_root,
+            self.witness_root,
             struct.pack(">d", float(self.timestamp)),
             self.proposer_id,
             self.randao_mix,
@@ -228,7 +233,8 @@ class BlockHeader:
     def from_bytes(cls, data: bytes) -> "BlockHeader":
         off = 0
         # +1 byte for the u8 hash_version field (crypto agility).
-        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 8 + 32 + 32 + 4
+        # +32 bytes for the witness_root field.
+        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 4
         if len(data) < expected_min:
             raise ValueError("BlockHeader blob too short")
         version = struct.unpack_from(">I", data, off)[0]; off += 4
@@ -244,6 +250,7 @@ class BlockHeader:
         prev_hash = bytes(data[off:off + 32]); off += 32
         merkle_root = bytes(data[off:off + 32]); off += 32
         state_root = bytes(data[off:off + 32]); off += 32
+        witness_root = bytes(data[off:off + 32]); off += 32
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
         proposer_id = bytes(data[off:off + 32]); off += 32
         randao_mix = bytes(data[off:off + 32]); off += 32
@@ -260,7 +267,8 @@ class BlockHeader:
         return cls(
             version=version, block_number=block_number,
             prev_hash=prev_hash, merkle_root=merkle_root,
-            state_root=state_root, timestamp=timestamp,
+            state_root=state_root, witness_root=witness_root,
+            timestamp=timestamp,
             proposer_id=proposer_id, randao_mix=randao_mix,
             proposer_signature=proposer_signature,
             hash_version=hash_version,
@@ -280,6 +288,7 @@ class BlockHeader:
             timestamp=data["timestamp"],
             proposer_id=bytes.fromhex(data["proposer_id"]),
             state_root=bytes.fromhex(data["state_root"]) if data.get("state_root") else b"\x00" * 32,
+            witness_root=bytes.fromhex(data["witness_root"]) if data.get("witness_root") else b"\x00" * 32,
             randao_mix=bytes.fromhex(data["randao_mix"]) if data.get("randao_mix") else b"\x00" * 32,
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
             hash_version=data.get("hash_version", HASH_VERSION_CURRENT),

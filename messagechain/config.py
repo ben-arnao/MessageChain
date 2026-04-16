@@ -505,6 +505,14 @@ ANCHOR_INTERVAL = 100                    # blocks between anchors (~16h)
 ANCHOR_DOMAIN_TAG = b"MCANCHOR_V1"       # domain separation
 ANCHOR_OP_RETURN_PREFIX = b"MC"          # 2-byte prefix in OP_RETURN for identification
 
+# Witness separation — split block storage into state-transition data
+# and witness data (WOTS signatures + Merkle auth paths).  After
+# finalization, ~97% of a block's bytes are witness data that serves
+# only auditability, not consensus safety.  Nothing is ever deleted —
+# witness data moves to a separate storage tier.
+WITNESS_SEPARATION_ENABLED = True       # feature gate
+WITNESS_RETENTION_BLOCKS = 200          # keep witnesses in main storage for this many blocks beyond finality
+
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 # Supermajority (2/3) required to approve a BINDING proposal (treasury

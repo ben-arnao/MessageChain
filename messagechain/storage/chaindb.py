@@ -188,6 +188,17 @@ class ChainDB:
                 signatures_blob BLOB NOT NULL
             );
 
+            -- Witness separation — stores witness data (WOTS signatures +
+            -- Merkle auth paths) separately from block bodies for finalized
+            -- blocks.  Full nodes strip witnesses from finalized blocks to
+            -- save ~97% of block storage; witness-archive nodes keep this
+            -- table populated.  Nothing is ever deleted — the data just
+            -- moves to a separate tier.
+            CREATE TABLE IF NOT EXISTS block_witnesses (
+                block_hash BLOB PRIMARY KEY,
+                witness_data BLOB NOT NULL
+            );
+
             -- Bitcoin anchoring — external immutability proof via OP_RETURN.
             -- Stores (mc_block_number, mc_block_hash, anchor_hash, btc_txid,
             -- btc_block_height, timestamp).  btc_txid and btc_block_height
@@ -250,12 +261,25 @@ class ChainDB:
         )
         self._conn.commit()
 
-    def get_block_by_hash(self, block_hash: bytes, state=None) -> Block | None:
+    def get_block_by_hash(self, block_hash: bytes, state=None, include_witnesses=False) -> Block | None:
+        """Get a block by hash.
+
+        When `include_witnesses=True` and the block has been witness-
+        stripped (witness data stored separately in block_witnesses),
+        the witness data is reattached before returning.  Default is
+        False — callers that need witness data must opt in.
+        """
         cur = self._conn.execute("SELECT data FROM blocks WHERE block_hash = ?", (block_hash,))
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.from_bytes(bytes(row[0]), state=state)
+        block = Block.from_bytes(bytes(row[0]), state=state)
+        if include_witnesses and self.has_witness_data(block_hash):
+            from messagechain.core.witness import attach_block_witnesses
+            witness_data = self.get_witness_data(block_hash)
+            if witness_data is not None:
+                block = attach_block_witnesses(block, witness_data)
+        return block
 
     def get_block_by_number(self, block_number: int, state=None) -> Block | None:
         """Get block by height. If multiple at same height (forks), returns the one on the best chain.
@@ -981,3 +1005,77 @@ class ChainDB:
         )
         row = cur.fetchone()
         return row[0] if row and row[0] is not None else 0
+
+    # ── Witness Separation (block witness data) ─────────────────────
+
+    def store_witness_data(self, block_hash: bytes, witness_data: bytes):
+        """Store witness data (signatures + auth paths) for a block.
+
+        Idempotent: INSERT OR REPLACE so re-storing is safe.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO block_witnesses "
+            "(block_hash, witness_data) VALUES (?, ?)",
+            (block_hash, witness_data),
+        )
+        self._conn.commit()
+
+    def get_witness_data(self, block_hash: bytes) -> bytes | None:
+        """Get stored witness data for a block, or None."""
+        cur = self._conn.execute(
+            "SELECT witness_data FROM block_witnesses WHERE block_hash = ?",
+            (block_hash,),
+        )
+        row = cur.fetchone()
+        return bytes(row[0]) if row else None
+
+    def has_witness_data(self, block_hash: bytes) -> bool:
+        """Check if separate witness data exists for a block."""
+        cur = self._conn.execute(
+            "SELECT 1 FROM block_witnesses WHERE block_hash = ?",
+            (block_hash,),
+        )
+        return cur.fetchone() is not None
+
+    def strip_finalized_witnesses(self, block_hash: bytes, state=None):
+        """Retroactively strip witnesses from a stored finalized block.
+
+        Reads the full block, extracts witness data into block_witnesses,
+        then overwrites the blocks row with the stripped form.  The
+        original block data is NOT deleted — it is replaced in-place
+        with the smaller stripped form.  Witness data moves to the
+        block_witnesses table so it can be served to auditors on demand.
+        """
+        from messagechain.core.witness import (
+            get_block_witness_data, strip_block_witnesses,
+        )
+        cur = self._conn.execute(
+            "SELECT data FROM blocks WHERE block_hash = ?",
+            (block_hash,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return  # block not found or already pruned
+
+        block = Block.from_bytes(bytes(row[0]), state=state)
+
+        # Extract witness data
+        witness_data = get_block_witness_data(block)
+
+        # Strip witnesses from block
+        stripped = strip_block_witnesses(block)
+        stripped_bytes = stripped.to_bytes(state=state)
+
+        # Store witness data separately
+        self._conn.execute(
+            "INSERT OR REPLACE INTO block_witnesses "
+            "(block_hash, witness_data) VALUES (?, ?)",
+            (block_hash, witness_data),
+        )
+
+        # Replace full block with stripped block
+        self._conn.execute(
+            "UPDATE blocks SET data = ? WHERE block_hash = ?",
+            (stripped_bytes, block_hash),
+        )
+        self._conn.commit()
