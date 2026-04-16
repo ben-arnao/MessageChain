@@ -192,24 +192,23 @@ MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 3
 ENFORCE_SLOT_TIMING = True
 
 # Network
-DEFAULT_PORT = 9333
+DEFAULT_PORT = 9333      # P2P listen port
+RPC_DEFAULT_PORT = 9334  # RPC listen port (clients speak JSON-RPC here)
 SEED_NODES: list[tuple[str, int]] = [
     ("35.237.211.12", DEFAULT_PORT),
 ]
 
-# Hardcoded entry-point endpoints for CLI clients.  The three genesis-
-# launch validators live here; the CLI uses them to make its initial
-# RPC connection.  Once connected, the CLI calls get_network_validators
-# to discover the rest of the network and — if non-seed validators with
-# known endpoints exist — routes subsequent calls via a sqrt(stake)-
-# weighted random pick so load doesn't perpetually concentrate on the
-# seeds.  Users can override per-command with `--server host:port`.
+# Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
+# to make its initial RPC connection.  Once connected, the CLI calls
+# get_network_validators to discover the rest of the network and — if
+# non-seed validators with known endpoints exist — routes subsequent
+# calls via a sqrt(stake)-weighted random pick so load doesn't
+# perpetually concentrate on the seeds.  Users can override per-command
+# with `--server host:port`.
 #
-# REPLACE the placeholder entries below before launch.  Leaving them
-# unreachable will force every unconfigured CLI invocation to fall
-# through to the "seed of last resort" = localhost:9333.
+# These must point at RPC ports (RPC_DEFAULT_PORT), not P2P ports.
 CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
-    ("35.237.211.12", DEFAULT_PORT),
+    ("35.237.211.12", RPC_DEFAULT_PORT),
 ]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 5  # seconds
@@ -327,7 +326,20 @@ GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 # unprivileged process calls submit_transaction / stake / ban_peer.
 # The token is compared via constant-time HMAC to prevent timing attacks.
 # Set to None to auto-generate a random token at startup.
-RPC_AUTH_ENABLED = True
+#
+# Default is True (secure by default).  A public-facing validator whose
+# RPC is bound to 0.0.0.0 and whose operator wants to accept
+# unauthenticated signed transactions can opt-in to disabling the token
+# check by setting the MESSAGECHAIN_RPC_AUTH_ENABLED=false environment
+# variable at process start.  Tx signature auth (WOTS+) still gates
+# state changes; RPC auth was an anti-local-privilege-escalation layer,
+# not the primary security boundary.
+import os as _os
+_rpc_auth_env = _os.environ.get("MESSAGECHAIN_RPC_AUTH_ENABLED")
+RPC_AUTH_ENABLED = (
+    False if (_rpc_auth_env is not None and _rpc_auth_env.lower() == "false")
+    else True
+)
 RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
 
 # TLS encryption for P2P connections — prevents passive eavesdropping

@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import asyncio
+import sys
 import hmac
 import json
 import logging
@@ -83,9 +84,10 @@ class Server:
     """MessageChain full node with RPC interface for clients."""
 
     def __init__(self, p2p_port: int, rpc_port: int, seed_nodes: list[tuple[str, int]],
-                 data_dir: str | None = None):
+                 data_dir: str | None = None, rpc_bind: str = "127.0.0.1"):
         self.p2p_port = p2p_port
         self.rpc_port = rpc_port
+        self.rpc_bind = rpc_bind
         self.seed_nodes = seed_nodes
 
         # Set up persistent storage if data_dir provided
@@ -234,7 +236,22 @@ class Server:
         """Start P2P server, RPC server, and block production."""
         # Initialize genesis if fresh chain
         if self.blockchain.height == 0:
-            if self.wallet_entity is not None:
+            import messagechain.config as _cfg
+            pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+            if pinned is not None:
+                # Network has a pinned canonical genesis — this node must
+                # sync block 0 from peers, not mint locally.  Only the
+                # original founder who produced the pinned block is
+                # allowed to call initialize_genesis, and that founder
+                # does so via the dedicated launch_single_validator.py
+                # runbook script, not via server auto-mint.  A newcomer
+                # who reached this branch with a wallet set would have
+                # their auto-mint rejected at blockchain.py anyway; we
+                # short-circuit here to give them a clean relay-only start.
+                logger.info(
+                    "Genesis hash pinned by project config — will sync from peers"
+                )
+            elif self.wallet_entity is not None:
                 # Use the operator's entity as genesis — they get the genesis allocation
                 # and become the first validator.
                 self.blockchain.initialize_genesis(self.wallet_entity)
@@ -260,11 +277,15 @@ class Server:
         )
         logger.info(f"P2P listening on port {self.p2p_port}")
 
-        # Start RPC server (for client commands)
+        # Start RPC server (for client commands).  Default bind is
+        # 127.0.0.1 so a locally-running CLI is the only reachable client
+        # and the box can't be hit by arbitrary internet traffic on the
+        # RPC port.  Public-facing validators that want to accept remote
+        # signed transactions pass --rpc-bind 0.0.0.0 at startup.
         rpc_server = await asyncio.start_server(
-            self._handle_rpc_connection, "127.0.0.1", self.rpc_port
+            self._handle_rpc_connection, self.rpc_bind, self.rpc_port
         )
-        logger.info(f"RPC listening on port {self.rpc_port}")
+        logger.info(f"RPC listening on {self.rpc_bind}:{self.rpc_port}")
 
         # Reconnect to anchor peers first (restart-time eclipse defense)
         for host, port in self.anchor_store.load_anchors():
@@ -1955,19 +1976,37 @@ async def run(args):
         rpc_port=args.rpc_port,
         seed_nodes=seed_nodes,
         data_dir=args.data_dir,
+        rpc_bind=args.rpc_bind,
     )
 
-    # Authenticate with private key to unlock block signing
-    if args.wallet:
-        print(f"Wallet ID: {args.wallet}")
-        print("Authenticate with your private key to enable block production.\n")
+    # Authenticate with private key to unlock block signing.  Two paths:
+    #   * --keyfile: read the hex-encoded key from a 0600 file.  Required
+    #     for unattended (systemd, Docker) operation where no tty exists.
+    #   * Interactive: getpass prompts for the key.  Default.
+    private_key_input: bytes = b""
+    if args.keyfile:
+        with open(args.keyfile) as _kf:
+            hex_key = _kf.read().strip()
+        try:
+            private_key_input = bytes.fromhex(hex_key)
+        except ValueError as e:
+            print(f"ERROR: keyfile {args.keyfile} does not contain valid hex: {e}")
+            sys.exit(1)
+        print(f"Loaded private key from {args.keyfile}")
     else:
-        print("To produce blocks and earn rewards, authenticate with your private key.")
-        print("If you don't have an account yet, use: python client.py create-account")
-        print("You can also press Enter to run as a relay-only node (no rewards).\n")
+        if args.wallet:
+            print(f"Wallet ID: {args.wallet}")
+            print("Authenticate with your private key to enable block production.\n")
+        else:
+            print("To produce blocks and earn rewards, authenticate with your private key.")
+            print("If you don't have an account yet, use: python client.py create-account")
+            print("You can also press Enter to run as a relay-only node (no rewards).\n")
 
-    import getpass
-    private_key_input = getpass.getpass("Private key (hidden, or Enter to skip): ").encode("utf-8")
+        import getpass
+        private_key_input = getpass.getpass(
+            "Private key (hidden, or Enter to skip): "
+        ).encode("utf-8")
+
     if private_key_input:
         entity = Entity.create(private_key_input)
 
@@ -1999,6 +2038,17 @@ def main():
     parser = argparse.ArgumentParser(description="MessageChain Server")
     parser.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
     parser.add_argument("--rpc-port", type=int, default=9334, help="RPC port for clients (default: 9334)")
+    parser.add_argument(
+        "--rpc-bind", type=str, default="127.0.0.1",
+        help="RPC bind address (default: 127.0.0.1). Use 0.0.0.0 for a "
+             "public validator accepting remote signed transactions.",
+    )
+    parser.add_argument(
+        "--keyfile", type=str, default=None,
+        help="Path to a file containing the hex-encoded private key.  "
+             "Required for unattended (systemd, Docker) operation.  "
+             "File should be 0600 and owned by the service user.",
+    )
     parser.add_argument("--seed", nargs="*", help="Seed nodes (host:port)")
     parser.add_argument("--wallet", type=str, help="Wallet ID hex (skip interactive prompt)")
     parser.add_argument("--data-dir", type=str, help="Directory for persistent chain data (enables SQLite storage)")
