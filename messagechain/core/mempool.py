@@ -59,6 +59,18 @@ class Mempool:
         # cap this low is generous but keeps this from becoming a DoS
         # vector if an attacker spams fake slash announcements.
         self.slash_pool_max_size: int = 1000
+        # Finality vote pool: holds FinalityVotes received via
+        # ANNOUNCE_FINALITY_VOTE gossip so the next time *this* node
+        # proposes a block, it can include them and collect the
+        # FINALITY_VOTE_INCLUSION_REWARD.  Same shape as slash_pool;
+        # dedupe key is the vote's consensus_hash (not tx_hash, since
+        # FinalityVote is not a transaction).
+        self.finality_pool: dict[bytes, object] = {}  # consensus_hash -> FinalityVote
+        # Hard cap — finality votes are small and arrive roughly once
+        # per FINALITY_INTERVAL per validator.  A cap this high lets
+        # a moderately large validator set fully gossip a checkpoint
+        # without eviction, yet bounds memory against spam.
+        self.finality_pool_max_size: int = 2000
 
     def add_transaction(
         self,
@@ -401,6 +413,36 @@ class Mempool:
         """Remove slash txs after they've been included in a block."""
         for h in tx_hashes:
             self.slash_pool.pop(h, None)
+
+    # ── Finality vote pool ───────────────────────────────────────
+
+    def add_finality_vote(self, vote) -> bool:
+        """Add a validated FinalityVote to the finality pool.
+
+        Returns True on insertion, False if the vote is already
+        present or the pool is full.  Keyed by consensus_hash so a
+        peer can't silently dislodge an existing vote by re-sending
+        a structurally-identical one.
+        """
+        key = vote.consensus_hash()
+        if key in self.finality_pool:
+            return False
+        if len(self.finality_pool) >= self.finality_pool_max_size:
+            return False
+        self.finality_pool[key] = vote
+        return True
+
+    def get_finality_votes(self, max_count: int | None = None) -> list:
+        """Return pending finality votes for inclusion in a new block."""
+        items = list(self.finality_pool.values())
+        if max_count is not None:
+            items = items[:max_count]
+        return items
+
+    def remove_finality_votes(self, keys: list[bytes]):
+        """Remove finality votes after inclusion in a block."""
+        for k in keys:
+            self.finality_pool.pop(k, None)
 
     @property
     def size(self) -> int:
