@@ -42,6 +42,7 @@ from messagechain.network.peer import Peer, ConnectionType
 from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
+from messagechain.network.peer_selection import PeerSelector
 
 # Plausibility cap on peer-reported cumulative weight. A peer can legitimately
 # be ahead of us, but not by more than this multiplier — otherwise they're
@@ -99,6 +100,11 @@ class Node:
 
         # Sybil-resistant address manager (formerly dead code — now wired)
         self.addrman = AddressManager()
+
+        # Anti-eclipse: subnet-diversity-aware outbound peer selector.
+        # Gates _maintain_outbound_peers so outbound slots fill with IPs
+        # from diverse /16 subnets, making eclipse attacks expensive.
+        self.peer_selector = PeerSelector()
 
         # Persistent anchor store — reloaded at startup, saved at shutdown.
         # Anchors survive node restarts to defeat eclipse-on-reboot attacks.
@@ -182,25 +188,59 @@ class Node:
     async def _maintain_outbound_peers(self):
         """Single tick of outbound-slot maintenance.
 
-        Pulls candidates from addrman.select_addresses and dials any
-        that fill open outbound slots. This is what *actually* gates
-        outbound connection decisions — PEER_LIST only populates
-        addrman, it does not control who we dial. An attacker flooding
-        PEER_LIST therefore cannot force us to connect to attacker-
-        chosen IPs; at worst it pollutes addrman, where Sybil bucketing
-        and per-source caps constrain the damage.
+        Pulls candidates from addrman.select_addresses and uses the
+        PeerSelector to pick the most diversity-improving candidate.
+        This is what *actually* gates outbound connection decisions —
+        PEER_LIST only populates addrman, it does not control who we
+        dial. An attacker flooding PEER_LIST therefore cannot force us
+        to connect to attacker-chosen IPs; at worst it pollutes addrman,
+        where Sybil bucketing and per-source caps constrain the damage.
+
+        Anti-eclipse: the PeerSelector prefers candidates whose /16
+        subnet is NOT already represented in the current outbound set.
+        An attacker needs IPs across many /16s to fill all our slots.
         """
         needed = MAX_PEERS - sum(1 for p in self.peers.values() if p.is_connected)
         if needed <= 0:
             return
-        candidates = self.addrman.select_addresses(needed)
-        for host, port in candidates:
+
+        # Build current outbound set for diversity scoring
+        current_outbound = [
+            (p.host, p.port) for p in self.peers.values()
+            if p.is_connected
+        ]
+
+        # Log diversity warning if below minimum (advisory only)
+        ok, warning = self.peer_selector.check_diversity(current_outbound)
+        if not ok and warning:
+            logger.warning(warning)
+
+        # Pull more candidates than needed — PeerSelector will rank them
+        raw_candidates = self.addrman.select_addresses(needed * 3)
+
+        # Filter out already-connected and banned
+        eligible = []
+        for host, port in raw_candidates:
             addr = f"{host}:{port}"
             if addr in self.peers and self.peers[addr].is_connected:
                 continue
             if self.ban_manager.is_banned(addr):
                 continue
+            eligible.append((host, port))
+
+        # Use PeerSelector to pick diversity-improving peers one at a time
+        connected = 0
+        while eligible and connected < needed:
+            chosen = self.peer_selector.select_outbound_peer(
+                eligible, current_outbound,
+            )
+            if chosen is None:
+                break
+            eligible.remove(chosen)
+            host, port = chosen
             await self._connect_to_peer(host, port)
+            current_outbound.append(chosen)
+            connected += 1
 
     async def _outbound_maintenance_loop(self):
         """Periodic background task that refills outbound slots."""
