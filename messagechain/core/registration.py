@@ -87,6 +87,47 @@ class RegistrationTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 entity_id | 32 public_key | u32 proof_len | proof |
+        f64 timestamp | 32 tx_hash.
+        """
+        proof_blob = self.registration_proof.to_bytes()
+        return b"".join([
+            self.entity_id,
+            self.public_key,
+            struct.pack(">I", len(proof_blob)),
+            proof_blob,
+            struct.pack(">d", float(self.timestamp)),
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RegistrationTransaction":
+        off = 0
+        if len(data) < 32 + 32 + 4 + 8 + 32:
+            raise ValueError("Registration blob too short")
+        entity_id = bytes(data[off:off + 32]); off += 32
+        public_key = bytes(data[off:off + 32]); off += 32
+        proof_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + proof_len + 8 + 32 > len(data):
+            raise ValueError("Registration truncated at proof/timestamp/hash")
+        proof = Signature.from_bytes(bytes(data[off:off + proof_len])); off += proof_len
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("Registration has trailing bytes")
+        tx = cls(
+            entity_id=entity_id, public_key=public_key,
+            registration_proof=proof, timestamp=timestamp,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"Registration hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "RegistrationTransaction":
         proof = Signature.deserialize(data["registration_proof"])

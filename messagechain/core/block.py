@@ -173,6 +173,70 @@ class BlockHeader:
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
         }
 
+    def to_bytes(self) -> bytes:
+        """Compact binary encoding for storage/wire.
+
+        Layout:
+            u32  version
+            u64  block_number
+            32   prev_hash
+            32   merkle_root
+            32   state_root
+            f64  timestamp
+            32   proposer_id
+            32   randao_mix
+            u32  sig_blob_len  (0 = no proposer signature)
+            N    sig_blob
+        """
+        if self.proposer_signature is None:
+            sig_blob = b""
+        else:
+            sig_blob = self.proposer_signature.to_bytes()
+        return b"".join([
+            struct.pack(">I", self.version),
+            struct.pack(">Q", self.block_number),
+            self.prev_hash,
+            self.merkle_root,
+            self.state_root,
+            struct.pack(">d", float(self.timestamp)),
+            self.proposer_id,
+            self.randao_mix,
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "BlockHeader":
+        off = 0
+        expected_min = 4 + 8 + 32 + 32 + 32 + 8 + 32 + 32 + 4
+        if len(data) < expected_min:
+            raise ValueError("BlockHeader blob too short")
+        version = struct.unpack_from(">I", data, off)[0]; off += 4
+        block_number = struct.unpack_from(">Q", data, off)[0]; off += 8
+        prev_hash = bytes(data[off:off + 32]); off += 32
+        merkle_root = bytes(data[off:off + 32]); off += 32
+        state_root = bytes(data[off:off + 32]); off += 32
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        proposer_id = bytes(data[off:off + 32]); off += 32
+        randao_mix = bytes(data[off:off + 32]); off += 32
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len > len(data):
+            raise ValueError("BlockHeader truncated at signature")
+        if sig_len == 0:
+            proposer_signature = None
+        else:
+            proposer_signature = Signature.from_bytes(bytes(data[off:off + sig_len]))
+        off += sig_len
+        if off != len(data):
+            raise ValueError("BlockHeader has trailing bytes")
+        return cls(
+            version=version, block_number=block_number,
+            prev_hash=prev_hash, merkle_root=merkle_root,
+            state_root=state_root, timestamp=timestamp,
+            proposer_id=proposer_id, randao_mix=randao_mix,
+            proposer_signature=proposer_signature,
+        )
+
     @classmethod
     def deserialize(cls, data: dict) -> "BlockHeader":
         return cls(
@@ -263,6 +327,237 @@ class Block:
         if self.registration_transactions:
             result["registration_transactions"] = [tx.serialize() for tx in self.registration_transactions]
         return result
+
+    def to_bytes(self) -> bytes:
+        """Compact binary encoding for storage/wire.
+
+        Every tx-list field is length-prefixed — empty lists contribute
+        exactly 4 bytes (a zero count) regardless of whether the
+        corresponding dict-format serialize() would have omitted them.
+        This keeps the decoder straight-line and avoids an optional-field
+        bitmap.
+
+        Authority and governance tx lists carry polymorphic tx types,
+        so each element in those lists is prefixed with a 1-byte
+        discriminator (see _encode_authority_tx / _encode_governance_tx).
+
+        Layout:
+            header_blob_len  (u32)  + header_blob
+            tx_count         (u32)  + N x (tx_len u32 + tx_blob)
+            vsig_count       (u32)  + N x (32 entity_id + sig_len u32 + sig_blob)
+            slash_count      (u32)  + N x (slash_len u32 + slash_blob)
+            att_count        (u32)  + N x (att_len u32 + att_blob)
+            xfer_count       (u32)  + N x (xfer_len u32 + xfer_blob)
+            gov_count        (u32)  + N x (u8 kind + gov_len u32 + gov_blob)
+            auth_count       (u32)  + N x (u8 kind + auth_len u32 + auth_blob)
+            stake_count      (u32)  + N x (stake_len u32 + stake_blob)
+            unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
+            reg_count        (u32)  + N x (reg_len u32 + reg_blob)
+            32               block_hash
+        """
+        from messagechain.consensus.slashing import SlashTransaction
+        from messagechain.consensus.attestation import Attestation
+        from messagechain.core.transfer import TransferTransaction
+        from messagechain.core.staking import (
+            StakeTransaction, UnstakeTransaction,
+        )
+        from messagechain.core.registration import RegistrationTransaction
+        from messagechain.core.authority_key import SetAuthorityKeyTransaction
+        from messagechain.core.emergency_revoke import RevokeTransaction
+        from messagechain.core.key_rotation import KeyRotationTransaction
+        from messagechain.governance.governance import (
+            ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
+        )
+
+        def enc_list(items):
+            parts = [struct.pack(">I", len(items))]
+            for item in items:
+                b = item.to_bytes()
+                parts.append(struct.pack(">I", len(b)))
+                parts.append(b)
+            return b"".join(parts)
+
+        def enc_vsigs():
+            parts = [struct.pack(">I", len(self.validator_signatures))]
+            for eid, sig in self.validator_signatures:
+                sb = sig.to_bytes()
+                parts.append(eid)
+                parts.append(struct.pack(">I", len(sb)))
+                parts.append(sb)
+            return b"".join(parts)
+
+        def enc_authority():
+            parts = [struct.pack(">I", len(self.authority_txs))]
+            for t in self.authority_txs:
+                if isinstance(t, SetAuthorityKeyTransaction):
+                    kind = 0
+                elif isinstance(t, RevokeTransaction):
+                    kind = 1
+                elif isinstance(t, KeyRotationTransaction):
+                    kind = 2
+                else:
+                    raise ValueError(f"Unknown authority tx: {type(t).__name__}")
+                b = t.to_bytes()
+                parts.append(struct.pack(">B", kind))
+                parts.append(struct.pack(">I", len(b)))
+                parts.append(b)
+            return b"".join(parts)
+
+        def enc_governance():
+            parts = [struct.pack(">I", len(self.governance_txs))]
+            for t in self.governance_txs:
+                if isinstance(t, ProposalTransaction):
+                    kind = 0
+                elif isinstance(t, VoteTransaction):
+                    kind = 1
+                elif isinstance(t, TreasurySpendTransaction):
+                    kind = 2
+                else:
+                    raise ValueError(f"Unknown governance tx: {type(t).__name__}")
+                b = t.to_bytes()
+                parts.append(struct.pack(">B", kind))
+                parts.append(struct.pack(">I", len(b)))
+                parts.append(b)
+            return b"".join(parts)
+
+        header_blob = self.header.to_bytes()
+        return b"".join([
+            struct.pack(">I", len(header_blob)),
+            header_blob,
+            enc_list(self.transactions),
+            enc_vsigs(),
+            enc_list(self.slash_transactions),
+            enc_list(self.attestations),
+            enc_list(self.transfer_transactions),
+            enc_governance(),
+            enc_authority(),
+            enc_list(self.stake_transactions),
+            enc_list(self.unstake_transactions),
+            enc_list(self.registration_transactions),
+            self.block_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Block":
+        from messagechain.consensus.slashing import SlashTransaction
+        from messagechain.consensus.attestation import Attestation
+        from messagechain.core.transfer import TransferTransaction
+        from messagechain.core.staking import (
+            StakeTransaction, UnstakeTransaction,
+        )
+        from messagechain.core.registration import RegistrationTransaction
+        from messagechain.core.authority_key import SetAuthorityKeyTransaction
+        from messagechain.core.emergency_revoke import RevokeTransaction
+        from messagechain.core.key_rotation import KeyRotationTransaction
+        from messagechain.governance.governance import (
+            ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
+        )
+
+        off = 0
+
+        def take(n):
+            nonlocal off
+            if off + n > len(data):
+                raise ValueError("Block blob truncated")
+            b = bytes(data[off:off + n])
+            off += n
+            return b
+
+        def take_u32():
+            nonlocal off
+            if off + 4 > len(data):
+                raise ValueError("Block blob truncated at u32")
+            v = struct.unpack_from(">I", data, off)[0]
+            off += 4
+            return v
+
+        def take_u8():
+            nonlocal off
+            if off + 1 > len(data):
+                raise ValueError("Block blob truncated at u8")
+            v = struct.unpack_from(">B", data, off)[0]
+            off += 1
+            return v
+
+        def dec_list(klass):
+            n = take_u32()
+            out = []
+            for _ in range(n):
+                ln = take_u32()
+                out.append(klass.from_bytes(take(ln)))
+            return out
+
+        header_len = take_u32()
+        header = BlockHeader.from_bytes(take(header_len))
+
+        txs = dec_list(MessageTransaction)
+
+        # validator_signatures: count | [32 eid + u32 sig_len + sig]
+        vsig_count = take_u32()
+        val_sigs = []
+        for _ in range(vsig_count):
+            eid = take(32)
+            sig_len = take_u32()
+            sig = Signature.from_bytes(take(sig_len))
+            val_sigs.append((eid, sig))
+
+        slash_txs = dec_list(SlashTransaction)
+        attestations = dec_list(Attestation)
+        transfer_txs = dec_list(TransferTransaction)
+
+        # Governance txs with 1-byte kind discriminator
+        gov_count = take_u32()
+        gov_classes = (
+            ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
+        )
+        governance_txs = []
+        for _ in range(gov_count):
+            kind = take_u8()
+            if kind >= len(gov_classes):
+                raise ValueError(f"Unknown governance tx kind: {kind}")
+            ln = take_u32()
+            governance_txs.append(gov_classes[kind].from_bytes(take(ln)))
+
+        # Authority txs with 1-byte kind discriminator
+        auth_count = take_u32()
+        auth_classes = (
+            SetAuthorityKeyTransaction, RevokeTransaction, KeyRotationTransaction,
+        )
+        authority_txs = []
+        for _ in range(auth_count):
+            kind = take_u8()
+            if kind >= len(auth_classes):
+                raise ValueError(f"Unknown authority tx kind: {kind}")
+            ln = take_u32()
+            authority_txs.append(auth_classes[kind].from_bytes(take(ln)))
+
+        stake_txs = dec_list(StakeTransaction)
+        unstake_txs = dec_list(UnstakeTransaction)
+        registration_txs = dec_list(RegistrationTransaction)
+
+        declared_hash = take(32)
+        if off != len(data):
+            raise ValueError("Block blob has trailing bytes")
+
+        block = cls(
+            header=header, transactions=txs,
+            validator_signatures=val_sigs,
+            slash_transactions=slash_txs,
+            attestations=attestations,
+            transfer_transactions=transfer_txs,
+            governance_txs=governance_txs,
+            authority_txs=authority_txs,
+            stake_transactions=stake_txs,
+            unstake_transactions=unstake_txs,
+            registration_transactions=registration_txs,
+        )
+        expected_hash = block._compute_hash()
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"Block hash mismatch: declared {declared_hash.hex()[:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
+        return block
 
     @classmethod
     def deserialize(cls, data: dict) -> "Block":

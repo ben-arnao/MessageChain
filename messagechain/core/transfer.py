@@ -65,6 +65,64 @@ class TransferTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Compact binary encoding for storage/wire.
+
+        Layout (big-endian):
+            32   entity_id
+            32   recipient_id
+            u64  amount
+            u64  nonce
+            f64  timestamp
+            u64  fee
+            u32  signature_blob_len
+            M    signature_blob
+            32   tx_hash
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.entity_id,
+            self.recipient_id,
+            struct.pack(">Q", self.amount),
+            struct.pack(">Q", self.nonce),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TransferTransaction":
+        off = 0
+        if len(data) < 32 + 32 + 8 + 8 + 8 + 8 + 4 + 32:
+            raise ValueError("TransferTransaction blob too short")
+        entity_id = bytes(data[off:off + 32]); off += 32
+        recipient_id = bytes(data[off:off + 32]); off += 32
+        amount = struct.unpack_from(">Q", data, off)[0]; off += 8
+        nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("TransferTransaction truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared_hash = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("TransferTransaction has trailing bytes")
+        tx = cls(
+            entity_id=entity_id, recipient_id=recipient_id,
+            amount=amount, nonce=nonce, timestamp=timestamp,
+            fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared_hash:
+            raise ValueError(
+                f"TransferTransaction hash mismatch: declared "
+                f"{declared_hash.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "TransferTransaction":
         sig = Signature.deserialize(data["signature"])

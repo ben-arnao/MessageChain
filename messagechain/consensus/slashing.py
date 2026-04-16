@@ -107,6 +107,46 @@ class SlashingEvidence:
             "evidence_hash": self.evidence_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 offender_id | u32 hdr_a_len | hdr_a | u32 hdr_b_len |
+        hdr_b | 32 evidence_hash.
+        """
+        a = self.header_a.to_bytes()
+        b = self.header_b.to_bytes()
+        return b"".join([
+            self.offender_id,
+            struct.pack(">I", len(a)), a,
+            struct.pack(">I", len(b)), b,
+            self.evidence_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SlashingEvidence":
+        from messagechain.core.block import BlockHeader
+        off = 0
+        if len(data) < 32 + 4:
+            raise ValueError("SlashingEvidence blob too short")
+        offender_id = bytes(data[off:off + 32]); off += 32
+        a_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + a_len + 4 > len(data):
+            raise ValueError("SlashingEvidence truncated at header_a")
+        header_a = BlockHeader.from_bytes(bytes(data[off:off + a_len])); off += a_len
+        b_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + b_len + 32 > len(data):
+            raise ValueError("SlashingEvidence truncated at header_b")
+        header_b = BlockHeader.from_bytes(bytes(data[off:off + b_len])); off += b_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("SlashingEvidence has trailing bytes")
+        ev = cls(offender_id=offender_id, header_a=header_a, header_b=header_b)
+        expected = ev._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"SlashingEvidence hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return ev
+
     @classmethod
     def deserialize(cls, data: dict) -> "SlashingEvidence":
         ev = cls(
@@ -160,6 +200,42 @@ class AttestationSlashingEvidence:
             "attestation_b": self.attestation_b.serialize(),
             "evidence_hash": self.evidence_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        a = self.attestation_a.to_bytes()
+        b = self.attestation_b.to_bytes()
+        return b"".join([
+            self.offender_id,
+            struct.pack(">I", len(a)), a,
+            struct.pack(">I", len(b)), b,
+            self.evidence_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "AttestationSlashingEvidence":
+        off = 0
+        if len(data) < 32 + 4:
+            raise ValueError("AttestationSlashingEvidence blob too short")
+        offender_id = bytes(data[off:off + 32]); off += 32
+        a_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + a_len + 4 > len(data):
+            raise ValueError("AttestationSlashingEvidence truncated at attestation_a")
+        att_a = Attestation.from_bytes(bytes(data[off:off + a_len])); off += a_len
+        b_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + b_len + 32 > len(data):
+            raise ValueError("AttestationSlashingEvidence truncated at attestation_b")
+        att_b = Attestation.from_bytes(bytes(data[off:off + b_len])); off += b_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("AttestationSlashingEvidence has trailing bytes")
+        ev = cls(offender_id=offender_id, attestation_a=att_a, attestation_b=att_b)
+        expected = ev._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"AttestationSlashingEvidence hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return ev
 
     @classmethod
     def deserialize(cls, data: dict) -> "AttestationSlashingEvidence":
@@ -257,6 +333,69 @@ class SlashTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        """Binary: u8 evidence_kind (0=block, 1=attestation) | u32 ev_len |
+        ev | 32 submitter_id | f64 timestamp | u64 fee | u32 sig_len |
+        sig | 32 tx_hash.
+        """
+        if isinstance(self.evidence, AttestationSlashingEvidence):
+            kind = 1
+        elif isinstance(self.evidence, SlashingEvidence):
+            kind = 0
+        else:
+            raise ValueError(f"Unknown evidence type: {type(self.evidence).__name__}")
+        ev_blob = self.evidence.to_bytes()
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            struct.pack(">B", kind),
+            struct.pack(">I", len(ev_blob)),
+            ev_blob,
+            self.submitter_id,
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SlashTransaction":
+        off = 0
+        if len(data) < 1 + 4 + 32 + 8 + 8 + 4 + 32:
+            raise ValueError("SlashTransaction blob too short")
+        kind = struct.unpack_from(">B", data, off)[0]; off += 1
+        ev_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + ev_len > len(data):
+            raise ValueError("SlashTransaction truncated at evidence")
+        ev_bytes = bytes(data[off:off + ev_len]); off += ev_len
+        if kind == 0:
+            evidence = SlashingEvidence.from_bytes(ev_bytes)
+        elif kind == 1:
+            evidence = AttestationSlashingEvidence.from_bytes(ev_bytes)
+        else:
+            raise ValueError(f"Unknown slash evidence kind: {kind}")
+        submitter_id = bytes(data[off:off + 32]); off += 32
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("SlashTransaction truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("SlashTransaction has trailing bytes")
+        tx = cls(
+            evidence=evidence, submitter_id=submitter_id,
+            timestamp=timestamp, fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"SlashTransaction hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return tx
 
     @classmethod
     def deserialize(cls, data: dict) -> "SlashTransaction":

@@ -72,6 +72,111 @@ class Signature:
             "wots_public_seed": self.wots_public_seed.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Compact binary encoding for storage/wire.
+
+        Layout (all unsigned big-endian):
+            u16  wots_chain_count
+            N x  32-byte chain hashes  (where N = wots_chain_count)
+            u32  leaf_index
+            u8   auth_path_len
+            M x  32-byte path hashes   (where M = auth_path_len)
+            32   wots_public_key
+            32   wots_public_seed
+
+        Every variable-length section is length-prefixed to prevent
+        ambiguous concatenation (same defense as canonical_bytes uses).
+        Hash elements are fixed-size (SHA3-256 = 32 bytes) so we encode
+        only the count, not each element's length.
+        """
+        parts = [struct.pack(">H", len(self.wots_signature))]
+        parts.extend(self.wots_signature)
+        parts.append(struct.pack(">I", self.leaf_index))
+        parts.append(struct.pack(">B", len(self.auth_path)))
+        parts.extend(self.auth_path)
+        parts.append(self.wots_public_key)
+        parts.append(self.wots_public_seed)
+        return b"".join(parts)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Signature":
+        """Decode a Signature from its compact binary form.
+
+        Matches the structural validation in deserialize(dict): all size
+        checks happen here before any hash work runs, so malformed blobs
+        cannot burn CPU on wots_verify.
+        """
+        # Placeholder-signature carve-out: empty blob decodes to the
+        # placeholder used during transaction construction (see
+        # `Signature([], 0, [], b"", b"")`).  Only relevant for in-memory
+        # round-trips that embed unsigned placeholders; stored blocks
+        # always carry a real signature.
+        if len(data) == 0:
+            return cls([], 0, [], b"", b"")
+
+        offset = 0
+        if len(data) < 2:
+            raise ValueError("Signature blob too short for chain count")
+        chain_count = struct.unpack_from(">H", data, offset)[0]
+        offset += 2
+        if chain_count != WOTS_KEY_CHAINS:
+            raise ValueError(
+                f"WOTS signature must have exactly {WOTS_KEY_CHAINS} chains, "
+                f"got {chain_count}"
+            )
+        wots_sig = []
+        for _ in range(chain_count):
+            if offset + _HASH_SIZE > len(data):
+                raise ValueError("Signature blob truncated in wots chains")
+            wots_sig.append(bytes(data[offset:offset + _HASH_SIZE]))
+            offset += _HASH_SIZE
+
+        if offset + 4 > len(data):
+            raise ValueError("Signature blob truncated at leaf_index")
+        leaf_index = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+
+        if offset + 1 > len(data):
+            raise ValueError("Signature blob truncated at auth_path length")
+        auth_len = struct.unpack_from(">B", data, offset)[0]
+        offset += 1
+        if auth_len > MAX_AUTH_PATH_LEN:
+            raise ValueError(
+                f"Auth path too long: {auth_len} > {MAX_AUTH_PATH_LEN}"
+            )
+        auth_path = []
+        for _ in range(auth_len):
+            if offset + _HASH_SIZE > len(data):
+                raise ValueError("Signature blob truncated in auth_path")
+            auth_path.append(bytes(data[offset:offset + _HASH_SIZE]))
+            offset += _HASH_SIZE
+
+        if offset + _HASH_SIZE > len(data):
+            raise ValueError("Signature blob truncated at wots_public_key")
+        pub_key = bytes(data[offset:offset + _HASH_SIZE])
+        offset += _HASH_SIZE
+
+        if offset + _HASH_SIZE > len(data):
+            raise ValueError("Signature blob truncated at wots_public_seed")
+        pub_seed = bytes(data[offset:offset + _HASH_SIZE])
+        offset += _HASH_SIZE
+
+        # leaf_index must be a valid index into a tree of height = auth_len.
+        max_leaf_index = (1 << auth_len) - 1 if auth_len > 0 else 0
+        if leaf_index > max_leaf_index:
+            raise ValueError(
+                f"leaf_index {leaf_index} outside tree coverage "
+                f"(auth_path len {auth_len} → max index {max_leaf_index})"
+            )
+
+        return cls(
+            wots_signature=wots_sig,
+            leaf_index=leaf_index,
+            auth_path=auth_path,
+            wots_public_key=pub_key,
+            wots_public_seed=pub_seed,
+        )
+
     @classmethod
     def deserialize(cls, data: dict) -> "Signature":
         wots_sig = [bytes.fromhex(s) for s in data["wots_signature"]]

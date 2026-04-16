@@ -13,11 +13,9 @@ Schema:
 - supply_meta: global supply tracking data
 """
 
-import json
 import sqlite3
 import threading
 from pathlib import Path
-from messagechain.validation import safe_json_loads
 
 from messagechain.core.block import Block
 
@@ -54,7 +52,7 @@ class ChainDB:
                 block_hash BLOB PRIMARY KEY,
                 block_number INTEGER NOT NULL,
                 prev_hash BLOB NOT NULL,
-                data TEXT NOT NULL
+                data BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_number ON blocks(block_number);
             CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
@@ -133,7 +131,7 @@ class ChainDB:
             CREATE TABLE IF NOT EXISTS block_headers (
                 block_hash BLOB PRIMARY KEY,
                 block_number INTEGER NOT NULL,
-                header_data TEXT NOT NULL
+                header_data BLOB NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_headers_number ON block_headers(block_number);
         """)
@@ -161,8 +159,14 @@ class ChainDB:
     # ── Block Storage ────────────────────────────────────────────
 
     def store_block(self, block: Block):
-        """Store a serialized block."""
-        data = json.dumps(block.serialize())
+        """Store a block in its compact binary form.
+
+        The `data` column is BLOB — the raw output of Block.to_bytes().
+        This is ~2x smaller than the old JSON-with-hex-fields format
+        (a WOTS signature drops from ~5.5 KB JSON to ~2 KB binary) and
+        compounds forever in the permanent-history model.
+        """
+        data = block.to_bytes()
         self._conn.execute(
             "INSERT OR REPLACE INTO blocks (block_hash, block_number, prev_hash, data) VALUES (?, ?, ?, ?)",
             (block.block_hash, block.header.block_number, block.header.prev_hash, data),
@@ -174,7 +178,7 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.deserialize(safe_json_loads(row[0]))
+        return Block.from_bytes(bytes(row[0]))
 
     def get_block_by_number(self, block_number: int) -> Block | None:
         """Get block by height. If multiple at same height (forks), returns the one on the best chain."""
@@ -185,14 +189,14 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.deserialize(safe_json_loads(row[0]))
+        return Block.from_bytes(bytes(row[0]))
 
     def get_blocks_at_height(self, block_number: int) -> list[Block]:
         """Get all blocks at a given height (for fork detection)."""
         cur = self._conn.execute(
             "SELECT data FROM blocks WHERE block_number = ?", (block_number,)
         )
-        return [Block.deserialize(safe_json_loads(row[0])) for row in cur.fetchall()]
+        return [Block.from_bytes(bytes(row[0])) for row in cur.fetchall()]
 
     def has_block(self, block_hash: bytes) -> bool:
         cur = self._conn.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (block_hash,))
@@ -236,10 +240,10 @@ class ChainDB:
         """Replace a full block with its header only.
 
         Deletes the full block data and stores just the header in the
-        block_headers table. This is the actual storage reclamation that
-        makes pruning effective for long-term sustainability.
+        block_headers table. Storage reclamation for long-term
+        sustainability; the header keeps the chain continuous for
+        light clients and header-sync peers.
         """
-        # Get the full block first
         cur = self._conn.execute(
             "SELECT data, block_hash FROM blocks WHERE block_number = ?",
             (block_number,),
@@ -248,20 +252,20 @@ class ChainDB:
         if row is None:
             return  # already pruned or doesn't exist
 
-        import json
-        block_data = safe_json_loads(row[0])
+        block_bytes = bytes(row[0])
         block_hash = bytes(row[1])
 
-        # Extract header from block data
-        header_data = json.dumps(block_data.get("header", {}))
+        # Decode the full block just to pull out the header blob.  Keeping
+        # the header in its binary encoding (rather than re-serializing to
+        # dict/JSON) preserves the size win pruning is supposed to deliver.
+        block = Block.from_bytes(block_bytes)
+        header_data = block.header.to_bytes()
 
-        # Store header
         self._conn.execute(
             "INSERT OR REPLACE INTO block_headers (block_hash, block_number, header_data) VALUES (?, ?, ?)",
             (block_hash, block_number, header_data),
         )
 
-        # Delete full block data
         self._conn.execute(
             "DELETE FROM blocks WHERE block_number = ? AND block_hash = ?",
             (block_number, block_hash),
@@ -275,8 +279,13 @@ class ChainDB:
         )
         return cur.fetchone() is not None
 
-    def get_block_header(self, block_number: int) -> dict | None:
-        """Get a stored header by block number (for pruned blocks)."""
+    def get_block_header(self, block_number: int) -> "BlockHeader | None":
+        """Get a stored BlockHeader by block number (for pruned blocks).
+
+        Returns the decoded BlockHeader object (None if no record).
+        Callers that need the old dict form can call `.serialize()` on
+        the returned header.
+        """
         cur = self._conn.execute(
             "SELECT header_data FROM block_headers WHERE block_number = ?",
             (block_number,),
@@ -284,8 +293,8 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        import json
-        return safe_json_loads(row[0])
+        from messagechain.core.block import BlockHeader
+        return BlockHeader.from_bytes(bytes(row[0]))
 
     # ── Chain Tips ───────────────────────────────────────────────
 
