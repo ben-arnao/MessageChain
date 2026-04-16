@@ -193,7 +193,9 @@ ENFORCE_SLOT_TIMING = True
 
 # Network
 DEFAULT_PORT = 9333
-SEED_NODES: list[tuple[str, int]] = []
+SEED_NODES: list[tuple[str, int]] = [
+    ("35.237.211.12", DEFAULT_PORT),
+]
 
 # Hardcoded entry-point endpoints for CLI clients.  The three genesis-
 # launch validators live here; the CLI uses them to make its initial
@@ -207,9 +209,7 @@ SEED_NODES: list[tuple[str, int]] = []
 # unreachable will force every unconfigured CLI invocation to fall
 # through to the "seed of last resort" = localhost:9333.
 CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
-    ("seed1.messagechain.invalid", DEFAULT_PORT),
-    ("seed2.messagechain.invalid", DEFAULT_PORT),
-    ("seed3.messagechain.invalid", DEFAULT_PORT),
+    ("35.237.211.12", DEFAULT_PORT),
 ]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 5  # seconds
