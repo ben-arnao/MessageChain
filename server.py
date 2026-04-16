@@ -57,7 +57,9 @@ from messagechain.network.peer import Peer, ConnectionType
 from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
-from messagechain.consensus.attestation import Attestation, verify_attestation
+from messagechain.consensus.attestation import (
+    Attestation, attest_block_if_allowed, verify_attestation,
+)
 from messagechain.consensus.slashing import (
     SlashTransaction as SlashTx, verify_slashing_evidence, verify_attestation_slashing_evidence,
     SlashingEvidence, AttestationSlashingEvidence,
@@ -577,7 +579,14 @@ class Server:
             valid, reason = self.blockchain.validate_transaction(tx)
             if not valid:
                 return {"ok": False, "error": reason}
-            self.mempool.add_transaction(tx)
+            # Record arrival height for the forced-inclusion rule.  Without
+            # this, txs default to height 0 which makes them "always-
+            # forced" — an attester that never updates arrival heights
+            # would wrongly flag every new tx for immediate forced
+            # inclusion and vote NO on every non-draining block.
+            self.mempool.add_transaction(
+                tx, arrival_block_height=self.blockchain.height,
+            )
 
             # Relay via inv (not full tx flood)
             tx_hash_hex = tx.tx_hash.hex()
@@ -1143,7 +1152,10 @@ class Server:
             valid, reason = self.blockchain.validate_transfer_transaction(tx)
             if not valid:
                 return {"ok": False, "error": reason}
-            self.mempool.add_transaction(tx)
+            # Record arrival height — see _rpc_submit_transaction for rationale.
+            self.mempool.add_transaction(
+                tx, arrival_block_height=self.blockchain.height,
+            )
 
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
@@ -1521,7 +1533,10 @@ class Server:
             valid, reason = self.blockchain.validate_transaction(tx)
             if valid:
                 self._track_seen_tx(tx_hash_hex)
-                self.mempool.add_transaction(tx)
+                # Record arrival height — see _rpc_submit_transaction for rationale.
+                self.mempool.add_transaction(
+                    tx, arrival_block_height=self.blockchain.height,
+                )
                 await self._relay_tx_inv([tx_hash_hex], exclude=address)
             else:
                 self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
@@ -1537,6 +1552,12 @@ class Server:
             success, reason = self.blockchain.add_block(block)
             if success:
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
+                # Attester duty: vote on the accepted block, but only if
+                # it honors our forced-inclusion list (censorship
+                # resistance).  Silent omission of a top-N long-waited
+                # tx means we skip the broadcast — block fails 2/3
+                # finality if enough honest attesters concur.
+                await self._maybe_attest_accepted_block(block)
             else:
                 self.ban_manager.record_offense(address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}")
 
@@ -1598,6 +1619,58 @@ class Server:
             )
 
     # ── Attestation and slash handlers ──────────────────────────────
+
+    async def _maybe_attest_accepted_block(self, block):
+        """Cast an attestation for a freshly-accepted block if we're a
+        registered validator AND the block honors our forced-inclusion
+        duty.  Silence (no broadcast) is the soft NO vote.
+
+        Mirrors network/node.py — both the library-mode Node and the
+        server entry point must enforce the forced-inclusion duty
+        identically, so any attester code path refuses to sign a block
+        that drops a top-N long-waited tx from our local mempool.
+        """
+        if self.wallet_entity is None:
+            return
+        if self.wallet_id not in self.blockchain.public_keys:
+            return
+        if self.wallet_id not in self.consensus.stakes:
+            return
+
+        def _is_includable(tx) -> bool:
+            ok, _reason = self.blockchain.validate_transaction(tx)
+            return ok
+
+        att = attest_block_if_allowed(
+            self.wallet_entity,
+            block,
+            self.mempool,
+            current_block_height=block.header.block_number,
+            is_includable=_is_includable,
+        )
+        if att is None:
+            logger.warning(
+                f"Refusing to attest block #{block.header.block_number}: "
+                f"forced-inclusion duty violated (censorship suspected)"
+            )
+            return
+
+        # Record locally (we won't see our own attestation on gossip)
+        # and broadcast.
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+        validator_stake = self.blockchain.supply.get_staked(self.wallet_id)
+        total_stake = sum(self.blockchain.supply.staked.values())
+        self.blockchain.finality.add_attestation(
+            att, validator_stake, total_stake,
+            public_keys=self.blockchain.public_keys,
+            min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+        )
+
+        msg = NetworkMessage(
+            msg_type=MessageType.ANNOUNCE_ATTESTATION,
+            payload=att.serialize(),
+        )
+        await self._broadcast(msg)
 
     async def _handle_announce_attestation(self, payload: dict, peer: Peer):
         """Handle an incoming attestation gossip message."""
