@@ -163,6 +163,30 @@ class ChainDB:
                 block_number INTEGER PRIMARY KEY,
                 block_hash BLOB NOT NULL UNIQUE
             );
+
+            -- Verified state checkpoints (bootstrap-speed sync).
+            -- Every STATE_CHECKPOINT_INTERVAL blocks, validators sign
+            -- StateCheckpoint(block_number, block_hash, state_root)
+            -- and when >=2/3 of stake has signed, the result is stored
+            -- here.  An archive node can serve these via the
+            -- REQUEST_STATE_CHECKPOINT p2p message so a new full node
+            -- can bootstrap without replaying ancient history.  The
+            -- chain itself is permanent — this table is a cache of
+            -- compact, signed snapshot commitments that new nodes
+            -- trust as ground-truth for state at block N.
+            --
+            -- `checkpoint_blob` is StateCheckpoint.to_bytes() (fixed
+            -- 72 bytes).  `signatures_blob` is a length-prefixed
+            -- concatenation of StateCheckpointSignature.to_bytes()
+            -- entries.  Kept as opaque BLOBs so the storage layer
+            -- does not depend on the exact object shape — future
+            -- scheme upgrades bump STATE_ROOT_VERSION without
+            -- migrating the table.
+            CREATE TABLE IF NOT EXISTS verified_state_checkpoints (
+                block_number INTEGER PRIMARY KEY,
+                checkpoint_blob BLOB NOT NULL,
+                signatures_blob BLOB NOT NULL
+            );
         """)
         conn.commit()
 
@@ -697,6 +721,78 @@ class ChainDB:
             "SELECT block_number, block_hash FROM finalized_blocks"
         )
         return {row[0]: bytes(row[1]) for row in cur.fetchall()}
+
+    # ── Verified State Checkpoints (bootstrap-speed sync) ───────────
+
+    def add_verified_state_checkpoint(self, checkpoint, signatures) -> None:
+        """Persist a verified (>=2/3 stake-signed) state checkpoint.
+
+        `checkpoint` is a messagechain.consensus.state_checkpoint.StateCheckpoint.
+        `signatures` is a list of StateCheckpointSignature.
+
+        Idempotent per block_number: the first-stored checkpoint for a
+        height wins (INSERT OR IGNORE).  A second call at the same
+        height with different contents would mean the network has seen
+        two verified checkpoints for one block, which is only possible
+        if 2/3 of stake double-signed — a scenario that manifests as
+        state_ckpt_double_sign slashing evidence, not as a silent
+        database row replacement.
+        """
+        import struct as _s
+        cp_blob = checkpoint.to_bytes()
+        parts = [_s.pack(">I", len(signatures))]
+        for sig in signatures:
+            sb = sig.to_bytes()
+            parts.append(_s.pack(">I", len(sb)))
+            parts.append(sb)
+        sigs_blob = b"".join(parts)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO verified_state_checkpoints "
+            "(block_number, checkpoint_blob, signatures_blob) VALUES (?, ?, ?)",
+            (checkpoint.block_number, cp_blob, sigs_blob),
+        )
+        self._conn.commit()
+
+    def get_verified_state_checkpoint(self, block_number: int):
+        """Return (StateCheckpoint, [StateCheckpointSignature, ...]) or None."""
+        import struct as _s
+        from messagechain.consensus.state_checkpoint import (
+            StateCheckpoint, StateCheckpointSignature,
+        )
+        cur = self._conn.execute(
+            "SELECT checkpoint_blob, signatures_blob "
+            "FROM verified_state_checkpoints WHERE block_number = ?",
+            (block_number,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        cp = StateCheckpoint.from_bytes(bytes(row[0]))
+        sigs_blob = bytes(row[1])
+        off = 0
+        (n,) = _s.unpack_from(">I", sigs_blob, off); off += 4
+        signatures = []
+        for _ in range(n):
+            (ln,) = _s.unpack_from(">I", sigs_blob, off); off += 4
+            signatures.append(
+                StateCheckpointSignature.from_bytes(sigs_blob[off:off + ln])
+            )
+            off += ln
+        return cp, signatures
+
+    def get_latest_verified_state_checkpoint_height(self) -> int | None:
+        cur = self._conn.execute(
+            "SELECT MAX(block_number) FROM verified_state_checkpoints"
+        )
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else None
+
+    def get_all_verified_state_checkpoint_heights(self) -> list[int]:
+        cur = self._conn.execute(
+            "SELECT block_number FROM verified_state_checkpoints "
+            "ORDER BY block_number"
+        )
+        return [row[0] for row in cur.fetchall()]
 
     # ── Batch Operations (for state snapshots / reorgs) ──────────
 

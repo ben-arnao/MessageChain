@@ -358,6 +358,49 @@ MIN_CUMULATIVE_STAKE_WEIGHT = 100
 # Set to None to verify all blocks (default for new chains)
 ASSUME_VALID_BLOCK_HASH = None  # bytes or None
 
+# Signed state-snapshot checkpoints — bootstrap-speed sync for new nodes.
+#
+# Replaying the chain from genesis in year 100 means replaying 100 years of
+# history. To let a new full-node / validator come up quickly, the network
+# publishes a signed state snapshot every STATE_CHECKPOINT_INTERVAL blocks.
+# A new node downloads the most recent such snapshot (with >= 2/3-stake
+# signatures at that height) plus the ~last N blocks since the snapshot and
+# starts participating without replaying ancient history. The chain itself
+# is permanent — archive nodes keep everything — this is ONLY about new-
+# node bootstrap time.
+#
+# Security model: identical to the finality-vote / weak-subjectivity story.
+# A new node MUST treat the signed checkpoint as ground truth (it has no
+# other basis on which to validate ancient history). In exchange, any
+# validator that double-signs a checkpoint (two different state_roots for
+# the same block_number) is slashed 100% stake + full escrow burn — same
+# penalty as double-proposal and double-attestation.
+#
+# STATE_CHECKPOINT_INTERVAL: how often a checkpoint is emitted.  1000 blocks
+# at 600s = ~7 days.  A node that wants to bootstrap waits at most one
+# interval for a fresh checkpoint.
+#
+# STATE_CHECKPOINT_THRESHOLD_{NUMERATOR,DENOMINATOR}: 2/3 of stake-at-X must
+# have signed the checkpoint for it to be "verified".  Mirrors the finality
+# fraction (FINALITY_THRESHOLD_*) so operators see one threshold number for
+# "the honest majority commits to this".
+#
+# MAX_STATE_SNAPSHOT_BYTES: 500MB upper bound on a single snapshot blob.
+# Prevents a malicious peer from DoSing a bootstrapping node with a
+# multi-GB snapshot.  The real snapshot size scales linearly with the
+# active account count — at ~100 B per account, 500MB comfortably
+# accommodates >1M accounts, well past any realistic per-person identity
+# count the chain targets.
+#
+# STATE_ROOT_VERSION: format version of the state-snapshot root commitment.
+# Bump-then-accept-both pattern lets a future governance proposal upgrade
+# the Merkle scheme without a chain reset, same shape as HASH_VERSION_CURRENT.
+STATE_CHECKPOINT_INTERVAL = 1000
+STATE_CHECKPOINT_THRESHOLD_NUMERATOR = 2
+STATE_CHECKPOINT_THRESHOLD_DENOMINATOR = 3
+MAX_STATE_SNAPSHOT_BYTES = 500_000_000
+STATE_ROOT_VERSION = 1
+
 # Weak-subjectivity checkpoints — the PoS long-range-attack defense.
 # A list of (block_number, block_hash, state_root) snapshots that new nodes
 # treat as ground truth during IBD. Any peer that serves a header at one of

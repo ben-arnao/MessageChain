@@ -546,6 +546,207 @@ class Blockchain:
 
         return genesis_block
 
+    def bootstrap_from_checkpoint(
+        self,
+        snapshot_bytes: bytes,
+        checkpoint,
+        signatures: list,
+        stake_at_checkpoint: dict,
+        public_keys_at_checkpoint: dict,
+        checkpoint_block,
+        recent_blocks: list,
+    ) -> tuple[bool, str]:
+        """Install a signed state snapshot + apply the recent blocks since X.
+
+        This is the bootstrap-speed path: a new full-node / validator
+        skips genesis-replay by downloading a >=2/3-stake-signed snapshot
+        at block X plus the ~last N blocks since X.  After this call, the
+        node is fully synced up through `recent_blocks[-1]` and can
+        propose / validate further blocks indistinguishably from an
+        archive node.
+
+        The chain itself remains permanent — archive nodes retain every
+        block — this is ONLY about letting a NEW node skip ancient
+        history replay.
+
+        Arguments:
+            snapshot_bytes:           encode_snapshot(serialize_state(...))
+            checkpoint:               StateCheckpoint committing to X
+            signatures:               list[StateCheckpointSignature]
+            stake_at_checkpoint:      entity_id -> stake, snapshotted at X
+            public_keys_at_checkpoint:entity_id -> pubkey, as-of X
+            checkpoint_block:         the Block at height X (needed so
+                                      `recent_blocks[0].prev_hash` can
+                                      link back)
+            recent_blocks:            blocks X+1, X+2, ..., current tip
+
+        Returns (ok, reason).  This method MUST be called on a fresh
+        Blockchain instance that has never had initialize_genesis or any
+        prior state installed — otherwise state installation would silently
+        mix into pre-existing state.
+        """
+        from messagechain.storage.state_snapshot import (
+            decode_snapshot,
+            compute_state_root as compute_snapshot_root,
+            MAX_STATE_SNAPSHOT_BYTES as _max_bytes_module,
+        )
+        # Pick up the live cap from the module so monkey-patching in tests
+        # is honored.  (decode_snapshot accepts an explicit max_bytes kwarg,
+        # so we pass through whatever the module currently holds.)
+        import messagechain.storage.state_snapshot as _ss_mod
+        from messagechain.consensus.state_checkpoint import (
+            verify_state_checkpoint, StateCheckpoint,
+        )
+
+        # Refuse to bootstrap a chain that's already been initialized —
+        # we would otherwise merge two different states.
+        if self.chain:
+            return False, (
+                "Refusing to bootstrap: chain is already initialized "
+                "(genesis or other blocks present)"
+            )
+
+        # 1. Size cap — cheap DoS guard before we parse anything.
+        if len(snapshot_bytes) > _ss_mod.MAX_STATE_SNAPSHOT_BYTES:
+            return False, (
+                f"Snapshot too large: {len(snapshot_bytes)} bytes > "
+                f"cap {_ss_mod.MAX_STATE_SNAPSHOT_BYTES}"
+            )
+
+        # 2. Parse the snapshot (decoder also enforces cap internally).
+        try:
+            snap = decode_snapshot(
+                snapshot_bytes,
+                max_bytes=_ss_mod.MAX_STATE_SNAPSHOT_BYTES,
+            )
+        except ValueError as e:
+            return False, f"Snapshot decode failed: {e}"
+
+        # 3. Verify the snapshot root matches the checkpoint.state_root.
+        computed_root = compute_snapshot_root(snap)
+        if computed_root != checkpoint.state_root:
+            return False, (
+                f"Mismatched state_root: checkpoint commits to "
+                f"{checkpoint.state_root.hex()[:16]}, snapshot computes "
+                f"{computed_root.hex()[:16]}"
+            )
+
+        # 4. Verify the checkpoint block hash matches the checkpoint.
+        if checkpoint_block.block_hash != checkpoint.block_hash:
+            return False, (
+                f"checkpoint_block hash {checkpoint_block.block_hash.hex()[:16]}"
+                f" does not match checkpoint.block_hash "
+                f"{checkpoint.block_hash.hex()[:16]}"
+            )
+        if checkpoint_block.header.block_number != checkpoint.block_number:
+            return False, (
+                f"checkpoint_block height {checkpoint_block.header.block_number}"
+                f" does not match checkpoint.block_number "
+                f"{checkpoint.block_number}"
+            )
+
+        # 5. Verify >=2/3 of stake-at-X has signed the checkpoint.
+        ok, reason = verify_state_checkpoint(
+            checkpoint, signatures,
+            stake_at_checkpoint, public_keys_at_checkpoint,
+        )
+        if not ok:
+            return False, f"Checkpoint signature verification failed: {reason}"
+
+        # 6. Install snapshot state into this blockchain instance.
+        self._install_state_snapshot(snap)
+
+        # 7. Install the checkpoint block as the current tip — later
+        # add_block() calls validate `prev_hash` against it.
+        self.chain.append(checkpoint_block)
+        self._block_by_hash[checkpoint_block.block_hash] = checkpoint_block
+        self.fork_choice.add_tip(
+            checkpoint_block.block_hash,
+            checkpoint_block.header.block_number,
+            0,
+        )
+        # Pin a stake snapshot for the checkpoint height so the next
+        # block's attestation/finality counters have a denominator.
+        self._stake_snapshots[checkpoint_block.header.block_number] = dict(
+            stake_at_checkpoint
+        )
+
+        # 8. Sanity: the snapshot's per-entity fields must reconcile with
+        # the header's state_root (which covers only the per-entity tree).
+        # Without this, a malicious snapshot could pass root-check on the
+        # broader commitment while mis-stating the per-entity commitment
+        # the chain's block pipeline actually uses.
+        header_root_on_install = self.compute_current_state_root()
+        if header_root_on_install != checkpoint_block.header.state_root:
+            return False, (
+                "Per-entity state root after install does not match "
+                "checkpoint block header state_root — snapshot is "
+                "internally inconsistent with the chain header"
+            )
+
+        # 9. Apply recent blocks in order.  Any failure leaves the chain
+        # in a partially-synced but self-consistent state up to the last
+        # successful block — caller can retry fetching missing blocks.
+        for blk in recent_blocks:
+            ok, reason = self.add_block(blk)
+            if not ok:
+                return False, (
+                    f"recent_block {blk.header.block_number} "
+                    f"rejected during bootstrap: {reason}"
+                )
+
+        # 10. Persist the verified checkpoint if a db is attached, so a
+        # future warm restart sees the same bootstrap point.
+        if self.db is not None and hasattr(
+            self.db, "add_verified_state_checkpoint"
+        ):
+            self.db.add_verified_state_checkpoint(checkpoint, signatures)
+
+        return True, "Bootstrap complete"
+
+    def _install_state_snapshot(self, snap: dict) -> None:
+        """Load a decoded state-snapshot dict into this blockchain.
+
+        Only called by bootstrap_from_checkpoint on a fresh (no-genesis)
+        chain, after the checkpoint signatures have been verified and
+        the root has been confirmed to match the snapshot bytes.
+        """
+        # Per-entity fields
+        self.supply.balances = dict(snap["balances"])
+        self.supply.staked = dict(snap["staked"])
+        self.nonces = dict(snap["nonces"])
+        self.public_keys = dict(snap["public_keys"])
+        self.authority_keys = dict(snap["authority_keys"])
+        self.leaf_watermarks = dict(snap["leaf_watermarks"])
+        self.key_rotation_counts = dict(snap["key_rotation_counts"])
+        self.revoked_entities = set(snap["revoked_entities"])
+        self.slashed_validators = set(snap["slashed_validators"])
+
+        # Entity index registry
+        self.entity_id_to_index = dict(snap["entity_id_to_index"])
+        self.entity_index_to_id = {
+            idx: eid for eid, idx in self.entity_id_to_index.items()
+        }
+        self._next_entity_index = int(snap["next_entity_index"])
+
+        # Global fields
+        self.supply.total_supply = int(snap["total_supply"])
+        self.supply.total_minted = int(snap["total_minted"])
+        self.supply.total_fees_collected = int(snap["total_fees_collected"])
+        self.supply.total_burned = int(snap["total_burned"])
+        self.supply.base_fee = int(snap["base_fee"])
+        self.base_fee = int(snap["base_fee"])
+
+        # Finalized checkpoints (long-range-attack defense — must carry
+        # across the bootstrap boundary or the new node would accept a
+        # competing chain that contradicts a known-finalized block).
+        for bn, bh in snap["finalized_checkpoints"].items():
+            self.finalized_checkpoints.mark_finalized(bh, bn)
+
+        # Rebuild the per-entity sparse Merkle tree from the installed
+        # state so compute_current_state_root reflects the snapshot.
+        self._rebuild_state_tree()
+
     def get_authority_key(self, entity_id: bytes) -> bytes | None:
         """Return the authority (cold) public key for an entity.
 
