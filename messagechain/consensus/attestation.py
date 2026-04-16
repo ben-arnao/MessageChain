@@ -120,6 +120,65 @@ def create_attestation(validator_entity, block_hash: bytes, block_number: int) -
     return att
 
 
+def attest_block_if_allowed(
+    validator_entity,
+    block,
+    mempool,
+    current_block_height: int,
+    is_includable=None,
+):
+    """Create an attestation for `block` iff the forced-inclusion rule allows it.
+
+    Single choke-point for the censorship-resistance defense.  Every
+    production code path that signs an attestation MUST route through
+    this function rather than calling `create_attestation` directly —
+    otherwise an attester could accidentally (or maliciously) sign a
+    block that drops long-waited user txs without the check firing.
+
+    Returns the signed Attestation on a YES vote, or None on a NO vote.
+    Callers who get None should log and silently skip — in the soft-
+    vote model, a NO is simply the absence of an affirmative
+    attestation.  If 2/3+ of stake similarly declines, the block fails
+    finality.
+
+    Parameters:
+        validator_entity:     The Entity whose keypair signs the
+                              attestation.
+        block:                The block being voted on.
+        mempool:              The attester's local Mempool — the
+                              subjective view that drives the forced-
+                              inclusion duty.
+        current_block_height: Height of the block being voted on.
+                              Used to compute "how long has this tx
+                              waited?" against mempool arrival heights.
+        is_includable:        Optional callback `(tx) -> bool` —
+                              treats a forced tx as legitimately
+                              excluded if it returns False (stale
+                              nonce, insufficient balance, bad sig).
+                              Pass None to default to "assume
+                              includable".
+
+    Design: this is deliberately a thin wrapper.  Keeping the
+    forced-inclusion logic in forced_inclusion.py (pure, no key
+    material, no network I/O) makes it easy to fuzz and audit; this
+    function composes it with signing so callers have one call to
+    make.  Tests that want to inspect the decision without signing
+    keys can still call `should_attest_block` directly.
+    """
+    # Import inside the function to avoid a circular dep.  attestation.py
+    # is imported by other consensus modules; forced_inclusion.py reads
+    # config and has no consensus-layer dependency, so the one-way
+    # direction at module load time stays clean.
+    from messagechain.consensus.forced_inclusion import should_attest_block
+    if not should_attest_block(
+        block, mempool, current_block_height, is_includable=is_includable,
+    ):
+        return None
+    return create_attestation(
+        validator_entity, block.block_hash, block.header.block_number,
+    )
+
+
 def verify_attestation(attestation: Attestation, public_key: bytes) -> bool:
     """Verify that an attestation signature is valid."""
     msg_hash = _hash(attestation.signable_data())
