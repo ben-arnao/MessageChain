@@ -72,6 +72,20 @@ class MessageType(Enum):
     REQUEST_STATE_CHECKPOINT = "request_state_checkpoint"
     RESPONSE_STATE_CHECKPOINT = "response_state_checkpoint"
 
+    # Active mempool replication — anti-censorship layer on top of
+    # passive ANNOUNCE_TX gossip.  A node periodically advertises a
+    # compact digest (sorted list of tx_hashes) of its current mempool
+    # to a random subset of peers; each recipient pulls any hashes it
+    # is missing via REQUEST_MEMPOOL_TX.  The responder replies with
+    # the existing ANNOUNCE_TX — one tx-broadcast code path, no
+    # duplication.  This defeats the single-captured-node censorship
+    # attack: a tx that reaches ANY honest node propagates to every
+    # honest node within one sync interval.  Payload shapes:
+    #   MEMPOOL_DIGEST:     {"hashes": [<hex>, ...]}
+    #   REQUEST_MEMPOOL_TX: {"hashes": [<hex>, ...]}
+    MEMPOOL_DIGEST = "mempool_digest"
+    REQUEST_MEMPOOL_TX = "request_mempool_tx"
+
 
 @dataclass
 class NetworkMessage:

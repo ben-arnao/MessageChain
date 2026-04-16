@@ -23,6 +23,8 @@ from messagechain.config import (
     DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
     OUTBOUND_BLOCK_RELAY_ONLY_SLOTS, OUTBOUND_FULL_RELAY_SLOTS,
+    MEMPOOL_SYNC_INTERVAL_SEC, MEMPOOL_SYNC_FANOUT,
+    MEMPOOL_DIGEST_MAX_HASHES, MEMPOOL_DIGEST_MIN_INTERVAL_SEC,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -133,6 +135,19 @@ class Node:
 
         # inv/getdata: track recently seen tx hashes (avoid re-requesting)
         self._seen_txs: OrderedDict = OrderedDict()
+
+        # Active mempool replication — anti-censorship.  Tracks:
+        #   _mempool_digest_last_seen[peer_addr] = timestamp of last
+        #       MEMPOOL_DIGEST received from that peer, used to enforce
+        #       MEMPOOL_DIGEST_MIN_INTERVAL_SEC (rejects digest spam).
+        #   _mempool_requested_hashes[peer_addr] = set of tx_hash_hex
+        #       we asked for from this peer in the CURRENT sync cycle.
+        #       When we advertise a hash and the peer doesn't deliver,
+        #       we do NOT re-request — silent give-up until a future
+        #       cycle advertises it again.  The set is cleared when a
+        #       new digest arrives from the peer.
+        self._mempool_digest_last_seen: dict[str, float] = {}
+        self._mempool_requested_hashes: dict[str, set] = {}
 
     def _on_sync_offense(self, peer_address: str, points: int, reason: str):
         """Callback invoked by ChainSyncer for sync-time misbehavior."""
@@ -278,6 +293,12 @@ class Node:
         # peers discovered via gossip, so PEER_LIST flooding cannot force
         # direct connections to attacker-chosen IPs.
         asyncio.create_task(self._outbound_maintenance_loop())
+
+        # Start the active mempool-replication loop — periodically sends
+        # a compact digest to a random subset of peers so a tx that
+        # reaches ANY honest node propagates to every honest node within
+        # one sync interval (anti-censorship; see MEMPOOL_DIGEST docstring).
+        asyncio.create_task(self._mempool_sync_loop())
 
     async def stop(self):
         self._running = False
@@ -647,6 +668,12 @@ class Node:
         elif msg.msg_type == MessageType.ANNOUNCE_FINALITY_VOTE:
             await self._handle_announce_finality_vote(msg.payload, peer)
 
+        elif msg.msg_type == MessageType.MEMPOOL_DIGEST:
+            await self._handle_mempool_digest(msg.payload, peer)
+
+        elif msg.msg_type == MessageType.REQUEST_MEMPOOL_TX:
+            await self._handle_request_mempool_tx(msg.payload, peer)
+
     @staticmethod
     def _is_valid_peer_address(host: str, port) -> bool:
         """Reject non-routable IPs and out-of-range ports (eclipse resistance).
@@ -985,6 +1012,240 @@ class Node:
                 sender_id=self.entity.entity_id_hex,
             )
             await self._broadcast(relay_msg, exclude=peer.address)
+
+    # ── Active mempool replication (anti-censorship) ──────────────
+
+    async def _handle_mempool_digest(self, payload: dict, peer: Peer):
+        """Handle an incoming MEMPOOL_DIGEST from a peer.
+
+        Reads `hashes` (list of hex tx_hash strings representing the
+        peer's current mempool), diffs against our local mempool, and
+        issues a single REQUEST_MEMPOOL_TX for the missing hashes.
+
+        DoS guards:
+          1. Size cap — reject any digest with > MEMPOOL_DIGEST_MAX_HASHES
+             entries.  A legitimate node's digest is bounded by the cap
+             enforced on our own outgoing digest; a peer claiming more
+             is trying to amplify our work.
+          2. Per-peer interval throttle — reject any second digest from
+             the same peer inside MEMPOOL_DIGEST_MIN_INTERVAL_SEC.  Digest
+             diffing is O(N) on both sides, so without this a spam peer
+             could saturate our event loop.
+        """
+        import time as _time
+
+        hashes = payload.get("hashes", [])
+        if not isinstance(hashes, list):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "digest_not_list",
+            )
+            return
+
+        if len(hashes) > MEMPOOL_DIGEST_MAX_HASHES:
+            # A peer that advertises more hashes than we would ever send
+            # is either buggy or hostile.  Reject and score.
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "digest_too_large",
+            )
+            return
+
+        # Per-peer interval throttle.  Record the arrival time even when
+        # we reject the content so the next arrival also sees a fresh
+        # timestamp (locks an attacker into steady-state no matter what).
+        now = _time.time()
+        last = self._mempool_digest_last_seen.get(peer.address)
+        self._mempool_digest_last_seen[peer.address] = now
+        if last is not None and (now - last) < MEMPOOL_DIGEST_MIN_INTERVAL_SEC:
+            # Silently drop — no offense score; honest peers might retry
+            # on a tight schedule during catch-up.
+            return
+
+        # A fresh digest — clear our "requested-in-this-cycle" set so we
+        # are willing to ask for hashes that the peer re-advertises.
+        self._mempool_requested_hashes[peer.address] = set()
+
+        # Compute the set of hashes we don't already have.  Also skip
+        # anything we've already requested from this peer (can't happen
+        # now since we just cleared, but belt-and-suspenders for future
+        # refactors that might interleave).
+        needed: list[str] = []
+        for h in hashes:
+            if not isinstance(h, str):
+                # Malformed entry — whole digest is suspect, score.
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "digest_non_str_hash",
+                )
+                return
+            tx_hash_bytes = parse_hex(h)
+            if tx_hash_bytes is None or len(tx_hash_bytes) != 32:
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "digest_bad_hash",
+                )
+                return
+            if tx_hash_bytes in self.mempool.pending:
+                continue
+            needed.append(h)
+            self._mempool_requested_hashes[peer.address].add(h)
+
+        if not needed:
+            return
+
+        # Cap the request size to the digest cap — a hostile digest that
+        # snuck through the size gate (should not happen) still can't
+        # explode our outgoing frame.
+        needed = needed[:MEMPOOL_DIGEST_MAX_HASHES]
+        req = NetworkMessage(
+            msg_type=MessageType.REQUEST_MEMPOOL_TX,
+            payload={"hashes": needed},
+            sender_id=self.entity.entity_id_hex,
+        )
+        if peer.writer:
+            try:
+                await write_message(peer.writer, req)
+            except Exception:
+                peer.is_connected = False
+
+    async def _handle_request_mempool_tx(self, payload: dict, peer: Peer):
+        """Handle a peer's REQUEST_MEMPOOL_TX: for each hash we have in
+        our mempool, respond with the full tx as ANNOUNCE_TX (reusing
+        the existing tx-broadcast path — one code path, no duplication).
+        Hashes we don't have are silently dropped (no error amplification)."""
+        hashes = payload.get("hashes", [])
+        if not isinstance(hashes, list):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "req_mempool_not_list",
+            )
+            return
+        if len(hashes) > MEMPOOL_DIGEST_MAX_HASHES:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION, "req_mempool_too_large",
+            )
+            return
+
+        for h in hashes:
+            if not isinstance(h, str):
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "req_mempool_non_str",
+                )
+                return
+            tx_hash_bytes = parse_hex(h)
+            if tx_hash_bytes is None or len(tx_hash_bytes) != 32:
+                self.ban_manager.record_offense(
+                    peer.address, OFFENSE_PROTOCOL_VIOLATION, "req_mempool_bad_hash",
+                )
+                return
+            tx = self.mempool.pending.get(tx_hash_bytes)
+            if tx is None:
+                # Silent drop — peer asked for something we don't have.
+                # Don't penalize (could be a race with our own eviction).
+                continue
+            msg = NetworkMessage(
+                msg_type=MessageType.ANNOUNCE_TX,
+                payload=tx.serialize(),
+                sender_id=self.entity.entity_id_hex,
+            )
+            if peer.writer:
+                try:
+                    await write_message(peer.writer, msg)
+                    peer.known_txs.add(h)
+                except Exception:
+                    peer.is_connected = False
+                    return
+
+    def _build_mempool_digest_payload(self) -> dict:
+        """Build the outgoing MEMPOOL_DIGEST payload: sorted tx_hashes,
+        capped at MEMPOOL_DIGEST_MAX_HASHES.
+
+        Deterministic sort on hex encoding keeps the digest stable across
+        reorderings and makes diffing cheaper on the receiver (though the
+        receiver uses a dict lookup, so strict sort is not required for
+        correctness — only for predictable framing)."""
+        hashes = sorted(h.hex() for h in self.mempool.pending.keys())
+        if len(hashes) > MEMPOOL_DIGEST_MAX_HASHES:
+            # An honest node's mempool should never grow past this cap
+            # (MEMPOOL_MAX_SIZE <= 5000 by default), but in case config
+            # drifts, truncate rather than send an oversized frame.
+            hashes = hashes[:MEMPOOL_DIGEST_MAX_HASHES]
+        return {"hashes": hashes}
+
+    def _select_mempool_sync_peers(self) -> list[Peer]:
+        """Pick up to MEMPOOL_SYNC_FANOUT connected peers for one sync cycle.
+
+        Uses os.urandom for unpredictability — an attacker trying to
+        figure out which peer saw our digest shouldn't be able to
+        predict it.  The choice is uniform over the connected peer set;
+        in practice this mixes full-relay and block-relay-only peers
+        equally, which is what we want for anti-censorship: even a peer
+        that doesn't normally relay txs should still gossip digests so
+        honest mempools converge.
+        """
+        connected = [p for p in self.peers.values()
+                     if p.is_connected and p.writer is not None]
+        if not connected:
+            return []
+        fanout = min(MEMPOOL_SYNC_FANOUT, len(connected))
+        # Shuffle using os.urandom for cryptographic randomness
+        # (we care about peer-selection privacy — see eviction.py for
+        # the same pattern).
+        chosen: list[Peer] = []
+        remaining = list(connected)
+        for _ in range(fanout):
+            idx = int.from_bytes(os.urandom(4), "big") % len(remaining)
+            chosen.append(remaining.pop(idx))
+        return chosen
+
+    async def run_one_mempool_sync_cycle(self) -> int:
+        """Fire one round of active mempool replication.
+
+        Builds a digest of our current mempool and sends it to up to
+        MEMPOOL_SYNC_FANOUT randomly-selected connected peers.  Each
+        recipient will pull the hashes it's missing via REQUEST_MEMPOOL_TX.
+
+        Returns the number of peers the digest was sent to — used by
+        tests and diagnostic RPC endpoints.  Callable from a background
+        tick loop (see _mempool_sync_loop) OR directly by tests that
+        want deterministic per-cycle behavior.
+
+        Design note: this is an active push of a compact advertisement,
+        NOT a passive response.  That's the whole anti-censorship story:
+        a captured node can drop an incoming tx, but it can't prevent
+        honest peers from advertising their mempools to each other.  A
+        tx that reached ANY honest node eventually reaches every honest
+        node that's within MEMPOOL_SYNC_FANOUT hops over a few cycles.
+        """
+        peers = self._select_mempool_sync_peers()
+        if not peers:
+            return 0
+
+        payload = self._build_mempool_digest_payload()
+        msg = NetworkMessage(
+            msg_type=MessageType.MEMPOOL_DIGEST,
+            payload=payload,
+            sender_id=self.entity.entity_id_hex,
+        )
+        sent = 0
+        for p in peers:
+            try:
+                await write_message(p.writer, msg)
+                sent += 1
+            except Exception:
+                p.is_connected = False
+        return sent
+
+    async def _mempool_sync_loop(self):
+        """Background task: fire run_one_mempool_sync_cycle every
+        MEMPOOL_SYNC_INTERVAL_SEC.  Starts after a small random jitter
+        so freshly-booted nodes don't synchronize their digest bursts."""
+        # Jitter: uniform [0, MEMPOOL_SYNC_INTERVAL_SEC) so node restarts
+        # don't produce a thundering-herd digest flood.
+        jitter = int.from_bytes(os.urandom(2), "big") % MEMPOOL_SYNC_INTERVAL_SEC
+        await asyncio.sleep(jitter)
+        while self._running:
+            try:
+                await self.run_one_mempool_sync_cycle()
+            except Exception as e:
+                logger.debug(f"Mempool sync cycle failed: {e}")
+            await asyncio.sleep(MEMPOOL_SYNC_INTERVAL_SEC)
 
     # ── Existing handlers ─────────────────────────────────────────
 
