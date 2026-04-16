@@ -18,6 +18,7 @@ from messagechain.config import (
     MEMPOOL_MAX_ANCESTORS, MEMPOOL_MAX_ORPHAN_TXS,
     MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
     MIN_FEE,
+    FORCED_INCLUSION_WAIT_BLOCKS, FORCED_INCLUSION_SET_SIZE,
 )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
@@ -31,6 +32,14 @@ class Mempool:
                  fee_policy: DynamicFeePolicy | None = None):
         self.pending: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
         self._sender_counts: dict[bytes, int] = defaultdict(int)  # entity_id -> count
+        # Block height at which each tx first entered THIS mempool.  Used by
+        # the forced-inclusion censorship-resistance check: txs that have
+        # been pending for >= FORCED_INCLUSION_WAIT_BLOCKS are eligible to
+        # appear in the top-N "forced" set that a proposer must include or
+        # justify via a structural excuse.  This is per-node subjective (no
+        # two nodes necessarily agree on arrival height), which is why the
+        # enforcement is attester-layer soft, not block-validity hard.
+        self.arrival_heights: dict[bytes, int] = {}
         self.max_size = max_size
         self.tx_ttl = tx_ttl
         self.per_sender_limit = per_sender_limit
@@ -51,13 +60,25 @@ class Mempool:
         # vector if an attacker spams fake slash announcements.
         self.slash_pool_max_size: int = 1000
 
-    def add_transaction(self, tx: MessageTransaction) -> bool:
+    def add_transaction(
+        self,
+        tx: MessageTransaction,
+        arrival_block_height: int | None = None,
+    ) -> bool:
         """
         Add a transaction to the mempool if not already present.
 
         Enforces per-sender limits and global size limits. If the mempool is
         full, the transaction is accepted only if its fee exceeds the
         lowest-fee transaction currently in the pool.
+
+        `arrival_block_height` records the block height at which this node
+        first saw the tx.  Used by the forced-inclusion rule to measure how
+        many blocks a tx has been waiting.  Defaults to 0 — a height of 0
+        means the tx has "always been here" and qualifies for forced
+        inclusion immediately.  Production callers should pass the current
+        chain height so a long-waited tx can be distinguished from a fresh
+        arrival.
         """
         if tx.tx_hash in self.pending:
             return False
@@ -98,6 +119,9 @@ class Mempool:
 
         self.pending[tx.tx_hash] = tx
         self._sender_counts[tx.entity_id] += 1
+        self.arrival_heights[tx.tx_hash] = (
+            arrival_block_height if arrival_block_height is not None else 0
+        )
         return True
 
     def get_transactions(self, max_count: int) -> list[MessageTransaction]:
@@ -110,6 +134,36 @@ class Mempool:
         txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
         return txs[:max_count]
 
+    def get_forced_inclusion_set(
+        self, current_block_height: int,
+    ) -> list[MessageTransaction]:
+        """Return the top-N highest-fee txs that have waited >= K blocks.
+
+        The attester-enforced censorship-resistance rule: these are the txs
+        the NEXT proposer MUST include (or provide a valid structural
+        excuse for omitting).  Ranking is deterministic on a single node:
+            1. Fee descending
+            2. Arrival height ascending (earlier waiter wins tie)
+            3. tx_hash ascending (final deterministic tiebreak)
+
+        Different nodes can see different mempools — that's fine.  Soft
+        attester voting converges on the honest subset; see
+        messagechain.consensus.forced_inclusion for the enforcement path.
+        """
+        cutoff = current_block_height - FORCED_INCLUSION_WAIT_BLOCKS
+        qualifying = [
+            tx for tx in self.pending.values()
+            if self.arrival_heights.get(tx.tx_hash, 0) <= cutoff
+        ]
+        qualifying.sort(
+            key=lambda t: (
+                -t.fee,
+                self.arrival_heights.get(t.tx_hash, 0),
+                t.tx_hash,
+            )
+        )
+        return qualifying[:FORCED_INCLUSION_SET_SIZE]
+
     def _remove_tx(self, tx: MessageTransaction):
         """Remove a single transaction and update sender count."""
         if tx.tx_hash in self.pending:
@@ -117,6 +171,7 @@ class Mempool:
             self._sender_counts[tx.entity_id] = max(0, self._sender_counts[tx.entity_id] - 1)
             if self._sender_counts[tx.entity_id] == 0:
                 del self._sender_counts[tx.entity_id]
+        self.arrival_heights.pop(tx.tx_hash, None)
 
     def remove_transactions(self, tx_hashes: list[bytes]):
         """Remove transactions after they've been included in a block."""
@@ -178,10 +233,15 @@ class Mempool:
         if not verify_transaction(new_tx, public_key):
             return False
 
-        # Remove old, add new
+        # Remove old, add new.  Carry the original arrival height forward
+        # so RBF replacements don't reset the forced-inclusion clock (an
+        # attacker should not be able to cancel a pending censorship duty
+        # by spamming trivial fee bumps).
+        prior_arrival = self.arrival_heights.get(existing.tx_hash, 0)
         self._remove_tx(existing)
         self.pending[new_tx.tx_hash] = new_tx
         self._sender_counts[new_tx.entity_id] += 1
+        self.arrival_heights[new_tx.tx_hash] = prior_arrival
         return True
 
     def get_fee_estimate(self) -> int:

@@ -217,6 +217,30 @@ HANDSHAKE_TIMEOUT = 5  # seconds
 BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
 BAN_DURATION = 86400      # ban length in seconds (24 hours)
 
+# Censorship resistance — forced inclusion list (attester-enforced)
+#
+# An attester tracks every tx it has held in its local mempool for at
+# least FORCED_INCLUSION_WAIT_BLOCKS blocks.  From that set, it ranks
+# by fee (descending, tiebreak by arrival height then hash) and takes
+# the top FORCED_INCLUSION_SET_SIZE.  A proposer that omits any of
+# these forced txs without a valid structural excuse (byte budget
+# exhausted, tx count cap reached, tx no longer includable) is being
+# censored — the attester votes NO on the block.
+#
+# 2/3 stake must attest for finality, so any 1/3 honest stake that
+# sees the censored tx is enough to veto the block without needing
+# global mempool consensus.  This is deliberately soft enforcement:
+# block validity itself is unchanged (avoiding the impossible
+# requirement of global-mempool agreement), but finality is gated.
+#
+# Parameters tuned for BLOCK_TIME_TARGET=600s and MAX_TXS_PER_BLOCK=20:
+#   K=3 → ~30 min wait before a tx becomes "forced" (enough to propagate
+#         through honest relay paths, short enough to punish censors)
+#   N=5 → 25% of a full block, substantial but not the whole block so
+#         proposers retain room to order other txs by fee
+FORCED_INCLUSION_WAIT_BLOCKS = 3
+FORCED_INCLUSION_SET_SIZE = 5
+
 # Mempool
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
