@@ -485,6 +485,26 @@ MAX_FINALITY_VOTES_PER_BLOCK = 200    # DoS guard on block-size expansion via fi
 # realistic gossip-lag window and still bounds the lookback.
 FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 
+# Bitcoin anchoring — external immutability proof via OP_RETURN.
+#
+# Periodically commit MessageChain block hashes into Bitcoin, creating an
+# independent proof that survives even total MessageChain validator collusion.
+# No single chain's validator set can be trusted for 1000 years — Bitcoin
+# anchors let anyone verify the chain was NOT rewritten by checking the
+# OP_RETURN records on the most durable PoW chain in existence.
+#
+# ANCHOR_INTERVAL: blocks between anchors.  100 blocks at 600s = ~16h.
+# Cost: ~$1/anchor at current Bitcoin fee rates.  Cheap insurance.
+#
+# ANCHOR_DOMAIN_TAG: mixed into the anchor hash to prevent collision with
+# other OP_RETURN data on Bitcoin.  Version-tagged (V1) for crypto agility.
+#
+# ANCHOR_OP_RETURN_PREFIX: 2-byte prefix in the OP_RETURN output for
+# identification when scanning Bitcoin blocks for MC anchors.
+ANCHOR_INTERVAL = 100                    # blocks between anchors (~16h)
+ANCHOR_DOMAIN_TAG = b"MCANCHOR_V1"       # domain separation
+ANCHOR_OP_RETURN_PREFIX = b"MC"          # 2-byte prefix in OP_RETURN for identification
+
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 # Supermajority (2/3) required to approve a BINDING proposal (treasury
