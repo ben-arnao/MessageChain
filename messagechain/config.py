@@ -390,6 +390,34 @@ CHAIN_ID = b"messagechain-v1"
 FINALITY_THRESHOLD_NUMERATOR = 2     # 2/3 of stake must attest for justification
 FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= total * 2
 
+# Finality signing — explicit 2/3-stake commitment to block hashes every
+# FINALITY_INTERVAL blocks.  Finalized blocks cannot be reorganized by any
+# later fork regardless of stake weight.  This is the long-range-attack
+# defense: in year 500, an attacker who has acquired early validator keys
+# (leak, coercion, purchase) cannot rewrite history past a finalized
+# checkpoint because the finalized-block hashes are persisted on every
+# honest node as a cryptographic commitment that is never retroactively
+# revisable by any later fork.
+#
+# Distinct from the attestation layer: attestations live in memory and
+# vote for the immediate parent block every slot.  FinalityVotes are
+# persistent checkpoints that gossip separately, live in a dedicated
+# mempool pool, and are included in later blocks where the proposer
+# earns a small bounty per vote included (from treasury).  A validator
+# signing two conflicting FinalityVotes for the same height is slashed
+# 100% of stake plus full escrow burn, the same penalty as double-sign
+# or double-attestation.
+FINALITY_INTERVAL = 100               # blocks between finality checkpoints (~16h at 600s)
+FINALITY_VOTE_INCLUSION_REWARD = 1    # tokens paid to proposer per vote included (from treasury)
+FINALITY_INACTIVITY_PENALTY = 0       # placeholder — reward-loss, not slashing; tune later
+MAX_FINALITY_VOTES_PER_BLOCK = 200    # DoS guard on block-size expansion via finality votes
+# A finality vote for a block older than FINALITY_VOTE_MAX_AGE blocks is
+# rejected — prevents spam gossip of votes targeting ancient blocks that
+# are already beyond the rewrite horizon anyway.  10 × FINALITY_INTERVAL
+# = 1000 blocks (~7 days at 600s) is comfortably larger than any
+# realistic gossip-lag window and still bounds the lookback.
+FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
+
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 # Supermajority (2/3) required to approve a BINDING proposal (treasury

@@ -147,6 +147,22 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_entity_indices_index
                 ON entity_indices(entity_index);
+
+            -- Finalized block checkpoints (long-range-attack defense).
+            -- A (block_number, block_hash) pair persisted the moment a
+            -- block accumulates 2/3-stake in FinalityVotes.  These are
+            -- permanent, append-only: no reorg ever removes a row here.
+            -- On cold restart, the blockchain rehydrates
+            -- FinalityCheckpoints.finalized_hashes/by_height from this
+            -- table, so the reorg-rejection rule (no chain may
+            -- contradict a finalized block) survives the full process
+            -- lifecycle.  Rows are small (32 B hash + 8 B height ≈ 40 B
+            -- per entry, one every FINALITY_INTERVAL blocks) — at 100
+            -- blocks/checkpoint and 600 s blocks that's ~525 rows/year.
+            CREATE TABLE IF NOT EXISTS finalized_blocks (
+                block_number INTEGER PRIMARY KEY,
+                block_hash BLOB NOT NULL UNIQUE
+            );
         """)
         conn.commit()
 
@@ -642,6 +658,45 @@ class ChainDB:
     def get_all_processed_evidence(self) -> set[bytes]:
         cur = self._conn.execute("SELECT evidence_hash FROM processed_evidence")
         return {bytes(row[0]) for row in cur.fetchall()}
+
+    # ── Finalized Block Checkpoints ─────────────────────────────
+
+    def add_finalized_block(self, block_number: int, block_hash: bytes):
+        """Persist a (block_number, block_hash) finality checkpoint.
+
+        Idempotent via INSERT OR IGNORE — once a height is finalized,
+        its hash is fixed for eternity; a second call with a different
+        hash is ignored (the pre-existing row wins, which is the
+        correct long-range-attack-defense semantic).
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO finalized_blocks "
+            "(block_number, block_hash) VALUES (?, ?)",
+            (block_number, block_hash),
+        )
+        self._conn.commit()
+
+    def is_block_finalized(self, block_hash: bytes) -> bool:
+        cur = self._conn.execute(
+            "SELECT 1 FROM finalized_blocks WHERE block_hash = ?",
+            (block_hash,),
+        )
+        return cur.fetchone() is not None
+
+    def get_finalized_block_at_height(self, block_number: int) -> bytes | None:
+        cur = self._conn.execute(
+            "SELECT block_hash FROM finalized_blocks WHERE block_number = ?",
+            (block_number,),
+        )
+        row = cur.fetchone()
+        return bytes(row[0]) if row else None
+
+    def get_all_finalized_blocks(self) -> dict[int, bytes]:
+        """Return {block_number: block_hash} for every finalized checkpoint."""
+        cur = self._conn.execute(
+            "SELECT block_number, block_hash FROM finalized_blocks"
+        )
+        return {row[0]: bytes(row[1]) for row in cur.fetchall()}
 
     # ── Batch Operations (for state snapshots / reorgs) ──────────
 

@@ -322,6 +322,17 @@ class Block:
     # unknown to seeds B/C" splits that would cause peer nodes to
     # reject blocks containing that entity's first transfer.
     registration_transactions: list = field(default_factory=list)
+    # Long-range-attack defense: FinalityVotes signed by validators
+    # that commit to a specific block hash at a specific height.  When
+    # >= 2/3 of stake has signed votes for a block and those votes
+    # have been included in any later block, the target block becomes
+    # FINALIZED — no subsequent reorg may revert it regardless of
+    # stake weight.  Proposers that include votes earn a small bounty
+    # from treasury (FINALITY_VOTE_INCLUSION_REWARD).  Defense is
+    # additive to the existing attestation-layer finality and
+    # persists across restart, so a cold-booted node inherits the
+    # chain's irreversibility commitments.
+    finality_votes: list = field(default_factory=list)  # list[FinalityVote]
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -360,6 +371,8 @@ class Block:
             result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
         if self.registration_transactions:
             result["registration_transactions"] = [tx.serialize() for tx in self.registration_transactions]
+        if self.finality_votes:
+            result["finality_votes"] = [v.serialize() for v in self.finality_votes]
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -387,6 +400,7 @@ class Block:
             stake_count      (u32)  + N x (stake_len u32 + stake_blob)
             unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
             reg_count        (u32)  + N x (reg_len u32 + reg_blob)
+            fvote_count      (u32)  + N x (fvote_len u32 + fvote_blob)
             32               block_hash
 
         `state` is threaded down to each child tx's `to_bytes(state)`
@@ -483,6 +497,7 @@ class Block:
             enc_list(self.stake_transactions),
             enc_list(self.unstake_transactions),
             enc_list(self.registration_transactions),
+            enc_list(self.finality_votes),
             self.block_hash,
         ])
 
@@ -601,6 +616,18 @@ class Block:
         unstake_txs = dec_list(UnstakeTransaction)
         registration_txs = dec_list(RegistrationTransaction)
 
+        # Finality votes.  Added after registration_transactions so
+        # older stored blocks (which predate this field) would NOT
+        # decode with this layout — a restart against such blobs would
+        # trip the trailing-bytes check below.  That's intentional: a
+        # node that hasn't resynced since the finality upgrade must
+        # replay the chain anyway before it can validate the finality
+        # rule, so forcing a hard decode boundary catches a
+        # partially-upgraded setup rather than silently returning
+        # empty finality_votes.
+        from messagechain.consensus.finality import FinalityVote
+        finality_votes = dec_list(FinalityVote)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -616,6 +643,7 @@ class Block:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             registration_transactions=registration_txs,
+            finality_votes=finality_votes,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -667,12 +695,19 @@ class Block:
                 RegistrationTransaction.deserialize(r)
                 for r in data["registration_transactions"]
             ]
+        finality_votes = []
+        if data.get("finality_votes"):
+            from messagechain.consensus.finality import FinalityVote
+            finality_votes = [
+                FinalityVote.deserialize(v) for v in data["finality_votes"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
                     unstake_transactions=unstake_txs,
-                    registration_transactions=registration_txs)
+                    registration_transactions=registration_txs,
+                    finality_votes=finality_votes)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

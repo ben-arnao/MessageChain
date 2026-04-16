@@ -46,6 +46,10 @@ from messagechain.consensus.slashing import (
 from messagechain.consensus.attestation import (
     Attestation, FinalityTracker, verify_attestation,
 )
+from messagechain.consensus.finality import (
+    FinalityVote, FinalityCheckpoints, verify_finality_vote,
+    FinalityDoubleVoteEvidence,
+)
 from messagechain.economics.inflation import SupplyTracker
 from messagechain.crypto.keys import verify_signature
 from messagechain.crypto.sig_cache import get_global_cache
@@ -78,6 +82,7 @@ def compute_block_sig_cost(block) -> int:
         + len(getattr(block, "registration_transactions", []))
         + 1  # proposer signature
         + len(block.attestations)
+        + len(getattr(block, "finality_votes", []))
     )
 
 
@@ -123,6 +128,15 @@ class Blockchain:
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
+        # Long-range-attack defense — persistent finality checkpoints.
+        # Distinct from `self.finality` (attestation-layer, in-memory,
+        # immediate-parent finality).  FinalityCheckpoints accumulates
+        # explicit FinalityVotes included in blocks; when a target
+        # block accumulates 2/3 of stake at its height, its hash is
+        # persisted via ChainDB.add_finalized_block so the reorg-
+        # rejection rule survives restart.  Loaded from disk in
+        # _load_from_db; rehydrated empty for in-memory chains.
+        self.finalized_checkpoints: FinalityCheckpoints = FinalityCheckpoints()
         # On-chain governance state: proposals, votes, and append-only
         # audit logs for executed binding outcomes.  Block processing
         # calls _apply_governance_block(block) which dispatches
@@ -259,6 +273,19 @@ class Blockchain:
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
             self.slashed_validators = self.db.get_all_slashed()
+
+        # Restore finalized-block checkpoints (long-range defense).
+        # The (block_number -> block_hash) set persisted by the
+        # on-chain finality path is the cryptographic commitment that
+        # survives process restart.  Rehydrating it into
+        # FinalityCheckpoints is what makes the reorg-rejection rule
+        # durable — without this, a cold-booted node would accept a
+        # competing long-range chain because it has no in-memory
+        # record of what was finalized pre-restart.  Gated by attr
+        # check so an older chaindb without the table still loads.
+        if hasattr(self.db, 'get_all_finalized_blocks'):
+            for bn, bh in self.db.get_all_finalized_blocks().items():
+                self.finalized_checkpoints.mark_finalized(bh, bn)
 
         # Restore processed-evidence set so a restart cannot re-apply an
         # already-consumed slashing evidence transaction (which would let
@@ -1088,8 +1115,13 @@ class Blockchain:
 
         # Verify the evidence itself (two valid conflicting signatures)
         offender_pk = self.public_keys[tx.evidence.offender_id]
+        from messagechain.consensus.finality import (
+            FinalityDoubleVoteEvidence, verify_finality_double_vote_evidence,
+        )
         if isinstance(tx.evidence, AttestationSlashingEvidence):
             valid, reason = verify_attestation_slashing_evidence(tx.evidence, offender_pk)
+        elif isinstance(tx.evidence, FinalityDoubleVoteEvidence):
+            valid, reason = verify_finality_double_vote_evidence(tx.evidence, offender_pk)
         else:
             valid, reason = verify_slashing_evidence(tx.evidence, offender_pk)
         if not valid:
@@ -1114,6 +1146,9 @@ class Blockchain:
             return evidence.header_a.block_number
         if hasattr(evidence, 'attestation_a'):
             return evidence.attestation_a.block_number
+        if hasattr(evidence, 'vote_a'):
+            # FinalityDoubleVoteEvidence: use the target block number.
+            return evidence.vote_a.target_block_number
         return None
 
     def apply_slash_transaction(self, tx: SlashTransaction, proposer_id: bytes) -> tuple[bool, str]:
@@ -1325,6 +1360,7 @@ class Blockchain:
         unstake_transactions: list | None = None,
         governance_txs: list | None = None,
         registration_transactions: list | None = None,
+        finality_votes: list | None = None,
         proposer_signature_leaf_index: int | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
@@ -1692,6 +1728,28 @@ class Blockchain:
             sim_balances = dict(sim_supply.balances)
             sim_staked = dict(sim_supply.staked)
 
+        # Simulate finality votes.  Two side effects touch the state
+        # root:
+        #   a) treasury → proposer bounty of FINALITY_VOTE_INCLUSION_REWARD
+        #      per vote (capped at available treasury balance)
+        #   b) signer's leaf watermark bumps to (leaf_index + 1)
+        # Must byte-mirror _apply_finality_votes or honest validators
+        # will reject otherwise-valid blocks with a state_root mismatch.
+        if finality_votes:
+            from messagechain.config import (
+                FINALITY_VOTE_INCLUSION_REWARD as _FVR,
+            )
+            for fv in finality_votes:
+                _bump_wm(fv.signer_entity_id, fv.signature.leaf_index)
+                if _FVR > 0:
+                    _tbal = sim_balances.get(TREASURY_ENTITY_ID, 0)
+                    _payout = min(_FVR, _tbal)
+                    if _payout > 0:
+                        sim_balances[TREASURY_ENTITY_ID] = _tbal - _payout
+                        sim_balances[proposer_id] = (
+                            sim_balances.get(proposer_id, 0) + _payout
+                        )
+
         return compute_state_root(
             sim_balances, sim_nonces, sim_staked,
             authority_keys=sim_authority_keys,
@@ -1715,6 +1773,7 @@ class Blockchain:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         registration_transactions: list | None = None,
+        finality_votes: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -1747,6 +1806,7 @@ class Blockchain:
             unstake_transactions=unstake_transactions,
             governance_txs=governance_txs,
             registration_transactions=registration_transactions,
+            finality_votes=finality_votes,
             proposer_signature_leaf_index=expected_proposer_leaf,
         )
         mtp = self.get_median_time_past()
@@ -1765,6 +1825,7 @@ class Blockchain:
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
             registration_transactions=registration_transactions,
+            finality_votes=finality_votes,
             timestamp=timestamp,
         )
 
@@ -1809,6 +1870,99 @@ class Blockchain:
                 return False, f"Invalid attestation signature from {att.validator_id.hex()[:16]}"
 
         return True, "Attestations valid"
+
+    def _validate_finality_votes(self, block: Block) -> tuple[bool, str]:
+        """Validate all FinalityVotes embedded in a block.
+
+        Checks:
+        1. Count <= MAX_FINALITY_VOTES_PER_BLOCK (DoS guard)
+        2. Each signer is a registered, non-revoked entity
+        3. The target block exists in our local view (no votes for
+           phantom blocks)
+        4. Target block is not older than FINALITY_VOTE_MAX_AGE_BLOCKS
+           below the current tip (prevents spam votes on ancient blocks)
+        5. Each vote signature verifies under the signer's public key
+        6. No two votes in the same block name the same signer at the
+           same target height (a conflict in ONE block is a slashable
+           offense too, but we reject the whole block first because
+           it's provably malformed by the proposer)
+
+        Returns (ok, reason).
+        """
+        from messagechain.config import (
+            MAX_FINALITY_VOTES_PER_BLOCK, FINALITY_VOTE_MAX_AGE_BLOCKS,
+        )
+        votes = getattr(block, "finality_votes", [])
+        if not votes:
+            return True, "No finality votes"
+        if len(votes) > MAX_FINALITY_VOTES_PER_BLOCK:
+            return False, (
+                f"Too many finality votes: {len(votes)} > "
+                f"{MAX_FINALITY_VOTES_PER_BLOCK}"
+            )
+        seen_signer_height: set[tuple[bytes, int]] = set()
+        current_height = block.header.block_number
+        for v in votes:
+            if v.signer_entity_id not in self.public_keys:
+                return False, (
+                    f"Finality vote from unknown entity "
+                    f"{v.signer_entity_id.hex()[:16]}"
+                )
+            if v.signer_entity_id in self.revoked_entities:
+                return False, (
+                    f"Finality vote from revoked entity "
+                    f"{v.signer_entity_id.hex()[:16]}"
+                )
+            if v.signer_entity_id in self.slashed_validators:
+                return False, (
+                    f"Finality vote from slashed entity "
+                    f"{v.signer_entity_id.hex()[:16]}"
+                )
+            # Target block must be in our current view
+            target = self.get_block_by_hash(v.target_block_hash)
+            if target is None:
+                return False, (
+                    f"Finality vote targets unknown block "
+                    f"{v.target_block_hash.hex()[:16]}"
+                )
+            if target.header.block_number != v.target_block_number:
+                return False, (
+                    f"Finality vote block_number {v.target_block_number} "
+                    f"does not match target block's actual height "
+                    f"{target.header.block_number}"
+                )
+            # Max-age horizon: votes on ancient blocks are rejected.
+            # (Current block is being proposed; its number == parent+1.
+            # We compare against the new height being validated.)
+            if current_height - v.target_block_number > FINALITY_VOTE_MAX_AGE_BLOCKS:
+                return False, (
+                    f"Finality vote too old: target #{v.target_block_number} "
+                    f"is more than {FINALITY_VOTE_MAX_AGE_BLOCKS} blocks "
+                    f"below tip #{current_height}"
+                )
+            # Signature verification
+            pk = self.public_keys[v.signer_entity_id]
+            if not verify_finality_vote(v, pk):
+                return False, (
+                    f"Invalid finality vote signature from "
+                    f"{v.signer_entity_id.hex()[:16]}"
+                )
+            # Reject block if a proposer packs two votes from the same
+            # signer at the same height (self-conflicting block).  An
+            # honest block author trims these; a malicious one produces
+            # them as a griefing vector.  We reject the block outright
+            # rather than half-apply the votes, and the slashable
+            # offense still stands if the two conflicting votes reach
+            # the slashing path via gossip.
+            key = (v.signer_entity_id, v.target_block_number)
+            if key in seen_signer_height:
+                return False, (
+                    f"Duplicate finality vote signer/height in block: "
+                    f"{v.signer_entity_id.hex()[:16]} at "
+                    f"#{v.target_block_number}"
+                )
+            seen_signer_height.add(key)
+        return True, "Finality votes valid"
 
     def _process_attestations(self, block: Block, stakes: dict[bytes, int]):
         """Process attestations in a block, updating finality tracker.
@@ -1859,6 +2013,90 @@ class Blockchain:
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
                 )
+
+    def _apply_finality_votes(self, block: Block, proposer_id: bytes):
+        """Apply finality votes: bounty, watermark, checkpoint update.
+
+        Called from _apply_block_state.  Every vote is individually
+        validated at this point (validate_block already ran); here we
+        just:
+
+          1. Credit FINALITY_VOTE_INCLUSION_REWARD from the treasury
+             entity to the proposer for each vote included.  If the
+             treasury is short, we simply pay what the treasury has —
+             keeps this from ever producing negative balances.
+          2. Bump the signer's leaf watermark (a finality vote
+             consumes a WOTS+ leaf just like any other signed
+             artifact; observable on chain).
+          3. Feed the vote into FinalityCheckpoints.  If the target
+             crosses the 2/3-stake threshold, mark it finalized and
+             persist the checkpoint so the long-range-defense rule
+             survives restart.
+          4. Pipe any auto-generated FinalityDoubleVoteEvidence into
+             the slashing path so equivocating signers are burned
+             100% immediately (same policy as double-attestation).
+        """
+        votes = getattr(block, "finality_votes", [])
+        if not votes:
+            return
+        from messagechain.config import (
+            FINALITY_VOTE_INCLUSION_REWARD, TREASURY_ENTITY_ID,
+        )
+        # 1+2: per-vote bounty and watermark
+        for v in votes:
+            self._bump_watermark(v.signer_entity_id, v.signature.leaf_index)
+            if FINALITY_VOTE_INCLUSION_REWARD > 0:
+                treasury_bal = self.supply.balances.get(TREASURY_ENTITY_ID, 0)
+                payout = min(FINALITY_VOTE_INCLUSION_REWARD, treasury_bal)
+                if payout > 0:
+                    self.supply.balances[TREASURY_ENTITY_ID] = (
+                        treasury_bal - payout
+                    )
+                    self.supply.balances[proposer_id] = (
+                        self.supply.balances.get(proposer_id, 0) + payout
+                    )
+
+        # 3: checkpoint update.  Use the stake snapshot at the
+        # target block so a validator who has since unstaked can
+        # still be counted for finalizing a block they voted for.
+        # Fall back to live staked map for very old targets whose
+        # snapshot was pruned.
+        for v in votes:
+            pinned = self._stake_snapshots.get(v.target_block_number)
+            stake_map = pinned if pinned is not None else dict(self.supply.staked)
+            signer_stake = stake_map.get(v.signer_entity_id, 0)
+            total_stake = sum(stake_map.values())
+            crossed = self.finalized_checkpoints.add_vote(
+                v, signer_stake, total_stake,
+            )
+            if crossed:
+                # Persist the newly-finalized hash so a restart
+                # rehydrates it and the reorg-rejection rule holds.
+                if self.db is not None and hasattr(
+                    self.db, "add_finalized_block",
+                ):
+                    self.db.add_finalized_block(
+                        v.target_block_number, v.target_block_hash,
+                    )
+                logger.info(
+                    f"FINALIZED via vote: block #{v.target_block_number} "
+                    f"({v.target_block_hash.hex()[:16]}) crossed the "
+                    f"2/3-stake commitment threshold"
+                )
+
+        # 4: auto-slash equivocating signers.  We produce evidence
+        # but do NOT apply the slash here (slashing has its own
+        # validation + on-chain evidence-tx flow).  Surface the
+        # evidence on the Blockchain instance so operators / a
+        # follow-up slash tx can consume it.  Re-use the existing
+        # slashing plumbing: attach to the same list the attestation-
+        # layer auto-slash uses, since it's the same "pending
+        # evidence seen by consensus, not yet on-chain" bucket.
+        pending = self.finalized_checkpoints.get_pending_slashing_evidence()
+        if pending:
+            if not hasattr(self, "_pending_finality_slashes"):
+                self._pending_finality_slashes = []
+            self._pending_finality_slashes.extend(pending)
 
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block. See _process_attestations."""
@@ -1978,6 +2216,16 @@ class Blockchain:
             ok, reason = _check_leaf(att.validator_id, att.signature.leaf_index, "attestation")
             if not ok:
                 return False, reason
+        # Finality votes share the signer's hot-key leaf namespace.
+        # Reusing a leaf between an attestation and a finality vote is
+        # the same WOTS+ private-key leak as any other reuse, so the
+        # dedupe set is the same.
+        for v in getattr(block, "finality_votes", []):
+            ok, reason = _check_leaf(
+                v.signer_entity_id, v.signature.leaf_index, "finality vote",
+            )
+            if not ok:
+                return False, reason
         for atx in getattr(block, "authority_txs", []):
             # authority txs (SetAuthorityKey, Revoke, KeyRotation) each carry a
             # signature keyed by their respective entity field.  Dispatch to
@@ -2038,8 +2286,11 @@ class Blockchain:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
         # Verify merkle root. Includes message txs, transfer txs, slash txs,
-        # governance txs, and authority txs — committing each cryptographically
-        # prevents a byzantine relayer from stripping them in transit.
+        # governance txs, authority txs, and finality votes — committing
+        # each cryptographically prevents a byzantine relayer from
+        # stripping them in transit.  FinalityVotes use consensus_hash
+        # (no tx_hash field; they're not transactions) in the same
+        # commitment position so a stripped vote fails merkle verification.
         tx_hashes = (
             [tx.tx_hash for tx in all_txs]
             + [tx.tx_hash for tx in block.slash_transactions]
@@ -2048,6 +2299,7 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "registration_transactions", [])]
+            + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -2196,6 +2448,14 @@ class Blockchain:
 
         # Validate attestations (votes for the parent block)
         valid, reason = self._validate_attestations(block)
+        if not valid:
+            return False, reason
+
+        # Validate embedded FinalityVotes (long-range-attack defense).
+        # Votes reference any prior block (not just the parent); each
+        # carries its own signature keyed by signer_entity_id.  See
+        # _validate_finality_votes for the full rule set.
+        valid, reason = self._validate_finality_votes(block)
         if not valid:
             return False, reason
 
@@ -3040,6 +3300,18 @@ class Blockchain:
         # act on the fully-updated supply/stakes.
         self._apply_governance_block(block)
 
+        # Apply FinalityVotes (long-range-attack defense).  Each vote
+        # feeds into FinalityCheckpoints; when a target block crosses
+        # the 2/3-stake threshold it is added to finalized_hashes and
+        # persisted.  Conflicting votes from the same signer at the
+        # same target height auto-generate slashing evidence that a
+        # third party (or the node itself) can submit as a slash tx.
+        # The proposer earns FINALITY_VOTE_INCLUSION_REWARD per vote
+        # paid from treasury — mirrors the slashing finder's-reward
+        # incentive and gives proposers a reason to actually include
+        # votes instead of silently dropping them.
+        self._apply_finality_votes(block, proposer_id)
+
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
@@ -3236,6 +3508,7 @@ class Blockchain:
                     unstake_transactions=getattr(block, "unstake_transactions", []),
                     governance_txs=getattr(block, "governance_txs", []),
                     registration_transactions=getattr(block, "registration_transactions", []),
+                    finality_votes=getattr(block, "finality_votes", []),
                     proposer_signature_leaf_index=proposer_sig_leaf,
                 )
             except Exception:
@@ -3358,9 +3631,34 @@ class Blockchain:
         # Walk the canonical chain to see if any block at this height is
         # already finalized — accepting a competing block would eventually
         # require reverting finalized state, violating PoS finality.
+        # Two independent layers are consulted:
+        #   * self.finality (attestation-layer, in-memory)
+        #   * self.finalized_checkpoints (FinalityVote-layer, persistent;
+        #     this is the long-range-attack-defense ratchet that survives
+        #     restart)
+        def _is_finalized(blk: Block) -> bool:
+            return (
+                self.finality.is_finalized(blk.block_hash)
+                or self.finalized_checkpoints.is_finalized(blk.block_hash)
+            )
+        # Reject outright if the competing block targets a height whose
+        # finalized hash differs from its own hash.  This is the explicit
+        # long-range rule: no chain may contradict a finalized block.
+        if self.finalized_checkpoints.is_height_finalized(
+            block.header.block_number,
+        ):
+            finalized_hash = self.finalized_checkpoints.finalized_by_height[
+                block.header.block_number
+            ]
+            if finalized_hash != block.block_hash:
+                return False, (
+                    f"Fork rejected — height {block.header.block_number} "
+                    f"has a finalized block ({finalized_hash.hex()[:16]}) "
+                    f"that this fork contradicts"
+                )
         for blk in self.chain:
             if blk.header.block_number == block.header.block_number:
-                if self.finality.is_finalized(blk.block_hash):
+                if _is_finalized(blk):
                     return False, (
                         f"Fork rejected — height {block.header.block_number} "
                         f"has a finalized block ({blk.block_hash.hex()[:16]})"
@@ -3374,7 +3672,7 @@ class Blockchain:
         for blk in self.chain:
             if blk.header.block_number > parent.header.block_number:
                 if blk.header.block_number <= fork_height:
-                    if self.finality.is_finalized(blk.block_hash):
+                    if _is_finalized(blk):
                         return False, (
                             f"Fork rejected — canonical block at height "
                             f"{blk.header.block_number} is finalized"
@@ -3454,9 +3752,16 @@ class Blockchain:
         if len(rollback_blocks) > MAX_REORG_DEPTH:
             return False, f"Reorg rejected — depth {len(rollback_blocks)} exceeds max {MAX_REORG_DEPTH}"
 
-        # Finality boundary: refuse to revert finalized blocks
+        # Finality boundary: refuse to revert finalized blocks.
+        # Check both layers (attestation-finality and persistent
+        # FinalityCheckpoints) — either is sufficient to pin a block
+        # irreversibly.  FinalityCheckpoints is the long-range-attack
+        # defense specifically because it survives restart.
         for blk in rollback_blocks:
-            if self.finality.is_finalized(blk.block_hash):
+            if (
+                self.finality.is_finalized(blk.block_hash)
+                or self.finalized_checkpoints.is_finalized(blk.block_hash)
+            ):
                 return False, (
                     f"Reorg rejected — block #{blk.header.block_number} "
                     f"({blk.block_hash.hex()[:16]}) is finalized"

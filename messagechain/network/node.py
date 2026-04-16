@@ -57,6 +57,9 @@ from messagechain.consensus.slashing import (
     SlashTransaction, verify_slashing_evidence, verify_attestation_slashing_evidence,
     SlashingEvidence, AttestationSlashingEvidence,
 )
+from messagechain.consensus.finality import (
+    FinalityVote, verify_finality_vote,
+)
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
     OFFENSE_INVALID_HEADERS, OFFENSE_UNREQUESTED_DATA,
@@ -641,6 +644,9 @@ class Node:
         elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
             await self._handle_announce_slash(msg.payload, peer)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_FINALITY_VOTE:
+            await self._handle_announce_finality_vote(msg.payload, peer)
+
     @staticmethod
     def _is_valid_peer_address(host: str, port) -> bool:
         """Reject non-routable IPs and out-of-range ports (eclipse resistance).
@@ -895,6 +901,50 @@ class Node:
         )
         await self._broadcast(relay_msg, exclude=peer.address)
 
+    async def _handle_announce_finality_vote(self, payload: dict, peer: Peer):
+        """Handle incoming FinalityVote gossip.
+
+        Validates the vote, stores it in the mempool's finality_pool
+        so the next time this node proposes a block it collects the
+        FINALITY_VOTE_INCLUSION_REWARD, and relays to other peers.
+        Matches the ANNOUNCE_SLASH handler shape — the pool step is
+        what makes the bounty mechanism actually incentivize inclusion
+        rather than having gossip-forever-never-included votes.
+        """
+        try:
+            vote = FinalityVote.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION,
+                "invalid_finality_vote_data",
+            )
+            return
+
+        # Signer must be known and not revoked/slashed
+        if vote.signer_entity_id not in self.blockchain.public_keys:
+            return
+        if vote.signer_entity_id in self.blockchain.revoked_entities:
+            return
+        if vote.signer_entity_id in self.blockchain.slashed_validators:
+            return
+
+        pk = self.blockchain.public_keys[vote.signer_entity_id]
+        if not verify_finality_vote(vote, pk):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX, "invalid_finality_vote_sig",
+            )
+            return
+
+        added = self.mempool.add_finality_vote(vote)
+
+        if added:
+            relay_msg = NetworkMessage(
+                msg_type=MessageType.ANNOUNCE_FINALITY_VOTE,
+                payload=payload,
+                sender_id=self.entity.entity_id_hex,
+            )
+            await self._broadcast(relay_msg, exclude=peer.address)
+
     async def _handle_announce_slash(self, payload: dict, peer: Peer):
         """Handle incoming slashing evidence gossip.
 
@@ -1076,9 +1126,17 @@ class Node:
         # collect the finder's reward — without this, slash txs relayed by
         # a non-proposer witness never land in any block.
         slash_txs = self.mempool.get_slash_transactions()
+        # Pull any pending FinalityVotes received via
+        # ANNOUNCE_FINALITY_VOTE gossip.  Same pattern as slash txs:
+        # inclusion earns the proposer FINALITY_VOTE_INCLUSION_REWARD
+        # per vote from treasury, and the votes contribute toward the
+        # 2/3-stake commitment that finalizes their target block.
+        from messagechain.config import MAX_FINALITY_VOTES_PER_BLOCK
+        fin_votes = self.mempool.get_finality_votes(MAX_FINALITY_VOTES_PER_BLOCK)
         block = self.blockchain.propose_block(
             self.consensus, self.entity, txs,
             slash_transactions=slash_txs,
+            finality_votes=fin_votes,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -1088,6 +1146,10 @@ class Node:
             if slash_txs:
                 self.mempool.remove_slash_transactions(
                     [s.tx_hash for s in slash_txs]
+                )
+            if fin_votes:
+                self.mempool.remove_finality_votes(
+                    [v.consensus_hash() for v in fin_votes]
                 )
             logger.info(
                 f"Proposed block #{block.header.block_number} with {len(txs)} txs "

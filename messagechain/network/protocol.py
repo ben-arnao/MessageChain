@@ -34,6 +34,12 @@ class MessageType(Enum):
     # Slashing evidence relay
     ANNOUNCE_SLASH = "announce_slash"
 
+    # FinalityVote gossip — long-range-attack defense.  Separate
+    # from ANNOUNCE_ATTESTATION because finality votes are persistent
+    # checkpoints that live in a dedicated mempool pool, not the
+    # ephemeral per-slot attestation tracker.
+    ANNOUNCE_FINALITY_VOTE = "announce_finality_vote"
+
     # Non-message-tx gossip: stake / unstake / authority-tx (SetAuthorityKey,
     # Revoke, KeyRotation) / governance txs. Without this, a pending tx
     # submitted to one node would only land in a block if that specific

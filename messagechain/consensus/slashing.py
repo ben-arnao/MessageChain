@@ -298,11 +298,12 @@ def verify_attestation_slashing_evidence(
 class SlashTransaction:
     """A transaction that submits slashing evidence.
 
-    Supports both evidence types:
+    Supports three evidence types:
     - SlashingEvidence (double-proposal)
     - AttestationSlashingEvidence (double-attestation)
+    - FinalityDoubleVoteEvidence (double-finality-vote, long-range defense)
     """
-    evidence: SlashingEvidence | AttestationSlashingEvidence
+    evidence: "SlashingEvidence | AttestationSlashingEvidence | FinalityDoubleVoteEvidence"
     submitter_id: bytes
     timestamp: float
     fee: int
@@ -341,12 +342,15 @@ class SlashTransaction:
         }
 
     def to_bytes(self) -> bytes:
-        """Binary: u8 evidence_kind (0=block, 1=attestation) | u32 ev_len |
-        ev | 32 submitter_id | f64 timestamp | u64 fee | u32 sig_len |
-        sig | 32 tx_hash.
+        """Binary: u8 evidence_kind (0=block, 1=attestation,
+        2=finality-vote) | u32 ev_len | ev | 32 submitter_id | f64
+        timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
         """
+        from messagechain.consensus.finality import FinalityDoubleVoteEvidence
         if isinstance(self.evidence, AttestationSlashingEvidence):
             kind = 1
+        elif isinstance(self.evidence, FinalityDoubleVoteEvidence):
+            kind = 2
         elif isinstance(self.evidence, SlashingEvidence):
             kind = 0
         else:
@@ -379,6 +383,11 @@ class SlashTransaction:
             evidence = SlashingEvidence.from_bytes(ev_bytes)
         elif kind == 1:
             evidence = AttestationSlashingEvidence.from_bytes(ev_bytes)
+        elif kind == 2:
+            from messagechain.consensus.finality import (
+                FinalityDoubleVoteEvidence,
+            )
+            evidence = FinalityDoubleVoteEvidence.from_bytes(ev_bytes)
         else:
             raise ValueError(f"Unknown slash evidence kind: {kind}")
         submitter_id = bytes(data[off:off + 32]); off += 32
@@ -407,8 +416,14 @@ class SlashTransaction:
     def deserialize(cls, data: dict) -> "SlashTransaction":
         sig = Signature.deserialize(data["signature"])
         ev_data = data["evidence"]
-        if ev_data.get("type") == "attestation_slash":
+        ev_type = ev_data.get("type")
+        if ev_type == "attestation_slash":
             evidence = AttestationSlashingEvidence.deserialize(ev_data)
+        elif ev_type == "finality_double_vote":
+            from messagechain.consensus.finality import (
+                FinalityDoubleVoteEvidence,
+            )
+            evidence = FinalityDoubleVoteEvidence.deserialize(ev_data)
         else:
             evidence = SlashingEvidence.deserialize(ev_data)
         tx = cls(
