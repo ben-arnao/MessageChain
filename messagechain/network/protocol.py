@@ -55,6 +55,23 @@ class MessageType(Enum):
     REQUEST_BLOCKS_BATCH = "request_blocks_batch"
     RESPONSE_BLOCKS_BATCH = "response_blocks_batch"
 
+    # State-checkpoint bootstrap: let a new full-node / validator skip
+    # the replay cost of ancient history by downloading a signed
+    # state snapshot from an archive node.  See
+    # messagechain/storage/state_snapshot.py and
+    # messagechain/consensus/state_checkpoint.py for the object model.
+    # Payload shapes:
+    #   REQUEST_STATE_CHECKPOINT:  {"block_number": int}
+    #   RESPONSE_STATE_CHECKPOINT: {
+    #       "checkpoint": <serialized StateCheckpoint>,
+    #       "signatures": [<serialized StateCheckpointSignature>, ...],
+    #       "snapshot_hex": str,                 # encode_snapshot(...) hex
+    #       "checkpoint_block_hex": str,         # Block.to_bytes() hex
+    #       "recent_blocks_hex": [str, ...],     # Block.to_bytes() hex each
+    #   }
+    REQUEST_STATE_CHECKPOINT = "request_state_checkpoint"
+    RESPONSE_STATE_CHECKPOINT = "response_state_checkpoint"
+
 
 @dataclass
 class NetworkMessage:
