@@ -18,7 +18,8 @@ import hashlib
 import logging
 import time as _time
 from messagechain.config import (
-    HASH_ALGO, MAX_TXS_PER_BLOCK, MAX_BLOCK_MESSAGE_BYTES,
+    HASH_ALGO, MAX_TXS_PER_BLOCK, MAX_TXS_PER_ENTITY_PER_BLOCK,
+    MAX_BLOCK_MESSAGE_BYTES,
     VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
@@ -2376,6 +2377,20 @@ class Blockchain:
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
 
+        # Per-entity message tx cap — prevents a single entity from
+        # monopolizing block space (anti-flooding / anti-censorship).
+        # Applies to MessageTransaction only; transfer/stake/governance
+        # txs are already rare and don't need this constraint.
+        entity_msg_counts: dict[bytes, int] = {}
+        for tx in block.transactions:
+            entity_msg_counts[tx.entity_id] = entity_msg_counts.get(tx.entity_id, 0) + 1
+            if entity_msg_counts[tx.entity_id] > MAX_TXS_PER_ENTITY_PER_BLOCK:
+                return False, (
+                    f"Per-entity cap exceeded: entity {tx.entity_id.hex()[:16]}... "
+                    f"has {entity_msg_counts[tx.entity_id]} message txs in block "
+                    f"(max {MAX_TXS_PER_ENTITY_PER_BLOCK})"
+                )
+
         # Check for duplicate transaction hashes within the block
         seen_tx_hashes = set()
         all_txs = list(block.transactions) + list(block.transfer_transactions)
@@ -3000,6 +3015,17 @@ class Blockchain:
         total_message_bytes = sum(len(tx.message) for tx in block.transactions)
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
+
+        # Per-entity message tx cap (same rule as validate_block).
+        entity_msg_counts: dict[bytes, int] = {}
+        for tx in block.transactions:
+            entity_msg_counts[tx.entity_id] = entity_msg_counts.get(tx.entity_id, 0) + 1
+            if entity_msg_counts[tx.entity_id] > MAX_TXS_PER_ENTITY_PER_BLOCK:
+                return False, (
+                    f"Per-entity cap exceeded: entity {tx.entity_id.hex()[:16]}... "
+                    f"has {entity_msg_counts[tx.entity_id]} message txs in block "
+                    f"(max {MAX_TXS_PER_ENTITY_PER_BLOCK})"
+                )
 
         # Timestamp checks
         if block.header.timestamp <= parent.header.timestamp:
@@ -3653,6 +3679,12 @@ class Blockchain:
         total_message_bytes = sum(len(tx.message) for tx in block.transactions)
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, "Orphan rejected — message bytes exceed budget"
+        # Per-entity cap (cheap structural check — no chain state needed).
+        _orphan_entity_counts: dict[bytes, int] = {}
+        for tx in block.transactions:
+            _orphan_entity_counts[tx.entity_id] = _orphan_entity_counts.get(tx.entity_id, 0) + 1
+            if _orphan_entity_counts[tx.entity_id] > MAX_TXS_PER_ENTITY_PER_BLOCK:
+                return False, "Orphan rejected — per-entity message tx cap exceeded"
 
         if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
             self.orphan_pool[block.block_hash] = block

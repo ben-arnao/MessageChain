@@ -158,9 +158,10 @@ class TestSigCostBudgetEnforcement(unittest.TestCase):
             pos = ProofOfStake()
             pos.stakes[self.entity.entity_id] = 1000
 
-            # Create multiple transactions so sig cost exceeds 3
+            # Create 3 transactions (per-entity cap) so sig cost exceeds 3
+            # (3 msg sigs + 1 proposer sig = 4 > MAX_BLOCK_SIG_COST of 3)
             txs = []
-            for i in range(5):
+            for i in range(3):
                 tx = create_transaction(self.entity, f"msg {i}", fee=1500, nonce=i)
                 txs.append(tx)
                 self.chain.nonces[self.entity.entity_id] = i + 1

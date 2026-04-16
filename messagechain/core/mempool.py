@@ -19,6 +19,7 @@ from messagechain.config import (
     MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
     MIN_FEE,
     FORCED_INCLUSION_WAIT_BLOCKS, FORCED_INCLUSION_SET_SIZE,
+    MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
@@ -145,6 +146,29 @@ class Mempool:
         """
         txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
         return txs[:max_count]
+
+    def get_transactions_with_entity_cap(
+        self, max_count: int,
+    ) -> list[MessageTransaction]:
+        """Get transactions respecting the per-entity cap.
+
+        Sorted by fee (highest first).  After including
+        MAX_TXS_PER_ENTITY_PER_BLOCK txs from any single entity_id,
+        further txs from that entity are skipped — even if they have
+        higher fees than txs from other entities.
+        """
+        txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
+        selected: list[MessageTransaction] = []
+        entity_counts: dict[bytes, int] = {}
+        for tx in txs:
+            if len(selected) >= max_count:
+                break
+            count = entity_counts.get(tx.entity_id, 0)
+            if count >= MAX_TXS_PER_ENTITY_PER_BLOCK:
+                continue
+            selected.append(tx)
+            entity_counts[tx.entity_id] = count + 1
+        return selected
 
     def get_forced_inclusion_set(
         self, current_block_height: int,

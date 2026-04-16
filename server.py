@@ -1256,7 +1256,7 @@ class Server:
 
         # Build the block. Empty mempool is fine — empty blocks carry
         # attestations and advance block-denominated timers.
-        all_pending = self.mempool.get_transactions(MAX_TXS_PER_BLOCK)
+        all_pending = self.mempool.get_transactions_with_entity_cap(MAX_TXS_PER_BLOCK)
         txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
         transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
         slash_txs = self.mempool.get_slash_transactions()
