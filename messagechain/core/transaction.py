@@ -17,6 +17,7 @@ from messagechain.config import (
     HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
     MESSAGE_DEFAULT_TTL, MESSAGE_MIN_TTL, MESSAGE_MAX_TTL,
+    SIG_VERSION_CURRENT,
 )
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
@@ -55,10 +56,23 @@ class MessageTransaction:
         compression_flag is included so tx_hash commits to the canonical
         encoding — an attacker who re-encodes the same plaintext under a
         different flag cannot produce a matching hash.
+
+        sig_version (from the attached signature) is included so tx_hash
+        commits to the chosen signature scheme: an attacker cannot swap
+        the sig_version after signing without changing the tx hash, which
+        breaks any downstream references (mempool dedupe, merkle root).
+
+        When `signature is None` (test fixtures constructing malformed
+        tx objects), we fall back to SIG_VERSION_CURRENT so the hash is
+        still deterministic — those tests drive negative-path code in
+        validate_transaction, which rejects them before the signature is
+        ever checked.
         """
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + struct.pack(">I", self.version)
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + struct.pack(">B", self.compression_flag)
             + self.message

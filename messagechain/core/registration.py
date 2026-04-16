@@ -31,7 +31,7 @@ import struct
 import time
 from dataclasses import dataclass
 
-from messagechain.config import CHAIN_ID, HASH_ALGO
+from messagechain.config import CHAIN_ID, HASH_ALGO, SIG_VERSION_CURRENT
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -65,10 +65,20 @@ class RegistrationTransaction:
     def _signable_data(self) -> bytes:
         """Canonical bytes for hashing.  The registration_proof signs a
         separate message (`SHA3("register" || entity_id)`) so its
-        domain-separation is independent of this tx hash."""
+        domain-separation is independent of this tx hash.
+
+        Crypto-agility: the registration_proof's sig_version is committed
+        into tx_hash so an attacker can't rewrite the registrant's chosen
+        scheme without invalidating the whole tx hash.  getattr fallback
+        keeps None-proof test fixtures working.
+        """
+        sig_version = getattr(
+            self.registration_proof, "sig_version", SIG_VERSION_CURRENT,
+        )
         return (
             CHAIN_ID
             + b"register_entity"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + self.public_key
             + struct.pack(">Q", int(self.timestamp))

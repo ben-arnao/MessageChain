@@ -13,7 +13,9 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MIN_FEE, MAX_TIMESTAMP_DRIFT, CHAIN_ID
+from messagechain.config import (
+    HASH_ALGO, MIN_FEE, MAX_TIMESTAMP_DRIFT, CHAIN_ID, SIG_VERSION_CURRENT,
+)
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -38,9 +40,15 @@ class TransferTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # sig_version from the attached signature is committed into tx_hash
+        # so the chosen signature scheme is tamper-evident (see MessageTransaction
+        # for the full rationale — this mirrors the same crypto-agility pattern).
+        # getattr fallback keeps test fixtures that pass signature=None working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"transfer"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + self.recipient_id
             + struct.pack(">Q", self.amount)

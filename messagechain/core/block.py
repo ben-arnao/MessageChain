@@ -11,7 +11,7 @@ import struct
 import time
 import json
 from dataclasses import dataclass, field
-from messagechain.config import HASH_ALGO
+from messagechain.config import HASH_ALGO, HASH_VERSION_CURRENT
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import Signature
 
@@ -144,14 +144,25 @@ class BlockHeader:
     state_root: bytes = b"\x00" * 32  # Merkle root of account state
     randao_mix: bytes = b"\x00" * 32  # accumulated RANDAO entropy (post-sign derived)
     proposer_signature: Signature | None = None
+    # Crypto-agility: identifies the hash algorithm used for this block's
+    # block_hash (over the header) and tx_root. Carried on every header so a
+    # governance proposal can widen the accepted set for a future scheme
+    # without a chain reset.  See config.HASH_VERSION_* and
+    # validate_hash_version.
+    hash_version: int = HASH_VERSION_CURRENT
 
     def signable_data(self) -> bytes:
         # NOTE: randao_mix is intentionally NOT included here. It is derived
         # from the proposer signature (which is itself over signable_data),
         # so including it would create a circular dependency. The randao_mix
         # is bound to the block via _compute_hash() instead.
+        #
+        # hash_version is committed here so the header hash itself is
+        # tamper-evident against a version swap: flipping the byte changes
+        # the hash, breaking the prev_hash chain and the proposer signature.
         return (
             struct.pack(">I", self.version)
+            + struct.pack(">B", self.hash_version)
             + struct.pack(">Q", self.block_number)
             + self.prev_hash
             + self.merkle_root
@@ -163,6 +174,7 @@ class BlockHeader:
     def serialize(self) -> dict:
         return {
             "version": self.version,
+            "hash_version": self.hash_version,
             "block_number": self.block_number,
             "prev_hash": self.prev_hash.hex(),
             "merkle_root": self.merkle_root.hex(),
@@ -178,6 +190,7 @@ class BlockHeader:
 
         Layout:
             u32  version
+            u8   hash_version        <- crypto-agility register
             u64  block_number
             32   prev_hash
             32   merkle_root
@@ -187,6 +200,11 @@ class BlockHeader:
             32   randao_mix
             u32  sig_blob_len  (0 = no proposer signature)
             N    sig_blob
+
+        hash_version sits right after `version` so a header blob is
+        unambiguously one flavor of hash commitment end-to-end — a
+        validator's decoder reads the version before any 32-byte hash
+        field and can dispatch when multiple schemes are active.
         """
         if self.proposer_signature is None:
             sig_blob = b""
@@ -194,6 +212,7 @@ class BlockHeader:
             sig_blob = self.proposer_signature.to_bytes()
         return b"".join([
             struct.pack(">I", self.version),
+            struct.pack(">B", self.hash_version),
             struct.pack(">Q", self.block_number),
             self.prev_hash,
             self.merkle_root,
@@ -208,10 +227,19 @@ class BlockHeader:
     @classmethod
     def from_bytes(cls, data: bytes) -> "BlockHeader":
         off = 0
-        expected_min = 4 + 8 + 32 + 32 + 32 + 8 + 32 + 32 + 4
+        # +1 byte for the u8 hash_version field (crypto agility).
+        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 8 + 32 + 32 + 4
         if len(data) < expected_min:
             raise ValueError("BlockHeader blob too short")
         version = struct.unpack_from(">I", data, off)[0]; off += 4
+        hash_version = struct.unpack_from(">B", data, off)[0]; off += 1
+        # Reject unknown hash versions at decode time so a malformed blob
+        # never reaches validate_block.  The consensus-layer check is still
+        # the primary gate; this one cuts off DoS via spray-and-pray blobs.
+        from messagechain.config import validate_hash_version
+        ok, reason = validate_hash_version(hash_version)
+        if not ok:
+            raise ValueError(f"Invalid block header: {reason}")
         block_number = struct.unpack_from(">Q", data, off)[0]; off += 8
         prev_hash = bytes(data[off:off + 32]); off += 32
         merkle_root = bytes(data[off:off + 32]); off += 32
@@ -235,10 +263,15 @@ class BlockHeader:
             state_root=state_root, timestamp=timestamp,
             proposer_id=proposer_id, randao_mix=randao_mix,
             proposer_signature=proposer_signature,
+            hash_version=hash_version,
         )
 
     @classmethod
     def deserialize(cls, data: dict) -> "BlockHeader":
+        # Default missing hash_version to HASH_VERSION_CURRENT so pre-
+        # migration dicts round-trip cleanly; a present-but-unknown value
+        # falls through to validate_block's consensus check and is rejected
+        # there with a human-readable reason.
         return cls(
             version=data["version"],
             block_number=data["block_number"],
@@ -249,6 +282,7 @@ class BlockHeader:
             state_root=bytes.fromhex(data["state_root"]) if data.get("state_root") else b"\x00" * 32,
             randao_mix=bytes.fromhex(data["randao_mix"]) if data.get("randao_mix") else b"\x00" * 32,
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
+            hash_version=data.get("hash_version", HASH_VERSION_CURRENT),
         )
 
 
@@ -620,8 +654,13 @@ class Block:
 
 def create_genesis_block(proposer_entity) -> Block:
     """Create the genesis block (block 0) with no transactions."""
+    # Genesis pins hash_version explicitly even though it's the dataclass
+    # default — the intent is that future readers of this function see that
+    # genesis is crypto-versioned, not that we accidentally got the current
+    # scheme by omitting the field.
     header = BlockHeader(
         version=1,
+        hash_version=HASH_VERSION_CURRENT,
         block_number=0,
         prev_hash=b"\x00" * 32,
         merkle_root=_hash(b"genesis"),

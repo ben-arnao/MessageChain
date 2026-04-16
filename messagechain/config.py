@@ -3,6 +3,63 @@
 # Cryptography (defined early — needed by Treasury ID derivation below)
 HASH_ALGO = "sha3_256"
 
+# Crypto agility — version bytes allow future algorithm upgrades via governance
+# without a chain reset. Validators MUST reject unknown versions.
+#
+# These are carry-only registers today (no dispatch table). When a future hash
+# or signature scheme ships, it is activated by a governance proposal that
+# bumps HASH_VERSION_CURRENT / SIG_VERSION_CURRENT — the existing gate simply
+# starts accepting the new value in addition to the old one for a migration
+# window. That's the upgrade path this field saves us from ever having to
+# hard-fork-and-reset over. SHA-256 will break someday (50 years? 200?); the
+# 1-byte-per-block + 1-byte-per-signature cost of carrying these now is a
+# trivial price for a chain designed to last 100-1000+ years.
+#
+# Reserved: 0 is invalid (traps uninitialized). Concrete current values pin
+# the scheme-in-use:
+#   HASH_VERSION_SHA256   = 1 (actually sha3_256 — HASH_ALGO above; the name
+#                             matches the conventional "SHA-256 family" label
+#                             the task spec uses). Future: 2 = a successor,
+#                             3 = another, etc.
+#   SIG_VERSION_WOTS_W16_K64 = 1 (WOTS+ with W=16, chains=64, Merkle h=20).
+#                                Future: 2 = XMSS, 3 = SPHINCS+, etc.
+HASH_VERSION_SHA256 = 1
+HASH_VERSION_CURRENT = HASH_VERSION_SHA256
+
+SIG_VERSION_WOTS_W16_K64 = 1  # current: WOTS W=16 chains=64 merkle h=20
+SIG_VERSION_CURRENT = SIG_VERSION_WOTS_W16_K64
+
+
+def validate_hash_version(hash_version: int) -> tuple[bool, str]:
+    """Reject any unknown hash_version at the consensus boundary.
+
+    Forward-compatibility gate: a future governance proposal can add a new
+    accepted version by editing HASH_VERSION_CURRENT and widening this
+    check. Until then, anything not equal to the current version is treated
+    as a byzantine byte flip or a too-new peer and rejected.
+    """
+    if hash_version != HASH_VERSION_CURRENT:
+        return False, (
+            f"Unknown hash version {hash_version} "
+            f"(current = {HASH_VERSION_CURRENT})"
+        )
+    return True, "OK"
+
+
+def validate_sig_version(sig_version: int) -> tuple[bool, str]:
+    """Reject any unknown sig_version at the consensus boundary.
+
+    Same forward-compatibility shape as validate_hash_version. A future
+    signature scheme (XMSS, SPHINCS+, a larger WOTS profile) is activated
+    by governance; until then, only SIG_VERSION_CURRENT is accepted.
+    """
+    if sig_version != SIG_VERSION_CURRENT:
+        return False, (
+            f"Unknown sig version {sig_version} "
+            f"(current = {SIG_VERSION_CURRENT})"
+        )
+    return True, "OK"
+
 # Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
 MAX_MESSAGE_CHARS = 280  # max characters per message
 MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)

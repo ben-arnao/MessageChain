@@ -60,6 +60,7 @@ from messagechain.config import (
     GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR,
     GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR,
     MIN_FEE,
+    SIG_VERSION_CURRENT,
     TREASURY_ENTITY_ID,
 )
 from messagechain.crypto.keys import Signature, verify_signature
@@ -99,9 +100,13 @@ class ProposalTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
+        # keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             config.CHAIN_ID
             + b"governance_proposal"
+            + struct.pack(">B", sig_version)
             + self.proposer_id
             + self.title.encode("utf-8")
             + self.description.encode("utf-8")
@@ -241,9 +246,13 @@ class VoteTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
+        # keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             config.CHAIN_ID
             + b"governance_vote"
+            + struct.pack(">B", sig_version)
             + self.voter_id
             + self.proposal_id
             + struct.pack(">?", self.approve)
@@ -355,9 +364,13 @@ class TreasurySpendTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
+        # keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             config.CHAIN_ID
             + b"treasury_spend"
+            + struct.pack(">B", sig_version)
             + self.proposer_id
             + self.recipient_id
             + struct.pack(">Q", self.amount)
