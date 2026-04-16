@@ -137,6 +137,39 @@ MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
 # escrow_blocks_for_progress() — this is the max value at progress=0.
 ATTESTER_ESCROW_BLOCKS = 12_960
 
+# Reputation-weighted bootstrap lottery.
+#
+# During bootstrap, a periodic lottery pays a meaningful bounty to one
+# non-seed validator, weighted by reputation.  Solves two problems:
+#   (a) Uniform attester-committee selection at progress=0 means good
+#       behavior doesn't compound into influence — a validator that
+#       has correctly attested for months has the same per-block
+#       selection odds as one that joined yesterday.  The lottery
+#       rewards sustained honest participation in real time.
+#   (b) A Sybil operator with N keys splits the committee pool N ways
+#       individually, but the lottery is winner-take-all per interval
+#       and weighted by reputation, so Sybil keys with similar
+#       reputation compete with each other AND with honest single-
+#       identity validators.  The Sybil-operator extraction rate
+#       is closer to a single honest actor's, not Nx.
+#
+# Reputation counter: +1 per attestation accepted in a block, zeroed
+# when the validator is slashed.  Capped at REPUTATION_CAP so a
+# 6-month-old validator can't become a deterministic winner.
+#
+# Lottery fires every LOTTERY_INTERVAL blocks (144 × 600s ≈ 1 day).
+# Bounty is deposited into the winner's escrow so it's slashable
+# through the standard escrow window — a winner who misbehaves
+# before the window closes loses it.
+#
+# Lottery stops firing once bootstrap_progress reaches 1.0.  Total
+# lottery mint across the bootstrap window is bounded:
+#   BOOTSTRAP_END_HEIGHT / LOTTERY_INTERVAL × LOTTERY_BOUNTY
+#   ≈ 105,192 / 144 × 100 ≈ 73K tokens (~0.007% of supply).
+REPUTATION_CAP = 10_000
+LOTTERY_INTERVAL = 144       # blocks (~1 day at 600s)
+LOTTERY_BOUNTY = 100         # tokens paid to lottery winner
+
 # Minimum number of distinct validators required for finality.
 #
 # Historical name "MIN_VALIDATORS_TO_EXIT_BOOTSTRAP" reflects the old

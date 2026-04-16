@@ -28,7 +28,8 @@ import unittest
 
 from messagechain.consensus.attester_committee import (
     ATTESTER_REWARD_PER_SLOT,
-    SEED_EXCLUSION_THRESHOLD,
+    SEED_EXCLUSION_CROSSOVER,
+    seed_weight_multiplier,
     select_attester_committee,
     weights_for_progress,
 )
@@ -148,21 +149,25 @@ class TestSeedExclusion(unittest.TestCase):
     Rationale: seeds already dominate proposer rewards (stake-weighted).
     Reserving the attester pool for newcomers during early bootstrap
     accelerates external stake accumulation without requiring any
-    founder action.  Exclusion lifts at SEED_EXCLUSION_THRESHOLD (0.5).
+    founder action.  The exclusion is a SMOOTH RAMP: fully excluded at
+    progress=0, linearly rejoining until fully included at
+    progress >= SEED_EXCLUSION_CROSSOVER (0.5).  Replaces a binary cliff
+    that caused a user-observable earnings discontinuity at the
+    crossover.
     """
 
-    def test_seeds_excluded_below_threshold(self):
-        """With progress < 0.5, seeds never appear in the committee."""
+    def test_seeds_fully_excluded_at_genesis(self):
+        """With progress = 0, seeds never appear in the committee."""
         seeds = frozenset({_eid(0), _eid(1), _eid(2)})
         candidates = [(_eid(i), 100) for i in range(10)]
         picked = select_attester_committee(
             candidates=candidates, seed_entity_ids=seeds,
-            bootstrap_progress=0.4, randomness=b"\x10" * 32,
+            bootstrap_progress=0.0, randomness=b"\x10" * 32,
             committee_size=12,
         )
         self.assertTrue(seeds.isdisjoint(set(picked)))
 
-    def test_seeds_included_at_or_above_threshold(self):
+    def test_seeds_fully_included_at_or_above_crossover(self):
         """At progress >= 0.5, seeds eligible alongside everyone else."""
         seeds = frozenset({_eid(0), _eid(1), _eid(2)})
         # Only seeds are candidates — if excluded, committee is empty.
@@ -174,8 +179,34 @@ class TestSeedExclusion(unittest.TestCase):
         )
         self.assertEqual(len(picked), 3)  # all seeds selected
 
-    def test_exclusion_with_mixed_pool(self):
-        """Early bootstrap with seeds + newcomers: only newcomers picked."""
+    def test_exclusion_is_smooth_not_cliff(self):
+        """At progress = 0.25 (halfway to crossover), seeds have
+        roughly half the weight of newcomers with equal stake.  Across
+        many independent slot randomness values, newcomers should be
+        selected noticeably more often than seeds."""
+        seeds = frozenset({_eid(0)})
+        # 1 seed + 1 newcomer, equal stake.  Without tilt they'd be
+        # 50/50; with tilt=0.5 the seed's weight is halved → newcomer
+        # should win ~2/3 of slots.
+        candidates = [(_eid(0), 100), (_eid(1), 100)]
+        newcomer_wins = 0
+        trials = 200
+        for i in range(trials):
+            picked = select_attester_committee(
+                candidates=candidates, seed_entity_ids=seeds,
+                bootstrap_progress=0.25,
+                randomness=i.to_bytes(32, "big"),
+                committee_size=1,
+            )
+            if picked == [_eid(1)]:
+                newcomer_wins += 1
+        # Expected ≈ 2/3 (seed tilt=0.5, newcomer tilt=1.0).  Allow
+        # a wide band for sampling noise at N=200.
+        self.assertGreater(newcomer_wins, trials * 0.55)
+        self.assertLess(newcomer_wins, trials * 0.80)
+
+    def test_full_exclusion_with_mixed_pool_at_genesis(self):
+        """At progress=0 with seeds + newcomers: only newcomers picked."""
         seeds = frozenset({_eid(0), _eid(1)})
         candidates = (
             [(_eid(0), 1_000_000), (_eid(1), 1_000_000)]  # two seeds
@@ -183,19 +214,29 @@ class TestSeedExclusion(unittest.TestCase):
         )
         picked = select_attester_committee(
             candidates=candidates, seed_entity_ids=seeds,
-            bootstrap_progress=0.1, randomness=b"\x12" * 32,
+            bootstrap_progress=0.0, randomness=b"\x12" * 32,
             committee_size=12,
         )
-        # All six newcomers selected, zero seeds — even though seeds
-        # have 99.99% of stake, they are excluded from this pool.
+        # All six newcomers selected, zero seeds.
         self.assertEqual(set(picked), {_eid(i) for i in range(2, 8)})
 
 
-class TestSeedExclusionConstants(unittest.TestCase):
-    """Sanity checks on the exported parameters."""
+class TestSeedWeightMultiplier(unittest.TestCase):
+    """The smooth-ramp multiplier is a simple linear function of progress."""
 
-    def test_seed_exclusion_threshold_is_half(self):
-        self.assertEqual(SEED_EXCLUSION_THRESHOLD, 0.5)
+    def test_zero_at_genesis(self):
+        self.assertEqual(seed_weight_multiplier(0.0), 0.0)
+
+    def test_one_at_and_above_crossover(self):
+        self.assertEqual(seed_weight_multiplier(0.5), 1.0)
+        self.assertEqual(seed_weight_multiplier(0.75), 1.0)
+        self.assertEqual(seed_weight_multiplier(1.0), 1.0)
+
+    def test_halfway_between_is_half(self):
+        self.assertAlmostEqual(seed_weight_multiplier(0.25), 0.5)
+
+    def test_crossover_constant_is_half(self):
+        self.assertEqual(SEED_EXCLUSION_CROSSOVER, 0.5)
 
     def test_reward_per_slot_is_integer_positive(self):
         self.assertIsInstance(ATTESTER_REWARD_PER_SLOT, int)

@@ -24,25 +24,18 @@ from messagechain.consensus.bootstrap_gradient import (
 
 
 class TestMinStakeFormula(unittest.TestCase):
-    """Pure-function behavior of the min-stake gradient."""
+    """Pure-function behavior of the min-stake gradient.
 
-    def test_zero_stake_in_first_half(self):
-        """Progress < 0.5 → min_stake = 0 (free-entry window)."""
+    The curve is pure linear: min_stake = full_min_stake * progress.
+    At progress = 0 a zero-funds user can register for free; as the
+    chain matures the barrier rises monotonically to full_min_stake
+    at progress = 1.0.
+    """
+
+    def test_zero_stake_at_genesis(self):
+        """Progress = 0 → min_stake = 0 (free-entry at launch)."""
         self.assertEqual(
             min_stake_for_progress(0.0, full_min_stake=100), 0,
-        )
-        self.assertEqual(
-            min_stake_for_progress(0.25, full_min_stake=100), 0,
-        )
-        # Just below inflection.
-        self.assertEqual(
-            min_stake_for_progress(0.499, full_min_stake=100), 0,
-        )
-
-    def test_ramp_begins_at_inflection(self):
-        """At inflection, min_stake = 0 exactly (curve start)."""
-        self.assertEqual(
-            min_stake_for_progress(0.5, full_min_stake=100), 0,
         )
 
     def test_full_min_at_progress_one(self):
@@ -51,33 +44,31 @@ class TestMinStakeFormula(unittest.TestCase):
             min_stake_for_progress(1.0, full_min_stake=100), 100,
         )
 
-    def test_linear_ramp_between_inflection_and_one(self):
-        """Second half is a linear ramp.  At progress=0.75, min = 50."""
+    def test_linear_ramp_from_zero_to_full(self):
+        """Pure linear: quarter progress = quarter full min, etc."""
         self.assertEqual(
-            min_stake_for_progress(0.75, full_min_stake=100), 50,
+            min_stake_for_progress(0.25, full_min_stake=100), 25,
+        )
+        self.assertEqual(
+            min_stake_for_progress(0.5, full_min_stake=100), 50,
+        )
+        self.assertEqual(
+            min_stake_for_progress(0.75, full_min_stake=100), 75,
         )
 
-    def test_custom_inflection(self):
-        """Inflection is configurable — ramp starts wherever caller wants."""
-        # Inflection at 0.8: first 80% is free-entry, last 20% ramps
-        self.assertEqual(
-            min_stake_for_progress(0.5, full_min_stake=100, inflection=0.8), 0,
-        )
-        self.assertEqual(
-            min_stake_for_progress(0.9, full_min_stake=100, inflection=0.8), 50,
-        )
+    def test_monotonic_no_regressions(self):
+        """The curve is monotonically non-decreasing in progress."""
+        prev = -1
+        for p in [i / 20 for i in range(21)]:
+            cur = min_stake_for_progress(p, full_min_stake=100)
+            self.assertGreaterEqual(cur, prev, f"regression at p={p}")
+            prev = cur
 
     def test_rejects_out_of_range_progress(self):
         with self.assertRaises(ValueError):
             min_stake_for_progress(-0.1, full_min_stake=100)
         with self.assertRaises(ValueError):
             min_stake_for_progress(1.5, full_min_stake=100)
-
-    def test_rejects_invalid_inflection(self):
-        with self.assertRaises(ValueError):
-            min_stake_for_progress(0.5, full_min_stake=100, inflection=1.0)
-        with self.assertRaises(ValueError):
-            min_stake_for_progress(0.5, full_min_stake=100, inflection=-0.1)
 
 
 class TestEscrowFormula(unittest.TestCase):
