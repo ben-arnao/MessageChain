@@ -288,9 +288,11 @@ class Blockchain:
 
         tip_hash, tip_height, tip_weight = best_tip
 
-        # Load all blocks into chain list (ordered by height)
+        # Load all blocks into chain list (ordered by height).  The
+        # entity-index registry is already rehydrated above, so blocks
+        # stored in the compact varint-index form decode cleanly here.
         for height in range(tip_height + 1):
-            block = self.db.get_block_by_number(height)
+            block = self.db.get_block_by_number(height, state=self)
             if block:
                 self.chain.append(block)
                 self._block_by_hash[block.block_hash] = block
@@ -507,7 +509,11 @@ class Blockchain:
 
         # Persist
         if self.db is not None:
-            self.db.store_block(genesis_block)
+            # Thread `self` as state so the compact entity-index wire form
+            # lands on disk.  The genesis entity is already registered in
+            # self.entity_id_to_index by this point, so the tx encoder
+            # can swap its 32-byte id for a 1-byte varint index.
+            self.db.store_block(genesis_block, state=self)
             self.db.add_chain_tip(genesis_block.block_hash, 0, 0)
             self._persist_state()
 
@@ -829,7 +835,9 @@ class Blockchain:
         """Look up a block by its hash (in-memory index or DB)."""
         block = self._block_by_hash.get(block_hash)
         if block is None and self.db is not None:
-            block = self.db.get_block_by_hash(block_hash)
+            # Thread `self` as state so any compact-form entity refs
+            # in the on-disk blob are resolved back to full ids.
+            block = self.db.get_block_by_hash(block_hash, state=self)
             if block:
                 self._block_by_hash[block_hash] = block
         return block
@@ -3137,7 +3145,7 @@ class Blockchain:
             self._block_by_hash[block.block_hash] = block
             self.fork_choice.add_tip(block.block_hash, 0, 0)
             if self.db is not None:
-                self.db.store_block(block)
+                self.db.store_block(block, state=self)
                 self.db.add_chain_tip(block.block_hash, 0, 0)
             return True, "Genesis block added"
 
@@ -3296,7 +3304,10 @@ class Blockchain:
 
         # Persist
         if self.db is not None:
-            self.db.store_block(block)
+            # Entity indices assigned by _apply_block_state above are
+            # already in self.entity_id_to_index, so any RegistrationTx
+            # in this block can now be referenced compactly too.
+            self.db.store_block(block, state=self)
             self.db.remove_chain_tip(old_tip)
             self.db.add_chain_tip(block.block_hash, block.header.block_number, new_weight)
             self._persist_state()
@@ -3369,10 +3380,16 @@ class Blockchain:
                             f"{blk.header.block_number} is finalized"
                         )
 
-        # Store the block (even if not on best chain yet)
+        # Store the block (even if not on best chain yet).  A fork
+        # block that registers a brand-new entity has NOT yet run
+        # through _apply_block_state, so that entity lacks an index
+        # in self.entity_id_to_index — encode_entity_ref falls back
+        # to the legacy 32-byte form for it, which is safe.  Entities
+        # registered in the ancestor chain are already indexed and
+        # get the compact form here.
         self._block_by_hash[block.block_hash] = block
         if self.db is not None:
-            self.db.store_block(block)
+            self.db.store_block(block, state=self)
 
         # Compute cumulative weight for this fork
         fork_weight = self._compute_cumulative_weight(block)

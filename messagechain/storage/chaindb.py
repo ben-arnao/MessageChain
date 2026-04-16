@@ -171,30 +171,46 @@ class ChainDB:
 
     # ── Block Storage ────────────────────────────────────────────
 
-    def store_block(self, block: Block):
+    def store_block(self, block: Block, state=None):
         """Store a block in its compact binary form.
 
         The `data` column is BLOB — the raw output of Block.to_bytes().
         This is ~2x smaller than the old JSON-with-hex-fields format
         (a WOTS signature drops from ~5.5 KB JSON to ~2 KB binary) and
         compounds forever in the permanent-history model.
+
+        When `state` is provided, entity references in each embedded
+        tx are serialized in their compact varint-index form instead
+        of the legacy 32-byte id.  This is the bloat-reduction wire
+        form actually hitting disk — without threading state through,
+        the varint encoder silently falls back to full-id mode and
+        saves nothing on the BLOB column.  `state` here is a duck-
+        typed object exposing `entity_id_to_index` (typically the
+        Blockchain instance owning the db).
         """
-        data = block.to_bytes()
+        data = block.to_bytes(state=state)
         self._conn.execute(
             "INSERT OR REPLACE INTO blocks (block_hash, block_number, prev_hash, data) VALUES (?, ?, ?, ?)",
             (block.block_hash, block.header.block_number, block.header.prev_hash, data),
         )
         self._conn.commit()
 
-    def get_block_by_hash(self, block_hash: bytes) -> Block | None:
+    def get_block_by_hash(self, block_hash: bytes, state=None) -> Block | None:
         cur = self._conn.execute("SELECT data FROM blocks WHERE block_hash = ?", (block_hash,))
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.from_bytes(bytes(row[0]))
+        return Block.from_bytes(bytes(row[0]), state=state)
 
-    def get_block_by_number(self, block_number: int) -> Block | None:
-        """Get block by height. If multiple at same height (forks), returns the one on the best chain."""
+    def get_block_by_number(self, block_number: int, state=None) -> Block | None:
+        """Get block by height. If multiple at same height (forks), returns the one on the best chain.
+
+        `state` (if provided) is threaded to `Block.from_bytes` so
+        any compact-form entity refs can be resolved to their full
+        32-byte ids.  Callers without a live state pass None and
+        will fail loudly on any compact-form blob — which is the
+        correct behavior for a standalone inspector.
+        """
         cur = self._conn.execute(
             "SELECT data FROM blocks WHERE block_number = ? LIMIT 1",
             (block_number,),
@@ -202,14 +218,14 @@ class ChainDB:
         row = cur.fetchone()
         if row is None:
             return None
-        return Block.from_bytes(bytes(row[0]))
+        return Block.from_bytes(bytes(row[0]), state=state)
 
-    def get_blocks_at_height(self, block_number: int) -> list[Block]:
+    def get_blocks_at_height(self, block_number: int, state=None) -> list[Block]:
         """Get all blocks at a given height (for fork detection)."""
         cur = self._conn.execute(
             "SELECT data FROM blocks WHERE block_number = ?", (block_number,)
         )
-        return [Block.from_bytes(bytes(row[0])) for row in cur.fetchall()]
+        return [Block.from_bytes(bytes(row[0]), state=state) for row in cur.fetchall()]
 
     def has_block(self, block_hash: bytes) -> bool:
         cur = self._conn.execute("SELECT 1 FROM blocks WHERE block_hash = ?", (block_hash,))
@@ -224,12 +240,12 @@ class ChainDB:
         row = cur.fetchone()
         return row[0] if row[0] is not None else -1
 
-    def get_chain_from_tip(self, tip_hash: bytes, count: int) -> list[Block]:
+    def get_chain_from_tip(self, tip_hash: bytes, count: int, state=None) -> list[Block]:
         """Walk backwards from a tip, returning up to `count` blocks."""
         blocks = []
         current_hash = tip_hash
         while len(blocks) < count and current_hash:
-            block = self.get_block_by_hash(current_hash)
+            block = self.get_block_by_hash(current_hash, state=state)
             if block is None:
                 break
             blocks.append(block)
@@ -249,13 +265,18 @@ class ChainDB:
 
     # ── Block Pruning ────────────────────────────────────────────
 
-    def prune_block_to_header(self, block_number: int):
+    def prune_block_to_header(self, block_number: int, state=None):
         """Replace a full block with its header only.
 
         Deletes the full block data and stores just the header in the
         block_headers table. Storage reclamation for long-term
         sustainability; the header keeps the chain continuous for
         light clients and header-sync peers.
+
+        `state` is threaded through `Block.from_bytes` so a compact-
+        form block (varint entity indices on disk) can be decoded far
+        enough to extract the header blob.  The header itself is
+        state-independent and is stored as-is.
         """
         cur = self._conn.execute(
             "SELECT data, block_hash FROM blocks WHERE block_number = ?",
@@ -271,7 +292,7 @@ class ChainDB:
         # Decode the full block just to pull out the header blob.  Keeping
         # the header in its binary encoding (rather than re-serializing to
         # dict/JSON) preserves the size win pruning is supposed to deliver.
-        block = Block.from_bytes(block_bytes)
+        block = Block.from_bytes(block_bytes, state=state)
         header_data = block.header.to_bytes()
 
         self._conn.execute(

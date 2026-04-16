@@ -68,9 +68,11 @@ class BlockPruner:
                 block_hash=block.block_hash,
             )
 
-            # Actually delete from SQLite if db is available
+            # Actually delete from SQLite if db is available.  `chain`
+            # doubles as the entity-index registry state so the compact-
+            # form on-disk block can be decoded to extract the header.
             if db is not None:
-                db.prune_block_to_header(i)
+                db.prune_block_to_header(i, state=chain)
 
             pruned_count += 1
 
