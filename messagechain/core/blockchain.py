@@ -1473,33 +1473,35 @@ class Blockchain:
                 sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
 
         # Simulate bootstrap lottery.  Must byte-mirror apply path —
-        # at block_height % LOTTERY_INTERVAL == 0 while bootstrap is
-        # live, one non-seed validator wins LOTTERY_BOUNTY tokens
-        # credited to balance.  Reputation snapshot used here is the
-        # pre-attestation-of-this-block state (matches apply: lottery
-        # runs before _process_attestations updates self.reputation
-        # with the current block's attestations).
+        # at block_height % LOTTERY_INTERVAL == 0, compute the
+        # progress-faded bounty and, if > 0, credit it to the winner's
+        # balance.  Reputation snapshot used here is the pre-
+        # attestation-of-this-block state (matches apply: lottery runs
+        # before _process_attestations updates self.reputation with the
+        # current block's attestations).
         from messagechain.config import (
             LOTTERY_INTERVAL as _LI,
             LOTTERY_BOUNTY as _LB,
             REPUTATION_CAP as _RC,
         )
-        if (
-            block_height > 0
-            and block_height % _LI == 0
-            and self.bootstrap_progress < 1.0
-        ):
+        if block_height > 0 and block_height % _LI == 0:
             from messagechain.consensus.reputation_lottery import (
-                select_lottery_winner,
+                select_lottery_winner, lottery_bounty_for_progress,
             )
-            _winner = select_lottery_winner(
-                candidates=list(self.reputation.items()),
-                seed_entity_ids=self.seed_entity_ids,
-                randomness=parent_randao,
-                reputation_cap=_RC,
+            _bounty = lottery_bounty_for_progress(
+                self.bootstrap_progress, full_bounty=_LB,
             )
-            if _winner is not None:
-                sim_balances[_winner] = sim_balances.get(_winner, 0) + _LB
+            if _bounty > 0:
+                _winner = select_lottery_winner(
+                    candidates=list(self.reputation.items()),
+                    seed_entity_ids=self.seed_entity_ids,
+                    randomness=parent_randao,
+                    reputation_cap=_RC,
+                )
+                if _winner is not None:
+                    sim_balances[_winner] = (
+                        sim_balances.get(_winner, 0) + _bounty
+                    )
 
         # Apply-path parity for signature-driven watermark bumps.  Order
         # matters: attestations run first because the same entity can be
@@ -2837,51 +2839,51 @@ class Blockchain:
                     )
 
         # Reputation-weighted bootstrap lottery.  Fires every
-        # LOTTERY_INTERVAL blocks while bootstrap_progress < 1.0.
-        # Winner receives LOTTERY_BOUNTY credited to balance AND held
-        # in escrow for the current escrow window — slashable if the
-        # winner then misbehaves.  Seeds are excluded; reputation = 0
-        # candidates can still win if nobody else has attested yet.
+        # LOTTERY_INTERVAL blocks; bounty fades linearly from full at
+        # progress=0 to 0 at progress=1 via lottery_bounty_for_progress
+        # — smooth time-bound handoff to normal PoS, no cliff.
+        # Winner receives the (faded) bounty credited to balance AND
+        # held in escrow for the current escrow window — slashable if
+        # the winner then misbehaves.  Seeds are excluded; reputation
+        # = 0 candidates can still win if nobody else has attested yet.
         from messagechain.config import (
             LOTTERY_INTERVAL, LOTTERY_BOUNTY,
             REPUTATION_CAP,
         )
         current_h = block.header.block_number
-        if (
-            current_h > 0
-            and current_h % LOTTERY_INTERVAL == 0
-            and self.bootstrap_progress < 1.0
-        ):
+        if current_h > 0 and current_h % LOTTERY_INTERVAL == 0:
             from messagechain.consensus.reputation_lottery import (
-                select_lottery_winner,
+                select_lottery_winner, lottery_bounty_for_progress,
             )
-            candidates = list(self.reputation.items())
-            winner = select_lottery_winner(
-                candidates=candidates,
-                seed_entity_ids=self.seed_entity_ids,
-                randomness=parent_randao,
-                reputation_cap=REPUTATION_CAP,
+            bounty = lottery_bounty_for_progress(
+                self.bootstrap_progress, full_bounty=LOTTERY_BOUNTY,
             )
-            if winner is not None:
-                # Credit bounty into balance + escrow (same pattern as
-                # attester rewards).  Mint is tracked against total_supply
-                # so the inflation accounting stays honest.
-                self.supply.balances[winner] = (
-                    self.supply.balances.get(winner, 0) + LOTTERY_BOUNTY
+            if bounty > 0:
+                candidates = list(self.reputation.items())
+                winner = select_lottery_winner(
+                    candidates=candidates,
+                    seed_entity_ids=self.seed_entity_ids,
+                    randomness=parent_randao,
+                    reputation_cap=REPUTATION_CAP,
                 )
-                self.supply.total_supply += LOTTERY_BOUNTY
-                if escrow_len > 0:
-                    self._escrow.add(
-                        entity_id=winner, amount=LOTTERY_BOUNTY,
-                        earned_at=current_h,
-                        unlock_at=current_h + escrow_len,
+                if winner is not None:
+                    self.supply.balances[winner] = (
+                        self.supply.balances.get(winner, 0) + bounty
                     )
-                logger.info(
-                    f"LOTTERY: block #{current_h} — winner "
-                    f"{winner.hex()[:16]} received {LOTTERY_BOUNTY} tokens "
-                    f"(reputation={self.reputation.get(winner, 0)}, "
-                    f"escrow_blocks={escrow_len})"
-                )
+                    self.supply.total_supply += bounty
+                    if escrow_len > 0:
+                        self._escrow.add(
+                            entity_id=winner, amount=bounty,
+                            earned_at=current_h,
+                            unlock_at=current_h + escrow_len,
+                        )
+                    logger.info(
+                        f"LOTTERY: block #{current_h} — winner "
+                        f"{winner.hex()[:16]} received {bounty} tokens "
+                        f"(reputation={self.reputation.get(winner, 0)}, "
+                        f"progress={self.bootstrap_progress:.3f}, "
+                        f"escrow_blocks={escrow_len})"
+                    )
 
         # Unlock matured escrow — no balance change (tokens were already
         # credited at mint time), just lifting the spendable-balance

@@ -41,6 +41,39 @@ def effective_reputation(rep: int, cap: int) -> int:
     return rep
 
 
+def lottery_bounty_for_progress(
+    bootstrap_progress: float, *, full_bounty: int,
+) -> int:
+    """Lottery bounty amount as a function of bootstrap progress.
+
+    Linear fade from `full_bounty` at progress=0 to 0 at progress=1.
+
+        bounty(p) = floor(full_bounty * (1 - p))
+
+    Replaces the earlier cliff behavior (fixed bounty during bootstrap,
+    then abruptly zero at progress=1.0).  The smooth fade matches the
+    design intent — early bootstrap concentrates the bounty when
+    validators most need it, and the incentive winds down on the same
+    schedule as every other bootstrap-era mechanic (min-stake ramp,
+    escrow-window ramp, seed-exclusion tilt).
+
+    Integrated envelope over the bootstrap window is bounded:
+    `sum_{k=0..BOOTSTRAP_END_HEIGHT/INTERVAL} full_bounty * (1 - k*I/H)`
+    ≈ full_bounty * (H / I) / 2.  So halving relative to the flat
+    curve — still comfortably under 0.01% of supply.
+
+    Returns an integer (token count), floor-rounded.  `full_bounty`
+    is typically `config.LOTTERY_BOUNTY`.
+    """
+    if not (0.0 <= bootstrap_progress <= 1.0):
+        raise ValueError(
+            f"bootstrap_progress must be in [0, 1], got {bootstrap_progress}"
+        )
+    if full_bounty < 0:
+        raise ValueError(f"full_bounty must be >= 0, got {full_bounty}")
+    return int(full_bounty * (1.0 - bootstrap_progress))
+
+
 def select_lottery_winner(
     *,
     candidates: list[tuple[bytes, int]],

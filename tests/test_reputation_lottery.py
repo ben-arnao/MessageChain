@@ -25,6 +25,7 @@ import unittest
 from messagechain.consensus.reputation_lottery import (
     select_lottery_winner,
     effective_reputation,
+    lottery_bounty_for_progress,
 )
 
 
@@ -46,6 +47,69 @@ class TestReputationClamp(unittest.TestCase):
 
     def test_above_cap_clamps_to_cap(self):
         self.assertEqual(effective_reputation(500, cap=100), 100)
+
+
+class TestLotteryBountyFade(unittest.TestCase):
+    """lottery_bounty_for_progress fades linearly from full at p=0 to 0 at p=1.
+
+    Replaces the earlier cliff behavior where the lottery fired at a
+    fixed bounty throughout bootstrap and abruptly went silent at
+    progress=1.0.  The smooth fade matches the design intent: early
+    bootstrap concentrates the bounty when validators need it most;
+    the incentive winds down on the same schedule as every other
+    bootstrap-era mechanic.
+    """
+
+    def test_full_bounty_at_genesis(self):
+        """At progress = 0 the bounty is the full configured amount."""
+        self.assertEqual(
+            lottery_bounty_for_progress(0.0, full_bounty=100), 100,
+        )
+
+    def test_zero_bounty_at_progress_one(self):
+        """At progress = 1.0 the bounty collapses to zero — no cliff."""
+        self.assertEqual(
+            lottery_bounty_for_progress(1.0, full_bounty=100), 0,
+        )
+
+    def test_linear_fade_half_at_half(self):
+        """At progress = 0.5 the bounty is half."""
+        self.assertEqual(
+            lottery_bounty_for_progress(0.5, full_bounty=100), 50,
+        )
+
+    def test_monotonic_non_increasing(self):
+        """The fade is monotonically non-increasing in progress."""
+        prev = 9999
+        for p in [i / 20 for i in range(21)]:
+            cur = lottery_bounty_for_progress(p, full_bounty=100)
+            self.assertLessEqual(cur, prev, f"non-monotonic at p={p}")
+            prev = cur
+
+    def test_rejects_out_of_range_progress(self):
+        with self.assertRaises(ValueError):
+            lottery_bounty_for_progress(-0.01, full_bounty=100)
+        with self.assertRaises(ValueError):
+            lottery_bounty_for_progress(1.01, full_bounty=100)
+
+    def test_rejects_negative_bounty(self):
+        with self.assertRaises(ValueError):
+            lottery_bounty_for_progress(0.5, full_bounty=-1)
+
+    def test_integrated_envelope_half_of_flat(self):
+        """Triangular (fading) envelope is ~half the rectangular (flat)
+        envelope over the same bootstrap window.  Spot-checks the
+        rough envelope math documented on the helper."""
+        n_intervals = 100
+        flat_total = n_intervals * 100
+        faded_total = sum(
+            lottery_bounty_for_progress(k / n_intervals, full_bounty=100)
+            for k in range(n_intervals)
+        )
+        # Triangular sum is ~half of rectangular; allow 5% band for
+        # integer-rounding effects.
+        self.assertLess(faded_total, flat_total * 0.55)
+        self.assertGreater(faded_total, flat_total * 0.45)
 
 
 class TestLotterySelection(unittest.TestCase):
