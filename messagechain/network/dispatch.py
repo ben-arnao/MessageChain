@@ -41,4 +41,12 @@ def message_category(msg_type: MessageType) -> str:
         # Unsolicited response flooding: a peer can spam large response
         # messages to exhaust CPU/memory without hitting request-side limits.
         return "response"
+    if msg_type == MessageType.REQUEST_MEMPOOL_TX:
+        # Active mempool-replication request — tight bucket to prevent a
+        # peer from amplifying work by repeatedly pulling our pool.
+        return "mempool_req"
+    if msg_type == MessageType.MEMPOOL_DIGEST:
+        # Digest arrivals — additionally throttled per-peer by interval
+        # (see Node._mempool_digest_last_seen / MEMPOOL_DIGEST_MIN_INTERVAL_SEC).
+        return "mempool_digest"
     return "general"

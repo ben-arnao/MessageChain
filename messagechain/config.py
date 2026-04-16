@@ -304,6 +304,30 @@ MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
 MEMPOOL_PER_SENDER_LIMIT = 5  # max pending txs per entity (tight to throttle burst spam)
 MEMPOOL_MAX_ANCESTORS = 5     # max unconfirmed tx chain depth per entity
 
+# Active mempool replication — censorship-resistance layer on top of
+# passive ANNOUNCE_TX gossip.  Every node periodically advertises a
+# compact digest of its current mempool (hashes only) to a random subset
+# of peers; each recipient pulls any hashes it's missing via
+# REQUEST_MEMPOOL_TX.  The responder replies with the existing
+# ANNOUNCE_TX — one tx-broadcast path, no duplicate logic.
+#
+# Why this matters: the per-node mempool means a captured first-hop
+# node that silently drops a tx censors it from everyone — including
+# attesters who would otherwise trigger the forced-inclusion veto.
+# Active replication closes the hole: a tx that reaches ANY honest
+# node propagates to every honest node within one sync interval.
+#
+# Rate limits are mandatory — a fanout of 3 digests every 30s is cheap,
+# but a peer sending a digest claiming millions of hashes is DoS.  Hard-
+# cap digest size, rate-limit REQUEST_MEMPOOL_TX per-peer, and throttle
+# repeated digests from the same peer.
+MEMPOOL_SYNC_INTERVAL_SEC = 30        # how often each node fires one sync cycle
+MEMPOOL_SYNC_FANOUT = 3               # random peers contacted per cycle
+MEMPOOL_DIGEST_MAX_HASHES = 10_000    # digest size cap (10K × 32B = 320KB worst case)
+MEMPOOL_REQUEST_RATE_PER_SEC = 10     # steady-state REQUEST_MEMPOOL_TX rate per peer
+MEMPOOL_REQUEST_BURST = 50            # burst allowance per peer
+MEMPOOL_DIGEST_MIN_INTERVAL_SEC = 10  # reject digests faster than this per peer
+
 # Per-pool cap on non-message-tx pending pools maintained by Server
 # (_pending_stake_txs, _pending_unstake_txs, _pending_authority_txs,
 # _pending_governance_txs).  Without a cap, a funded attacker could fill
