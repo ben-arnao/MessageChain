@@ -14,7 +14,10 @@ import hashlib
 import hmac
 import struct
 from dataclasses import dataclass, field
-from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT, WOTS_KEY_CHAINS
+from messagechain.config import (
+    HASH_ALGO, MERKLE_TREE_HEIGHT, WOTS_KEY_CHAINS,
+    SIG_VERSION_CURRENT, validate_sig_version,
+)
 from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _hash
 
 # Hash output size for SHA3-256, used for strict size validation on signatures.
@@ -30,12 +33,19 @@ MAX_AUTH_PATH_LEN = 64
 
 @dataclass
 class Signature:
-    """A complete signature: WOTS+ sig + Merkle authentication path."""
+    """A complete signature: WOTS+ sig + Merkle authentication path.
+
+    `sig_version` is a crypto-agility register: carried on every signature,
+    committed into the signable_data of every transaction, and rejected by
+    validators when it doesn't match SIG_VERSION_CURRENT. See config.py
+    (`SIG_VERSION_*`, `validate_sig_version`) for the migration design.
+    """
     wots_signature: list[bytes]
     leaf_index: int
     auth_path: list[bytes]  # sibling hashes from leaf to root
     wots_public_key: bytes  # the leaf's WOTS+ public key
     wots_public_seed: bytes
+    sig_version: int = SIG_VERSION_CURRENT
 
     def canonical_bytes(self) -> bytes:
         """Canonical byte representation of the signature.
@@ -61,6 +71,10 @@ class Signature:
         # Public key and seed
         parts.append(self.wots_public_key)
         parts.append(self.wots_public_seed)
+        # Crypto-agility: sig_version trails the existing fields so the
+        # canonical form is a superset of the pre-migration bytes.  The
+        # witness_hash therefore commits to the signer's chosen scheme.
+        parts.append(struct.pack(">B", self.sig_version))
         return b"".join(parts)
 
     def serialize(self) -> dict:
@@ -70,6 +84,7 @@ class Signature:
             "auth_path": [h.hex() for h in self.auth_path],
             "wots_public_key": self.wots_public_key.hex(),
             "wots_public_seed": self.wots_public_seed.hex(),
+            "sig_version": self.sig_version,
         }
 
     def to_bytes(self) -> bytes:
@@ -83,11 +98,19 @@ class Signature:
             M x  32-byte path hashes   (where M = auth_path_len)
             32   wots_public_key
             32   wots_public_seed
+            u8   sig_version             <- crypto-agility register
 
         Every variable-length section is length-prefixed to prevent
         ambiguous concatenation (same defense as canonical_bytes uses).
         Hash elements are fixed-size (SHA3-256 = 32 bytes) so we encode
         only the count, not each element's length.
+
+        sig_version is appended after the pre-migration fields so the
+        blob is a strict extension: a pre-migration parser would fail
+        fast on the trailing byte rather than mis-decode into a valid-
+        looking sig.  (That is what we want — silently accepting a
+        pre-migration blob as a post-migration signature would let an
+        attacker forge a sig_version of their choosing via truncation.)
         """
         parts = [struct.pack(">H", len(self.wots_signature))]
         parts.extend(self.wots_signature)
@@ -96,6 +119,7 @@ class Signature:
         parts.extend(self.auth_path)
         parts.append(self.wots_public_key)
         parts.append(self.wots_public_seed)
+        parts.append(struct.pack(">B", self.sig_version))
         return b"".join(parts)
 
     @classmethod
@@ -161,6 +185,18 @@ class Signature:
         pub_seed = bytes(data[offset:offset + _HASH_SIZE])
         offset += _HASH_SIZE
 
+        # Crypto-agility register: reject unknown versions at decode time so
+        # malformed or future-version blobs never reach wots_verify.  A
+        # missing byte here is a truncation; a non-current value is either
+        # a byte flip in transit or a too-new peer — either way, not ours.
+        if offset + 1 > len(data):
+            raise ValueError("Signature blob truncated at sig_version")
+        sig_version = struct.unpack_from(">B", data, offset)[0]
+        offset += 1
+        ok, reason = validate_sig_version(sig_version)
+        if not ok:
+            raise ValueError(f"Invalid signature: {reason}")
+
         # leaf_index must be a valid index into a tree of height = auth_len.
         max_leaf_index = (1 << auth_len) - 1 if auth_len > 0 else 0
         if leaf_index > max_leaf_index:
@@ -175,6 +211,7 @@ class Signature:
             auth_path=auth_path,
             wots_public_key=pub_key,
             wots_public_seed=pub_seed,
+            sig_version=sig_version,
         )
 
     @classmethod
@@ -184,6 +221,13 @@ class Signature:
         auth_path = [bytes.fromhex(h) for h in data["auth_path"]]
         pub_key = bytes.fromhex(data["wots_public_key"])
         pub_seed = bytes.fromhex(data["wots_public_seed"])
+        # Crypto-agility: default to SIG_VERSION_CURRENT when the field is
+        # absent so pre-migration dicts (mempool dumps, test fixtures) load
+        # cleanly.  A PRESENT-but-unknown value is a clear error and rejected.
+        sig_version = data.get("sig_version", SIG_VERSION_CURRENT)
+        ok, reason = validate_sig_version(sig_version)
+        if not ok:
+            raise ValueError(f"Invalid signature: {reason}")
 
         # M4: Structural validation on deserialization.  Every check here
         # runs BEFORE verify_signature sees the input, so malformed blobs
@@ -229,6 +273,7 @@ class Signature:
             auth_path=auth_path,
             wots_public_key=pub_key,
             wots_public_seed=pub_seed,
+            sig_version=sig_version,
         )
 
 

@@ -22,6 +22,7 @@ from messagechain.config import (
     HASH_ALGO,
     MAX_TIMESTAMP_DRIFT,
     MIN_FEE,
+    SIG_VERSION_CURRENT,
     VALIDATOR_MIN_STAKE,
 )
 from messagechain.crypto.keys import Signature, verify_signature
@@ -83,9 +84,13 @@ class StakeTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit the signer's chosen scheme into tx_hash.
+        # getattr fallback keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"stake"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + struct.pack(">Q", self.amount)
             + struct.pack(">Q", self.nonce)
@@ -166,9 +171,13 @@ class UnstakeTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit the signer's chosen scheme into tx_hash.
+        # getattr fallback keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"unstake"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + struct.pack(">Q", self.amount)
             + struct.pack(">Q", self.nonce)

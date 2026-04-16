@@ -40,6 +40,7 @@ from messagechain.config import (
     HASH_ALGO,
     MAX_TIMESTAMP_DRIFT,
     MIN_FEE,
+    SIG_VERSION_CURRENT,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -67,9 +68,13 @@ class RevokeTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
+        # keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"revoke"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)

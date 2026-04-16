@@ -17,7 +17,10 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID, MAX_TIMESTAMP_DRIFT
+from messagechain.config import (
+    HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID, MAX_TIMESTAMP_DRIFT,
+    SIG_VERSION_CURRENT,
+)
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
 from messagechain.identity.identity import Entity
 
@@ -39,9 +42,16 @@ class KeyRotationTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
-        """Canonical byte representation for signing."""
+        """Canonical byte representation for signing.
+
+        Includes sig_version from the attached signature so the tx_hash
+        commits to the signer's crypto scheme (crypto-agility register).
+        getattr fallback keeps None-signature test fixtures working.
+        """
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + self.old_public_key
             + self.new_public_key

@@ -831,6 +831,14 @@ class Blockchain:
         if tx.entity_id not in self.public_keys:
             return False, "Unknown entity — must register first"
 
+        # Crypto-agility gate: reject unknown signature schemes up-front so
+        # the reason string is a clear "sig version" and not a generic
+        # "invalid signature".  Applies before any hash/verify work.
+        from messagechain.config import validate_sig_version
+        ok, reason = validate_sig_version(tx.signature.sig_version)
+        if not ok:
+            return False, f"Invalid sig version: {reason}"
+
         expected_nonce = self.nonces.get(tx.entity_id, 0)
         if tx.nonce != expected_nonce:
             return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
@@ -1785,6 +1793,24 @@ class Blockchain:
         if block.header.version != 1:
             return False, f"Unknown block version {block.header.version}"
 
+        # Crypto-agility gate: reject any block whose header advertises an
+        # unknown hash scheme.  This is the single chokepoint that activates
+        # future hash algorithms via governance — until HASH_VERSION_CURRENT
+        # moves, only the current scheme is accepted here.
+        from messagechain.config import validate_hash_version, validate_sig_version
+        ok, reason = validate_hash_version(block.header.hash_version)
+        if not ok:
+            return False, reason
+        # Proposer signature must use an accepted sig scheme.  We check here
+        # (not only inside verify_signature) so the reason string is clear
+        # and rejection happens before any hash work.
+        if block.header.proposer_signature is not None:
+            ok, reason = validate_sig_version(
+                block.header.proposer_signature.sig_version,
+            )
+            if not ok:
+                return False, f"Proposer signature: {reason}"
+
         # Reject blocks proposed by emergency-revoked validators.  The cold-
         # key holder has declared this hot key compromised; the network
         # must stop honoring its block proposals immediately, regardless of
@@ -2405,6 +2431,20 @@ class Blockchain:
         # Block version must be known
         if block.header.version != 1:
             return False, f"Unknown block version {block.header.version}"
+
+        # Crypto-agility gate: mirror validate_block — unknown hash or sig
+        # scheme is rejected at the consensus boundary regardless of which
+        # entry point the block arrived through.
+        from messagechain.config import validate_hash_version, validate_sig_version
+        ok, reason = validate_hash_version(block.header.hash_version)
+        if not ok:
+            return False, reason
+        if block.header.proposer_signature is not None:
+            ok, reason = validate_sig_version(
+                block.header.proposer_signature.sig_version,
+            )
+            if not ok:
+                return False, f"Proposer signature: {reason}"
 
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
         if total_tx_count > MAX_TXS_PER_BLOCK:

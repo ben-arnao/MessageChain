@@ -24,7 +24,10 @@ Design:
 import hashlib
 import struct
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR, CHAIN_ID
+from messagechain.config import (
+    HASH_ALGO, FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR,
+    CHAIN_ID, SIG_VERSION_CURRENT,
+)
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -45,10 +48,18 @@ class Attestation:
     signature: Signature
 
     def signable_data(self) -> bytes:
-        """Data that the validator signs to create this attestation."""
+        """Data that the validator signs to create this attestation.
+
+        Crypto-agility: sig_version from the attached signature is committed
+        so a downstream byte flip of the scheme invalidates the whole
+        attestation hash.  getattr fallback keeps None-signature test
+        fixtures working.
+        """
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"attestation"
+            + struct.pack(">B", sig_version)
             + self.validator_id
             + self.block_hash
             + struct.pack(">Q", self.block_number)

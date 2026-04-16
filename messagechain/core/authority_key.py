@@ -34,6 +34,7 @@ from messagechain.config import (
     HASH_ALGO,
     MAX_TIMESTAMP_DRIFT,
     MIN_FEE,
+    SIG_VERSION_CURRENT,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -65,9 +66,13 @@ class SetAuthorityKeyTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
+        # keeps None-signature test fixtures working.
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
             + b"set_authority_key"
+            + struct.pack(">B", sig_version)
             + self.entity_id
             + self.new_authority_key
             + struct.pack(">Q", self.nonce)
