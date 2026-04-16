@@ -343,6 +343,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Port advertised on the .onion address (default: same as --rpc-port)",
     )
 
+    # --- anchor ---
+    anchor = sub.add_parser(
+        "anchor",
+        help="Bitcoin anchoring — external immutability proof",
+        description=(
+            "Manage Bitcoin anchors: submit new anchors, verify existing "
+            "anchors against Bitcoin, or list all stored anchors."
+        ),
+    )
+    anchor_sub = anchor.add_subparsers(dest="anchor_command", required=True)
+
+    # anchor submit
+    anchor_submit = anchor_sub.add_parser(
+        "submit",
+        help="Submit a Bitcoin anchor for a finalized block",
+    )
+    anchor_submit.add_argument(
+        "--block-number", type=int, required=True,
+        help="MC block number to anchor",
+    )
+    anchor_submit.add_argument(
+        "--bitcoin-rpc", type=str, default="http://localhost:8332",
+        help="Bitcoin Core RPC URL (default: http://localhost:8332)",
+    )
+
+    # anchor verify
+    anchor_verify = anchor_sub.add_parser(
+        "verify",
+        help="Verify all stored anchors against Bitcoin",
+    )
+    anchor_verify.add_argument(
+        "--bitcoin-rpc", type=str, default="http://localhost:8332",
+        help="Bitcoin Core RPC URL (default: http://localhost:8332)",
+    )
+
+    # anchor list
+    anchor_sub.add_parser(
+        "list",
+        help="Show all anchors with their Bitcoin confirmation status",
+    )
+
     return parser
 
 
@@ -1777,6 +1818,108 @@ def cmd_ping(args):
             print(f"  {label}: {info[key]}")
 
 
+def cmd_anchor(args):
+    """Bitcoin anchoring — submit, verify, or list anchors."""
+    subcmd = args.anchor_command
+
+    if subcmd == "list":
+        _cmd_anchor_list(args)
+    elif subcmd == "verify":
+        _cmd_anchor_verify(args)
+    elif subcmd == "submit":
+        _cmd_anchor_submit(args)
+
+
+def _cmd_anchor_list(_args):
+    """Show all stored Bitcoin anchors."""
+    from messagechain.storage.chaindb import ChainDB
+    import os
+
+    data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
+    db_path = os.path.join(data_dir, "messagechain.db")
+
+    if not os.path.exists(db_path):
+        print("No chain database found. Start a node first.")
+        sys.exit(1)
+
+    db = ChainDB(db_path)
+    try:
+        anchors = db.get_all_bitcoin_anchors()
+    finally:
+        db.close()
+
+    if not anchors:
+        print("No Bitcoin anchors stored.")
+        return
+
+    print(f"=== Bitcoin Anchors ({len(anchors)}) ===\n")
+    for a in anchors:
+        status = "confirmed" if a["btc_txid"] else "pending"
+        print(f"  MC block {a['mc_block_number']:>8}  [{status}]")
+        print(f"    anchor_hash: {a['anchor_hash'].hex()}")
+        if a["btc_txid"]:
+            print(f"    btc_txid:    {a['btc_txid']}")
+            print(f"    btc_height:  {a['btc_block_height']}")
+        print()
+
+
+def _cmd_anchor_verify(args):
+    """Verify all stored anchors against Bitcoin."""
+    from messagechain.storage.chaindb import ChainDB
+    from messagechain.anchoring.bitcoin_anchor import verify_chain_integrity
+    import os
+
+    data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
+    db_path = os.path.join(data_dir, "messagechain.db")
+
+    if not os.path.exists(db_path):
+        print("No chain database found. Start a node first.")
+        sys.exit(1)
+
+    db = ChainDB(db_path)
+    try:
+        results = verify_chain_integrity(db, args.bitcoin_rpc)
+    finally:
+        db.close()
+
+    if not results:
+        print("No confirmed anchors to verify.")
+        return
+
+    print(f"=== Anchor Verification ({len(results)}) ===\n")
+    passed = 0
+    failed = 0
+    for r in results:
+        mark = "PASS" if r.passed else "FAIL"
+        if r.passed:
+            passed += 1
+        else:
+            failed += 1
+        print(f"  [{mark}] MC block {r.mc_block_number}")
+        if not r.passed and r.error:
+            print(f"         error: {r.error}")
+
+    print(f"\n  {passed} passed, {failed} failed out of {len(results)} anchors")
+    if failed > 0:
+        print("\n  WARNING: Failed anchors indicate possible chain rewrite.")
+        print("  Investigate immediately via governance.")
+        sys.exit(1)
+
+
+def _cmd_anchor_submit(args):
+    """Submit a Bitcoin anchor for a specific block."""
+    from messagechain.anchoring.bitcoin_anchor import compute_anchor_hash
+    print(f"=== Submit Bitcoin Anchor ===\n")
+    print(f"  Block number: {args.block_number}")
+    print(f"  Bitcoin RPC:  {args.bitcoin_rpc}")
+    print()
+    print("Anchor submission requires a running node and Bitcoin Core.")
+    print("Use the node's operational anchor scheduler for automated anchoring.")
+    print(f"\nSample anchor hash for block {args.block_number}:")
+    sample = compute_anchor_hash(b"\x00" * 32, args.block_number, b"\x00" * 32)
+    print(f"  {sample.hex()}")
+
+
 def cmd_gen_tor_config(args):
     """Print a torrc snippet fronting this validator's RPC with a hidden service.
 
@@ -1853,6 +1996,7 @@ def main():
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,
+        "anchor": cmd_anchor,
     }
 
     handler = commands.get(args.command)
