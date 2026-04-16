@@ -88,6 +88,44 @@ class RevokeTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 entity_id | f64 timestamp | u64 fee | u32 sig_len |
+        sig | 32 tx_hash.
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.entity_id,
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "RevokeTransaction":
+        off = 0
+        if len(data) < 32 + 8 + 8 + 4 + 32:
+            raise ValueError("RevokeTransaction blob too short")
+        entity_id = bytes(data[off:off + 32]); off += 32
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("RevokeTransaction truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("RevokeTransaction has trailing bytes")
+        tx = cls(entity_id=entity_id, timestamp=timestamp, fee=fee, signature=sig)
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"RevokeTransaction hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "RevokeTransaction":
         sig = Signature.deserialize(data["signature"])

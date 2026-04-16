@@ -66,6 +66,54 @@ class KeyRotationTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 entity_id | 32 old_pk | 32 new_pk | u64 rotation_number |
+        f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.entity_id,
+            self.old_public_key,
+            self.new_public_key,
+            struct.pack(">Q", self.rotation_number),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "KeyRotationTransaction":
+        off = 0
+        if len(data) < 32 + 32 + 32 + 8 + 8 + 8 + 4 + 32:
+            raise ValueError("KeyRotation blob too short")
+        entity_id = bytes(data[off:off + 32]); off += 32
+        old_pk = bytes(data[off:off + 32]); off += 32
+        new_pk = bytes(data[off:off + 32]); off += 32
+        rotation_number = struct.unpack_from(">Q", data, off)[0]; off += 8
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("KeyRotation truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("KeyRotation has trailing bytes")
+        tx = cls(
+            entity_id=entity_id, old_public_key=old_pk,
+            new_public_key=new_pk, rotation_number=rotation_number,
+            timestamp=timestamp, fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"KeyRotation tx hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "KeyRotationTransaction":
         sig = Signature.deserialize(data["signature"])

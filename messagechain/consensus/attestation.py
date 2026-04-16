@@ -62,6 +62,38 @@ class Attestation:
             "signature": self.signature.serialize(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 validator_id | 32 block_hash | u64 block_number |
+        u32 sig_len | sig.
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.validator_id,
+            self.block_hash,
+            struct.pack(">Q", self.block_number),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "Attestation":
+        off = 0
+        if len(data) < 32 + 32 + 8 + 4:
+            raise ValueError("Attestation blob too short")
+        validator_id = bytes(data[off:off + 32]); off += 32
+        block_hash = bytes(data[off:off + 32]); off += 32
+        block_number = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len > len(data):
+            raise ValueError("Attestation truncated at signature")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        if off != len(data):
+            raise ValueError("Attestation has trailing bytes")
+        return cls(
+            validator_id=validator_id, block_hash=block_hash,
+            block_number=block_number, signature=sig,
+        )
+
     @classmethod
     def deserialize(cls, data: dict) -> "Attestation":
         return cls(

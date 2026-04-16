@@ -92,6 +92,97 @@ class MessageTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Compact binary encoding for storage/wire.
+
+        Layout (big-endian throughout):
+            u32  version
+            32   entity_id
+            u16  message_len
+            N    message (raw bytes)
+            f64  timestamp (seconds, float)
+            u64  nonce
+            u64  fee
+            u32  ttl
+            u32  signature_blob_len
+            M    signature_blob (Signature.to_bytes)
+            32   tx_hash
+
+        timestamp is stored as float64 so the dict round-trip is
+        bit-equivalent. Consensus hashing uses int(self.timestamp)
+        in _signable_data, so the fractional part never affects
+        tx_hash — storing the fractional seconds is a convenience
+        for clients that want sub-second ordering.
+        """
+        sig_blob = self.signature.to_bytes()
+        parts = [
+            struct.pack(">I", self.version),
+            self.entity_id,
+            struct.pack(">H", len(self.message)),
+            self.message,
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.nonce),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", self.ttl),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ]
+        return b"".join(parts)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "MessageTransaction":
+        """Decode a MessageTransaction from its compact binary form.
+
+        Verifies the declared tx_hash against a freshly-computed hash, so
+        a tampered-with blob never produces a seemingly-valid object —
+        matches the integrity guarantee of deserialize(dict).
+        """
+        offset = 0
+        if len(data) < 4 + 32 + 2:
+            raise ValueError("MessageTransaction blob too short")
+        version = struct.unpack_from(">I", data, offset)[0]
+        offset += 4
+        entity_id = bytes(data[offset:offset + 32]); offset += 32
+        msg_len = struct.unpack_from(">H", data, offset)[0]; offset += 2
+        if offset + msg_len > len(data):
+            raise ValueError("MessageTransaction message truncated")
+        message = bytes(data[offset:offset + msg_len]); offset += msg_len
+        if offset + 8 + 8 + 8 + 4 + 4 > len(data):
+            raise ValueError("MessageTransaction blob truncated at fixed fields")
+        timestamp = struct.unpack_from(">d", data, offset)[0]; offset += 8
+        nonce = struct.unpack_from(">Q", data, offset)[0]; offset += 8
+        fee = struct.unpack_from(">Q", data, offset)[0]; offset += 8
+        ttl = struct.unpack_from(">I", data, offset)[0]; offset += 4
+        sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
+        if offset + sig_len > len(data):
+            raise ValueError("MessageTransaction signature truncated")
+        sig = Signature.from_bytes(bytes(data[offset:offset + sig_len]))
+        offset += sig_len
+        if offset + 32 > len(data):
+            raise ValueError("MessageTransaction tx_hash truncated")
+        declared_hash = bytes(data[offset:offset + 32]); offset += 32
+        if offset != len(data):
+            raise ValueError("MessageTransaction blob has trailing bytes")
+        tx = cls(
+            entity_id=entity_id,
+            message=message,
+            timestamp=timestamp,
+            nonce=nonce,
+            fee=fee,
+            signature=sig,
+            version=version,
+            ttl=ttl,
+        )
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = tx._compute_hash()
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"Transaction hash mismatch: declared {declared_hash.hex()[:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "MessageTransaction":
         sig = Signature.deserialize(data["signature"])

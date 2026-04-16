@@ -515,7 +515,12 @@ class ChainSyncer:
 
         for block_data in blocks_data:
             try:
-                block = Block.deserialize(block_data)
+                # Wire format: hex-encoded Block.to_bytes() binary blob.
+                # See node._handle_request_blocks_batch for why we ship
+                # blocks opaquely rather than as nested dicts.
+                if not isinstance(block_data, str):
+                    raise ValueError("block batch entry must be hex string")
+                block = Block.from_bytes(bytes.fromhex(block_data))
                 block_hash = block.block_hash
 
                 # Remove from needed list

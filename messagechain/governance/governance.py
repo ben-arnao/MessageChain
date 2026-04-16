@@ -131,6 +131,70 @@ class ProposalTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self) -> bytes:
+        """Binary: 32 proposer_id | u16 title_len | title utf8 | u32 desc_len |
+        desc utf8 | u8 ref_len | ref_hash | f64 timestamp | u64 fee |
+        u32 sig_len | sig | 32 tx_hash.
+
+        title uses u16 (bounded by MAX_PROPOSAL_TITLE_LENGTH = 200).
+        description uses u32 (bounded by MAX_PROPOSAL_DESCRIPTION_LENGTH = 10k).
+        reference_hash is 0 or 32 bytes — u8 length lets us distinguish.
+        """
+        title_b = self.title.encode("utf-8")
+        desc_b = self.description.encode("utf-8")
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.proposer_id,
+            struct.pack(">H", len(title_b)),
+            title_b,
+            struct.pack(">I", len(desc_b)),
+            desc_b,
+            struct.pack(">B", len(self.reference_hash)),
+            self.reference_hash,
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ProposalTransaction":
+        off = 0
+        if len(data) < 32 + 2:
+            raise ValueError("Proposal blob too short")
+        proposer_id = bytes(data[off:off + 32]); off += 32
+        title_len = struct.unpack_from(">H", data, off)[0]; off += 2
+        if off + title_len + 4 > len(data):
+            raise ValueError("Proposal truncated at title")
+        title = data[off:off + title_len].decode("utf-8"); off += title_len
+        desc_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + desc_len + 1 > len(data):
+            raise ValueError("Proposal truncated at description")
+        desc = data[off:off + desc_len].decode("utf-8"); off += desc_len
+        ref_len = struct.unpack_from(">B", data, off)[0]; off += 1
+        if off + ref_len + 8 + 8 + 4 + 32 > len(data):
+            raise ValueError("Proposal truncated at reference_hash/tail")
+        ref_hash = bytes(data[off:off + ref_len]); off += ref_len
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("Proposal truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("Proposal has trailing bytes")
+        tx = cls(
+            proposer_id=proposer_id, title=title, description=desc,
+            timestamp=timestamp, fee=fee, signature=sig,
+            reference_hash=ref_hash,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError("Proposal tx hash mismatch")
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "ProposalTransaction":
         sig = Signature.deserialize(data["signature"])
@@ -201,6 +265,48 @@ class VoteTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        """Binary: 32 voter_id | 32 proposal_id | u8 approve | f64 timestamp |
+        u64 fee | u32 sig_len | sig | 32 tx_hash.
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.voter_id,
+            self.proposal_id,
+            struct.pack(">B", 1 if self.approve else 0),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "VoteTransaction":
+        off = 0
+        if len(data) < 32 + 32 + 1 + 8 + 8 + 4 + 32:
+            raise ValueError("Vote blob too short")
+        voter_id = bytes(data[off:off + 32]); off += 32
+        proposal_id = bytes(data[off:off + 32]); off += 32
+        approve = struct.unpack_from(">B", data, off)[0] != 0; off += 1
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("Vote truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("Vote has trailing bytes")
+        tx = cls(
+            voter_id=voter_id, proposal_id=proposal_id,
+            approve=approve, timestamp=timestamp, fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError("Vote tx hash mismatch")
+        return tx
 
     @classmethod
     def deserialize(cls, data: dict) -> "VoteTransaction":
@@ -281,6 +387,64 @@ class TreasurySpendTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        """Binary: 32 proposer_id | 32 recipient_id | u64 amount |
+        u16 title_len | title | u32 desc_len | desc | f64 timestamp |
+        u64 fee | u32 sig_len | sig | 32 tx_hash.
+        """
+        title_b = self.title.encode("utf-8")
+        desc_b = self.description.encode("utf-8")
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.proposer_id,
+            self.recipient_id,
+            struct.pack(">Q", self.amount),
+            struct.pack(">H", len(title_b)),
+            title_b,
+            struct.pack(">I", len(desc_b)),
+            desc_b,
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "TreasurySpendTransaction":
+        off = 0
+        if len(data) < 32 + 32 + 8 + 2:
+            raise ValueError("TreasurySpend blob too short")
+        proposer_id = bytes(data[off:off + 32]); off += 32
+        recipient_id = bytes(data[off:off + 32]); off += 32
+        amount = struct.unpack_from(">Q", data, off)[0]; off += 8
+        title_len = struct.unpack_from(">H", data, off)[0]; off += 2
+        if off + title_len + 4 > len(data):
+            raise ValueError("TreasurySpend truncated at title")
+        title = data[off:off + title_len].decode("utf-8"); off += title_len
+        desc_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + desc_len + 8 + 8 + 4 + 32 > len(data):
+            raise ValueError("TreasurySpend truncated at description/tail")
+        desc = data[off:off + desc_len].decode("utf-8"); off += desc_len
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("TreasurySpend truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("TreasurySpend has trailing bytes")
+        tx = cls(
+            proposer_id=proposer_id, recipient_id=recipient_id,
+            amount=amount, title=title, description=desc,
+            timestamp=timestamp, fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError("Treasury spend tx hash mismatch")
+        return tx
 
     @classmethod
     def deserialize(cls, data: dict) -> "TreasurySpendTransaction":

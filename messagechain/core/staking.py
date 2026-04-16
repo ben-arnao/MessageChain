@@ -31,6 +31,42 @@ def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
 
+def _decode_stake_like(cls, data: bytes, label: str):
+    """Shared binary decoder for StakeTransaction / UnstakeTransaction.
+
+    Both types have identical envelopes (entity_id | amount | nonce |
+    timestamp | fee | sig | tx_hash); only the _signable_data domain
+    tag differs.  Sharing the decoder means an envelope change has
+    exactly one implementation to touch.
+    """
+    off = 0
+    if len(data) < 32 + 8 + 8 + 8 + 8 + 4 + 32:
+        raise ValueError(f"{label} blob too short")
+    entity_id = bytes(data[off:off + 32]); off += 32
+    amount = struct.unpack_from(">Q", data, off)[0]; off += 8
+    nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
+    timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+    fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+    sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+    if off + sig_len + 32 > len(data):
+        raise ValueError(f"{label} truncated at signature/hash")
+    sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+    declared_hash = bytes(data[off:off + 32]); off += 32
+    if off != len(data):
+        raise ValueError(f"{label} has trailing bytes")
+    tx = cls(
+        entity_id=entity_id, amount=amount, nonce=nonce,
+        timestamp=timestamp, fee=fee, signature=sig,
+    )
+    expected = tx._compute_hash()
+    if expected != declared_hash:
+        raise ValueError(
+            f"{label} hash mismatch: declared {declared_hash.hex()[:16]}, "
+            f"computed {expected.hex()[:16]}"
+        )
+    return tx
+
+
 @dataclass
 class StakeTransaction:
     """An on-chain transaction to lock tokens for validator staking."""
@@ -71,6 +107,26 @@ class StakeTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        """Compact binary: 32 entity_id | u64 amount | u64 nonce |
+        f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.entity_id,
+            struct.pack(">Q", self.amount),
+            struct.pack(">Q", self.nonce),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "StakeTransaction":
+        return _decode_stake_like(cls, data, label="StakeTransaction")
 
     @classmethod
     def deserialize(cls, data: dict) -> "StakeTransaction":
@@ -134,6 +190,29 @@ class UnstakeTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+
+    def to_bytes(self) -> bytes:
+        """Same layout as StakeTransaction — the distinguishing "stake" vs
+        "unstake" discriminator lives in _signable_data (domain-separated
+        hashing), not in the binary envelope.  Callers know which class
+        to deserialize into from context (which block-level list it came
+        out of).
+        """
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.entity_id,
+            struct.pack(">Q", self.amount),
+            struct.pack(">Q", self.nonce),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "UnstakeTransaction":
+        return _decode_stake_like(cls, data, label="UnstakeTransaction")
 
     @classmethod
     def deserialize(cls, data: dict) -> "UnstakeTransaction":
