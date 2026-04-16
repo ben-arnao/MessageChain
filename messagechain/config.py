@@ -299,6 +299,15 @@ BAN_DURATION = 86400      # ban length in seconds (24 hours)
 FORCED_INCLUSION_WAIT_BLOCKS = 3
 FORCED_INCLUSION_SET_SIZE = 5
 
+# Inclusion attestation — proposer mempool-snapshot accountability
+#
+# When enabled, each proposer embeds a Merkle root of their mempool's
+# tx hashes in the block header.  This creates on-chain evidence of
+# which txs the proposer saw at proposal time.  The proposer's block
+# signature covers it transitively (via signable_data).  Evidence is
+# for governance review, NOT automatic slashing.
+INCLUSION_ATTESTATION_ENABLED = True
+
 # Mempool
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)

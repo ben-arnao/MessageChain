@@ -151,6 +151,10 @@ class BlockHeader:
     # without a chain reset.  See config.HASH_VERSION_* and
     # validate_hash_version.
     hash_version: int = HASH_VERSION_CURRENT
+    # Inclusion attestation: Merkle root of proposer's mempool tx hashes
+    # at proposal time.  Committed via signable_data so the proposer's
+    # block signature covers it transitively — no separate snapshot sig.
+    mempool_snapshot_root: bytes = b"\x00" * 32
 
     def signable_data(self) -> bytes:
         # NOTE: randao_mix is intentionally NOT included here. It is derived
@@ -171,6 +175,7 @@ class BlockHeader:
             + self.witness_root
             + struct.pack(">Q", int(self.timestamp))
             + self.proposer_id
+            + self.mempool_snapshot_root
         )
 
     def serialize(self) -> dict:
@@ -185,6 +190,7 @@ class BlockHeader:
             "timestamp": self.timestamp,
             "proposer_id": self.proposer_id.hex(),
             "randao_mix": self.randao_mix.hex(),
+            "mempool_snapshot_root": self.mempool_snapshot_root.hex(),
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
         }
 
@@ -202,6 +208,7 @@ class BlockHeader:
             f64  timestamp
             32   proposer_id
             32   randao_mix
+            32   mempool_snapshot_root  <- inclusion attestation
             u32  sig_blob_len  (0 = no proposer signature)
             N    sig_blob
 
@@ -225,6 +232,7 @@ class BlockHeader:
             struct.pack(">d", float(self.timestamp)),
             self.proposer_id,
             self.randao_mix,
+            self.mempool_snapshot_root,
             struct.pack(">I", len(sig_blob)),
             sig_blob,
         ])
@@ -234,7 +242,8 @@ class BlockHeader:
         off = 0
         # +1 byte for the u8 hash_version field (crypto agility).
         # +32 bytes for the witness_root field.
-        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 4
+        # +32 bytes for the mempool_snapshot_root field.
+        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32 + 4
         if len(data) < expected_min:
             raise ValueError("BlockHeader blob too short")
         version = struct.unpack_from(">I", data, off)[0]; off += 4
@@ -254,6 +263,7 @@ class BlockHeader:
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
         proposer_id = bytes(data[off:off + 32]); off += 32
         randao_mix = bytes(data[off:off + 32]); off += 32
+        mempool_snapshot_root = bytes(data[off:off + 32]); off += 32
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
         if off + sig_len > len(data):
             raise ValueError("BlockHeader truncated at signature")
@@ -272,6 +282,7 @@ class BlockHeader:
             proposer_id=proposer_id, randao_mix=randao_mix,
             proposer_signature=proposer_signature,
             hash_version=hash_version,
+            mempool_snapshot_root=mempool_snapshot_root,
         )
 
     @classmethod
@@ -292,6 +303,7 @@ class BlockHeader:
             randao_mix=bytes.fromhex(data["randao_mix"]) if data.get("randao_mix") else b"\x00" * 32,
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
             hash_version=data.get("hash_version", HASH_VERSION_CURRENT),
+            mempool_snapshot_root=bytes.fromhex(data["mempool_snapshot_root"]) if data.get("mempool_snapshot_root") else b"\x00" * 32,
         )
 
 
