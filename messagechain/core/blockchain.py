@@ -3550,7 +3550,7 @@ class Blockchain:
         for block in reversed(self.chain):
             for tx in reversed(block.transactions):
                 messages.append({
-                    "message": tx.message.decode("utf-8", errors="replace"),
+                    "message": tx.plaintext.decode("utf-8", errors="replace"),
                     "entity_id": tx.entity_id.hex(),
                     "timestamp": tx.timestamp,
                     "tx_hash": tx.tx_hash.hex(),

@@ -113,20 +113,29 @@ class TestSizeBasedFeeIntegration(unittest.TestCase):
         self.alice = Entity.create(b"alice-key-for-fee-tests".ljust(32, b"\x00"))
 
     def test_create_transaction_rejects_fee_below_nonlinear_minimum(self):
-        msg = "A" * 100
+        # Fees are charged on the STORED (canonical) size after compression,
+        # not the raw plaintext. Use a short incompressible message so the
+        # stored size equals the plaintext size and the test is exercising
+        # the non-linear fee formula directly.
+        msg = "hi there, friend!"  # short enough to stay raw
         min_required = calculate_min_fee(msg.encode("ascii"))
         with self.assertRaises(ValueError):
             create_transaction(self.alice, msg, fee=min_required - 1, nonce=0)
 
     def test_create_transaction_accepts_fee_at_nonlinear_minimum(self):
         msg = "A" * 100
-        min_required = calculate_min_fee(msg.encode("ascii"))
+        # Compressible — fee must exceed calculate_min_fee(stored), not plaintext.
+        from messagechain.core.compression import encode_payload
+        stored, _ = encode_payload(msg.encode("ascii"))
+        min_required = calculate_min_fee(stored)
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
         self.assertEqual(tx.fee, min_required)
 
     def test_verify_transaction_with_valid_fee(self):
         msg = "B" * 200
-        min_required = calculate_min_fee(msg.encode("ascii"))
+        from messagechain.core.compression import encode_payload
+        stored, _ = encode_payload(msg.encode("ascii"))
+        min_required = calculate_min_fee(stored)
         tx = create_transaction(self.alice, msg, fee=min_required, nonce=0)
         self.assertTrue(verify_transaction(tx, self.alice.keypair.public_key))
 

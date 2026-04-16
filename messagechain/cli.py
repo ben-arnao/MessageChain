@@ -829,8 +829,13 @@ def cmd_send(args):
     # always take max(local_min, server_suggestion) to avoid silently
     # submitting a tx the chain will reject.
     from messagechain.core.transaction import calculate_min_fee
+    from messagechain.core.compression import encode_payload
+    # Fee is charged on the canonical stored size — compute locally so
+    # we never overpay and never underpay relative to what the chain
+    # will enforce.
     msg_bytes = args.message.encode("ascii")
-    local_min = calculate_min_fee(msg_bytes)
+    stored_bytes, _ = encode_payload(msg_bytes)
+    local_min = calculate_min_fee(stored_bytes)
     fee = args.fee
     if fee is None:
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
