@@ -185,6 +185,27 @@ class Blockchain:
         # rebuilt from history on load.
         self.reputation: dict[bytes, int] = {}
 
+        # Entity-index registry: bidirectional map for bloat reduction.
+        # Every registered entity is assigned a monotonic integer index
+        # (starting at 1; 0 reserved as the "invalid / unassigned"
+        # sentinel). Tx binary encoders write a varint index instead
+        # of the full 32-byte entity_id, saving ~29 B per tx.
+        #
+        # Immutability: an index, once assigned, is part of the state
+        # forever. Chain replay must produce identical indices on every
+        # node — they're assigned deterministically in the order
+        # RegistrationTransactions are applied (genesis seed first,
+        # then in-block registrations in block order, left-to-right
+        # within each block).
+        #
+        # _signable_data() across every tx type continues to use the
+        # 32-byte entity_id; the index is a wire/storage optimization
+        # only. A signed tx remains verifiable even under hypothetical
+        # index churn — defense in depth.
+        self.entity_id_to_index: dict[bytes, int] = {}
+        self.entity_index_to_id: dict[int, bytes] = {}
+        self._next_entity_index: int = 1  # 0 reserved
+
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
@@ -244,6 +265,21 @@ class Blockchain:
         # a validator be slashed twice for the same offence).
         if hasattr(self.db, 'get_all_processed_evidence'):
             self._processed_evidence = self.db.get_all_processed_evidence()
+
+        # Restore entity-index registry (bloat reduction). Indices are
+        # assigned monotonically at registration time; rebuilding the
+        # bidirectional map from the persisted table keeps a restart's
+        # index assignments identical to the pre-restart ones so signed
+        # txs already in flight (or arriving soon after restart) that
+        # reference the entity by index decode to the same entity_id.
+        if hasattr(self.db, 'get_all_entity_indices'):
+            persisted = self.db.get_all_entity_indices()
+            self.entity_id_to_index = dict(persisted)
+            self.entity_index_to_id = {
+                idx: eid for eid, idx in persisted.items()
+            }
+            if persisted:
+                self._next_entity_index = max(persisted.values()) + 1
 
         # Rebuild in-memory chain from best tip
         best_tip = self.db.get_best_tip()
@@ -326,6 +362,13 @@ class Blockchain:
             if hasattr(self.db, 'mark_evidence_processed'):
                 for ev_hash in self._processed_evidence:
                     self.db.mark_evidence_processed(ev_hash, self.height)
+            # Persist the entity-index registry so a restart rehydrates
+            # the bidirectional map with identical assignments.  The
+            # underlying INSERT OR IGNORE makes re-persisting an
+            # already-stored pair a no-op (indices are immutable).
+            if hasattr(self.db, 'set_entity_index'):
+                for eid, idx in self.entity_id_to_index.items():
+                    self.db.set_entity_index(eid, idx)
             self.db.commit_transaction()
         except Exception:
             self.db.rollback_transaction()
@@ -382,6 +425,9 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
+        # Genesis entity gets the first entity_index (1). All subsequent
+        # RegistrationTransactions extend this monotonic sequence.
+        self._assign_entity_index(genesis_entity.entity_id)
         # Genesis block was signed — track the WOTS+ leaf consumed and
         # advance the leaf watermark so the state commitment reflects the
         # used leaf.  Without this, a fresh chain's state_root would lag
@@ -400,6 +446,14 @@ class Blockchain:
                 self.supply.balances[entity_id] = (
                     self.supply.balances.get(entity_id, 0) + amount
                 )
+                # Pre-allocate entity indices for every genesis-allocated
+                # recipient.  Even non-seed recipients may transact later
+                # (e.g., a treasury spend), and every transacting entity
+                # needs an index for the compact wire form.  Iteration
+                # order of dicts is insertion-order-stable since Python
+                # 3.7, so every node replaying genesis from the same
+                # allocation_table assigns identical indices.
+                self._assign_entity_index(entity_id)
             # Pin seed identity at genesis: every entity in the allocation
             # table EXCEPT the treasury is a seed.  Treasury is excluded
             # because it is a protocol-owned address, not a validator.
@@ -663,6 +717,7 @@ class Blockchain:
         self.public_keys[entity_id] = public_key
         self.nonces[entity_id] = 0
         self._bump_watermark(entity_id, registration_proof.leaf_index)
+        self._assign_entity_index(entity_id)
 
         if self.db is not None:
             self.db.set_public_key(entity_id, public_key)
@@ -671,6 +726,30 @@ class Blockchain:
             self.db.flush_state()
 
         return True, "Entity registered"
+
+    def _assign_entity_index(self, entity_id: bytes) -> int:
+        """Assign the next monotonic index to `entity_id` if unassigned.
+
+        Idempotent: returns the existing index if already registered.
+        Persists the (entity_id, index) pair to ChainDB when present so
+        a restart rehydrates the bidirectional map without replaying
+        every RegistrationTransaction.
+
+        Index 0 is reserved as the "invalid/unassigned" sentinel; the
+        first real entity gets index 1. This matches the convention
+        chosen by varint encoders (a 0 byte is cheap but is never a
+        valid index on wire).
+        """
+        existing = self.entity_id_to_index.get(entity_id)
+        if existing is not None:
+            return existing
+        idx = self._next_entity_index
+        self.entity_id_to_index[entity_id] = idx
+        self.entity_index_to_id[idx] = entity_id
+        self._next_entity_index = idx + 1
+        if self.db is not None and hasattr(self.db, "set_entity_index"):
+            self.db.set_entity_index(entity_id, idx)
+        return idx
 
     def sync_consensus_stakes(self, consensus: "ProofOfStake", block_height: int | None = None):
         """Populate consensus.stakes from the supply tracker's staked amounts.
@@ -2767,6 +2846,10 @@ class Blockchain:
             self._bump_watermark(
                 rtx.entity_id, rtx.registration_proof.leaf_index,
             )
+            # Assign the next monotonic entity_index. Deterministic: every
+            # replaying node sees the same block in the same order, so
+            # every node assigns identical indices.
+            self._assign_entity_index(rtx.entity_id)
 
         # Candidate attesters for the reward committee: everyone whose
         # attestation was included in this block.  Stake is 0 during

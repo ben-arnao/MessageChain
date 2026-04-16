@@ -95,13 +95,20 @@ class SetAuthorityKeyTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
-        """Binary: 32 entity_id | 32 new_authority_key | u64 nonce |
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT entity_ref | 32 new_authority_key | u64 nonce |
         f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+
+        new_authority_key is a raw public key (not an entity_id) —
+        it is deliberately NOT encoded as an entity reference because
+        the cold key often does not belong to a registered on-chain
+        entity (keeping it wholly off-chain prevents a leaf-reveal
+        attack on it).
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            self.entity_id,
+            encode_entity_ref(self.entity_id, state=state),
             self.new_authority_key,
             struct.pack(">Q", self.nonce),
             struct.pack(">d", float(self.timestamp)),
@@ -112,11 +119,12 @@ class SetAuthorityKeyTransaction:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "SetAuthorityKeyTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "SetAuthorityKeyTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 32 + 32 + 8 + 8 + 8 + 4 + 32:
+        if len(data) < 1 + 32 + 8 + 8 + 8 + 4 + 32:
             raise ValueError("SetAuthorityKey blob too short")
-        entity_id = bytes(data[off:off + 32]); off += 32
+        entity_id, n = decode_entity_ref(data, off, state=state); off += n
         new_auth = bytes(data[off:off + 32]); off += 32
         nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8

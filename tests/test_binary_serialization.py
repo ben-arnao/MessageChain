@@ -107,16 +107,19 @@ class TestMessageTransactionBinary(unittest.TestCase):
     def test_from_bytes_tamper_detected(self):
         """Flipping a consensus-covered byte yields a hash mismatch on decode.
 
-        The tx layout starts with 4 bytes of version, then 32 bytes of
-        entity_id. Flipping a bit inside entity_id desyncs _signable_data
-        from the declared tx_hash, so from_bytes raises on the integrity
-        check. (WOTS chain bytes are NOT hash-integrity-checked at decode —
-        they're verified separately by verify_signature, so flipping one
-        there would pass decode and fail later validation.)
+        The tx layout starts with 4 bytes of version, then a 1-byte
+        entity-ref tag, then the 32-byte entity_id (tag=0x00 legacy
+        form). Flipping a bit inside entity_id desyncs _signable_data
+        from the declared tx_hash, so from_bytes raises on the
+        integrity check. (WOTS chain bytes are NOT hash-integrity-
+        checked at decode — they're verified separately by
+        verify_signature, so flipping one there would pass decode and
+        fail later validation.)
         """
         tx = create_transaction(self.alice, "tamper", fee=1500, nonce=0)
         blob = bytearray(tx.to_bytes())
-        # Flip a bit in entity_id (starts at offset 4 after the u32 version)
+        # Flip the first byte of entity_id (offset 5, after u32 version
+        # at [0..4) and the 1-byte entity-ref tag at [4]).
         blob[5] ^= 0x01
         with self.assertRaises(Exception):
             MessageTransaction.from_bytes(bytes(blob))

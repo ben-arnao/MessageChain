@@ -362,7 +362,7 @@ class Block:
             result["registration_transactions"] = [tx.serialize() for tx in self.registration_transactions]
         return result
 
-    def to_bytes(self) -> bytes:
+    def to_bytes(self, state=None) -> bytes:
         """Compact binary encoding for storage/wire.
 
         Every tx-list field is length-prefixed — empty lists contribute
@@ -388,6 +388,11 @@ class Block:
             unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
             reg_count        (u32)  + N x (reg_len u32 + reg_blob)
             32               block_hash
+
+        `state` is threaded down to each child tx's `to_bytes(state)`
+        so the varint-index compact form is emitted when an entity
+        registry is available.  Without state, child txs emit the
+        legacy 32-byte-id form.
         """
         from messagechain.consensus.slashing import SlashTransaction
         from messagechain.consensus.attestation import Attestation
@@ -403,10 +408,20 @@ class Block:
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
 
+        def _tx_bytes(item):
+            # Every participating tx type now accepts an optional state
+            # arg; fall back to the no-arg form for any legacy types
+            # that don't yet take one (slash txs carry no entity_id at
+            # top level — they nest evidence that is block-internal).
+            try:
+                return item.to_bytes(state=state)
+            except TypeError:
+                return item.to_bytes()
+
         def enc_list(items):
             parts = [struct.pack(">I", len(items))]
             for item in items:
-                b = item.to_bytes()
+                b = _tx_bytes(item)
                 parts.append(struct.pack(">I", len(b)))
                 parts.append(b)
             return b"".join(parts)
@@ -431,7 +446,7 @@ class Block:
                     kind = 2
                 else:
                     raise ValueError(f"Unknown authority tx: {type(t).__name__}")
-                b = t.to_bytes()
+                b = _tx_bytes(t)
                 parts.append(struct.pack(">B", kind))
                 parts.append(struct.pack(">I", len(b)))
                 parts.append(b)
@@ -448,7 +463,7 @@ class Block:
                     kind = 2
                 else:
                     raise ValueError(f"Unknown governance tx: {type(t).__name__}")
-                b = t.to_bytes()
+                b = _tx_bytes(t)
                 parts.append(struct.pack(">B", kind))
                 parts.append(struct.pack(">I", len(b)))
                 parts.append(b)
@@ -472,7 +487,7 @@ class Block:
         ])
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "Block":
+    def from_bytes(cls, data: bytes, state=None) -> "Block":
         from messagechain.consensus.slashing import SlashTransaction
         from messagechain.consensus.attestation import Attestation
         from messagechain.core.transfer import TransferTransaction
@@ -518,7 +533,14 @@ class Block:
             out = []
             for _ in range(n):
                 ln = take_u32()
-                out.append(klass.from_bytes(take(ln)))
+                blob = take(ln)
+                # Every participating tx type now accepts an optional
+                # state kw; legacy types (e.g., SlashTransaction) don't
+                # need it and fall through to the no-kw path.
+                try:
+                    out.append(klass.from_bytes(blob, state=state))
+                except TypeError:
+                    out.append(klass.from_bytes(blob))
             return out
 
         header_len = take_u32()
@@ -539,6 +561,12 @@ class Block:
         attestations = dec_list(Attestation)
         transfer_txs = dec_list(TransferTransaction)
 
+        def _call_from_bytes(klass, blob):
+            try:
+                return klass.from_bytes(blob, state=state)
+            except TypeError:
+                return klass.from_bytes(blob)
+
         # Governance txs with 1-byte kind discriminator
         gov_count = take_u32()
         gov_classes = (
@@ -550,7 +578,9 @@ class Block:
             if kind >= len(gov_classes):
                 raise ValueError(f"Unknown governance tx kind: {kind}")
             ln = take_u32()
-            governance_txs.append(gov_classes[kind].from_bytes(take(ln)))
+            governance_txs.append(
+                _call_from_bytes(gov_classes[kind], take(ln))
+            )
 
         # Authority txs with 1-byte kind discriminator
         auth_count = take_u32()
@@ -563,7 +593,9 @@ class Block:
             if kind >= len(auth_classes):
                 raise ValueError(f"Unknown authority tx kind: {kind}")
             ln = take_u32()
-            authority_txs.append(auth_classes[kind].from_bytes(take(ln)))
+            authority_txs.append(
+                _call_from_bytes(auth_classes[kind], take(ln))
+            )
 
         stake_txs = dec_list(StakeTransaction)
         unstake_txs = dec_list(UnstakeTransaction)

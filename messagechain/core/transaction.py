@@ -138,12 +138,12 @@ class MessageTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
-    def to_bytes(self) -> bytes:
+    def to_bytes(self, state=None) -> bytes:
         """Compact binary encoding for storage/wire.
 
         Layout (big-endian throughout):
             u32  version
-            32   entity_id
+            ENT  entity reference (1-byte tag + 32 full id OR varint index)
             u8   compression_flag (0=raw, 1=raw-deflate)
             u16  message_len
             N    message (canonical stored bytes)
@@ -160,11 +160,20 @@ class MessageTransaction:
         in _signable_data, so the fractional part never affects
         tx_hash — storing the fractional seconds is a convenience
         for clients that want sub-second ordering.
+
+        `state`: if provided, the entity reference is emitted as a
+        1-byte tag + varint entity_index (saving ~29 B vs the full id).
+        Without state, the legacy 32-byte-id form is emitted so
+        round-trips keep working in callers that don't thread state
+        through (tests, bare-tx contexts).  `_signable_data` always
+        uses the 32-byte entity_id — tx_hash is independent of the
+        chosen wire form, so any valid encoding yields the same hash.
         """
+        from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         parts = [
             struct.pack(">I", self.version),
-            self.entity_id,
+            encode_entity_ref(self.entity_id, state=state),
             struct.pack(">B", self.compression_flag),
             struct.pack(">H", len(self.message)),
             self.message,
@@ -179,19 +188,25 @@ class MessageTransaction:
         return b"".join(parts)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "MessageTransaction":
+    def from_bytes(cls, data: bytes, state=None) -> "MessageTransaction":
         """Decode a MessageTransaction from its compact binary form.
 
         Verifies the declared tx_hash against a freshly-computed hash, so
         a tampered-with blob never produces a seemingly-valid object —
         matches the integrity guarantee of deserialize(dict).
+
+        `state` must be provided if the blob uses the varint-index
+        entity reference form (tag=0x01); blobs written without state
+        use the legacy 32-byte form and decode with state=None.
         """
+        from messagechain.core.entity_ref import decode_entity_ref
         offset = 0
-        if len(data) < 4 + 32 + 1 + 2:
+        if len(data) < 4 + 1 + 1 + 2:
             raise ValueError("MessageTransaction blob too short")
         version = struct.unpack_from(">I", data, offset)[0]
         offset += 4
-        entity_id = bytes(data[offset:offset + 32]); offset += 32
+        entity_id, consumed = decode_entity_ref(data, offset, state=state)
+        offset += consumed
         compression_flag = struct.unpack_from(">B", data, offset)[0]; offset += 1
         msg_len = struct.unpack_from(">H", data, offset)[0]; offset += 2
         if offset + msg_len > len(data):
