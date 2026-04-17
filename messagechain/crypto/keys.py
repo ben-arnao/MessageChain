@@ -13,6 +13,7 @@ creation time and constant memory overhead.
 import hashlib
 import hmac
 import json
+import logging
 import os
 import struct
 from dataclasses import dataclass, field
@@ -21,6 +22,23 @@ from messagechain.config import (
     SIG_VERSION_CURRENT, validate_sig_version,
 )
 from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _hash
+
+logger = logging.getLogger(__name__)
+
+# WOTS+ leaf-usage thresholds (percent of capacity) at which sign() emits
+# an operator-visible WARNING.  The footgun these guard against: a
+# wallet or validator that never submits a KeyRotationTransaction will
+# silently brick its funds the instant leaf #(num_leaves) is requested.
+# 80% is the "plan a rotation" line; 95% is "do it TODAY".
+_SIG_WARN_PERCENTS = (80, 95)
+
+# Tracks which (keypair_root, threshold_pct) pairs have already emitted
+# a warning in this process run.  Module-level so the dedup survives
+# across sign() calls, but deliberately keyed on the Merkle root so two
+# different keypairs warn independently — a rotated key does NOT inherit
+# the pre-rotation silence, and two validators on the same host do not
+# cross-suppress each other.  Cleared only on process restart.
+_warned_thresholds: set[tuple[bytes, int]] = set()
 
 # Hash output size for SHA3-256, used for strict size validation on signatures.
 _HASH_SIZE = 32
@@ -436,6 +454,13 @@ class KeyPair:
         if self.leaf_index_path is not None:
             self.persist_leaf_index(self.leaf_index_path)
 
+        # Exhaustion-visibility warnings.  Emit at 80% and 95% usage so
+        # operators notice in their normal log pipeline long before the
+        # hard wall at 100% (after which funds are locked unless the
+        # user previously submitted a KeyRotationTransaction).  Deduped
+        # per (root, threshold) to avoid flooding logs on every slot.
+        self._maybe_warn_exhaustion()
+
         return Signature(
             wots_signature=wots_sig,
             leaf_index=leaf_idx,
@@ -443,6 +468,44 @@ class KeyPair:
             wots_public_key=pub_key,
             wots_public_seed=pub_seed,
         )
+
+    def _maybe_warn_exhaustion(self) -> None:
+        """Emit a WARNING log when leaf usage first crosses 80% and 95%.
+
+        Called from sign() after _next_leaf has been incremented so the
+        percentage reflects the signature just produced.  Uses integer
+        math to avoid float drift at very large num_leaves (production
+        is 2^20 = 1,048,576 and we must not miss the threshold due to
+        rounding).
+        """
+        # Scale by 100 for integer comparison: used_pct_x100 is
+        # (used * 100) // num_leaves, which is exact for all finite
+        # tree heights we support.
+        used = self._next_leaf
+        total = self.num_leaves
+        if total <= 0:
+            return
+        used_pct = (used * 100) // total
+        for threshold in _SIG_WARN_PERCENTS:
+            if used_pct < threshold:
+                continue
+            key = (bytes(self.public_key), threshold)
+            if key in _warned_thresholds:
+                continue
+            _warned_thresholds.add(key)
+            remaining = total - used
+            logger.warning(
+                "WOTS+ one-time signatures at %d%% capacity "
+                "(%d used / %d total, %d remaining) for key %s. "
+                "Run `messagechain rotate-key` before exhaustion — "
+                "past 100%% the key is bricked and funds lock until "
+                "a previously-signed KeyRotationTransaction is submitted.",
+                threshold,
+                used,
+                total,
+                remaining,
+                self.public_key.hex()[:16],
+            )
 
     @property
     def remaining_signatures(self) -> int:
