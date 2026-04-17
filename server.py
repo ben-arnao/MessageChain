@@ -113,6 +113,28 @@ def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> 
     return os.path.join(data_dir, f"keypair_cache_{h}.bin")
 
 
+def _bind_leaf_index_path(entity: Entity, data_dir: str | None) -> None:
+    """Attach the persistent leaf-index file to *entity*'s keypair.
+
+    When *data_dir* is None (ephemeral / in-memory mode), the attribute
+    stays None and sign() skips the write-ahead step — preserving existing
+    test behavior.
+
+    When a path is available, we bind it AND immediately load any
+    previously-persisted counter so a restarted validator cannot reuse a
+    WOTS+ leaf.  load_leaf_index refuses to move the counter backwards, so
+    it's safe to call even when the in-memory _next_leaf is already ahead
+    (for example, because advance_to_leaf() ran first based on the on-chain
+    leaf watermark).
+    """
+    if data_dir is None:
+        return
+    from messagechain.config import LEAF_INDEX_FILENAME
+    path = os.path.join(data_dir, LEAF_INDEX_FILENAME)
+    entity.keypair.leaf_index_path = path
+    entity.keypair.load_leaf_index(path)
+
+
 def _load_or_create_entity(
     private_key: bytes,
     tree_height: int,
@@ -124,6 +146,10 @@ def _load_or_create_entity(
 
     If *data_dir* is ``None`` or *no_cache* is ``True``, the cache is
     bypassed and the entity is created fresh every time.
+
+    When *data_dir* is set, the entity's keypair is also bound to a
+    persistent leaf-index file at ``<data_dir>/leaf_index.json`` so the
+    WOTS+ one-time-key invariant survives restarts.
     """
     use_cache = data_dir is not None and not no_cache
 
@@ -136,6 +162,7 @@ def _load_or_create_entity(
                 with open(cache_file, "rb") as f:
                     entity = pickle.load(f)
                 logger.info("Loaded keypair from cache %s", cache_file)
+                _bind_leaf_index_path(entity, data_dir)
                 return entity
             except Exception:
                 logger.warning(
@@ -163,6 +190,7 @@ def _load_or_create_entity(
         except OSError:
             logger.warning("Could not write keypair cache to %s", cache_file)
 
+    _bind_leaf_index_path(entity, data_dir)
     return entity
 
 

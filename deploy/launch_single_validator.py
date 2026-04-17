@@ -40,7 +40,9 @@ if _ROOT not in sys.path:
 import messagechain.config as _mc_config
 _mc_config.DEVNET = True
 
-from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
+from messagechain.config import (
+    LEAF_INDEX_FILENAME, TREASURY_ENTITY_ID, TREASURY_ALLOCATION,
+)
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.bootstrap import bootstrap_seed_local
 from messagechain.identity.address import encode_address
@@ -88,6 +90,15 @@ def main() -> int:
     print(f"Address:   {encode_address(entity.entity_id)}")
 
     os.makedirs(args.data_dir, exist_ok=True)
+
+    # Wire WOTS+ leaf-index persistence to the data dir so the genesis
+    # signature (and any subsequent signs before the long-running server
+    # takes over) advance the on-disk counter.  Without this, a crash
+    # between minting genesis and the first server start-up could let the
+    # founder re-use leaf 0 against a different block.
+    leaf_index_path = os.path.join(args.data_dir, LEAF_INDEX_FILENAME)
+    entity.keypair.leaf_index_path = leaf_index_path
+    entity.keypair.load_leaf_index(leaf_index_path)
     db_path = os.path.join(args.data_dir, "chain.db")
     if os.path.exists(db_path):
         print(f"ERROR: {db_path} already exists. Refusing to overwrite.", file=sys.stderr)

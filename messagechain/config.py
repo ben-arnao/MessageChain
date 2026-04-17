@@ -185,6 +185,13 @@ MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (produc
 # inactivity penalties.  Operators should schedule rotations well
 # ahead of exhaustion — ideally at the halfway mark.
 
+# Filename (inside the validator's data_dir) for WOTS+ leaf-index persistence.
+# Guards against leaf reuse after a restart: sign() write-aheads the next-leaf
+# counter here before returning the signature, so a crash between signing and
+# gossip cannot let the restarted validator pick a leaf_index <= one it has
+# already used.  See KeyPair.persist_leaf_index / load_leaf_index.
+LEAF_INDEX_FILENAME = "leaf_index.json"
+
 # Consensus — flat minimum stake from block 0.
 # 100 tokens required to register as a validator at any block height.
 VALIDATOR_MIN_STAKE = 100
