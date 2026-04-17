@@ -408,6 +408,40 @@ class KeyPair:
     ) -> "KeyPair":
         return cls(seed, height, start_leaf=start_leaf, progress=progress)
 
+    @classmethod
+    def _from_trusted_root(
+        cls,
+        seed: bytes,
+        height: int,
+        public_key: bytes,
+        start_leaf: int = 0,
+    ) -> "KeyPair":
+        """Construct a KeyPair with a pre-computed Merkle root.
+
+        Skips the O(2^height) leaf derivation that __init__ performs —
+        the caller supplies a previously-computed public_key from
+        trusted storage (e.g. an HMAC-authenticated cache file).
+
+        The root is NOT re-derived, so the caller is responsible for
+        making sure the supplied public_key actually corresponds to
+        `seed` and `height`.  Passing a forged root produces a signer
+        whose signatures will never verify against the claimed root —
+        a local DoS, not a forgery vector — but callers must still
+        authenticate the source before taking this path.
+        """
+        if not isinstance(public_key, (bytes, bytearray)) or len(public_key) != 32:
+            raise ValueError("public_key must be 32 bytes (SHA3-256 output)")
+        if height <= 0:
+            raise ValueError(f"height must be positive, got {height}")
+        kp = cls.__new__(cls)
+        kp.height = height
+        kp.num_leaves = 1 << height
+        kp._seed = seed
+        kp._next_leaf = start_leaf
+        kp.leaf_index_path = None
+        kp.public_key = bytes(public_key)
+        return kp
+
     def advance_to_leaf(self, leaf_index: int):
         """Advance the next-leaf pointer to skip already-used leaves.
 

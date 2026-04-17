@@ -24,7 +24,6 @@ import hmac
 import json
 import logging
 import os
-import pickle
 import struct
 import time
 from collections import OrderedDict
@@ -100,17 +99,17 @@ def _hash(data: bytes) -> bytes:
 # Keypair disk cache — eliminates costly WOTS+ Merkle-tree regeneration on
 # restart.  The keypair is deterministic (same private key + tree height
 # always yields the same tree), so the cached result is safe to reuse.
+#
+# On-disk format:
+#     [4 B magic "MCKC"] [32 B HMAC-SHA3-256] [JSON payload]
+#
+# The HMAC is keyed on the validator's private key.  Any tamper — byte
+# flip, swapped file, stale format — fails authentication and the
+# cache is treated as corrupt (deleted, regenerated).  This replaced an
+# earlier pickle-based cache: pickle.load on an attacker-planted file
+# is arbitrary code execution as the validator user, the worst
+# possible blast radius for a file sitting next to hot-key material.
 # ---------------------------------------------------------------------------
-
-# Header prepended to every keypair cache file.  The magic lets us detect
-# files from a pre-versioning build (raw pickle with no header), and the
-# version byte lets us evolve the on-disk layout safely in the future.
-# If you change how the Entity/KeyPair pickles, bump KEYPAIR_CACHE_VERSION
-# so old caches are invalidated instead of silently unpickling into a
-# wrong-shaped object.  Keep version in [0, 255] — the header is 5 bytes.
-KEYPAIR_CACHE_MAGIC = b"MCKP"  # MessageChain KeyPair
-KEYPAIR_CACHE_VERSION = 1
-_KEYPAIR_CACHE_HEADER_LEN = len(KEYPAIR_CACHE_MAGIC) + 1  # magic + 1-byte version
 
 
 def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
@@ -122,6 +121,93 @@ def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> 
     """
     h = _hashlib.sha3_256(private_key + tree_height.to_bytes(4, "big")).hexdigest()[:16]
     return os.path.join(data_dir, f"keypair_cache_{h}.bin")
+
+
+_CACHE_MAGIC = b"MCKC"  # MessageChain Keypair Cache (HMAC-authenticated)
+_CACHE_FORMAT_VERSION = 1
+_HMAC_SIZE = 32
+_CACHE_HMAC_DOMAIN = b"messagechain-keypair-cache-v1|"
+
+
+def _keypair_cache_mac_key(private_key: bytes) -> bytes:
+    """Derive the HMAC key used to authenticate the cache payload.
+
+    Domain-separated from any other use of the private key so that a
+    future reuse of the key in a different context cannot produce a
+    matching MAC.
+    """
+    return _hashlib.sha3_256(_CACHE_HMAC_DOMAIN + private_key).digest()
+
+
+def _encode_keypair_cache(
+    entity: Entity, private_key: bytes, tree_height: int
+) -> bytes:
+    payload_obj = {
+        "version": _CACHE_FORMAT_VERSION,
+        "tree_height": tree_height,
+        "public_key": entity.keypair.public_key.hex(),
+        "entity_id": entity.entity_id.hex(),
+    }
+    payload = json.dumps(
+        payload_obj, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    mac = hmac.new(
+        _keypair_cache_mac_key(private_key), payload, _hashlib.sha3_256
+    ).digest()
+    return _CACHE_MAGIC + mac + payload
+
+
+def _decode_keypair_cache(
+    data: bytes, private_key: bytes, tree_height: int
+) -> "Entity | None":
+    """Return a reconstructed Entity, or None for any malformed / unauthenticated blob.
+
+    Every rejection path returns None silently: the caller deletes the
+    file and regenerates.  No partial or differential information
+    leaks from the loader.
+    """
+    header_len = len(_CACHE_MAGIC) + _HMAC_SIZE
+    if len(data) < header_len:
+        return None
+    if not data.startswith(_CACHE_MAGIC):
+        return None
+    mac = data[len(_CACHE_MAGIC):header_len]
+    payload = data[header_len:]
+    expected = hmac.new(
+        _keypair_cache_mac_key(private_key), payload, _hashlib.sha3_256
+    ).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("version") != _CACHE_FORMAT_VERSION:
+        return None
+    if obj.get("tree_height") != tree_height:
+        return None
+    try:
+        public_key = bytes.fromhex(obj["public_key"])
+        entity_id = bytes.fromhex(obj["entity_id"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if len(public_key) != 32 or len(entity_id) != 32:
+        return None
+
+    from messagechain.identity.identity import (
+        _derive_signing_seed, derive_entity_id,
+    )
+    # Cross-check: even after the HMAC passes, the entity_id stored in
+    # the payload must match what derive_entity_id(public_key) would
+    # produce.  Cheap and catches any future format drift between the
+    # two fields.
+    if derive_entity_id(public_key) != entity_id:
+        return None
+    seed = _derive_signing_seed(private_key)
+    keypair = KeyPair._from_trusted_root(seed, tree_height, public_key)
+    return Entity(entity_id=entity_id, keypair=keypair, _seed=seed)
 
 
 def _bind_leaf_index_path(entity: Entity, data_dir: str | None) -> None:
@@ -167,64 +253,57 @@ def _load_or_create_entity(
     if use_cache:
         cache_file = _keypair_cache_path(private_key, tree_height, data_dir)
 
-        # Try loading from cache.  Every valid cache file starts with
-        # KEYPAIR_CACHE_MAGIC + one-byte KEYPAIR_CACHE_VERSION.  If either
-        # doesn't match we treat the file as incompatible and regenerate
-        # — this protects against silently unpickling an Entity whose
-        # class layout has drifted since the cache was written.
+        # Cache hit path: read + HMAC-verify.  Any failure — missing
+        # file, short read, wrong magic, bad MAC, malformed JSON,
+        # wrong format version, tree-height mismatch — results in
+        # delete-and-regenerate.  This is the pickle-safe replacement
+        # for the previous pickle.load path: a planted pickle blob
+        # fails the HMAC check and is dropped instead of executed.
         if os.path.exists(cache_file):
+            entity = None
             try:
                 with open(cache_file, "rb") as f:
-                    header = f.read(_KEYPAIR_CACHE_HEADER_LEN)
-                    if len(header) < _KEYPAIR_CACHE_HEADER_LEN:
-                        raise ValueError("cache file shorter than header")
-                    magic = header[: len(KEYPAIR_CACHE_MAGIC)]
-                    version = header[len(KEYPAIR_CACHE_MAGIC)]
-                    if magic != KEYPAIR_CACHE_MAGIC:
-                        logger.warning(
-                            "Keypair cache %s has wrong magic %r — cache from "
-                            "older incompatible version, regenerating",
-                            cache_file, magic,
-                        )
-                        raise ValueError("bad magic")
-                    if version != KEYPAIR_CACHE_VERSION:
-                        logger.warning(
-                            "Keypair cache %s has version %d but this build "
-                            "expects %d — cache from older incompatible "
-                            "version, regenerating",
-                            cache_file, version, KEYPAIR_CACHE_VERSION,
-                        )
-                        raise ValueError("bad version")
-                    entity = pickle.load(f)
+                    blob = f.read()
+                entity = _decode_keypair_cache(blob, private_key, tree_height)
+            except OSError:
+                entity = None
+            if entity is not None:
                 logger.info("Loaded keypair from cache %s", cache_file)
                 _bind_leaf_index_path(entity, data_dir)
                 return entity
-            except Exception:
-                logger.warning(
-                    "Corrupt or incompatible keypair cache %s — deleting "
-                    "and regenerating",
-                    cache_file,
-                )
-                try:
-                    os.remove(cache_file)
-                except OSError:
-                    pass
+            logger.warning(
+                "Corrupt or unauthenticated keypair cache %s — deleting "
+                "and regenerating",
+                cache_file,
+            )
+            try:
+                os.remove(cache_file)
+            except OSError:
+                pass
 
     # Fresh keygen
     entity = Entity.create(private_key, tree_height=tree_height)
 
     if use_cache:
         try:
-            with open(cache_file, "wb") as f:
-                # Header: magic + 1-byte version, then the pickled entity.
-                f.write(KEYPAIR_CACHE_MAGIC)
-                f.write(bytes([KEYPAIR_CACHE_VERSION]))
-                pickle.dump(entity, f)
-            # Owner-only permissions (best-effort on Windows)
+            blob = _encode_keypair_cache(entity, private_key, tree_height)
+            # Atomic write: serialize to a temp file, fsync, chmod, then
+            # rename into place.  Guarantees a reader never sees a
+            # truncated blob (which would fail the HMAC check and cause
+            # a pointless regeneration on every subsequent restart).
+            tmp_file = cache_file + ".tmp"
+            with open(tmp_file, "wb") as f:
+                f.write(blob)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
             try:
-                os.chmod(cache_file, 0o600)
+                os.chmod(tmp_file, 0o600)
             except OSError:
                 pass
+            os.replace(tmp_file, cache_file)
             logger.info("Saved keypair cache to %s", cache_file)
         except OSError:
             logger.warning("Could not write keypair cache to %s", cache_file)

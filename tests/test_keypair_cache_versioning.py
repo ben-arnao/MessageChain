@@ -1,13 +1,14 @@
-"""Tests for keypair cache file versioning.
+"""Tests for keypair cache file format and authentication.
 
 The cache file format is:
 
-    [4-byte magic = b"MCKP"] [1-byte version] [pickled Entity]
+    [4-byte magic = b"MCKC"] [32-byte HMAC-SHA3-256] [JSON payload]
 
-On load, both the magic and version must match, otherwise the cache is
-treated as corrupt (logged, discarded, regenerated).  This guards against
-silently loading an object pickled by an older/incompatible version of the
-code — a real hazard on a 1000-year chain where class layouts can drift.
+The HMAC is keyed on the validator's private key, so any tampering —
+byte flip, wrong key, old pickle blob — fails authentication and the
+cache is treated as corrupt (logged, discarded, regenerated).  This
+replaces an earlier pickle-based format that turned any local write
+into arbitrary code execution as the validator user.
 """
 
 import os
@@ -22,7 +23,21 @@ from messagechain.identity.identity import Entity
 import server
 
 
-class TestKeypairCacheVersioning(unittest.TestCase):
+_PICKLE_TRIPWIRE = {"fired": False}
+
+
+def _pickle_tripwire_callee():
+    """Module-level callee so pickle can reference it via REDUCE."""
+    _PICKLE_TRIPWIRE["fired"] = True
+    return "tripwire-fired"
+
+
+class _PickleTripwirePayload:
+    def __reduce__(self):
+        return (_pickle_tripwire_callee, ())
+
+
+class TestKeypairCacheFormat(unittest.TestCase):
     def setUp(self):
         self.private_key = b"v" * 32
         self.tree_height = messagechain.config.MERKLE_TREE_HEIGHT
@@ -41,53 +56,41 @@ class TestKeypairCacheVersioning(unittest.TestCase):
             self.private_key, self.tree_height, self.tmpdir
         )
 
-    # ------------------------------------------------------------------
-    # Constants exposed at module level
-    # ------------------------------------------------------------------
-
-    def test_module_defines_magic_and_version(self):
-        """Module constants are present with expected values."""
-        self.assertEqual(server.KEYPAIR_CACHE_MAGIC, b"MCKP")
-        self.assertEqual(len(server.KEYPAIR_CACHE_MAGIC), 4)
-        self.assertIsInstance(server.KEYPAIR_CACHE_VERSION, int)
-        self.assertGreaterEqual(server.KEYPAIR_CACHE_VERSION, 1)
-        # Version must fit in a single byte so the header stays 5 bytes.
-        self.assertLess(server.KEYPAIR_CACHE_VERSION, 256)
+    def _write_file(self, data: bytes) -> None:
+        with open(self._cache_path(), "wb") as f:
+            f.write(data)
 
     # ------------------------------------------------------------------
     # Save path
     # ------------------------------------------------------------------
 
-    def test_saved_cache_starts_with_magic_and_version(self):
-        """A saved cache file begins with magic + version header."""
-        self._load_or_create()  # generates and saves the cache
-
-        path = self._cache_path()
-        self.assertTrue(os.path.exists(path))
-
-        with open(path, "rb") as f:
-            header = f.read(5)
-        self.assertEqual(header[:4], server.KEYPAIR_CACHE_MAGIC)
-        self.assertEqual(header[4], server.KEYPAIR_CACHE_VERSION)
-
-    def test_saved_cache_payload_is_pickled_entity(self):
-        """The bytes after the 5-byte header unpickle to an Entity."""
+    def test_saved_cache_starts_with_mckc_magic(self):
+        """A saved cache file begins with the MCKC magic + 32-byte HMAC."""
         self._load_or_create()
         with open(self._cache_path(), "rb") as f:
-            f.read(5)  # skip header
-            obj = pickle.load(f)
-        self.assertIsInstance(obj, Entity)
+            prefix = f.read(4)
+        self.assertEqual(prefix, b"MCKC")
+        # File must be at least magic + HMAC + 1 byte of payload.
+        self.assertGreater(os.path.getsize(self._cache_path()), 4 + 32)
+
+    def test_saved_cache_is_not_pickle(self):
+        """Saved cache payload must not be unpickleable — no pickle in the format."""
+        self._load_or_create()
+        with open(self._cache_path(), "rb") as f:
+            blob = f.read()
+        # Skip magic + HMAC; what remains must be JSON, not pickle.
+        payload = blob[4 + 32:]
+        with self.assertRaises(Exception):
+            pickle.loads(payload)
 
     # ------------------------------------------------------------------
     # Load path — happy case
     # ------------------------------------------------------------------
 
-    def test_load_with_correct_header_succeeds(self):
+    def test_round_trip_preserves_entity(self):
         """Writing a cache and loading it again yields the same entity."""
         first = self._load_or_create()
-        # Sanity: cache file exists with the correct header.
         self.assertTrue(os.path.exists(self._cache_path()))
-
         second = self._load_or_create()
         self.assertEqual(first.entity_id, second.entity_id)
         self.assertEqual(first.keypair.public_key, second.keypair.public_key)
@@ -96,77 +99,85 @@ class TestKeypairCacheVersioning(unittest.TestCase):
     # Load path — rejection cases
     # ------------------------------------------------------------------
 
-    def _write_file(self, data: bytes) -> None:
-        with open(self._cache_path(), "wb") as f:
-            f.write(data)
-
-    def test_load_with_wrong_magic_regenerates(self):
+    def test_wrong_magic_regenerates(self):
         """A cache with bad magic is discarded and the entity is rebuilt."""
-        # Write a file that has valid pickle body but wrong magic.
-        fresh = Entity.create(self.private_key, tree_height=self.tree_height)
-        bad_magic = b"XXXX"
-        self.assertNotEqual(bad_magic, server.KEYPAIR_CACHE_MAGIC)
-        payload = bad_magic + bytes([server.KEYPAIR_CACHE_VERSION]) + pickle.dumps(fresh)
-        self._write_file(payload)
-
-        # Should NOT raise — should log and regenerate.
+        self._write_file(b"XXXX" + b"\x00" * 32 + b'{"version":1}')
         entity = self._load_or_create()
-        self.assertEqual(entity.entity_id, fresh.entity_id)
-
-        # After regeneration, the cache on disk is rewritten with a proper
-        # header.
-        with open(self._cache_path(), "rb") as f:
-            header = f.read(5)
-        self.assertEqual(header[:4], server.KEYPAIR_CACHE_MAGIC)
-        self.assertEqual(header[4], server.KEYPAIR_CACHE_VERSION)
-
-    def test_load_with_wrong_version_regenerates(self):
-        """A cache with correct magic but unknown version is discarded."""
         fresh = Entity.create(self.private_key, tree_height=self.tree_height)
-        bad_version = (server.KEYPAIR_CACHE_VERSION + 7) % 256
-        self.assertNotEqual(bad_version, server.KEYPAIR_CACHE_VERSION)
-        payload = (
-            server.KEYPAIR_CACHE_MAGIC
-            + bytes([bad_version])
-            + pickle.dumps(fresh)
-        )
-        self._write_file(payload)
+        self.assertEqual(entity.keypair.public_key, fresh.keypair.public_key)
+        # Cache has been rewritten with the correct magic.
+        with open(self._cache_path(), "rb") as f:
+            self.assertEqual(f.read(4), b"MCKC")
+
+    def test_bad_hmac_regenerates(self):
+        """A cache with correct magic but wrong HMAC is discarded."""
+        self._load_or_create()
+        path = self._cache_path()
+        with open(path, "rb") as f:
+            data = bytearray(f.read())
+        # Flip a byte inside the HMAC region.
+        data[4 + 5] ^= 0xFF
+        with open(path, "wb") as f:
+            f.write(bytes(data))
 
         entity = self._load_or_create()
-        self.assertEqual(entity.entity_id, fresh.entity_id)
+        fresh = Entity.create(self.private_key, tree_height=self.tree_height)
+        self.assertEqual(entity.keypair.public_key, fresh.keypair.public_key)
 
-        # Cache has been rewritten with the current version.
-        with open(self._cache_path(), "rb") as f:
-            header = f.read(5)
-        self.assertEqual(header[4], server.KEYPAIR_CACHE_VERSION)
+    def test_planted_pickle_does_not_execute(self):
+        """A pickle blob planted in the cache file must not be deserialized.
 
-    def test_load_pre_versioning_raw_pickle_regenerates(self):
-        """Old-format caches (raw pickle, no magic header) are discarded.
-
-        This is the migration case: a node upgraded from the pre-versioning
-        build will have a raw pickle on disk.  The first 5 bytes of a pickle
-        stream do NOT start with b"MCKP", so the magic check rejects them
-        and the cache is regenerated safely.
+        This is the critical regression guard against the pre-HMAC format,
+        where pickle.load on this file would execute _pickle_tripwire_callee
+        (or anything else an attacker named in a REDUCE opcode).
         """
-        fresh = Entity.create(self.private_key, tree_height=self.tree_height)
-        self._write_file(pickle.dumps(fresh))  # no header — legacy format
+        planted = pickle.dumps(_PickleTripwirePayload())
+        # Sanity: the planted blob really does execute on pickle.loads.
+        _PICKLE_TRIPWIRE["fired"] = False
+        pickle.loads(planted)
+        self.assertTrue(
+            _PICKLE_TRIPWIRE["fired"],
+            "planted payload is not a real pickle tripwire — test is broken",
+        )
 
+        _PICKLE_TRIPWIRE["fired"] = False
+        self._write_file(planted)
         entity = self._load_or_create()
-        self.assertEqual(entity.entity_id, fresh.entity_id)
-
-        # After the call, the cache file is in the new format.
-        with open(self._cache_path(), "rb") as f:
-            header = f.read(5)
-        self.assertEqual(header[:4], server.KEYPAIR_CACHE_MAGIC)
-        self.assertEqual(header[4], server.KEYPAIR_CACHE_VERSION)
-
-    def test_load_truncated_header_regenerates(self):
-        """A file shorter than the 5-byte header is handled gracefully."""
-        self._write_file(b"MCK")  # only 3 bytes — not even a full magic
-
         fresh = Entity.create(self.private_key, tree_height=self.tree_height)
+        self.assertEqual(entity.keypair.public_key, fresh.keypair.public_key)
+        self.assertFalse(
+            _PICKLE_TRIPWIRE["fired"],
+            "planted pickle was unpickled — cache loader still executes pickle",
+        )
+
+    def test_truncated_header_regenerates(self):
+        """A file shorter than magic + HMAC is handled gracefully."""
+        self._write_file(b"MCK")
         entity = self._load_or_create()
-        self.assertEqual(entity.entity_id, fresh.entity_id)
+        fresh = Entity.create(self.private_key, tree_height=self.tree_height)
+        self.assertEqual(entity.keypair.public_key, fresh.keypair.public_key)
+
+    def test_cache_from_different_private_key_rejected(self):
+        """A valid cache written under key A must not authenticate under key B.
+
+        Guards against an attacker copying a cache file between hosts with
+        different keys — the HMAC binds the payload to the specific private
+        key that produced it.
+        """
+        a_key = b"A" * 32
+        b_key = b"B" * 32
+        server._load_or_create_entity(a_key, self.tree_height, self.tmpdir)
+        a_path = server._keypair_cache_path(a_key, self.tree_height, self.tmpdir)
+        b_path = server._keypair_cache_path(b_key, self.tree_height, self.tmpdir)
+        self.assertNotEqual(a_path, b_path)
+        with open(a_path, "rb") as f:
+            blob = f.read()
+        with open(b_path, "wb") as f:
+            f.write(blob)
+
+        entity_b = server._load_or_create_entity(b_key, self.tree_height, self.tmpdir)
+        fresh_b = Entity.create(b_key, tree_height=self.tree_height)
+        self.assertEqual(entity_b.keypair.public_key, fresh_b.keypair.public_key)
 
 
 if __name__ == "__main__":
