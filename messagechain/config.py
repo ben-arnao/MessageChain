@@ -531,7 +531,7 @@ GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
 # counts as "no".  This gives an implicit 2/3 turnout floor for binding
 # outcomes and keeps self-serving proposals from sliding through on a
 # quiet week.
-GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >=2/3 of total eligible weight must approve
+GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR = 2    # >2/3 (strict) of total eligible weight must approve
 GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: yes * 3 > total * 2
 GOVERNANCE_PROPOSAL_FEE = 10_000      # fee to create a proposal (spam deterrent)
 GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote

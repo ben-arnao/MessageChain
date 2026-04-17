@@ -1731,7 +1731,7 @@ def cmd_proposals(args):
     for p in proposals:
         print(f"  {p['proposal_id'][:16]}...  [{p['status'].upper()}]  {p['title']}")
         print(f"    proposer: {p['proposer_id'][:16]}...")
-        print(f"    votes: {p['vote_count']} cast  |  yes {p['yes_weight']} / total {p['total_weight']}")
+        print(f"    votes: {p['vote_count']} cast  |  yes {p['yes_weight']} / eligible {p['total_eligible']}")
         if p["status"] == "open":
             print(f"    {p['blocks_remaining']} blocks remaining")
         print()

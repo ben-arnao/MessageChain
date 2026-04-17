@@ -105,6 +105,34 @@ class TestGovernancePipeline(unittest.TestCase):
         # Audit log records the spend
         self.assertEqual(len(self.chain.governance.treasury_spend_log), 1)
 
+    def test_treasury_spend_rejected_at_exact_two_thirds(self):
+        """Exactly 2/3 yes-weight must NOT pass (strict >2/3 required)."""
+        self.chain.supply.balances[TREASURY_ENTITY_ID] = 100_000
+
+        spend = create_treasury_spend_proposal(
+            self.alice, self.bob.entity_id, 5_000,
+            "Fund work", "Boundary test",
+        )
+        proposal_block = 5
+        b1 = _make_block(proposal_block, self.alice.entity_id, [spend])
+        self.chain._apply_governance_block(b1)
+
+        # Only 2 of 3 validators vote yes → 20k / 30k = exactly 2/3
+        for voter in (self.alice, self.bob):
+            vote = create_vote(voter, spend.proposal_id, True)
+            b = _make_block(proposal_block + 1, self.alice.entity_id, [vote])
+            self.chain._apply_governance_block(b)
+
+        # Advance past voting window — should NOT auto-execute
+        closed_block = proposal_block + GOVERNANCE_VOTING_WINDOW + 1
+        b_close = _make_block(closed_block, self.alice.entity_id, [])
+        bob_before = self.chain.supply.balances.get(self.bob.entity_id, 0)
+        self.chain._apply_governance_block(b_close)
+        bob_after = self.chain.supply.balances.get(self.bob.entity_id, 0)
+
+        self.assertEqual(bob_after, bob_before, "Treasury spend must NOT execute at exactly 2/3")
+        self.assertEqual(len(self.chain.governance.treasury_spend_log), 0)
+
     def test_closed_proposals_pruned(self):
         proposal = create_proposal(
             self.alice, "Something", "Details",
