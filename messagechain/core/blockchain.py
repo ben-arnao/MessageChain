@@ -4282,7 +4282,12 @@ class Blockchain:
         self.slash_sig_counts = {}
         self.key_rotation_counts = {}
         self.public_keys = {}
-        self.slashed_validators = set()
+        # slashed_validators is deliberately NOT cleared here — it is a
+        # security ratchet, like revoked_entities and leaf_watermarks.
+        # Once an equivocation is detected on any fork, the punishment
+        # is permanent; clearing it would allow slash evasion via reorg.
+        # _processed_evidence (also not cleared) stays consistent.
+        self.reputation = {}
         self._immature_rewards = []
         # Reset the bootstrap ratchet — it will rebuild deterministically
         # as blocks replay via _update_bootstrap_ratchet.  Every node
@@ -4291,6 +4296,10 @@ class Blockchain:
         self._bootstrap_ratchet = RatchetState()
         from messagechain.economics.escrow import EscrowLedger
         self._escrow = EscrowLedger()
+        # Reset in-memory attestation finality tracker — old-fork finality
+        # data must not persist.  Note: finalized_checkpoints (persistent,
+        # long-range-attack defense) is deliberately NOT reset.
+        self.finality = FinalityTracker()
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -4310,6 +4319,10 @@ class Blockchain:
         - revoked_entities: emergency revocation is an authority-key-signed
           kill-switch. Once broadcast it represents a clear authorized
           intent to disable the entity; we preserve it across reorgs.
+        - slashed_validators: once an equivocation is detected on any
+          fork, the punishment is permanent. Rolling it back would allow
+          slash evasion via reorg while _processed_evidence still blocks
+          re-submission of the same evidence.
         """
         snapshot = {
             "balances": dict(self.supply.balances),
