@@ -52,6 +52,9 @@ from messagechain.network.peer_selection import PeerSelector
 # progress.
 PEER_WEIGHT_CAP_MULTIPLIER = 4      # accept up to 4x our own weight
 PEER_WEIGHT_CAP_FLOOR = 1_000_000   # but always allow at least this much
+# Cap the number of ANNOUNCE_TX responses per GETDATA request to prevent
+# bandwidth amplification (one small GETDATA should not trigger 500 full txs).
+MAX_GETDATA_RESPONSES = 50
 # Cadence of the outbound-maintenance task — dials missing slots from addrman.
 OUTBOUND_MAINTAIN_INTERVAL = 30     # seconds
 from messagechain.consensus.attestation import (
@@ -427,6 +430,8 @@ class Node:
             peer.is_connected = False
             self.rate_limiter.remove_peer(address)
             self.eviction_protector.remove_peer(address)
+            self._mempool_digest_last_seen.pop(address, None)
+            self._mempool_requested_hashes.pop(address, None)
             writer.close()
 
     async def _connect_to_peer(self, host: str, port: int):
@@ -817,6 +822,7 @@ class Node:
             )
             return
 
+        sent = 0
         for h in tx_hashes:
             tx_hash_bytes = parse_hex(h)
             if tx_hash_bytes is None:
@@ -826,6 +832,8 @@ class Node:
                 return
             tx = self.mempool.pending.get(tx_hash_bytes)
             if tx:
+                if sent >= MAX_GETDATA_RESPONSES:
+                    break
                 msg = NetworkMessage(
                     msg_type=MessageType.ANNOUNCE_TX,
                     payload=tx.serialize(),
@@ -834,6 +842,7 @@ class Node:
                 if peer.writer:
                     await write_message(peer.writer, msg)
                 peer.known_txs.add(h)
+                sent += 1
 
     async def _relay_tx_inv(self, tx_hash_hexes: list[str], exclude: str = ""):
         """Relay transaction hashes via INV to peers that don't know them yet."""
