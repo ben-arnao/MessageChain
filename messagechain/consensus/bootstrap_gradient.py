@@ -57,6 +57,21 @@ def compute_bootstrap_progress(
 
     Result is max(height, stake).
 
+    Structural note on the stake component: under the recommended launch
+    allocation in `messagechain/core/bootstrap.py` the seed stakes 99M
+    tokens (~9.9% of supply), while total non-seed stake during the
+    bootstrap window is capped by mint issuance at ~1.68M tokens (16
+    reward floor × 105,192 blocks ≈ 2M tokens even if 100% is captured
+    and immediately staked).  That pins the stake component at roughly
+    2M / (99M + 2M) ≈ 2% for the entire bootstrap window — nowhere near
+    the 1.0 needed to end bootstrap early.  The `max()` is therefore
+    cosmetic under the recommended topology: progress is effectively
+    `height / BOOTSTRAP_END_HEIGHT`.  The stake term is retained so
+    alternative launch topologies (smaller seed stake, or later
+    post-bootstrap re-use of the formula) still get the decentralization
+    floor, and so the invariant "bootstrap cannot persist forever even
+    if height stalls" holds independent of economic assumptions.
+
     Edge cases:
       - zero total stake → stake component is 0 (not undefined).  This
         matches the "we just launched and nobody has staked anything
