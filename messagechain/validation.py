@@ -50,13 +50,21 @@ _SAFE_ERROR_PATTERNS = [
 def sanitize_error(error_msg: str) -> str:
     """Sanitize an error message for external RPC responses.
 
-    Passes through known business-logic errors verbatim.
-    Replaces unknown errors with a generic message to prevent
-    leaking file paths, line numbers, or internal state.
+    Passes through known business-logic errors verbatim.  Replaces
+    unknown errors with a generic message to prevent leaking file
+    paths, line numbers, or internal state.  When sanitizing, the
+    raw error is logged at WARNING level so operators can diagnose
+    the underlying issue from journalctl without it reaching clients.
     """
     for pattern in _SAFE_ERROR_PATTERNS:
         if pattern.lower() in error_msg.lower():
             return error_msg
+    # Not a safe pattern — log the raw message before we bury it
+    # behind "Internal error" so operators can trace the cause.
+    import logging as _logging
+    _logging.getLogger("messagechain.validation").warning(
+        "RPC returned 'Internal error' — raw cause: %s", error_msg,
+    )
     return "Internal error"
 
 
