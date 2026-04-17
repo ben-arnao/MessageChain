@@ -88,7 +88,7 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 DEVNET = False
 
 PINNED_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "4f6dc15f9a5b9bec77c64c9f3bb7580db8ed5e25922619f2acf4cb07fde37257"
+    "d930fab1e9fcf337dc0cbe34d9cb69d8e613516f727ccf1545d1d43982dfba2a"
 )
 
 # Treasury — a governance-controlled fund for community spending.
