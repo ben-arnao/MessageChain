@@ -200,6 +200,15 @@ class Blockchain:
         # rebuilt from history on load.
         self.reputation: dict[bytes, int] = {}
 
+        # Inactivity leak — Casper-style finalization-stall counter.
+        # Incremented every block; reset to 0 when attestation-layer
+        # finality fires (a block becomes justified in
+        # _process_attestations).  Deterministic from chain replay.
+        # When this counter exceeds INACTIVITY_LEAK_ACTIVATION_THRESHOLD,
+        # non-attesting validators bleed stake quadratically until
+        # honest participants regain 2/3 supermajority.
+        self.blocks_since_last_finalization: int = 0
+
         # Entity-index registry: bidirectional map for bloat reduction.
         # Every registered entity is assigned a monotonic integer index
         # (starting at 1; 0 reserved as the "invalid / unassigned"
@@ -2008,6 +2017,31 @@ class Blockchain:
                             sim_balances.get(proposer_id, 0) + _payout
                         )
 
+        # Simulate inactivity leak — must mirror _apply_block_state.
+        # The counter is incremented first; if the leak is active, inactive
+        # validators have their sim_staked reduced.  The counter reset
+        # from finalization happens in _process_attestations (after the
+        # state root), so from the state root's perspective the counter
+        # always increments.
+        sim_blocks_since_fin = self.blocks_since_last_finalization + 1
+        from messagechain.consensus.inactivity import (
+            is_leak_active as _ila,
+            get_inactive_validators as _giv,
+            apply_inactivity_leak as _ail,
+        )
+        if _ila(sim_blocks_since_fin):
+            _expected = {
+                eid for eid, amt in sim_staked.items() if amt > 0
+            }
+            _actual = {
+                att.validator_id for att in (attestations or [])
+            }
+            _inactive = _giv(_expected, _actual)
+            if _inactive:
+                from messagechain.consensus.pos import graduated_min_stake as _gms
+                _ms = _gms(block_height)
+                _ail(sim_staked, sim_blocks_since_fin, _inactive, min_stake=_ms)
+
         return compute_state_root(
             sim_balances, sim_nonces, sim_staked,
             authority_keys=sim_authority_keys,
@@ -2292,6 +2326,9 @@ class Blockchain:
                 min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
             )
             if justified:
+                # Reset inactivity leak counter: finalization resumed.
+                # Penalties stop immediately on the next block.
+                self.blocks_since_last_finalization = 0
                 logger.info(
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
@@ -3819,6 +3856,46 @@ class Blockchain:
         # votes instead of silently dropping them.
         self._apply_finality_votes(block, proposer_id)
 
+        # Inactivity leak — Casper-style defense against liveness attacks.
+        # Increment the finalization-stall counter.  If finalization happened
+        # this block, _process_attestations (called after us from add_block)
+        # will reset it to 0.  The counter drives quadratic penalties on
+        # non-attesting validators during prolonged finalization stalls.
+        self.blocks_since_last_finalization += 1
+
+        from messagechain.consensus.inactivity import (
+            is_leak_active,
+            get_inactive_validators,
+            apply_inactivity_leak,
+        )
+        if is_leak_active(self.blocks_since_last_finalization):
+            # Expected attesters: all validators with positive stake.
+            expected = {
+                eid for eid, amt in self.supply.staked.items()
+                if amt > 0
+            }
+            # Actual attesters in this block.
+            actual = {att.validator_id for att in block.attestations}
+            inactive = get_inactive_validators(expected, actual)
+            if inactive:
+                from messagechain.consensus.pos import graduated_min_stake
+                min_stake = graduated_min_stake(block.header.block_number)
+                total_burned, deactivated = apply_inactivity_leak(
+                    self.supply.staked,
+                    self.blocks_since_last_finalization,
+                    inactive,
+                    min_stake=min_stake,
+                )
+                if total_burned > 0:
+                    self.supply.total_supply -= total_burned
+                    self.supply.total_burned += total_burned
+                    logger.info(
+                        f"INACTIVITY LEAK: block #{block.header.block_number} "
+                        f"burned {total_burned} tokens from "
+                        f"{len(inactive)} inactive validators "
+                        f"(stall={self.blocks_since_last_finalization} blocks)"
+                    )
+
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
@@ -4440,6 +4517,7 @@ class Blockchain:
             # and must not silently regress across a reorg that undoes
             # and re-applies blocks.
             "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
+            "blocks_since_last_finalization": self.blocks_since_last_finalization,
         }
         # Snapshot governance state if tracker is attached
         if hasattr(self, "governance") and self.governance is not None:
@@ -4481,6 +4559,9 @@ class Blockchain:
         self._bootstrap_ratchet = RatchetState()
         if ratchet_value > 0.0:
             self._bootstrap_ratchet.observe(ratchet_value)
+        self.blocks_since_last_finalization = snapshot.get(
+            "blocks_since_last_finalization", 0,
+        )
         if "authority_keys" in snapshot:
             self.authority_keys = dict(snapshot["authority_keys"])
         if "pending_unstakes" in snapshot:

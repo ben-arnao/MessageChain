@@ -533,6 +533,32 @@ FINALITY_THRESHOLD_DENOMINATOR = 3   # Use integer arithmetic: stake * 3 >= tota
 FINALITY_INTERVAL = 100               # blocks between finality checkpoints (~16h at 600s)
 FINALITY_VOTE_INCLUSION_REWARD = 1    # tokens paid to proposer per vote included (from treasury)
 FINALITY_INACTIVITY_PENALTY = 0       # placeholder — reward-loss, not slashing; tune later
+
+# Inactivity leak — Casper-style defense against liveness attacks.
+# If finalization stalls, non-participating validators' stakes are slowly
+# drained (quadratically) until honest participants hold 2/3 supermajority.
+# This is the ONLY known defense against a minority cartel that halts the
+# chain by refusing to attest: without it, 40% silent stake permanently
+# prevents finalization and no slashing triggers because slashing requires
+# finalization.
+#
+# Quadratic scaling is intentional: early blocks of a stall are nearly free
+# (brief outages, node restarts shouldn't catastrophically slash), but
+# sustained non-participation bleeds stake rapidly.
+#
+# INACTIVITY_LEAK_ACTIVATION_THRESHOLD: blocks without finalization before
+#   leak mode activates.  4 blocks = ~40 minutes at 600s — short enough
+#   to respond to genuine attacks, long enough to ride out transient hiccups.
+#
+# INACTIVITY_PENALTY_QUOTIENT: ~2^24; controls leak speed.  Higher = slower.
+#   After ~4000 blocks (~28 days) a 40% cartel has lost enough stake that
+#   honest 60% becomes the new 2/3.
+#
+# INACTIVITY_BASE_PENALTY: base penalty per missed attestation per block
+#   (in tokens).  Multiplied by (blocks_since_finality^2 / quotient).
+INACTIVITY_LEAK_ACTIVATION_THRESHOLD = 4
+INACTIVITY_PENALTY_QUOTIENT = 16_777_216  # ~2^24
+INACTIVITY_BASE_PENALTY = 1
 MAX_FINALITY_VOTES_PER_BLOCK = 200    # DoS guard on block-size expansion via finality votes
 # A finality vote for a block older than FINALITY_VOTE_MAX_AGE blocks is
 # rejected — prevents spam gossip of votes targeting ancient blocks that
