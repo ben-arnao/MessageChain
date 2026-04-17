@@ -32,6 +32,12 @@ import zlib
 RAW_FLAG = 0
 COMPRESSED_FLAG = 1
 
+# Hard cap on decompressed payload size.  4x MAX_MESSAGE_CHARS (280)
+# gives generous margin for any valid message while stopping
+# decompression bombs cold.  A malicious tx with small compressed
+# bytes that decompress to megabytes/gigabytes is rejected here.
+MAX_DECOMPRESSED_MESSAGE_SIZE = 1120
+
 
 def encode_payload(plaintext: bytes) -> tuple[bytes, int]:
     """Return (stored_bytes, compression_flag) in canonical form.
@@ -57,5 +63,11 @@ def decode_payload(stored: bytes, flag: int) -> bytes:
     if flag == RAW_FLAG:
         return stored
     if flag == COMPRESSED_FLAG:
-        return zlib.decompress(stored, -zlib.MAX_WBITS)
+        dobj = zlib.decompressobj(-zlib.MAX_WBITS)
+        result = dobj.decompress(stored, MAX_DECOMPRESSED_MESSAGE_SIZE)
+        if dobj.unconsumed_tail:
+            raise ValueError(
+                f"Decompressed payload exceeds {MAX_DECOMPRESSED_MESSAGE_SIZE} bytes"
+            )
+        return result
     raise ValueError(f"Unknown compression flag: {flag}")

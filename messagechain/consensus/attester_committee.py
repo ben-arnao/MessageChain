@@ -28,6 +28,7 @@ reward-layer mechanism on top of the existing attestation flow.
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal, localcontext
 
 from messagechain.config import HASH_ALGO
 
@@ -137,18 +138,25 @@ def _deterministic_weighted_sample(
         return sorted(items)
 
     priorities: list[tuple[float, bytes]] = []
-    for item, w in zip(items, weights):
-        h = hashlib.new(HASH_ALGO, randomness + item).digest()
-        # Convert hash to a float in (0, 1] — avoid 0 for log-domain safety.
-        u = (int.from_bytes(h[:8], "big") + 1) / (2**64)
-        if w <= 0:
-            # Zero-weight items go last.  log-key = -inf pushes them
-            # below every positive-weight item in descending order.
-            pri = float("-inf")
-        else:
-            import math
-            pri = math.log(u) / w  # heavier items → closer to 0 → larger
-        priorities.append((pri, item))
+    with localcontext() as ctx:
+        ctx.prec = 40
+        for item, w in zip(items, weights):
+            h = hashlib.new(HASH_ALGO, randomness + item).digest()
+            # Convert hash to a value in (0, 1] — avoid 0 for log-domain safety.
+            hash_int = int.from_bytes(h[:8], "big") + 1
+            if w <= 0:
+                # Zero-weight items go last.  log-key = -inf pushes them
+                # below every positive-weight item in descending order.
+                pri = float("-inf")
+            else:
+                # Use Decimal.ln() instead of math.log() for platform-independent
+                # results.  math.log delegates to C libm which can differ at the
+                # ULP level across platforms/libc implementations — a consensus
+                # split risk.  Decimal with 40-digit precision is deterministic
+                # everywhere Python runs.
+                u = Decimal(hash_int) / Decimal(2**64)
+                pri = float(u.ln() / Decimal(w))
+            priorities.append((pri, item))
 
     # Take top-k: sort descending by priority, tiebreak ascending by
     # item bytes so ties resolve deterministically.
