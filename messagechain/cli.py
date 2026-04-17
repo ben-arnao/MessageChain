@@ -63,6 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--server", type=str, default=None,
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
+    account.add_argument(
+        "--sponsor", type=str, default=None,
+        help="Address of a registered entity that will pay the "
+             "REGISTRATION_FEE on your behalf (required when the fee is "
+             "non-zero; the sponsor must have a balance of at least "
+             "REGISTRATION_FEE tokens).",
+    )
 
     # --- send ---
     send = sub.add_parser(
@@ -837,11 +844,26 @@ def cmd_account(args):
     host, port = _parse_server(args.server)
     print(f"Registering with server at {host}:{port}...")
 
+    # Resolve sponsor address (if provided) to an entity_id hex string.
+    sponsor_hex = ""
+    if getattr(args, "sponsor", None):
+        from messagechain.identity.address import decode_address, is_checksummed
+        try:
+            if is_checksummed(args.sponsor):
+                sponsor_hex = decode_address(args.sponsor).hex()
+            else:
+                # Accept raw hex as a convenience.
+                sponsor_hex = bytes.fromhex(args.sponsor).hex()
+        except Exception as e:
+            print(f"Invalid --sponsor: {e}")
+            sys.exit(1)
+
     from client import rpc_call
     response = rpc_call(host, port, "register_entity", {
         "entity_id": entity.entity_id_hex,
         "public_key": entity.public_key.hex(),
         "registration_proof": proof.serialize(),
+        "sponsor_id": sponsor_hex,
     })
 
     if response.get("ok"):
