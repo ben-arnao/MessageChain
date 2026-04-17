@@ -103,6 +103,19 @@ class Blockchain:
         self.base_fee: int = self.supply.base_fee  # mirror for easy access
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
+        # WOTS+ Merkle tree height per entity, captured the moment the
+        # entity's pubkey is installed on chain (genesis, first-spend
+        # reveal, or _install_pubkey_direct).  Carried so a server
+        # restart can rebuild the SAME keypair (same entity_id derivation)
+        # from the private key without guessing a tree_height from global
+        # config — a mismatch would silently produce a different entity_id
+        # and make the node unable to sign for its own wallet.
+        # Set-once per entity: a pubkey install that's already recorded
+        # in this map never overwrites, so an entity's tree height is
+        # as immutable as its entity_id.  Key rotation keeps the same
+        # tree_height by construction (derive_rotated_keypair reuses the
+        # keypair's height).
+        self.wots_tree_heights: dict[bytes, int] = {}
         self.entity_message_count: dict[bytes, int] = {}
         self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
@@ -289,6 +302,13 @@ class Blockchain:
         if hasattr(self.db, 'get_all_key_rotation_counts'):
             self.key_rotation_counts = self.db.get_all_key_rotation_counts()
 
+        # Restore per-entity WOTS+ tree heights.  Consulted at server
+        # startup to rebuild the SAME keypair from the operator's
+        # private key, independent of whatever global config the
+        # process was launched with.
+        if hasattr(self.db, 'get_all_wots_tree_heights'):
+            self.wots_tree_heights = self.db.get_all_wots_tree_heights()
+
         # Restore slashed validators
         if hasattr(self.db, 'get_all_slashed'):
             self.slashed_validators = self.db.get_all_slashed()
@@ -396,6 +416,11 @@ class Blockchain:
             if hasattr(self.db, 'set_key_rotation_count'):
                 for eid, rn in self.key_rotation_counts.items():
                     self.db.set_key_rotation_count(eid, rn)
+            if hasattr(self.db, 'set_wots_tree_height'):
+                # Set-once at the storage layer (INSERT OR IGNORE), so
+                # re-persisting unchanged entries is a cheap no-op.
+                for eid, th in self.wots_tree_heights.items():
+                    self.db.set_wots_tree_height(eid, th)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
             self.db.set_supply_meta("total_fees_collected", self.supply.total_fees_collected)
@@ -486,6 +511,12 @@ class Blockchain:
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
         self.nonces[genesis_entity.entity_id] = 0
+        # Capture the genesis entity's WOTS+ tree_height in chain state so
+        # a server restart can reconstruct the same keypair from the
+        # private key without trusting global config.
+        self._set_tree_height_explicit(
+            genesis_entity.entity_id, genesis_entity.keypair.height,
+        )
         # Genesis entity gets the first entity_index (1). All subsequent
         # RegistrationTransactions extend this monotonic sequence.
         self._assign_entity_index(genesis_entity.entity_id)
@@ -1001,6 +1032,11 @@ class Blockchain:
         self.nonces[entity_id] = 0
         self._bump_watermark(entity_id, registration_proof.leaf_index)
         self._assign_entity_index(entity_id)
+        # Bind the WOTS+ tree_height to this entity: derived from the
+        # registration proof's auth_path length, so a server restart can
+        # rebuild the exact same keypair without guessing a global
+        # config value that may have drifted.
+        self._record_tree_height(entity_id, registration_proof)
         # Cover the mutation in the consensus state root — bootstrap
         # runs before any block is appended, so the next block's state
         # root reconstruction must include this leaf.
@@ -1427,6 +1463,11 @@ class Blockchain:
             # of this function bumps it to 1.
             self.nonces.setdefault(tx.entity_id, 0)
             self._assign_entity_index(tx.entity_id)
+            # Capture the sender's WOTS+ tree_height from the signature
+            # auth_path length — the canonical in-signature commitment
+            # to tree height.  One-shot: only the first-spend install
+            # binds the height.
+            self._record_tree_height(tx.entity_id, tx.signature)
             if self.db is not None:
                 self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
 
@@ -1465,6 +1506,9 @@ class Blockchain:
             self.public_keys[tx.entity_id] = tx.sender_pubkey
             self.nonces.setdefault(tx.entity_id, 0)
             self._assign_entity_index(tx.entity_id)
+            # Capture WOTS+ tree_height on first-spend (see
+            # apply_transfer_transaction docstring for rationale).
+            self._record_tree_height(tx.entity_id, tx.signature)
             if self.db is not None:
                 self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
 
@@ -3827,6 +3871,7 @@ class Blockchain:
             self.public_keys[tx.entity_id] = tx.sender_pubkey
             self.nonces.setdefault(tx.entity_id, 0)
             self._assign_entity_index(tx.entity_id)
+            self._record_tree_height(tx.entity_id, tx.signature)
             if self.db is not None:
                 self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
 
@@ -4036,6 +4081,8 @@ class Blockchain:
                 self.public_keys[stx.entity_id] = stx.sender_pubkey
                 self.nonces.setdefault(stx.entity_id, 0)
                 self._assign_entity_index(stx.entity_id)
+                # Record tree_height on first-spend stake install.
+                self._record_tree_height(stx.entity_id, stx.signature)
                 if self.db is not None:
                     self.db.set_public_key(stx.entity_id, stx.sender_pubkey)
             if not self.supply.pay_fee_with_burn(
@@ -4924,6 +4971,13 @@ class Blockchain:
             "staked": dict(self.supply.staked),
             "nonces": dict(self.nonces),
             "public_keys": dict(self.public_keys),
+            # Tree heights ride alongside public_keys: a reorg that
+            # removes a first-spend pubkey install must also remove the
+            # corresponding tree_height binding, otherwise a later
+            # re-install (possibly with a different height) would be
+            # blocked by a stale entry.  Set-once semantics only apply
+            # within a single canonical chain history.
+            "wots_tree_heights": dict(self.wots_tree_heights),
             "message_counts": dict(self.entity_message_count),
             "proposer_sig_counts": dict(self.proposer_sig_counts),
             "attestation_sig_counts": dict(self.attestation_sig_counts),
@@ -4982,6 +5036,11 @@ class Blockchain:
         self.base_fee = self.supply.base_fee
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
+        # Tree heights are paired with public_keys in the snapshot so
+        # a reorged-out first-spend install cleanly removes both.  Older
+        # snapshots that predate this field restore to an empty dict,
+        # which matches a freshly-initialized Blockchain.
+        self.wots_tree_heights = dict(snapshot.get("wots_tree_heights", {}))
         self.entity_message_count = snapshot["message_counts"]
         self.proposer_sig_counts = snapshot.get("proposer_sig_counts", {})
         self.attestation_sig_counts = snapshot.get("attestation_sig_counts", {})
@@ -5024,6 +5083,52 @@ class Blockchain:
                 self.governance._executed_treasury_spends = set(
                     snapshot["gov_executed_treasury_spends"],
                 )
+
+    def get_wots_tree_height(self, entity_id: bytes) -> int | None:
+        """Return the WOTS+ Merkle tree height recorded for `entity_id`.
+
+        Returns None if the entity has never had its pubkey installed on
+        chain.  The server uses this at startup to reconstruct the exact
+        same keypair (same entity_id derivation) from the private key,
+        rather than trusting `config.MERKLE_TREE_HEIGHT` — a mismatch
+        between the height used at creation and the height used at
+        restart would silently derive a different public key and make
+        the node unable to sign for its own wallet.
+        """
+        return self.wots_tree_heights.get(entity_id)
+
+    def _record_tree_height(self, entity_id: bytes, signature) -> None:
+        """Record the WOTS+ tree_height derived from a signature's auth_path.
+
+        Idempotent: once an entity has a tree_height recorded, this never
+        overwrites.  The auth_path length is the canonical, signature-
+        included commitment to tree height (a WOTS+ signature's Merkle
+        authentication path has exactly `tree_height` siblings).
+
+        Called from every pubkey-install site (genesis, first-spend
+        Transfer / Stake, _install_pubkey_direct) so the height is
+        captured at the same moment the entity becomes known on chain.
+        """
+        if entity_id in self.wots_tree_heights:
+            return
+        try:
+            height = len(signature.auth_path)
+        except AttributeError:
+            return
+        self.wots_tree_heights[entity_id] = height
+        if self.db is not None and hasattr(self.db, "set_wots_tree_height"):
+            self.db.set_wots_tree_height(entity_id, height)
+
+    def _set_tree_height_explicit(self, entity_id: bytes, height: int) -> None:
+        """Record a tree_height directly (used at genesis where the entity
+        object is available and we take the authoritative value from
+        its KeyPair rather than a signature's auth_path).
+        """
+        if entity_id in self.wots_tree_heights:
+            return
+        self.wots_tree_heights[entity_id] = int(height)
+        if self.db is not None and hasattr(self.db, "set_wots_tree_height"):
+            self.db.set_wots_tree_height(entity_id, int(height))
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
         """Total WOTS+ leaves consumed by this entity across ALL signature types.

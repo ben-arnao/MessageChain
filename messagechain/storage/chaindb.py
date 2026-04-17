@@ -112,6 +112,20 @@ class ChainDB:
                 rotation_number INTEGER NOT NULL DEFAULT 0
             );
 
+            -- WOTS+ Merkle tree height per entity.  Recorded the moment
+            -- the entity's pubkey is installed on chain (genesis,
+            -- first-spend reveal, or direct install).  The server looks
+            -- this up at startup to reconstruct the SAME keypair from a
+            -- private key — without it, a config default that drifted
+            -- from the value used at creation would silently derive a
+            -- different entity_id and make the node unable to sign for
+            -- its own wallet.  Set-once per entity; key rotation
+            -- preserves the height by construction.
+            CREATE TABLE IF NOT EXISTS wots_tree_heights (
+                entity_id BLOB PRIMARY KEY,
+                tree_height INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS supply_meta (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -656,6 +670,33 @@ class ChainDB:
     def get_all_key_rotation_counts(self) -> dict[bytes, int]:
         cur = self._conn.execute(
             "SELECT entity_id, rotation_number FROM key_rotation_counts"
+        )
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: WOTS+ Tree Heights per Entity ────────────────────
+
+    def get_wots_tree_height(self, entity_id: bytes) -> int | None:
+        cur = self._conn.execute(
+            "SELECT tree_height FROM wots_tree_heights WHERE entity_id = ?",
+            (entity_id,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    def set_wots_tree_height(self, entity_id: bytes, tree_height: int):
+        # INSERT OR IGNORE preserves the set-once invariant at the
+        # storage layer: even if a caller passes a different height
+        # later, the first value wins and the entity's binding is as
+        # immutable as its entity_id.
+        self._conn.execute(
+            "INSERT OR IGNORE INTO wots_tree_heights (entity_id, tree_height) "
+            "VALUES (?, ?)",
+            (entity_id, int(tree_height)),
+        )
+
+    def get_all_wots_tree_heights(self) -> dict[bytes, int]:
+        cur = self._conn.execute(
+            "SELECT entity_id, tree_height FROM wots_tree_heights"
         )
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 

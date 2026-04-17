@@ -401,6 +401,12 @@ class TestM1NegativeTipClamp(unittest.TestCase):
         tx.entity_id = entity.entity_id
         tx.recipient_id = recipient.entity_id
         tx.nonce = 0
+        # Not a first-spend: sender is already known via
+        # _install_pubkey_direct in _make_chain_with_entity, so the mock
+        # must explicitly leave sender_pubkey empty (otherwise the
+        # MagicMock default is a truthy Mock and we'd falsely enter the
+        # first-spend path, which also expects a real signature object).
+        tx.sender_pubkey = b""
 
         # The tip should be clamped to 0, not negative
         chain._apply_transfer_with_burn(tx, proposer.entity_id, base_fee=100)

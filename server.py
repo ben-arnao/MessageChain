@@ -2253,10 +2253,42 @@ async def run(args):
         ).encode("utf-8")
 
     if private_key_input:
-        from messagechain.config import MERKLE_TREE_HEIGHT as _th
+        from messagechain.config import MERKLE_TREE_HEIGHT as _config_th
+        # Prefer the tree_height recorded in chain state over the global
+        # config default.  The stored value is the authoritative binding:
+        # the entity_id derived from this private key was computed with
+        # THAT height, so re-deriving the keypair with anything else
+        # silently produces a different public key (and hence a
+        # different entity_id) — the node would then be unable to sign
+        # for its own wallet.  Chain state wins whenever we can identify
+        # the operator's wallet entity; config is the fallback for a
+        # brand-new node with no prior state.
+        _resolved_th: int | None = None
+        if args.wallet:
+            try:
+                wallet_id_bytes = bytes.fromhex(args.wallet)
+                _resolved_th = server.blockchain.get_wots_tree_height(
+                    wallet_id_bytes,
+                )
+            except ValueError:
+                logger.warning(
+                    "--wallet %s is not valid hex; falling back to config",
+                    args.wallet,
+                )
+        if _resolved_th is None:
+            _resolved_th = _config_th
+            logger.info(
+                "Using config MERKLE_TREE_HEIGHT=%d for keypair generation",
+                _resolved_th,
+            )
+        else:
+            logger.info(
+                "Using chain-state WOTS+ tree_height=%d for wallet %s",
+                _resolved_th, args.wallet[:16] if args.wallet else "?",
+            )
         entity = _load_or_create_entity(
             private_key_input,
-            _th,
+            _resolved_th,
             args.data_dir,
             no_cache=getattr(args, "no_keypair_cache", False),
         )
