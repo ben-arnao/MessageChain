@@ -278,8 +278,14 @@ class Server:
             on_peer_offense=self._on_sync_offense,
         )
 
-        # RPC rate limiting
-        self.rpc_rate_limiter = RPCRateLimiter(max_requests=60, window_seconds=60.0)
+        # RPC rate limiting.  60 req/min was too tight for real workflows —
+        # a typical session is balance -> nonce -> estimate_fee -> submit
+        # (4 calls), and batched scripts hit the cap fast.  300/min (5/sec)
+        # still bounds a single attacker's throughput well below what the
+        # async event loop can handle while leaving headroom for legitimate
+        # clients.  DoS protection is primarily the per-tx signature cost
+        # and the rate limiter is a secondary guard.
+        self.rpc_rate_limiter = RPCRateLimiter(max_requests=300, window_seconds=60.0)
 
         # RPC authentication — generate a random token if none configured.
         # Any RPC client must include {"auth": "<token>"} in requests.
