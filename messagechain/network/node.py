@@ -73,6 +73,7 @@ from messagechain.consensus.slashing import (
 from messagechain.consensus.finality import (
     FinalityVote, verify_finality_vote,
 )
+from messagechain.consensus.equivocation_watcher import EquivocationWatcher
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
     OFFENSE_INVALID_HEADERS, OFFENSE_UNREQUESTED_DATA,
@@ -226,6 +227,23 @@ class Node:
         #       new digest arrives from the peer.
         self._mempool_digest_last_seen: dict[str, float] = {}
         self._mempool_requested_hashes: dict[str, set] = {}
+
+        # Equivocation watcher — files slash evidence automatically when
+        # any peer double-signs a block header or attestation on the
+        # wire.  Persistent observations live in chaindb.seen_signatures
+        # so a node restart does not reopen a hole an attacker could time
+        # their double-sign through.  Requires the blockchain's db; if
+        # we're running without persistence (in-memory Blockchain()) the
+        # watcher is disabled — detect-only mode still wouldn't survive
+        # a restart, so there's no security value in running it.
+        self.equivocation_watcher: EquivocationWatcher | None = None
+        if getattr(self.blockchain, "db", None) is not None:
+            self.equivocation_watcher = EquivocationWatcher(
+                chaindb=self.blockchain.db,
+                blockchain=self.blockchain,
+                mempool=self.mempool,
+                submitter_entity=self.entity,
+            )
 
     def _on_sync_offense(self, peer_address: str, points: int, reason: str):
         """Callback invoked by ChainSyncer for sync-time misbehavior."""
@@ -803,6 +821,25 @@ class Node:
                 )
                 self.mempool.remove_transactions(all_tx_hashes)
                 logger.info(f"Added block #{block.header.block_number} ({reason})")
+                # Equivocation watcher: feed the signed header in AFTER
+                # the block has passed validation (add_block verifies
+                # the proposer signature).  A prior conflicting header
+                # from the same proposer at the same height will now
+                # trigger auto-emission of a SlashTransaction into our
+                # mempool.  Then prune expired observations — a single
+                # cheap bounded DELETE per block keeps the rolling 7-day
+                # window bounded.
+                if self.equivocation_watcher is not None:
+                    try:
+                        self.equivocation_watcher.observe_block_header(
+                            block.header,
+                        )
+                        self.equivocation_watcher.prune()
+                    except Exception:
+                        logger.exception(
+                            "equivocation_watcher crashed on block "
+                            f"#{block.header.block_number}"
+                        )
                 # Attester duty: if we're a registered validator, cast a
                 # vote on the accepted block — but only if it honors our
                 # forced-inclusion list (censorship resistance).  A silent
@@ -1142,6 +1179,19 @@ class Node:
                 peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
             )
             return
+
+        # Equivocation watcher: record the (validator, height) and auto-
+        # file slash evidence if we've seen a DIFFERENT signed attestation
+        # from this validator at the same height.  Runs after signature
+        # verification so we never index garbage.
+        if self.equivocation_watcher is not None:
+            try:
+                self.equivocation_watcher.observe_attestation(att)
+            except Exception:
+                logger.exception(
+                    "equivocation_watcher crashed on attestation from "
+                    f"{att.validator_id.hex()[:16]}"
+                )
 
         # Record in finality tracker.  Finality safety floor: the active
         # set must meet the minimum validator count regardless of
