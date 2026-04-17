@@ -148,7 +148,9 @@ class TestStakeTxConvergesAcrossNodes(_Base):
         chainA = Blockchain()
         genesis = chainA.initialize_genesis(alice)
         chainA.supply.balances[alice.entity_id] = 100_000
-        alice.keypair._next_leaf = 0
+        # Genesis consumed alice's leaf 0 for the proposer sig; stake
+        # must sign with a fresh leaf to satisfy the WOTS+ leaf-reuse
+        # guard that applies to every signed tx type.
 
         stx = create_stake_transaction(
             alice, amount=50_000, nonce=0, fee=MIN_FEE,
@@ -163,7 +165,6 @@ class TestStakeTxConvergesAcrossNodes(_Base):
         # Build node B with the SAME genesis state and block (as if received
         # from A during peer sync) so prev_hash in A's block matches.
         aliceB = _entity(b"stake-converge")  # same seed = same entity
-        aliceB.keypair._next_leaf = 0
         chainB = Blockchain()
         # Register alice on node B, then replay the exact genesis block A
         # produced.  In a real network these would arrive as part of peer
