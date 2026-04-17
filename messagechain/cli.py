@@ -63,6 +63,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--server", type=str, default=None,
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
+    account.add_argument(
+        "--sigs-remaining", action="store_true",
+        help="Print the number of one-time WOTS+ signatures still "
+             "available on your local Merkle key tree.  Useful for "
+             "confirming you have room to rotate before the key exhausts.",
+    )
 
     # --- send ---
     send = sub.add_parser(
@@ -827,9 +833,18 @@ def cmd_account(args):
     transfer (via TransferTransaction.sender_pubkey).  All this command
     does now is derive + display the entity ID and address so you know
     what to tell the sender who will fund you.
+
+    With --sigs-remaining, skip the "create" summary and instead print
+    the local WOTS+ signature capacity so a user can see how close they
+    are to key exhaustion.  Works entirely off the local key tree — no
+    RPC roundtrip — so a user whose node is down can still check.
     """
     from messagechain.identity.identity import Entity
     from messagechain.identity.address import encode_address
+
+    if getattr(args, "sigs_remaining", False):
+        _cmd_account_sigs_remaining()
+        return
 
     print("=== Create Account ===\n")
 
@@ -848,6 +863,46 @@ def cmd_account(args):
     print("you tokens.  Your first outgoing transfer will reveal your")
     print("public key to the chain automatically.")
     print("Your private key is your sole credential. Never share it.")
+
+
+def _cmd_account_sigs_remaining():
+    """Print WOTS+ one-time-signature capacity for the current wallet.
+
+    Uses ONLY the local keypair — no RPC required.  This is deliberate:
+    if the user has run out of leaves, their node may be offline or
+    refusing to sign, and they still need a way to see the problem.
+
+    The number shown is a local upper bound on the remaining signatures.
+    Actual on-chain usage may be slightly ahead (if the node has advanced
+    its leaf_index since the last `load_leaf_index`), but can never be
+    behind — so "remaining" is always the safe-to-use floor.
+    """
+    from messagechain.identity.identity import Entity
+
+    print("=== Signatures Remaining ===\n")
+
+    private_key = _collect_private_key()
+    entity = Entity.create(private_key)
+
+    total = entity.keypair.num_leaves
+    remaining = entity.keypair.remaining_signatures
+    used = total - remaining
+    # Exact to 1 decimal place — large trees (2^20 = 1,048,576) need
+    # sub-integer precision to distinguish 79.9% from 80.0%, which is
+    # where the rotation warning fires.
+    pct_used = (used * 1000) // total / 10 if total else 0.0
+
+    print(f"  Signatures remaining: {remaining:,} / {total:,} ({pct_used:.1f}% used)")
+    if pct_used >= 95:
+        print()
+        print("  CRITICAL: over 95% of one-time signatures consumed.")
+        print("  Rotate your key NOW with: messagechain rotate-key")
+        print("  If the tree exhausts before you rotate, funds lock until")
+        print("  a previously-signed KeyRotationTransaction is submitted.")
+    elif pct_used >= 80:
+        print()
+        print("  WARNING: over 80% of one-time signatures consumed.")
+        print("  Schedule a rotation soon: messagechain rotate-key")
 
 
 def cmd_send(args):
