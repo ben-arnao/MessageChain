@@ -2,6 +2,13 @@
 Description=MessageChain validator node
 After=network-online.target
 Wants=network-online.target
+# Crash-loop guard.  StartLimitBurst=5 / StartLimitIntervalSec=3600 means
+# systemd stops trying after 5 restarts in an hour — a block-level DoS bug
+# that segfaults the validator each time it sees a particular block won't
+# burn CPU and log volume forever.  The operator gets a halted unit they
+# can investigate instead of an indefinite restart loop.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,14 +19,17 @@ ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
     --data-dir /var/lib/messagechain \
     --rpc-bind 0.0.0.0 \
     --keyfile /etc/messagechain/keyfile
-# Bootstrap-phase profile: flips a coherent bundle of early-deployment
-# defaults in one switch — 30s blocks, MERKLE_TREE_HEIGHT=16 (fast keygen,
-# matches the founder-launch entity baked into genesis), checkpoints
-# waived, and RPC auth disabled.  For production-cadence operation, set
-# MESSAGECHAIN_PROFILE=production (or remove this line; unset == production).
-# Individual env vars still override the profile for fine-grained control.
-# See messagechain/config.py for the full profile bundle.
-Environment=MESSAGECHAIN_PROFILE=prototype
+# This is the production-default unit: no MESSAGECHAIN_PROFILE override,
+# RPC auth on, full block-time, full Merkle tree height, checkpoints
+# required.  An operator who copy-pastes this file gets the safe posture.
+#
+# For prototype-phase deployments (early bootstrap, single-validator test
+# nets), drop in messagechain-validator-prototype.conf.example to
+# /etc/systemd/system/messagechain-validator.service.d/profile.conf and
+# `systemctl daemon-reload`.  That keeps the dev-time choice opt-in
+# rather than baked into the prod default — the failure mode of a
+# mainnet validator silently running prototype defaults is what this
+# split is designed to prevent.
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
