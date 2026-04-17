@@ -418,6 +418,34 @@ KEY_ROTATION_FEE = 1000   # fee required for key rotation transaction
 # Dust limit — minimum transfer amount to prevent state bloat from tiny accounts
 DUST_LIMIT = 10           # transfers below this amount are rejected
 
+# New-account surcharge — an extra fee, BURNED (not paid to the proposer),
+# on any Transfer whose recipient does not yet exist in on-chain state.
+# The surcharge is bundled into the tx's single `fee` field — callers
+# creating a transfer to a brand-new recipient must set
+#     fee >= MIN_FEE + NEW_ACCOUNT_FEE
+# or validation rejects it with a clear "new-account surcharge" error.
+#
+# Rationale: permanent state entry is expensive (storage, proofs,
+# proof-serving for the lifetime of the chain).  Pricing it at MIN_FEE
+# alone made full account creation cost ~110 tokens, far below the old
+# REGISTRATION_FEE=1000 baseline the chain used before receive-to-exist.
+# Burning (rather than paying to the proposer) aligns incentives:
+# permanent state entry → permanent supply reduction.
+#
+# Exemptions:
+#   * Genesis allocation_table entries (initial state, not user creation)
+#   * Intra-block pipelining: only the FIRST tx funding a given
+#     brand-new recipient in a single block pays the surcharge; a
+#     second tx to the same recipient in the same block does not.
+#   * Stake first-spend from an already-credited entity (no new state
+#     entry is created — balance entry already exists from the prior
+#     Transfer that funded them and paid the surcharge then).
+#
+# Treasury spends that credit a brand-new recipient burn NEW_ACCOUNT_FEE
+# from the treasury balance on execute, failing the spend if treasury
+# can't cover amount + NEW_ACCOUNT_FEE.
+NEW_ACCOUNT_FEE = 1000
+
 # Orphan block pool
 MAX_ORPHAN_BLOCKS = 100   # max orphan blocks stored (bounded to prevent memory exhaustion)
 

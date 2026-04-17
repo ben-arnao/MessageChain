@@ -150,9 +150,20 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
         # itself first spends (not tested here — we care about receive).
         sweep_amount = 500
         transfer_nonce = chain.nonces.get(self.seed.entity_id, 0)
+        # Payout is brand-new → MIN_FEE + NEW_ACCOUNT_FEE surcharge.
+        # RECOMMENDED_FEE_BUFFER (1000) was sized for the old flat MIN_FEE
+        # regime; the new-account surcharge raises the first-sweep cost
+        # past the buffer, so top up the seed's liquid balance enough to
+        # cover amount + fee.  (A real launch would size the fee buffer
+        # larger; exercising the economics here is out of scope.)
+        from messagechain.config import NEW_ACCOUNT_FEE
+        chain.supply.balances[self.seed.entity_id] = (
+            chain.supply.get_balance(self.seed.entity_id)
+            + sweep_amount + MIN_FEE + NEW_ACCOUNT_FEE
+        )
         sweep_tx = create_transfer_transaction(
             self.seed, self.payout.entity_id, sweep_amount,
-            nonce=transfer_nonce, fee=MIN_FEE,
+            nonce=transfer_nonce, fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         proposer = pick_selected_proposer(chain, [self.seed])
         block = chain.propose_block(

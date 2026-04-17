@@ -333,18 +333,38 @@ class SupplyTracker:
         self.balances[to_id] = self.balances.get(to_id, 0) + amount
         return True
 
-    def treasury_spend(self, recipient_id: bytes, amount: int) -> bool:
+    def treasury_spend(
+        self,
+        recipient_id: bytes,
+        amount: int,
+        *,
+        new_account_surcharge: int = 0,
+    ) -> bool:
         """Move funds from treasury to recipient (governance-authorized only).
 
         This is the ONLY way to debit the treasury. Callers must ensure
         governance approval before invoking this method.
+
+        If `new_account_surcharge > 0`, the recipient is brand-new (no
+        on-chain state) and the treasury must additionally cover the
+        surcharge, which is BURNED (not credited to the recipient).
+        The recipient receives exactly `amount`; the treasury is debited
+        by `amount + new_account_surcharge`, and the surcharge is added
+        to total_burned.  If the treasury cannot cover
+        `amount + new_account_surcharge`, the spend is rejected.
         """
-        if self.get_balance(TREASURY_ENTITY_ID) < amount:
-            return False
         if amount <= 0:
             return False
-        self.balances[TREASURY_ENTITY_ID] -= amount
+        if new_account_surcharge < 0:
+            return False
+        debit_total = amount + new_account_surcharge
+        if self.get_balance(TREASURY_ENTITY_ID) < debit_total:
+            return False
+        self.balances[TREASURY_ENTITY_ID] -= debit_total
         self.balances[recipient_id] = self.balances.get(recipient_id, 0) + amount
+        if new_account_surcharge > 0:
+            self.total_supply -= new_account_surcharge
+            self.total_burned += new_account_surcharge
         return True
 
     def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:
