@@ -3082,6 +3082,14 @@ class Blockchain:
         if not isinstance(stx, StakeTransaction):
             return False, f"Unexpected type {type(stx).__name__}"
 
+        # Match the unstake path: revoked entities cannot re-acquire stake.
+        # Revoke is an authoritative kill switch — any re-staking would
+        # silently re-enroll a validator the cold-key holder explicitly
+        # retired, and because the unstake path is also revocation-blocked,
+        # freshly staked tokens would be permanently trapped.
+        if stx.entity_id in self.revoked_entities:
+            return False, f"Entity {stx.entity_id.hex()[:16]} is revoked"
+
         # Resolve verifying pubkey — same two-branch logic as
         # validate_transfer_transaction.  A nil dict means "no
         # cross-tx bookkeeping" (standalone validation).
