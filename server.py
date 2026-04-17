@@ -1257,18 +1257,26 @@ class Server:
     def _rpc_estimate_fee(self, params: dict) -> dict:
         """Price a prospective message or transfer without submitting.
 
-        Returns three numbers:
-          - min_fee: protocol floor from the size-based curve
-          - mempool_fee: median of pending-tx fees (demand signal)
-          - recommended_fee: max(min_fee, mempool_fee) — safe to submit now
+        Returns:
+          - min_fee: protocol floor (size-based for messages, MIN_FEE +
+            NEW_ACCOUNT_FEE for transfers to brand-new recipients, else
+            MIN_FEE).
+          - mempool_fee: median of pending-tx fees (demand signal).
+          - recommended_fee: max(min_fee, mempool_fee) — safe to submit now.
+          - recipient_is_new (transfers only): True iff the target
+            `recipient_id` does not yet exist on chain, so the client can
+            display "+NEW_ACCOUNT_FEE surcharge (burned)" if it wants.
 
         For `kind=message`, the size curve dominates on long messages.
-        For `kind=transfer`, only MIN_FEE applies; mempool pressure can
-        push the recommendation up during congestion.
+        For `kind=transfer`, pass `recipient_id` (hex) to get a surcharge-
+        inclusive estimate when the recipient has no on-chain state yet.
+        Omit `recipient_id` (or supply an invalid hex) to fall back to the
+        legacy estimate that assumes an existing recipient.
         """
         from messagechain.core.transaction import calculate_min_fee
-        from messagechain.config import MIN_FEE, MAX_MESSAGE_CHARS
+        from messagechain.config import MIN_FEE, NEW_ACCOUNT_FEE, MAX_MESSAGE_CHARS
         kind = params.get("kind", "message")
+        recipient_is_new = False
         if kind == "message":
             msg = params.get("message", "")
             if not isinstance(msg, str):
@@ -1278,15 +1286,27 @@ class Server:
             min_fee = calculate_min_fee(msg.encode("utf-8"))
         elif kind == "transfer":
             min_fee = MIN_FEE
+            # Optional recipient_id: if provided and the recipient has no
+            # on-chain state, the chain will require a NEW_ACCOUNT_FEE
+            # surcharge on apply, so surface it here.
+            recipient_id_hex = params.get("recipient_id")
+            if recipient_id_hex:
+                recipient_id = parse_hex(recipient_id_hex)
+                if recipient_id is not None:
+                    if self.blockchain._recipient_is_new(recipient_id):
+                        recipient_is_new = True
+                        min_fee += NEW_ACCOUNT_FEE
         else:
             return {"ok": False, "error": f"Unknown fee kind: {kind}"}
 
         mempool_fee = self.mempool.get_fee_estimate()
-        return {"ok": True, "result": {
+        result = {
             "min_fee": min_fee,
             "mempool_fee": mempool_fee,
             "recommended_fee": max(min_fee, mempool_fee),
-        }}
+            "recipient_is_new": recipient_is_new,
+        }
+        return {"ok": True, "result": result}
 
     def _rpc_submit_transfer(self, params: dict) -> dict:
         """Accept a signed transfer transaction from a client."""

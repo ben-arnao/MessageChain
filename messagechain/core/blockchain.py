@@ -25,7 +25,7 @@ from messagechain.config import (
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
-    NEW_ACCOUNT_FEE,
+    NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.state_tree import SparseMerkleTree
@@ -3198,6 +3198,19 @@ class Blockchain:
                 pending_balance_credits.get(ttx.recipient_id, 0) + ttx.amount
             )
 
+        # Per-block new-account cap — second line of defense beyond the
+        # NEW_ACCOUNT_FEE surcharge.  Count brand-new recipients funded
+        # by this block (deduped via pending_new_account_created, so
+        # intra-block pipelining to the same recipient counts once).
+        # Enforced as a HARD consensus rule: all nodes arrive at the
+        # same count by using the same _recipient_is_new helper.
+        if len(pending_new_account_created) > MAX_NEW_ACCOUNTS_PER_BLOCK:
+            return False, (
+                f"Block creates {len(pending_new_account_created)} new accounts, "
+                f"exceeding MAX_NEW_ACCOUNTS_PER_BLOCK cap "
+                f"of {MAX_NEW_ACCOUNTS_PER_BLOCK} per block"
+            )
+
         # Validate attestations (votes for the parent block)
         valid, reason = self._validate_attestations(block)
         if not valid:
@@ -3728,6 +3741,23 @@ class Blockchain:
             pk = self.public_keys[ttx.entity_id]
             if not verify_transfer_transaction(ttx, pk):
                 return False, f"Invalid signature in transfer {ttx.tx_hash.hex()[:16]}"
+
+        # Per-block new-account cap — mirrors validate_block.  Count
+        # brand-new recipients with intra-block pipelining so the count
+        # matches across all validation entry points.
+        pending_new_account_created_sa: set[bytes] = set()
+        for ttx in block.transfer_transactions:
+            if self._recipient_is_new(
+                ttx.recipient_id,
+                pending_new_account_created=pending_new_account_created_sa,
+            ):
+                pending_new_account_created_sa.add(ttx.recipient_id)
+        if len(pending_new_account_created_sa) > MAX_NEW_ACCOUNTS_PER_BLOCK:
+            return False, (
+                f"Block creates {len(pending_new_account_created_sa)} new accounts, "
+                f"exceeding MAX_NEW_ACCOUNTS_PER_BLOCK cap "
+                f"of {MAX_NEW_ACCOUNTS_PER_BLOCK} per block"
+            )
 
         return True, "Valid"
 
@@ -4368,6 +4398,14 @@ class Blockchain:
            memory growth.  The audit log in `treasury_spend_log` survives
            pruning so post-hoc accountability does not depend on proposal
            retention.
+
+        Note on MAX_NEW_ACCOUNTS_PER_BLOCK: the cap is enforced on
+        transfer txs in validate_block.  Treasury spends that credit
+        brand-new accounts are rate-limited by governance itself (weeks
+        of 2/3-supermajority voting per spend), so they do NOT share a
+        per-block counter with transfers.  Each treasury spend still
+        burns NEW_ACCOUNT_FEE from the treasury when it credits a new
+        account (see execute_treasury_spend).
         """
         if not hasattr(self, "governance") or self.governance is None:
             return

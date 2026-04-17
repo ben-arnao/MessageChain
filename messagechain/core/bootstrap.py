@@ -22,7 +22,7 @@ verbatim.
 from __future__ import annotations
 
 import hashlib
-from messagechain.config import HASH_ALGO, MIN_FEE
+from messagechain.config import HASH_ALGO, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.core.authority_key import create_set_authority_key_transaction
 
 
@@ -190,7 +190,22 @@ def bootstrap_seed_local(
 # Smaller values weaken Sybil resistance; larger values over-concentrate
 # supply.  99M (~9.9%) is the pragmatic sweet spot.
 RECOMMENDED_STAKE_PER_SEED: int = 99_000_000
-RECOMMENDED_FEE_BUFFER: int = MIN_FEE * 10          # 1_000
+
+# Fee buffer sized to cover the seed's initial surcharge-bearing ops.
+#
+# Since NEW_ACCOUNT_FEE = 1000 burns on any Transfer whose recipient
+# does not yet exist on chain, a single sweep from the seed to a brand-
+# new payout address now costs MIN_FEE + NEW_ACCOUNT_FEE = 1100 tokens.
+# The previous 1000-token buffer was insufficient — it would not cover
+# even one such sweep.
+#
+# We budget for ~5 surcharge-bearing ops: set-authority-key (no
+# surcharge, but still fee), a first payout-address funding (surcharge),
+# and a few retries / emergency sweeps to fresh addresses.  The math:
+#   (MIN_FEE + NEW_ACCOUNT_FEE) * 5 = 1100 * 5 = 5500
+# rounds to a clean 5500 which is still dwarfed by stake + treasury,
+# so the fee buffer has no meaningful impact on genesis allocation math.
+RECOMMENDED_FEE_BUFFER: int = (MIN_FEE + NEW_ACCOUNT_FEE) * 5  # 5_500
 RECOMMENDED_GENESIS_PER_SEED: int = (
     RECOMMENDED_STAKE_PER_SEED + RECOMMENDED_FEE_BUFFER
 )

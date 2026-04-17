@@ -12,7 +12,7 @@ weighted moving averages of recent block fee distributions.
 """
 
 from collections import deque
-from messagechain.config import MIN_FEE
+from messagechain.config import MIN_FEE, NEW_ACCOUNT_FEE
 
 
 # Number of recent blocks to track for fee estimation
@@ -41,7 +41,12 @@ class FeeEstimator:
         if fees:
             self._block_fees.append(sorted(fees))
 
-    def estimate_fee(self, target_blocks: int = 1) -> int:
+    def estimate_fee(
+        self,
+        target_blocks: int = 1,
+        *,
+        recipient_is_new: bool = False,
+    ) -> int:
         """Estimate the fee needed to confirm within target_blocks.
 
         Higher urgency (lower target_blocks) returns higher fee estimates.
@@ -50,12 +55,19 @@ class FeeEstimator:
 
         Args:
             target_blocks: Number of blocks within which to target confirmation.
+            recipient_is_new: If True, add NEW_ACCOUNT_FEE to the estimate
+                so the caller pays the surcharge the chain will require on
+                apply.  Default False preserves behavior for message-only
+                flows and existing-recipient transfers.
 
         Returns:
-            Estimated fee (always >= MIN_FEE).
+            Estimated fee (always >= MIN_FEE, plus NEW_ACCOUNT_FEE when
+            `recipient_is_new` is True).
         """
+        surcharge = NEW_ACCOUNT_FEE if recipient_is_new else 0
+
         if not self._block_fees:
-            return MIN_FEE
+            return MIN_FEE + surcharge
 
         # Collect all fees from recent blocks
         all_fees = []
@@ -63,7 +75,7 @@ class FeeEstimator:
             all_fees.extend(block_fees)
 
         if not all_fees:
-            return MIN_FEE
+            return MIN_FEE + surcharge
 
         all_fees.sort()
 
@@ -85,7 +97,7 @@ class FeeEstimator:
         idx = min(int(len(all_fees) * percentile), len(all_fees) - 1)
         estimate = all_fees[idx]
 
-        return max(estimate, MIN_FEE)
+        return max(estimate, MIN_FEE) + surcharge
 
     @property
     def has_data(self) -> bool:

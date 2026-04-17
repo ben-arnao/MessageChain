@@ -10,7 +10,7 @@ messagechain.config.DEVNET = True
 messagechain.config.MERKLE_TREE_HEIGHT = 16
 messagechain.config.REQUIRE_CHECKPOINTS = False
 
-from messagechain.config import HASH_ALGO, MIN_FEE
+from messagechain.config import HASH_ALGO, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.core.transaction import create_transaction
 from messagechain.core.transfer import create_transfer_transaction
 from messagechain.core.staking import create_stake_transaction, create_unstake_transaction
@@ -105,7 +105,8 @@ def main():
     print(f"  Generated key: {user_key.hex()[:16]}... (tree_height=4, instant)")
     print(f"  Address: {encode_address(user.entity_id)}")
 
-    tx = create_transfer_transaction(gen, user.entity_id, amount=5000, nonce=nonce, fee=MIN_FEE)
+    # Brand-new recipient — must pay MIN_FEE + NEW_ACCOUNT_FEE surcharge.
+    tx = create_transfer_transaction(gen, user.entity_id, amount=5000, nonce=nonce, fee=MIN_FEE + NEW_ACCOUNT_FEE)
     r = rpc("submit_transfer", {"transaction": tx.serialize()})
     ok("fund user with 5000 tokens (implicit account creation)", r)
     nonce += 1
@@ -199,7 +200,8 @@ def main():
     w3 = Entity.create(os.urandom(32), tree_height=4)
     print(f"  Wallet3: {encode_address(w3.entity_id)}")
 
-    tx = create_transfer_transaction(gen, w3.entity_id, amount=1000, nonce=nonce, fee=MIN_FEE)
+    # wallet3 is brand-new — surcharge applies.
+    tx = create_transfer_transaction(gen, w3.entity_id, amount=1000, nonce=nonce, fee=MIN_FEE + NEW_ACCOUNT_FEE)
     r = rpc("submit_transfer", {"transaction": tx.serialize()})
     ok("genesis -> wallet3 (1000, implicit account creation)", r)
     nonce += 1

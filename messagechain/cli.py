@@ -995,7 +995,7 @@ def cmd_transfer(args):
     """Transfer tokens to another entity."""
     from messagechain.identity.identity import Entity
     from messagechain.core.transfer import create_transfer_transaction
-    from messagechain.config import MIN_FEE
+    from messagechain.config import MIN_FEE, NEW_ACCOUNT_FEE
     from messagechain.validation import parse_hex
 
     print("=== Transfer Tokens ===\n")
@@ -1026,19 +1026,22 @@ def cmd_transfer(args):
     host, port = _parse_server(args.server)
     from client import rpc_call
 
-    # Check the recipient is actually registered on-chain.  Transferring
-    # to an unregistered (or mistyped) address would be rejected by the
-    # server, but we want a clean error path without having typed the
-    # private key yet.
-    recipient_info = rpc_call(host, port, "get_entity", {
-        "entity_id": recipient_id.hex(),
+    # Receive-to-exist: the recipient need NOT be pre-registered — a
+    # Transfer to a brand-new entity_id is fine; the chain creates the
+    # balance entry on apply.  Call `estimate_fee` with the recipient_id
+    # so the server can tell us (a) whether this is a brand-new recipient
+    # and (b) what total fee (including any NEW_ACCOUNT_FEE surcharge)
+    # will be accepted by the validator.
+    fee_resp = rpc_call(host, port, "estimate_fee", {
+        "kind": "transfer",
+        "recipient_id": recipient_id.hex(),
     })
-    if not recipient_info.get("ok"):
-        print(f"Error: recipient not registered on this chain.")
-        print(f"  Entity ID: {recipient_id.hex()}")
-        print(f"  This is usually a typo. Double-check the address with")
-        print(f"  the recipient before continuing.")
-        sys.exit(1)
+    recipient_is_new = False
+    server_min_fee = MIN_FEE
+    if fee_resp.get("ok"):
+        r = fee_resp["result"]
+        recipient_is_new = bool(r.get("recipient_is_new", False))
+        server_min_fee = int(r.get("min_fee", MIN_FEE))
 
     # Confirmation step — last chance before the key is handled. Shows
     # both ends of the address so a single-character typo is visible, plus
@@ -1051,6 +1054,11 @@ def cmd_transfer(args):
     print(f"  Recipient: {head}...{tail}")
     print(f"             (full:       {recipient_id.hex()})")
     print(f"             (checksummed: {encode_address(recipient_id)})")
+    if recipient_is_new:
+        print(
+            f"  Note:      Recipient is brand-new on chain — "
+            f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)."
+        )
     confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
     if confirm != "yes":
         print("Transfer cancelled.")
@@ -1081,16 +1089,24 @@ def cmd_transfer(args):
         pk_hex = status_resp["result"].get("public_key", "") or ""
         is_first_spend = pk_hex == ""
 
-    # Fee: never below MIN_FEE. Use max(local_min, server_suggestion).
+    # Fee policy:
+    #   * --fee explicit:  honor it if it clears the estimator floor
+    #     (which includes any NEW_ACCOUNT_FEE surcharge); else error.
+    #   * --fee omitted:   use the server-suggested minimum (which
+    #     already bundles the surcharge when needed).
     fee = args.fee
+    required_floor = max(MIN_FEE, server_min_fee)
     if fee is None:
-        est_resp = rpc_call(host, port, "get_fee_estimate", {})
-        server_suggested = (
-            est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
-        )
-        fee = max(MIN_FEE, server_suggested)
-    elif fee < MIN_FEE:
-        print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
+        fee = required_floor
+    elif fee < required_floor:
+        if recipient_is_new:
+            print(
+                f"Error: fee {fee} is below required {required_floor} "
+                f"(MIN_FEE {MIN_FEE} + NEW_ACCOUNT_FEE {NEW_ACCOUNT_FEE} "
+                f"surcharge for brand-new recipient)."
+            )
+        else:
+            print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
         sys.exit(1)
 
     tx = create_transfer_transaction(
@@ -1098,6 +1114,11 @@ def cmd_transfer(args):
         include_pubkey=is_first_spend,
     )
 
+    if recipient_is_new:
+        print(
+            f"Transferring to a brand-new account — "
+            f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)"
+        )
     print(f"Transferring {args.amount} tokens (fee: {fee})...")
 
     response = rpc_call(host, port, "submit_transfer", {
