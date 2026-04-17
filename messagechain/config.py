@@ -87,7 +87,9 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 # misconfigured nodes from silently forking the network.
 DEVNET = False
 
-PINNED_GENESIS_HASH: bytes | None = None  # set after founder launch mints genesis
+PINNED_GENESIS_HASH: bytes | None = bytes.fromhex(
+    "abe88b0f3af89ae9e99d1c3c8e009e07aca3e35a5826740cc0f67688cdaf1e9c"
+)
 
 # Treasury — a governance-controlled fund for community spending.
 # The treasury entity has a well-known deterministic ID (no private key exists).
