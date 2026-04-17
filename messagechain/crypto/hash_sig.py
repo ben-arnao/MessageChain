@@ -52,10 +52,10 @@ def wots_keygen(seed: bytes) -> tuple[list[bytes], bytes, bytes]:
     """
     public_seed = _hash(seed + b"public_seed")
 
-    # Generate private key chains
+    # Generate private key chains (as mutable bytearrays for safe zeroing)
     private_keys = []
     for i in range(WOTS_KEY_CHAINS):
-        sk_i = _prf(seed, i)
+        sk_i = bytearray(_prf(seed, i))
         private_keys.append(sk_i)
 
     # Compute public key: hash chain each private key to the end, then hash all together
@@ -100,7 +100,10 @@ def wots_sign(msg_hash: bytes, private_keys: list[bytes], public_seed: bytes) ->
     signature = []
     for i, d in enumerate(digits):
         sig_i = _chain(private_keys[i], 0, d, public_seed, i)
-        signature.append(sig_i)
+        # When d=0, _chain returns the input object unchanged. Convert
+        # to immutable bytes so the signature is independent of any
+        # later zeroing of the private key material.
+        signature.append(bytes(sig_i))
     return signature
 
 
@@ -131,10 +134,17 @@ def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, publ
 
     digits = _message_to_base_w(msg_hash)
     pk_parts = []
+    dummy = b'\x00' * 32
     for i, d in enumerate(digits):
         remaining = WOTS_CHAIN_LENGTH - d
         pk_i = _chain(signature[i], d, remaining, public_seed, i)
         pk_parts.append(pk_i)
+        # Constant-time normalization: always perform WOTS_CHAIN_LENGTH total
+        # hash iterations per chain element regardless of digit value d.
+        # The real computation does `remaining` steps; the dummy does `d` steps.
+        # Total = remaining + d = WOTS_CHAIN_LENGTH for every chain element.
+        if d > 0:
+            _chain(dummy, 0, d, public_seed, i)
 
     computed_pk = _hash(b"".join(pk_parts))
     return hmac.compare_digest(computed_pk, public_key)
