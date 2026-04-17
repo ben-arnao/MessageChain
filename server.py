@@ -655,7 +655,13 @@ class Server:
         """Accept a signed transaction from a client."""
         try:
             tx = MessageTransaction.deserialize(params["transaction"])
-            valid, reason = self.blockchain.validate_transaction(tx)
+            # Compute pending nonce so users can submit sequential txs
+            # without waiting for each to be mined.
+            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
+            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            valid, reason = self.blockchain.validate_transaction(
+                tx, expected_nonce=pending_nonce,
+            )
             if not valid:
                 return {"ok": False, "error": reason}
             # Record arrival height for the forced-inclusion rule.  Without
@@ -1228,7 +1234,12 @@ class Server:
         """Accept a signed transfer transaction from a client."""
         try:
             tx = TransferTransaction.deserialize(params["transaction"])
-            valid, reason = self.blockchain.validate_transfer_transaction(tx)
+            # Compute pending nonce (same as _rpc_submit_transaction).
+            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
+            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            valid, reason = self.blockchain.validate_transfer_transaction(
+                tx, expected_nonce=pending_nonce,
+            )
             if not valid:
                 return {"ok": False, "error": reason}
             # Record arrival height — see _rpc_submit_transaction for rationale.
@@ -1630,7 +1641,11 @@ class Server:
             tx_hash_hex = tx.tx_hash.hex()
             if tx_hash_hex in self._seen_txs:
                 return
-            valid, reason = self.blockchain.validate_transaction(tx)
+            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
+            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            valid, reason = self.blockchain.validate_transaction(
+                tx, expected_nonce=pending_nonce,
+            )
             if valid:
                 self._track_seen_tx(tx_hash_hex)
                 # Record arrival height — see _rpc_submit_transaction for rationale.

@@ -200,6 +200,22 @@ class Mempool:
         )
         return qualifying[:FORCED_INCLUSION_SET_SIZE]
 
+    def get_pending_nonce(self, entity_id: bytes, on_chain_nonce: int) -> int:
+        """Return the next expected nonce for *entity_id* considering mempool txs.
+
+        Scans pending transactions for the highest nonce from this entity
+        that is >= on_chain_nonce.  If any are found, returns max_nonce + 1.
+        Otherwise returns on_chain_nonce unchanged.
+        """
+        max_nonce = on_chain_nonce - 1  # sentinel: below on_chain
+        for tx in self.pending.values():
+            if tx.entity_id == entity_id and tx.nonce >= on_chain_nonce:
+                if tx.nonce > max_nonce:
+                    max_nonce = tx.nonce
+        if max_nonce >= on_chain_nonce:
+            return max_nonce + 1
+        return on_chain_nonce
+
     def _remove_tx(self, tx: MessageTransaction):
         """Remove a single transaction and update sender count."""
         if tx.tx_hash in self.pending:

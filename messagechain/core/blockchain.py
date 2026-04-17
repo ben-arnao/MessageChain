@@ -1172,8 +1172,16 @@ class Blockchain:
             return self.db.has_block(block_hash)
         return False
 
-    def validate_transaction(self, tx: MessageTransaction) -> tuple[bool, str]:
-        """Validate a transaction against current chain state."""
+    def validate_transaction(
+        self, tx: MessageTransaction, *, expected_nonce: int | None = None,
+    ) -> tuple[bool, str]:
+        """Validate a transaction against current chain state.
+
+        If *expected_nonce* is provided it overrides the on-chain nonce
+        for this entity.  This allows the mempool layer to pass a
+        "pending nonce" so users can submit sequential transactions
+        without waiting for each to be mined.
+        """
         if tx.entity_id not in self.public_keys:
             return False, "Unknown entity — must register first"
 
@@ -1185,9 +1193,9 @@ class Blockchain:
         if not ok:
             return False, f"Invalid sig version: {reason}"
 
-        expected_nonce = self.nonces.get(tx.entity_id, 0)
-        if tx.nonce != expected_nonce:
-            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+        effective_nonce = expected_nonce if expected_nonce is not None else self.nonces.get(tx.entity_id, 0)
+        if tx.nonce != effective_nonce:
+            return False, f"Invalid nonce: expected {effective_nonce}, got {tx.nonce}"
 
         if tx.timestamp <= 0:
             return False, "Transaction must have a valid timestamp"
@@ -1207,8 +1215,14 @@ class Blockchain:
 
         return True, "Valid"
 
-    def validate_transfer_transaction(self, tx: TransferTransaction) -> tuple[bool, str]:
-        """Validate a transfer transaction against current chain state."""
+    def validate_transfer_transaction(
+        self, tx: TransferTransaction, *, expected_nonce: int | None = None,
+    ) -> tuple[bool, str]:
+        """Validate a transfer transaction against current chain state.
+
+        If *expected_nonce* is provided it overrides the on-chain nonce
+        for this entity (see validate_transaction for rationale).
+        """
         if tx.entity_id not in self.public_keys:
             return False, "Unknown sender — must register first"
 
@@ -1219,9 +1233,9 @@ class Blockchain:
         if tx.amount < DUST_LIMIT:
             return False, f"Transfer amount {tx.amount} below dust limit {DUST_LIMIT}"
 
-        expected_nonce = self.nonces.get(tx.entity_id, 0)
-        if tx.nonce != expected_nonce:
-            return False, f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"
+        effective_nonce = expected_nonce if expected_nonce is not None else self.nonces.get(tx.entity_id, 0)
+        if tx.nonce != effective_nonce:
+            return False, f"Invalid nonce: expected {effective_nonce}, got {tx.nonce}"
 
         if self.get_spendable_balance(tx.entity_id) < tx.amount + tx.fee:
             return False, f"Insufficient spendable balance for transfer of {tx.amount} + fee {tx.fee}"
