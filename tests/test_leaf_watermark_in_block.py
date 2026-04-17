@@ -36,7 +36,7 @@ class TestInBlockLeafReuse(unittest.TestCase):
 
     def _register(self, chain, entity):
         proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        chain.register_entity(entity.entity_id, entity.public_key, proof)
+        chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
     def test_same_entity_same_leaf_twice_in_one_block_rejected(self):
         """Two txs signed at the same leaf_index must never both apply."""

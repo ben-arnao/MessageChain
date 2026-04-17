@@ -114,7 +114,7 @@ class TestRegistrationProof(unittest.TestCase):
         )
 
     def test_registration_proof_matches_blockchain_expectation(self):
-        """The proof format must match what blockchain.register_entity expects."""
+        """The proof format must match what blockchain._install_pubkey_direct expects."""
         from messagechain.core.blockchain import Blockchain
         private_key = os.urandom(32)
         entity = Entity.create(private_key)
@@ -131,7 +131,7 @@ class TestRegistrationProof(unittest.TestCase):
         other_proof_msg = _hash(b"register" + other.entity_id)
         other_proof = other.keypair.sign(other_proof_msg)
 
-        success, msg = bc.register_entity(
+        success, msg = bc._install_pubkey_direct(
             other.entity_id, other.public_key, registration_proof=other_proof
         )
         self.assertTrue(success, msg)
@@ -153,7 +153,7 @@ class TestRegistrationProof(unittest.TestCase):
         wrong_proof_msg = _hash(b"register" + other.entity_id)
         wrong_proof = entity.keypair.sign(wrong_proof_msg)
 
-        success, msg = bc.register_entity(
+        success, msg = bc._install_pubkey_direct(
             other.entity_id, other.public_key, registration_proof=wrong_proof
         )
         self.assertFalse(success)

@@ -224,7 +224,6 @@ class ProofOfStake:
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
-        registration_transactions: list | None = None,
         finality_votes: list | None = None,
         timestamp: float | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
@@ -256,7 +255,6 @@ class ProofOfStake:
         auth_txs = list(authority_txs or [])
         stake_txs = list(stake_transactions or [])
         unstake_txs = list(unstake_transactions or [])
-        registration_txs = list(registration_transactions or [])
         fin_votes = list(finality_votes or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
@@ -266,7 +264,6 @@ class ProofOfStake:
             + [tx.tx_hash for tx in auth_txs]
             + [tx.tx_hash for tx in stake_txs]
             + [tx.tx_hash for tx in unstake_txs]
-            + [tx.tx_hash for tx in registration_txs]
             + [v.consensus_hash() for v in fin_votes]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
@@ -299,11 +296,11 @@ class ProofOfStake:
         # guarantee the header signature gets a fresh leaf.
         proposer_id = proposer_entity.entity_id
         for tx_list in (txs, transfer_txs, slash_txs, gov_txs,
-                        auth_txs, stake_txs, unstake_txs, registration_txs):
+                        auth_txs, stake_txs, unstake_txs):
             for tx in tx_list:
                 tx_entity = getattr(tx, "entity_id", None)
                 if tx_entity == proposer_id:
-                    sig = getattr(tx, "signature", None) or getattr(tx, "registration_proof", None)
+                    sig = getattr(tx, "signature", None)
                     if sig is not None and hasattr(sig, "leaf_index"):
                         proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
 
@@ -331,7 +328,6 @@ class ProofOfStake:
             authority_txs=auth_txs,
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
-            registration_transactions=registration_txs,
             finality_votes=fin_votes,
         )
         block.block_hash = block._compute_hash()

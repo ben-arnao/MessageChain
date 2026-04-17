@@ -47,7 +47,7 @@ def _entity(seed: bytes) -> Entity:
 
 def _register(chain, entity):
     proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-    chain.register_entity(entity.entity_id, entity.public_key, proof)
+    chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
 
 def _make_tx(sender: Entity, nonce: int = 0, fee: int = 500):

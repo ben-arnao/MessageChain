@@ -819,45 +819,35 @@ def cmd_start(args):
 
 
 def cmd_account(args):
-    """Create a new account. Enter private key, sign proof, register."""
+    """Derive a local entity ID from a private key.
+
+    Receive-to-exist model: there is no "register" step.  A new account
+    comes into existence as a consequence of RECEIVING a transfer, and
+    its signing pubkey is installed on chain by the first outgoing
+    transfer (via TransferTransaction.sender_pubkey).  All this command
+    does now is derive + display the entity ID and address so you know
+    what to tell the sender who will fund you.
+    """
     from messagechain.identity.identity import Entity
-    from messagechain.crypto.hash_sig import _hash
+    from messagechain.identity.address import encode_address
 
     print("=== Create Account ===\n")
 
     private_key = _collect_private_key()
     entity = Entity.create(private_key)
 
-    # Sign registration proof to demonstrate key ownership.
-    proof_msg = _hash(b"register" + entity.entity_id)
-    proof = entity.keypair.sign(proof_msg)
-
-    print(f"\nYour entity ID: {entity.entity_id_hex}")
-
-    host, port = _parse_server(args.server)
-    print(f"Registering with server at {host}:{port}...")
-
-    from client import rpc_call
-    response = rpc_call(host, port, "register_entity", {
-        "entity_id": entity.entity_id_hex,
-        "public_key": entity.public_key.hex(),
-        "registration_proof": proof.serialize(),
-    })
-
-    if response.get("ok"):
-        result = response["result"]
-        from messagechain.identity.address import encode_address
-        print(f"\nAccount created!")
-        print(f"  Entity ID:  {result['entity_id']}")
-        print(f"  Address:    {encode_address(entity.entity_id)}")
-        print(f"  Balance:    {result['initial_balance']} tokens")
-        print(f"\nShare the 'Address' form when receiving funds — it has a")
-        print("built-in checksum that catches single-character transcription")
-        print("errors. The raw 'Entity ID' is still accepted for compatibility.")
-        print("Your private key is your sole credential. Never share it.")
-    else:
-        print(f"\nFailed: {response.get('error')}")
-        sys.exit(1)
+    print(f"\nAccount derived from your private key.")
+    print(f"  Entity ID:  {entity.entity_id_hex}")
+    print(f"  Address:    {encode_address(entity.entity_id)}")
+    print()
+    print("Share the 'Address' form when receiving funds — it has a")
+    print("built-in checksum that catches single-character transcription")
+    print("errors. The raw 'Entity ID' is still accepted for compatibility.")
+    print()
+    print("Your account will appear on chain when someone first sends")
+    print("you tokens.  Your first outgoing transfer will reveal your")
+    print("public key to the chain automatically.")
+    print("Your private key is your sole credential. Never share it.")
 
 
 def cmd_send(args):
@@ -1025,6 +1015,17 @@ def cmd_transfer(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
+    # Receive-to-exist: determine whether this is a first-spend tx
+    # (server has no pubkey for this entity yet).  If so we include
+    # sender_pubkey so the chain can install it on apply.
+    status_resp = rpc_call(host, port, "get_key_status", {
+        "entity_id": entity.entity_id_hex,
+    })
+    is_first_spend = True
+    if status_resp.get("ok"):
+        pk_hex = status_resp["result"].get("public_key", "") or ""
+        is_first_spend = pk_hex == ""
+
     # Fee: never below MIN_FEE. Use max(local_min, server_suggestion).
     fee = args.fee
     if fee is None:
@@ -1037,7 +1038,10 @@ def cmd_transfer(args):
         print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
         sys.exit(1)
 
-    tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
+    tx = create_transfer_transaction(
+        entity, recipient_id, args.amount, nonce=nonce, fee=fee,
+        include_pubkey=is_first_spend,
+    )
 
     print(f"Transferring {args.amount} tokens (fee: {fee})...")
 
@@ -1249,21 +1253,23 @@ def cmd_bootstrap_seed(args):
         entity.keypair.advance_to_leaf(w)
         return n, w
 
-    # ── Step 1: register ────────────────────────────────────────────
-    print("[1/3] Registering entity...")
+    # ── Step 1: verify the seed is already known on chain ───────────
+    # Receive-to-exist: seeds are installed at genesis (via the
+    # allocation table + bootstrap.bootstrap_seed_local on the
+    # validator node itself), not via an RPC call.  An unknown seed
+    # here means the server was started without this entity in its
+    # genesis allocation, which is a misconfiguration that this CLI
+    # cannot repair remotely.
+    print("[1/3] Verifying seed entity is known on chain...")
     existing = _fetch_state()
-    if existing is not None:
-        print("      already registered; skipping")
-    else:
-        proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        resp = rpc_call(host, port, "register_entity", {
-            "entity_id": entity.entity_id_hex,
-            "public_key": entity.public_key.hex(),
-            "registration_proof": proof.serialize(),
-        })
-        if not resp.get("ok"):
-            _fatal("1/3 register", resp.get("error", "unknown"))
-        print(f"      OK: {resp['result']}")
+    if existing is None:
+        _fatal(
+            "1/3 verify",
+            "Seed entity is not in chain state.  Include it in the "
+            "genesis allocation on the validator host before running "
+            "bootstrap-seed.",
+        )
+    print("      OK: entity is in state")
 
     # ── Step 2: set authority key (cold) ────────────────────────────
     print("\n[2/3] Setting cold authority key...")

@@ -127,7 +127,7 @@ class TestEntityIndexRegistry(unittest.TestCase):
                     "sha3_256", b"register" + e.entity_id,
                 ).digest()
             )
-            ok, _ = bc.register_entity(
+            ok, _ = bc._install_pubkey_direct(
                 e.entity_id, e.public_key, reg_proof,
             )
             self.assertTrue(ok)
@@ -149,12 +149,12 @@ class TestEntityIndexRegistry(unittest.TestCase):
         proof = e.keypair.sign(
             hashlib.new("sha3_256", b"register" + e.entity_id).digest()
         )
-        ok, _ = bc.register_entity(e.entity_id, e.public_key, proof)
+        ok, _ = bc._install_pubkey_direct(e.entity_id, e.public_key, proof)
         self.assertTrue(ok)
         first_idx = bc.entity_id_to_index[e.entity_id]
 
         # Duplicate registration is rejected (existing behavior)
-        ok2, _ = bc.register_entity(e.entity_id, e.public_key, proof)
+        ok2, _ = bc._install_pubkey_direct(e.entity_id, e.public_key, proof)
         self.assertFalse(ok2)
         # Index unchanged
         self.assertEqual(bc.entity_id_to_index[e.entity_id], first_idx)
@@ -185,7 +185,7 @@ class TestEntityIndexRegistry(unittest.TestCase):
                         "sha3_256", b"register" + e.entity_id,
                     ).digest()
                 )
-                ok, _ = bc.register_entity(e.entity_id, e.public_key, proof)
+                ok, _ = bc._install_pubkey_direct(e.entity_id, e.public_key, proof)
                 self.assertTrue(ok)
 
             pre_restart_map = dict(bc.entity_id_to_index)
@@ -227,7 +227,7 @@ class TestTxIndexedEncoding(unittest.TestCase):
             proof = e.keypair.sign(
                 hashlib.new("sha3_256", b"register" + e.entity_id).digest()
             )
-            bc.register_entity(e.entity_id, e.public_key, proof)
+            bc._install_pubkey_direct(e.entity_id, e.public_key, proof)
         return bc, alice, bob
 
     def test_message_tx_roundtrip_with_state(self):
@@ -403,22 +403,6 @@ class TestTxIndexedEncoding(unittest.TestCase):
         self.assertEqual(dec.validator_id, att.validator_id)
         self.assertEqual(dec.block_hash, att.block_hash)
 
-    def test_registration_tx_keeps_full_entity_id(self):
-        """Registration CREATES the entity — cannot reference its own index."""
-        from messagechain.core.registration import (
-            RegistrationTransaction, create_registration_transaction,
-        )
-        from messagechain.identity.identity import Entity
-
-        e = Entity.create(b"new-reg".ljust(32, b"\x00"))
-        tx = create_registration_transaction(e)
-        # Registration ALWAYS uses the full entity_id form — the state
-        # doesn't know about this entity yet.
-        blob = tx.to_bytes()
-        dec = RegistrationTransaction.from_bytes(blob)
-        self.assertEqual(dec.entity_id, e.entity_id)
-        self.assertEqual(dec.tx_hash, tx.tx_hash)
-
 
 class TestBlockRoundtripWithState(unittest.TestCase):
     def test_block_with_state_roundtrip(self):
@@ -437,7 +421,7 @@ class TestBlockRoundtripWithState(unittest.TestCase):
         proof = alice.keypair.sign(
             hashlib.new("sha3_256", b"register" + alice.entity_id).digest()
         )
-        bc.register_entity(alice.entity_id, alice.public_key, proof)
+        bc._install_pubkey_direct(alice.entity_id, alice.public_key, proof)
 
         txs = [create_transaction(alice, f"m{i}", fee=2000, nonce=i)
                for i in range(3)]

@@ -323,7 +323,7 @@ class TestBlockchainInactivityIntegration(unittest.TestCase):
         from messagechain.config import HASH_ALGO
         h = hashlib.new(HASH_ALGO, b"register" + entity.entity_id).digest()
         proof = entity.keypair.sign(h)
-        self.chain.register_entity(entity.entity_id, entity.public_key, proof)
+        self.chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
     def _pick_proposer(self, candidates):
         latest = self.chain.get_latest_block()

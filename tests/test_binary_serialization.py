@@ -38,9 +38,6 @@ from messagechain.core.emergency_revoke import (
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, create_key_rotation, derive_rotated_keypair,
 )
-from messagechain.core.registration import (
-    RegistrationTransaction, create_registration_transaction,
-)
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root, _hash
 from messagechain.consensus.attestation import Attestation, create_attestation
 from messagechain.consensus.slashing import (
@@ -254,10 +251,6 @@ class TestBlockBinary(unittest.TestCase):
         new_kp = derive_rotated_keypair(self.alice, rotation_number=1)
         rotate_tx = create_key_rotation(self.alice, new_kp, rotation_number=1)
 
-        # Registration
-        reg_entity = Entity.create(b"carol-binary".ljust(32, b"\x00"))
-        reg_tx = create_registration_transaction(reg_entity)
-
         # Governance
         prop_tx = create_proposal(self.alice, "Test proposal", "description text")
         vote_tx = create_vote(self.alice, prop_tx.tx_hash, approve=True)
@@ -282,7 +275,6 @@ class TestBlockBinary(unittest.TestCase):
             stake_transactions=[stake_tx],
             unstake_transactions=[unstake_tx],
             authority_txs=[auth_tx, revoke_tx, rotate_tx],
-            registration_transactions=[reg_tx],
             governance_txs=[prop_tx, vote_tx, treasury_tx],
             attestations=[att],
         )
@@ -295,7 +287,6 @@ class TestBlockBinary(unittest.TestCase):
         self.assertEqual(len(decoded.stake_transactions), 1)
         self.assertEqual(len(decoded.unstake_transactions), 1)
         self.assertEqual(len(decoded.authority_txs), 3)
-        self.assertEqual(len(decoded.registration_transactions), 1)
         self.assertEqual(len(decoded.governance_txs), 3)
         self.assertEqual(len(decoded.attestations), 1)
         # Hash preservation
@@ -449,12 +440,6 @@ class TestMiscTxBinary(unittest.TestCase):
         decoded = KeyRotationTransaction.from_bytes(tx.to_bytes())
         self.assertEqual(decoded.tx_hash, tx.tx_hash)
         self.assertEqual(decoded.new_public_key, tx.new_public_key)
-
-    def test_registration_roundtrip(self):
-        tx = create_registration_transaction(self.alice)
-        decoded = RegistrationTransaction.from_bytes(tx.to_bytes())
-        self.assertEqual(decoded.tx_hash, tx.tx_hash)
-        self.assertEqual(decoded.public_key, tx.public_key)
 
     def test_proposal_roundtrip(self):
         tx = create_proposal(self.alice, "title", "description")

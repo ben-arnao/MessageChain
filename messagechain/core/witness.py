@@ -147,7 +147,6 @@ def strip_block_witnesses(block) -> "Block":
         authority_txs=block.authority_txs,
         stake_transactions=block.stake_transactions,
         unstake_transactions=block.unstake_transactions,
-        registration_transactions=block.registration_transactions,
         finality_votes=block.finality_votes,
     )
     # block_hash is header-derived, so it should match the original
@@ -204,7 +203,6 @@ def attach_block_witnesses(stripped_block, witness_data: bytes):
         authority_txs=stripped_block.authority_txs,
         stake_transactions=stripped_block.stake_transactions,
         unstake_transactions=stripped_block.unstake_transactions,
-        registration_transactions=stripped_block.registration_transactions,
         finality_votes=stripped_block.finality_votes,
     )
     restored.block_hash = restored._compute_hash()

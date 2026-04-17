@@ -50,7 +50,7 @@ class TestAuthorityKeyRegistration(unittest.TestCase):
 
     def _register(self, chain, entity):
         proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        ok, _ = chain.register_entity(entity.entity_id, entity.public_key, proof)
+        ok, _ = chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
         return ok
 
     def test_authority_key_defaults_to_signing_key(self):
@@ -80,7 +80,7 @@ class TestSetAuthorityKey(unittest.TestCase):
 
     def _register(self, chain, entity):
         proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        chain.register_entity(entity.entity_id, entity.public_key, proof)
+        chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
     def test_set_authority_key_promotes_cold_key(self):
         chain = Blockchain()
@@ -185,7 +185,7 @@ class TestUnstakeRequiresAuthorityKey(unittest.TestCase):
 
     def _register(self, chain, entity):
         proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        chain.register_entity(entity.entity_id, entity.public_key, proof)
+        chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
     def test_unstake_with_hot_key_rejected_after_cold_key_set(self):
         from messagechain.core.staking import verify_unstake_transaction

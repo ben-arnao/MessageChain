@@ -23,17 +23,23 @@ messagechain.config.DEVNET = True
 messagechain.config.REQUIRE_CHECKPOINTS = False
 # Override the production pinned hash so test entities can initialize_genesis.
 messagechain.config.PINNED_GENESIS_HASH = None
-# Disable registration fee in tests — existing tests register entities
-# without sponsors/fees.  The fee logic is tested explicitly in
-# test_registration_cap.py which overrides this back to 1000.
-messagechain.config.REGISTRATION_FEE = 0
 
 
 def register_entity_for_test(chain, entity):
-    """Register an entity with a valid registration proof (test helper)."""
+    """Install an entity's pubkey directly into chain state (test helper).
+
+    Wraps the internal `_install_pubkey_direct` bootstrap helper — this
+    is NOT how entities come into existence on a live chain under the
+    receive-to-exist model (live entities enter via implicit recipient
+    creation on Transfer, then install their pubkey on first-spend).
+    It's kept for the ~65 existing tests that build up chain state
+    without wanting to simulate a funding transfer for every entity.
+    """
     msg = hashlib.new(HASH_ALGO, b"register" + entity.entity_id).digest()
     proof = entity.keypair.sign(msg)
-    return chain.register_entity(entity.entity_id, entity.public_key, registration_proof=proof)
+    return chain._install_pubkey_direct(
+        entity.entity_id, entity.public_key, registration_proof=proof,
+    )
 
 
 def pick_selected_proposer(chain, entities):

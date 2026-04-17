@@ -47,7 +47,7 @@ class TestGenesisDistribution(unittest.TestCase):
         from messagechain.config import HASH_ALGO
         msg = hashlib.new(HASH_ALGO, b"register" + bob.entity_id).digest()
         proof = bob.keypair.sign(msg)
-        chain.register_entity(bob.entity_id, bob.public_key, registration_proof=proof)
+        chain._install_pubkey_direct(bob.entity_id, bob.public_key, registration_proof=proof)
 
         self.assertEqual(chain.supply.get_balance(bob.entity_id), 0)
 

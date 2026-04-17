@@ -359,7 +359,7 @@ class TestKeyRotationNoDuplicatePK(unittest.TestCase):
         bc, entity_a = _setup_chain()
         entity_b = _make_entity()
         proof = entity_b.keypair.sign(_hash(b"register" + entity_b.entity_id))
-        bc.register_entity(entity_b.entity_id, entity_b.public_key, proof)
+        bc._install_pubkey_direct(entity_b.entity_id, entity_b.public_key, proof)
         # The public_keys dict should contain both keys
         self.assertIn(entity_a.public_key, bc.public_keys.values())
         self.assertIn(entity_b.public_key, bc.public_keys.values())
@@ -428,7 +428,7 @@ class TestSlashingEvidenceExpiration(unittest.TestCase):
         from messagechain.config import UNBONDING_PERIOD
         # We need a submitter
         submitter = _make_entity()
-        bc.register_entity(submitter.entity_id, submitter.public_key,
+        bc._install_pubkey_direct(submitter.entity_id, submitter.public_key,
                            submitter.keypair.sign(_hash(b"register" + submitter.entity_id)))
         bc.supply.balances[submitter.entity_id] = 10_000
         from messagechain.consensus.slashing import create_slash_transaction

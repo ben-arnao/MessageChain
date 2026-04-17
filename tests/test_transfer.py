@@ -137,19 +137,39 @@ class TestTransferOnChain(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("Insufficient", reason)
 
-    def test_validate_transfer_unknown_sender(self):
-        """Transfer from unregistered entity is rejected."""
+    def test_validate_transfer_unknown_sender_without_pubkey_reveal(self):
+        """Receive-to-exist: unknown sender without sender_pubkey is rejected
+        (the chain has no way to verify the signature)."""
         from messagechain.core.transfer import create_transfer_transaction
         unknown = Entity.create(b"unknown_key".ljust(32, b"\x00"))
+        # include_pubkey defaults to False — without it, this unknown entity
+        # cannot validate.
         tx = create_transfer_transaction(
             unknown, self.recipient.entity_id, 50, nonce=0, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
         self.assertFalse(valid)
-        self.assertIn("Unknown", reason)
+        self.assertIn("sender_pubkey", reason.lower())
 
-    def test_validate_transfer_unknown_recipient(self):
-        """Transfer to unregistered entity is rejected."""
+    def test_validate_transfer_unknown_sender_with_first_spend_reveal(self):
+        """Receive-to-exist: unknown sender WITH valid sender_pubkey passes
+        validation (modulo balance — for this test we just verify the
+        error is no longer about the sender being unknown)."""
+        from messagechain.core.transfer import create_transfer_transaction
+        unknown = Entity.create(b"unknown_key_rev".ljust(32, b"\x00"))
+        tx = create_transfer_transaction(
+            unknown, self.recipient.entity_id, 50, nonce=0, fee=1500,
+            include_pubkey=True,
+        )
+        valid, reason = self.chain.validate_transfer_transaction(tx)
+        # Will fail on "Insufficient spendable balance" (unknown entity has 0)
+        # but NOT on "Unknown sender" — that's the behavior change.
+        self.assertFalse(valid)
+        self.assertIn("insufficient", reason.lower())
+
+    def test_validate_transfer_unknown_recipient_is_accepted(self):
+        """Receive-to-exist: unknown recipient is accepted — they get
+        a balance entry on apply."""
         from messagechain.core.transfer import create_transfer_transaction
         unknown = Entity.create(b"unknown_recipient".ljust(32, b"\x00"))
         nonce = self.chain.nonces[self.genesis.entity_id]
@@ -160,8 +180,7 @@ class TestTransferOnChain(unittest.TestCase):
             self.genesis, unknown.entity_id, 50, nonce=nonce, fee=1500,
         )
         valid, reason = self.chain.validate_transfer_transaction(tx)
-        self.assertFalse(valid)
-        self.assertIn("recipient", reason.lower())
+        self.assertTrue(valid, f"Unknown recipient should validate: {reason}")
 
     def test_validate_transfer_wrong_nonce(self):
         """Wrong nonce is rejected."""

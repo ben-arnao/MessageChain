@@ -336,13 +336,13 @@ class Block:
     # on who is unbonding and when.  Same block-pipeline shape as
     # stake_transactions but dispatched to supply.unstake on apply.
     unstake_transactions: list = field(default_factory=list)
-    # Entity registrations: self-authenticating txs that add a new
-    # (entity_id -> public_key) mapping to chain state.  Block-included
-    # so peers learn about new entities through consensus rather than
-    # via the isolated RPC path — prevents "registered on seed A,
-    # unknown to seeds B/C" splits that would cause peer nodes to
-    # reject blocks containing that entity's first transfer.
-    registration_transactions: list = field(default_factory=list)
+    # (The explicit RegistrationTransaction field was removed in the
+    # receive-to-exist refactor.  An entity now enters chain state
+    # implicitly when it first RECEIVES a transfer, and its pubkey is
+    # installed during its FIRST outgoing transfer via the
+    # `TransferTransaction.sender_pubkey` reveal.  Removing the field
+    # is a consensus-format change — blocks produced by pre-refactor
+    # nodes cannot round-trip through the new decoder.)
     # Long-range-attack defense: FinalityVotes signed by validators
     # that commit to a specific block hash at a specific height.  When
     # >= 2/3 of stake has signed votes for a block and those votes
@@ -390,8 +390,6 @@ class Block:
             result["stake_transactions"] = [tx.serialize() for tx in self.stake_transactions]
         if self.unstake_transactions:
             result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
-        if self.registration_transactions:
-            result["registration_transactions"] = [tx.serialize() for tx in self.registration_transactions]
         if self.finality_votes:
             result["finality_votes"] = [v.serialize() for v in self.finality_votes]
         return result
@@ -420,9 +418,13 @@ class Block:
             auth_count       (u32)  + N x (u8 kind + auth_len u32 + auth_blob)
             stake_count      (u32)  + N x (stake_len u32 + stake_blob)
             unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
-            reg_count        (u32)  + N x (reg_len u32 + reg_blob)
             fvote_count      (u32)  + N x (fvote_len u32 + fvote_blob)
             32               block_hash
+
+        (The `reg_count`/registration-tx block slot was removed with
+        the receive-to-exist refactor — new entities enter state
+        implicitly via Transfer txs, so there is no RegistrationTransaction
+        type on the wire anymore.  This is a consensus-format change.)
 
         `state` is threaded down to each child tx's `to_bytes(state)`
         so the varint-index compact form is emitted when an entity
@@ -435,7 +437,6 @@ class Block:
         from messagechain.core.staking import (
             StakeTransaction, UnstakeTransaction,
         )
-        from messagechain.core.registration import RegistrationTransaction
         from messagechain.core.authority_key import SetAuthorityKeyTransaction
         from messagechain.core.emergency_revoke import RevokeTransaction
         from messagechain.core.key_rotation import KeyRotationTransaction
@@ -517,7 +518,6 @@ class Block:
             enc_authority(),
             enc_list(self.stake_transactions),
             enc_list(self.unstake_transactions),
-            enc_list(self.registration_transactions),
             enc_list(self.finality_votes),
             self.block_hash,
         ])
@@ -530,7 +530,6 @@ class Block:
         from messagechain.core.staking import (
             StakeTransaction, UnstakeTransaction,
         )
-        from messagechain.core.registration import RegistrationTransaction
         from messagechain.core.authority_key import SetAuthorityKeyTransaction
         from messagechain.core.emergency_revoke import RevokeTransaction
         from messagechain.core.key_rotation import KeyRotationTransaction
@@ -635,17 +634,15 @@ class Block:
 
         stake_txs = dec_list(StakeTransaction)
         unstake_txs = dec_list(UnstakeTransaction)
-        registration_txs = dec_list(RegistrationTransaction)
 
-        # Finality votes.  Added after registration_transactions so
-        # older stored blocks (which predate this field) would NOT
-        # decode with this layout — a restart against such blobs would
-        # trip the trailing-bytes check below.  That's intentional: a
-        # node that hasn't resynced since the finality upgrade must
-        # replay the chain anyway before it can validate the finality
-        # rule, so forcing a hard decode boundary catches a
-        # partially-upgraded setup rather than silently returning
-        # empty finality_votes.
+        # Finality votes.  The receive-to-exist refactor removed the
+        # registration_transactions list from the binary block layout,
+        # so finality_votes now sits directly after unstake_transactions.
+        # Pre-refactor blobs cannot round-trip through this decoder (the
+        # first u32 here reads what used to be the registration count)
+        # — that's a deliberate consensus-format hard break: a node
+        # carrying pre-refactor blocks must resync from a peer running
+        # the new code.
         from messagechain.consensus.finality import FinalityVote
         finality_votes = dec_list(FinalityVote)
 
@@ -663,7 +660,6 @@ class Block:
             authority_txs=authority_txs,
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
-            registration_transactions=registration_txs,
             finality_votes=finality_votes,
         )
         expected_hash = block._compute_hash()
@@ -709,13 +705,6 @@ class Block:
         if data.get("unstake_transactions"):
             from messagechain.core.staking import UnstakeTransaction
             unstake_txs = [UnstakeTransaction.deserialize(s) for s in data["unstake_transactions"]]
-        registration_txs = []
-        if data.get("registration_transactions"):
-            from messagechain.core.registration import RegistrationTransaction
-            registration_txs = [
-                RegistrationTransaction.deserialize(r)
-                for r in data["registration_transactions"]
-            ]
         finality_votes = []
         if data.get("finality_votes"):
             from messagechain.consensus.finality import FinalityVote
@@ -727,7 +716,6 @@ class Block:
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
                     unstake_transactions=unstake_txs,
-                    registration_transactions=registration_txs,
                     finality_votes=finality_votes)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()

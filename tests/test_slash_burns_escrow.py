@@ -36,7 +36,7 @@ def _register(chain: Blockchain, entity: Entity):
     from messagechain.config import HASH_ALGO
     h = hashlib.new(HASH_ALGO, b"register" + entity.entity_id).digest()
     proof = entity.keypair.sign(h)
-    chain.register_entity(entity.entity_id, entity.public_key, proof)
+    chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
 
 class TestSlashBurnsEscrow(unittest.TestCase):

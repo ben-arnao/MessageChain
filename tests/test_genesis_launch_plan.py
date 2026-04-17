@@ -36,7 +36,6 @@ from messagechain.core.bootstrap import (
     RECOMMENDED_STAKE_PER_SEED,
     RECOMMENDED_GENESIS_PER_SEED,
 )
-from messagechain.core.registration import create_registration_transaction
 from messagechain.core.staking import (
     create_unstake_transaction, verify_unstake_transaction,
 )
@@ -134,29 +133,21 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
         # mismatch, not a structural bug.
         self.assertTrue(verify_unstake_transaction(malicious, self.seed.public_key))
 
-    def test_payout_registers_via_block_and_can_receive_sweep(self):
-        """The shared payout: registered post-genesis, receives transfers."""
+    def test_payout_registers_via_receive_to_exist_and_can_receive_sweep(self):
+        """Receive-to-exist flow: payout enters state on first incoming transfer."""
         chain = self._build_genesis_chain()
         self._bootstrap_seed(chain)
         consensus = ProofOfStake()
         consensus.stakes[self.seed.entity_id] = RECOMMENDED_STAKE_PER_SEED
 
-        # Payout is not yet on chain.
+        # Payout is not yet on chain — no balance, no pubkey.
         self.assertNotIn(self.payout.entity_id, chain.public_keys)
+        self.assertEqual(chain.supply.get_balance(self.payout.entity_id), 0)
 
-        # Register the payout by broadcasting a RegistrationTransaction.
-        reg_tx = create_registration_transaction(self.payout)
-        proposer = pick_selected_proposer(chain, [self.seed])
-        block = chain.propose_block(
-            consensus, proposer, [],
-            registration_transactions=[reg_tx],
-        )
-        ok, reason = chain.add_block(block)
-        self.assertTrue(ok, f"registration block rejected: {reason}")
-        self.assertIn(self.payout.entity_id, chain.public_keys)
-
-        # Sweep: seed transfers some of its liquid to the payout.
-        pre_payout = chain.supply.get_balance(self.payout.entity_id)
+        # Sweep: seed sends tokens directly to the payout's entity_id.
+        # Under receive-to-exist this creates the payout's balance entry
+        # with no pubkey; the pubkey is installed only when the payout
+        # itself first spends (not tested here — we care about receive).
         sweep_amount = 500
         transfer_nonce = chain.nonces.get(self.seed.entity_id, 0)
         sweep_tx = create_transfer_transaction(
@@ -172,9 +163,10 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
         self.assertTrue(ok, f"sweep block rejected: {reason}")
 
         self.assertEqual(
-            chain.supply.get_balance(self.payout.entity_id) - pre_payout,
-            sweep_amount,
+            chain.supply.get_balance(self.payout.entity_id), sweep_amount,
         )
+        # The payout is a balance-only entity — no pubkey yet.
+        self.assertNotIn(self.payout.entity_id, chain.public_keys)
 
     def test_founder_token_concentration_within_security_and_optics_bounds(self):
         """Founder allocation sits above the security floor and below the

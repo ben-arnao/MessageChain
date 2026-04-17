@@ -66,13 +66,20 @@ def bootstrap_seed_local(
     eid_short = eid.hex()[:16]
     pid = proposer_id if proposer_id is not None else eid
 
-    # ── Step 1: Register entity ────────────────────────────────────
+    # ── Step 1: Install the seed's pubkey directly ────────────────
+    # This is a pre-consensus bootstrap op — no block pipeline yet.
+    # _install_pubkey_direct is the same in-memory shortcut that
+    # `register_entity_for_test` uses; it bypasses the receive-to-exist
+    # Transfer flow because the seed has nothing from which to receive
+    # funds yet (it IS the origin of the validator set).
     if eid in blockchain.public_keys:
         log.append(f"[1/3] registration: already present for {eid_short}, skipping")
     else:
         msg = _hash(b"register" + eid)
         proof = seed_entity.keypair.sign(msg)
-        ok, reason = blockchain.register_entity(eid, seed_entity.public_key, proof)
+        ok, reason = blockchain._install_pubkey_direct(
+            eid, seed_entity.public_key, proof,
+        )
         if not ok:
             log.append(f"[1/3] registration FAILED: {reason}")
             return False, log
@@ -198,9 +205,9 @@ def build_launch_allocation(
 
     Credits the seed with `stake_per_seed + fee_buffer` liquid at
     genesis, plus the standard treasury allocation.  Payout entities
-    are NOT pre-allocated — they register post-genesis via the normal
-    RegistrationTransaction pipeline and accumulate balance from
-    subsequent transfers.
+    are NOT pre-allocated — they are created implicitly when they first
+    receive a transfer from the seed (receive-to-exist model), and
+    their pubkey is installed on their first outgoing transfer.
 
     Requires exactly 1 seed entity_id — the founder's single validator.
     If you want a different shape, build the dict yourself.

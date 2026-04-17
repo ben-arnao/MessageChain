@@ -1,12 +1,19 @@
 """
 Transfer transactions for MessageChain.
 
-Enables peer-to-peer token transfers between registered entities.
-Follows the same pattern as StakeTransaction:
-- Nonce-based replay protection
-- Signature verification
-- Fee payment
-- Hash verification on deserialize
+Enables peer-to-peer token transfers between entities.  Follows the same
+pattern as StakeTransaction (nonce-based replay protection, signature
+verification, fee payment, hash-verified deserialization) with ONE
+receive-to-exist extension:
+
+  * On an entity's FIRST outgoing Transfer, the tx may carry
+    `sender_pubkey` so the chain can verify the signature and install
+    the pubkey into state (Bitcoin P2PKH-style first-spend reveal).
+  * On every subsequent Transfer the field MUST be empty — non-empty is
+    rejected as malleability (the pubkey is already on chain).
+  * The field is always covered by `_signable_data` with an explicit
+    length prefix so flipping it empty<->non-empty is tamper-evident in
+    the tx hash.
 """
 
 import hashlib
@@ -33,6 +40,12 @@ class TransferTransaction:
     timestamp: float
     fee: int
     signature: Signature
+    # First-spend pubkey reveal: populated only on the sender's FIRST
+    # outgoing transfer (when entity_id has no mapping in Blockchain.
+    # public_keys yet).  Empty on every subsequent transfer.  Committed
+    # inside _signable_data with a length prefix so stripping or
+    # swapping the field invalidates the tx hash.
+    sender_pubkey: bytes = b""
     tx_hash: bytes = b""
 
     def __post_init__(self):
@@ -45,6 +58,10 @@ class TransferTransaction:
         # for the full rationale — this mirrors the same crypto-agility pattern).
         # getattr fallback keeps test fixtures that pass signature=None working.
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        # Length-prefix sender_pubkey so empty (b"") and non-empty (32 B)
+        # produce different signable data — otherwise a relayer could
+        # strip the pubkey bytes without invalidating the signature.
+        pk = self.sender_pubkey or b""
         return (
             CHAIN_ID
             + b"transfer"
@@ -55,13 +72,14 @@ class TransferTransaction:
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
+            + struct.pack(">H", len(pk)) + pk
         )
 
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 
     def serialize(self) -> dict:
-        return {
+        d = {
             "type": "transfer",
             "entity_id": self.entity_id.hex(),
             "recipient_id": self.recipient_id.hex(),
@@ -72,6 +90,9 @@ class TransferTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+        if self.sender_pubkey:
+            d["sender_pubkey"] = self.sender_pubkey.hex()
+        return d
 
     def to_bytes(self, state=None) -> bytes:
         """Compact binary encoding for storage/wire.
@@ -85,6 +106,8 @@ class TransferTransaction:
             u64  fee
             u32  signature_blob_len
             M    signature_blob
+            u16  sender_pubkey_len
+            P    sender_pubkey     (P may be 0 on steady-state transfers)
             32   tx_hash
 
         With `state` provided, both sender and recipient are encoded
@@ -94,6 +117,7 @@ class TransferTransaction:
         """
         from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
+        pk = self.sender_pubkey or b""
         return b"".join([
             encode_entity_ref(self.entity_id, state=state),
             encode_entity_ref(self.recipient_id, state=state),
@@ -103,6 +127,8 @@ class TransferTransaction:
             struct.pack(">Q", self.fee),
             struct.pack(">I", len(sig_blob)),
             sig_blob,
+            struct.pack(">H", len(pk)),
+            pk,
             self.tx_hash,
         ])
 
@@ -110,7 +136,8 @@ class TransferTransaction:
     def from_bytes(cls, data: bytes, state=None) -> "TransferTransaction":
         from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 32:
+        # Minimum size: ENT(1)+ENT(1)+8+8+8+8+4 sig_len+0 sig+2 pk_len+0 pk+32 hash
+        if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 2 + 32:
             raise ValueError("TransferTransaction blob too short")
         entity_id, n = decode_entity_ref(data, off, state=state); off += n
         recipient_id, n = decode_entity_ref(data, off, state=state); off += n
@@ -119,16 +146,20 @@ class TransferTransaction:
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
         fee = struct.unpack_from(">Q", data, off)[0]; off += 8
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
-        if off + sig_len + 32 > len(data):
-            raise ValueError("TransferTransaction truncated at signature/hash")
+        if off + sig_len + 2 + 32 > len(data):
+            raise ValueError("TransferTransaction truncated at signature")
         sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        pk_len = struct.unpack_from(">H", data, off)[0]; off += 2
+        if off + pk_len + 32 > len(data):
+            raise ValueError("TransferTransaction truncated at sender_pubkey")
+        sender_pubkey = bytes(data[off:off + pk_len]); off += pk_len
         declared_hash = bytes(data[off:off + 32]); off += 32
         if off != len(data):
             raise ValueError("TransferTransaction has trailing bytes")
         tx = cls(
             entity_id=entity_id, recipient_id=recipient_id,
             amount=amount, nonce=nonce, timestamp=timestamp,
-            fee=fee, signature=sig,
+            fee=fee, signature=sig, sender_pubkey=sender_pubkey,
         )
         expected = tx._compute_hash()
         if expected != declared_hash:
@@ -141,6 +172,11 @@ class TransferTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "TransferTransaction":
         sig = Signature.deserialize(data["signature"])
+        sender_pubkey = (
+            bytes.fromhex(data["sender_pubkey"])
+            if data.get("sender_pubkey")
+            else b""
+        )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             recipient_id=bytes.fromhex(data["recipient_id"]),
@@ -149,6 +185,7 @@ class TransferTransaction:
             timestamp=data["timestamp"],
             fee=data["fee"],
             signature=sig,
+            sender_pubkey=sender_pubkey,
         )
         expected_hash = tx._compute_hash()
         declared_hash = bytes.fromhex(data["tx_hash"])
@@ -166,8 +203,15 @@ def create_transfer_transaction(
     amount: int,
     nonce: int,
     fee: int = MIN_FEE,
+    *,
+    include_pubkey: bool = False,
 ) -> TransferTransaction:
-    """Create and sign a transfer transaction."""
+    """Create and sign a transfer transaction.
+
+    Set `include_pubkey=True` on the sender's FIRST outgoing transfer so
+    the chain can install their public key on apply.  Leave it False
+    thereafter — non-empty on a subsequent transfer is rejected.
+    """
     if amount <= 0:
         raise ValueError("Transfer amount must be positive")
     if entity.entity_id == recipient_id:
@@ -181,6 +225,7 @@ def create_transfer_transaction(
         timestamp=time.time(),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
+        sender_pubkey=entity.public_key if include_pubkey else b"",
     )
     msg_hash = _hash(tx._signable_data())
     tx.signature = entity.keypair.sign(msg_hash)

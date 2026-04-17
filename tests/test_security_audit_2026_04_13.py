@@ -34,7 +34,7 @@ def _make_chain_with_entity():
     from messagechain.core.blockchain import Blockchain
     entity = _make_entity()
     chain = Blockchain()
-    chain.register_entity(entity.entity_id, entity.keypair.public_key)
+    chain._install_pubkey_direct(entity.entity_id, entity.keypair.public_key)
     chain.supply.balances[entity.entity_id] = 1_000_000
     return chain, entity
 
@@ -386,10 +386,10 @@ class TestM1NegativeTipClamp(unittest.TestCase):
         """_apply_transfer_with_burn should clamp tip to zero if fee < base_fee."""
         chain, entity = _make_chain_with_entity()
         recipient = _make_entity()
-        chain.register_entity(recipient.entity_id, recipient.keypair.public_key)
+        chain._install_pubkey_direct(recipient.entity_id, recipient.keypair.public_key)
 
         proposer = _make_entity()
-        chain.register_entity(proposer.entity_id, proposer.keypair.public_key)
+        chain._install_pubkey_direct(proposer.entity_id, proposer.keypair.public_key)
         proposer_balance_before = chain.supply.get_balance(proposer.entity_id)
 
         from messagechain.core.transfer import TransferTransaction

@@ -398,7 +398,7 @@ class TestEntityIdLengthValidation(unittest.TestCase):
         alice = Entity.create(b"alice-l4".ljust(32, b"\x00"))
         chain.initialize_genesis(alice)
 
-        ok, reason = chain.register_entity(b"short", b"\x00" * 32)
+        ok, reason = chain._install_pubkey_direct(b"short", b"\x00" * 32)
         self.assertFalse(ok)
         self.assertIn("32 bytes", reason)
 

@@ -80,7 +80,6 @@ def compute_block_sig_cost(block) -> int:
         + len(getattr(block, "authority_txs", []))
         + len(getattr(block, "stake_transactions", []))
         + len(getattr(block, "unstake_transactions", []))
-        + len(getattr(block, "registration_transactions", []))
         + 1  # proposer signature
         + len(block.attestations)
         + len(getattr(block, "finality_votes", []))
@@ -935,22 +934,37 @@ class Blockchain:
         if nxt > current:
             self.leaf_watermarks[entity_id] = nxt
 
-    def register_entity(
+    def _install_pubkey_direct(
         self,
         entity_id: bytes,
         public_key: bytes,
         registration_proof: "Signature | None" = None,
     ) -> tuple[bool, str]:
         """
-        Register a new entity on the chain.
+        INTERNAL / non-consensus-safe.  Install (entity_id -> public_key)
+        directly into chain state without going through a block.
+
+        Used in exactly two situations:
+          * Genesis / bootstrap, when there is no block pipeline yet —
+            see bootstrap.bootstrap_seed_local and the test helper
+            tests.register_entity_for_test.
+          * Test fixtures that set up chain state.
+
+        The production flow for a new entity is receive-to-exist: an
+        entity enters state when it RECEIVES a transfer (just a balance
+        entry) and its pubkey is installed when it spends for the first
+        time via a Transfer carrying `sender_pubkey` — NOT via this
+        method.  Calling this mid-chain would bypass consensus: peers
+        replaying the chain would never install the same pubkey and
+        their state roots would diverge.
 
         Requires a registration_proof: a signature over
         SHA3-256("register" || entity_id) using the keypair corresponding
-        to public_key. This proves the registrant controls the keypair
-        and prevents fabrication of arbitrary identities.
+        to public_key. This proves the caller controls the keypair and
+        prevents fabrication of arbitrary identities.
 
         ENFORCES: one entity per key. If the entity_id already exists,
-        registration is REJECTED.
+        the call is REJECTED.
         """
         # L4: Validate entity_id is correct length (SHA3-256 = 32 bytes)
         if len(entity_id) != 32:
@@ -977,6 +991,10 @@ class Blockchain:
         self.nonces[entity_id] = 0
         self._bump_watermark(entity_id, registration_proof.leaf_index)
         self._assign_entity_index(entity_id)
+        # Cover the mutation in the consensus state root — bootstrap
+        # runs before any block is appended, so the next block's state
+        # root reconstruction must include this leaf.
+        self._touch_state({entity_id})
 
         if self.db is not None:
             self.db.set_public_key(entity_id, public_key)
@@ -1226,40 +1244,106 @@ class Blockchain:
     ) -> tuple[bool, str]:
         """Validate a transfer transaction against current chain state.
 
+        Receive-to-exist semantics:
+          * Recipients never need to be pre-registered — an unknown
+            recipient_id is fine; apply creates a balance entry.
+          * Senders must either (a) already have a pubkey in state, in
+            which case `sender_pubkey` must be empty, or (b) be making
+            their FIRST outgoing transfer with `sender_pubkey` populated
+            so we can derive+verify the entity_id and install the key.
+
         If *expected_nonce* is provided it overrides the on-chain nonce
         for this entity (see validate_transaction for rationale).
         """
-        if tx.entity_id not in self.public_keys:
-            return False, "Unknown sender — must register first"
-
-        if tx.recipient_id not in self.public_keys:
-            return False, "Unknown recipient — must register first"
+        from messagechain.identity.identity import derive_entity_id
 
         # Dust limit: reject transfers below minimum to prevent state bloat
         if tx.amount < DUST_LIMIT:
             return False, f"Transfer amount {tx.amount} below dust limit {DUST_LIMIT}"
 
-        effective_nonce = expected_nonce if expected_nonce is not None else self.nonces.get(tx.entity_id, 0)
+        # Resolve the pubkey we should verify against.  Two paths:
+        #  (a) entity already known on chain -> use stored pubkey, and
+        #      reject any non-empty sender_pubkey as malleability.
+        #  (b) entity unknown -> require sender_pubkey in the tx,
+        #      derive entity_id from it, verify the derivation matches,
+        #      then use it for signature verification.
+        if tx.entity_id in self.public_keys:
+            if tx.sender_pubkey:
+                return False, (
+                    "sender_pubkey must be empty for an already-registered "
+                    "entity — first-spend reveal is one-shot"
+                )
+            verifying_pubkey = self.public_keys[tx.entity_id]
+            is_first_spend = False
+        else:
+            if not tx.sender_pubkey:
+                return False, (
+                    f"Entity {tx.entity_id.hex()[:16]} has no registered "
+                    f"pubkey — first outgoing transfer must include "
+                    f"sender_pubkey"
+                )
+            if derive_entity_id(tx.sender_pubkey) != tx.entity_id:
+                return False, (
+                    "sender_pubkey does not derive the claimed entity_id "
+                    "(hash mismatch)"
+                )
+            verifying_pubkey = tx.sender_pubkey
+            is_first_spend = True
+
+        # Nonce.  For an entity that's never spent before, the expected
+        # nonce is 0 (unless the caller has pinned something higher —
+        # mempool pipelining).  self.nonces.get falls back to 0, which
+        # is exactly what we want for first-spend.
+        effective_nonce = (
+            expected_nonce if expected_nonce is not None
+            else self.nonces.get(tx.entity_id, 0)
+        )
         if tx.nonce != effective_nonce:
             return False, f"Invalid nonce: expected {effective_nonce}, got {tx.nonce}"
 
         if self.get_spendable_balance(tx.entity_id) < tx.amount + tx.fee:
             return False, f"Insufficient spendable balance for transfer of {tx.amount} + fee {tx.fee}"
 
+        # Leaf-reuse guard against the entity's own watermark (even
+        # first-spend cases: if a burnt leaf was seen via some other
+        # path, e.g. an attestation or proposer sig on a funded
+        # validator-in-waiting, we must still refuse to accept its
+        # reuse).
         if tx.signature.leaf_index < self.leaf_watermarks.get(tx.entity_id, 0):
             return False, (
                 f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
                 f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
             )
 
-        public_key = self.public_keys[tx.entity_id]
-        if not verify_transfer_transaction(tx, public_key):
+        if not verify_transfer_transaction(tx, verifying_pubkey):
             return False, "Invalid signature"
 
         return True, "Valid"
 
     def apply_transfer_transaction(self, tx: TransferTransaction, proposer_id: bytes):
-        """Apply a validated transfer: move tokens from sender to recipient, fee to proposer."""
+        """Apply a validated transfer.
+
+        Moves `tx.amount` from sender to recipient and credits `tx.fee`
+        to `proposer_id`.  Implicitly:
+          * creates a balance entry for the recipient if they were
+            previously unknown; and
+          * on first-spend (sender_pubkey populated + no existing
+            pubkey in state) installs the sender's pubkey, initializes
+            nonce to 0, and assigns their entity_index.
+        """
+        # First-spend pubkey install: runs BEFORE the balance/nonce
+        # mutations so the state-tree sync captures the new pubkey in
+        # the same _touch_state sweep the caller is about to do.
+        if tx.sender_pubkey and tx.entity_id not in self.public_keys:
+            self.public_keys[tx.entity_id] = tx.sender_pubkey
+            # Nonce 0 is the genesis nonce for first-spend; the
+            # `self.nonces[tx.entity_id] = tx.nonce + 1` at the bottom
+            # of this function bumps it to 1.
+            self.nonces.setdefault(tx.entity_id, 0)
+            self._assign_entity_index(tx.entity_id)
+            if self.db is not None:
+                self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
+
         self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
         self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
         self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tx.fee
@@ -1613,7 +1697,6 @@ class Blockchain:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         governance_txs: list | None = None,
-        registration_transactions: list | None = None,
         finality_votes: list | None = None,
         proposer_signature_leaf_index: int | None = None,
     ) -> bytes:
@@ -1681,8 +1764,17 @@ class Blockchain:
             sim_nonces[tx.entity_id] = tx.nonce + 1
             _bump_wm(tx.entity_id, tx.signature.leaf_index)
 
-        # Simulate transfer transactions (with burn)
+        # Simulate transfer transactions (with burn).  Mirrors
+        # _apply_transfer_with_burn: on a first-spend tx (sender_pubkey
+        # populated + entity not yet in sim_public_keys), install the
+        # pubkey so the committed state root matches the apply-path
+        # mutation.
         for ttx in (transfer_transactions or []):
+            if (
+                getattr(ttx, "sender_pubkey", b"")
+                and ttx.entity_id not in sim_public_keys
+            ):
+                sim_public_keys[ttx.entity_id] = ttx.sender_pubkey
             effective_base_fee = min(current_base_fee, ttx.fee)
             tip = ttx.fee - effective_base_fee
             sim_balances[ttx.entity_id] = sim_balances.get(ttx.entity_id, 0) - ttx.amount - ttx.fee
@@ -1768,24 +1860,10 @@ class Blockchain:
             if (ak_sim == b"" and pk_sim != b"") or ak_sim == pk_sim:
                 _bump_wm(utx.entity_id, utx.signature.leaf_index)
 
-        # Simulate registrations — install (entity_id -> public_key) and
-        # initialize nonce.  Deduct REGISTRATION_FEE from sponsor and
-        # credit to treasury when fee > 0.  Bump the leaf watermark with
-        # the proof's leaf index so a post-reg tx cannot reuse leaf 0.
-        import messagechain.config as _sim_reg_cfg
-        for rtx in (registration_transactions or []):
-            sim_reg_fee = _sim_reg_cfg.REGISTRATION_FEE
-            sim_sponsor = getattr(rtx, "sponsor_id", b"")
-            if sim_reg_fee > 0 and sim_sponsor:
-                sim_balances[sim_sponsor] = (
-                    sim_balances.get(sim_sponsor, 0) - sim_reg_fee
-                )
-                sim_balances[TREASURY_ENTITY_ID] = (
-                    sim_balances.get(TREASURY_ENTITY_ID, 0) + sim_reg_fee
-                )
-            sim_public_keys[rtx.entity_id] = rtx.public_key
-            sim_nonces[rtx.entity_id] = 0
-            _bump_wm(rtx.entity_id, rtx.registration_proof.leaf_index)
+        # Receive-to-exist: no separate registration simulation needed.
+        # The transfer simulation above already installs pubkeys via the
+        # `sim_public_keys[ttx.entity_id] = ttx.sender_pubkey` branch
+        # for first-spend txs, keeping sim and apply paths in lockstep.
 
         # Simulate block reward: committee-based attester distribution +
         # proposer share + PROPOSER_REWARD_CAP overflow.  Must mirror
@@ -2035,9 +2113,8 @@ class Blockchain:
             }
             _inactive = _giv(_expected, _actual)
             if _inactive:
-                from messagechain.consensus.pos import graduated_min_stake as _gms
-                _ms = _gms(block_height)
-                _ail(sim_staked, sim_blocks_since_fin, _inactive, min_stake=_ms)
+                _ail(sim_staked, sim_blocks_since_fin, _inactive,
+                     min_stake=VALIDATOR_MIN_STAKE)
 
         return compute_state_root(
             sim_balances, sim_nonces, sim_staked,
@@ -2061,7 +2138,6 @@ class Blockchain:
         authority_txs: list | None = None,
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
-        registration_transactions: list | None = None,
         finality_votes: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
@@ -2094,12 +2170,11 @@ class Blockchain:
             authority_txs or [],
             stake_transactions or [],
             unstake_transactions or [],
-            registration_transactions or [],
         ):
             for tx in tx_list:
                 tx_entity = getattr(tx, "entity_id", None)
                 if tx_entity == proposer_id:
-                    sig = getattr(tx, "signature", None) or getattr(tx, "registration_proof", None)
+                    sig = getattr(tx, "signature", None)
                     if sig is not None and hasattr(sig, "leaf_index"):
                         proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
         # The proposer's next signature will consume _next_leaf from their
@@ -2118,7 +2193,6 @@ class Blockchain:
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
             governance_txs=governance_txs,
-            registration_transactions=registration_transactions,
             finality_votes=finality_votes,
             proposer_signature_leaf_index=expected_proposer_leaf,
         )
@@ -2137,7 +2211,6 @@ class Blockchain:
             authority_txs=authority_txs,
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
-            registration_transactions=registration_transactions,
             finality_votes=finality_votes,
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
@@ -2588,18 +2661,6 @@ class Blockchain:
             ok, reason = _check_leaf(signer_key, utx.signature.leaf_index, "unstake tx")
             if not ok:
                 return False, reason
-        for rtx in getattr(block, "registration_transactions", []):
-            # Registration proof is signed by the entity's own hot key at
-            # its lowest-index leaf (typically leaf 0).  Dedupe against
-            # (entity_id, leaf_index) to catch two registrations re-using
-            # the same leaf — validate_block also rejects duplicate
-            # entity_ids outright, but the leaf-reuse dedupe is defense
-            # in depth.
-            ok, reason = _check_leaf(
-                rtx.entity_id, rtx.registration_proof.leaf_index, "registration tx",
-            )
-            if not ok:
-                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -2629,35 +2690,16 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
-            + [tx.tx_hash for tx in getattr(block, "registration_transactions", [])]
             + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
 
-        # Registration txs — self-authenticating (bundle their own pubkey).
-        # Duplicate-registration check uses pending_registrations so two
-        # registrations of the same entity in one block are caught.
-        #
-        # Per-block registration cap: hard limit on how many new entities
-        # can register per block, regardless of economic resources.
-        import messagechain.config as _reg_cfg
-        reg_txs_list = getattr(block, "registration_transactions", [])
-        if len(reg_txs_list) > _reg_cfg.MAX_REGISTRATIONS_PER_BLOCK:
-            return False, (
-                f"Too many registration transactions: {len(reg_txs_list)} "
-                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
-                f"({_reg_cfg.MAX_REGISTRATIONS_PER_BLOCK})"
-            )
-        pending_registrations: set[bytes] = set()
-        pending_sponsor_spent: dict[bytes, int] = {}
-        for rtx in reg_txs_list:
-            valid, reason = self._validate_registration_tx(
-                rtx, pending_registrations, pending_sponsor_spent,
-            )
-            if not valid:
-                return False, f"Invalid registration tx: {reason}"
+        # Receive-to-exist: no RegistrationTransaction type.  New
+        # entities enter chain state implicitly on their first Transfer
+        # (either as a recipient — balance only — or as a first-spend
+        # sender, which installs the pubkey via sender_pubkey reveal).
 
         # Verify proposer signature (mandatory — unsigned blocks are rejected)
         if block.header.proposer_id not in self.public_keys:
@@ -2809,12 +2851,37 @@ class Blockchain:
             pending_nonces[tx.entity_id] = expected_nonce + 1
             pending_balance_spent[tx.entity_id] = spent_so_far + tx.fee
 
-        # Validate transfer transactions (same nonce/balance tracking)
+        # Validate transfer transactions (same nonce/balance tracking).
+        # Receive-to-exist: the recipient need not be pre-registered;
+        # the sender may also be unknown on-chain iff the tx carries a
+        # valid `sender_pubkey` (first-spend reveal).  Pubkeys installed
+        # earlier in the same block are visible to later txs via
+        # pending_pubkey_installs so a single block can contain "fund X
+        # + first-spend from X" without rejecting the second tx.
+        from messagechain.identity.identity import derive_entity_id
+        pending_pubkey_installs: dict[bytes, bytes] = {}
         for ttx in block.transfer_transactions:
-            if ttx.entity_id not in self.public_keys:
-                return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Unknown sender"
-            if ttx.recipient_id not in self.public_keys:
-                return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Unknown recipient"
+            # Known-sender vs first-spend reveal.
+            known_pk = self.public_keys.get(ttx.entity_id) or pending_pubkey_installs.get(ttx.entity_id)
+            if known_pk is not None:
+                if ttx.sender_pubkey:
+                    return False, (
+                        f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                        f"sender_pubkey must be empty for already-registered entity"
+                    )
+                verifying_pubkey = known_pk
+            else:
+                if not ttx.sender_pubkey:
+                    return False, (
+                        f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                        f"Unknown sender — first-spend transfer must include sender_pubkey"
+                    )
+                if derive_entity_id(ttx.sender_pubkey) != ttx.entity_id:
+                    return False, (
+                        f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                        f"sender_pubkey does not derive claimed entity_id"
+                    )
+                verifying_pubkey = ttx.sender_pubkey
 
             expected_nonce = pending_nonces.get(
                 ttx.entity_id, self.nonces.get(ttx.entity_id, 0)
@@ -2832,9 +2899,14 @@ class Blockchain:
                     f"Insufficient balance for transfer of {ttx.amount} + fee {ttx.fee}"
                 )
 
-            public_key = self.public_keys[ttx.entity_id]
-            if not verify_transfer_transaction(ttx, public_key):
+            if not verify_transfer_transaction(ttx, verifying_pubkey):
                 return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Invalid signature"
+
+            if known_pk is None:
+                # Mark this first-spend pubkey as visible to later txs in
+                # the same block (e.g., a stake-from-the-same-sender tx
+                # after this transfer).
+                pending_pubkey_installs[ttx.entity_id] = ttx.sender_pubkey
 
             pending_nonces[ttx.entity_id] = expected_nonce + 1
             pending_balance_spent[ttx.entity_id] = spent_so_far + ttx.amount + ttx.fee
@@ -2898,92 +2970,7 @@ class Blockchain:
             if not ok:
                 return False, f"Invalid unstake tx: {reason}"
 
-        # Validate registration transactions — per-block cap + fee/sponsor.
-        import messagechain.config as _reg_cfg2
-        reg_txs_standalone = getattr(block, "registration_transactions", [])
-        if len(reg_txs_standalone) > _reg_cfg2.MAX_REGISTRATIONS_PER_BLOCK:
-            return False, (
-                f"Too many registration transactions: {len(reg_txs_standalone)} "
-                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
-                f"({_reg_cfg2.MAX_REGISTRATIONS_PER_BLOCK})"
-            )
-        pending_registrations: set[bytes] = set()
-        pending_sponsor_spent_sa: dict[bytes, int] = {}
-        for rtx in reg_txs_standalone:
-            ok, reason = self._validate_registration_tx(
-                rtx, pending_registrations, pending_sponsor_spent_sa,
-            )
-            if not ok:
-                return False, f"Invalid registration tx: {reason}"
-
-        return True, "Valid"
-
-    def _validate_registration_tx(
-        self, rtx,
-        pending_registrations: set[bytes],
-        pending_sponsor_spent: dict[bytes, int] | None = None,
-    ) -> tuple[bool, str]:
-        """Validate a RegistrationTransaction in the context of a block.
-
-        Registration is self-authenticating: the tx bundles its own
-        public_key and a proof signed by the matching private key.  We
-        verify the proof, confirm the entity isn't already registered
-        (either on chain or earlier in this same block), and track
-        pending_registrations to catch two registrations of the same
-        entity_id in one block.
-
-        When REGISTRATION_FEE > 0, a sponsor_id must be set to an existing
-        entity with sufficient balance.  The fee is tracked cumulatively
-        in pending_sponsor_spent so multiple registrations by the same
-        sponsor in one block are balance-checked correctly.
-        """
-        import messagechain.config as _rcfg
-        from messagechain.core.registration import (
-            RegistrationTransaction, verify_registration_transaction,
-        )
-        if not isinstance(rtx, RegistrationTransaction):
-            return False, f"Unexpected type {type(rtx).__name__}"
-        ok, reason = verify_registration_transaction(rtx)
-        if not ok:
-            return False, reason
-        if rtx.entity_id in self.public_keys:
-            return False, (
-                f"Entity {rtx.entity_id.hex()[:16]} already registered — "
-                f"duplicate registration rejected"
-            )
-        if rtx.entity_id in pending_registrations:
-            return False, (
-                f"Entity {rtx.entity_id.hex()[:16]} registered twice in the "
-                f"same block — duplicate rejected"
-            )
-
-        # Registration fee enforcement
-        reg_fee = _rcfg.REGISTRATION_FEE
-        if reg_fee > 0:
-            sponsor_id = getattr(rtx, "sponsor_id", b"")
-            if not sponsor_id:
-                return False, (
-                    "Registration requires a sponsor when REGISTRATION_FEE > 0 "
-                    f"(current fee: {reg_fee})"
-                )
-            if sponsor_id not in self.public_keys:
-                return False, (
-                    f"Sponsor {sponsor_id.hex()[:16]} is not a registered "
-                    f"entity — cannot pay registration fee"
-                )
-            if pending_sponsor_spent is None:
-                pending_sponsor_spent = {}
-            already_spent = pending_sponsor_spent.get(sponsor_id, 0)
-            sponsor_balance = self.get_spendable_balance(sponsor_id)
-            if sponsor_balance < already_spent + reg_fee:
-                return False, (
-                    f"Insufficient sponsor balance: sponsor "
-                    f"{sponsor_id.hex()[:16]} has {sponsor_balance} spendable "
-                    f"(already committed {already_spent}), needs {reg_fee}"
-                )
-            pending_sponsor_spent[sponsor_id] = already_spent + reg_fee
-
-        pending_registrations.add(rtx.entity_id)
+        # Receive-to-exist: no separate registration tx type to validate.
         return True, "Valid"
 
     def _validate_stake_tx_in_block(
@@ -3274,29 +3261,12 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
-            + [tx.tx_hash for tx in getattr(block, "registration_transactions", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
 
-        # Registration txs — self-authenticating, duplicate guard + cap + fee
-        import messagechain.config as _reg_cfg3
-        reg_txs_sa2 = getattr(block, "registration_transactions", [])
-        if len(reg_txs_sa2) > _reg_cfg3.MAX_REGISTRATIONS_PER_BLOCK:
-            return False, (
-                f"Too many registration transactions: {len(reg_txs_sa2)} "
-                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
-                f"({_reg_cfg3.MAX_REGISTRATIONS_PER_BLOCK})"
-            )
-        pending_registrations: set[bytes] = set()
-        pending_sponsor_spent_3: dict[bytes, int] = {}
-        for rtx in reg_txs_sa2:
-            valid, reason = self._validate_registration_tx(
-                rtx, pending_registrations, pending_sponsor_spent_3,
-            )
-            if not valid:
-                return False, f"Invalid registration tx: {reason}"
+        # Receive-to-exist: no RegistrationTransaction type to validate.
 
         # Governance txs — signature + sender checks (same as validate_block)
         for gtx in block.governance_txs:
@@ -3466,7 +3436,22 @@ class Blockchain:
         # an unknown type before reaching here, so this branch is defensive.
 
     def _apply_transfer_with_burn(self, tx, proposer_id: bytes, base_fee: int):
-        """Apply a transfer transaction with EIP-1559 fee burning."""
+        """Apply a transfer transaction with EIP-1559 fee burning.
+
+        Receive-to-exist: if `tx.sender_pubkey` is populated and the
+        sender is not yet in `self.public_keys`, install the pubkey
+        before touching balances.  That's how first-time senders cross
+        from "balance-only" to "fully registered."
+        """
+        # First-spend pubkey install (see apply_transfer_transaction
+        # docstring — same semantics, inline here for the burn path).
+        if tx.sender_pubkey and tx.entity_id not in self.public_keys:
+            self.public_keys[tx.entity_id] = tx.sender_pubkey
+            self.nonces.setdefault(tx.entity_id, 0)
+            self._assign_entity_index(tx.entity_id)
+            if self.db is not None:
+                self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
+
         # M1: Clamp base_fee to the actual fee to prevent negative tip
         effective_base_fee = min(base_fee, tx.fee)
         tip = tx.fee - effective_base_fee
@@ -3512,11 +3497,6 @@ class Blockchain:
             affected.add(stx.entity_id)
         for utx in getattr(block, "unstake_transactions", []):
             affected.add(utx.entity_id)
-        for rtx in getattr(block, "registration_transactions", []):
-            affected.add(rtx.entity_id)
-            sponsor = getattr(rtx, "sponsor_id", b"")
-            if sponsor:
-                affected.add(sponsor)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -3635,30 +3615,11 @@ class Blockchain:
             if authority_pk == signing_pk:
                 self._bump_watermark(utx.entity_id, utx.signature.leaf_index)
 
-        # Apply registration transactions.  Deduct REGISTRATION_FEE from
-        # sponsor (if any) and credit to treasury.  Install (entity_id ->
-        # public_key) and initialize nonce to 0.  The proof's leaf index
-        # bumps the watermark.
-        import messagechain.config as _apply_reg_cfg
-        for rtx in getattr(block, "registration_transactions", []):
-            reg_fee = _apply_reg_cfg.REGISTRATION_FEE
-            sponsor_id = getattr(rtx, "sponsor_id", b"")
-            if reg_fee > 0 and sponsor_id:
-                self.supply.balances[sponsor_id] = (
-                    self.supply.balances.get(sponsor_id, 0) - reg_fee
-                )
-                self.supply.balances[_apply_reg_cfg.TREASURY_ENTITY_ID] = (
-                    self.supply.balances.get(_apply_reg_cfg.TREASURY_ENTITY_ID, 0) + reg_fee
-                )
-            self.public_keys[rtx.entity_id] = rtx.public_key
-            self.nonces[rtx.entity_id] = 0
-            self._bump_watermark(
-                rtx.entity_id, rtx.registration_proof.leaf_index,
-            )
-            # Assign the next monotonic entity_index. Deterministic: every
-            # replaying node sees the same block in the same order, so
-            # every node assigns identical indices.
-            self._assign_entity_index(rtx.entity_id)
+        # Receive-to-exist: first-spend pubkey install happens inside
+        # `_apply_transfer_with_burn` above.  No separate registration
+        # section is needed — an entity becomes "registered" the first
+        # time it spends, and becomes visible in state the first time
+        # it receives.
 
         # Candidate attesters for the reward committee: everyone whose
         # attestation was included in this block.  Stake is 0 during
@@ -3875,13 +3836,11 @@ class Blockchain:
             actual = {att.validator_id for att in block.attestations}
             inactive = get_inactive_validators(expected, actual)
             if inactive:
-                from messagechain.consensus.pos import graduated_min_stake
-                min_stake = graduated_min_stake(block.header.block_number)
                 total_burned, deactivated = apply_inactivity_leak(
                     self.supply.staked,
                     self.blocks_since_last_finalization,
                     inactive,
-                    min_stake=min_stake,
+                    min_stake=VALIDATOR_MIN_STAKE,
                 )
                 if total_burned > 0:
                     self.supply.total_supply -= total_burned
@@ -4102,7 +4061,6 @@ class Blockchain:
                     stake_transactions=getattr(block, "stake_transactions", []),
                     unstake_transactions=getattr(block, "unstake_transactions", []),
                     governance_txs=getattr(block, "governance_txs", []),
-                    registration_transactions=getattr(block, "registration_transactions", []),
                     finality_votes=getattr(block, "finality_votes", []),
                     proposer_signature_leaf_index=proposer_sig_leaf,
                 )

@@ -36,7 +36,7 @@ class _Base(unittest.TestCase):
 
     def _register(self, chain, entity):
         proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-        chain.register_entity(entity.entity_id, entity.public_key, proof)
+        chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
 
     def _bootstrap(self, extras=()):
         """Chain + staked proposer + genesis. Returns (chain, proposer,

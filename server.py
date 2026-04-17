@@ -453,10 +453,7 @@ class Server:
         """Process a single RPC request from a client."""
         method = request.get("method", "")
 
-        if method == "register_entity":
-            return self._rpc_register_entity(request["params"])
-
-        elif method == "submit_transaction":
+        if method == "submit_transaction":
             return self._rpc_submit_transaction(request["params"])
 
         elif method == "get_entity":
@@ -580,76 +577,6 @@ class Server:
 
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
-
-    def _rpc_register_entity(self, params: dict) -> dict:
-        """Accept a new-entity registration.
-
-        The client sends entity_id + public_key + registration_proof.
-        The server wraps them in a RegistrationTransaction and queues
-        it for the next block — state is only mutated when the block
-        containing this tx is produced and validated, so every peer
-        converges on the same public_keys map.  Prior design applied
-        the registration directly to local state, which made the first
-        transfer from a newly-registered entity fail across multi-node
-        deployments (peer nodes rejected the block because they had
-        never seen the registration).
-        """
-        try:
-            import time as _time
-            from messagechain.crypto.keys import Signature
-            from messagechain.core.registration import (
-                RegistrationTransaction, verify_registration_transaction,
-            )
-            entity_id = parse_hex(params.get("entity_id", ""))
-            public_key = parse_hex(params.get("public_key", ""))
-            if entity_id is None or public_key is None:
-                return {"ok": False, "error": "Invalid hex in entity_id or public_key"}
-
-            proof_data = params.get("registration_proof")
-            if proof_data is None:
-                return {"ok": False, "error": "Registration proof required"}
-            proof = Signature.deserialize(proof_data)
-
-            if entity_id in self.blockchain.public_keys:
-                return {"ok": False, "error": "Entity already registered"}
-
-            tx = RegistrationTransaction(
-                entity_id=entity_id,
-                public_key=public_key,
-                registration_proof=proof,
-                timestamp=_time.time(),
-            )
-            tx.tx_hash = tx._compute_hash()
-
-            ok, reason = verify_registration_transaction(tx)
-            if not ok:
-                return {"ok": False, "error": reason}
-
-            if not hasattr(self, "_pending_registration_txs"):
-                self._pending_registration_txs = {}
-            # Reject a duplicate pending registration for the same entity
-            # so repeated CLI calls don't queue multiple txs (the block-
-            # level dedupe would catch it but it's clearer to fail early).
-            for pending in self._pending_registration_txs.values():
-                if pending.entity_id == entity_id:
-                    return {
-                        "ok": False,
-                        "error": "Registration already pending for this entity",
-                    }
-            self._pending_registration_txs[tx.tx_hash] = tx
-
-            return {
-                "ok": True,
-                "result": {
-                    "entity_id": params["entity_id"],
-                    "public_key": params["public_key"],
-                    "tx_hash": tx.tx_hash.hex(),
-                    "status": "pending — will be included in the next block",
-                    "initial_balance": 0,
-                },
-            }
-        except Exception as e:
-            return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_transaction(self, params: dict) -> dict:
         """Accept a signed transaction from a client."""
@@ -1412,8 +1339,6 @@ class Server:
         unstake_txs = list(pending_unstake.values())[:MAX_TXS_PER_BLOCK]
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
-        pending_registration = getattr(self, "_pending_registration_txs", {})
-        registration_txs = list(pending_registration.values())[:MAX_TXS_PER_BLOCK]
 
         block = self.blockchain.propose_block(
             self.consensus, self.wallet_entity, txs,
@@ -1423,7 +1348,6 @@ class Server:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             governance_txs=governance_txs,
-            registration_transactions=registration_txs,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -1446,9 +1370,6 @@ class Server:
             if governance_txs:
                 for gh in [g.tx_hash for g in governance_txs]:
                     pending_gov.pop(gh, None)
-            if registration_txs:
-                for rh in [r.tx_hash for r in registration_txs]:
-                    pending_registration.pop(rh, None)
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(

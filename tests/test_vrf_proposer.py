@@ -291,64 +291,12 @@ class TestRandaoCommitment(unittest.TestCase):
         from messagechain.identity.identity import Entity
         return Entity.create(name.encode().ljust(32, b"\x00"))
 
-    def test_registration_has_randao_commitment_field(self):
-        """RegistrationTransaction accepts a randao_commitment field."""
-        from messagechain.core.registration import create_registration_transaction
-        entity = self._make_entity("test-reg-field")
-        tx = create_registration_transaction(entity)
-        # Default commitment should be zero bytes
-        self.assertEqual(len(tx.randao_commitment), 32)
-
-    def test_registration_randao_commitment_in_signable_data(self):
-        """randao_commitment is included in _signable_data for tamper evidence."""
-        from messagechain.core.registration import create_registration_transaction
-        entity = self._make_entity("test-reg-signable")
-        tx1 = create_registration_transaction(entity)
-        # Change randao_commitment on a copy to verify signable_data changes
-        from messagechain.core.registration import RegistrationTransaction
-        tx2 = RegistrationTransaction(
-            entity_id=tx1.entity_id,
-            public_key=tx1.public_key,
-            registration_proof=tx1.registration_proof,
-            timestamp=tx1.timestamp,
-            randao_commitment=b"\xaa" * 32,
-        )
-        tx3 = RegistrationTransaction(
-            entity_id=tx1.entity_id,
-            public_key=tx1.public_key,
-            registration_proof=tx1.registration_proof,
-            timestamp=tx1.timestamp,
-            randao_commitment=b"\xbb" * 32,
-        )
-        # Different commitments must produce different signable data
-        self.assertNotEqual(tx2._signable_data(), tx3._signable_data())
-
-    def test_registration_default_randao_commitment(self):
-        """Default randao_commitment is 32 zero bytes (backward compat)."""
-        from messagechain.core.registration import create_registration_transaction
-        entity = self._make_entity("test-reg-default")
-        tx = create_registration_transaction(entity)
-        self.assertEqual(tx.randao_commitment, b"\x00" * 32)
-
-    def test_registration_serialize_deserialize_with_commitment(self):
-        """randao_commitment survives serialize/deserialize round-trip."""
-        from messagechain.core.registration import create_registration_transaction
-        entity = self._make_entity("test-reg-serde")
-        tx = create_registration_transaction(entity)
-        data = tx.serialize()
-        self.assertIn("randao_commitment", data)
-        self.assertEqual(data["randao_commitment"], tx.randao_commitment.hex())
-
-    def test_registration_to_bytes_from_bytes_with_commitment(self):
-        """randao_commitment survives binary round-trip."""
-        from messagechain.core.registration import (
-            RegistrationTransaction, create_registration_transaction,
-        )
-        entity = self._make_entity("test-reg-binary")
-        tx = create_registration_transaction(entity)
-        blob = tx.to_bytes()
-        restored = RegistrationTransaction.from_bytes(blob)
-        self.assertEqual(restored.randao_commitment, tx.randao_commitment)
+    # RegistrationTransaction was removed in the receive-to-exist
+    # refactor.  The randao_commitment-on-registration tests that used
+    # to live here no longer have a target type — the corresponding
+    # state change now happens implicitly on first Transfer, which
+    # commits to its own signature (and hence the leaf that goes into
+    # randao) via the standard tx-hash path.
 
 
 class TestBlockchainVRFIntegration(unittest.TestCase):
@@ -367,7 +315,7 @@ class TestBlockchainVRFIntegration(unittest.TestCase):
         entity = Entity.create(b"vrf-integration-test".ljust(32, b"\x00"))
         bc = Blockchain()
         bc.initialize_genesis(entity)
-        bc.register_entity(entity.entity_id, entity.public_key)
+        bc._install_pubkey_direct(entity.entity_id, entity.public_key)
         bc.supply.staked[entity.entity_id] = 1000
 
         # Build a few blocks (less than key exhaustion limit)

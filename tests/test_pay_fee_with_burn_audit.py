@@ -39,7 +39,7 @@ def _setup_chain_and_proposer():
     consensus = ProofOfStake()
     proposer = _entity(b"proposer")
     proof = proposer.keypair.sign(_hash(b"register" + proposer.entity_id))
-    chain.register_entity(proposer.entity_id, proposer.public_key, proof)
+    chain._install_pubkey_direct(proposer.entity_id, proposer.public_key, proof)
     chain.supply.balances[proposer.entity_id] = 200_000_000
     chain.supply.staked[proposer.entity_id] = 100_000_000
     chain.initialize_genesis(proposer)
@@ -50,7 +50,7 @@ def _setup_chain_and_proposer():
 def _register_entity(chain, entity, balance=10_000_000):
     """Register and fund an entity on the chain."""
     proof = entity.keypair.sign(_hash(b"register" + entity.entity_id))
-    chain.register_entity(entity.entity_id, entity.public_key, proof)
+    chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
     chain.supply.balances[entity.entity_id] = balance
 
 

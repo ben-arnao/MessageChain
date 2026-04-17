@@ -40,7 +40,7 @@ class TestLeafWatermark(unittest.TestCase):
     def _register(self, chain: Blockchain, entity: Entity) -> bool:
         proof_msg = _hash(b"register" + entity.entity_id)
         proof = entity.keypair.sign(proof_msg)
-        ok, _ = chain.register_entity(entity.entity_id, entity.public_key, proof)
+        ok, _ = chain._install_pubkey_direct(entity.entity_id, entity.public_key, proof)
         return ok
 
     # ── Watermark advances on every signature the chain observes ──
@@ -132,7 +132,7 @@ class TestLeafWatermark(unittest.TestCase):
         entity.keypair._next_leaf = 0
         proof_msg = _hash(b"register" + entity.entity_id)
         stale_proof = entity.keypair.sign(proof_msg)
-        ok, reason = chain.register_entity(entity.entity_id, entity.public_key, stale_proof)
+        ok, reason = chain._install_pubkey_direct(entity.entity_id, entity.public_key, stale_proof)
         self.assertFalse(ok)
 
     # ── Persistence: watermarks survive restart ──
