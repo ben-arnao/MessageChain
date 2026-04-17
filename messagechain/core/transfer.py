@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass
 from messagechain.config import (
     HASH_ALGO, MIN_FEE, MAX_TIMESTAMP_DRIFT, CHAIN_ID, SIG_VERSION_CURRENT,
+    TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -98,6 +99,7 @@ class TransferTransaction:
         """Compact binary encoding for storage/wire.
 
         Layout (big-endian):
+            u8   serialization_version  (wire-format gate)
             ENT  sender entity reference
             ENT  recipient entity reference
             u64  amount
@@ -110,6 +112,11 @@ class TransferTransaction:
             P    sender_pubkey     (P may be 0 on steady-state transfers)
             32   tx_hash
 
+        Leading u8 is a wire-format carry-only register — see
+        config.TX_SERIALIZATION_VERSION.  A future format bump widens
+        the gate; unknown values are rejected at parse time with a
+        clear error instead of surfacing as a hash mismatch.
+
         With `state` provided, both sender and recipient are encoded
         as varint indices — a transfer tx saves ~58 B vs the legacy
         two-32-byte-id form.  _signable_data still commits to the
@@ -119,6 +126,7 @@ class TransferTransaction:
         sig_blob = self.signature.to_bytes()
         pk = self.sender_pubkey or b""
         return b"".join([
+            struct.pack(">B", TX_SERIALIZATION_VERSION),
             encode_entity_ref(self.entity_id, state=state),
             encode_entity_ref(self.recipient_id, state=state),
             struct.pack(">Q", self.amount),
@@ -136,9 +144,13 @@ class TransferTransaction:
     def from_bytes(cls, data: bytes, state=None) -> "TransferTransaction":
         from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        # Minimum size: ENT(1)+ENT(1)+8+8+8+8+4 sig_len+0 sig+2 pk_len+0 pk+32 hash
-        if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 2 + 32:
+        # Minimum size: u8 ser_ver + ENT(1)+ENT(1)+8+8+8+8+4 sig_len+0 sig+2 pk_len+0 pk+32 hash
+        if len(data) < 1 + 1 + 1 + 8 + 8 + 8 + 8 + 4 + 2 + 32:
             raise ValueError("TransferTransaction blob too short")
+        ser_version = struct.unpack_from(">B", data, off)[0]; off += 1
+        ok, reason = validate_tx_serialization_version(ser_version)
+        if not ok:
+            raise ValueError(f"TransferTransaction: {reason}")
         entity_id, n = decode_entity_ref(data, off, state=state); off += n
         recipient_id, n = decode_entity_ref(data, off, state=state); off += n
         amount = struct.unpack_from(">Q", data, off)[0]; off += 8

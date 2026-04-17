@@ -11,7 +11,10 @@ import struct
 import time
 import json
 from dataclasses import dataclass, field
-from messagechain.config import HASH_ALGO, HASH_VERSION_CURRENT
+from messagechain.config import (
+    HASH_ALGO, HASH_VERSION_CURRENT,
+    BLOCK_SERIALIZATION_VERSION, validate_block_serialization_version,
+)
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import Signature
 
@@ -507,6 +510,14 @@ class Block:
 
         header_blob = self.header.to_bytes()
         return b"".join([
+            # Leading u8 wire-format version — see
+            # config.BLOCK_SERIALIZATION_VERSION.  Lets a future
+            # governance proposal bump the binary layout without
+            # silently invalidating existing chain data.  Decoder
+            # rejects unknown values at parse time with a clear
+            # error rather than letting a layout change surface as
+            # a cryptic hash mismatch further down the pipeline.
+            struct.pack(">B", BLOCK_SERIALIZATION_VERSION),
             struct.pack(">I", len(header_blob)),
             header_blob,
             enc_list(self.transactions),
@@ -577,6 +588,15 @@ class Block:
                 except TypeError:
                     out.append(klass.from_bytes(blob))
             return out
+
+        # Wire-format gate: a leading u8 marks the binary layout version.
+        # Unknown values are rejected at the parse boundary with a clear
+        # error so a future layout change doesn't surface as a cryptic
+        # hash mismatch further down.  See config.BLOCK_SERIALIZATION_VERSION.
+        ser_version = take_u8()
+        ok, reason = validate_block_serialization_version(ser_version)
+        if not ok:
+            raise ValueError(f"Block: {reason}")
 
         header_len = take_u32()
         header = BlockHeader.from_bytes(take(header_len))

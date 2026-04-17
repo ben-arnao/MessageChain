@@ -39,7 +39,9 @@ from messagechain.config import (
     MAX_TIMESTAMP_DRIFT,
     MIN_FEE,
     SIG_VERSION_CURRENT,
+    TX_SERIALIZATION_VERSION,
     VALIDATOR_MIN_STAKE,
+    validate_tx_serialization_version,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 
@@ -51,15 +53,25 @@ def _hash(data: bytes) -> bytes:
 def _decode_unstake_like(cls, data: bytes, label: str, state=None):
     """Shared binary decoder for UnstakeTransaction (and historically Stake).
 
-    Envelope: entity_ref | amount | nonce | timestamp | fee | sig | tx_hash.
+    Envelope: u8 ser_version | entity_ref | amount | nonce | timestamp |
+              fee | sig | tx_hash.
+
+    The leading u8 is a wire-format carry-only register (see
+    config.TX_SERIALIZATION_VERSION); unknown values are rejected at
+    parse time with a clear error rather than surfacing later as a
+    cryptic hash mismatch.
 
     `state` enables resolving varint-indexed entity references.
     Without state, only legacy 32-byte-id blobs decode.
     """
     from messagechain.core.entity_ref import decode_entity_ref
     off = 0
-    if len(data) < 1 + 8 + 8 + 8 + 8 + 4 + 32:
+    if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 32:
         raise ValueError(f"{label} blob too short")
+    ser_version = struct.unpack_from(">B", data, off)[0]; off += 1
+    ok, reason = validate_tx_serialization_version(ser_version)
+    if not ok:
+        raise ValueError(f"{label}: {reason}")
     entity_id, n = decode_entity_ref(data, off, state=state); off += n
     amount = struct.unpack_from(">Q", data, off)[0]; off += 8
     nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
@@ -90,11 +102,14 @@ def _encode_unstake_like(tx, state=None) -> bytes:
 
     Factored so envelope changes (e.g., swapping 32-byte entity_id
     for a varint entity_index) have a single implementation site.
+    Emits a leading u8 TX_SERIALIZATION_VERSION so the wire-format
+    gate can reject unknown versions at parse time.
     """
     import struct as _s
     from messagechain.core.entity_ref import encode_entity_ref
     sig_blob = tx.signature.to_bytes()
     return b"".join([
+        _s.pack(">B", TX_SERIALIZATION_VERSION),
         encode_entity_ref(tx.entity_id, state=state),
         _s.pack(">Q", tx.amount),
         _s.pack(">Q", tx.nonce),
@@ -169,9 +184,13 @@ class StakeTransaction:
         return d
 
     def to_bytes(self, state=None) -> bytes:
-        """Compact binary: ENT entity_ref | u64 amount | u64 nonce |
-        f64 timestamp | u64 fee | u32 sig_len | sig | u16 pk_len | pk |
-        32 tx_hash.
+        """Compact binary: u8 ser_version | ENT entity_ref | u64 amount |
+        u64 nonce | f64 timestamp | u64 fee | u32 sig_len | sig |
+        u16 pk_len | pk | 32 tx_hash.
+
+        Leading u8 is TX_SERIALIZATION_VERSION — a carry-only register
+        that lets a future governance proposal bump the wire format
+        without silently invalidating existing chain data.
 
         With `state`, the entity reference is a 1-byte tag + varint
         index (~3 B total), saving ~29 B vs the legacy 32-byte id.
@@ -182,6 +201,7 @@ class StakeTransaction:
         sig_blob = self.signature.to_bytes()
         pk = self.sender_pubkey or b""
         return b"".join([
+            struct.pack(">B", TX_SERIALIZATION_VERSION),
             encode_entity_ref(self.entity_id, state=state),
             struct.pack(">Q", self.amount),
             struct.pack(">Q", self.nonce),
@@ -198,9 +218,13 @@ class StakeTransaction:
     def from_bytes(cls, data: bytes, state=None) -> "StakeTransaction":
         from messagechain.core.entity_ref import decode_entity_ref
         off = 0
-        # Minimum size: ENT(1)+8+8+8+8+4 sig_len+0 sig+2 pk_len+0 pk+32 hash
-        if len(data) < 1 + 8 + 8 + 8 + 8 + 4 + 2 + 32:
+        # Minimum size: u8 ser_ver + ENT(1)+8+8+8+8+4 sig_len+0 sig+2 pk_len+0 pk+32 hash
+        if len(data) < 1 + 1 + 8 + 8 + 8 + 8 + 4 + 2 + 32:
             raise ValueError("StakeTransaction blob too short")
+        ser_version = struct.unpack_from(">B", data, off)[0]; off += 1
+        ok, reason = validate_tx_serialization_version(ser_version)
+        if not ok:
+            raise ValueError(f"StakeTransaction: {reason}")
         entity_id, n = decode_entity_ref(data, off, state=state); off += n
         amount = struct.unpack_from(">Q", data, off)[0]; off += 8
         nonce = struct.unpack_from(">Q", data, off)[0]; off += 8
