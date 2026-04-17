@@ -24,7 +24,9 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 # still create a genesis and then record its hash here.  Production networks
 # MUST pin this — otherwise two nodes on empty data dirs each mint their own
 # incompatible block 0, creating permanently bifurcated chains.
-PINNED_GENESIS_HASH: bytes | None = None
+PINNED_GENESIS_HASH: bytes | None = bytes.fromhex(
+    "4f6dc15f9a5b9bec77c64c9f3bb7580db8ed5e25922619f2acf4cb07fde37257"
+)
 
 # Treasury — a governance-controlled fund for community spending.
 # The treasury entity has a well-known deterministic ID (no private key exists).

@@ -16,6 +16,10 @@ messagechain.config.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1
 # must be disabled. The proposer-match check stays on — tests that stake
 # validators must use the deterministically-selected proposer.
 messagechain.config.ENFORCE_SLOT_TIMING = False
+# Tests mint their own genesis blocks with test-only entities. The
+# production pinned hash would reject every test genesis — override to
+# None so tests can initialize_genesis freely.
+messagechain.config.PINNED_GENESIS_HASH = None
 
 
 def register_entity_for_test(chain, entity):

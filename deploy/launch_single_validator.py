@@ -60,14 +60,22 @@ def main() -> int:
         "--stake", type=int, default=50_000,
         help="Tokens to lock as validator stake (default: 50,000).",
     )
+    parser.add_argument(
+        "--tree-height", type=int, default=16,
+        help="WOTS+ Merkle tree height (default: 16 = 65K signing keys, "
+             "~450 days before rotation needed). Higher = more keys but "
+             "exponentially slower keygen. Use 20 for production longevity.",
+    )
     args = parser.parse_args()
 
     with open(args.keyfile) as f:
         hex_key = f.read().strip()
     private_key = bytes.fromhex(hex_key)
 
-    print(f"Deriving entity from {len(private_key)}-byte key (this generates WOTS+ Merkle tree — slow)...")
-    entity = Entity.create(private_key)
+    leaves = 1 << args.tree_height
+    print(f"Generating WOTS+ tree: height={args.tree_height} ({leaves:,} signing keys)...")
+    sys.stdout.flush()
+    entity = Entity.create(private_key, tree_height=args.tree_height)
     print(f"Entity ID: {entity.entity_id.hex()}")
     print(f"Address:   {encode_address(entity.entity_id)}")
 
