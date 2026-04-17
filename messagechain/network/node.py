@@ -44,7 +44,12 @@ from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
 from messagechain.network.peer_selection import PeerSelector
-from messagechain.network.tls import CertificatePinStore, verify_peer_certificate
+from messagechain.network.tls import (
+    CertificatePinStore,
+    create_client_ssl_context,
+    create_node_ssl_context,
+    verify_peer_certificate,
+)
 
 # Plausibility cap on peer-reported cumulative weight. A peer can legitimately
 # be ahead of us, but not by more than this multiplier — otherwise they're
@@ -133,6 +138,46 @@ class Node:
         # __init__ already loads if the file exists; keep an explicit call
         # for defensive clarity and so tests can round-trip save/load.
         self.pin_store.load()
+
+        # TLS server certificate — the P2P listener needs a cert/key pair
+        # so `asyncio.start_server(..., ssl=...)` can actually encrypt the
+        # transport.  The cert is persistent under data_dir so the
+        # fingerprint that peers TOFU-pin on first sight keeps matching on
+        # restart.  Generated lazily: the _first_ Node startup on this
+        # data_dir creates the pair; every subsequent start reuses it.
+        #
+        # The design uses TLS for ENCRYPTION ONLY — peer identity is
+        # handled at the application layer via signed handshakes.  So a
+        # self-signed cert is the right choice (no CA involved), and the
+        # matching client context has verify_mode=CERT_NONE.  TOFU pinning
+        # (above) is the identity check on top of TLS-level encryption.
+        if data_dir is not None:
+            self._server_cert_path = os.path.join(data_dir, "p2p_cert.pem")
+            self._server_key_path = os.path.join(data_dir, "p2p_key.pem")
+        else:
+            # No data_dir: stash certs under a per-entity temp path so a
+            # restarted in-memory node still reuses the same cert (avoids
+            # needlessly invalidating TOFU pins that remote peers may
+            # already hold for us).
+            import tempfile as _tempfile
+            _tmp_base = os.path.join(
+                _tempfile.gettempdir(),
+                f"messagechain-{self.entity.entity_id_hex[:16]}",
+            )
+            os.makedirs(_tmp_base, exist_ok=True)
+            self._server_cert_path = os.path.join(_tmp_base, "p2p_cert.pem")
+            self._server_key_path = os.path.join(_tmp_base, "p2p_key.pem")
+        # Only materialize the cert when TLS is actually enabled.  Keeps
+        # TLS-disabled devnets from paying the (small but real) RSA-keygen
+        # cost on every Node construction.
+        from messagechain import config as _cfg
+        if getattr(_cfg, "P2P_TLS_ENABLED", True):
+            if not (os.path.exists(self._server_cert_path)
+                    and os.path.exists(self._server_key_path)):
+                from messagechain.network.tls import _generate_self_signed_cert
+                _generate_self_signed_cert(
+                    self._server_cert_path, self._server_key_path,
+                )
 
         # IBD / sync — receives trusted checkpoints + a misbehavior callback
         # so checkpoint violations and stalls are actually penalized.
@@ -348,9 +393,20 @@ class Node:
         else:
             logger.info(f"Loaded chain from storage: height={self.blockchain.height}")
 
-        # Start TCP server
+        # Start TCP server.  When P2P_TLS_ENABLED is on we wrap the listener
+        # with a server SSL context so the actual wire is encrypted — this
+        # is what finally gives `writer.get_extra_info("ssl_object")` a real
+        # TLS session for the TOFU pin-store verification to inspect
+        # (previously dormant).
+        from messagechain import config as _cfg
+        server_ssl = None
+        if getattr(_cfg, "P2P_TLS_ENABLED", True):
+            server_ssl = create_node_ssl_context(
+                cert_path=self._server_cert_path,
+                key_path=self._server_key_path,
+            )
         self._server = await asyncio.start_server(
-            self._handle_connection, "0.0.0.0", self.port
+            self._handle_connection, "0.0.0.0", self.port, ssl=server_ssl,
         )
         self._running = True
         logger.info(f"Listening on port {self.port}")
@@ -549,11 +605,20 @@ class Node:
             return
 
         from messagechain.config import HANDSHAKE_TIMEOUT
+        from messagechain import config as _cfg
+        client_ssl = (
+            create_client_ssl_context()
+            if getattr(_cfg, "P2P_TLS_ENABLED", True)
+            else None
+        )
         try:
             # Bound the initial TCP connect so an unreachable host doesn't
-            # hang the event loop forever.
+            # hang the event loop forever.  When TLS is enabled, `ssl=` is
+            # a real SSLContext; asyncio negotiates the handshake as part
+            # of open_connection so the returned writer already carries
+            # the TLS session that `_verify_and_pin_peer_tls` then inspects.
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
+                asyncio.open_connection(host, port, ssl=client_ssl),
                 timeout=HANDSHAKE_TIMEOUT,
             )
             # TOFU pin check runs right after the transport is up. When
