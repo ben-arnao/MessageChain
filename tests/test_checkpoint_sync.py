@@ -112,7 +112,7 @@ class TestSnapshotDeterminism(unittest.TestCase):
         eid_a = b"a" * 32
         eid_b = b"b" * 32
         snap1 = {
-            "version": 1,
+            "version": 2,
             "balances": {eid_a: 100, eid_b: 200},
             "nonces": {eid_a: 5, eid_b: 6},
             "staked": {},
@@ -133,7 +133,7 @@ class TestSnapshotDeterminism(unittest.TestCase):
         }
         # Same content, different insertion order on all dicts and sets.
         snap2 = {
-            "version": 1,
+            "version": 2,
             "balances": {eid_b: 200, eid_a: 100},
             "nonces": {eid_b: 6, eid_a: 5},
             "staked": {},
@@ -723,7 +723,9 @@ class TestCheckpointIntervalConst(unittest.TestCase):
         self.assertEqual(STATE_CHECKPOINT_THRESHOLD_NUMERATOR, 2)
         self.assertEqual(STATE_CHECKPOINT_THRESHOLD_DENOMINATOR, 3)
         self.assertEqual(MAX_STATE_SNAPSHOT_BYTES, 500_000_000)
-        self.assertEqual(STATE_ROOT_VERSION, 1)
+        # v2: bumped when seed_divestment_debt was added to the
+        # snapshot Merkle root (partial-divestment-to-floor schedule).
+        self.assertEqual(STATE_ROOT_VERSION, 2)
 
 
 class TestMeasureSnapshotSize(unittest.TestCase):

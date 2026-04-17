@@ -194,11 +194,34 @@ class Blockchain:
 
         # Seed-validator divestment snapshot: entity_id -> initial staked
         # amount captured at the first divestment block (H = START + 1).
-        # The per-block decrement is `snapshot / window` and stays fixed
-        # for the entire divestment window — deterministic from replay,
-        # since every node re-applies block START+1 and records the same
-        # value.  Snapshotted in _snapshot_memory_state for reorg safety.
+        # The per-block decrement is `(initial - RETAIN_FLOOR) / window`
+        # and stays fixed for the entire divestment window —
+        # deterministic from replay, since every node re-applies block
+        # START+1 and records the same value.  Snapshotted in
+        # _snapshot_memory_state for reorg safety.
         self.seed_initial_stakes: dict[bytes, int] = {}
+
+        # Per-seed fractional debt for divestment accounting
+        # (entity_id -> scaled fractional units).  SCALE = 10**9 of a
+        # whole token.  Each divestment block adds
+        # `(divestible * SCALE) // window` to the seed's debt; when debt
+        # crosses SCALE, that many whole tokens are drained and the
+        # integer-token portion is subtracted from the debt.
+        #
+        # Why fractional: the OLD formula `per_block = initial // window`
+        # silently floored to 0 whenever `divestible < window`, producing
+        # a no-op divestment for small stakes (e.g. 50K stake with a
+        # 210K-block window).  The fractional representation is
+        # integer-only (consensus-safe) and correctly drains tiny
+        # amounts over the full window.
+        #
+        # Migration: pre-existing chains reload this dict as empty —
+        # debt accumulates forward from the next divestment block.  A
+        # chain reloading mid-window has a one-block timing discrepancy
+        # where up to ~1 token of fractional debt is dropped; acceptable
+        # for the prototype phase since the absolute error is bounded
+        # by 1 token per seed per reload.
+        self.seed_divestment_debt: dict[bytes, int] = {}
 
         # Attester-reward escrow (stage 3).  Bootstrap-era committee
         # rewards sit here for escrow_blocks_for_progress(progress)
@@ -816,6 +839,15 @@ class Blockchain:
         # snapshot root.  See state_snapshot._TAG_SEED_INIT_STAKES.
         self.seed_initial_stakes = dict(
             snap.get("seed_initial_stakes", {})
+        )
+        # Seed divestment fractional debt — per-seed fractional
+        # remainder for the new divestion-to-floor schedule.  Must be
+        # installed alongside seed_initial_stakes so a state-synced
+        # node's next divestment block computes the identical per-block
+        # integer drain as a replaying node.  See
+        # state_snapshot._TAG_SEED_DIVEST_DEBT.
+        self.seed_divestment_debt = dict(
+            snap.get("seed_divestment_debt", {})
         )
 
         # Rebuild the per-entity sparse Merkle tree from the installed
@@ -2109,11 +2141,14 @@ class Blockchain:
         # Simulate seed divestment — must byte-mirror _apply_seed_divestment.
         # Runs before attester-committee candidate selection so the seed's
         # reduced stake is reflected in committee weights for this block.
-        # The snapshot dict is read-only here (sim does not persist its
-        # first-block capture); the apply path owns the mutation.
+        # The snapshot dict and debt dict are read-only here (sim does not
+        # persist its first-block capture or debt update); the apply path
+        # owns the mutation.  The debt READ uses self.seed_divestment_debt
+        # which holds the value as of the END of block_height-1.
         from messagechain.config import (
             SEED_DIVESTMENT_START_HEIGHT as _SDS,
             SEED_DIVESTMENT_END_HEIGHT as _SDE,
+            SEED_DIVESTMENT_RETAIN_FLOOR as _SDRF,
             SEED_DIVESTMENT_TREASURY_BPS as _SDT,
         )
         if (
@@ -2122,6 +2157,7 @@ class Blockchain:
             and self.seed_entity_ids
         ):
             _window = _SDE - _SDS
+            _SCALE = self._DIVESTMENT_SCALE
             for _seid in self.seed_entity_ids:
                 # Apply path snapshots at the first divestment block from
                 # live stake; on replay the same capture reproduces.  We
@@ -2130,13 +2166,19 @@ class Blockchain:
                 _init = self.seed_initial_stakes.get(
                     _seid, sim_staked.get(_seid, 0),
                 )
-                if _init <= 0:
+                if _init <= _SDRF:
                     continue
-                _per_block = _init // _window
-                if _per_block <= 0:
-                    continue
+                _divestible = _init - _SDRF
                 _current = sim_staked.get(_seid, 0)
-                _divest = min(_per_block, _current)
+                if _current <= _SDRF:
+                    continue
+                _per_block_scaled = (_divestible * _SCALE) // _window
+                _debt = self.seed_divestment_debt.get(_seid, 0) + _per_block_scaled
+                _whole = _debt // _SCALE
+                if _whole <= 0:
+                    continue
+                _max_drainable = _current - _SDRF
+                _divest = min(_whole, _max_drainable)
                 if _divest <= 0:
                     continue
                 _treasury_share = _divest * _SDT // 10_000
@@ -3977,29 +4019,55 @@ class Blockchain:
         affected.update(self.seed_entity_ids)
         return affected
 
+    # Fractional-accounting scale for divestment debt.  1 whole token =
+    # _DIVESTMENT_SCALE fractional units.  10**9 gives ~1 part per
+    # billion precision — more than enough to drain any divestible
+    # amount cleanly over a 210K-block window without float arithmetic.
+    _DIVESTMENT_SCALE: int = 10 ** 9
+
     def _apply_seed_divestment(self, block_height: int) -> None:
-        """Forcibly divest a linear fraction of each seed's genesis stake.
+        """Forcibly divest the founder's stake DOWN TO the retain floor.
 
         Non-discretionary, always-on schedule.  Between SEED_DIVESTMENT_START
-        (exclusive) and SEED_DIVESTMENT_END (inclusive), each block unbonds
-        initial_seed_stake / window tokens per seed — 75% burned, 25% to
+        (exclusive) and SEED_DIVESTMENT_END (inclusive), each block drains
+        a linear portion of the DIVESTIBLE amount — 75% burned, 25% to
         treasury.  Outside that window this is a no-op.
+
+        Divestible = max(0, initial_seed_stake - SEED_DIVESTMENT_RETAIN_FLOOR).
+        Only the excess above the floor is subject to divestment; the
+        founder keeps at least RETAIN_FLOOR tokens of stake permanently
+        through protocol enforcement.  They can voluntarily unstake via
+        a normal UnstakeTransaction post-END.
+
+        **Fractional accounting**: the OLD formula
+        `per_block = initial // window` silently floored to 0 for any
+        seed whose divestible amount was smaller than the window length
+        (210,384 blocks), producing a silent no-op for small stakes.
+        The fix: maintain a per-seed integer debt dict at SCALE = 10**9
+        fractional units; each block add `(divestible * SCALE) // window`
+        to debt; when debt >= SCALE, drain `debt // SCALE` whole tokens
+        and keep the remainder.  Integer-only arithmetic (consensus-safe)
+        that correctly drains tiny amounts over the full window.
 
         Snapshot is taken once at the first divestment block from the
         live staked balance so replay is deterministic (every node that
         re-applies that block captures the same value).  Stored in
-        `self.seed_initial_stakes` and restored across reorg via
-        _snapshot_memory_state / _restore_memory_snapshot.
+        `self.seed_initial_stakes` (the reference) and
+        `self.seed_divestment_debt` (the running fractional remainder);
+        both round-trip through _snapshot_memory_state for reorg safety
+        and through the state-snapshot root for state-sync parity.
 
         Called from `_apply_block_state` after all tx-driven stake moves
         so the divestment operates on the post-tx staked balance.  Any
-        integer-rounding remainder accrues to burn (cleaner: smaller
-        supply).  Stake is clamped at 0 — once a seed's stake is gone
-        no further tokens move regardless of the schedule.
+        integer-rounding remainder in the per-block burn/treasury split
+        accrues to burn (cleaner: smaller supply).  Stake is clamped at
+        the floor — once a seed's stake hits RETAIN_FLOOR no further
+        tokens move regardless of the schedule.
         """
         from messagechain.config import (
             SEED_DIVESTMENT_START_HEIGHT,
             SEED_DIVESTMENT_END_HEIGHT,
+            SEED_DIVESTMENT_RETAIN_FLOOR,
             SEED_DIVESTMENT_TREASURY_BPS,
             TREASURY_ENTITY_ID,
         )
@@ -4012,6 +4080,8 @@ class Blockchain:
         window = SEED_DIVESTMENT_END_HEIGHT - SEED_DIVESTMENT_START_HEIGHT
         assert window > 0, "divestment window must be positive"
 
+        SCALE = self._DIVESTMENT_SCALE
+
         for eid in self.seed_entity_ids:
             # First-block snapshot: capture the seed's then-current stake
             # once, so subsequent blocks decrement by a flat per-block
@@ -4019,15 +4089,32 @@ class Blockchain:
             if eid not in self.seed_initial_stakes:
                 self.seed_initial_stakes[eid] = self.supply.get_staked(eid)
             initial = self.seed_initial_stakes[eid]
-            if initial <= 0:
+            if initial <= SEED_DIVESTMENT_RETAIN_FLOOR:
+                # Nothing divestible — a tiny-stake seed keeps its full
+                # balance.  Explicit early-exit so no fractional debt
+                # accrues for this seed.
                 continue
 
-            per_block = initial // window  # integer floor — consensus-safe
-            if per_block <= 0:
-                continue
-
+            divestible = initial - SEED_DIVESTMENT_RETAIN_FLOOR
             current_stake = self.supply.get_staked(eid)
-            divest = min(per_block, current_stake)
+            if current_stake <= SEED_DIVESTMENT_RETAIN_FLOOR:
+                # Current stake already at/below floor — freeze.  This
+                # handles external shocks (slashing, unstaking) that
+                # pushed stake below the floor mid-window.
+                continue
+
+            # Fractional debt: drift forward by divestible/window.
+            per_block_scaled = (divestible * SCALE) // window
+            debt = self.seed_divestment_debt.get(eid, 0) + per_block_scaled
+            whole = debt // SCALE
+            self.seed_divestment_debt[eid] = debt - whole * SCALE
+            if whole <= 0:
+                continue
+
+            # Clamp: never drain below the floor, even if cumulative
+            # fractional drift would overshoot by a token.
+            max_drainable = current_stake - SEED_DIVESTMENT_RETAIN_FLOOR
+            divest = min(whole, max_drainable)
             if divest <= 0:
                 continue
 
@@ -5065,6 +5152,12 @@ class Blockchain:
             # messagechain/storage/state_snapshot.py) so state-synced
             # nodes inherit the same reference values.
             "seed_initial_stakes": dict(self.seed_initial_stakes),
+            # Seed divestment fractional debt: reorg-safe rewind of the
+            # per-seed fractional remainder.  Same consensus criticality
+            # as seed_initial_stakes — a silent rewind of debt that does
+            # not rewind stake would cause double-counted drains on
+            # replay.
+            "seed_divestment_debt": dict(self.seed_divestment_debt),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -5117,6 +5210,9 @@ class Blockchain:
         )
         self.seed_initial_stakes = dict(
             snapshot.get("seed_initial_stakes", {})
+        )
+        self.seed_divestment_debt = dict(
+            snapshot.get("seed_divestment_debt", {})
         )
         if "authority_keys" in snapshot:
             self.authority_keys = dict(snapshot["authority_keys"])

@@ -104,9 +104,13 @@ class TestSeedInitialStakesRoundTrip(unittest.TestCase):
 
     def test_deserialize_state_default_empty_dict(self):
         """A snapshot missing the field defaults to an empty dict."""
-        snap = deserialize_state({"version": 1})
+        from messagechain.storage.state_snapshot import STATE_SNAPSHOT_VERSION
+        snap = deserialize_state({"version": STATE_SNAPSHOT_VERSION})
         self.assertIn("seed_initial_stakes", snap)
         self.assertEqual(snap["seed_initial_stakes"], {})
+        # seed_divestment_debt also defaults empty for pre-v2 callers.
+        self.assertIn("seed_divestment_debt", snap)
+        self.assertEqual(snap["seed_divestment_debt"], {})
 
     def test_encode_decode_round_trip_empty(self):
         """Pre-divestment: dict is empty and still round-trips."""
@@ -292,13 +296,15 @@ class TestReplayVsStateSyncLockstep(unittest.TestCase):
         self._assert_states_equal(chain_a, chain_b, seed.entity_id)
 
     def test_snapshot_after_divestment_complete(self):
-        """Snapshot taken AFTER END: dict is fully populated, stake near zero."""
+        """Snapshot taken AFTER END: dict is fully populated, stake at floor."""
+        from messagechain.config import SEED_DIVESTMENT_RETAIN_FLOOR
         chain_a, seed, _ = _bootstrapped_chain()
         _advance_divestment(chain_a, START + 1, END)
-        # Sanity: stake is within [0, WINDOW) — matches the end-of-window
-        # floor remainder behavior documented in _apply_seed_divestment.
+        # Sanity: stake ≈ FLOOR (within 1 token of fractional-accounting
+        # residual — see _apply_seed_divestment docstring).
         residual = chain_a.supply.get_staked(seed.entity_id)
-        self.assertLess(residual, WINDOW)
+        self.assertGreaterEqual(residual, SEED_DIVESTMENT_RETAIN_FLOOR)
+        self.assertLess(residual, SEED_DIVESTMENT_RETAIN_FLOOR + 2)
         self.assertEqual(
             chain_a.seed_initial_stakes[seed.entity_id],
             RECOMMENDED_STAKE_PER_SEED,

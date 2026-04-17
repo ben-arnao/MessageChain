@@ -183,29 +183,33 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
         """Founder allocation sits above the security floor and below the
         optics ceiling.
 
-        Security floor (>=5% of supply): the founder must hold enough
-        stake to retain a 2/3 supermajority of consensus weight during
-        bootstrap, even after zero-funds validators accumulate tokens via
-        escrow-era committee rewards.  Below 5%, a modestly funded Sybil
-        swarm can outweigh the seed.
+        Security floor (>=1% of supply): the founder must hold enough
+        stake to dominate cumulative non-seed bootstrap earnings by at
+        least a factor of 10.  With BOOTSTRAP_END_HEIGHT ≈ 105K blocks
+        × 16 tokens/block, the non-seed envelope is ~1.68M tokens
+        (0.168% of supply); 1% keeps the seed at ~6x dominance even in
+        the worst case.  The 20M default provides >10x dominance.
 
-        Optics ceiling (<=15% of supply): hoarding more than this signals
+        Optics ceiling (<=10% of supply): hoarding more than this signals
         an extractive genesis distribution and deters outside validators
         from participating.  The treasury (4%) is excluded from this
         calculation -- it's governance-controlled and flows via proposals.
+
+        Post-divestment the founder drains down to SEED_DIVESTMENT_RETAIN_FLOOR
+        (0.1% of supply), so any over-concentration here is transient.
         """
         from messagechain.config import GENESIS_SUPPLY
         founder_total = RECOMMENDED_GENESIS_PER_SEED
         pct = founder_total / GENESIS_SUPPLY
         self.assertGreaterEqual(
-            pct, 0.05,
-            f"founder concentration is {pct:.4%} -- below the 5% security "
-            f"floor; zero-funds validators could outweigh the seed "
-            f"during bootstrap",
+            pct, 0.01,
+            f"founder concentration is {pct:.4%} -- below the 1% security "
+            f"floor; seed stake would not dominate bootstrap-era Sybil "
+            f"accumulation by a comfortable margin",
         )
         self.assertLessEqual(
-            pct, 0.15,
-            f"founder concentration is {pct:.4%} -- above the 15% optics "
+            pct, 0.10,
+            f"founder concentration is {pct:.4%} -- above the 10% optics "
             f"ceiling; hoarding at this level looks extractive",
         )
 
