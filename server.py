@@ -102,6 +102,17 @@ def _hash(data: bytes) -> bytes:
 # always yields the same tree), so the cached result is safe to reuse.
 # ---------------------------------------------------------------------------
 
+# Header prepended to every keypair cache file.  The magic lets us detect
+# files from a pre-versioning build (raw pickle with no header), and the
+# version byte lets us evolve the on-disk layout safely in the future.
+# If you change how the Entity/KeyPair pickles, bump KEYPAIR_CACHE_VERSION
+# so old caches are invalidated instead of silently unpickling into a
+# wrong-shaped object.  Keep version in [0, 255] — the header is 5 bytes.
+KEYPAIR_CACHE_MAGIC = b"MCKP"  # MessageChain KeyPair
+KEYPAIR_CACHE_VERSION = 1
+_KEYPAIR_CACHE_HEADER_LEN = len(KEYPAIR_CACHE_MAGIC) + 1  # magic + 1-byte version
+
+
 def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
     """Return the filesystem path for a cached keypair.
 
@@ -156,17 +167,42 @@ def _load_or_create_entity(
     if use_cache:
         cache_file = _keypair_cache_path(private_key, tree_height, data_dir)
 
-        # Try loading from cache
+        # Try loading from cache.  Every valid cache file starts with
+        # KEYPAIR_CACHE_MAGIC + one-byte KEYPAIR_CACHE_VERSION.  If either
+        # doesn't match we treat the file as incompatible and regenerate
+        # — this protects against silently unpickling an Entity whose
+        # class layout has drifted since the cache was written.
         if os.path.exists(cache_file):
             try:
                 with open(cache_file, "rb") as f:
+                    header = f.read(_KEYPAIR_CACHE_HEADER_LEN)
+                    if len(header) < _KEYPAIR_CACHE_HEADER_LEN:
+                        raise ValueError("cache file shorter than header")
+                    magic = header[: len(KEYPAIR_CACHE_MAGIC)]
+                    version = header[len(KEYPAIR_CACHE_MAGIC)]
+                    if magic != KEYPAIR_CACHE_MAGIC:
+                        logger.warning(
+                            "Keypair cache %s has wrong magic %r — cache from "
+                            "older incompatible version, regenerating",
+                            cache_file, magic,
+                        )
+                        raise ValueError("bad magic")
+                    if version != KEYPAIR_CACHE_VERSION:
+                        logger.warning(
+                            "Keypair cache %s has version %d but this build "
+                            "expects %d — cache from older incompatible "
+                            "version, regenerating",
+                            cache_file, version, KEYPAIR_CACHE_VERSION,
+                        )
+                        raise ValueError("bad version")
                     entity = pickle.load(f)
                 logger.info("Loaded keypair from cache %s", cache_file)
                 _bind_leaf_index_path(entity, data_dir)
                 return entity
             except Exception:
                 logger.warning(
-                    "Corrupt keypair cache %s — deleting and regenerating",
+                    "Corrupt or incompatible keypair cache %s — deleting "
+                    "and regenerating",
                     cache_file,
                 )
                 try:
@@ -180,6 +216,9 @@ def _load_or_create_entity(
     if use_cache:
         try:
             with open(cache_file, "wb") as f:
+                # Header: magic + 1-byte version, then the pickled entity.
+                f.write(KEYPAIR_CACHE_MAGIC)
+                f.write(bytes([KEYPAIR_CACHE_VERSION]))
                 pickle.dump(entity, f)
             # Owner-only permissions (best-effort on Windows)
             try:
