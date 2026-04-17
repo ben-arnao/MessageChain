@@ -1054,6 +1054,21 @@ class Blockchain:
         if total == 0:
             return None
 
+        # VRF lookahead: use randao_mix from block (N - VRF_LOOKAHEAD)
+        # instead of the immediate parent's mix. This makes the proposer
+        # for block N unknowable until block N - VRF_LOOKAHEAD is finalized.
+        from messagechain.config import VRF_ENABLED, VRF_LOOKAHEAD
+        if VRF_ENABLED and len(self.chain) > 1:
+            from messagechain.consensus.vrf import select_proposer_vrf
+            target_block = max(0, height - VRF_LOOKAHEAD)
+            target_block = min(target_block, len(self.chain) - 1)
+            lookahead_mix = self.chain[target_block].header.randao_mix
+            return select_proposer_vrf(
+                lookahead_mix, height, dict(validators), round_number=round_number
+            )
+
+        # Fallback: pre-VRF deterministic selection (VRF_ENABLED=False
+        # or very early chain with only genesis block).
         seed_input = (
             parent.block_hash
             + parent.header.randao_mix

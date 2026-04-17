@@ -56,6 +56,7 @@ class RegistrationTransaction:
     public_key: bytes
     registration_proof: Signature
     timestamp: float
+    randao_commitment: bytes = b"\x00" * 32  # SHA3(randao_seed); published at registration
     tx_hash: bytes = b""
 
     def __post_init__(self):
@@ -82,6 +83,7 @@ class RegistrationTransaction:
             + self.entity_id
             + self.public_key
             + struct.pack(">Q", int(self.timestamp))
+            + self.randao_commitment
         )
 
     def _compute_hash(self) -> bytes:
@@ -94,12 +96,13 @@ class RegistrationTransaction:
             "public_key": self.public_key.hex(),
             "registration_proof": self.registration_proof.serialize(),
             "timestamp": self.timestamp,
+            "randao_commitment": self.randao_commitment.hex(),
             "tx_hash": self.tx_hash.hex(),
         }
 
     def to_bytes(self) -> bytes:
         """Binary: 32 entity_id | 32 public_key | u32 proof_len | proof |
-        f64 timestamp | 32 tx_hash.
+        f64 timestamp | 32 randao_commitment | 32 tx_hash.
         """
         proof_blob = self.registration_proof.to_bytes()
         return b"".join([
@@ -108,27 +111,31 @@ class RegistrationTransaction:
             struct.pack(">I", len(proof_blob)),
             proof_blob,
             struct.pack(">d", float(self.timestamp)),
+            self.randao_commitment,
             self.tx_hash,
         ])
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RegistrationTransaction":
         off = 0
-        if len(data) < 32 + 32 + 4 + 8 + 32:
+        # 32 entity_id + 32 public_key + 4 proof_len + 8 timestamp + 32 randao_commitment + 32 tx_hash
+        if len(data) < 32 + 32 + 4 + 8 + 32 + 32:
             raise ValueError("Registration blob too short")
         entity_id = bytes(data[off:off + 32]); off += 32
         public_key = bytes(data[off:off + 32]); off += 32
         proof_len = struct.unpack_from(">I", data, off)[0]; off += 4
-        if off + proof_len + 8 + 32 > len(data):
-            raise ValueError("Registration truncated at proof/timestamp/hash")
+        if off + proof_len + 8 + 32 + 32 > len(data):
+            raise ValueError("Registration truncated at proof/timestamp/commitment/hash")
         proof = Signature.from_bytes(bytes(data[off:off + proof_len])); off += proof_len
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        randao_commitment = bytes(data[off:off + 32]); off += 32
         declared = bytes(data[off:off + 32]); off += 32
         if off != len(data):
             raise ValueError("Registration has trailing bytes")
         tx = cls(
             entity_id=entity_id, public_key=public_key,
             registration_proof=proof, timestamp=timestamp,
+            randao_commitment=randao_commitment,
         )
         expected = tx._compute_hash()
         if expected != declared:
@@ -141,11 +148,17 @@ class RegistrationTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "RegistrationTransaction":
         proof = Signature.deserialize(data["registration_proof"])
+        randao_commitment = (
+            bytes.fromhex(data["randao_commitment"])
+            if data.get("randao_commitment")
+            else b"\x00" * 32
+        )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             public_key=bytes.fromhex(data["public_key"]),
             registration_proof=proof,
             timestamp=data["timestamp"],
+            randao_commitment=randao_commitment,
         )
         expected = tx._compute_hash()
         declared = bytes.fromhex(data["tx_hash"])

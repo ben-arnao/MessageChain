@@ -314,6 +314,21 @@ FORCED_INCLUSION_SET_SIZE = 5
 # for governance review, NOT automatic slashing.
 INCLUSION_ATTESTATION_ENABLED = True
 
+# VRF-based proposer selection — RANDAO lookahead.
+#
+# Proposer selection for block N uses the RANDAO mix from block
+# N - VRF_LOOKAHEAD instead of the immediate parent. This makes the
+# proposer for block N unknowable until block N - VRF_LOOKAHEAD is
+# finalized, giving ~VRF_LOOKAHEAD * BLOCK_TIME_TARGET seconds of
+# unpredictability (32 * 600s = ~5.3 hours).
+#
+# VRF_ENABLED gates the feature: when False, proposer selection falls
+# back to the pre-VRF deterministic path (immediate parent mix).
+# For early chain / bootstrap, blocks before VRF_LOOKAHEAD use the
+# genesis mix (index 0), so the feature degrades gracefully.
+VRF_LOOKAHEAD = 32              # blocks of proposer unpredictability
+VRF_ENABLED = True              # feature gate
+
 # Mempool
 MEMPOOL_MAX_SIZE = 5000       # max transactions in mempool
 MEMPOOL_TX_TTL = 1_209_600    # tx expiry in seconds (14 days)
