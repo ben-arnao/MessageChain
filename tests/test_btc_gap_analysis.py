@@ -399,11 +399,11 @@ class TestTransactionVersioning(unittest.TestCase):
         chain.supply.balances[entities[0].entity_id] = 10000
 
         tx = create_transaction(entities[0], "test msg", fee=1500, nonce=0)
-        # Version should be part of signable data
+        # Version should be part of signable data.  Layout:
+        #   CHAIN_ID | b"message" (domain-separation tag) | u32 version | ...
         signable = tx._signable_data()
-        # Signable data starts with CHAIN_ID then the version
         version_bytes = struct.pack(">I", tx.version)
-        self.assertTrue(signable.startswith(CHAIN_ID + version_bytes))
+        self.assertTrue(signable.startswith(CHAIN_ID + b"message" + version_bytes))
 
     def test_version_serialization_roundtrip(self):
         """Version survives serialization/deserialization."""

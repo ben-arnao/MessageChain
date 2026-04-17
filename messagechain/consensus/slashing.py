@@ -320,6 +320,7 @@ class SlashTransaction:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
+            + b"slash"  # domain-separation tag: prevents cross-type sig replay
             + struct.pack(">B", sig_version)
             + self.evidence.evidence_hash
             + self.submitter_id
