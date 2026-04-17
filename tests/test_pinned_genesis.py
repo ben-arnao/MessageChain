@@ -41,6 +41,61 @@ class TestUnpinnedGenesisPreservesOldBehavior(_Base):
         self.assertIsNotNone(genesis)
 
 
+class TestDevnetGuard(_Base):
+    """Non-devnet mode with PINNED_GENESIS_HASH=None must refuse genesis init."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_devnet = config.DEVNET
+
+    def tearDown(self):
+        config.DEVNET = self._orig_devnet
+        super().tearDown()
+
+    def test_non_devnet_none_pin_raises(self):
+        """Production mode (DEVNET=False) with no pinned hash must error."""
+        config.DEVNET = False
+        config.PINNED_GENESIS_HASH = None
+        chain = Blockchain()
+        entity = _entity(b"alice")
+        with self.assertRaises(RuntimeError) as ctx:
+            chain.initialize_genesis(entity)
+        msg = str(ctx.exception).lower()
+        self.assertIn("pinned_genesis_hash", msg)
+        self.assertIn("devnet", msg)
+
+    def test_devnet_none_pin_allowed(self):
+        """Devnet mode (DEVNET=True) with no pinned hash is allowed."""
+        config.DEVNET = True
+        config.PINNED_GENESIS_HASH = None
+        chain = Blockchain()
+        entity = _entity(b"alice")
+        genesis = chain.initialize_genesis(entity)
+        self.assertIsNotNone(genesis)
+
+    def test_non_devnet_with_pin_works(self):
+        """Production mode with a matching pinned hash works normally."""
+        from unittest.mock import patch
+        config.DEVNET = False
+        with patch("messagechain.core.block.time.time", return_value=1_700_000_000.0), \
+             patch("messagechain.consensus.pos.time.time", return_value=1_700_000_000.0):
+            # First, create genesis in devnet to get the hash
+            config.DEVNET = True
+            config.PINNED_GENESIS_HASH = None
+            chain = Blockchain()
+            entity = _entity(b"bootstrap")
+            genesis = chain.initialize_genesis(entity)
+            expected_hash = genesis.block_hash
+
+            # Now test production mode with correct pin
+            config.DEVNET = False
+            config.PINNED_GENESIS_HASH = expected_hash
+            chain2 = Blockchain()
+            entity2 = _entity(b"bootstrap")
+            g2 = chain2.initialize_genesis(entity2)
+            self.assertEqual(g2.block_hash, expected_hash)
+
+
 class TestPinnedGenesisEnforced(_Base):
     """When PINNED_GENESIS_HASH is set, arbitrary genesis creation is refused."""
 

@@ -81,6 +81,12 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 # still create a genesis and then record its hash here.  Production networks
 # MUST pin this — otherwise two nodes on empty data dirs each mint their own
 # incompatible block 0, creating permanently bifurcated chains.
+# Network mode — when True, PINNED_GENESIS_HASH may be None (local testing).
+# Production nodes MUST leave this False; initialize_genesis will refuse to
+# create a genesis block without a pinned hash in non-devnet mode, preventing
+# misconfigured nodes from silently forking the network.
+DEVNET = False
+
 PINNED_GENESIS_HASH: bytes | None = None
 
 # Treasury — a governance-controlled fund for community spending.

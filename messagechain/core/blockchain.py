@@ -434,13 +434,26 @@ class Blockchain:
 
         genesis_block = create_genesis_block(genesis_entity)
 
+        # Non-devnet safety: refuse to create genesis when no pinned hash
+        # is configured.  A misconfigured production node with an empty
+        # data dir would otherwise silently mint its own genesis block,
+        # forking the network permanently.
+        import messagechain.config as _cfg
+        pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+        devnet = getattr(_cfg, "DEVNET", False)
+        if pinned is None and not devnet:
+            raise RuntimeError(
+                "PINNED_GENESIS_HASH is not set and DEVNET is False. "
+                "A production node must have PINNED_GENESIS_HASH configured "
+                "in messagechain/config.py to prevent accidental chain forks. "
+                "Set DEVNET=True for local testing."
+            )
+
         # If a canonical genesis hash is pinned in config, refuse to
         # initialize unless this entity happens to produce the exact same
         # block.  Prevents two nodes on fresh data directories from each
         # minting their own genesis and creating permanently bifurcated
         # chains that can never reconcile.
-        import messagechain.config as _cfg
-        pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
         if pinned is not None and pinned != genesis_block.block_hash:
             raise RuntimeError(
                 f"Refusing to mint a local genesis: pinned genesis hash is "
