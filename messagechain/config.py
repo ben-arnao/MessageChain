@@ -165,7 +165,14 @@ MESSAGE_MAX_TTL = 52_560      # maximum TTL (~1 year at 600s) — bounds long-te
 WOTS_W = 16  # Winternitz parameter (base-16)
 WOTS_KEY_CHAINS = 64  # number of hash chains per WOTS keypair
 WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
-MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (production)
+# MERKLE_TREE_HEIGHT: WOTS+ Merkle tree height.  2^height = number of one-
+# time signing keys per entity.  Default is 20 (1,048,576 keys ≈ 2 years of
+# runtime per hot key at production block cadence).  Keygen is O(2^height)
+# and expensive — height=20 takes ~90 min on a weak VM, height=16 takes ~5 min.
+# Override via env var for bootstrap-phase deployments on low-CPU hardware.
+import os as _os_mt  # noqa: E402
+_merkle_env = _os_mt.environ.get("MESSAGECHAIN_MERKLE_TREE_HEIGHT")
+MERKLE_TREE_HEIGHT = int(_merkle_env) if _merkle_env is not None else 20
 # Tests override this to 4 (16 leaves) via tests/__init__.py for fast execution.
 #
 # Leaf exhaustion cadence — an active validator consumes one leaf per
