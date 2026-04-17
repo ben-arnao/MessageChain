@@ -171,6 +171,26 @@ class Node:
         """Callback invoked by ChainSyncer for sync-time misbehavior."""
         self.ban_manager.record_offense(peer_address, points, reason)
 
+    def _handle_task_exception(self, task_name: str, task: asyncio.Task) -> None:
+        """Log uncaught exceptions from background tasks so they don't die silently.
+
+        Without this callback, an exception escaping a ``create_task``-launched
+        coroutine is swallowed by asyncio's default handler at garbage-collection
+        time. The task dies, the node keeps running as a zombie (listening but
+        not producing blocks or syncing), and in a PoS system with an inactivity
+        leak, the operator's stake gets slowly drained to zero before anyone
+        notices. Loud CRITICAL logging is the minimum viable alarm.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.critical(
+            f"Background task {task_name} crashed: {exc!r}",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
     def _current_cumulative_weight(self) -> int:
         """Our node's best-tip cumulative stake weight, for handshakes."""
         best = self.blockchain.fork_choice.get_best_tip()
@@ -327,30 +347,48 @@ class Node:
         # an attacker to isolate us across a restart (BTC PR #17428).
         for host, port in self.anchor_store.load_anchors():
             if port != self.port:
-                asyncio.create_task(self._connect_to_peer(host, port))
+                t = asyncio.create_task(self._connect_to_peer(host, port))
+                t.add_done_callback(
+                    lambda x: self._handle_task_exception("connect_to_peer(anchor)", x)
+                )
 
         # Connect to seed nodes
         for host, port in self.seed_nodes:
             if port != self.port:  # don't connect to self
-                asyncio.create_task(self._connect_to_peer(host, port))
+                t = asyncio.create_task(self._connect_to_peer(host, port))
+                t.add_done_callback(
+                    lambda x: self._handle_task_exception("connect_to_peer(seed)", x)
+                )
 
         # Start block production loop
-        asyncio.create_task(self._block_production_loop())
+        t = asyncio.create_task(self._block_production_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("block_production_loop", x)
+        )
 
         # Start sync check loop
-        asyncio.create_task(self._sync_loop())
+        t = asyncio.create_task(self._sync_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("sync_loop", x)
+        )
 
         # Start outbound-slot maintenance — pulls candidates from addrman
         # and fills open outbound slots. This is the only path that dials
         # peers discovered via gossip, so PEER_LIST flooding cannot force
         # direct connections to attacker-chosen IPs.
-        asyncio.create_task(self._outbound_maintenance_loop())
+        t = asyncio.create_task(self._outbound_maintenance_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("outbound_maintenance_loop", x)
+        )
 
         # Start the active mempool-replication loop — periodically sends
         # a compact digest to a random subset of peers so a tx that
         # reaches ANY honest node propagates to every honest node within
         # one sync interval (anti-censorship; see MEMPOOL_DIGEST docstring).
-        asyncio.create_task(self._mempool_sync_loop())
+        t = asyncio.create_task(self._mempool_sync_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("mempool_sync_loop", x)
+        )
 
     async def stop(self):
         self._running = False
@@ -563,7 +601,10 @@ class Node:
 
             # If peer is ahead, initiate sync
             if peer_height > self.blockchain.height and not self.syncer.is_syncing:
-                asyncio.create_task(self.syncer.start_sync())
+                t = asyncio.create_task(self.syncer.start_sync())
+                t.add_done_callback(
+                    lambda x: self._handle_task_exception("syncer.start_sync", x)
+                )
 
         elif msg.msg_type == MessageType.INV:
             await self._handle_inv(msg.payload, peer)
