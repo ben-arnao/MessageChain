@@ -513,10 +513,22 @@ class Server:
 
     async def start(self):
         """Start P2P server, RPC server, and block production."""
+        # Announce the network identity loudly before any peer I/O.  If an
+        # operator ever sees "NETWORK=testnet" in the logs of what they
+        # thought was a mainnet validator, they spot the misconfiguration
+        # before it matters.  The hex prefix of the pin lets them
+        # cross-check against the canonical block-0 hash.
+        import messagechain.config as _cfg
+        _pin = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+        logger.info(
+            "NETWORK=%s  pinned_genesis=%s",
+            getattr(_cfg, "NETWORK_NAME", "<unset>"),
+            _pin.hex()[:16] + "..." if _pin is not None else "<none>",
+        )
+
         # Initialize genesis if fresh chain
         if self.blockchain.height == 0:
-            import messagechain.config as _cfg
-            pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+            pinned = _pin
             if pinned is not None:
                 # Network has a pinned canonical genesis — this node must
                 # sync block 0 from peers, not mint locally.  Only the

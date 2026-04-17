@@ -11,8 +11,9 @@
 # MERKLE_TREE_HEIGHT = 16              # ~65K signing keys, faster keygen
 
 # ── Dev / localhost testing ─────────────────────────────────────────
-# DEVNET = True                        # allow genesis mint without pinned hash
-# PINNED_GENESIS_HASH = None           # skip pin check
+# NETWORK_NAME = "devnet"              # preferred switch — implies no pin
+# DEVNET = True                        # kept as a legacy alias; NETWORK_NAME is the source of truth
+# PINNED_GENESIS_HASH = None           # skip pin check (NETWORK_NAME=devnet already does this)
 # BLOCK_TIME_TARGET = 10               # fast blocks for quick iteration
 # P2P_TLS_ENABLED = False              # skip TLS setup in dev
 

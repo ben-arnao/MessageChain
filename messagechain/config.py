@@ -217,20 +217,69 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 # mint their own genesis — they sync block 0 from peers and reject any block
 # whose hash doesn't match this pin.  Only the single bootstrap node that
 # produced the pinned block may call initialize_genesis and have it succeed.
+# Two nodes on empty data dirs with no pin each mint their own incompatible
+# block 0, creating permanently bifurcated chains — which is why the pin
+# exists.
 #
-# Left as None in this prototype/devnet build so a first-time operator can
-# still create a genesis and then record its hash here.  Production networks
-# MUST pin this — otherwise two nodes on empty data dirs each mint their own
-# incompatible block 0, creating permanently bifurcated chains.
-# Network mode — when True, PINNED_GENESIS_HASH may be None (local testing).
-# Production nodes MUST leave this False; initialize_genesis will refuse to
-# create a genesis block without a pinned hash in non-devnet mode, preventing
-# misconfigured nodes from silently forking the network.
-DEVNET = False
+# Network identity is selected by NETWORK_NAME below rather than by editing a
+# raw hex literal.  To cut mainnet:
+#   1. Mint mainnet genesis and set _MAINNET_GENESIS_HASH to its hash.
+#   2. Flip NETWORK_NAME to "mainnet".
+# Doing (2) without (1) raises at config load — a mainnet build cannot
+# silently fall back to the testnet hash.
+NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
 
-PINNED_GENESIS_HASH: bytes | None = bytes.fromhex(
+# Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
+# below; do not reference them directly from other modules.
+_TESTNET_GENESIS_HASH: bytes | None = bytes.fromhex(
     "abe88b0f3af89ae9e99d1c3c8e009e07aca3e35a5826740cc0f67688cdaf1e9c"
 )
+_MAINNET_GENESIS_HASH: bytes | None = None  # set before mainnet cut
+
+
+def _resolve_pinned_genesis_hash(network: str) -> bytes | None:
+    """Map NETWORK_NAME → the pinned block-0 hash for that network.
+
+    - mainnet: returns _MAINNET_GENESIS_HASH, or raises if it is None.
+      A None pin on mainnet is a configuration bug, not a graceful
+      fallback — the whole point of this selector is that "ship
+      mainnet without filling in the hash" fails loudly rather than
+      trusting the testnet hash by accident.
+    - testnet: returns _TESTNET_GENESIS_HASH (may be None for a fresh
+      testnet that hasn't minted genesis yet; initialize_genesis will
+      refuse to start in that case unless network == "devnet").
+    - devnet: returns None unconditionally — local testing lets any
+      node mint its own genesis.
+    - anything else: raises, so typos ("mainet", "staging") don't
+      silently degrade to a disabled pin.
+    """
+    if network == "mainnet":
+        if _MAINNET_GENESIS_HASH is None:
+            raise RuntimeError(
+                "NETWORK_NAME='mainnet' but _MAINNET_GENESIS_HASH is None. "
+                "Refusing to load config: a mainnet build must pin the real "
+                "mainnet block-0 hash before it can run. Edit "
+                "messagechain/config.py and set _MAINNET_GENESIS_HASH to the "
+                "mainnet genesis hash, or flip NETWORK_NAME back to "
+                "'testnet'/'devnet' for non-production use."
+            )
+        return _MAINNET_GENESIS_HASH
+    if network == "testnet":
+        return _TESTNET_GENESIS_HASH
+    if network == "devnet":
+        return None
+    raise RuntimeError(
+        f"Unknown NETWORK_NAME {network!r}: must be one of "
+        f"'mainnet', 'testnet', 'devnet'."
+    )
+
+
+PINNED_GENESIS_HASH: bytes | None = _resolve_pinned_genesis_hash(NETWORK_NAME)
+
+# Legacy alias — existing call sites (blockchain.py, initialize_genesis) read
+# DEVNET directly.  Kept as a derived flag rather than a parallel source of
+# truth so the two can never disagree.
+DEVNET = NETWORK_NAME == "devnet"
 
 # Treasury — a governance-controlled fund for community spending.
 # The treasury entity has a well-known deterministic ID (no private key exists).

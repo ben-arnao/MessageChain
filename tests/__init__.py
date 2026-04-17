@@ -16,13 +16,15 @@ messagechain.config.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1
 # must be disabled. The proposer-match check stays on — tests that stake
 # validators must use the deterministically-selected proposer.
 messagechain.config.ENFORCE_SLOT_TIMING = False
-# Tests run in devnet mode — allow genesis creation without PINNED_GENESIS_HASH.
+# Tests run in devnet mode — allow genesis creation without a network pin.
+# Keep NETWORK_NAME / DEVNET / PINNED_GENESIS_HASH in sync so the invariant
+# "DEVNET == (NETWORK_NAME == 'devnet')" holds under the test harness.
+messagechain.config.NETWORK_NAME = "devnet"
 messagechain.config.DEVNET = True
+messagechain.config.PINNED_GENESIS_HASH = None
 # Tests run without checkpoint files; disable the strict requirement so
 # test nodes don't refuse to start.
 messagechain.config.REQUIRE_CHECKPOINTS = False
-# Override the production pinned hash so test entities can initialize_genesis.
-messagechain.config.PINNED_GENESIS_HASH = None
 
 
 def register_entity_for_test(chain, entity):
