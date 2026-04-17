@@ -95,7 +95,11 @@ def submit_transaction_to_mempool(
     if tx.tx_hash in mempool.pending:
         return SubmissionResult(ok=True, tx_hash=tx.tx_hash, duplicate=True)
 
-    valid, reason = blockchain.validate_transaction(tx)
+    on_chain_nonce = blockchain.nonces.get(tx.entity_id, 0)
+    pending_nonce = mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+    valid, reason = blockchain.validate_transaction(
+        tx, expected_nonce=pending_nonce,
+    )
     if not valid:
         return SubmissionResult(ok=False, error=reason)
 
