@@ -52,6 +52,14 @@ fresh node needs to resume participation:
     - total_burned       global burned counter (EIP-1559 base-fee burn)
     - base_fee           current base fee
     - finalized_checkpoints  (block_number -> block_hash) finality records
+    - seed_initial_stakes   seed_id → stake captured at first divestment
+                            block (H = SEED_DIVESTMENT_START + 1).  Drives
+                            the flat per-block divestment decrement for
+                            the entire window.  MUST be in the snapshot
+                            root: two state-synced nodes that disagree on
+                            this dict fork silently at the next divestment
+                            block because each recomputes per_block from
+                            its own (post-divestment) stake reference.
 
 The snapshot root (`compute_state_root`) is a Merkle tree over sorted
 (section_tag, key, value_hash) entries, where each section_tag is a fixed
@@ -103,6 +111,13 @@ _TAG_SLASHED = b"slh"
 _TAG_ENTITY_INDEX = b"eidx"
 _TAG_FINALIZED = b"fin"
 _TAG_GLOBAL = b"glb"
+# seed_initial_stakes — consensus-visible dict[seed_id → initial_stake].
+# Captured once per seed at the first divestment block and used as the
+# denominator reference for the flat per-block unbond through END.  Not
+# covered by any other section, so it needs its own tag — otherwise two
+# state-synced nodes can silently disagree on the per-block divestment
+# amount and fork at the next divestment block.
+_TAG_SEED_INIT_STAKES = b"seed_init"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -146,6 +161,10 @@ def serialize_state(blockchain) -> dict:
         "finalized_checkpoints": dict(
             blockchain.finalized_checkpoints.finalized_by_height
         ),
+        # Seed divestment reference — see _TAG_SEED_INIT_STAKES docstring.
+        "seed_initial_stakes": dict(
+            getattr(blockchain, "seed_initial_stakes", {})
+        ),
     }
 
 
@@ -184,6 +203,11 @@ def deserialize_state(snapshot: dict) -> dict:
     out.setdefault("total_burned", 0)
     out.setdefault("base_fee", 0)
     out.setdefault("finalized_checkpoints", {})
+    # Default to empty dict for pre-divestment snapshots and for any
+    # legacy in-memory dict that predates the field.  Binary decode
+    # always populates this, so the default only matters for callers
+    # that hand-build snapshot dicts.
+    out.setdefault("seed_initial_stakes", {})
     return out
 
 
@@ -284,6 +308,14 @@ def compute_state_root(snapshot: dict) -> bytes:
             })),
         _TAG_FINALIZED: _merkle(_entries_for_section(
             _TAG_FINALIZED, snap["finalized_checkpoints"])),
+        # Seed divestment reference dict.  MUST participate in the
+        # snapshot root: two state-synced nodes that agreed on every
+        # other section but disagreed on seed_initial_stakes would
+        # silently fork at the next divestment block because the
+        # per-block decrement is `initial_stake / WINDOW`, computed
+        # from this exact dict.
+        _TAG_SEED_INIT_STAKES: _merkle(_entries_for_section(
+            _TAG_SEED_INIT_STAKES, snap["seed_initial_stakes"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -438,6 +470,7 @@ def encode_snapshot(snap: dict) -> bytes:
         u64                 total_burned
         u64                 base_fee
         <int→bytes dict>    finalized_checkpoints
+        <bytes→int  dict>   seed_initial_stakes
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -459,6 +492,9 @@ def encode_snapshot(snap: dict) -> bytes:
     out += struct.pack(">Q", int(snap["total_burned"]))
     out += struct.pack(">Q", int(snap["base_fee"]))
     out += _encode_int_bytes_dict(snap["finalized_checkpoints"])
+    # Seed divestment reference — bytes→int dict, sorted keys, matches
+    # the canonical encoding used elsewhere for entity-keyed int dicts.
+    out += _encode_bytes_int_dict(snap["seed_initial_stakes"])
     return bytes(out)
 
 
@@ -507,6 +543,7 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     (base_fee,) = struct.unpack_from(">Q", blob, off)
     off += 8
     finalized_checkpoints, off = _decode_int_bytes_dict(blob, off)
+    seed_initial_stakes, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -531,4 +568,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "total_burned": total_burned,
         "base_fee": base_fee,
         "finalized_checkpoints": finalized_checkpoints,
+        "seed_initial_stakes": seed_initial_stakes,
     }
