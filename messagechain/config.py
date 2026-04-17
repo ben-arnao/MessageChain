@@ -178,15 +178,9 @@ MERKLE_TREE_HEIGHT = 20  # 2^20 = 1,048,576 one-time keypairs per entity (produc
 # inactivity penalties.  Operators should schedule rotations well
 # ahead of exhaustion — ideally at the halfway mark.
 
-# Consensus — graduated minimum stake
-# Early network is accessible (1 token), matures into higher barrier.
-# These thresholds are checked via graduated_min_stake() in pos.py.
-VALIDATOR_MIN_STAKE = 100            # legacy flat minimum (used as final tier)
-GRADUATED_STAKE_TIERS = [
-    (50_000, 1),      # blocks 0–49,999: 1 token
-    (200_000, 10),    # blocks 50,000–199,999: 10 tokens
-    (None, 100),      # blocks 200,000+: 100 tokens
-]
+# Consensus — flat minimum stake from block 0.
+# 100 tokens required to register as a validator at any block height.
+VALIDATOR_MIN_STAKE = 100
 CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fraction)
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
@@ -243,11 +237,11 @@ LOTTERY_BOUNTY = 100         # tokens paid to lottery winner
 # `bootstrap_progress` gradient (see
 # messagechain/consensus/bootstrap_gradient.py), and this constant
 # survives only as the finality floor — 2/3 of stake is not meaningful
-# finality if only one or two validators exist.  Tests override this
-# dynamically to 1 for single-validator chains; keeping the old name
-# avoids breaking that pattern.  Reader should treat this name as
-# "min validators for finality."
-MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 3
+# finality if only one or two validators exist.  Set to 1 because the
+# chain launches with a single seed validator.  Tests also override
+# this dynamically; keeping the old name avoids breaking that pattern.
+# Reader should treat this name as "min validators for finality."
+MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1
 
 # Slot-timing enforcement — if True, validate_block rejects blocks whose
 # timestamp is less than BLOCK_TIME_TARGET seconds after the parent's.

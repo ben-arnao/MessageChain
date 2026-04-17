@@ -1,9 +1,9 @@
 """Stage 5: min-stake gating as a function of bootstrap_progress.
 
-The chain's validator-registration gate used to consult
-`graduated_min_stake(block_height)` — a tiered function of raw height.
-That couples the "is bootstrap over?" question to a clock, not to the
-actual decentralization metric.
+The chain's validator-registration gate uses the flat
+VALIDATOR_MIN_STAKE (100 tokens) as the baseline minimum.
+This stage introduces `min_stake_for_progress()` so the gate follows
+the `bootstrap_progress` gradient for the bootstrap era.
 
 This stage introduces `min_stake_for_progress()` so the gate follows
 the single `bootstrap_progress` gradient that drives every other

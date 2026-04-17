@@ -14,7 +14,7 @@ import hashlib
 import struct
 import time
 from messagechain.config import (
-    HASH_ALGO, VALIDATOR_MIN_STAKE, GRADUATED_STAKE_TIERS,
+    HASH_ALGO, VALIDATOR_MIN_STAKE,
     CONSENSUS_THRESHOLD_NUMERATOR,
     CONSENSUS_THRESHOLD_DENOMINATOR, MAX_TXS_PER_BLOCK, MAX_BLOCK_MESSAGE_BYTES,
 )
@@ -26,19 +26,6 @@ from messagechain.consensus.attestation import Attestation, create_attestation, 
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
-
-
-def graduated_min_stake(block_height: int) -> int:
-    """Return the minimum stake required at a given block height.
-
-    Early network is accessible (1 token minimum). As the chain matures,
-    the barrier increases to harden sybil resistance.
-    """
-    for threshold, min_stake in GRADUATED_STAKE_TIERS:
-        if threshold is not None and block_height < threshold:
-            return min_stake
-    # Final tier (threshold is None)
-    return GRADUATED_STAKE_TIERS[-1][1]
 
 
 class ProofOfStake:
@@ -75,7 +62,7 @@ class ProofOfStake:
 
     def register_validator(self, entity_id: bytes, stake_amount: int, block_height: int = 0) -> bool:
         """Register a validator with their stake."""
-        if stake_amount < graduated_min_stake(block_height):
+        if stake_amount < VALIDATOR_MIN_STAKE:
             return False
         self.stakes[entity_id] = self.stakes.get(entity_id, 0) + stake_amount
         # Local bootstrap-heuristic ends once we have enough distinct

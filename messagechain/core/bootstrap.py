@@ -1,8 +1,7 @@
 """Seed-validator bootstrap orchestration.
 
-Running three validators with proper security posture requires three
-distinct on-chain operations on each server, in the right order, with
-the right keys:
+Running a validator with proper security posture requires three
+distinct on-chain operations, in the right order, with the right keys:
 
   1. Register the hot (signing) entity.
   2. Set its authority key to the operator's cold wallet public key
@@ -148,13 +147,13 @@ def bootstrap_seed_local(
 
 
 # ───────────────────────────────────────────────────────────────────────
-# Recommended launch plan for the 3-seed + shared-payout layout.
+# Recommended launch plan for the single-seed layout.
 #
 # Encodes the decisions documented in the operator runbook so operators
 # don't have to re-derive them (and can't silently under-budget fees or
 # mis-size stake):
-#   * Each seed stakes 250,000 tokens.
-#   * Each seed is allocated 251,000 liquid at genesis (stake + fee
+#   * The seed stakes 99,000,000 tokens (~9.9% of supply).
+#   * The seed is allocated 99,001,000 liquid at genesis (stake + fee
 #     buffer for set-authority-key + bootstrap retries + initial ops).
 #   * Treasury allocation is 4% of supply per the existing default.
 #   * Payout entity is registered post-genesis via the block pipeline.
@@ -164,17 +163,17 @@ def bootstrap_seed_local(
 # reasons (security + optics + bootstrap runway).
 # ───────────────────────────────────────────────────────────────────────
 
-# Each seed stakes ~1/30 of total supply.  With 3 seeds = ~10% of supply
-# staked at genesis by the founder, chosen so the founder holds a durable
-# 2/3+ supermajority of stake throughout the bootstrap window even after
-# thousands of zero-funds validators accumulate escrow-era rewards.
+# The seed stakes ~1/10 of total supply — 99M tokens — chosen so the
+# founder holds a durable 2/3+ supermajority of stake throughout the
+# bootstrap window even after thousands of zero-funds validators
+# accumulate escrow-era rewards.
 #
 # Napkin math for the security floor:
 #   * BOOTSTRAP_END_HEIGHT ≈ 105K blocks → ≈ 1.68M tokens total minted
 #     during bootstrap (16 tokens/block × 105K).
 #   * Even if 100% of minted tokens are captured by non-seed validators
 #     and immediately staked, that's ≤ 2M of non-seed stake.
-#   * With 3 seeds × 33M = 99M seed stake, seed share stays above
+#   * With 1 seed × 99M = 99M seed stake, seed share stays above
 #     99M / (99M + 2M) = 98%.  Comfortable headroom against Sybil
 #     stake accumulation AND against the founder wanting to move
 #     some allocation (e.g. treasury grants, early backers) without
@@ -182,8 +181,8 @@ def bootstrap_seed_local(
 #
 # This is the "founder secures the chain during bootstrap" constant.
 # Smaller values weaken Sybil resistance; larger values over-concentrate
-# supply.  100M total (10%) is the pragmatic sweet spot.
-RECOMMENDED_STAKE_PER_SEED: int = 33_000_000
+# supply.  99M (~9.9%) is the pragmatic sweet spot.
+RECOMMENDED_STAKE_PER_SEED: int = 99_000_000
 RECOMMENDED_FEE_BUFFER: int = MIN_FEE * 10          # 1_000
 RECOMMENDED_GENESIS_PER_SEED: int = (
     RECOMMENDED_STAKE_PER_SEED + RECOMMENDED_FEE_BUFFER
@@ -197,25 +196,23 @@ def build_launch_allocation(
 ) -> dict[bytes, int]:
     """Build the genesis allocation table for a seed-validator launch.
 
-    Credits each seed with `stake_per_seed + fee_buffer` liquid at
+    Credits the seed with `stake_per_seed + fee_buffer` liquid at
     genesis, plus the standard treasury allocation.  Payout entities
     are NOT pre-allocated — they register post-genesis via the normal
     RegistrationTransaction pipeline and accumulate balance from
     subsequent transfers.
 
-    Requires exactly 3 seed entity_ids so the caller can't accidentally
-    launch with one (single-point-of-failure) or two (can't hit the
-    MIN_VALIDATORS_TO_EXIT_BOOTSTRAP=3 threshold).  If you want a
-    different shape, build the dict yourself.
+    Requires exactly 1 seed entity_id — the founder's single validator.
+    If you want a different shape, build the dict yourself.
     """
     from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
-    if len(seed_entity_ids) != 3:
+    if len(seed_entity_ids) != 1:
         raise ValueError(
-            f"Recommended launch plan requires exactly 3 seed entity_ids, "
+            f"Recommended launch plan requires exactly 1 seed entity_id, "
             f"got {len(seed_entity_ids)}.  Build the allocation table "
             f"manually if you need a different shape."
         )
-    if len(set(seed_entity_ids)) != 3:
+    if len(set(seed_entity_ids)) != 1:
         raise ValueError("seed entity_ids must be distinct")
     if stake_per_seed <= 0 or fee_buffer < 0:
         raise ValueError("stake_per_seed must be positive, fee_buffer non-negative")

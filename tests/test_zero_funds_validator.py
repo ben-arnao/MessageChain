@@ -37,16 +37,15 @@ from tests import register_entity_for_test, pick_selected_proposer
 class TestZeroFundsValidator(unittest.TestCase):
     """A zero-funds entity registers, attests, and earns a reward via committee."""
 
-    def _make_chain_with_seeds(self, num_seeds: int = 3, stake_per_seed: int = 250_000):
-        """Build a blockchain with `num_seeds` funded + staked seed validators.
+    def _make_chain_with_seeds(self, stake_per_seed: int = 250_000):
+        """Build a blockchain with 1 funded + staked seed validator.
 
-        Returns (chain, seeds, consensus).  Every seed is funded at genesis,
+        Returns (chain, seeds, consensus).  The seed is funded at genesis,
         registered, and has `stake_per_seed` tokens staked.  The chain is
         ready to accept blocks.
         """
         seeds = [
-            Entity.create(f"seed-{i}".encode().ljust(32, b"\x00"))
-            for i in range(num_seeds)
+            Entity.create(b"seed-0".ljust(32, b"\x00")),
         ]
         for s in seeds:
             s.keypair._next_leaf = 0
@@ -156,8 +155,8 @@ class TestFounderStakeDominance(unittest.TestCase):
     bootstrap-era minting envelope so this assertion holds.
     """
 
-    def test_three_seeds_hold_supermajority_against_worst_case_sybils(self):
-        """3 founder seeds still hold ≥2/3 of stake even if the entire
+    def test_single_seed_holds_supermajority_against_worst_case_sybils(self):
+        """The founder seed still holds >=2/3 of stake even if the entire
         bootstrap minting envelope (~1.68M tokens) is captured and staked
         by non-seed validators."""
         from messagechain.consensus.bootstrap_gradient import (
@@ -165,7 +164,7 @@ class TestFounderStakeDominance(unittest.TestCase):
         )
         from messagechain.config import BLOCK_REWARD
 
-        total_founder_stake = 3 * RECOMMENDED_STAKE_PER_SEED
+        total_founder_stake = RECOMMENDED_STAKE_PER_SEED
         # Upper bound on tokens minted across the whole bootstrap window —
         # assumes reward never halves during the window (pessimistic for
         # attacker; conservative for defender).
