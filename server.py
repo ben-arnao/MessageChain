@@ -18,11 +18,13 @@ Usage:
 
 import argparse
 import asyncio
+import hashlib as _hashlib
 import sys
 import hmac
 import json
 import logging
 import os
+import pickle
 import struct
 import time
 from collections import OrderedDict
@@ -80,6 +82,76 @@ logger = logging.getLogger("messagechain.server")
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
+
+
+# ---------------------------------------------------------------------------
+# Keypair disk cache — eliminates costly WOTS+ Merkle-tree regeneration on
+# restart.  The keypair is deterministic (same private key + tree height
+# always yields the same tree), so the cached result is safe to reuse.
+# ---------------------------------------------------------------------------
+
+def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
+    """Return the filesystem path for a cached keypair.
+
+    The filename embeds a truncated SHA3-256 digest of (private_key ||
+    tree_height) so that different keys or heights never collide, and the
+    raw private key never appears in the filename.
+    """
+    h = _hashlib.sha3_256(private_key + tree_height.to_bytes(4, "big")).hexdigest()[:16]
+    return os.path.join(data_dir, f"keypair_cache_{h}.bin")
+
+
+def _load_or_create_entity(
+    private_key: bytes,
+    tree_height: int,
+    data_dir: str | None,
+    *,
+    no_cache: bool = False,
+) -> Entity:
+    """Create an Entity, using a disk cache when possible.
+
+    If *data_dir* is ``None`` or *no_cache* is ``True``, the cache is
+    bypassed and the entity is created fresh every time.
+    """
+    use_cache = data_dir is not None and not no_cache
+
+    if use_cache:
+        cache_file = _keypair_cache_path(private_key, tree_height, data_dir)
+
+        # Try loading from cache
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    entity = pickle.load(f)
+                logger.info("Loaded keypair from cache %s", cache_file)
+                return entity
+            except Exception:
+                logger.warning(
+                    "Corrupt keypair cache %s — deleting and regenerating",
+                    cache_file,
+                )
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
+
+    # Fresh keygen
+    entity = Entity.create(private_key, tree_height=tree_height)
+
+    if use_cache:
+        try:
+            with open(cache_file, "wb") as f:
+                pickle.dump(entity, f)
+            # Owner-only permissions (best-effort on Windows)
+            try:
+                os.chmod(cache_file, 0o600)
+            except OSError:
+                pass
+            logger.info("Saved keypair cache to %s", cache_file)
+        except OSError:
+            logger.warning("Could not write keypair cache to %s", cache_file)
+
+    return entity
 
 
 class Server:
@@ -2088,7 +2160,13 @@ async def run(args):
         ).encode("utf-8")
 
     if private_key_input:
-        entity = Entity.create(private_key_input)
+        from messagechain.config import MERKLE_TREE_HEIGHT as _th
+        entity = _load_or_create_entity(
+            private_key_input,
+            _th,
+            args.data_dir,
+            no_cache=getattr(args, "no_keypair_cache", False),
+        )
 
         # Advance WOTS+ keypair past all previously-used one-time signing keys.
         # Without this, restarting the server would reuse WOTS+ leaves, which
@@ -2166,6 +2244,11 @@ def main():
     parser.add_argument("--wallet", type=str, help="Wallet ID hex (skip interactive prompt)")
     parser.add_argument("--data-dir", type=str, help="Directory for persistent chain data (enables SQLite storage)")
     parser.add_argument("--verbose", action="store_true", help="Verbose logging")
+    parser.add_argument(
+        "--no-keypair-cache", action="store_true", default=False,
+        help="Disable on-disk keypair caching. Forces full WOTS+ tree "
+             "regeneration on every restart.",
+    )
     # --- Censorship-resistance HTTPS submission endpoint (opt-in) ---
     # Off by default.  Set --submission-port (typ. 8443) AND supply
     # --submission-cert + --submission-key to expose a public POST
