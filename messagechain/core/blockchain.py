@@ -2024,6 +2024,29 @@ class Blockchain:
         """
         prev = self.get_latest_block()
         block_height = prev.header.block_number + 1
+        # Guard against WOTS+ leaf reuse: if the proposer also has
+        # transactions in this block (signed earlier, possibly before a
+        # keypair restart), the keypair's _next_leaf may not have been
+        # advanced past those txs' leaves.  Advance past any such leaves
+        # BEFORE reading expected_proposer_leaf — otherwise the state
+        # root is computed with a stale leaf index and validators reject.
+        proposer_id = proposer_entity.entity_id
+        for tx_list in (
+            transactions,
+            transfer_transactions or [],
+            slash_transactions or [],
+            governance_txs or [],
+            authority_txs or [],
+            stake_transactions or [],
+            unstake_transactions or [],
+            registration_transactions or [],
+        ):
+            for tx in tx_list:
+                tx_entity = getattr(tx, "entity_id", None)
+                if tx_entity == proposer_id:
+                    sig = getattr(tx, "signature", None) or getattr(tx, "registration_proof", None)
+                    if sig is not None and hasattr(sig, "leaf_index"):
+                        proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
         # The proposer's next signature will consume _next_leaf from their
         # keypair.  Read it BEFORE computing the state root so the sim
         # knows which watermark-bump the apply path will make after the

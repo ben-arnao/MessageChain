@@ -304,6 +304,22 @@ class ProofOfStake:
             mempool_snapshot_root=snapshot_root,
         )
 
+        # Guard against WOTS+ leaf reuse: if the proposer also has
+        # transactions in this block (signed earlier, possibly before a
+        # keypair restart), the keypair's _next_leaf may not have been
+        # advanced past those txs' leaves.  Scan all tx lists for the
+        # proposer's entity_id and advance past the highest used leaf to
+        # guarantee the header signature gets a fresh leaf.
+        proposer_id = proposer_entity.entity_id
+        for tx_list in (txs, transfer_txs, slash_txs, gov_txs,
+                        auth_txs, stake_txs, unstake_txs, registration_txs):
+            for tx in tx_list:
+                tx_entity = getattr(tx, "entity_id", None)
+                if tx_entity == proposer_id:
+                    sig = getattr(tx, "signature", None) or getattr(tx, "registration_proof", None)
+                    if sig is not None and hasattr(sig, "leaf_index"):
+                        proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
+
         # Proposer signs the block header. randao_mix is excluded from
         # signable_data to break a circular dependency (the mix is derived
         # from this very signature) but is bound to the block via _compute_hash.
