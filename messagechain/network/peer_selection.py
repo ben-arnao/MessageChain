@@ -163,10 +163,13 @@ class PeerSelector:
         if not candidates:
             return None
 
+        # Count subnets in current outbound set.  Private/loopback peers
+        # still contribute to the subnet count for diversity *preference*
+        # scoring (so a selector with one 10.1.x.x peer still prefers a
+        # 10.2.x.x candidate over another 10.1.x.x one).  Private IPs only
+        # bypass the hard saturation cap, not the soft diversity preference.
         current_subnets: dict[str, int] = {}
         for ip, _port in current_outbound:
-            if _is_private_or_loopback(ip):
-                continue
             subnet = get_subnet(ip)
             current_subnets[subnet] = current_subnets.get(subnet, 0) + 1
 
@@ -176,17 +179,14 @@ class PeerSelector:
         tier_saturated: list[tuple[str, int]] = []         # subnet at max
 
         for candidate in candidates:
-            ip, port = candidate
-            if _is_private_or_loopback(ip):
-                # Private IPs bypass — always best tier
-                tier_new_subnet.append(candidate)
-                continue
-
+            ip, _port = candidate
             subnet = get_subnet(ip)
             count = current_subnets.get(subnet, 0)
             if count == 0:
                 tier_new_subnet.append(candidate)
-            elif count < MAX_PEERS_PER_SUBNET:
+            elif count < MAX_PEERS_PER_SUBNET or _is_private_or_loopback(ip):
+                # Private IPs never hit the saturated tier — they always
+                # remain at least unsaturated (bypass the hard cap).
                 tier_unsaturated.append(candidate)
             else:
                 tier_saturated.append(candidate)
