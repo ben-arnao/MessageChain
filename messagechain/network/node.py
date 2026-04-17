@@ -44,6 +44,7 @@ from messagechain.network.addrman import AddressManager
 from messagechain.network.anchor import AnchorStore
 from messagechain.network.sync import ChainSyncer
 from messagechain.network.peer_selection import PeerSelector
+from messagechain.network.tls import CertificatePinStore, verify_peer_certificate
 
 # Plausibility cap on peer-reported cumulative weight. A peer can legitimately
 # be ahead of us, but not by more than this multiplier — otherwise they're
@@ -118,6 +119,20 @@ class Node:
             else os.path.join(os.getcwd(), "anchors.json")
         )
         self.anchor_store = AnchorStore(anchor_path)
+
+        # TOFU certificate pin store — records SHA-256 fingerprints of
+        # peer TLS certs on first sight and detects changes on reconnect.
+        # Defense-in-depth against TLS-layer MITM (application-layer signed
+        # handshakes handle peer identity, but a MITM on the transport
+        # could still tamper with framing/backpressure). Persists under
+        # data_dir when provided; otherwise in-memory only.
+        pin_path = (
+            os.path.join(data_dir, "peer_pins.json") if data_dir else None
+        )
+        self.pin_store = CertificatePinStore(pin_path)
+        # __init__ already loads if the file exists; keep an explicit call
+        # for defensive clarity and so tests can round-trip save/load.
+        self.pin_store.load()
 
         # IBD / sync — receives trusted checkpoints + a misbehavior callback
         # so checkpoint violations and stalls are actually penalized.
@@ -472,6 +487,56 @@ class Node:
             self._mempool_requested_hashes.pop(address, None)
             writer.close()
 
+    def _verify_and_pin_peer_tls(self, writer, host: str, port: int) -> bool:
+        """Apply TOFU certificate pinning to an outbound connection.
+
+        Returns True when:
+          - the connection is not TLS-wrapped (plain TCP; no cert to pin), OR
+          - the peer's cert fingerprint is first-seen (records a pin), OR
+          - the peer's cert fingerprint matches the stored pin.
+
+        Returns False when the peer presents a DIFFERENT cert than the one
+        previously pinned for (host, port) — a possible MITM.  On first
+        pin, persists the updated pin store to disk (best-effort).
+
+        Defense-in-depth: the blockchain already authenticates peer
+        identity via the signed application-layer HANDSHAKE.  This
+        catches active network-layer MITM that swaps the TLS cert while
+        letting the blockchain handshake pass through intact.
+        """
+        # asyncio's writer.get_extra_info returns None when the transport
+        # is not SSL-wrapped.  In that (current) case we skip pinning
+        # entirely — there is no TLS identity to pin — but we still
+        # return True so the caller proceeds with the plain-TCP connection.
+        try:
+            ssl_obj = writer.get_extra_info("ssl_object")
+        except Exception:
+            ssl_obj = None
+        if ssl_obj is None:
+            return True
+
+        had_pin = self.pin_store.get(host, port) is not None
+        ok = verify_peer_certificate(ssl_obj, host, port, self.pin_store)
+        if ok and not had_pin:
+            # First-seen: TOFU just recorded a new pin.  Persist so
+            # subsequent restarts still catch a mid-lifecycle MITM.
+            try:
+                self.pin_store.save()
+            except Exception as e:
+                logger.debug(f"Failed to save pin store for {host}:{port}: {e}")
+        elif not ok:
+            # Cert changed — loud warning.  We don't auto-ban: TLS cert
+            # rotation is legitimate for long-lived peers, and a ban here
+            # would tempt operators to disable the check entirely.  The
+            # caller closes the connection; re-pinning requires explicit
+            # operator action (clear_pin).
+            logger.warning(
+                f"TLS pin mismatch for peer {host}:{port} — possible MITM. "
+                f"Closing connection; run clear_pin({host!r}, {port}) to "
+                f"accept a rotated certificate."
+            )
+        return ok
+
     async def _connect_to_peer(self, host: str, port: int):
         """Connect to a peer node."""
         addr = f"{host}:{port}"
@@ -491,6 +556,14 @@ class Node:
                 asyncio.open_connection(host, port),
                 timeout=HANDSHAKE_TIMEOUT,
             )
+            # TOFU pin check runs right after the transport is up. When
+            # TLS is active this verifies the peer's cert matches the
+            # first-seen fingerprint (or pins it on first sight). When
+            # the transport is plain TCP this is a no-op returning True.
+            if not self._verify_and_pin_peer_tls(writer, host, port):
+                writer.close()
+                return
+
             # Decide what kind of outbound peer this is (full-relay vs
             # block-relay-only) based on how many slots are already filled.
             conn_type = self._next_connection_type()
