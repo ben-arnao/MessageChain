@@ -7,8 +7,8 @@ at the bottom so the top of the file is always "what's left."
 ## Current state (as of 2026-04-17)
 
 - **Testnet:** single validator running remotely on a GCP VM.
-- **Mode:** pre-mainnet. Genesis hash is not yet pinned in `messagechain/config.py`.
-- **Profile:** `MESSAGECHAIN_PROFILE=prototype` on the VM (dev-scale bundle: 30s blocks, tree height 16, checkpoints waived, RPC auth off).
+- **Mode:** pre-mainnet. `NETWORK_NAME = "testnet"` selects `_TESTNET_GENESIS_HASH`. `_MAINNET_GENESIS_HASH` is still `None` — flipping `NETWORK_NAME` to `"mainnet"` without setting it raises at config load.
+- **Profile:** `MESSAGECHAIN_PROFILE=prototype` on the VM (dev-scale bundle: 30s blocks, tree height 16, checkpoints waived, RPC auth off). The shipped systemd unit no longer bakes this in — operators install `messagechain-validator-prototype.conf.example` as a drop-in to opt into prototype mode.
 - **Clients:** seed endpoint list in `CLIENT_SEED_ENDPOINTS` points only at the test VM.
 
 ---
@@ -110,7 +110,8 @@ Requirements:
 ### Genesis & chain config
 
 - [ ] Final genesis parameters agreed (supply, initial allocations, fee schedule).
-- [ ] Mint mainnet genesis, pin its hash in `messagechain/config.py::PINNED_GENESIS_HASH`, commit, tag release.
+- [ ] Mint mainnet genesis, set `_MAINNET_GENESIS_HASH` in `messagechain/config.py` to the resulting block-0 hash, commit, tag release. (Do not flip `NETWORK_NAME` to `"mainnet"` until this is done — config will refuse to load.)
+- [ ] Flip `NETWORK_NAME` from `"testnet"` to `"mainnet"`, commit, tag release.
 - [ ] Freeze `CLIENT_SEED_ENDPOINTS` to the initial mainnet seed set.
 
 ### Security review
@@ -165,4 +166,6 @@ Requirements:
 
 ## Done
 
-_(move completed items here with the date they landed)_
+- **2026-04-17 — Keypair cache no longer pickle-based.** Replaced `pickle.load`/`pickle.dump` in `server.py` with HMAC-SHA3-256-authenticated JSON keyed on the validator's private key. A planted file (malware, restored backup, stray `cp`) can no longer execute arbitrary code as the validator user. Regression tests in [tests/test_keypair_cache_versioning.py](../tests/test_keypair_cache_versioning.py) pin the format and prove a planted pickle does not deserialize.
+- **2026-04-17 — `PINNED_GENESIS_HASH` gated on `NETWORK_NAME` selector.** Cutting mainnet now requires two explicit edits (set `_MAINNET_GENESIS_HASH`, flip `NETWORK_NAME`); doing the second without the first raises at config load. A clone of the repo can no longer accidentally trust a testnet hash on mainnet.
+- **2026-04-17 — Production systemd unit purged of dev-time overrides.** Default unit ships with no `MESSAGECHAIN_PROFILE=prototype` (=production posture) and adds `StartLimitBurst` for crash-loop protection. Prototype-phase deployments install the new `messagechain-validator-prototype.conf.example` drop-in. A copy-paste install no longer silently runs in degraded mode.
