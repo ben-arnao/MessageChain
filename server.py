@@ -1243,23 +1243,28 @@ class Server:
             sleep_seconds = block_producer.next_wake_seconds(self.blockchain)
             await asyncio.sleep(sleep_seconds)
 
-    async def _try_produce_block(self):
-        """One iteration of block production. Build and broadcast if we
-        are the selected proposer for the current slot+round."""
+    def _try_produce_block_sync(self):
+        """CPU-bound block production (runs in thread pool).
+
+        Returns (block, success, reason, round_number) if a block was
+        proposed, or None if this node should not propose right now.
+        All CPU-heavy work (WOTS+ signing, state root, validation) lives
+        here so it can run off the event loop via asyncio.to_thread().
+        """
         from messagechain.consensus import block_producer
 
         if self.syncer.is_syncing:
-            return
+            return None
 
         # Need a full entity (with keypair) to sign blocks
         if self.wallet_entity is None or self.wallet_id not in self.blockchain.public_keys:
-            return
+            return None
 
         ok, round_number, _reason = block_producer.should_propose(
             self.blockchain, self.consensus, self.wallet_id,
         )
         if not ok:
-            return
+            return None
 
         # Build the block. Empty mempool is fine — empty blocks carry
         # attestations and advance block-denominated timers.
@@ -1338,14 +1343,30 @@ class Server:
                 f"reward: {self.blockchain.supply.calculate_block_reward(block.header.block_number)} | "
                 f"wallet balance: {balance}"
             )
-            await self._broadcast_block(block)
         else:
-            logger.warning(f"Failed to add proposed block: {reason}")
             if block_producer.is_clock_skew_reason(reason):
                 logger.warning(
+                    f"Failed to add proposed block: {reason}. "
                     "This may indicate your system clock is out of sync. "
                     "Check your OS time settings."
                 )
+            else:
+                logger.warning(f"Failed to add proposed block: {reason}")
+
+        return (block, success, reason, round_number)
+
+    async def _try_produce_block(self):
+        """One iteration of block production. Offloads CPU-bound work
+        (WOTS+ signing, state root, validation) to a thread pool so
+        the asyncio event loop stays responsive for RPC handlers."""
+
+        result = await asyncio.to_thread(self._try_produce_block_sync)
+        if result is None:
+            return
+
+        block, success, reason, round_number = result
+        if success:
+            await self._broadcast_block(block)
 
     # ── Sync Loop ────────────────────────────────────────────────
 
