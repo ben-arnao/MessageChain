@@ -1016,11 +1016,9 @@ class Blockchain:
         Must be called after loading from DB so that the consensus module
         has accurate stake data (prevents falling into permissive bootstrap mode).
         """
-        from messagechain.consensus.pos import graduated_min_stake
-        height = block_height if block_height is not None else self.height
-        min_stake = graduated_min_stake(height)
+        from messagechain.config import VALIDATOR_MIN_STAKE
         for entity_id, amount in self.supply.staked.items():
-            if amount >= min_stake:
+            if amount >= VALIDATOR_MIN_STAKE:
                 consensus.stakes[entity_id] = amount
 
     def get_latest_block(self) -> Block | None:
@@ -1033,8 +1031,8 @@ class Blockchain:
         round `round_number`, using the chain's own supply.staked as the
         authoritative stake state.
 
-        Returns None when no validator meets the graduated minimum stake
-        — that indicates bootstrap mode, and validate_block skips the
+        Returns None when no validator meets the minimum stake — that
+        indicates bootstrap mode, and validate_block skips the
         proposer-match check so any registered entity may propose.
 
         This mirrors ProofOfStake.select_proposer but lives on Blockchain
@@ -1044,16 +1042,15 @@ class Blockchain:
         selection algorithm byte-for-byte.
         """
         import struct
-        from messagechain.consensus.pos import graduated_min_stake
+        from messagechain.config import VALIDATOR_MIN_STAKE
 
         height = parent.header.block_number + 1
-        min_stake = graduated_min_stake(height)
         # Slashed validators already have staked[eid] = 0, so the
         # min_stake filter excludes them implicitly.
         stakes = {
             eid: amt
             for eid, amt in self.supply.staked.items()
-            if amt >= min_stake
+            if amt >= VALIDATOR_MIN_STAKE
         }
         if not stakes:
             return None  # bootstrap mode — no enforcement

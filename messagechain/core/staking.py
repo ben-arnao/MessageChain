@@ -314,9 +314,7 @@ def verify_stake_transaction(
 
     `min_stake_override`: if provided, the caller (typically Blockchain,
     which has access to `bootstrap_progress`) dictates the minimum stake
-    amount.  When None, falls back to the legacy height-tier table
-    (graduated_min_stake) for backward compatibility with tests that do
-    not drive a full blockchain context.
+    amount.  When None, falls back to the flat VALIDATOR_MIN_STAKE.
     """
     if tx.amount <= 0:
         return False
@@ -324,8 +322,8 @@ def verify_stake_transaction(
         if tx.amount < min_stake_override:
             return False
     else:
-        from messagechain.consensus.pos import graduated_min_stake
-        if tx.amount < graduated_min_stake(block_height):
+        from messagechain.config import VALIDATOR_MIN_STAKE
+        if tx.amount < VALIDATOR_MIN_STAKE:
             return False
     if tx.fee < MIN_FEE:
         return False

@@ -1,19 +1,19 @@
-"""Three-seed local bootstrap rehearsal.
+"""Single-seed local bootstrap rehearsal.
 
-Exercises the `bootstrap_seed_local` orchestration on a 3-validator
+Exercises the `bootstrap_seed_local` orchestration on a 1-validator
 genesis allocation with a separate cold-wallet entity, then asserts
 every security-critical post-condition:
 
-1. All three seeds registered on chain.
-2. All three seeds have authority_key == cold wallet public key.
-3. All three seeds have the expected stake locked.
+1. The seed is registered on chain.
+2. The seed has authority_key == cold wallet public key.
+3. The seed has the expected stake locked.
 4. A simulated hot-key compromise CANNOT unstake (authority-gated).
-5. Block production + finality work with the 3-seed set post-bootstrap.
+5. Block production works with the seed post-bootstrap.
 6. Re-running bootstrap is idempotent.
 
-These are the same checks the production runbook has to make on real
-servers.  Passing this rehearsal does not prove the remote-RPC path is
-correct — it proves the orchestration sequence and post-condition
+These are the same checks the production runbook has to make on the
+real server.  Passing this rehearsal does not prove the remote-RPC path
+is correct -- it proves the orchestration sequence and post-condition
 checks are correct, which is the step people actually get wrong.
 """
 
@@ -39,21 +39,12 @@ WALLET_LIQUID = 5_000
 def _build_entities():
     """Generate entities the operator would generate offline.
 
-    Three seed hot-keys PLUS three distinct cold-authority keys — one per
-    seed — because the chain enforces uniqueness on authority keys across
-    entities (see Blockchain.validate_set_authority_key).  Using one cold
-    key for all seeds would let a chain observer collapse all three
-    seeds' trust into a single key anyway, so per-seed cold keys are also
-    better security: compromising one cold key compromises one seed, not
-    the whole validator set.  Store all three cold mnemonics in the safe.
+    One seed hot-key PLUS one distinct cold-authority key.  Store the
+    cold mnemonic in the safe.
     """
     return {
         "seed1": Entity.create(b"rehearsal-seed-1".ljust(32, b"\x00")),
-        "seed2": Entity.create(b"rehearsal-seed-2".ljust(32, b"\x00")),
-        "seed3": Entity.create(b"rehearsal-seed-3".ljust(32, b"\x00")),
         "cold1": Entity.create(b"rehearsal-cold-1".ljust(32, b"\x00")),
-        "cold2": Entity.create(b"rehearsal-cold-2".ljust(32, b"\x00")),
-        "cold3": Entity.create(b"rehearsal-cold-3".ljust(32, b"\x00")),
     }
 
 
@@ -65,29 +56,22 @@ def _build_four_entities():
 def _fresh_chain(entities: dict) -> Blockchain:
     """Initialise a chain with the genesis allocation table.
 
-    Matches the production runbook: treasury gets 4%, each seed gets its
-    stake amount pre-allocated as liquid balance.  Cold-wallet entities
-    are NOT allocated on chain and NOT registered — they live off-chain
-    entirely; only their public keys are pointed at as authority keys.
-    The operator can fund a cold wallet separately later by transferring
-    rewards from the seeds.
+    Matches the production runbook: treasury gets 4%, the seed gets its
+    stake amount pre-allocated as liquid balance.  Cold-wallet entity
+    is NOT allocated on chain and NOT registered -- it lives off-chain
+    entirely; only its public key is pointed at as authority key.
     """
     chain = Blockchain()
     allocation = {
         TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
         entities["seed1"].entity_id: SEED_GENESIS,
-        entities["seed2"].entity_id: SEED_GENESIS,
-        entities["seed3"].entity_id: SEED_GENESIS,
     }
-    # initialize_genesis registers the first entity and credits allocations.
-    # We pass seed1 so it becomes the genesis proposer; the allocation
-    # table handles the rest of the funding.
     chain.initialize_genesis(entities["seed1"], allocation_table=allocation)
     return chain
 
 
 class TestBootstrapRehearsal(unittest.TestCase):
-    """End-to-end bootstrap of 3 seeds against a real Blockchain."""
+    """End-to-end bootstrap of 1 seed against a real Blockchain."""
 
     def setUp(self):
         self.entities = _build_entities()
@@ -95,17 +79,14 @@ class TestBootstrapRehearsal(unittest.TestCase):
         for e in self.entities.values():
             e.keypair._next_leaf = 0
         self.chain = _fresh_chain(self.entities)
-        # Map each seed to its unique cold key.
         self.cold_pks = {
             "seed1": self.entities["cold1"].public_key,
-            "seed2": self.entities["cold2"].public_key,
-            "seed3": self.entities["cold3"].public_key,
         }
 
     def _bootstrap_all(self):
-        """Run bootstrap_seed_local for each of the 3 seeds."""
+        """Run bootstrap_seed_local for the seed."""
         results = {}
-        for name in ("seed1", "seed2", "seed3"):
+        for name in ("seed1",):
             ok, log = bootstrap_seed_local(
                 self.chain,
                 self.entities[name],
@@ -115,7 +96,7 @@ class TestBootstrapRehearsal(unittest.TestCase):
             results[name] = (ok, log)
         return results
 
-    def test_all_three_seeds_bootstrap_cleanly(self):
+    def test_seed_bootstraps_cleanly(self):
         results = self._bootstrap_all()
         for name, (ok, log) in results.items():
             self.assertTrue(ok, f"{name} bootstrap failed:\n" + "\n".join(log))
@@ -124,38 +105,35 @@ class TestBootstrapRehearsal(unittest.TestCase):
                 f"{name} log missing completion marker",
             )
 
-    def test_all_seeds_registered_after_bootstrap(self):
+    def test_seed_registered_after_bootstrap(self):
         self._bootstrap_all()
-        for name in ("seed1", "seed2", "seed3"):
-            eid = self.entities[name].entity_id
-            self.assertIn(eid, self.chain.public_keys, f"{name} not registered")
+        eid = self.entities["seed1"].entity_id
+        self.assertIn(eid, self.chain.public_keys, "seed1 not registered")
 
-    def test_all_seeds_have_cold_authority_key(self):
+    def test_seed_has_cold_authority_key(self):
         """The single most important post-condition: hot key is NOT its
         own authority.  Otherwise unstake/revoke would only need the hot
         key, defeating the whole cold-key split."""
         self._bootstrap_all()
-        for name in ("seed1", "seed2", "seed3"):
-            eid = self.entities[name].entity_id
-            authority = self.chain.get_authority_key(eid)
-            self.assertEqual(
-                authority, self.cold_pks[name],
-                f"{name} authority key is NOT the matching cold key — "
-                f"hot-key compromise would be fatal",
-            )
-            self.assertNotEqual(
-                authority, self.entities[name].public_key,
-                f"{name} authority key is still the hot signing key",
-            )
+        eid = self.entities["seed1"].entity_id
+        authority = self.chain.get_authority_key(eid)
+        self.assertEqual(
+            authority, self.cold_pks["seed1"],
+            "seed1 authority key is NOT the matching cold key -- "
+            "hot-key compromise would be fatal",
+        )
+        self.assertNotEqual(
+            authority, self.entities["seed1"].public_key,
+            "seed1 authority key is still the hot signing key",
+        )
 
-    def test_all_seeds_staked_to_target(self):
+    def test_seed_staked_to_target(self):
         self._bootstrap_all()
-        for name in ("seed1", "seed2", "seed3"):
-            eid = self.entities[name].entity_id
-            self.assertEqual(
-                self.chain.supply.get_staked(eid), SEED_STAKE,
-                f"{name} stake != {SEED_STAKE}",
-            )
+        eid = self.entities["seed1"].entity_id
+        self.assertEqual(
+            self.chain.supply.get_staked(eid), SEED_STAKE,
+            f"seed1 stake != {SEED_STAKE}",
+        )
 
     def test_hot_key_cannot_unstake_after_bootstrap(self):
         """Simulate a compromised validator server: the attacker has the
@@ -166,20 +144,15 @@ class TestBootstrapRehearsal(unittest.TestCase):
         self._bootstrap_all()
 
         seed1 = self.entities["seed1"]
-        # Nonce after Step 2 (set-authority-key) advanced the nonce by 1.
-        # Fetch the current nonce from chain state to be safe.
         current_nonce = self.chain.nonces.get(seed1.entity_id, 0)
 
-        # Attacker signs an unstake with the HOT key (what they'd have
-        # if they compromised the validator server).
+        # Attacker signs an unstake with the HOT key.
         malicious_unstake = create_unstake_transaction(
             seed1, amount=SEED_STAKE, nonce=current_nonce,
         )
 
-        # The chain should reject this because the authority key (cold)
-        # is what's required to sign unstake, not the hot key.
         from messagechain.core.staking import verify_unstake_transaction
-        # Verify directly against the authority (cold) key — must FAIL
+        # Verify directly against the authority (cold) key -- must FAIL
         self.assertFalse(
             verify_unstake_transaction(malicious_unstake, self.cold_pks["seed1"]),
             "Unstake signed by hot key must not verify under cold authority",
@@ -190,27 +163,18 @@ class TestBootstrapRehearsal(unittest.TestCase):
             "Unstake tx is well-formed; the defense is ONLY the key mismatch",
         )
 
-    def test_blocks_can_be_produced_by_bootstrapped_seeds(self):
+    def test_blocks_can_be_produced_by_bootstrapped_seed(self):
         """Smoke: after bootstrap, the chain can still produce blocks
-        proposed by the staked seeds.  Proves we didn't break block
-        production during orchestration."""
+        proposed by the staked seed."""
         self._bootstrap_all()
 
         consensus = ProofOfStake()
-        for name in ("seed1", "seed2", "seed3"):
-            eid = self.entities[name].entity_id
-            consensus.stakes[eid] = SEED_STAKE
+        eid = self.entities["seed1"].entity_id
+        consensus.stakes[eid] = SEED_STAKE
 
-        # Pick the deterministically-selected proposer for the next slot.
         latest = self.chain.get_latest_block()
         selected = self.chain._selected_proposer_for_slot(latest, round_number=0)
-        proposer_entity = None
-        for name in ("seed1", "seed2", "seed3"):
-            if self.entities[name].entity_id == selected:
-                proposer_entity = self.entities[name]
-                break
-        if proposer_entity is None:
-            proposer_entity = self.entities["seed1"]  # bootstrap fallback
+        proposer_entity = self.entities["seed1"]
 
         block = self.chain.propose_block(consensus, proposer_entity, [])
         ok, reason = self.chain.add_block(block)
@@ -218,18 +182,16 @@ class TestBootstrapRehearsal(unittest.TestCase):
 
     def test_bootstrap_is_idempotent(self):
         """Re-running bootstrap after a partial success must not double-
-        charge fees, double-stake, or otherwise drift.  This matters
-        when an operator retries after a transient failure."""
+        charge fees, double-stake, or otherwise drift."""
         self._bootstrap_all()
         snapshot = {
-            name: (
-                self.chain.supply.get_staked(self.entities[name].entity_id),
-                self.chain.get_authority_key(self.entities[name].entity_id),
-                self.chain.supply.get_balance(self.entities[name].entity_id),
-            )
-            for name in ("seed1", "seed2", "seed3")
+            "seed1": (
+                self.chain.supply.get_staked(self.entities["seed1"].entity_id),
+                self.chain.get_authority_key(self.entities["seed1"].entity_id),
+                self.chain.supply.get_balance(self.entities["seed1"].entity_id),
+            ),
         }
-        # Second pass — every step should detect "already done" and skip.
+        # Second pass -- every step should detect "already done" and skip.
         results = self._bootstrap_all()
         for name, (ok, log) in results.items():
             self.assertTrue(ok, f"{name} second pass failed")
@@ -237,25 +199,21 @@ class TestBootstrapRehearsal(unittest.TestCase):
                 any("skipping" in line for line in log),
                 f"{name} second pass didn't skip any step",
             )
-        for name in ("seed1", "seed2", "seed3"):
-            eid = self.entities[name].entity_id
-            now = (
-                self.chain.supply.get_staked(eid),
-                self.chain.get_authority_key(eid),
-                self.chain.supply.get_balance(eid),
-            )
-            self.assertEqual(
-                snapshot[name], now,
-                f"{name} state drifted on second bootstrap pass",
-            )
+        eid = self.entities["seed1"].entity_id
+        now = (
+            self.chain.supply.get_staked(eid),
+            self.chain.get_authority_key(eid),
+            self.chain.supply.get_balance(eid),
+        )
+        self.assertEqual(
+            snapshot["seed1"], now,
+            "seed1 state drifted on second bootstrap pass",
+        )
 
     def test_bootstrap_fails_loudly_on_insufficient_balance(self):
-        """If someone mis-configures the genesis allocation so a seed
+        """If someone mis-configures the genesis allocation so the seed
         doesn't have enough liquid balance to stake, bootstrap MUST fail
-        loudly — not silently run with a smaller stake."""
-        # Leave enough for the set-authority-key fee so we fail at the
-        # stake step, not earlier.  This mimics an under-budgeted genesis
-        # allocation that covers fees but not the full stake amount.
+        loudly -- not silently run with a smaller stake."""
         self.chain.supply.balances[self.entities["seed1"].entity_id] = MIN_FEE * 5
         ok, log = bootstrap_seed_local(
             self.chain,

@@ -224,7 +224,7 @@ class TestReputationBlockchainIntegration(unittest.TestCase):
     unit-level but actually connected to attestation flow.
     """
 
-    def _make_chain_with_seeds(self, num_seeds: int = 3):
+    def _make_chain_with_seeds(self):
         from messagechain.identity.identity import Entity
         from messagechain.core.blockchain import Blockchain
         from messagechain.core.bootstrap import build_launch_allocation
@@ -232,8 +232,7 @@ class TestReputationBlockchainIntegration(unittest.TestCase):
         from tests import register_entity_for_test
 
         seeds = [
-            Entity.create(f"rlx-seed-{i}".encode().ljust(32, b"\x00"))
-            for i in range(num_seeds)
+            Entity.create(b"rlx-seed-0".ljust(32, b"\x00")),
         ]
         for s in seeds:
             s.keypair._next_leaf = 0
@@ -243,8 +242,6 @@ class TestReputationBlockchainIntegration(unittest.TestCase):
             stake_per_seed=100_000, fee_buffer=0,
         )
         chain.initialize_genesis(seeds[0], allocation_table=allocation)
-        for s in seeds[1:]:
-            register_entity_for_test(chain, s)
         for s in seeds:
             chain.supply.stake(s.entity_id, 100_000)
         consensus = ProofOfStake()
