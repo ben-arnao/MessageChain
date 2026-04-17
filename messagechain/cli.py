@@ -670,14 +670,14 @@ def _load_key_from_file(path: str) -> bytes:
     except InvalidKeyFormatError as e:
         raise KeyFileError(f"Key file has invalid format: {path}: {e}")
 
-    # Warn about permissive permissions (POSIX only — Windows stat is different).
+    # Reject permissive permissions (POSIX only — Windows stat is different).
     if hasattr(os, "getuid"):
         try:
             mode = os.stat(path).st_mode
             if mode & (stat.S_IRGRP | stat.S_IROTH | stat.S_IWGRP | stat.S_IWOTH):
-                print(
-                    f"WARNING: key file {path} is readable by group/others. "
-                    "Recommended: chmod 0600 to restrict access."
+                raise KeyFileError(
+                    f"Key file {path} is readable by group/others (mode {oct(mode)}). "
+                    f"Fix with: chmod 600 {path}"
                 )
         except OSError:
             pass

@@ -18,6 +18,7 @@ import getpass
 
 from messagechain.identity.identity import Entity
 from messagechain.core.transaction import create_transaction
+from messagechain.validation import safe_json_loads
 
 
 def rpc_call(host: str, port: int, method: str, params: dict) -> dict:
@@ -39,7 +40,7 @@ def rpc_call(host: str, port: int, method: str, params: dict) -> dict:
         if length > MAX_RESPONSE_LENGTH:
             raise ValueError(f"Response too large: {length} bytes (max {MAX_RESPONSE_LENGTH})")
         data = _recv_exact(sock, length)
-        return json.loads(data.decode("utf-8"))
+        return safe_json_loads(data.decode("utf-8"), max_depth=32)
     finally:
         sock.close()
 
