@@ -14,6 +14,7 @@ Now supports:
 - Chain reorganization — rolls back and replays when a better fork appears
 """
 
+import copy
 import hashlib
 import logging
 import time as _time
@@ -2035,8 +2036,7 @@ class Blockchain:
             }
             _inactive = _giv(_expected, _actual)
             if _inactive:
-                from messagechain.consensus.pos import graduated_min_stake as _gms
-                _ms = _gms(block_height)
+                from messagechain.config import VALIDATOR_MIN_STAKE as _ms
                 _ail(sim_staked, sim_blocks_since_fin, _inactive, min_stake=_ms)
 
         return compute_state_root(
@@ -3875,13 +3875,12 @@ class Blockchain:
             actual = {att.validator_id for att in block.attestations}
             inactive = get_inactive_validators(expected, actual)
             if inactive:
-                from messagechain.consensus.pos import graduated_min_stake
-                min_stake = graduated_min_stake(block.header.block_number)
+                from messagechain.config import VALIDATOR_MIN_STAKE
                 total_burned, deactivated = apply_inactivity_leak(
                     self.supply.staked,
                     self.blocks_since_last_finalization,
                     inactive,
-                    min_stake=min_stake,
+                    min_stake=VALIDATOR_MIN_STAKE,
                 )
                 if total_burned > 0:
                     self.supply.total_supply -= total_burned
@@ -4516,13 +4515,14 @@ class Blockchain:
             "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
             "blocks_since_last_finalization": self.blocks_since_last_finalization,
         }
-        # Snapshot governance state if tracker is attached
+        # Snapshot governance state if tracker is attached.
+        # deepcopy the full proposals dict so that nested mutation on a
+        # later fork (e.g., new votes, flipped votes, updated
+        # stake_snapshot) cannot leak through the rollback boundary.
+        # Reorgs are rare, so correctness over performance here.
         if hasattr(self, "governance") and self.governance is not None:
             gov = self.governance
-            snapshot["gov_proposals"] = {
-                pid: (dict(ps.votes), ps.created_at_block)
-                for pid, ps in gov.proposals.items()
-            }
+            snapshot["gov_proposals"] = copy.deepcopy(gov.proposals)
             snapshot["gov_executed_treasury_spends"] = set(gov._executed_treasury_spends)
         return snapshot
 
@@ -4566,10 +4566,17 @@ class Blockchain:
                 eid: list(entries)
                 for eid, entries in snapshot["pending_unstakes"].items()
             }
-        # Restore governance state if tracker is attached and was snapshotted
+        # Restore governance state if tracker is attached and was snapshotted.
+        # deepcopy again on the way out so the snapshot itself is not
+        # aliased with live state — a subsequent failed reorg could
+        # otherwise mutate the stored dict through the restored reference.
         if hasattr(self, "governance") and self.governance is not None:
+            if "gov_proposals" in snapshot:
+                self.governance.proposals = copy.deepcopy(snapshot["gov_proposals"])
             if "gov_executed_treasury_spends" in snapshot:
-                self.governance._executed_treasury_spends = snapshot["gov_executed_treasury_spends"]
+                self.governance._executed_treasury_spends = set(
+                    snapshot["gov_executed_treasury_spends"],
+                )
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
         """Total WOTS+ leaves consumed by this entity across ALL signature types.
