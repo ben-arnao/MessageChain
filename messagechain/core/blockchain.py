@@ -809,9 +809,10 @@ class Blockchain:
         if not ok:
             return False, reason
 
-        self.supply.pay_fee_with_burn(
+        if not self.supply.pay_fee_with_burn(
             tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
-        )
+        ):
+            return False, f"Fee payment failed (fee {tx.fee} vs base_fee {self.supply.base_fee})"
         self.authority_keys[tx.entity_id] = tx.new_authority_key
         self.nonces[tx.entity_id] = tx.nonce + 1
         self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
@@ -854,9 +855,10 @@ class Blockchain:
         if not ok:
             return False, reason
 
-        self.supply.pay_fee_with_burn(
+        if not self.supply.pay_fee_with_burn(
             tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
-        )
+        ):
+            return False, f"Fee payment failed (fee {tx.fee} vs base_fee {self.supply.base_fee})"
 
         # Push all active stake into the 7-day unbonding queue. Do NOT
         # release it immediately — in-flight slashing evidence must still
@@ -1257,7 +1259,8 @@ class Blockchain:
             return False, reason
 
         # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
-        self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, self.supply.base_fee)
+        if not self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, self.supply.base_fee):
+            return False, f"Fee payment failed (fee {tx.fee} vs base_fee {self.supply.base_fee})"
 
         # Rotation installs a fresh Merkle tree whose leaf indices re-count
         # from 0, independent of the old tree. Reset the watermark to 0 so
@@ -1360,7 +1363,8 @@ class Blockchain:
             return False, reason
 
         # Pay fee with burn (same as all other tx types — base fee burned, tip to proposer)
-        self.supply.pay_fee_with_burn(tx.submitter_id, proposer_id, tx.fee, self.supply.base_fee)
+        if not self.supply.pay_fee_with_burn(tx.submitter_id, proposer_id, tx.fee, self.supply.base_fee):
+            return False, f"Fee payment failed (fee {tx.fee} vs base_fee {self.supply.base_fee})"
 
         # Slash the offender: burn stake, burn bootstrap-era escrow.
         # Escrow burn happens BEFORE the stake burn returns so the
@@ -2594,6 +2598,56 @@ class Blockchain:
                     f"got {block.header.proposer_id.hex()[:16]})"
                 )
 
+        # ── Base fee gate ─────────────────────────────────────────────
+        # Every fee-bearing transaction must cover the current base_fee.
+        # Without this, transactions with MIN_FEE <= fee < base_fee pass
+        # per-tx validation but silently fail at pay_fee_with_burn time,
+        # allowing free state changes.  Check here once, before any
+        # per-type validation, so no tx type can slip through.
+        current_base_fee = self.supply.base_fee
+        for tx in block.transactions:
+            if tx.fee < current_base_fee:
+                return False, (
+                    f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                    f"fee {tx.fee} below current base_fee {current_base_fee}"
+                )
+        for ttx in block.transfer_transactions:
+            if ttx.fee < current_base_fee:
+                return False, (
+                    f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                    f"fee {ttx.fee} below current base_fee {current_base_fee}"
+                )
+        for stx in block.slash_transactions:
+            if stx.fee < current_base_fee:
+                return False, (
+                    f"Invalid slash tx {stx.tx_hash.hex()[:16]}: "
+                    f"fee {stx.fee} below current base_fee {current_base_fee}"
+                )
+        for gtx in block.governance_txs:
+            if gtx.fee < current_base_fee:
+                return False, (
+                    f"Invalid governance tx {gtx.tx_hash.hex()[:16]}: "
+                    f"fee {gtx.fee} below current base_fee {current_base_fee}"
+                )
+        for atx in getattr(block, "authority_txs", []):
+            if atx.fee < current_base_fee:
+                return False, (
+                    f"Invalid authority tx {atx.tx_hash.hex()[:16]}: "
+                    f"fee {atx.fee} below current base_fee {current_base_fee}"
+                )
+        for stx in getattr(block, "stake_transactions", []):
+            if stx.fee < current_base_fee:
+                return False, (
+                    f"Invalid stake tx {stx.tx_hash.hex()[:16]}: "
+                    f"fee {stx.fee} below current base_fee {current_base_fee}"
+                )
+        for utx in getattr(block, "unstake_transactions", []):
+            if utx.fee < current_base_fee:
+                return False, (
+                    f"Invalid unstake tx {utx.tx_hash.hex()[:16]}: "
+                    f"fee {utx.fee} below current base_fee {current_base_fee}"
+                )
+
         # Validate all transactions, tracking nonce and balance increments
         # within the block to prevent duplicate-nonce / double-spend attacks.
         pending_nonces: dict[bytes, int] = {}
@@ -3104,6 +3158,51 @@ class Blockchain:
         if block.header.randao_mix != expected_mix:
             return False, "Invalid randao_mix"
 
+        # ── Base fee gate (mirrors validate_block) ────────────────
+        current_base_fee = self.supply.base_fee
+        for tx in block.transactions:
+            if tx.fee < current_base_fee:
+                return False, (
+                    f"fee {tx.fee} below current base_fee {current_base_fee} "
+                    f"in tx {tx.tx_hash.hex()[:16]}"
+                )
+        for ttx in block.transfer_transactions:
+            if ttx.fee < current_base_fee:
+                return False, (
+                    f"fee {ttx.fee} below current base_fee {current_base_fee} "
+                    f"in transfer {ttx.tx_hash.hex()[:16]}"
+                )
+        for stx in block.slash_transactions:
+            if stx.fee < current_base_fee:
+                return False, (
+                    f"fee {stx.fee} below current base_fee {current_base_fee} "
+                    f"in slash tx {stx.tx_hash.hex()[:16]}"
+                )
+        for gtx in block.governance_txs:
+            if gtx.fee < current_base_fee:
+                return False, (
+                    f"fee {gtx.fee} below current base_fee {current_base_fee} "
+                    f"in governance tx {gtx.tx_hash.hex()[:16]}"
+                )
+        for atx in getattr(block, "authority_txs", []):
+            if atx.fee < current_base_fee:
+                return False, (
+                    f"fee {atx.fee} below current base_fee {current_base_fee} "
+                    f"in authority tx {atx.tx_hash.hex()[:16]}"
+                )
+        for stx in getattr(block, "stake_transactions", []):
+            if stx.fee < current_base_fee:
+                return False, (
+                    f"fee {stx.fee} below current base_fee {current_base_fee} "
+                    f"in stake tx {stx.tx_hash.hex()[:16]}"
+                )
+        for utx in getattr(block, "unstake_transactions", []):
+            if utx.fee < current_base_fee:
+                return False, (
+                    f"fee {utx.fee} below current base_fee {current_base_fee} "
+                    f"in unstake tx {utx.tx_hash.hex()[:16]}"
+                )
+
         # Validate transaction signatures
         for tx in block.transactions:
             if tx.entity_id not in self.public_keys:
@@ -3136,7 +3235,12 @@ class Blockchain:
             ok, _ = self.validate_set_authority_key(atx)
             if not ok:
                 return
-            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            if not self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee):
+                logger.error(
+                    f"SetAuthorityKey fee payment failed (fee {atx.fee} vs "
+                    f"base_fee {base_fee}) — skipping"
+                )
+                return
             self.authority_keys[atx.entity_id] = atx.new_authority_key
             self.nonces[atx.entity_id] = atx.nonce + 1
             self._bump_watermark(atx.entity_id, atx.signature.leaf_index)
@@ -3146,7 +3250,12 @@ class Blockchain:
             ok, _ = self.validate_revoke(atx)
             if not ok:
                 return
-            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            if not self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee):
+                logger.error(
+                    f"Revoke fee payment failed (fee {atx.fee} vs "
+                    f"base_fee {base_fee}) — skipping"
+                )
+                return
             active_stake = self.supply.get_staked(atx.entity_id)
             if active_stake > 0:
                 self.supply.unstake(
@@ -3165,7 +3274,12 @@ class Blockchain:
             ok, _ = self.validate_key_rotation(atx)
             if not ok:
                 return
-            self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee)
+            if not self.supply.pay_fee_with_burn(atx.entity_id, proposer_id, atx.fee, base_fee):
+                logger.error(
+                    f"KeyRotation fee payment failed (fee {atx.fee} vs "
+                    f"base_fee {base_fee}) — skipping"
+                )
+                return
             self.public_keys[atx.entity_id] = atx.new_public_key
             self.key_rotation_counts[atx.entity_id] = atx.rotation_number + 1
             # New Merkle tree = independent leaf namespace, so reset.
@@ -3242,7 +3356,12 @@ class Blockchain:
 
         # Apply message transaction fees (EIP-1559: burn base fee, tip to proposer)
         for tx in block.transactions:
-            self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, current_base_fee)
+            if not self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, current_base_fee):
+                logger.error(
+                    f"Message tx {tx.tx_hash.hex()[:16]} fee payment failed "
+                    f"(fee {tx.fee} vs base_fee {current_base_fee}) — skipping"
+                )
+                continue
             self.nonces[tx.entity_id] = tx.nonce + 1
             self.entity_message_count[tx.entity_id] = (
                 self.entity_message_count.get(tx.entity_id, 0) + 1
@@ -3258,7 +3377,11 @@ class Blockchain:
         # from apply_slash_transaction (which is the other entry point
         # for slashing — kept semantically identical to avoid drift).
         for stx in block.slash_transactions:
-            self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee)
+            if not self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee):
+                logger.error(
+                    f"Slash tx {stx.tx_hash.hex()[:16]} fee payment failed — skipping"
+                )
+                continue
             escrow_burned = self._escrow.slash_all(stx.evidence.offender_id)
             if escrow_burned > 0:
                 cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
@@ -3288,9 +3411,13 @@ class Blockchain:
         # sender has sufficient balance and the amount meets the graduated
         # minimum, so both calls below must succeed.
         for stx in getattr(block, "stake_transactions", []):
-            self.supply.pay_fee_with_burn(
+            if not self.supply.pay_fee_with_burn(
                 stx.entity_id, proposer_id, stx.fee, current_base_fee,
-            )
+            ):
+                logger.error(
+                    f"Stake tx {stx.tx_hash.hex()[:16]} fee payment failed — skipping"
+                )
+                continue
             staked_ok = self.supply.stake(stx.entity_id, stx.amount)
             if not staked_ok:
                 # Only reachable if validate_block was bypassed — keep a loud
@@ -3307,9 +3434,13 @@ class Blockchain:
         # the UNBONDING_PERIOD unbond queue (not immediately spendable) so
         # in-flight slashing evidence stays effective during unbonding.
         for utx in getattr(block, "unstake_transactions", []):
-            self.supply.pay_fee_with_burn(
+            if not self.supply.pay_fee_with_burn(
                 utx.entity_id, proposer_id, utx.fee, current_base_fee,
-            )
+            ):
+                logger.error(
+                    f"Unstake tx {utx.tx_hash.hex()[:16]} fee payment failed — skipping"
+                )
+                continue
             unbond_ok = self.supply.unstake(
                 utx.entity_id, utx.amount,
                 current_block=block.header.block_number,
@@ -3594,17 +3725,25 @@ class Blockchain:
         # Phase 1: register
         for gtx in block.governance_txs:
             if isinstance(gtx, (ProposalTransaction, TreasurySpendTransaction)):
-                self.supply.pay_fee_with_burn(
+                if not self.supply.pay_fee_with_burn(
                     gtx.proposer_id, proposer_id, gtx.fee, current_base_fee,
-                )
+                ):
+                    logger.error(
+                        f"Governance proposal fee payment failed — skipping"
+                    )
+                    continue
                 tracker.add_proposal(
                     gtx, block_height=current_block, supply_tracker=self.supply,
                 )
                 self._bump_watermark(gtx.proposer_id, gtx.signature.leaf_index)
             elif isinstance(gtx, VoteTransaction):
-                self.supply.pay_fee_with_burn(
+                if not self.supply.pay_fee_with_burn(
                     gtx.voter_id, proposer_id, gtx.fee, current_base_fee,
-                )
+                ):
+                    logger.error(
+                        f"Governance vote fee payment failed — skipping"
+                    )
+                    continue
                 tracker.add_vote(gtx, current_block=current_block)
                 self._bump_watermark(gtx.voter_id, gtx.signature.leaf_index)
 
