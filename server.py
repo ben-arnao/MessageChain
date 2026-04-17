@@ -708,8 +708,9 @@ class Server:
             if not verify_stake_transaction(tx, public_key, block_height=self.blockchain.height):
                 return {"ok": False, "error": "Invalid stake transaction signature"}
 
-            # Validate nonce
-            expected_nonce = self.blockchain.nonces.get(entity_id, 0)
+            # Validate nonce — use pending nonce so consecutive submissions
+            # are accepted without waiting for block inclusion.
+            expected_nonce = self._get_pending_nonce_all_pools(entity_id)
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
 
@@ -759,8 +760,9 @@ class Server:
             if not verify_unstake_transaction(tx, authority_key):
                 return {"ok": False, "error": "Invalid unstake signature — unstake must be signed by the authority (cold) key"}
 
-            # Validate nonce
-            expected_nonce = self.blockchain.nonces.get(entity_id, 0)
+            # Validate nonce — use pending nonce so consecutive submissions
+            # are accepted without waiting for block inclusion.
+            expected_nonce = self._get_pending_nonce_all_pools(entity_id)
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
 
@@ -879,6 +881,33 @@ class Server:
                 del pool[h]
                 dropped += 1
         return dropped
+
+    def _get_pending_nonce_all_pools(self, entity_id: bytes) -> int:
+        """Compute the next expected nonce for an entity across all pools.
+
+        Scans the mempool AND the server-local pending pools (stake,
+        unstake, authority, governance) so that consecutive submissions
+        of any tx type use sequential nonces without waiting for block
+        inclusion.
+        """
+        on_chain_nonce = self.blockchain.nonces.get(entity_id, 0)
+        # Start from mempool's view (covers message + transfer txs).
+        best = self.mempool.get_pending_nonce(entity_id, on_chain_nonce)
+        # Extend with server-local pools.
+        for pool_attr in (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+        ):
+            pool = getattr(self, pool_attr, None)
+            if not pool:
+                continue
+            for tx in pool.values():
+                eid = getattr(tx, "entity_id", None)
+                tx_nonce = getattr(tx, "nonce", None)
+                if eid == entity_id and tx_nonce is not None and tx_nonce >= on_chain_nonce:
+                    if tx_nonce + 1 > best:
+                        best = tx_nonce + 1
+        return best
 
     def _admit_to_pool(self, pool_attr: str, tx) -> bool:
         """Insert `tx` into a capped per-type pending pool with fee-based
@@ -1211,12 +1240,14 @@ class Server:
         push the recommendation up during congestion.
         """
         from messagechain.core.transaction import calculate_min_fee
-        from messagechain.config import MIN_FEE
+        from messagechain.config import MIN_FEE, MAX_MESSAGE_CHARS
         kind = params.get("kind", "message")
         if kind == "message":
             msg = params.get("message", "")
             if not isinstance(msg, str):
                 return {"ok": False, "error": "message must be a string"}
+            if len(msg) > MAX_MESSAGE_CHARS:
+                return {"ok": False, "error": f"Message exceeds {MAX_MESSAGE_CHARS} chars"}
             min_fee = calculate_min_fee(msg.encode("utf-8"))
         elif kind == "transfer":
             min_fee = MIN_FEE

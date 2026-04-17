@@ -267,6 +267,7 @@ class _HandlerContext:
         self.mempool = mempool
         self.relay_callback = relay_callback
         self._buckets: dict[str, TokenBucket] = {}
+        self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
         # Cap the dict to prevent an attacker rotating IPs from
         # exhausting memory with one-shot buckets.
@@ -274,14 +275,16 @@ class _HandlerContext:
 
     def rate_limit_check(self, ip: str) -> bool:
         """Consume one token from `ip`'s bucket; return True iff allowed."""
+        import time as _time
         with self._buckets_lock:
             bucket = self._buckets.get(ip)
             if bucket is None:
-                # If we're at the cap, evict any fully-refilled bucket
-                # (inactive IP) — if none are inactive, reject the
-                # request outright rather than grow unboundedly.
+                # If we're at the cap, first evict inactive buckets,
+                # then fall back to LRU eviction of the oldest active IP.
                 if len(self._buckets) >= self._max_tracked_ips:
                     self._evict_inactive_locked()
+                    if len(self._buckets) >= self._max_tracked_ips:
+                        self._evict_lru_locked()
                     if len(self._buckets) >= self._max_tracked_ips:
                         return False
                 bucket = TokenBucket(
@@ -289,6 +292,7 @@ class _HandlerContext:
                     max_tokens=SUBMISSION_BURST,
                 )
                 self._buckets[ip] = bucket
+            self._last_active[ip] = _time.time()
             return bucket.consume()
 
     def _evict_inactive_locked(self):
@@ -300,6 +304,15 @@ class _HandlerContext:
                 to_drop.append(ip)
         for ip in to_drop:
             del self._buckets[ip]
+            self._last_active.pop(ip, None)
+
+    def _evict_lru_locked(self):
+        """Evict the least-recently-active IP to make room for a new one."""
+        if not self._last_active:
+            return
+        oldest_ip = min(self._last_active, key=self._last_active.get)
+        self._buckets.pop(oldest_ip, None)
+        self._last_active.pop(oldest_ip, None)
 
     def submit(self, tx: MessageTransaction) -> SubmissionResult:
         return submit_transaction_to_mempool(tx, self.blockchain, self.mempool)
