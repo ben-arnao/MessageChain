@@ -454,6 +454,11 @@ class KeyPair:
         The file is a small JSON object so it is human-inspectable and
         trivially portable across platforms.
         """
+        # Symlink traversal guard: refuse to write through symlinks.
+        real_path = os.path.realpath(path)
+        if real_path != os.path.abspath(path):
+            raise ValueError(f"Refusing to write through symlink: {path}")
+
         data = {"next_leaf": self._next_leaf}
         tmp_path = path + ".tmp"
         with open(tmp_path, "w") as f:
@@ -473,11 +478,18 @@ class KeyPair:
         The loaded value is never allowed to move _next_leaf backwards —
         this prevents a stale backup from causing WOTS+ leaf reuse.
         """
-        if not os.path.exists(path):
-            return
-        with open(path, "r") as f:
-            data = json.load(f)
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return  # no file or corrupt — use current _next_leaf
         stored = data.get("next_leaf", 0)
+        if not isinstance(stored, int) or stored < 0:
+            return  # ignore corrupt data
+        if stored >= self.num_leaves:
+            raise ValueError(
+                f"Corrupted leaf index file: next_leaf={stored} >= num_leaves={self.num_leaves}"
+            )
         if stored > self._next_leaf:
             self._next_leaf = stored
 
