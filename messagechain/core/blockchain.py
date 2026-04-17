@@ -775,6 +775,18 @@ class Blockchain:
         for bn, bh in snap["finalized_checkpoints"].items():
             self.finalized_checkpoints.mark_finalized(bh, bn)
 
+        # Seed divestment reference dict — captured once at the first
+        # divestment block and used as the denominator for the flat
+        # per-block unbond through END.  Without this a state-synced
+        # node mid-divestment would re-capture the *post-divestment*
+        # stake at its next divestment block, producing a smaller
+        # per-block decrement than replaying nodes and forking off the
+        # canonical chain until END.  Consensus-critical; kept in the
+        # snapshot root.  See state_snapshot._TAG_SEED_INIT_STAKES.
+        self.seed_initial_stakes = dict(
+            snap.get("seed_initial_stakes", {})
+        )
+
         # Rebuild the per-entity sparse Merkle tree from the installed
         # state so compute_current_state_root reflects the snapshot.
         self._rebuild_state_tree()
@@ -4956,7 +4968,10 @@ class Blockchain:
             "blocks_since_last_finalization": self.blocks_since_last_finalization,
             # Seed divestment snapshot: reorg-safe so the once-per-seed
             # initial-stake reference is not silently rebuilt from a
-            # post-reorg stake value on replay.
+            # post-reorg stake value on replay.  Also persisted in the
+            # state-snapshot blob and the snapshot-root commitment (see
+            # messagechain/storage/state_snapshot.py) so state-synced
+            # nodes inherit the same reference values.
             "seed_initial_stakes": dict(self.seed_initial_stakes),
         }
         # Snapshot governance state if tracker is attached.
