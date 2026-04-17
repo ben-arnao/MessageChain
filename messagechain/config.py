@@ -87,9 +87,7 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 # misconfigured nodes from silently forking the network.
 DEVNET = False
 
-PINNED_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "b4440070452e8d46e0fe0d60362229b4a88178471a8d4163bdb83579bdca0c40"
-)
+PINNED_GENESIS_HASH: bytes | None = None  # set after founder launch mints genesis
 
 # Treasury — a governance-controlled fund for community spending.
 # The treasury entity has a well-known deterministic ID (no private key exists).
@@ -485,7 +483,15 @@ TRUSTED_CHECKPOINTS: tuple = ()
 # TRUSTED_CHECKPOINTS nor from checkpoints.json) refuses to start.
 # This prevents a new node from silently running without long-range-
 # attack protection.  Devnet/testnet deployments can set this to False.
-REQUIRE_CHECKPOINTS = True
+#
+# Override via env var MESSAGECHAIN_REQUIRE_CHECKPOINTS=false for
+# bootstrap-phase deployments that haven't shipped checkpoints yet.
+import os as _os_cp  # noqa: E402
+_require_cp_env = _os_cp.environ.get("MESSAGECHAIN_REQUIRE_CHECKPOINTS")
+REQUIRE_CHECKPOINTS = (
+    False if (_require_cp_env is not None and _require_cp_env.lower() == "false")
+    else True
+)
 
 # Outbound connection slot allocation — mix full-relay (tx + block) peers
 # with block-relay-only peers to defeat topology inference via tx-relay

@@ -22,22 +22,21 @@ class TestRequireCheckpointsConfig(unittest.TestCase):
 
     def test_default_is_true(self):
         # tests/__init__.py overrides to False for test convenience;
-        # verify the production source still declares True.
-        import ast
-        import messagechain.config as _cfg_mod
-        src_path = _cfg_mod.__file__
-        with open(src_path) as f:
-            tree = ast.parse(f.read())
-        found = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == "REQUIRE_CHECKPOINTS":
-                        # The default value in source must be True
-                        self.assertIsInstance(node.value, ast.Constant)
-                        self.assertTrue(node.value.value)
-                        found = True
-        self.assertTrue(found, "REQUIRE_CHECKPOINTS not found in config.py source")
+        # verify the production source defaults to True when the env var
+        # MESSAGECHAIN_REQUIRE_CHECKPOINTS is unset.
+        import os
+        import subprocess
+        import sys
+        env = {k: v for k, v in os.environ.items()
+               if k != "MESSAGECHAIN_REQUIRE_CHECKPOINTS"}
+        # Run a subprocess with the env var unset and no tests/__init__.py
+        # side effects (invoke messagechain.config directly).
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import messagechain.config as c; print(c.REQUIRE_CHECKPOINTS)"],
+            env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "True")
 
     def test_tests_override_to_false(self):
         # Confirm that the test harness overrides to False so tests don't

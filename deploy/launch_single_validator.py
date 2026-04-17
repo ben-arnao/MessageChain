@@ -32,6 +32,14 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# Bootstrap-only override: the founder-launch script is the one legitimate
+# place where PINNED_GENESIS_HASH is unknown (we're about to mint the first
+# block), so flip DEVNET on for this process only.  The long-running server
+# that starts afterward will use the committed config with DEVNET=False and
+# a pinned genesis hash.
+import messagechain.config as _mc_config
+_mc_config.DEVNET = True
+
 from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.bootstrap import bootstrap_seed_local

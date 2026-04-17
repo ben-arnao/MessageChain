@@ -13,6 +13,7 @@ ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
     --rpc-bind 0.0.0.0 \
     --keyfile /etc/messagechain/keyfile
 Environment=MESSAGECHAIN_RPC_AUTH_ENABLED=false
+Environment=MESSAGECHAIN_REQUIRE_CHECKPOINTS=false
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
