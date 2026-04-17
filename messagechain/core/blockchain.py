@@ -1352,6 +1352,49 @@ class Blockchain:
         self.nonces[tx.entity_id] = tx.nonce + 1
         self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
 
+    def apply_stake_transaction(self, tx, proposer_id: bytes):
+        """Apply a validated stake transaction (standalone, outside block apply).
+
+        Receive-to-exist first-spend: on a stake from an entity that
+        isn't yet in `self.public_keys` and that carries a non-empty
+        `sender_pubkey`, install the pubkey BEFORE the balance/stake/
+        nonce mutations so the state-tree sync captures the new pubkey.
+
+        This path is exercised by standalone tests and by any caller
+        applying a single stake outside the block pipeline.  The block
+        pipeline's inline loop in `_apply_block_state` performs the
+        same mutations in the same order.
+        """
+        # First-spend pubkey install (mirrors apply_transfer_transaction).
+        if (
+            getattr(tx, "sender_pubkey", b"")
+            and tx.entity_id not in self.public_keys
+        ):
+            self.public_keys[tx.entity_id] = tx.sender_pubkey
+            self.nonces.setdefault(tx.entity_id, 0)
+            self._assign_entity_index(tx.entity_id)
+            if self.db is not None:
+                self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
+
+        # Pay fee (tip to proposer, base burned) — same semantics as the
+        # block-apply path so standalone callers can't accidentally skip
+        # the burn.
+        if not self.supply.pay_fee_with_burn(
+            tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
+        ):
+            logger.error(
+                f"Stake tx {tx.tx_hash.hex()[:16]} fee payment failed"
+            )
+            return
+        staked_ok = self.supply.stake(tx.entity_id, tx.amount)
+        if not staked_ok:
+            logger.error(
+                f"Stake tx {tx.tx_hash.hex()[:16]} failed at apply-time "
+                f"(validate_stake not called?)"
+            )
+        self.nonces[tx.entity_id] = tx.nonce + 1
+        self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
+
     def validate_key_rotation(self, tx: KeyRotationTransaction) -> tuple[bool, str]:
         """Validate a key rotation transaction against current chain state."""
         if tx.entity_id not in self.public_keys:
@@ -1823,7 +1866,17 @@ class Blockchain:
         # `_validate_stake_tx_in_block` will reject such a tx.  Clamping
         # here keeps the simulation from raising (e.g., on struct-packing
         # a negative value) when a dishonest proposer includes a bad tx.
+        #
+        # Receive-to-exist first-spend: if a stake carries sender_pubkey
+        # and the entity isn't yet in sim_public_keys, install it here
+        # so the committed state root matches the apply-path mutation
+        # (see apply path's "first-spend pubkey install" block above).
         for stx in (stake_transactions or []):
+            if (
+                getattr(stx, "sender_pubkey", b"")
+                and stx.entity_id not in sim_public_keys
+            ):
+                sim_public_keys[stx.entity_id] = stx.sender_pubkey
             effective_base_fee = min(current_base_fee, stx.fee)
             tip = stx.fee - effective_base_fee
             new_bal = sim_balances.get(stx.entity_id, 0) - stx.fee - stx.amount
@@ -2861,6 +2914,12 @@ class Blockchain:
         # + first-spend from X" without rejecting the second tx.
         from messagechain.identity.identity import derive_entity_id
         pending_pubkey_installs: dict[bytes, bytes] = {}
+        # Credits to recipients inside this block — lets a later Stake
+        # from the same recipient see its same-block funding when the
+        # block is of the form [fund X via Transfer, X stakes first-
+        # spend].  The cumulative-balance check at stake-validate time
+        # consults this alongside get_spendable_balance.
+        pending_balance_credits: dict[bytes, int] = {}
         for ttx in block.transfer_transactions:
             # Known-sender vs first-spend reveal.
             known_pk = self.public_keys.get(ttx.entity_id) or pending_pubkey_installs.get(ttx.entity_id)
@@ -2911,6 +2970,12 @@ class Blockchain:
 
             pending_nonces[ttx.entity_id] = expected_nonce + 1
             pending_balance_spent[ttx.entity_id] = spent_so_far + ttx.amount + ttx.fee
+            # Credit the recipient inside this block so a later Stake
+            # (or any other fee-paying tx) from the same recipient can
+            # see its same-block funding.
+            pending_balance_credits[ttx.recipient_id] = (
+                pending_balance_credits.get(ttx.recipient_id, 0) + ttx.amount
+            )
 
         # Validate attestations (votes for the parent block)
         valid, reason = self._validate_attestations(block)
@@ -2950,12 +3015,18 @@ class Blockchain:
                 return False, f"Invalid governance tx: {reason}"
 
         # Validate stake transactions — full check: signature, sender
-        # registered, nonce, amount meets the graduated minimum, and the
-        # sender can afford stake + fee.  Nonce and balance are tracked
-        # cumulatively with message/transfer txs earlier in this block.
+        # registered (either in state OR revealed first-spend-style via
+        # sender_pubkey), nonce, amount meets the graduated minimum, and
+        # the sender can afford stake + fee.  Nonce and balance are
+        # tracked cumulatively with message/transfer txs earlier in this
+        # block.  pending_pubkey_installs is shared with the transfer
+        # pass so a block containing "fund X via Transfer + X stakes
+        # first-spend" validates both txs against the same view.
         for stx in getattr(block, "stake_transactions", []):
             ok, reason = self._validate_stake_tx_in_block(
                 stx, pending_nonces, pending_balance_spent,
+                pending_pubkey_installs,
+                pending_balance_credits,
             )
             if not ok:
                 return False, f"Invalid stake tx: {reason}"
@@ -2978,6 +3049,8 @@ class Blockchain:
         self, stx,
         pending_nonces: dict[bytes, int],
         pending_balance_spent: dict[bytes, int],
+        pending_pubkey_installs: dict[bytes, bytes] | None = None,
+        pending_balance_credits: dict[bytes, int] | None = None,
     ) -> tuple[bool, str]:
         """Validate a StakeTransaction within a block being proposed/received.
 
@@ -2985,6 +3058,17 @@ class Blockchain:
         alongside message and transfer txs so that a single block containing
         multiple fee-paying txs from the same sender is validated against
         the cumulative spend, not the pre-block balance.
+
+        Receive-to-exist first-spend: a brand-new entity whose natural
+        first on-chain action is Stake (not Transfer) may carry
+        `sender_pubkey` so this path can verify the signature and install
+        the key.  Dual branch mirrors `validate_transfer_transaction`:
+          * entity already known (on chain or via a same-block first-spend
+            tx recorded in `pending_pubkey_installs`): sender_pubkey must
+            be empty (non-empty is malleability).
+          * entity unknown: sender_pubkey required; its hash must equal
+            entity_id; used for signature verification; recorded in
+            `pending_pubkey_installs` so later txs in this block see it.
         """
         from messagechain.core.staking import (
             StakeTransaction, verify_stake_transaction,
@@ -2993,11 +3077,55 @@ class Blockchain:
             min_stake_for_progress,
         )
         from messagechain.config import VALIDATOR_MIN_STAKE
+        from messagechain.identity.identity import derive_entity_id
+
         if not isinstance(stx, StakeTransaction):
             return False, f"Unexpected type {type(stx).__name__}"
-        if stx.entity_id not in self.public_keys:
-            return False, f"Unknown sender {stx.entity_id.hex()[:16]}"
-        pk = self.public_keys[stx.entity_id]
+
+        # Resolve verifying pubkey — same two-branch logic as
+        # validate_transfer_transaction.  A nil dict means "no
+        # cross-tx bookkeeping" (standalone validation).
+        if pending_pubkey_installs is None:
+            pending_pubkey_installs = {}
+        known_pk = (
+            self.public_keys.get(stx.entity_id)
+            or pending_pubkey_installs.get(stx.entity_id)
+        )
+        if known_pk is not None:
+            if getattr(stx, "sender_pubkey", b""):
+                return False, (
+                    "sender_pubkey must be empty for an already-registered "
+                    "entity — first-spend reveal is one-shot"
+                )
+            verifying_pubkey = known_pk
+            is_first_spend = False
+        else:
+            if not getattr(stx, "sender_pubkey", b""):
+                return False, (
+                    f"Entity {stx.entity_id.hex()[:16]} has no registered "
+                    f"pubkey — first on-chain stake must include "
+                    f"sender_pubkey"
+                )
+            if derive_entity_id(stx.sender_pubkey) != stx.entity_id:
+                return False, (
+                    "sender_pubkey does not derive the claimed entity_id "
+                    "(hash mismatch)"
+                )
+            verifying_pubkey = stx.sender_pubkey
+            is_first_spend = True
+
+        # Leaf-reuse guard — even on first-spend, reject reuse of a leaf
+        # already past the watermark (same rationale as Transfer).  Runs
+        # BEFORE signature verification so a caller mutating leaf_index
+        # on a fresh tx is rejected on the right failure mode (leaf
+        # reuse, not signature) — mirrors validate_transfer_transaction.
+        if stx.signature.leaf_index < self.leaf_watermarks.get(stx.entity_id, 0):
+            return False, (
+                f"WOTS+ leaf {stx.signature.leaf_index} already consumed "
+                f"(watermark {self.leaf_watermarks[stx.entity_id]}) — "
+                f"leaf reuse rejected"
+            )
+
         # verify_stake_transaction applies its own independent min-stake
         # check that we want to bypass during bootstrap (it uses the legacy
         # height-tier table, not the bootstrap_progress gradient).  Pass
@@ -3008,7 +3136,8 @@ class Blockchain:
             self.bootstrap_progress, full_min_stake=VALIDATOR_MIN_STAKE,
         )
         if not verify_stake_transaction(
-            stx, pk, block_height=self.height, min_stake_override=progress_min,
+            stx, verifying_pubkey, block_height=self.height,
+            min_stake_override=progress_min,
         ):
             return False, "Invalid signature or fields"
 
@@ -3031,8 +3160,13 @@ class Blockchain:
             )
 
         spent_so_far = pending_balance_spent.get(stx.entity_id, 0)
+        credited_so_far = (
+            pending_balance_credits.get(stx.entity_id, 0)
+            if pending_balance_credits is not None else 0
+        )
         needed = spent_so_far + stx.fee + stx.amount
-        if self.get_spendable_balance(stx.entity_id) < needed:
+        available = self.get_spendable_balance(stx.entity_id) + credited_so_far
+        if available < needed:
             return False, (
                 f"Insufficient balance for stake {stx.amount} + fee {stx.fee} "
                 f"(cumulative with other txs in this block)"
@@ -3040,6 +3174,8 @@ class Blockchain:
 
         pending_nonces[stx.entity_id] = expected_nonce + 1
         pending_balance_spent[stx.entity_id] = needed
+        if is_first_spend:
+            pending_pubkey_installs[stx.entity_id] = stx.sender_pubkey
         return True, "Valid"
 
     def _validate_stake_tx(self, stx) -> tuple[bool, str]:
@@ -3051,7 +3187,11 @@ class Blockchain:
         """
         empty_nonces: dict[bytes, int] = {}
         empty_spent: dict[bytes, int] = {}
-        return self._validate_stake_tx_in_block(stx, empty_nonces, empty_spent)
+        empty_pubkeys: dict[bytes, bytes] = {}
+        empty_credits: dict[bytes, int] = {}
+        return self._validate_stake_tx_in_block(
+            stx, empty_nonces, empty_spent, empty_pubkeys, empty_credits,
+        )
 
     def _validate_unstake_tx_in_block(
         self, utx,
@@ -3563,8 +3703,21 @@ class Blockchain:
 
         # Apply stake transactions.  validate_block already verified the
         # sender has sufficient balance and the amount meets the graduated
-        # minimum, so both calls below must succeed.
+        # minimum, so both calls below must succeed.  Receive-to-exist
+        # first-spend: if `sender_pubkey` is populated and the entity is
+        # not yet known on chain, install the pubkey BEFORE mutating any
+        # fee/balance/stake so the same-block state commitment captures
+        # the install (mirrors `_apply_transfer_with_burn`).
         for stx in getattr(block, "stake_transactions", []):
+            if (
+                getattr(stx, "sender_pubkey", b"")
+                and stx.entity_id not in self.public_keys
+            ):
+                self.public_keys[stx.entity_id] = stx.sender_pubkey
+                self.nonces.setdefault(stx.entity_id, 0)
+                self._assign_entity_index(stx.entity_id)
+                if self.db is not None:
+                    self.db.set_public_key(stx.entity_id, stx.sender_pubkey)
             if not self.supply.pay_fee_with_burn(
                 stx.entity_id, proposer_id, stx.fee, current_base_fee,
             ):
