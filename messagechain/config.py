@@ -254,9 +254,11 @@ ENFORCE_SLOT_TIMING = True
 # Network
 DEFAULT_PORT = 9333      # P2P listen port
 RPC_DEFAULT_PORT = 9334  # RPC listen port (clients speak JSON-RPC here)
-SEED_NODES: list[tuple[str, int]] = [
-    ("35.237.211.12", DEFAULT_PORT),
-]
+# The genesis validator IS the seed — it doesn't peer with itself.
+# Other nodes either use CLIENT_SEED_ENDPOINTS (for CLI RPC discovery),
+# pass --seed on startup (for P2P peering), or populate this via
+# config_local.py.
+SEED_NODES: list[tuple[str, int]] = []
 
 # Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
 # to make its initial RPC connection.  Once connected, the CLI calls
@@ -672,3 +674,29 @@ def validate_block_hex_size(block_data) -> bool:
     if not isinstance(block_data, str):
         return False
     return len(block_data) <= MAX_BLOCK_HEX_SIZE
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Local overrides
+# ─────────────────────────────────────────────────────────────────────
+# If messagechain/config_local.py exists next to this file, any names
+# defined there replace the values defined above.  config_local.py is
+# gitignored so operator-specific settings survive `git pull` without
+# risking accidental commits.
+#
+# Typical contents of config_local.py for a validator VM:
+#     SEED_NODES = []
+#     REQUIRE_CHECKPOINTS = False
+#     MERKLE_TREE_HEIGHT = 16
+#
+# See config_local.py.example for a template.
+import importlib.util as _ilu  # noqa: E402
+import os as _os_local  # noqa: E402
+_local_path = _os_local.path.join(_os_local.path.dirname(__file__), "config_local.py")
+if _os_local.path.isfile(_local_path):
+    _spec = _ilu.spec_from_file_location("messagechain._config_local", _local_path)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    for _name in dir(_mod):
+        if not _name.startswith("_"):
+            globals()[_name] = getattr(_mod, _name)
