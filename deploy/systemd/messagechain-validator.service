@@ -14,6 +14,9 @@ ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
     --keyfile /etc/messagechain/keyfile
 Environment=MESSAGECHAIN_RPC_AUTH_ENABLED=false
 Environment=MESSAGECHAIN_REQUIRE_CHECKPOINTS=false
+# TESTING: 30s block time for fast live-network iteration.  Remove this
+# line (or flip to 600s) for production-cadence operation.
+Environment=MESSAGECHAIN_BLOCK_TIME_TARGET=30
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

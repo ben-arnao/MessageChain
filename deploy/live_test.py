@@ -51,7 +51,7 @@ def chk(label, cond, detail=""):
     else: F += 1; print(f"  [FAIL] {label}" + (f" -- {detail}" if detail else ""))
 
 
-def wait_block(h, mx=45):
+def wait_block(h, mx=120):
     for _ in range(mx):
         r = rpc("get_chain_info")
         if r.get("ok") and r["result"]["height"] >= h: return r["result"]["height"]

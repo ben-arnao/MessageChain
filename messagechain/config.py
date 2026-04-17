@@ -140,7 +140,14 @@ MIN_TIP = 1                          # minimum priority tip to proposer
 MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
 
 # Block parameters
-BLOCK_TIME_TARGET = 600  # seconds between blocks (10 min, same as BTC — speed is not a priority)
+#
+# BLOCK_TIME_TARGET: seconds between blocks (10 min, same as BTC — speed is
+# not a priority).  Override via MESSAGECHAIN_BLOCK_TIME_TARGET env var for
+# testing deployments that need faster block production.  Production nodes
+# leave this at 600s.
+import os as _os_bt  # noqa: E402
+_bt_env = _os_bt.environ.get("MESSAGECHAIN_BLOCK_TIME_TARGET")
+BLOCK_TIME_TARGET = int(_bt_env) if _bt_env is not None else 600
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
