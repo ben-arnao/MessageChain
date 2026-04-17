@@ -213,6 +213,43 @@ class ChainDB:
                 witness_data BLOB NOT NULL
             );
 
+            -- Equivocation-watcher observation store.  Records every
+            -- signed block header and attestation that passed signature
+            -- verification on arrival, keyed by
+            -- (validator_id, block_height, round, message_type).  When a
+            -- second distinct payload arrives for a key already present,
+            -- the watcher constructs slashing evidence from the two
+            -- stored payloads and broadcasts a SlashTransaction.
+            --
+            -- Why persistent (not in-memory): a node restart must not
+            -- give an equivocator a free pass.  Otherwise a malicious
+            -- validator could time double-signs around their target's
+            -- node restarts.
+            --
+            -- Rolling 7-day window (UNBONDING_PERIOD = 1008 blocks at
+            -- 600s).  Entries are pruned when
+            --     first_seen_block_height < current_height - UNBONDING_PERIOD
+            -- because any older observation is useless — the chain
+            -- rejects evidence older than UNBONDING_PERIOD in
+            -- Blockchain.validate_slash_transaction.  At ~144 validators
+            -- × 1008 blocks × ~100 B/row the disk ceiling is ~15 MB.
+            --
+            -- `signed_payload` stores the fully-signed wire form
+            -- (BlockHeader.to_bytes() or Attestation.to_bytes()) so the
+            -- watcher can reconstruct evidence after a restart.
+            CREATE TABLE IF NOT EXISTS seen_signatures (
+                validator_id BLOB NOT NULL,
+                block_height INTEGER NOT NULL,
+                round_number INTEGER NOT NULL DEFAULT 0,
+                message_type TEXT NOT NULL,
+                signed_payload BLOB NOT NULL,
+                signature_bytes BLOB NOT NULL,
+                first_seen_block_height INTEGER NOT NULL,
+                PRIMARY KEY (validator_id, block_height, round_number, message_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_seen_sigs_first_seen
+                ON seen_signatures(first_seen_block_height);
+
             -- Bitcoin anchoring — external immutability proof via OP_RETURN.
             -- Stores (mc_block_number, mc_block_hash, anchor_hash, btc_txid,
             -- btc_block_height, timestamp).  btc_txid and btc_block_height
@@ -762,6 +799,78 @@ class ChainDB:
     def get_all_processed_evidence(self) -> set[bytes]:
         cur = self._conn.execute("SELECT evidence_hash FROM processed_evidence")
         return {bytes(row[0]) for row in cur.fetchall()}
+
+    # ── Equivocation Watcher: Seen Signatures ───────────────────────
+
+    def get_seen_signature(
+        self,
+        validator_id: bytes,
+        block_height: int,
+        round_number: int,
+        message_type: str,
+    ) -> tuple[bytes, bytes, int] | None:
+        """Return (signed_payload, signature_bytes, first_seen_block_height)
+        or None if no observation exists for the given key.
+        """
+        cur = self._conn.execute(
+            "SELECT signed_payload, signature_bytes, first_seen_block_height "
+            "FROM seen_signatures "
+            "WHERE validator_id = ? AND block_height = ? "
+            "  AND round_number = ? AND message_type = ?",
+            (validator_id, block_height, round_number, message_type),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return (bytes(row[0]), bytes(row[1]), row[2])
+
+    def add_seen_signature(
+        self,
+        validator_id: bytes,
+        block_height: int,
+        round_number: int,
+        message_type: str,
+        signed_payload: bytes,
+        signature_bytes: bytes,
+        first_seen_block_height: int,
+    ) -> bool:
+        """Record an observation.  Idempotent via INSERT OR IGNORE — the
+        first payload seen for a given key is pinned; subsequent distinct
+        payloads are NOT silently overwritten, because the equivocation
+        detector needs to compare against the ORIGINAL observation to
+        build evidence.
+        """
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO seen_signatures "
+            "(validator_id, block_height, round_number, message_type, "
+            " signed_payload, signature_bytes, first_seen_block_height) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                validator_id, block_height, round_number, message_type,
+                signed_payload, signature_bytes, first_seen_block_height,
+            ),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def prune_seen_signatures_before(self, cutoff_block_height: int) -> int:
+        """Delete seen_signatures rows with first_seen_block_height < cutoff.
+
+        Returns the number of rows deleted.  Safe to call on every block:
+        SQLite + the first_seen index makes this a cheap range DELETE,
+        bounded by the ~1008-block rolling window.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM seen_signatures WHERE first_seen_block_height < ?",
+            (cutoff_block_height,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
+    def count_seen_signatures(self) -> int:
+        """Total rows in seen_signatures.  Used by tests + ops metrics."""
+        cur = self._conn.execute("SELECT COUNT(*) FROM seen_signatures")
+        return cur.fetchone()[0]
 
     # ── Finalized Block Checkpoints ─────────────────────────────
 
