@@ -86,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send tokens to another entity",
         description="Transfer tokens to another registered entity.",
     )
-    transfer.add_argument("--to", required=True, help="Recipient entity ID (hex)")
+    transfer.add_argument("--to", required=True, help="Recipient address (mc1… checksummed or raw hex)")
     transfer.add_argument("--amount", type=int, required=True, help="Amount to transfer")
     transfer.add_argument("--fee", type=int, default=None, help="Transaction fee (auto-detected if omitted)")
     transfer.add_argument("--server", type=str, default=None, help="Server address host:port")
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     stake = sub.add_parser(
         "stake",
         help="Stake tokens to become a validator",
-        description="Lock tokens for validator staking (minimum 100).",
+        description="Lock tokens for validator staking (minimum graduates 1→10→100 with chain height).",
     )
     stake.add_argument("--amount", type=int, required=True, help="Amount to stake")
     stake.add_argument("--fee", type=int, default=None, help="Transaction fee")
