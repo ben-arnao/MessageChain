@@ -2,6 +2,13 @@
 
 A blockchain for sending messages. Quantum-resistant, proof-of-stake, built to last centuries.
 
+## Why
+
+- **Censorship-resistant communication.** No platform, government, or ISP can hide, filter, or silently remove your messages. If it's on-chain, it's there.
+- **Costly to spam.** Every message costs real tokens. Bots can participate, but they pay the same price as everyone else — AI-generated noise has a floor.
+- **Simple and durable.** Designed to run for centuries with minimal moving parts. Slow blocks and expensive fees are features, not bugs.
+- **Democratic by default.** On-chain governance, distributed validation, no privileged operators. L2s can layer reputation, identity, and moderation on top.
+
 ## Install
 
 Python 3.10+, no third-party deps.
