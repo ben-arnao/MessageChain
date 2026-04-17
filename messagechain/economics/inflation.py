@@ -148,22 +148,39 @@ class SupplyTracker:
         # "reward earmarked but not paid to a validator."
         treasury_excess = attester_pool - attester_tokens_paid
 
-        # Proposer-cap check: if proposer is also in the committee,
-        # their combined earnings might exceed effective_cap.  Claw
-        # back the attester credit before crediting the proposer share.
+        # Proposer-cap check: the proposer's combined earnings
+        # (proposer share + committee slot if they're on the committee)
+        # must not exceed effective_cap.  Two-step trim:
+        #   1. Claw back the committee-slot credit if it alone pushes
+        #      proposer over the cap (preferred — attester rewards are
+        #      smaller and trimming them first preserves the most of
+        #      the primary proposer_share).
+        #   2. If proposer_share *alone* still exceeds the cap (only
+        #      reachable if governance reconfigures numerator /
+        #      denominator / cap such that share > cap — unreachable
+        #      with default constants where share == cap), also trim
+        #      proposer_share down to the cap.
+        # All trimmed tokens flow to the treasury.  Conservation of
+        # supply: attesters_paid + proposer_credited + treasury ==
+        # reward, under every (share, slot, cap) combination.
         proposer_att_reward = attestor_rewards.get(proposer_id, 0)
         proposer_total = proposer_share + proposer_att_reward
         if proposer_total > effective_cap:
-            overage = proposer_total - effective_cap
-            treasury_excess += overage
+            # Step 1: claw back the attester credit (if any).
             self.balances[proposer_id] = (
                 self.balances.get(proposer_id, 0) - proposer_att_reward
             )
             attestor_rewards[proposer_id] = 0
+            # The clawed-back attester reward went to the proposer's
+            # balance via the committee loop above — redirect it to
+            # the treasury now.
+            treasury_excess += proposer_att_reward
             proposer_att_reward = 0
-            # Reduce proposer share if it alone still exceeds cap
-            # (paranoid edge — proposer_share = 4, cap = 4, attester =
-            # 1, total 5 → trim attester first gets us to 4).
+            # Step 2: if proposer_share alone still exceeds cap, trim
+            # it and route the extra to treasury.
+            if proposer_share > effective_cap:
+                treasury_excess += proposer_share - effective_cap
+                proposer_share = effective_cap
 
         self.balances[proposer_id] = (
             self.balances.get(proposer_id, 0) + proposer_share
