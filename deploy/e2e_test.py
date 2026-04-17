@@ -27,7 +27,7 @@ messagechain.config.DEVNET = True
 messagechain.config.MERKLE_TREE_HEIGHT = 8
 messagechain.config.REQUIRE_CHECKPOINTS = False
 
-from messagechain.config import HASH_ALGO, MIN_FEE
+from messagechain.config import HASH_ALGO, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.core.transaction import create_transaction
 from messagechain.core.transfer import create_transfer_transaction
 from messagechain.identity.identity import Entity
@@ -159,8 +159,9 @@ def main():
     nonce = refresh_entity(genesis)
     for i, w in enumerate(wallets):
         amount = (i + 1) * 100  # 100, 200, 300
+        # Brand-new recipient — must pay MIN_FEE + NEW_ACCOUNT_FEE surcharge.
         tx = create_transfer_transaction(genesis, w.entity_id, amount=amount,
-                                         nonce=nonce + i, fee=MIN_FEE)
+                                         nonce=nonce + i, fee=MIN_FEE + NEW_ACCOUNT_FEE)
         r = rpc("submit_transfer", {"transaction": tx.serialize()})
         check(f"transfer {amount} to wallet{i+1}", r.get("ok"), r.get("error", ""))
     nonce += 3

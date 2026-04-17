@@ -12,6 +12,7 @@ from messagechain.core.bootstrap import (
     build_launch_allocation,
     RECOMMENDED_STAKE_PER_SEED,
     RECOMMENDED_GENESIS_PER_SEED,
+    RECOMMENDED_FEE_BUFFER,
 )
 
 
@@ -40,10 +41,17 @@ class TestSingleSeedAllocation(unittest.TestCase):
         self.assertEqual(RECOMMENDED_STAKE_PER_SEED, 99_000_000)
 
     def test_recommended_genesis_includes_fee_buffer(self):
-        """Genesis allocation = stake + fee buffer."""
+        """Genesis allocation = stake + fee buffer.
+
+        The fee buffer sizing lives in bootstrap.py and must cover a few
+        surcharge-bearing ops now that NEW_ACCOUNT_FEE applies to
+        brand-new payout-address sweeps.  Assert only the invariant
+        (genesis == stake + buffer) here so the numeric value can move
+        without invalidating this test.
+        """
         self.assertEqual(
             RECOMMENDED_GENESIS_PER_SEED,
-            RECOMMENDED_STAKE_PER_SEED + 1_000,  # MIN_FEE * 10
+            RECOMMENDED_STAKE_PER_SEED + RECOMMENDED_FEE_BUFFER,
         )
 
 

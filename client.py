@@ -187,14 +187,41 @@ def cmd_transfer(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    from messagechain.config import MIN_FEE
-    fee = args.fee if args.fee else MIN_FEE
-    if fee < MIN_FEE:
-        print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
-        sys.exit(1)
+    from messagechain.config import MIN_FEE, NEW_ACCOUNT_FEE
     recipient_id = bytes.fromhex(args.to)
+
+    # Ask the server whether this recipient is brand-new, so we bundle
+    # the NEW_ACCOUNT_FEE surcharge by default when needed (otherwise
+    # the validator rejects the tx with "new-account surcharge required").
+    est_resp = rpc_call(args.host, args.rpc_port, "estimate_fee", {
+        "kind": "transfer",
+        "recipient_id": args.to,
+    })
+    recipient_is_new = False
+    server_min_fee = MIN_FEE
+    if est_resp.get("ok"):
+        r = est_resp["result"]
+        recipient_is_new = bool(r.get("recipient_is_new", False))
+        server_min_fee = int(r.get("min_fee", MIN_FEE))
+
+    required_floor = max(MIN_FEE, server_min_fee)
+    fee = args.fee if args.fee else required_floor
+    if fee < required_floor:
+        if recipient_is_new:
+            print(
+                f"Error: fee {fee} is below required {required_floor} "
+                f"(MIN_FEE {MIN_FEE} + NEW_ACCOUNT_FEE {NEW_ACCOUNT_FEE})."
+            )
+        else:
+            print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
+        sys.exit(1)
     tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
 
+    if recipient_is_new:
+        print(
+            f"Transferring to a brand-new account — "
+            f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)"
+        )
     print(f"Transferring {args.amount} tokens to {args.to[:16]}... (fee: {fee})")
     response = rpc_call(args.host, args.rpc_port, "submit_transfer", {
         "transaction": tx.serialize(),

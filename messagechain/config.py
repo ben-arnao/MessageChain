@@ -584,6 +584,38 @@ DUST_LIMIT = 10           # transfers below this amount are rejected
 # can't cover amount + NEW_ACCOUNT_FEE.
 NEW_ACCOUNT_FEE = 1000
 
+# Per-block cap on NEW permanent state entries (brand-new recipients).
+# Second line of defense beyond the NEW_ACCOUNT_FEE surcharge — bounds
+# state growth at a predictable rate regardless of how much an attacker
+# is willing to burn.
+#
+# Ceiling math (144 blocks/day at BLOCK_TIME_TARGET=600s):
+#   144 blocks/day * 10 accounts/block = 1,440 new accounts/day
+#   at ~100 bytes of permanent state per account:
+#     1,440 * 100 B = ~140 KB/day = ~50 MB/year worst case
+#
+# Permissive enough that legitimate onboarding isn't bottlenecked
+# (under normal load actual creation is tiny; the cap only bites under
+# sustained burn-attack traffic), while keeping permanent-storage
+# growth on a schedule operators can plan around for 100+ years.
+#
+# Counting rules (same as NEW_ACCOUNT_FEE surcharge — uses
+# `_recipient_is_new(..., pending_new_account_created=...)`):
+#   * TransferTransactions whose recipient has no on-chain state count.
+#   * Intra-block pipelining: multiple txs funding the SAME brand-new
+#     recipient in one block count as ONE new-account creation.
+#   * Genesis allocation_table entries do NOT count (they create state
+#     at block 0 before any normal-path validation runs).
+#
+# Treasury spends that credit a brand-new account are NOT in this
+# counter.  Rationale: treasury spends are governance-gated (weeks of
+# 2/3-supermajority voting per spend), so a burst of new-account
+# creations via that path is rate-limited by governance itself and
+# doesn't add burst-attack surface.  They still individually pay
+# NEW_ACCOUNT_FEE (burned from treasury on execute) — see
+# execute_treasury_spend.
+MAX_NEW_ACCOUNTS_PER_BLOCK = 10
+
 # Orphan block pool
 MAX_ORPHAN_BLOCKS = 100   # max orphan blocks stored (bounded to prevent memory exhaustion)
 
