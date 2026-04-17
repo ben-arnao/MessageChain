@@ -51,6 +51,7 @@ class KeyRotationTransaction:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
+            + b"key_rotation"  # domain-separation tag: prevents cross-type sig replay
             + struct.pack(">B", sig_version)
             + self.entity_id
             + self.old_public_key

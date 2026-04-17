@@ -1,0 +1,21 @@
+# Template for messagechain/config_local.py — copy to config_local.py
+# (which is gitignored) and uncomment the values you want to override.
+#
+# config.py imports this at the end, so anything here replaces the
+# default.  Ideal for per-deployment settings that should survive
+# `git pull`: peer addresses, tree heights, dev-mode flags.
+
+# ── Validator VM running on public internet ─────────────────────────
+# SEED_NODES = []                      # genesis seed — no peers to connect to yet
+# REQUIRE_CHECKPOINTS = False          # chain < 1000 blocks; auto-waived anyway
+# MERKLE_TREE_HEIGHT = 16              # ~65K signing keys, faster keygen
+
+# ── Dev / localhost testing ─────────────────────────────────────────
+# DEVNET = True                        # allow genesis mint without pinned hash
+# PINNED_GENESIS_HASH = None           # skip pin check
+# BLOCK_TIME_TARGET = 10               # fast blocks for quick iteration
+# P2P_TLS_ENABLED = False              # skip TLS setup in dev
+
+# ── Public validator accepting remote RPC ───────────────────────────
+# RPC_AUTH_ENABLED = False             # only affects admin RPCs after the
+                                       # public/admin split

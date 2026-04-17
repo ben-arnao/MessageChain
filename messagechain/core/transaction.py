@@ -71,6 +71,7 @@ class MessageTransaction:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
             CHAIN_ID
+            + b"message"  # domain-separation tag: prevents cross-type sig replay
             + struct.pack(">I", self.version)
             + struct.pack(">B", sig_version)
             + self.entity_id

@@ -14,6 +14,7 @@ Now supports:
 - Chain reorganization — rolls back and replays when a better fork appears
 """
 
+import copy
 import hashlib
 import logging
 import time as _time
@@ -4474,13 +4475,14 @@ class Blockchain:
             "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
             "blocks_since_last_finalization": self.blocks_since_last_finalization,
         }
-        # Snapshot governance state if tracker is attached
+        # Snapshot governance state if tracker is attached.
+        # deepcopy the full proposals dict so that nested mutation on a
+        # later fork (e.g., new votes, flipped votes, updated
+        # stake_snapshot) cannot leak through the rollback boundary.
+        # Reorgs are rare, so correctness over performance here.
         if hasattr(self, "governance") and self.governance is not None:
             gov = self.governance
-            snapshot["gov_proposals"] = {
-                pid: (dict(ps.votes), ps.created_at_block)
-                for pid, ps in gov.proposals.items()
-            }
+            snapshot["gov_proposals"] = copy.deepcopy(gov.proposals)
             snapshot["gov_executed_treasury_spends"] = set(gov._executed_treasury_spends)
         return snapshot
 
@@ -4524,10 +4526,17 @@ class Blockchain:
                 eid: list(entries)
                 for eid, entries in snapshot["pending_unstakes"].items()
             }
-        # Restore governance state if tracker is attached and was snapshotted
+        # Restore governance state if tracker is attached and was snapshotted.
+        # deepcopy again on the way out so the snapshot itself is not
+        # aliased with live state — a subsequent failed reorg could
+        # otherwise mutate the stored dict through the restored reference.
         if hasattr(self, "governance") and self.governance is not None:
+            if "gov_proposals" in snapshot:
+                self.governance.proposals = copy.deepcopy(snapshot["gov_proposals"])
             if "gov_executed_treasury_spends" in snapshot:
-                self.governance._executed_treasury_spends = snapshot["gov_executed_treasury_spends"]
+                self.governance._executed_treasury_spends = set(
+                    snapshot["gov_executed_treasury_spends"],
+                )
 
     def get_wots_leaves_used(self, entity_id: bytes) -> int:
         """Total WOTS+ leaves consumed by this entity across ALL signature types.

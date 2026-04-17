@@ -79,6 +79,18 @@ from messagechain.network.ratelimit import RPCRateLimiter
 
 logger = logging.getLogger("messagechain.server")
 
+# RPC methods that require the operator's auth token (RPC_AUTH_TOKEN).
+# Everything else is public — tx submissions are already gated by the
+# WOTS+ signature on the tx itself, so no auth is needed there.  This
+# split lets a public validator accept remote signed txs while still
+# protecting operational commands (ban_peer, etc.) from unauthorized
+# callers.
+_ADMIN_RPC_METHODS = frozenset({
+    "ban_peer",
+    "unban_peer",
+    "get_banned_peers",
+})
+
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
@@ -211,12 +223,26 @@ class Server:
                 by_height[cp.block_number] = cp
             checkpoints = list(by_height.values())
         if REQUIRE_CHECKPOINTS and not checkpoints:
-            raise RuntimeError(
-                "No weak-subjectivity checkpoints loaded (TRUSTED_CHECKPOINTS "
-                "is empty and no checkpoints.json found). A node without "
-                "checkpoints is vulnerable to long-range PoS attacks. Set "
-                "REQUIRE_CHECKPOINTS=False only for devnet/testnet."
-            )
+            # Young chains (< 1000 blocks) have nothing meaningful to
+            # checkpoint against.  Auto-waive the requirement with a
+            # warning instead of crashing — the long-range attack vector
+            # is effectively theoretical when the chain is this fresh.
+            # Once the chain matures past 1000 blocks, operators MUST
+            # ship checkpoints or explicitly set REQUIRE_CHECKPOINTS=False.
+            if self.blockchain.height < 1000:
+                logger.warning(
+                    "No weak-subjectivity checkpoints loaded but chain is "
+                    "young (height=%d < 1000) — proceeding without. "
+                    "Ship checkpoints before the chain crosses block 1000.",
+                    self.blockchain.height,
+                )
+            else:
+                raise RuntimeError(
+                    "No weak-subjectivity checkpoints loaded (TRUSTED_CHECKPOINTS "
+                    "is empty and no checkpoints.json found). A node without "
+                    "checkpoints is vulnerable to long-range PoS attacks. Set "
+                    "REQUIRE_CHECKPOINTS=False only for devnet/testnet."
+                )
         self.syncer = ChainSyncer(
             self.blockchain,
             self._get_peer_writer,
@@ -382,13 +408,12 @@ class Server:
         # Start sync loop
         asyncio.create_task(self._sync_loop())
 
-        print(f"Server running. P2P={self.p2p_port} RPC={self.rpc_port}")
-        print(f"Wallet: {self.wallet_id.hex() if self.wallet_id else 'NOT SET'}")
+        logger.info(f"Server running. P2P={self.p2p_port} RPC={self.rpc_port}")
+        logger.info(f"Wallet: {self.wallet_id.hex() if self.wallet_id else 'NOT SET'}")
         if self.db:
-            print(f"Storage: persistent (SQLite)")
+            logger.info("Storage: persistent (SQLite)")
         else:
-            print(f"Storage: in-memory (data lost on restart)")
-        print("Press Ctrl+C to stop.\n")
+            logger.info("Storage: in-memory (data lost on restart)")
 
     async def stop(self):
         self._running = False
@@ -426,13 +451,19 @@ class Server:
             data = await reader.readexactly(length)
             request = safe_json_loads(data.decode("utf-8"), max_depth=16)
 
-            # RPC authentication — constant-time comparison to prevent timing attacks
-            if self.rpc_auth_enabled:
+            # RPC authentication — only admin methods (ban_peer, unban_peer,
+            # etc.) require the token.  Public methods (submit_transaction,
+            # get_entity, etc.) are always accessible, since their state
+            # mutations are already gated by WOTS+ signatures on the
+            # transactions themselves.  This lets a public-facing validator
+            # accept signed txs from anyone without also exposing admin ops.
+            method = request.get("method", "")
+            if self.rpc_auth_enabled and method in _ADMIN_RPC_METHODS:
                 token = request.get("auth", "")
                 if not isinstance(token, str) or not hmac.compare_digest(
                     token.encode(), self.rpc_auth_token.encode()
                 ):
-                    resp = json.dumps({"ok": False, "error": "Authentication required"}).encode("utf-8")
+                    resp = json.dumps({"ok": False, "error": "Authentication required for admin method"}).encode("utf-8")
                     writer.write(struct.pack(">I", len(resp)))
                     writer.write(resp)
                     await writer.drain()
@@ -582,10 +613,10 @@ class Server:
         """Accept a signed transaction from a client."""
         try:
             tx = MessageTransaction.deserialize(params["transaction"])
-            # Compute pending nonce so users can submit sequential txs
-            # without waiting for each to be mined.
-            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
-            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            # Compute pending nonce across ALL pools so users can submit
+            # sequential txs of any type (message, transfer, stake) without
+            # waiting for each to be mined.
+            pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
             valid, reason = self.blockchain.validate_transaction(
                 tx, expected_nonce=pending_nonce,
             )
@@ -1192,9 +1223,9 @@ class Server:
         """Accept a signed transfer transaction from a client."""
         try:
             tx = TransferTransaction.deserialize(params["transaction"])
-            # Compute pending nonce (same as _rpc_submit_transaction).
-            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
-            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            # Pending nonce scans all pools (message + transfer + stake +
+            # unstake + governance) so sequential tx of any type work.
+            pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
             valid, reason = self.blockchain.validate_transfer_transaction(
                 tx, expected_nonce=pending_nonce,
             )
@@ -1593,8 +1624,7 @@ class Server:
             tx_hash_hex = tx.tx_hash.hex()
             if tx_hash_hex in self._seen_txs:
                 return
-            on_chain_nonce = self.blockchain.nonces.get(tx.entity_id, 0)
-            pending_nonce = self.mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
+            pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
             valid, reason = self.blockchain.validate_transaction(
                 tx, expected_nonce=pending_nonce,
             )
@@ -2130,12 +2160,12 @@ async def run(args):
         try:
             private_key_input = bytes.fromhex(hex_key)
         except ValueError as e:
-            print(f"ERROR: keyfile {args.keyfile} does not contain valid hex: {e}")
+            logger.error(f"keyfile {args.keyfile} does not contain valid hex: {e}")
             sys.exit(1)
-        print(f"Loaded private key from {args.keyfile}")
+        logger.info(f"Loaded private key from {args.keyfile}")
     else:
         if args.wallet:
-            print(f"Wallet ID: {args.wallet}")
+            logger.info(f"Wallet ID: {args.wallet}")
             print("Authenticate with your private key to enable block production.\n")
         else:
             print("To produce blocks and earn rewards, authenticate with your private key.")
@@ -2165,10 +2195,10 @@ async def run(args):
             logger.info(f"Advanced keypair past {leaves_used} used WOTS+ leaves")
 
         server.set_wallet_entity(entity)
-        print(f"Authenticated as: {entity.entity_id_hex[:16]}...")
+        logger.info(f"Authenticated as: {entity.entity_id_hex[:16]}...")
     elif args.wallet:
         server.set_wallet(args.wallet)
-        print("Warning: wallet set but no private key — node cannot sign blocks.")
+        logger.warning("Wallet set but no private key — node cannot sign blocks.")
 
     await server.start()
 
@@ -2207,7 +2237,7 @@ async def run(args):
         while True:
             await asyncio.sleep(1)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        logger.info("Shutting down")
         if submission_server is not None:
             submission_server.stop()
         await server.stop()

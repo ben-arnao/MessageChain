@@ -79,41 +79,24 @@ def collect_private_key() -> bytes:
 
 
 def cmd_create_account(args):
-    """Create a new account on the chain."""
-    from messagechain.crypto.hash_sig import _hash
+    """Derive an account locally.
 
+    Receive-to-exist model: no on-chain registration step.  The account
+    appears on chain the first time someone sends it a transfer; the
+    first outgoing transfer from it reveals the pubkey automatically.
+    """
     print("=== Create Account ===\n")
 
     private_key = collect_private_key()
 
-    # Derive entity locally — private key material stays on this device.
     entity = Entity.create(private_key)
-    print(f"\nYour entity ID: {entity.entity_id_hex}")
-
-    # Sign registration proof to demonstrate key ownership.
-    proof_msg = _hash(b"register" + entity.entity_id)
-    proof = entity.keypair.sign(proof_msg)
-
-    # Send public identity + proof to the server.
-    # Private key never leaves the client.
-    print(f"Registering with server at {args.host}:{args.rpc_port}...")
-    response = rpc_call(args.host, args.rpc_port, "register_entity", {
-        "entity_id": entity.entity_id_hex,
-        "public_key": entity.public_key.hex(),
-        "registration_proof": proof.serialize(),
-    })
-
-    if response.get("ok"):
-        result = response["result"]
-        print(f"\nAccount created!")
-        print(f"  Entity ID:       {result['entity_id']}")
-        print(f"  Public key:      {result['public_key'][:32]}...")
-        print(f"  Initial balance: {result['initial_balance']} tokens")
-        print(f"\nSave your entity ID — this is your wallet address.")
-        print("Your private key is your sole credential. Never share it.")
-    else:
-        print(f"\nFailed: {response.get('error')}")
-        sys.exit(1)
+    print(f"\nAccount derived from your private key.")
+    print(f"  Entity ID:  {entity.entity_id_hex}")
+    print()
+    print("Your account will appear on chain when someone first sends")
+    print("you tokens.  Your first outgoing transfer will reveal your")
+    print("public key to the chain automatically.")
+    print("Your private key is your sole credential. Never share it.")
 
 
 def cmd_send_message(args):

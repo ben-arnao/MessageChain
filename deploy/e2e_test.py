@@ -144,26 +144,17 @@ def main():
     check("3 messages posted", ent2["result"]["messages_posted"] >= 3,
           f"actual={ent2['result']['messages_posted']}")
 
-    # ── 5. Create + register 3 wallets ──
-    section("5. Create + register 3 wallets")
+    # ── 5. Create 3 wallets locally (no on-chain registration) ──
+    section("5. Create 3 wallets locally")
     wallets = []
     for i in range(3):
         w = Entity.create(os.urandom(32), tree_height=4)
-        proof_msg = hashlib.new(HASH_ALGO, b"register" + w.entity_id).digest()
-        proof = w.keypair.sign(proof_msg)
-        r = rpc("register_entity", {
-            "entity_id": w.entity_id.hex(),
-            "public_key": w.public_key.hex(),
-            "registration_proof": proof.serialize(),
-        })
-        check(f"register wallet{i+1}", r.get("ok"), r.get("error", ""))
         wallets.append(w)
         print(f"    {encode_address(w.entity_id)}")
 
-    print("  Waiting for registrations to confirm...")
-    wait_for_block(start_height + 3, max_wait=45)
-
     # ── 6. Sequential transfers WITHOUT waiting (mempool nonce tracking) ──
+    # Each transfer implicitly creates the recipient's state entry
+    # (receive-to-exist).  No RegistrationTransaction needed.
     section("6. Transfer to all 3 wallets (sequential nonces)")
     nonce = refresh_entity(genesis)
     for i, w in enumerate(wallets):
@@ -219,13 +210,7 @@ def main():
     r = rpc("submit_transfer", {"transaction": big_xfer.serialize()})
     check("reject overdraft transfer", not r.get("ok"), r.get("error", "")[:60])
 
-    # 8e. Duplicate registration (same entity)
-    proof_msg = hashlib.new(HASH_ALGO, b"register" + wallets[0].entity_id).digest()
-    # Can't re-sign — leaf already used. Just check server rejects known entity.
-    # Use a fresh proof from a different keypair attempt
-    check("reject duplicate registration", True, "wallet already registered — client-side guard")
-
-    # 8f. Nonce gap (should reject with mempool tracking)
+    # 8e. Nonce gap (should reject with mempool tracking)
     nonce = refresh_entity(genesis)
     try:
         gap_tx = create_transaction(genesis, "gap test", fee=500, nonce=nonce + 5)
@@ -234,7 +219,7 @@ def main():
     except Exception as e:
         check("reject nonce gap", True, str(e)[:60])
 
-    # 8g. Max-length message (exactly 280 chars)
+    # 8f. Max-length message (exactly 280 chars)
     nonce = refresh_entity(genesis)
     max_msg = "X" * 280
     tx_max = create_transaction(genesis, max_msg, fee=2000, nonce=nonce)
