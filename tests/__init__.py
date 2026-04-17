@@ -21,6 +21,8 @@ messagechain.config.DEVNET = True
 # Tests run without checkpoint files; disable the strict requirement so
 # test nodes don't refuse to start.
 messagechain.config.REQUIRE_CHECKPOINTS = False
+# Override the production pinned hash so test entities can initialize_genesis.
+messagechain.config.PINNED_GENESIS_HASH = None
 
 
 def register_entity_for_test(chain, entity):
