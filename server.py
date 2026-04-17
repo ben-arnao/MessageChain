@@ -288,6 +288,26 @@ class Server:
         """Callback for sync-time misbehavior (checkpoint mismatch, stall)."""
         self.ban_manager.record_offense(peer_address, points, reason)
 
+    def _handle_task_exception(self, task_name: str, task: asyncio.Task) -> None:
+        """Log uncaught exceptions from background tasks so they don't die silently.
+
+        Without this callback, an exception escaping a ``create_task``-launched
+        coroutine is swallowed by asyncio's default handler. The task dies, the
+        server keeps running as a zombie (listening but not producing blocks or
+        syncing), and in a PoS system with an inactivity leak, the operator's
+        stake gets slowly drained to zero before anyone notices. Loud CRITICAL
+        logging is the minimum viable alarm.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        logger.critical(
+            f"Background task {task_name} crashed: {exc!r}",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
     def _current_cumulative_weight(self) -> int:
         """Our best-tip cumulative stake weight, for handshakes."""
         best = self.blockchain.fork_choice.get_best_tip()
@@ -396,17 +416,29 @@ class Server:
 
         # Reconnect to anchor peers first (restart-time eclipse defense)
         for host, port in self.anchor_store.load_anchors():
-            asyncio.create_task(self._connect_to_peer(host, port))
+            t = asyncio.create_task(self._connect_to_peer(host, port))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception("connect_to_peer(anchor)", x)
+            )
 
         # Connect to seed nodes
         for host, port in self.seed_nodes:
-            asyncio.create_task(self._connect_to_peer(host, port))
+            t = asyncio.create_task(self._connect_to_peer(host, port))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception("connect_to_peer(seed)", x)
+            )
 
         # Start block production
-        asyncio.create_task(self._block_production_loop())
+        t = asyncio.create_task(self._block_production_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("block_production_loop", x)
+        )
 
         # Start sync loop
-        asyncio.create_task(self._sync_loop())
+        t = asyncio.create_task(self._sync_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("sync_loop", x)
+        )
 
         logger.info(f"Server running. P2P={self.p2p_port} RPC={self.rpc_port}")
         logger.info(f"Wallet: {self.wallet_id.hex() if self.wallet_id else 'NOT SET'}")
@@ -634,7 +666,10 @@ class Server:
             # Relay via inv (not full tx flood)
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
-            asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
+            t = asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception("relay_tx_inv", x)
+            )
 
             return {
                 "ok": True,
@@ -1238,7 +1273,10 @@ class Server:
 
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
-            asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
+            t = asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception("relay_tx_inv", x)
+            )
 
             return {
                 "ok": True,
@@ -1605,7 +1643,10 @@ class Server:
                 cumulative_weight=peer_weight,
             )
             if peer_height > self.blockchain.height and not self.syncer.is_syncing:
-                asyncio.create_task(self.syncer.start_sync())
+                t = asyncio.create_task(self.syncer.start_sync())
+                t.add_done_callback(
+                    lambda x: self._handle_task_exception("syncer.start_sync", x)
+                )
 
         elif msg.msg_type == MessageType.INV:
             await self._handle_inv(msg.payload, peer)
