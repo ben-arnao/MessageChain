@@ -12,6 +12,8 @@ creation time and constant memory overhead.
 
 import hashlib
 import hmac
+import json
+import os
 import struct
 from dataclasses import dataclass, field
 from messagechain.config import (
@@ -362,6 +364,12 @@ class KeyPair:
         self._seed = seed
         self._next_leaf = start_leaf
 
+        # Optional path for persistent leaf-index tracking.  When set,
+        # sign() writes the updated _next_leaf to this file BEFORE
+        # returning the signature (write-ahead), preventing WOTS+ leaf
+        # reuse after a process restart.
+        self.leaf_index_path: str | None = None
+
         # Compute the Merkle root (the public key) by building the tree
         # bottom-up over derived leaf public keys. This is the only expensive
         # operation — O(2^height) leaf derivations, done once at creation.
@@ -410,8 +418,23 @@ class KeyPair:
 
         # Derive the leaf keypair on demand — no private keys stored
         priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
-        wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
-        auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
+        try:
+            wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
+            auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
+        finally:
+            # Best-effort private key zeroing.  priv_keys are bytearray
+            # (mutable), so we can overwrite the buffer contents in-place.
+            # This limits the window in which key material sits in memory.
+            for pk in priv_keys:
+                if isinstance(pk, bytearray):
+                    for j in range(len(pk)):
+                        pk[j] = 0
+
+        # Write-ahead persistence: commit the new _next_leaf to disk
+        # BEFORE returning the signature, so a crash after signing but
+        # before the caller processes the result cannot cause leaf reuse.
+        if self.leaf_index_path is not None:
+            self.persist_leaf_index(self.leaf_index_path)
 
         return Signature(
             wots_signature=wots_sig,
@@ -424,6 +447,39 @@ class KeyPair:
     @property
     def remaining_signatures(self) -> int:
         return self.num_leaves - self._next_leaf
+
+    def persist_leaf_index(self, path: str) -> None:
+        """Write the current _next_leaf to disk (atomic via tmp + rename).
+
+        The file is a small JSON object so it is human-inspectable and
+        trivially portable across platforms.
+        """
+        data = {"next_leaf": self._next_leaf}
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        # Atomic rename — on POSIX this is guaranteed atomic; on Windows
+        # os.replace is as close as we get.
+        os.replace(tmp_path, path)
+
+    def load_leaf_index(self, path: str) -> None:
+        """Restore _next_leaf from a previously-persisted file.
+
+        If the file does not exist, _next_leaf is left unchanged (safe
+        default: a fresh KeyPair starts at 0).
+
+        The loaded value is never allowed to move _next_leaf backwards —
+        this prevents a stale backup from causing WOTS+ leaf reuse.
+        """
+        if not os.path.exists(path):
+            return
+        with open(path, "r") as f:
+            data = json.load(f)
+        stored = data.get("next_leaf", 0)
+        if stored > self._next_leaf:
+            self._next_leaf = stored
 
 
 def verify_signature(message_hash: bytes, signature: Signature, root_public_key: bytes) -> bool:
