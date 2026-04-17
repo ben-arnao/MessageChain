@@ -170,26 +170,31 @@ def bootstrap_seed_local(
 # reasons (security + optics + bootstrap runway).
 # ───────────────────────────────────────────────────────────────────────
 
-# The seed stakes ~1/10 of total supply — 99M tokens — chosen so the
-# founder holds a durable 2/3+ supermajority of stake throughout the
-# bootstrap window even after thousands of zero-funds validators
-# accumulate escrow-era rewards.
+# The seed stakes ~2% of total supply — 20M tokens — chosen so the
+# founder holds >10× the expected cumulative non-seed bootstrap
+# earnings throughout the bootstrap window, without over-concentrating
+# supply long-term.
 #
 # Napkin math for the security floor:
 #   * BOOTSTRAP_END_HEIGHT ≈ 105K blocks → ≈ 1.68M tokens total minted
 #     during bootstrap (16 tokens/block × 105K).
 #   * Even if 100% of minted tokens are captured by non-seed validators
 #     and immediately staked, that's ≤ 2M of non-seed stake.
-#   * With 1 seed × 99M = 99M seed stake, seed share stays above
-#     99M / (99M + 2M) = 98%.  Comfortable headroom against Sybil
-#     stake accumulation AND against the founder wanting to move
-#     some allocation (e.g. treasury grants, early backers) without
-#     losing >2/3 control.
+#   * With 1 seed × 20M = 20M seed stake, seed share stays above
+#     20M / (20M + 1.68M) ≈ 92%.  Comfortably above the 2/3 threshold
+#     with >10× dominance over cumulative non-seed bootstrap earnings.
+#
+# Post-divestment: between SEED_DIVESTMENT_START and END the seed
+# drains linearly down to SEED_DIVESTMENT_RETAIN_FLOOR = 1M tokens
+# (0.1% of supply — "top validator but beatable").  The floor
+# rewards the founder's launch work without preserving indefinite
+# dominance; the divestible portion is 19M of the 20M initial.
 #
 # This is the "founder secures the chain during bootstrap" constant.
 # Smaller values weaken Sybil resistance; larger values over-concentrate
-# supply.  99M (~9.9%) is the pragmatic sweet spot.
-RECOMMENDED_STAKE_PER_SEED: int = 99_000_000
+# supply.  20M (~2%) is the pragmatic sweet spot that matches the
+# partial-divestment-to-floor model.
+RECOMMENDED_STAKE_PER_SEED: int = 20_000_000
 
 # Fee buffer sized to cover the seed's initial surcharge-bearing ops.
 #

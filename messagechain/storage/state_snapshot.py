@@ -60,6 +60,13 @@ fresh node needs to resume participation:
                             this dict fork silently at the next divestment
                             block because each recomputes per_block from
                             its own (post-divestment) stake reference.
+    - seed_divestment_debt  seed_id → per-seed fractional remainder
+                            (integer debt at SCALE = 10**9 per whole
+                            token) for the partial-divestment-to-floor
+                            schedule.  MUST be in the snapshot root for
+                            the same reason as seed_initial_stakes: a
+                            stale debt value produces a different whole-
+                            token drain at the next divestment block.
 
 The snapshot root (`compute_state_root`) is a Merkle tree over sorted
 (section_tag, key, value_hash) entries, where each section_tag is a fixed
@@ -90,7 +97,8 @@ from messagechain.config import (
 )
 
 # Re-exported so callers don't need to import from both places.
-STATE_SNAPSHOT_VERSION = 1  # wire format version for encode/decode
+# v2: added seed_divestment_debt (partial-divestment-to-floor schedule).
+STATE_SNAPSHOT_VERSION = 2  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -118,6 +126,14 @@ _TAG_GLOBAL = b"glb"
 # state-synced nodes can silently disagree on the per-block divestment
 # amount and fork at the next divestment block.
 _TAG_SEED_INIT_STAKES = b"seed_init"
+# seed_divestment_debt — consensus-visible dict[seed_id → scaled debt
+# (fractional units)].  Per-seed running fractional remainder for the
+# partial-divestment-to-floor schedule.  Must participate in the
+# snapshot root: a state-synced node that installs with a stale debt
+# value computes a different whole-token drain at its next divestment
+# block than a replaying node.  Same consensus criticality as
+# seed_initial_stakes.
+_TAG_SEED_DIVEST_DEBT = b"seed_debt"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -165,6 +181,13 @@ def serialize_state(blockchain) -> dict:
         "seed_initial_stakes": dict(
             getattr(blockchain, "seed_initial_stakes", {})
         ),
+        # Seed divestment fractional debt — see _TAG_SEED_DIVEST_DEBT
+        # docstring.  Per-seed running fractional remainder driving the
+        # partial-divestment-to-floor schedule; must participate in the
+        # snapshot root for state-sync parity with replaying nodes.
+        "seed_divestment_debt": dict(
+            getattr(blockchain, "seed_divestment_debt", {})
+        ),
     }
 
 
@@ -208,6 +231,11 @@ def deserialize_state(snapshot: dict) -> dict:
     # always populates this, so the default only matters for callers
     # that hand-build snapshot dicts.
     out.setdefault("seed_initial_stakes", {})
+    # Default to empty dict for pre-v2 snapshots (wire format prior to
+    # seed_divestment_debt).  A migrating chain starts debt-free — see
+    # Blockchain.seed_divestment_debt init comment for the one-block
+    # timing note on migration.
+    out.setdefault("seed_divestment_debt", {})
     return out
 
 
@@ -316,6 +344,12 @@ def compute_state_root(snapshot: dict) -> bytes:
         # from this exact dict.
         _TAG_SEED_INIT_STAKES: _merkle(_entries_for_section(
             _TAG_SEED_INIT_STAKES, snap["seed_initial_stakes"])),
+        # Seed divestment fractional debt.  Same consensus criticality
+        # as _TAG_SEED_INIT_STAKES: a node that disagreed on this dict
+        # would compute a different whole-token drain at the next
+        # divestment block and silently fork until END.
+        _TAG_SEED_DIVEST_DEBT: _merkle(_entries_for_section(
+            _TAG_SEED_DIVEST_DEBT, snap["seed_divestment_debt"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -471,6 +505,7 @@ def encode_snapshot(snap: dict) -> bytes:
         u64                 base_fee
         <int→bytes dict>    finalized_checkpoints
         <bytes→int  dict>   seed_initial_stakes
+        <bytes→int  dict>   seed_divestment_debt  (v2+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -495,6 +530,11 @@ def encode_snapshot(snap: dict) -> bytes:
     # Seed divestment reference — bytes→int dict, sorted keys, matches
     # the canonical encoding used elsewhere for entity-keyed int dicts.
     out += _encode_bytes_int_dict(snap["seed_initial_stakes"])
+    # Seed divestment fractional debt — bytes→int dict with scaled
+    # fractional units (SCALE = 10**9 per whole token).  Debt is
+    # always < 2 * SCALE at block boundaries (each block adds a small
+    # fraction; drain removes whole tokens), so u64 is ample.
+    out += _encode_bytes_int_dict(snap["seed_divestment_debt"])
     return bytes(out)
 
 
@@ -544,6 +584,8 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     off += 8
     finalized_checkpoints, off = _decode_int_bytes_dict(blob, off)
     seed_initial_stakes, off = _decode_bytes_int_dict(blob, off)
+    # v2+: seed_divestment_debt.  Always present on v2 blobs.
+    seed_divestment_debt, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -569,4 +611,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "base_fee": base_fee,
         "finalized_checkpoints": finalized_checkpoints,
         "seed_initial_stakes": seed_initial_stakes,
+        "seed_divestment_debt": seed_divestment_debt,
     }

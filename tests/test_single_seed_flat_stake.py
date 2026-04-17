@@ -36,9 +36,12 @@ class TestSingleSeedAllocation(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_launch_allocation(eids)
 
-    def test_recommended_stake_is_99m(self):
-        """Single seed stakes 99M instead of 3 x 33M."""
-        self.assertEqual(RECOMMENDED_STAKE_PER_SEED, 99_000_000)
+    def test_recommended_stake_is_20m(self):
+        """Single seed stakes 20M (~2% of supply).  Sized so founder
+        holds >10x cumulative non-seed bootstrap earnings without
+        over-concentrating supply long-term; pairs with the
+        partial-divestment-to-floor schedule (drains to 1M = 0.1%)."""
+        self.assertEqual(RECOMMENDED_STAKE_PER_SEED, 20_000_000)
 
     def test_recommended_genesis_includes_fee_buffer(self):
         """Genesis allocation = stake + fee buffer.

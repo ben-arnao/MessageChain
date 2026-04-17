@@ -6,12 +6,16 @@ every guardrail drops simultaneously, leaving the founder dominant
 with no forced unwind.  The rule tested here:
 
   * H <= SEED_DIVESTMENT_START (105_192): seed's full stake intact.
-  * START < H <= END (315_576): each block forcibly unbonds
-    initial_seed_stake / (END - START) tokens from stake.  75% of
-    that is burned (total_supply drops), 25% to treasury.  Rounding
-    remainder at each block goes to burn.
-  * H > END: seed has no special status.  A StakeTransaction from
-    the (former) seed succeeds normally.
+  * START < H <= END (315_576): each block forcibly unbonds a
+    linear portion of DIVESTIBLE = max(0, initial_stake -
+    SEED_DIVESTMENT_RETAIN_FLOOR) tokens — 75% burned (supply
+    drops), 25% to treasury.  Per-block accounting uses integer
+    fractional debt at SCALE=10**9 so even tiny divestible amounts
+    drain correctly.  Per-block split rounding favors burn.
+  * H > END: seed has no special divestment pressure.  Residual
+    stake is whatever the floor left (≥ RETAIN_FLOOR).  The seed
+    can re-stake fresh tokens via a normal StakeTransaction without
+    those getting eroded.
 
 These tests drive the production block-apply step function directly
 against a pre-bootstrapped Blockchain — applying 200K+ real blocks
@@ -36,6 +40,7 @@ TREASURY = config.TREASURY_ENTITY_ID
 START = config.SEED_DIVESTMENT_START_HEIGHT
 END = config.SEED_DIVESTMENT_END_HEIGHT
 WINDOW = END - START
+FLOOR = config.SEED_DIVESTMENT_RETAIN_FLOOR
 
 
 def _entity(tag: bytes) -> Entity:
@@ -65,8 +70,9 @@ class TestDivestmentSchedule(unittest.TestCase):
         self.chain, self.seed, self.cold = _bootstrapped_chain()
         self.seed_id = self.seed.entity_id
         self.initial_stake = self.chain.supply.get_staked(self.seed_id)
-        # Sanity: confirm we're bootstrapped at 99M.
         self.assertEqual(self.initial_stake, RECOMMENDED_STAKE_PER_SEED)
+        self.divestible = self.initial_stake - FLOOR
+        self.assertGreater(self.divestible, 0)
         self.initial_treasury = self.chain.supply.get_balance(TREASURY)
         self.initial_total_supply = self.chain.supply.total_supply
 
@@ -101,17 +107,24 @@ class TestDivestmentSchedule(unittest.TestCase):
         )
 
     def test_first_divestment_block(self):
-        """At H=START+1 stake drops by initial/WINDOW; 75% burned, 25% treasury."""
-        per_block = self.initial_stake // WINDOW
-        self.assertEqual(per_block, 99_000_000 // 210_384)  # 470
-        treasury_cut = per_block * config.SEED_DIVESTMENT_TREASURY_BPS // 10_000
-        burn_cut = per_block - treasury_cut  # includes rounding remainder
+        """At H=START+1 stake drops by divestible/WINDOW (via fractional
+        debt); 75% burned, 25% treasury.
+        """
+        # Expected per-block drain uses the same fractional-accounting
+        # formula as _apply_seed_divestment.
+        SCALE = 10 ** 9
+        per_block_scaled = (self.divestible * SCALE) // WINDOW
+        # First block: debt = per_block_scaled, whole = debt // SCALE.
+        expected_whole = per_block_scaled // SCALE
 
         self._apply_step(START + 1)
-        self.assertEqual(
-            self.chain.supply.get_staked(self.seed_id),
-            self.initial_stake - per_block,
-        )
+        stake_after = self.chain.supply.get_staked(self.seed_id)
+        self.assertEqual(stake_after, self.initial_stake - expected_whole)
+
+        # Burn/treasury conservation: 25% treasury (basis points),
+        # remainder to burn.
+        treasury_cut = expected_whole * config.SEED_DIVESTMENT_TREASURY_BPS // 10_000
+        burn_cut = expected_whole - treasury_cut
         self.assertEqual(
             self.chain.supply.get_balance(TREASURY),
             self.initial_treasury + treasury_cut,
@@ -121,49 +134,48 @@ class TestDivestmentSchedule(unittest.TestCase):
             self.initial_total_supply - burn_cut,
         )
 
-    def test_midpoint_stake_halved(self):
-        """At H=midpoint cumulative divested ~= 49.5M; burn ~= 37.1M; treasury ~= 12.4M."""
-        midpoint = START + WINDOW // 2  # 105_192 + 105_192 = 210_384
+    def test_midpoint_stake_is_half_divested(self):
+        """At H=midpoint cumulative divested ≈ divestible/2; burn ≈ 75% of
+        that; treasury ≈ 25% of that.  Stake ≈ initial - divestible/2."""
+        midpoint = START + WINDOW // 2
         for h in range(START + 1, midpoint + 1):
             self._apply_step(h)
 
         stake_now = self.chain.supply.get_staked(self.seed_id)
-        # Rough halfway: allow small integer-rounding slack.
-        self.assertGreater(stake_now, 49_400_000)
-        self.assertLess(stake_now, 49_600_000)
+        # Should have drained roughly half the divestible.
+        half_drain = self.divestible // 2
+        expected_stake = self.initial_stake - half_drain
+        # Tolerance: one block's per-block drain (~91 tokens).
+        self.assertGreater(stake_now, expected_stake - 100)
+        self.assertLess(stake_now, expected_stake + 100)
 
         treasury_gain = self.chain.supply.get_balance(TREASURY) - self.initial_treasury
         burn = self.initial_total_supply - self.chain.supply.total_supply
         total_divested = self.initial_stake - stake_now
-        # Treasury + burn must equal total divested (conservation).
         self.assertEqual(treasury_gain + burn, total_divested)
-        # Split ~= 75/25.
+        # Split ≈ 75/25.
         self.assertGreater(burn, treasury_gain * 2)
         self.assertLess(burn, treasury_gain * 4)
-        self.assertGreater(treasury_gain, 12_000_000)
-        self.assertLess(treasury_gain, 12_700_000)
 
-    def test_end_of_divestment_stake_near_zero(self):
-        """At H=END cumulative ~= full initial; stake ~= 0 (integer remainder OK)."""
+    def test_end_of_divestment_stake_at_floor(self):
+        """At H=END cumulative ≈ divestible; stake ≈ FLOOR (within 1 token
+        of the fractional-accounting residual)."""
         for h in range(START + 1, END + 1):
             self._apply_step(h)
 
         stake_now = self.chain.supply.get_staked(self.seed_id)
-        # The flat per-block amount is floor(initial / WINDOW), so the
-        # residual at end is initial - WINDOW * floor(initial/WINDOW),
-        # which is bounded by WINDOW - 1.
-        self.assertLess(stake_now, WINDOW)
-        self.assertGreaterEqual(stake_now, 0)
+        # Residual at end is at most 1 token above FLOOR (fractional
+        # floor rounding in (divestible * SCALE) // window).
+        self.assertGreaterEqual(stake_now, FLOOR)
+        self.assertLess(stake_now, FLOOR + 2)
 
         total_divested = self.initial_stake - stake_now
         treasury_gain = self.chain.supply.get_balance(TREASURY) - self.initial_treasury
         burn = self.initial_total_supply - self.chain.supply.total_supply
         self.assertEqual(treasury_gain + burn, total_divested)
-        # 25% treasury ~= 24.75M; 75% burn ~= 74.25M.
-        self.assertGreater(burn, 74_000_000)
-        self.assertLess(burn, 74_500_000)
-        self.assertGreater(treasury_gain, 24_600_000)
-        self.assertLess(treasury_gain, 24_900_000)
+        # Split is approximately 75% / 25% with rounding favor to burn.
+        self.assertGreaterEqual(burn * 4, total_divested * 3)
+        self.assertLessEqual(treasury_gain * 4, total_divested)
 
     def test_no_further_decay_post_divestment(self):
         """Steps past END are no-ops — seed's residual stake is stable."""
@@ -180,10 +192,11 @@ class TestDivestmentSchedule(unittest.TestCase):
         self.assertEqual(self.chain.supply.get_balance(TREASURY), treasury_at_end)
         self.assertEqual(self.chain.supply.total_supply, supply_at_end)
 
-    def test_stake_clamps_at_zero(self):
-        """If stake runs out early (edge), no negative balances or over-burn."""
-        # Artificially zero the stake, then run divestment for many blocks.
-        self.chain.supply.staked[self.seed_id] = 0
+    def test_stake_clamps_at_floor(self):
+        """If stake has already been pushed to the floor (external shock),
+        no further divestment moves tokens and stake stays at floor."""
+        # Artificially set stake to the floor, then run divestment.
+        self.chain.supply.staked[self.seed_id] = FLOOR
         # Prime the snapshot so the step function has a reference.
         self.chain.seed_initial_stakes[self.seed_id] = self.initial_stake
 
@@ -191,8 +204,10 @@ class TestDivestmentSchedule(unittest.TestCase):
         pre_supply = self.chain.supply.total_supply
         for h in range(START + 1, START + 1000):
             self._apply_step(h)
-        self.assertEqual(self.chain.supply.get_staked(self.seed_id), 0)
-        # No extra tokens moved once stake hit zero.
+        self.assertEqual(
+            self.chain.supply.get_staked(self.seed_id), FLOOR,
+        )
+        # No extra tokens moved once stake hit the floor.
         self.assertEqual(self.chain.supply.get_balance(TREASURY), pre_treasury)
         self.assertEqual(self.chain.supply.total_supply, pre_supply)
 
@@ -244,6 +259,9 @@ class TestDeterminism(unittest.TestCase):
         self.assertEqual(
             chain_a.seed_initial_stakes, chain_b.seed_initial_stakes,
         )
+        self.assertEqual(
+            chain_a.seed_divestment_debt, chain_b.seed_divestment_debt,
+        )
 
 
 class TestPostDivestmentRestake(unittest.TestCase):
@@ -257,11 +275,12 @@ class TestPostDivestmentRestake(unittest.TestCase):
         for h in range(START + 1, END + 1):
             chain._apply_seed_divestment(h)
 
-        # Seed identity is pinned at genesis (permanent on-chain record)
-        # but the seed has no special stake anymore.
+        # Seed identity is pinned at genesis (permanent on-chain record).
+        # Residual stake is clamped at the retain floor (± <= 1 token).
         self.assertIn(seed.entity_id, chain.seed_entity_ids)
         residual = chain.supply.get_staked(seed.entity_id)
-        self.assertLess(residual, WINDOW)
+        self.assertGreaterEqual(residual, FLOOR)
+        self.assertLess(residual, FLOOR + 2)
 
         # Give the seed some fresh liquid (simulating fees/rewards earned
         # through normal means) and stake it via the standard supply API.
@@ -291,11 +310,15 @@ class TestBlockPipelineIntegration(unittest.TestCase):
         """Divestment hook fires with the block height; seed state moves."""
         chain, seed, _ = _bootstrapped_chain()
         initial_stake = chain.supply.get_staked(seed.entity_id)
-        per_block = initial_stake // WINDOW
+        divestible = initial_stake - FLOOR
+        SCALE = 10 ** 9
+        per_block_scaled = (divestible * SCALE) // WINDOW
+        expected_whole = per_block_scaled // SCALE
+
         chain._apply_seed_divestment(START + 1)
         self.assertEqual(
             chain.supply.get_staked(seed.entity_id),
-            initial_stake - per_block,
+            initial_stake - expected_whole,
         )
 
     def test_block_affected_entities_includes_seeds(self):

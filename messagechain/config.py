@@ -728,7 +728,9 @@ STATE_CHECKPOINT_INTERVAL = 1000
 STATE_CHECKPOINT_THRESHOLD_NUMERATOR = 2
 STATE_CHECKPOINT_THRESHOLD_DENOMINATOR = 3
 MAX_STATE_SNAPSHOT_BYTES = 500_000_000
-STATE_ROOT_VERSION = 1
+# v2: added seed_divestment_debt section to the snapshot Merkle tree
+# (partial-divestment-to-floor schedule).
+STATE_ROOT_VERSION = 2
 
 # Weak-subjectivity checkpoints — the PoS long-range-attack defense.
 # A list of (block_number, block_hash, state_root) snapshots that new nodes
@@ -783,6 +785,23 @@ SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 315_576
 SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
 SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
 assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
+
+# Partial divestment: the founder's initial stake is drained DOWN TO
+# this floor, not to zero.  Sized to be "one of the bigger players but
+# not dominant" post-bootstrap: 0.1% of GENESIS_SUPPLY, roughly 10x
+# the expected average non-seed validator stake after bootstrap
+# distributes ~1.68M tokens across non-seeds.  The founder can still
+# voluntarily unstake this floor later via an UnstakeTransaction; no
+# protocol mechanism drains below it.
+#
+# Rationale:
+#   * Preserves a meaningful founder stake commensurate with the
+#     effort of bootstrapping the chain.
+#   * Keeps the floor well below any individual quorum threshold so
+#     the founder can never single-handedly block consensus.
+#   * Floor is a CONSENSUS CONSTANT — changing it is a hard fork.
+SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # tokens the founder always keeps
+# The founder's initial stake is divested DOWN TO this floor, not to zero.
 
 # Staking
 UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
