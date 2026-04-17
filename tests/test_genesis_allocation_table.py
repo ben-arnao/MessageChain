@@ -244,8 +244,14 @@ class TestTreasurySpend(unittest.TestCase):
         self.assertFalse(result)
 
     def test_treasury_spend_executes_after_approval(self):
-        """Approved treasury spend transfers funds to recipient."""
-        from messagechain.config import TREASURY_ENTITY_ID, TREASURY_ALLOCATION
+        """Approved treasury spend transfers funds to recipient.
+
+        Bob is a brand-new recipient (not in balances), so the treasury
+        also covers the NEW_ACCOUNT_FEE surcharge, which is burned.
+        """
+        from messagechain.config import (
+            TREASURY_ENTITY_ID, TREASURY_ALLOCATION, NEW_ACCOUNT_FEE,
+        )
         from messagechain.governance.governance import (
             GovernanceTracker, create_treasury_spend_proposal,
         )
@@ -262,7 +268,7 @@ class TestTreasurySpend(unittest.TestCase):
         self.assertEqual(chain.supply.get_balance(self.bob.entity_id), 5000)
         self.assertEqual(
             chain.supply.get_balance(TREASURY_ENTITY_ID),
-            TREASURY_ALLOCATION - 5000,
+            TREASURY_ALLOCATION - 5000 - NEW_ACCOUNT_FEE,
         )
 
     def test_treasury_spend_cannot_execute_twice(self):

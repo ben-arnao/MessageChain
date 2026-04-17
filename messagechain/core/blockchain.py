@@ -25,6 +25,7 @@ from messagechain.config import (
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
+    NEW_ACCOUNT_FEE,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.state_tree import SparseMerkleTree
@@ -1240,8 +1241,58 @@ class Blockchain:
 
         return True, "Valid"
 
+    def _recipient_is_new(
+        self,
+        recipient_id: bytes,
+        *,
+        pending_new_account_created: set[bytes] | None = None,
+    ) -> bool:
+        """Return True iff `recipient_id` has no on-chain state at all.
+
+        The canonical check is "state_tree has no leaf for this entity,"
+        but the state_tree is only synced lazily (compute_current_state_root
+        /_touch_state). During validation the live dicts are the
+        authoritative source of truth.  An entity is "brand-new" iff it
+        appears in NONE of: balances, staked, public_keys, authority_keys,
+        leaf_watermarks, key_rotation_counts, revoked_entities,
+        slashed_validators, or entity_index.  This matches the set of
+        fields _rebuild_state_tree iterates when populating the SMT, so
+        absence here == absence of any committed state.
+
+        `pending_new_account_created`, if provided, lists recipients
+        already funded by earlier txs within the same block but not yet
+        flushed to dicts — used only by the block-path validator for
+        intra-block pipelining.  If the recipient is in that set, we
+        treat them as NOT new (since an earlier tx in this block already
+        paid the surcharge).
+        """
+        if pending_new_account_created is not None and recipient_id in pending_new_account_created:
+            return False
+        if recipient_id in self.supply.balances:
+            return False
+        if recipient_id in self.supply.staked:
+            return False
+        if recipient_id in self.public_keys:
+            return False
+        if recipient_id in self.authority_keys:
+            return False
+        if recipient_id in self.leaf_watermarks:
+            return False
+        if recipient_id in self.key_rotation_counts:
+            return False
+        if recipient_id in self.revoked_entities:
+            return False
+        if recipient_id in self.slashed_validators:
+            return False
+        if recipient_id in self.entity_id_to_index:
+            return False
+        if recipient_id in self.nonces:
+            return False
+        return True
+
     def validate_transfer_transaction(
         self, tx: TransferTransaction, *, expected_nonce: int | None = None,
+        pending_new_account_created: set[bytes] | None = None,
     ) -> tuple[bool, str]:
         """Validate a transfer transaction against current chain state.
 
@@ -1261,6 +1312,22 @@ class Blockchain:
         # Dust limit: reject transfers below minimum to prevent state bloat
         if tx.amount < DUST_LIMIT:
             return False, f"Transfer amount {tx.amount} below dust limit {DUST_LIMIT}"
+
+        # New-account surcharge: if the recipient has no on-chain state,
+        # this tx is creating a permanent state entry and must pay
+        # MIN_FEE + NEW_ACCOUNT_FEE at minimum.  The extra surcharge is
+        # BURNED on apply (see _apply_transfer_with_burn).
+        if self._recipient_is_new(
+            tx.recipient_id,
+            pending_new_account_created=pending_new_account_created,
+        ):
+            required = MIN_FEE + NEW_ACCOUNT_FEE
+            if tx.fee < required:
+                return False, (
+                    f"Transfer to brand-new recipient requires "
+                    f"fee >= {required} (MIN_FEE {MIN_FEE} + "
+                    f"new-account surcharge {NEW_ACCOUNT_FEE}); got {tx.fee}"
+                )
 
         # Resolve the pubkey we should verify against.  Two paths:
         #  (a) entity already known on chain -> use stored pubkey, and
@@ -1325,13 +1392,23 @@ class Blockchain:
         """Apply a validated transfer.
 
         Moves `tx.amount` from sender to recipient and credits `tx.fee`
-        to `proposer_id`.  Implicitly:
+        (minus the new-account surcharge, if applicable) to `proposer_id`.
+        Implicitly:
           * creates a balance entry for the recipient if they were
             previously unknown; and
           * on first-spend (sender_pubkey populated + no existing
             pubkey in state) installs the sender's pubkey, initializes
             nonce to 0, and assigns their entity_index.
+
+        Surcharge accounting: if the recipient was brand-new at call
+        time, NEW_ACCOUNT_FEE of the tx fee is burned (total_supply
+        decreases; total_burned increases) and the proposer only
+        receives (tx.fee - NEW_ACCOUNT_FEE).  Permanent state entry →
+        permanent supply reduction.
         """
+        # Must snapshot "is recipient new" BEFORE any state mutation.
+        recipient_was_new = self._recipient_is_new(tx.recipient_id)
+
         # First-spend pubkey install: runs BEFORE the balance/nonce
         # mutations so the state-tree sync captures the new pubkey in
         # the same _touch_state sweep the caller is about to do.
@@ -1345,9 +1422,16 @@ class Blockchain:
             if self.db is not None:
                 self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
 
+        # Surcharge burn for brand-new recipient.
+        surcharge = NEW_ACCOUNT_FEE if recipient_was_new else 0
+        proposer_credit = tx.fee - surcharge
+
         self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
         self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
-        self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tx.fee
+        self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + proposer_credit
+        if surcharge > 0:
+            self.supply.total_supply -= surcharge
+            self.supply.total_burned += surcharge
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
         self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
@@ -1812,18 +1896,57 @@ class Blockchain:
         # _apply_transfer_with_burn: on a first-spend tx (sender_pubkey
         # populated + entity not yet in sim_public_keys), install the
         # pubkey so the committed state root matches the apply-path
-        # mutation.
+        # mutation.  Also mirrors the NEW_ACCOUNT_FEE surcharge: when
+        # the recipient is brand-new, NEW_ACCOUNT_FEE is burned and the
+        # proposer tip is correspondingly reduced.
+        def _sim_recipient_is_new(rid: bytes) -> bool:
+            """Brand-new iff no on-chain state at all in the sim.
+
+            Checks every per-entity source the SMT would commit to;
+            mirrors self._recipient_is_new but against sim_* dicts so
+            intra-block pipelining is captured naturally (once tx1
+            upserts sim_balances[rid], tx2 sees it and skips the
+            surcharge)."""
+            if rid in sim_balances:
+                return False
+            if rid in sim_staked:
+                return False
+            if rid in sim_public_keys:
+                return False
+            if rid in sim_authority_keys:
+                return False
+            if rid in sim_leaf_watermarks:
+                return False
+            if rid in sim_rotation_counts:
+                return False
+            if rid in sim_revoked:
+                return False
+            if rid in sim_slashed:
+                return False
+            # Fall back to blockchain's own canonical check for fields
+            # the sim doesn't maintain separately (e.g., entity_id_to_index
+            # and nonces outside sim_nonces' view).
+            return self._recipient_is_new(rid)
+
         for ttx in (transfer_transactions or []):
             if (
                 getattr(ttx, "sender_pubkey", b"")
                 and ttx.entity_id not in sim_public_keys
             ):
                 sim_public_keys[ttx.entity_id] = ttx.sender_pubkey
+            recipient_was_new = _sim_recipient_is_new(ttx.recipient_id)
             effective_base_fee = min(current_base_fee, ttx.fee)
-            tip = ttx.fee - effective_base_fee
+            surcharge = NEW_ACCOUNT_FEE if recipient_was_new else 0
+            if effective_base_fee + surcharge > ttx.fee:
+                surcharge = max(0, ttx.fee - effective_base_fee)
+            tip = ttx.fee - effective_base_fee - surcharge
             sim_balances[ttx.entity_id] = sim_balances.get(ttx.entity_id, 0) - ttx.amount - ttx.fee
             sim_balances[ttx.recipient_id] = sim_balances.get(ttx.recipient_id, 0) + ttx.amount
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            # Note: surcharge burn reduces total_supply but NOT any
+            # per-entity balance (it's truly destroyed).  The state_root
+            # commits only to per-entity state, so we do not need to
+            # reflect the burn itself anywhere in the sim state.
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
             _bump_wm(ttx.entity_id, ttx.signature.leaf_index)
 
@@ -2116,8 +2239,19 @@ class Blockchain:
                     continue
                 if block_height - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
                     continue
+                # New-account surcharge is charged if the recipient is
+                # brand-new.  In sim, "brand-new" means absent from every
+                # live dict.  We use the same helper as the real path so
+                # byte-for-byte burn semantics match.
+                def _sim_is_new(rid: bytes) -> bool:
+                    if rid in sim_supply.balances:
+                        return False
+                    if rid in sim_supply.staked:
+                        return False
+                    return self._recipient_is_new(rid)
                 sim_tracker.execute_treasury_spend(
                     proposal, sim_supply, current_block=block_height,
+                    is_new_account=_sim_is_new,
                 )
 
             # Read the post-governance state back into sim_* for state_root
@@ -2920,7 +3054,39 @@ class Blockchain:
         # spend].  The cumulative-balance check at stake-validate time
         # consults this alongside get_spendable_balance.
         pending_balance_credits: dict[bytes, int] = {}
+        # Recipients funded earlier in this block — so a later tx to the
+        # same recipient in the same block does NOT re-pay the
+        # NEW_ACCOUNT_FEE surcharge.  Mirrors pending_pubkey_installs
+        # for the sender side.  Only the FIRST tx to fund a given brand-
+        # new recipient pays the surcharge.
+        pending_new_account_created: set[bytes] = set()
         for ttx in block.transfer_transactions:
+            # Dust limit: mirrors the standalone validator so block-
+            # path validation cannot admit a transfer below the limit.
+            if ttx.amount < DUST_LIMIT:
+                return False, (
+                    f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                    f"Transfer amount {ttx.amount} below dust limit {DUST_LIMIT}"
+                )
+
+            # New-account surcharge: if the recipient has no on-chain
+            # state AND no earlier tx in this block has funded them,
+            # this tx creates a permanent state entry and must pay
+            # MIN_FEE + NEW_ACCOUNT_FEE.
+            recipient_is_new = self._recipient_is_new(
+                ttx.recipient_id,
+                pending_new_account_created=pending_new_account_created,
+            )
+            if recipient_is_new:
+                required = MIN_FEE + NEW_ACCOUNT_FEE
+                if ttx.fee < required:
+                    return False, (
+                        f"Invalid transfer {ttx.tx_hash.hex()[:16]}: "
+                        f"Transfer to brand-new recipient requires fee "
+                        f">= {required} (MIN_FEE {MIN_FEE} + new-account "
+                        f"surcharge {NEW_ACCOUNT_FEE}); got {ttx.fee}"
+                    )
+
             # Known-sender vs first-spend reveal.
             known_pk = self.public_keys.get(ttx.entity_id) or pending_pubkey_installs.get(ttx.entity_id)
             if known_pk is not None:
@@ -2967,6 +3133,11 @@ class Blockchain:
                 # the same block (e.g., a stake-from-the-same-sender tx
                 # after this transfer).
                 pending_pubkey_installs[ttx.entity_id] = ttx.sender_pubkey
+
+            # Mark the recipient as "created in this block" so later txs
+            # to the same recipient don't re-charge the surcharge.
+            if recipient_is_new:
+                pending_new_account_created.add(ttx.recipient_id)
 
             pending_nonces[ttx.entity_id] = expected_nonce + 1
             pending_balance_spent[ttx.entity_id] = spent_so_far + ttx.amount + ttx.fee
@@ -3583,7 +3754,15 @@ class Blockchain:
         sender is not yet in `self.public_keys`, install the pubkey
         before touching balances.  That's how first-time senders cross
         from "balance-only" to "fully registered."
+
+        New-account surcharge: if the recipient is brand-new (no
+        on-chain state at call time), NEW_ACCOUNT_FEE is burned in
+        addition to the EIP-1559 base-fee burn.  Proposer tip is
+        (tx.fee - base_fee - NEW_ACCOUNT_FEE).
         """
+        # Snapshot "is recipient new" BEFORE any state mutation.
+        recipient_was_new = self._recipient_is_new(tx.recipient_id)
+
         # First-spend pubkey install (see apply_transfer_transaction
         # docstring — same semantics, inline here for the burn path).
         if tx.sender_pubkey and tx.entity_id not in self.public_keys:
@@ -3595,12 +3774,20 @@ class Blockchain:
 
         # M1: Clamp base_fee to the actual fee to prevent negative tip
         effective_base_fee = min(base_fee, tx.fee)
-        tip = tx.fee - effective_base_fee
+        surcharge = NEW_ACCOUNT_FEE if recipient_was_new else 0
+        # Block-path validation ensures tx.fee >= base_fee + surcharge for
+        # brand-new recipients; clamp defensively so we never emit a
+        # negative tip if that invariant is somehow violated (e.g., base
+        # fee rose above the tx's ceiling post-admission).
+        if effective_base_fee + surcharge > tx.fee:
+            surcharge = max(0, tx.fee - effective_base_fee)
+        tip = tx.fee - effective_base_fee - surcharge
         self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
         self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
         self.supply.balances[proposer_id] = self.supply.get_balance(proposer_id) + tip
-        self.supply.total_supply -= effective_base_fee  # burn
-        self.supply.total_burned += effective_base_fee
+        burned = effective_base_fee + surcharge
+        self.supply.total_supply -= burned  # burn
+        self.supply.total_burned += burned
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
 
@@ -4090,6 +4277,7 @@ class Blockchain:
                 continue
             tracker.execute_treasury_spend(
                 proposal, self.supply, current_block=current_block,
+                is_new_account=self._recipient_is_new,
             )
 
         # Phase 3: prune

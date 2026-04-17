@@ -774,19 +774,32 @@ class GovernanceTracker:
         tx: TreasurySpendTransaction,
         supply_tracker,
         current_block: int = 0,
+        *,
+        is_new_account=None,
     ) -> bool:
         """Execute an approved treasury spend. Returns False if rejected.
 
         Rejects if:
         - Amount is invalid
-        - Treasury has insufficient funds
+        - Treasury has insufficient funds (including any new-account
+          surcharge required for a brand-new recipient)
         - Spend has already been executed (replay protection)
         - Proposal does not exist on-chain
         - Voting window is still open
         - yes_weight does not clear strict 2/3 of TOTAL ELIGIBLE stake
           at snapshot.  Silence counts as "no" — a sleepy electorate
           defaults to status quo.
+
+        `is_new_account`, if provided, is a callable that returns True
+        iff the recipient has no on-chain state.  When True, the
+        treasury is additionally charged NEW_ACCOUNT_FEE (burned, not
+        credited to the recipient), matching the surcharge the chain
+        imposes on ordinary Transfer→brand-new flows.  When None, the
+        supply_tracker's own balances dict is consulted as a best-
+        effort fallback; this is suitable only for tests and non-chain
+        paths that don't have a full blockchain view.
         """
+        from messagechain.config import NEW_ACCOUNT_FEE
         if tx.amount <= 0:
             return False
         # Replay protection — each tx_hash can only execute once
@@ -809,7 +822,22 @@ class GovernanceTracker:
         if (yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
                 <= total_eligible * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR):
             return False
-        result = supply_tracker.treasury_spend(tx.recipient_id, tx.amount)
+        # New-account surcharge: if caller supplied a recipient-novelty
+        # check, use it; otherwise fall back to the supply_tracker's
+        # balances/staked dicts as a best-effort approximation (fine for
+        # isolated tests, inadequate for live chain code).
+        if is_new_account is not None:
+            recipient_is_new = bool(is_new_account(tx.recipient_id))
+        else:
+            recipient_is_new = (
+                tx.recipient_id not in supply_tracker.balances
+                and supply_tracker.get_staked(tx.recipient_id) == 0
+            )
+        surcharge = NEW_ACCOUNT_FEE if recipient_is_new else 0
+        result = supply_tracker.treasury_spend(
+            tx.recipient_id, tx.amount,
+            new_account_surcharge=surcharge,
+        )
         if result:
             self._executed_treasury_spends.add(tx.tx_hash)
             self.treasury_spend_log.append({

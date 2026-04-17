@@ -20,7 +20,7 @@ operations fail with a clear error.
 import time
 import unittest
 
-from messagechain.config import GENESIS_ALLOCATION, MIN_FEE
+from messagechain.config import GENESIS_ALLOCATION, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.identity.identity import Entity, derive_entity_id
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transfer import (
@@ -112,8 +112,10 @@ class TestImplicitRecipientCreation(unittest.TestCase):
         recipient = Entity.create(b"unknown_recipient".ljust(32, b"\x00"))
         chain = self._make_chain(sender, recipient.entity_id)
 
+        # Brand-new recipient → must pay MIN_FEE + NEW_ACCOUNT_FEE.
         tx = create_transfer_transaction(
             sender, recipient.entity_id, 100, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         ok, reason = chain.validate_transfer_transaction(tx)
         self.assertTrue(ok, f"Unknown recipient should be accepted now: {reason}")
@@ -129,6 +131,7 @@ class TestImplicitRecipientCreation(unittest.TestCase):
 
         tx = create_transfer_transaction(
             sender, recipient.entity_id, 100, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         ok, _ = chain.validate_transfer_transaction(tx)
         self.assertTrue(ok)
@@ -152,9 +155,10 @@ class TestFirstSpendPubkeyReveal(unittest.TestCase):
         )
         # Fund new_entity via a direct transfer application — no block
         # machinery, we just want state that looks like "received funds
-        # but never spent."
+        # but never spent."  New account → MIN_FEE + NEW_ACCOUNT_FEE.
         tx = create_transfer_transaction(
             funder, new_entity.entity_id, 5_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         ok, reason = chain.validate_transfer_transaction(tx)
         self.assertTrue(ok, reason)
@@ -169,8 +173,10 @@ class TestFirstSpendPubkeyReveal(unittest.TestCase):
         chain, funder, new_entity = self._prep_chain_with_funded_new_entity()
         destination = Entity.create(b"destination_key".ljust(32, b"\x00"))
 
+        # Brand-new destination → MIN_FEE + NEW_ACCOUNT_FEE.
         tx = create_transfer_transaction(
             new_entity, destination.entity_id, 100, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
             include_pubkey=True,
         )
         ok, reason = chain.validate_transfer_transaction(tx)
@@ -186,27 +192,35 @@ class TestFirstSpendPubkeyReveal(unittest.TestCase):
         self.assertGreater(chain.leaf_watermarks[new_entity.entity_id], 0)
 
     def test_first_outgoing_transfer_without_pubkey_is_rejected(self):
-        """Missing sender_pubkey on a first outgoing transfer is rejected."""
-        chain, _, new_entity = self._prep_chain_with_funded_new_entity()
-        destination = Entity.create(b"destination2".ljust(32, b"\x00"))
+        """Missing sender_pubkey on a first outgoing transfer is rejected.
 
+        Use an EXISTING destination so the surcharge check doesn't fire
+        first — we want to exercise the "must include sender_pubkey"
+        error specifically.
+        """
+        chain, funder, new_entity = self._prep_chain_with_funded_new_entity()
+        # Use funder (an existing entity) as destination so that the
+        # brand-new-recipient surcharge rule isn't the reason for failure.
         # include_pubkey defaults to False — this is exactly the error case.
         tx = create_transfer_transaction(
-            new_entity, destination.entity_id, 100, nonce=0,
+            new_entity, funder.entity_id, 100, nonce=0,
         )
         ok, reason = chain.validate_transfer_transaction(tx)
         self.assertFalse(ok, "Transfer from unregistered entity without pubkey must fail")
         self.assertIn("sender_pubkey", reason.lower())
 
     def test_first_outgoing_transfer_with_mismatched_pubkey_rejected(self):
-        """sender_pubkey whose hash != entity_id must be rejected."""
-        chain, _, new_entity = self._prep_chain_with_funded_new_entity()
-        destination = Entity.create(b"destination3".ljust(32, b"\x00"))
+        """sender_pubkey whose hash != entity_id must be rejected.
+
+        Use an existing destination so the surcharge check is not the
+        reason for failure.
+        """
+        chain, funder, new_entity = self._prep_chain_with_funded_new_entity()
         impostor = Entity.create(b"impostor_key".ljust(32, b"\x00"))
 
         # Build a transfer signed by new_entity but carrying impostor's pubkey.
         tx = create_transfer_transaction(
-            new_entity, destination.entity_id, 100, nonce=0,
+            new_entity, funder.entity_id, 100, nonce=0,
             include_pubkey=True,
         )
         # Swap the pubkey in and recompute tx_hash as a malicious relayer would.
@@ -227,9 +241,10 @@ class TestFirstSpendPubkeyReveal(unittest.TestCase):
         chain, funder, new_entity = self._prep_chain_with_funded_new_entity()
         destination = Entity.create(b"destination4".ljust(32, b"\x00"))
 
-        # First transfer: reveal pubkey.
+        # First transfer: reveal pubkey.  Brand-new destination → surcharge.
         tx1 = create_transfer_transaction(
             new_entity, destination.entity_id, 100, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
             include_pubkey=True,
         )
         ok, reason = chain.validate_transfer_transaction(tx1)
@@ -237,6 +252,7 @@ class TestFirstSpendPubkeyReveal(unittest.TestCase):
         chain.apply_transfer_transaction(tx1, proposer_id=funder.entity_id)
 
         # Second transfer: must NOT populate sender_pubkey again.
+        # destination now exists — no surcharge required.
         tx2 = create_transfer_transaction(
             new_entity, destination.entity_id, 50, nonce=1,
             include_pubkey=True,
@@ -260,9 +276,11 @@ class TestStakeFromUnregisteredEntity(unittest.TestCase):
             funder, allocation_table={funder.entity_id: GENESIS_ALLOCATION},
         )
 
-        # Fund receiver to put them "in state" by balance.
+        # Fund receiver to put them "in state" by balance.  Brand-new
+        # recipient → MIN_FEE + NEW_ACCOUNT_FEE.
         tx = create_transfer_transaction(
             funder, receiver.entity_id, 5_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         self.assertTrue(chain.validate_transfer_transaction(tx)[0])
         chain.apply_transfer_transaction(tx, proposer_id=funder.entity_id)
@@ -296,6 +314,7 @@ class TestReceiveOnlyEntityInStateTree(unittest.TestCase):
         )
         tx = create_transfer_transaction(
             funder, receiver.entity_id, 777, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         self.assertTrue(chain.validate_transfer_transaction(tx)[0])
         chain.apply_transfer_transaction(tx, proposer_id=funder.entity_id)

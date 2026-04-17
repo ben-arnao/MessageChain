@@ -23,7 +23,7 @@ Invariants mirrored from Transfer (see test_receive_to_exist.py):
 import unittest
 
 from messagechain import config
-from messagechain.config import GENESIS_ALLOCATION, MIN_FEE
+from messagechain.config import GENESIS_ALLOCATION, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block
@@ -110,9 +110,11 @@ class TestStakeFirstSpendValidation(unittest.TestCase):
         chain = Blockchain()
         chain.initialize_genesis(funder)
         chain.supply.balances[funder.entity_id] = 1_000_000
-        # Fund the new entity but don't install its pubkey.
+        # Fund the new entity but don't install its pubkey.  Brand-new
+        # recipient → MIN_FEE + NEW_ACCOUNT_FEE.
         tx = create_transfer_transaction(
             funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         ok, reason = chain.validate_transfer_transaction(tx)
         self.assertTrue(ok, reason)
@@ -172,6 +174,7 @@ class TestKnownEntityMalleability(unittest.TestCase):
         chain.supply.balances[funder.entity_id] = 1_000_000
         tx = create_transfer_transaction(
             funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         self.assertTrue(chain.validate_transfer_transaction(tx)[0])
         chain.apply_transfer_transaction(tx, proposer_id=funder.entity_id)
@@ -223,6 +226,7 @@ class TestStakeFirstSpendApply(unittest.TestCase):
         chain.supply.balances[funder.entity_id] = 1_000_000
         tx = create_transfer_transaction(
             funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         self.assertTrue(chain.validate_transfer_transaction(tx)[0])
         chain.apply_transfer_transaction(tx, proposer_id=funder.entity_id)
@@ -258,6 +262,7 @@ class TestStakeFirstSpendApply(unittest.TestCase):
         chain.supply.balances[funder.entity_id] = 1_000_000
         tx = create_transfer_transaction(
             funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         chain.apply_transfer_transaction(tx, proposer_id=funder.entity_id)
 
@@ -300,9 +305,10 @@ class TestStakeFirstSpendSingleBlock(unittest.TestCase):
         # Give funder a big liquid balance.
         chain.supply.balances[funder.entity_id] = 1_000_000
 
-        # Transfer that funds new_entity.
+        # Transfer that funds new_entity.  Brand-new recipient → surcharge.
         ttx = create_transfer_transaction(
-            funder, new_entity.entity_id, 200_000, nonce=0, fee=MIN_FEE,
+            funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         # Stake from new_entity using first-spend pubkey reveal.
         stx = create_stake_transaction(
@@ -345,7 +351,8 @@ class TestStakeFirstSpendSingleBlock(unittest.TestCase):
         chain.supply.balances[funder.entity_id] = 1_000_000
 
         ttx = create_transfer_transaction(
-            funder, new_entity.entity_id, 200_000, nonce=0, fee=MIN_FEE,
+            funder, new_entity.entity_id, 200_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         stx = create_stake_transaction(
             new_entity, amount=100_000, nonce=0, fee=MIN_FEE,
@@ -389,10 +396,12 @@ class TestStakeFirstSpendStandaloneEntity(unittest.TestCase):
         chain.initialize_genesis(genesis)
         chain.supply.balances[genesis.entity_id] = 1_000_000
 
-        # Block 1: genesis transfers funds to newcomer.
+        # Block 1: genesis transfers funds to newcomer.  Brand-new
+        # recipient → MIN_FEE + NEW_ACCOUNT_FEE.
         consensus = ProofOfStake()
         ttx = create_transfer_transaction(
-            genesis, newcomer.entity_id, 300_000, nonce=0, fee=MIN_FEE,
+            genesis, newcomer.entity_id, 300_000, nonce=0,
+            fee=MIN_FEE + NEW_ACCOUNT_FEE,
         )
         blk1 = chain.propose_block(
             consensus, genesis, [],
