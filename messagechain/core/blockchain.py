@@ -179,6 +179,14 @@ class Blockchain:
         from messagechain.consensus.bootstrap_gradient import RatchetState
         self._bootstrap_ratchet: RatchetState = RatchetState()
 
+        # Seed-validator divestment snapshot: entity_id -> initial staked
+        # amount captured at the first divestment block (H = START + 1).
+        # The per-block decrement is `snapshot / window` and stays fixed
+        # for the entire divestment window — deterministic from replay,
+        # since every node re-applies block START+1 and records the same
+        # value.  Snapshotted in _snapshot_memory_state for reorg safety.
+        self.seed_initial_stakes: dict[bytes, int] = {}
+
         # Attester-reward escrow (stage 3).  Bootstrap-era committee
         # rewards sit here for escrow_blocks_for_progress(progress)
         # blocks before unlocking to spendable balance.  Slashable
@@ -2042,6 +2050,48 @@ class Blockchain:
         # `sim_public_keys[ttx.entity_id] = ttx.sender_pubkey` branch
         # for first-spend txs, keeping sim and apply paths in lockstep.
 
+        # Simulate seed divestment — must byte-mirror _apply_seed_divestment.
+        # Runs before attester-committee candidate selection so the seed's
+        # reduced stake is reflected in committee weights for this block.
+        # The snapshot dict is read-only here (sim does not persist its
+        # first-block capture); the apply path owns the mutation.
+        from messagechain.config import (
+            SEED_DIVESTMENT_START_HEIGHT as _SDS,
+            SEED_DIVESTMENT_END_HEIGHT as _SDE,
+            SEED_DIVESTMENT_TREASURY_BPS as _SDT,
+        )
+        if (
+            block_height > _SDS
+            and block_height <= _SDE
+            and self.seed_entity_ids
+        ):
+            _window = _SDE - _SDS
+            for _seid in self.seed_entity_ids:
+                # Apply path snapshots at the first divestment block from
+                # live stake; on replay the same capture reproduces.  We
+                # mirror that here: if the entry isn't yet in the live
+                # dict, read the current live (pre-divestment) stake.
+                _init = self.seed_initial_stakes.get(
+                    _seid, sim_staked.get(_seid, 0),
+                )
+                if _init <= 0:
+                    continue
+                _per_block = _init // _window
+                if _per_block <= 0:
+                    continue
+                _current = sim_staked.get(_seid, 0)
+                _divest = min(_per_block, _current)
+                if _divest <= 0:
+                    continue
+                _treasury_share = _divest * _SDT // 10_000
+                sim_staked[_seid] = _current - _divest
+                if _treasury_share > 0:
+                    sim_balances[TREASURY_ENTITY_ID] = (
+                        sim_balances.get(TREASURY_ENTITY_ID, 0) + _treasury_share
+                    )
+                # Burn portion reduces total_supply — not represented in
+                # the per-entity state tree, so no sim_balances change.
+
         # Simulate block reward: committee-based attester distribution +
         # proposer share + PROPOSER_REWARD_CAP overflow.  Must mirror
         # mint_block_reward byte-for-byte; any divergence here produces
@@ -3833,7 +3883,82 @@ class Blockchain:
             affected.add(stx.entity_id)
         for utx in getattr(block, "unstake_transactions", []):
             affected.add(utx.entity_id)
+        # Seed divestment mutates seed stake + treasury every block within
+        # the divestment window.  Cheap to always include (small set, often
+        # a single seed); guarantees the incremental state-tree refresh
+        # never misses the touched rows.
+        affected.update(self.seed_entity_ids)
         return affected
+
+    def _apply_seed_divestment(self, block_height: int) -> None:
+        """Forcibly divest a linear fraction of each seed's genesis stake.
+
+        Non-discretionary, always-on schedule.  Between SEED_DIVESTMENT_START
+        (exclusive) and SEED_DIVESTMENT_END (inclusive), each block unbonds
+        initial_seed_stake / window tokens per seed — 75% burned, 25% to
+        treasury.  Outside that window this is a no-op.
+
+        Snapshot is taken once at the first divestment block from the
+        live staked balance so replay is deterministic (every node that
+        re-applies that block captures the same value).  Stored in
+        `self.seed_initial_stakes` and restored across reorg via
+        _snapshot_memory_state / _restore_memory_snapshot.
+
+        Called from `_apply_block_state` after all tx-driven stake moves
+        so the divestment operates on the post-tx staked balance.  Any
+        integer-rounding remainder accrues to burn (cleaner: smaller
+        supply).  Stake is clamped at 0 — once a seed's stake is gone
+        no further tokens move regardless of the schedule.
+        """
+        from messagechain.config import (
+            SEED_DIVESTMENT_START_HEIGHT,
+            SEED_DIVESTMENT_END_HEIGHT,
+            SEED_DIVESTMENT_TREASURY_BPS,
+            TREASURY_ENTITY_ID,
+        )
+        if block_height <= SEED_DIVESTMENT_START_HEIGHT:
+            return
+        if block_height > SEED_DIVESTMENT_END_HEIGHT:
+            return
+        if not self.seed_entity_ids:
+            return
+        window = SEED_DIVESTMENT_END_HEIGHT - SEED_DIVESTMENT_START_HEIGHT
+        assert window > 0, "divestment window must be positive"
+
+        for eid in self.seed_entity_ids:
+            # First-block snapshot: capture the seed's then-current stake
+            # once, so subsequent blocks decrement by a flat per-block
+            # amount instead of rebasing against the decayed stake.
+            if eid not in self.seed_initial_stakes:
+                self.seed_initial_stakes[eid] = self.supply.get_staked(eid)
+            initial = self.seed_initial_stakes[eid]
+            if initial <= 0:
+                continue
+
+            per_block = initial // window  # integer floor — consensus-safe
+            if per_block <= 0:
+                continue
+
+            current_stake = self.supply.get_staked(eid)
+            divest = min(per_block, current_stake)
+            if divest <= 0:
+                continue
+
+            # Split: treasury gets the exact 25% share (basis points);
+            # burn gets the remainder so any integer-rounding remainder
+            # always favors burn — smaller supply is the cleaner invariant.
+            treasury_share = divest * SEED_DIVESTMENT_TREASURY_BPS // 10_000
+            burn_share = divest - treasury_share
+            assert treasury_share + burn_share == divest
+
+            self.supply.staked[eid] = current_stake - divest
+            if treasury_share > 0:
+                self.supply.balances[TREASURY_ENTITY_ID] = (
+                    self.supply.balances.get(TREASURY_ENTITY_ID, 0) + treasury_share
+                )
+            if burn_share > 0:
+                self.supply.total_supply -= burn_share
+                self.supply.total_burned += burn_share
 
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
@@ -3969,6 +4094,12 @@ class Blockchain:
         # section is needed — an entity becomes "registered" the first
         # time it spends, and becomes visible in state the first time
         # it receives.
+
+        # Non-discretionary seed divestment — runs after all tx-driven
+        # stake moves so the schedule operates on the post-tx staked
+        # balance, and before committee selection so the seed's reduced
+        # stake is reflected in the same block's attester weights.
+        self._apply_seed_divestment(block.header.block_number)
 
         # Candidate attesters for the reward committee: everyone whose
         # attestation was included in this block.  Stake is 0 during
@@ -4823,6 +4954,10 @@ class Blockchain:
             # and re-applies blocks.
             "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
             "blocks_since_last_finalization": self.blocks_since_last_finalization,
+            # Seed divestment snapshot: reorg-safe so the once-per-seed
+            # initial-stake reference is not silently rebuilt from a
+            # post-reorg stake value on replay.
+            "seed_initial_stakes": dict(self.seed_initial_stakes),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -4867,6 +5002,9 @@ class Blockchain:
             self._bootstrap_ratchet.observe(ratchet_value)
         self.blocks_since_last_finalization = snapshot.get(
             "blocks_since_last_finalization", 0,
+        )
+        self.seed_initial_stakes = dict(
+            snapshot.get("seed_initial_stakes", {})
         )
         if "authority_keys" in snapshot:
             self.authority_keys = dict(snapshot["authority_keys"])

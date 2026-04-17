@@ -544,6 +544,30 @@ REQUIRE_CHECKPOINTS = (
 OUTBOUND_FULL_RELAY_SLOTS = 8
 OUTBOUND_BLOCK_RELAY_ONLY_SLOTS = 2
 
+# Seed-validator divestment — non-discretionary unwind of founder stake.
+#
+# The founder bootstraps the chain with ~99M tokens staked (~9.9% of supply).
+# Without an enforced unwind, at H=BOOTSTRAP_END_HEIGHT the founder would
+# still dominate consensus with ~98% of stake as every bootstrap guardrail
+# drops simultaneously.  The divestment schedule forces a linear unwind of
+# each seed's initial stake over SEED_DIVESTMENT_END - SEED_DIVESTMENT_START
+# blocks (~4 years at 600s), routing 75% to burn and 25% to the treasury.
+#
+# This is non-discretionary, always-on, and has no kill-switch.  Seeds can
+# still re-stake post-divestment via a normal StakeTransaction using tokens
+# earned through fees, rewards, or purchases — they simply lose their
+# special genesis-stake status.
+#
+# Imported from bootstrap_gradient at module load to keep the one source
+# of truth for BOOTSTRAP_END_HEIGHT.  Window length is fixed at 210,384
+# blocks (~4 years) to match the existing halving cadence.
+from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT as _BEH  # noqa: E402
+SEED_DIVESTMENT_START_HEIGHT = _BEH                                    # 105_192
+SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 315_576
+SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
+SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
+assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
+
 # Staking
 UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
 
