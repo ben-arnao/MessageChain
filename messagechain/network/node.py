@@ -25,6 +25,7 @@ from messagechain.config import (
     OUTBOUND_BLOCK_RELAY_ONLY_SLOTS, OUTBOUND_FULL_RELAY_SLOTS,
     MEMPOOL_SYNC_INTERVAL_SEC, MEMPOOL_SYNC_FANOUT,
     MEMPOOL_DIGEST_MAX_HASHES, MEMPOOL_DIGEST_MIN_INTERVAL_SEC,
+    MAX_BLOCK_HEX_SIZE, validate_block_hex_size,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -593,8 +594,8 @@ class Node:
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
             try:
                 block_hex = msg.payload.get("block")
-                if not isinstance(block_hex, str):
-                    raise ValueError("ANNOUNCE_BLOCK payload missing 'block' hex string")
+                if not validate_block_hex_size(block_hex):
+                    raise ValueError("ANNOUNCE_BLOCK payload missing/oversized 'block' hex string")
                 block = Block.from_bytes(bytes.fromhex(block_hex))
             except Exception:
                 self.ban_manager.record_offense(
@@ -689,8 +690,8 @@ class Node:
             block_data = msg.payload.get("block")
             if block_data:
                 try:
-                    if not isinstance(block_data, str):
-                        raise ValueError("RESPONSE_BLOCK 'block' must be hex string")
+                    if not validate_block_hex_size(block_data):
+                        raise ValueError("RESPONSE_BLOCK 'block' must be hex string within size limit")
                     block = Block.from_bytes(bytes.fromhex(block_data))
                 except Exception:
                     self.ban_manager.record_offense(

@@ -11,6 +11,8 @@ stores it alongside the chain data.  Peers accept any certificate (no CA
 verification) because the goal is encryption, not PKI-based trust.
 """
 
+import hashlib
+import json
 import logging
 import os
 import ssl
@@ -19,6 +21,102 @@ import tempfile
 from messagechain.config import P2P_TLS_ENABLED, TLS_CERT_PATH, TLS_KEY_PATH
 
 logger = logging.getLogger(__name__)
+
+
+class CertificatePinStore:
+    """TOFU (Trust On First Use) certificate pin store.
+
+    Stores SHA-256 fingerprints of peer TLS certificates keyed by
+    (host, port).  On first connection to a peer, records their
+    certificate fingerprint.  On subsequent connections, verifies
+    the fingerprint matches — a mismatch signals a possible MITM.
+
+    Pins are persisted to a JSON file so they survive restarts.
+    """
+
+    def __init__(self, path: str | None = None):
+        self._path = path
+        self._pins: dict[str, str] = {}  # "host:port" -> hex fingerprint
+        if path and os.path.exists(path):
+            self.load()
+
+    @staticmethod
+    def _key(host: str, port: int) -> str:
+        return f"{host}:{port}"
+
+    def pin(self, host: str, port: int, fingerprint: str) -> None:
+        """Store a fingerprint for a peer."""
+        self._pins[self._key(host, port)] = fingerprint
+
+    def get(self, host: str, port: int) -> str | None:
+        """Retrieve the stored fingerprint for a peer, or None."""
+        return self._pins.get(self._key(host, port))
+
+    def check_or_pin(self, host: str, port: int, fingerprint: str) -> bool:
+        """Check fingerprint against stored pin, or pin if first-seen.
+
+        Returns True if the peer is trusted (first-seen or matching pin).
+        Returns False if the fingerprint differs from the stored pin
+        (possible MITM).
+        """
+        existing = self.get(host, port)
+        if existing is None:
+            # First connection — trust and pin
+            self.pin(host, port, fingerprint)
+            return True
+        return existing == fingerprint
+
+    def clear_pin(self, host: str, port: int) -> None:
+        """Remove a pin (for legitimate certificate rotation)."""
+        key = self._key(host, port)
+        self._pins.pop(key, None)
+
+    def save(self) -> None:
+        """Persist pins to the JSON file."""
+        if self._path is None:
+            return
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w") as f:
+            json.dump(self._pins, f)
+
+    def load(self) -> None:
+        """Load pins from the JSON file."""
+        if self._path is None or not os.path.exists(self._path):
+            return
+        try:
+            with open(self._path, "r") as f:
+                self._pins = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to load certificate pin store; starting fresh")
+            self._pins = {}
+
+
+def _cert_fingerprint(der_bytes: bytes) -> str:
+    """Compute SHA-256 fingerprint of a DER-encoded certificate."""
+    return hashlib.sha256(der_bytes).hexdigest()
+
+
+def verify_peer_certificate(
+    ssl_socket: ssl.SSLSocket,
+    host: str,
+    port: int,
+    pin_store: CertificatePinStore,
+) -> bool:
+    """Verify a peer's TLS certificate against the TOFU pin store.
+
+    Call this after the TLS handshake completes.  Gets the peer's
+    DER-encoded certificate, computes its SHA-256 fingerprint, and
+    checks it against the pin store.
+
+    Returns True if first-seen (pins it) or if fingerprint matches.
+    Returns False if fingerprint changed (possible MITM) or if no
+    certificate was presented.
+    """
+    der_cert = ssl_socket.getpeercert(binary_form=True)
+    if der_cert is None:
+        return False
+    fingerprint = _cert_fingerprint(der_cert)
+    return pin_store.check_or_pin(host, port, fingerprint)
 
 
 def _generate_self_signed_cert(cert_path: str, key_path: str):

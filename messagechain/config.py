@@ -593,3 +593,22 @@ TLS_KEY_PATH: str | None = None   # auto-generated if None
 SUBMISSION_RATE_LIMIT_PER_SEC = 2
 SUBMISSION_BURST = 10
 MAX_SUBMISSION_BODY_BYTES = 16384
+
+# Block deserialization size limit — maximum hex-encoded block size
+# accepted from peers over the network.  A block with MAX_TXS_PER_BLOCK=20
+# transactions each carrying MAX_BLOCK_MESSAGE_BYTES of payload plus WOTS+
+# signatures is well under 1MB binary.  We allow 2MB hex (= 1MB binary) as
+# a conservative ceiling.  Anything larger is either malicious or a bug on
+# the sender side.
+MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
+
+
+def validate_block_hex_size(block_data) -> bool:
+    """Return True if block_data is a string within the size limit.
+
+    Used as a guard before Block.from_bytes(bytes.fromhex(block_data))
+    to reject oversized payloads from untrusted peers.
+    """
+    if not isinstance(block_data, str):
+        return False
+    return len(block_data) <= MAX_BLOCK_HEX_SIZE

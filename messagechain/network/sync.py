@@ -27,6 +27,7 @@ from typing import Callable
 
 import messagechain.config
 from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
+from messagechain.config import MAX_BLOCK_HEX_SIZE, validate_block_hex_size
 from messagechain.consensus.checkpoint import WeakSubjectivityCheckpoint
 from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
 from messagechain.core.block import Block, BlockHeader
@@ -518,8 +519,8 @@ class ChainSyncer:
                 # Wire format: hex-encoded Block.to_bytes() binary blob.
                 # See node._handle_request_blocks_batch for why we ship
                 # blocks opaquely rather than as nested dicts.
-                if not isinstance(block_data, str):
-                    raise ValueError("block batch entry must be hex string")
+                if not validate_block_hex_size(block_data):
+                    raise ValueError("block batch entry must be hex string within size limit")
                 block = Block.from_bytes(bytes.fromhex(block_data))
                 block_hash = block.block_hash
 
