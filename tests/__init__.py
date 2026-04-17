@@ -16,6 +16,9 @@ messagechain.config.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1
 # must be disabled. The proposer-match check stays on — tests that stake
 # validators must use the deterministically-selected proposer.
 messagechain.config.ENFORCE_SLOT_TIMING = False
+# Tests run without checkpoint files; disable the strict requirement so
+# test nodes don't refuse to start.
+messagechain.config.REQUIRE_CHECKPOINTS = False
 
 
 def register_entity_for_test(chain, entity):
