@@ -1097,6 +1097,108 @@ class Server:
         pool[tx.tx_hash] = tx
         return True
 
+    def _has_pending_stake_from(self, entity_id: bytes) -> bool:
+        """Return True iff any pending stake tx in the local pool belongs
+        to `entity_id`.
+
+        Cheap guard that prevents auto-restake from stacking two sweep
+        txs for the same entity when a second block fires before the
+        first sweep was included.  A second stake tx with the same
+        nonce would be rejected anyway (mempool nonce gate), but
+        skipping at the source avoids pointless WOTS+ leaf consumption.
+        """
+        pool = getattr(self, "_pending_stake_txs", {}) or {}
+        for tx in pool.values():
+            if getattr(tx, "entity_id", None) == entity_id:
+                return True
+        return False
+
+    def _maybe_auto_restake(self):
+        """Node-local opt-in policy: convert surplus liquid into stake.
+
+        Called after a successful `add_block` in `_try_produce_block_sync`.
+        When config.AUTO_RESTAKE is off (the default), this is a no-op —
+        a node that never flips the flag behaves identically to today.
+
+        When enabled, the node sweeps its own liquid balance above
+        AUTO_RESTAKE_LIQUID_BUFFER into a new StakeTransaction, but only
+        if the amount after reserving the stake-tx fee clears
+        AUTO_RESTAKE_MIN_AMOUNT.  The tx is admitted via the same
+        `_admit_to_pool` path real RPC clients use, so every mempool
+        invariant (nonce ordering, rate limiting, leaf dedupe, pool cap)
+        still applies.
+
+        Safety:
+          * Never crashes block production — all exceptions are logged
+            and swallowed.  Auto-restake is a convenience feature, not
+            a correctness requirement.
+          * Never double-submits — `_has_pending_stake_from` short-
+            circuits when a sweep is already queued for this entity.
+          * Never touches entities that aren't our own — the handle
+            `self.wallet_entity` is the only key we can sign under.
+          * Never builds a tx for an unregistered entity — the chain
+            would reject it and we'd waste a WOTS+ leaf.
+        """
+        try:
+            # Re-read config on every call so tests and operators can flip
+            # the flag at runtime without restarting.
+            from messagechain import config as _cfg
+            if not getattr(_cfg, "AUTO_RESTAKE", False):
+                return
+            if self.wallet_entity is None:
+                return  # observer mode — nothing to sign with
+            eid = self.wallet_entity.entity_id
+            if eid not in self.blockchain.public_keys:
+                # Entity not yet registered — attempting a stake would be
+                # rejected by the chain anyway.  Wait until first-spend
+                # registration has happened.
+                return
+            if self._has_pending_stake_from(eid):
+                return  # sweep already queued; don't stack another
+
+            liquid = self.blockchain.supply.get_balance(eid)
+            buffer_amt = getattr(_cfg, "AUTO_RESTAKE_LIQUID_BUFFER", 1_000)
+            min_amt = getattr(_cfg, "AUTO_RESTAKE_MIN_AMOUNT", 1_000)
+            fee = _cfg.MIN_FEE
+
+            # Reserve fee on top of buffer — paying the stake tx's fee must
+            # not push liquid below buffer after the tx applies.
+            stakeable = liquid - buffer_amt - fee
+            if stakeable < min_amt:
+                return
+            # VALIDATOR_MIN_STAKE applies to the tx amount, not to the
+            # delta over existing stake.  If our sweep would be below the
+            # min-stake floor, skip — a lower-value sweep would be
+            # rejected at block apply time.
+            if stakeable < _cfg.VALIDATOR_MIN_STAKE:
+                return
+
+            from messagechain.core.staking import create_stake_transaction
+            nonce = self._get_pending_nonce_all_pools(eid)
+            tx = create_stake_transaction(
+                self.wallet_entity,
+                amount=stakeable,
+                nonce=nonce,
+                fee=fee,
+            )
+            ok = self._admit_to_pool("_pending_stake_txs", tx)
+            if ok:
+                logger.info(
+                    "AUTO_RESTAKE: queued stake tx for %d tokens "
+                    "(kept %d liquid buffer, fee %d)",
+                    stakeable, buffer_amt, fee,
+                )
+            else:
+                logger.warning(
+                    "AUTO_RESTAKE: pool full, sweep of %d tokens refused",
+                    stakeable,
+                )
+        except Exception as e:
+            # Broad except is intentional: a buggy sweep must NEVER take
+            # down block production.  Log and move on — the operator can
+            # inspect logs; the chain keeps running.
+            logger.warning("AUTO_RESTAKE: sweep failed: %r", e)
+
     def _tx_signer_pubkey(self, tx) -> bytes | None:
         """Return the public key that `tx`'s signature verifies under.
 
@@ -1631,6 +1733,13 @@ class Server:
                 f"reward: {self.blockchain.supply.calculate_block_reward(block.header.block_number)} | "
                 f"wallet balance: {balance}"
             )
+            # Opt-in auto-restake — sweep liquid rewards back into stake
+            # if the operator has enabled it.  Runs AFTER add_block so the
+            # reward the proposer just earned is already credited to
+            # liquid balance.  Any failure is logged and swallowed: block
+            # production must never abort because a restake sweep
+            # misbehaved (this is best-effort, opt-in operator convenience).
+            self._maybe_auto_restake()
         else:
             if block_producer.is_clock_skew_reason(reason):
                 logger.warning(

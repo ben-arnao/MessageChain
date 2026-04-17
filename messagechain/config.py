@@ -787,6 +787,42 @@ assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
 # Staking
 UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
 
+# Auto-restake — opt-in, node-local policy.  When AUTO_RESTAKE is True,
+# after a node produces a block it sweeps its own liquid balance above
+# AUTO_RESTAKE_LIQUID_BUFFER into a new StakeTransaction (provided the
+# stakeable amount is at least AUTO_RESTAKE_MIN_AMOUNT).  The stake tx
+# goes through the same admission path a real client uses, so every
+# mempool invariant (nonce ordering, leaf dedupe, rate limit, pool cap)
+# applies.
+#
+# Why a client-side flag instead of consensus-level auto-compounding:
+#   * No consensus rule change — a node with AUTO_RESTAKE=False behaves
+#     identically to today.  Individual operators pick their own policy
+#     without forcing every validator to inherit our guess of "what
+#     fraction is worth restaking."
+#   * The optimal dust threshold depends on fee economics at the time.
+#     Baking a particular rule into state-transition code would force
+#     every operator in 2080 to live with a 2026 parameter.  A config
+#     flag is easy to tune per-deployment.
+#   * Block rewards already land in supply.balances[proposer] as liquid;
+#     the existing StakeTransaction path is exactly the right tool to
+#     convert them back into stake.  This is just a loop tied to a
+#     local config flag.
+#
+# Safety:
+#   * AUTO_RESTAKE_LIQUID_BUFFER keeps a reserve of liquid tokens so the
+#     validator always has fees for future stake/unstake/authority txs.
+#   * AUTO_RESTAKE_MIN_AMOUNT avoids spamming stake txs that are small
+#     compared to the fee cost.
+#   * The node skips if a pending stake tx from it is already queued,
+#     so two auto-restake attempts in quick succession don't produce
+#     two competing stake txs.
+#   * Any failure in stake-tx construction is swallowed with a warning
+#     log — block production is never aborted by an auto-restake error.
+AUTO_RESTAKE = False                  # opt-in; set True in config_local.py
+AUTO_RESTAKE_MIN_AMOUNT = 1_000       # don't sweep dust (avoid fee waste)
+AUTO_RESTAKE_LIQUID_BUFFER = 1_000    # always keep at least this much liquid for fees
+
 # Slashing
 SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
 SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter

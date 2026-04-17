@@ -20,3 +20,12 @@
 # ── Public validator accepting remote RPC ───────────────────────────
 # RPC_AUTH_ENABLED = False             # only affects admin RPCs after the
                                        # public/admin split
+
+# ── Auto-restake (opt-in node-local policy) ─────────────────────────
+# Uncomment to have the node automatically sweep liquid balance above
+# AUTO_RESTAKE_LIQUID_BUFFER into stake whenever the sweep amount is at
+# least AUTO_RESTAKE_MIN_AMOUNT.  No consensus change — the node just
+# emits a normal StakeTransaction through its own RPC admission path.
+# AUTO_RESTAKE = True
+# AUTO_RESTAKE_MIN_AMOUNT = 1_000      # minimum sweep size (avoid dust)
+# AUTO_RESTAKE_LIQUID_BUFFER = 1_000   # keep this much liquid for fees
