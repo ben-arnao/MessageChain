@@ -1763,10 +1763,20 @@ class Blockchain:
                 _bump_wm(utx.entity_id, utx.signature.leaf_index)
 
         # Simulate registrations — install (entity_id -> public_key) and
-        # initialize nonce.  Fee-free, no balance movement.  Bump the
-        # leaf watermark with the proof's leaf index so a post-reg tx
-        # cannot reuse leaf 0.
+        # initialize nonce.  Deduct REGISTRATION_FEE from sponsor and
+        # credit to treasury when fee > 0.  Bump the leaf watermark with
+        # the proof's leaf index so a post-reg tx cannot reuse leaf 0.
+        import messagechain.config as _sim_reg_cfg
         for rtx in (registration_transactions or []):
+            sim_reg_fee = _sim_reg_cfg.REGISTRATION_FEE
+            sim_sponsor = getattr(rtx, "sponsor_id", b"")
+            if sim_reg_fee > 0 and sim_sponsor:
+                sim_balances[sim_sponsor] = (
+                    sim_balances.get(sim_sponsor, 0) - sim_reg_fee
+                )
+                sim_balances[TREASURY_ENTITY_ID] = (
+                    sim_balances.get(TREASURY_ENTITY_ID, 0) + sim_reg_fee
+                )
             sim_public_keys[rtx.entity_id] = rtx.public_key
             sim_nonces[rtx.entity_id] = 0
             _bump_wm(rtx.entity_id, rtx.registration_proof.leaf_index)
@@ -2595,10 +2605,22 @@ class Blockchain:
         # Registration txs — self-authenticating (bundle their own pubkey).
         # Duplicate-registration check uses pending_registrations so two
         # registrations of the same entity in one block are caught.
+        #
+        # Per-block registration cap: hard limit on how many new entities
+        # can register per block, regardless of economic resources.
+        import messagechain.config as _reg_cfg
+        reg_txs_list = getattr(block, "registration_transactions", [])
+        if len(reg_txs_list) > _reg_cfg.MAX_REGISTRATIONS_PER_BLOCK:
+            return False, (
+                f"Too many registration transactions: {len(reg_txs_list)} "
+                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
+                f"({_reg_cfg.MAX_REGISTRATIONS_PER_BLOCK})"
+            )
         pending_registrations: set[bytes] = set()
-        for rtx in getattr(block, "registration_transactions", []):
+        pending_sponsor_spent: dict[bytes, int] = {}
+        for rtx in reg_txs_list:
             valid, reason = self._validate_registration_tx(
-                rtx, pending_registrations,
+                rtx, pending_registrations, pending_sponsor_spent,
             )
             if not valid:
                 return False, f"Invalid registration tx: {reason}"
@@ -2842,14 +2864,20 @@ class Blockchain:
             if not ok:
                 return False, f"Invalid unstake tx: {reason}"
 
-        # Validate registration transactions.  Self-authenticating + no
-        # nonce / no fee, so cumulative tracking isn't needed — we only
-        # check that entity_id isn't already registered or being
-        # registered twice in this same block.
+        # Validate registration transactions — per-block cap + fee/sponsor.
+        import messagechain.config as _reg_cfg2
+        reg_txs_standalone = getattr(block, "registration_transactions", [])
+        if len(reg_txs_standalone) > _reg_cfg2.MAX_REGISTRATIONS_PER_BLOCK:
+            return False, (
+                f"Too many registration transactions: {len(reg_txs_standalone)} "
+                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
+                f"({_reg_cfg2.MAX_REGISTRATIONS_PER_BLOCK})"
+            )
         pending_registrations: set[bytes] = set()
-        for rtx in getattr(block, "registration_transactions", []):
+        pending_sponsor_spent_sa: dict[bytes, int] = {}
+        for rtx in reg_txs_standalone:
             ok, reason = self._validate_registration_tx(
-                rtx, pending_registrations,
+                rtx, pending_registrations, pending_sponsor_spent_sa,
             )
             if not ok:
                 return False, f"Invalid registration tx: {reason}"
@@ -2859,6 +2887,7 @@ class Blockchain:
     def _validate_registration_tx(
         self, rtx,
         pending_registrations: set[bytes],
+        pending_sponsor_spent: dict[bytes, int] | None = None,
     ) -> tuple[bool, str]:
         """Validate a RegistrationTransaction in the context of a block.
 
@@ -2868,7 +2897,13 @@ class Blockchain:
         (either on chain or earlier in this same block), and track
         pending_registrations to catch two registrations of the same
         entity_id in one block.
+
+        When REGISTRATION_FEE > 0, a sponsor_id must be set to an existing
+        entity with sufficient balance.  The fee is tracked cumulatively
+        in pending_sponsor_spent so multiple registrations by the same
+        sponsor in one block are balance-checked correctly.
         """
+        import messagechain.config as _rcfg
         from messagechain.core.registration import (
             RegistrationTransaction, verify_registration_transaction,
         )
@@ -2887,6 +2922,33 @@ class Blockchain:
                 f"Entity {rtx.entity_id.hex()[:16]} registered twice in the "
                 f"same block — duplicate rejected"
             )
+
+        # Registration fee enforcement
+        reg_fee = _rcfg.REGISTRATION_FEE
+        if reg_fee > 0:
+            sponsor_id = getattr(rtx, "sponsor_id", b"")
+            if not sponsor_id:
+                return False, (
+                    "Registration requires a sponsor when REGISTRATION_FEE > 0 "
+                    f"(current fee: {reg_fee})"
+                )
+            if sponsor_id not in self.public_keys:
+                return False, (
+                    f"Sponsor {sponsor_id.hex()[:16]} is not a registered "
+                    f"entity — cannot pay registration fee"
+                )
+            if pending_sponsor_spent is None:
+                pending_sponsor_spent = {}
+            already_spent = pending_sponsor_spent.get(sponsor_id, 0)
+            sponsor_balance = self.get_spendable_balance(sponsor_id)
+            if sponsor_balance < already_spent + reg_fee:
+                return False, (
+                    f"Insufficient sponsor balance: sponsor "
+                    f"{sponsor_id.hex()[:16]} has {sponsor_balance} spendable "
+                    f"(already committed {already_spent}), needs {reg_fee}"
+                )
+            pending_sponsor_spent[sponsor_id] = already_spent + reg_fee
+
         pending_registrations.add(rtx.entity_id)
         return True, "Valid"
 
@@ -3184,11 +3246,20 @@ class Blockchain:
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
 
-        # Registration txs — self-authenticating, duplicate guard
+        # Registration txs — self-authenticating, duplicate guard + cap + fee
+        import messagechain.config as _reg_cfg3
+        reg_txs_sa2 = getattr(block, "registration_transactions", [])
+        if len(reg_txs_sa2) > _reg_cfg3.MAX_REGISTRATIONS_PER_BLOCK:
+            return False, (
+                f"Too many registration transactions: {len(reg_txs_sa2)} "
+                f"exceeds MAX_REGISTRATIONS_PER_BLOCK "
+                f"({_reg_cfg3.MAX_REGISTRATIONS_PER_BLOCK})"
+            )
         pending_registrations: set[bytes] = set()
-        for rtx in getattr(block, "registration_transactions", []):
+        pending_sponsor_spent_3: dict[bytes, int] = {}
+        for rtx in reg_txs_sa2:
             valid, reason = self._validate_registration_tx(
-                rtx, pending_registrations,
+                rtx, pending_registrations, pending_sponsor_spent_3,
             )
             if not valid:
                 return False, f"Invalid registration tx: {reason}"
@@ -3409,6 +3480,9 @@ class Blockchain:
             affected.add(utx.entity_id)
         for rtx in getattr(block, "registration_transactions", []):
             affected.add(rtx.entity_id)
+            sponsor = getattr(rtx, "sponsor_id", b"")
+            if sponsor:
+                affected.add(sponsor)
         return affected
 
     def _apply_block_state(self, block: Block):
@@ -3527,13 +3601,21 @@ class Blockchain:
             if authority_pk == signing_pk:
                 self._bump_watermark(utx.entity_id, utx.signature.leaf_index)
 
-        # Apply registration transactions.  Fee-free, nonce-free; simply
-        # installs (entity_id -> public_key) and initializes nonce to 0.
-        # The proof's leaf index bumps the watermark — a re-registration
-        # attempt at the same leaf is structurally impossible (duplicate
-        # entity_id would be caught first) but we still advance the
-        # watermark so a later rotate / reset cannot reuse it.
+        # Apply registration transactions.  Deduct REGISTRATION_FEE from
+        # sponsor (if any) and credit to treasury.  Install (entity_id ->
+        # public_key) and initialize nonce to 0.  The proof's leaf index
+        # bumps the watermark.
+        import messagechain.config as _apply_reg_cfg
         for rtx in getattr(block, "registration_transactions", []):
+            reg_fee = _apply_reg_cfg.REGISTRATION_FEE
+            sponsor_id = getattr(rtx, "sponsor_id", b"")
+            if reg_fee > 0 and sponsor_id:
+                self.supply.balances[sponsor_id] = (
+                    self.supply.balances.get(sponsor_id, 0) - reg_fee
+                )
+                self.supply.balances[_apply_reg_cfg.TREASURY_ENTITY_ID] = (
+                    self.supply.balances.get(_apply_reg_cfg.TREASURY_ENTITY_ID, 0) + reg_fee
+                )
             self.public_keys[rtx.entity_id] = rtx.public_key
             self.nonces[rtx.entity_id] = 0
             self._bump_watermark(

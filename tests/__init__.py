@@ -23,6 +23,10 @@ messagechain.config.DEVNET = True
 messagechain.config.REQUIRE_CHECKPOINTS = False
 # Override the production pinned hash so test entities can initialize_genesis.
 messagechain.config.PINNED_GENESIS_HASH = None
+# Disable registration fee in tests — existing tests register entities
+# without sponsors/fees.  The fee logic is tested explicitly in
+# test_registration_cap.py which overrides this back to 1000.
+messagechain.config.REGISTRATION_FEE = 0
 
 
 def register_entity_for_test(chain, entity):

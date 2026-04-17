@@ -31,7 +31,7 @@ import struct
 import time
 from dataclasses import dataclass
 
-from messagechain.config import CHAIN_ID, HASH_ALGO, SIG_VERSION_CURRENT
+from messagechain.config import CHAIN_ID, HASH_ALGO, SIG_VERSION_CURRENT, REGISTRATION_FEE
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -57,6 +57,7 @@ class RegistrationTransaction:
     registration_proof: Signature
     timestamp: float
     randao_commitment: bytes = b"\x00" * 32  # SHA3(randao_seed); published at registration
+    sponsor_id: bytes = b""  # existing entity who pays the registration fee
     tx_hash: bytes = b""
 
     def __post_init__(self):
@@ -84,13 +85,14 @@ class RegistrationTransaction:
             + self.public_key
             + struct.pack(">Q", int(self.timestamp))
             + self.randao_commitment
+            + self.sponsor_id
         )
 
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 
     def serialize(self) -> dict:
-        return {
+        d = {
             "type": "register_entity",
             "entity_id": self.entity_id.hex(),
             "public_key": self.public_key.hex(),
@@ -99,36 +101,52 @@ class RegistrationTransaction:
             "randao_commitment": self.randao_commitment.hex(),
             "tx_hash": self.tx_hash.hex(),
         }
+        if self.sponsor_id:
+            d["sponsor_id"] = self.sponsor_id.hex()
+        return d
 
     def to_bytes(self) -> bytes:
         """Binary: 32 entity_id | 32 public_key | u32 proof_len | proof |
-        f64 timestamp | 32 randao_commitment | 32 tx_hash.
+        f64 timestamp | 32 randao_commitment | u8 has_sponsor | [32 sponsor_id] |
+        32 tx_hash.
         """
         proof_blob = self.registration_proof.to_bytes()
-        return b"".join([
+        parts = [
             self.entity_id,
             self.public_key,
             struct.pack(">I", len(proof_blob)),
             proof_blob,
             struct.pack(">d", float(self.timestamp)),
             self.randao_commitment,
-            self.tx_hash,
-        ])
+        ]
+        if self.sponsor_id:
+            parts.append(b"\x01")
+            parts.append(self.sponsor_id)
+        else:
+            parts.append(b"\x00")
+        parts.append(self.tx_hash)
+        return b"".join(parts)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "RegistrationTransaction":
         off = 0
-        # 32 entity_id + 32 public_key + 4 proof_len + 8 timestamp + 32 randao_commitment + 32 tx_hash
-        if len(data) < 32 + 32 + 4 + 8 + 32 + 32:
+        # 32 entity_id + 32 public_key + 4 proof_len + 8 timestamp + 32 randao_commitment + 1 has_sponsor + 32 tx_hash
+        if len(data) < 32 + 32 + 4 + 8 + 32 + 1 + 32:
             raise ValueError("Registration blob too short")
         entity_id = bytes(data[off:off + 32]); off += 32
         public_key = bytes(data[off:off + 32]); off += 32
         proof_len = struct.unpack_from(">I", data, off)[0]; off += 4
-        if off + proof_len + 8 + 32 + 32 > len(data):
+        if off + proof_len + 8 + 32 + 1 + 32 > len(data):
             raise ValueError("Registration truncated at proof/timestamp/commitment/hash")
         proof = Signature.from_bytes(bytes(data[off:off + proof_len])); off += proof_len
         timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
         randao_commitment = bytes(data[off:off + 32]); off += 32
+        has_sponsor = data[off]; off += 1
+        sponsor_id = b""
+        if has_sponsor:
+            if off + 32 + 32 > len(data):
+                raise ValueError("Registration truncated at sponsor_id")
+            sponsor_id = bytes(data[off:off + 32]); off += 32
         declared = bytes(data[off:off + 32]); off += 32
         if off != len(data):
             raise ValueError("Registration has trailing bytes")
@@ -136,6 +154,7 @@ class RegistrationTransaction:
             entity_id=entity_id, public_key=public_key,
             registration_proof=proof, timestamp=timestamp,
             randao_commitment=randao_commitment,
+            sponsor_id=sponsor_id,
         )
         expected = tx._compute_hash()
         if expected != declared:
@@ -153,12 +172,18 @@ class RegistrationTransaction:
             if data.get("randao_commitment")
             else b"\x00" * 32
         )
+        sponsor_id = (
+            bytes.fromhex(data["sponsor_id"])
+            if data.get("sponsor_id")
+            else b""
+        )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             public_key=bytes.fromhex(data["public_key"]),
             registration_proof=proof,
             timestamp=data["timestamp"],
             randao_commitment=randao_commitment,
+            sponsor_id=sponsor_id,
         )
         expected = tx._compute_hash()
         declared = bytes.fromhex(data["tx_hash"])
@@ -170,10 +195,16 @@ class RegistrationTransaction:
         return tx
 
 
-def create_registration_transaction(entity) -> RegistrationTransaction:
+def create_registration_transaction(
+    entity, sponsor_id: bytes = b"",
+) -> RegistrationTransaction:
     """Build and sign a registration tx for `entity`.
 
     Entity is the client-side object holding keypair, entity_id, public_key.
+
+    When REGISTRATION_FEE > 0, `sponsor_id` must be the entity_id of an
+    existing registered entity who will pay the fee.  When REGISTRATION_FEE
+    is 0, sponsor_id may be omitted.
     """
     proof_msg = _hash(b"register" + entity.entity_id)
     proof = entity.keypair.sign(proof_msg)
@@ -182,6 +213,7 @@ def create_registration_transaction(entity) -> RegistrationTransaction:
         public_key=entity.public_key,
         registration_proof=proof,
         timestamp=time.time(),
+        sponsor_id=sponsor_id,
     )
     tx.tx_hash = tx._compute_hash()
     return tx

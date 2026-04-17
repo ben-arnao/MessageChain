@@ -390,6 +390,21 @@ SEEN_TX_CACHE_SIZE = 10000  # max recently-seen tx hashes to remember
 # Key rotation
 KEY_ROTATION_FEE = 1000   # fee required for key rotation transaction
 
+# Registration anti-bloat — fee + per-block cap.
+# Without these, RegistrationTransaction is fee-free (~2,931 bytes each)
+# and an attacker can register 2,880 entities/day at ZERO cost, generating
+# 8.44 GB/day of permanent bloat.
+#
+# Fee: 1000 tokens makes mass-registration economically prohibitive
+# (2,880 registrations/day × 1000 tokens = 2.88M tokens/day).
+# Paid by a sponsor (existing entity) since the new entity has no balance.
+#
+# Cap: at most 2 registrations per block hard-caps growth regardless of
+# economic resources.  2 × 144 blocks/day × 2,931 bytes ≈ 844 KB/day,
+# or ~308 MB/year — manageable for permanent storage.
+REGISTRATION_FEE = 1000               # tokens required to register a new entity
+MAX_REGISTRATIONS_PER_BLOCK = 2       # hard cap on registrations per block
+
 # Dust limit — minimum transfer amount to prevent state bloat from tiny accounts
 DUST_LIMIT = 10           # transfers below this amount are rejected
 
