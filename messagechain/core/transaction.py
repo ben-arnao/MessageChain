@@ -18,6 +18,7 @@ from messagechain.config import (
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
     MESSAGE_DEFAULT_TTL, MESSAGE_MIN_TTL, MESSAGE_MAX_TTL,
     SIG_VERSION_CURRENT,
+    TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
 )
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
@@ -143,7 +144,8 @@ class MessageTransaction:
         """Compact binary encoding for storage/wire.
 
         Layout (big-endian throughout):
-            u32  version
+            u8   serialization_version (wire-format gate, see TX_SERIALIZATION_VERSION)
+            u32  version              (the tx-logic version, NOT the wire format)
             ENT  entity reference (1-byte tag + 32 full id OR varint index)
             u8   compression_flag (0=raw, 1=raw-deflate)
             u16  message_len
@@ -155,6 +157,15 @@ class MessageTransaction:
             u32  signature_blob_len
             M    signature_blob (Signature.to_bytes)
             32   tx_hash
+
+        The leading serialization_version byte is a carry-only register
+        that lets a future governance proposal bump the wire format
+        without silently invalidating existing chain data — the decoder
+        rejects unknown versions at the parse boundary with a clear
+        error rather than letting a layout change surface as a cryptic
+        "hash mismatch" further down the pipeline.  See
+        config.BLOCK_SERIALIZATION_VERSION's module comment for the
+        full motivation.
 
         timestamp is stored as float64 so the dict round-trip is
         bit-equivalent. Consensus hashing uses int(self.timestamp)
@@ -173,6 +184,7 @@ class MessageTransaction:
         from messagechain.core.entity_ref import encode_entity_ref
         sig_blob = self.signature.to_bytes()
         parts = [
+            struct.pack(">B", TX_SERIALIZATION_VERSION),
             struct.pack(">I", self.version),
             encode_entity_ref(self.entity_id, state=state),
             struct.pack(">B", self.compression_flag),
@@ -202,8 +214,14 @@ class MessageTransaction:
         """
         from messagechain.core.entity_ref import decode_entity_ref
         offset = 0
-        if len(data) < 4 + 1 + 1 + 2:
+        if len(data) < 1 + 4 + 1 + 1 + 2:
             raise ValueError("MessageTransaction blob too short")
+        # Wire-format gate: reject unknown versions at the parse boundary.
+        # See config.TX_SERIALIZATION_VERSION for the upgrade pattern.
+        ser_version = struct.unpack_from(">B", data, offset)[0]; offset += 1
+        ok, reason = validate_tx_serialization_version(ser_version)
+        if not ok:
+            raise ValueError(f"MessageTransaction: {reason}")
         version = struct.unpack_from(">I", data, offset)[0]
         offset += 4
         entity_id, consumed = decode_entity_ref(data, offset, state=state)

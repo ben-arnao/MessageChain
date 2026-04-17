@@ -142,6 +142,65 @@ def validate_sig_version(sig_version: int) -> tuple[bool, str]:
         )
     return True, "OK"
 
+
+# Wire-format (binary serialization) versions — carry-only registers that
+# gate the on-disk / on-wire layout of blocks and transactions, independent
+# of the crypto-agility HASH/SIG versions above.
+#
+# Rationale: a silent breaking change to Block.to_bytes / MessageTransaction.
+# to_bytes produces only a cryptic "hash mismatch" when old data is loaded
+# by new code — an operator cannot tell whether the chain is corrupted, the
+# signature is wrong, or the wire format changed under their feet.  On a
+# 100-1000 year chain this class of failure is catastrophic: multiple format
+# changes will accumulate over centuries, and any future reader must be
+# able to diagnose "this blob predates my version of the decoder" in one
+# hop rather than chasing down what the old layout used to look like.
+#
+# Embedding a leading version byte in every block / tx binary blob costs
+# one byte per object and gives the decoder a decisive reject at the
+# parse boundary: "unknown serialization version X (current = Y)".
+#
+# Future upgrade path mirrors HASH_VERSION_CURRENT exactly: a governance
+# proposal bumps BLOCK_SERIALIZATION_VERSION / TX_SERIALIZATION_VERSION,
+# the validate_*_serialization_version gate widens to accept the new
+# value alongside the old during a migration window, and nodes that have
+# not upgraded produce a clear error rather than silent corruption.
+#
+# Reserved: 0 is invalid (traps uninitialized / truncated input).
+BLOCK_SERIALIZATION_VERSION = 1
+TX_SERIALIZATION_VERSION = 1
+
+
+def validate_block_serialization_version(version: int) -> tuple[bool, str]:
+    """Reject unknown block wire-format versions at the parse boundary.
+
+    Called from Block.from_bytes after reading the leading version byte.
+    A future format-bump governance proposal widens this check to accept
+    both the old and new values during a migration window.
+    """
+    if version != BLOCK_SERIALIZATION_VERSION:
+        return False, (
+            f"Unknown block serialization version {version} "
+            f"(current = {BLOCK_SERIALIZATION_VERSION})"
+        )
+    return True, "OK"
+
+
+def validate_tx_serialization_version(version: int) -> tuple[bool, str]:
+    """Reject unknown transaction wire-format versions at the parse boundary.
+
+    Called from every tx type's from_bytes after reading the leading
+    version byte.  Same bump-and-widen upgrade shape as
+    validate_block_serialization_version.
+    """
+    if version != TX_SERIALIZATION_VERSION:
+        return False, (
+            f"Unknown transaction serialization version {version} "
+            f"(current = {TX_SERIALIZATION_VERSION})"
+        )
+    return True, "OK"
+
+
 # Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
 MAX_MESSAGE_CHARS = 280  # max characters per message
 MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
