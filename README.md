@@ -151,6 +151,28 @@ sudo cp deploy/systemd/messagechain-validator.service /etc/systemd/system/
 sudo systemctl enable --now messagechain-validator
 ```
 
+### Deployment profiles
+
+A single env var, `MESSAGECHAIN_PROFILE`, flips a coherent bundle of
+defaults:
+
+- `production` (or unset) — strict defaults: 600s blocks,
+  `MERKLE_TREE_HEIGHT=20` (~2 years of hot-key runtime), checkpoints
+  required, RPC auth enabled.
+- `prototype` — bootstrap-phase bundle: 30s blocks,
+  `MERKLE_TREE_HEIGHT=16` (~5 min keygen on a weak VM), checkpoints
+  waived, RPC auth disabled.
+
+Individual env vars (`MESSAGECHAIN_BLOCK_TIME_TARGET`,
+`MESSAGECHAIN_MERKLE_TREE_HEIGHT`, `MESSAGECHAIN_REQUIRE_CHECKPOINTS`,
+`MESSAGECHAIN_RPC_AUTH_ENABLED`) still override the profile for
+fine-grained control. Precedence: individual env var > profile > hardcoded default.
+
+Unknown profile values raise a clear error at startup — no silent
+fallback. The shipped systemd unit runs with
+`MESSAGECHAIN_PROFILE=prototype` during the bootstrap phase; flip to
+`production` (or drop the env var) for mainnet-cadence operation.
+
 ## Tests
 
 ```bash

@@ -8,7 +8,7 @@ at the bottom so the top of the file is always "what's left."
 
 - **Testnet:** single validator running remotely on a GCP VM.
 - **Mode:** pre-mainnet. Genesis hash is not yet pinned in `messagechain/config.py`.
-- **Tree height:** `MESSAGECHAIN_MERKLE_TREE_HEIGHT=16` on the VM (dev-scale).
+- **Profile:** `MESSAGECHAIN_PROFILE=prototype` on the VM (dev-scale bundle: 30s blocks, tree height 16, checkpoints waived, RPC auth off).
 - **Clients:** seed endpoint list in `CLIENT_SEED_ENDPOINTS` points only at the test VM.
 
 ---

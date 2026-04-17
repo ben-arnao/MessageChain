@@ -12,15 +12,14 @@ ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
     --data-dir /var/lib/messagechain \
     --rpc-bind 0.0.0.0 \
     --keyfile /etc/messagechain/keyfile
-Environment=MESSAGECHAIN_RPC_AUTH_ENABLED=false
-Environment=MESSAGECHAIN_REQUIRE_CHECKPOINTS=false
-# TESTING: 30s block time for fast live-network iteration.  Remove this
-# line (or flip to 600s) for production-cadence operation.
-Environment=MESSAGECHAIN_BLOCK_TIME_TARGET=30
-# TESTING: tree_height=16 matches the founder-launch entity baked into
-# genesis.  Production should bump launch script + this override to 20
-# for longer hot-key runtime (~2y vs ~450d at 600s block cadence).
-Environment=MESSAGECHAIN_MERKLE_TREE_HEIGHT=16
+# Bootstrap-phase profile: flips a coherent bundle of early-deployment
+# defaults in one switch — 30s blocks, MERKLE_TREE_HEIGHT=16 (fast keygen,
+# matches the founder-launch entity baked into genesis), checkpoints
+# waived, and RPC auth disabled.  For production-cadence operation, set
+# MESSAGECHAIN_PROFILE=production (or remove this line; unset == production).
+# Individual env vars still override the profile for fine-grained control.
+# See messagechain/config.py for the full profile bundle.
+Environment=MESSAGECHAIN_PROFILE=prototype
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

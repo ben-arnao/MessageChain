@@ -2380,6 +2380,21 @@ def main():
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s [%(levelname)s] %(message)s")
 
+    # Log the active deployment profile (MESSAGECHAIN_PROFILE) so operators
+    # can confirm at a glance whether the node is running production-strict
+    # defaults or the prototype bootstrap bundle. Helps catch silent
+    # misconfiguration — e.g., a VM that inherited the wrong profile env.
+    from messagechain.config import active_profile
+    _profile = active_profile()
+    if _profile == "prototype":
+        logger.info(
+            "Active profile: prototype (bootstrap-phase defaults: 30s blocks, "
+            "MERKLE_TREE_HEIGHT=16, checkpoints waived, RPC auth disabled). "
+            "Set MESSAGECHAIN_PROFILE=production for strict defaults."
+        )
+    else:
+        logger.info("Active profile: production (strict defaults)")
+
     asyncio.run(run(args))
 
 

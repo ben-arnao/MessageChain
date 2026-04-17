@@ -1,5 +1,87 @@
 """Global configuration constants for the MessageChain protocol."""
 
+# ─────────────────────────────────────────────────────────────────────
+# Deployment profile — MESSAGECHAIN_PROFILE env var
+# ─────────────────────────────────────────────────────────────────────
+# A single switch that flips a coherent bundle of bootstrap-phase
+# defaults.  Prior to this, a validator VM needed four separate env vars
+# (RPC_AUTH_ENABLED, REQUIRE_CHECKPOINTS, BLOCK_TIME_TARGET,
+# MERKLE_TREE_HEIGHT) to bootstrap — forgetting any one caused silent
+# wrong behavior (slow keygen, refused start on missing checkpoints).
+#
+# Profiles:
+#   production (or unset) — strict defaults, full security posture.
+#   prototype             — coarse bootstrap bundle for early-phase
+#                           deployments: fast blocks (30s), small Merkle
+#                           trees (h=16, ~5 min keygen), checkpoints
+#                           waived, RPC auth disabled.
+#
+# Precedence (most specific wins):
+#   individual env var  >  profile  >  hardcoded default
+#
+# Unknown values raise a clear error at import — silent fallback would
+# defeat the whole purpose (a typo becomes a production default, the
+# opposite of what the operator intended).
+import os as _os_profile
+
+_PROFILE_RAW = _os_profile.environ.get("MESSAGECHAIN_PROFILE", "").strip().lower()
+# Empty string == unset (a bare `Environment=MESSAGECHAIN_PROFILE=` in a
+# systemd unit produces "" rather than removing the variable; treat both
+# identically so a blank line doesn't crash the node).
+if _PROFILE_RAW == "":
+    _PROFILE = "production"
+elif _PROFILE_RAW in ("production", "prototype"):
+    _PROFILE = _PROFILE_RAW
+else:
+    raise ValueError(
+        f"Unknown MESSAGECHAIN_PROFILE={_PROFILE_RAW!r}. "
+        f"Valid values: 'production' (or unset) | 'prototype'. "
+        f"Refusing to silently fall back to a default — a typo here "
+        f"would inherit the opposite of the operator's intent."
+    )
+
+# Prototype bundle — the coherent set of bootstrap-phase defaults.
+# Individual env vars override these (see _profile_bool / _profile_int
+# helpers below).  Keep this dict as the one source of truth for what
+# "prototype mode" means.
+_PROTOTYPE_OVERRIDES: dict = {
+    "REQUIRE_CHECKPOINTS": False,
+    "BLOCK_TIME_TARGET": 30,
+    "MERKLE_TREE_HEIGHT": 16,
+    "RPC_AUTH_ENABLED": False,
+}
+
+
+def _profile_bool(env_name: str, key: str, default: bool) -> bool:
+    """Resolve a bool config with precedence: env var > profile > default.
+
+    Bool env-var convention: any value other than the case-insensitive
+    string "false" counts as True (matches the pre-profile behavior of
+    RPC_AUTH_ENABLED / REQUIRE_CHECKPOINTS).
+    """
+    raw = _os_profile.environ.get(env_name)
+    if raw is not None:
+        return raw.strip().lower() != "false"
+    if _PROFILE == "prototype" and key in _PROTOTYPE_OVERRIDES:
+        return bool(_PROTOTYPE_OVERRIDES[key])
+    return default
+
+
+def _profile_int(env_name: str, key: str, default: int) -> int:
+    """Resolve an int config with precedence: env var > profile > default."""
+    raw = _os_profile.environ.get(env_name)
+    if raw is not None:
+        return int(raw)
+    if _PROFILE == "prototype" and key in _PROTOTYPE_OVERRIDES:
+        return int(_PROTOTYPE_OVERRIDES[key])
+    return default
+
+
+def active_profile() -> str:
+    """Return the active profile name ('production' or 'prototype')."""
+    return _PROFILE
+
+
 # Cryptography (defined early — needed by Treasury ID derivation below)
 HASH_ALGO = "sha3_256"
 
@@ -142,12 +224,10 @@ MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current t
 # Block parameters
 #
 # BLOCK_TIME_TARGET: seconds between blocks (10 min, same as BTC — speed is
-# not a priority).  Override via MESSAGECHAIN_BLOCK_TIME_TARGET env var for
-# testing deployments that need faster block production.  Production nodes
-# leave this at 600s.
-import os as _os_bt  # noqa: E402
-_bt_env = _os_bt.environ.get("MESSAGECHAIN_BLOCK_TIME_TARGET")
-BLOCK_TIME_TARGET = int(_bt_env) if _bt_env is not None else 600
+# not a priority).  Production default is 600s.  Bootstrap-phase deployments
+# can opt in via MESSAGECHAIN_PROFILE=prototype (30s) or override
+# individually via MESSAGECHAIN_BLOCK_TIME_TARGET.
+BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_TARGET", 600)
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
@@ -169,10 +249,9 @@ WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
 # time signing keys per entity.  Default is 20 (1,048,576 keys ≈ 2 years of
 # runtime per hot key at production block cadence).  Keygen is O(2^height)
 # and expensive — height=20 takes ~90 min on a weak VM, height=16 takes ~5 min.
-# Override via env var for bootstrap-phase deployments on low-CPU hardware.
-import os as _os_mt  # noqa: E402
-_merkle_env = _os_mt.environ.get("MESSAGECHAIN_MERKLE_TREE_HEIGHT")
-MERKLE_TREE_HEIGHT = int(_merkle_env) if _merkle_env is not None else 20
+# Bootstrap-phase deployments can opt in via MESSAGECHAIN_PROFILE=prototype
+# (h=16) or override individually via MESSAGECHAIN_MERKLE_TREE_HEIGHT.
+MERKLE_TREE_HEIGHT = _profile_int("MESSAGECHAIN_MERKLE_TREE_HEIGHT", "MERKLE_TREE_HEIGHT", 20)
 # Tests override this to 4 (16 leaves) via tests/__init__.py for fast execution.
 #
 # Leaf exhaustion cadence — an active validator consumes one leaf per
@@ -528,13 +607,10 @@ TRUSTED_CHECKPOINTS: tuple = ()
 # This prevents a new node from silently running without long-range-
 # attack protection.  Devnet/testnet deployments can set this to False.
 #
-# Override via env var MESSAGECHAIN_REQUIRE_CHECKPOINTS=false for
-# bootstrap-phase deployments that haven't shipped checkpoints yet.
-import os as _os_cp  # noqa: E402
-_require_cp_env = _os_cp.environ.get("MESSAGECHAIN_REQUIRE_CHECKPOINTS")
-REQUIRE_CHECKPOINTS = (
-    False if (_require_cp_env is not None and _require_cp_env.lower() == "false")
-    else True
+# Bootstrap-phase deployments can opt in via MESSAGECHAIN_PROFILE=prototype
+# (False) or override individually via MESSAGECHAIN_REQUIRE_CHECKPOINTS=false.
+REQUIRE_CHECKPOINTS = _profile_bool(
+    "MESSAGECHAIN_REQUIRE_CHECKPOINTS", "REQUIRE_CHECKPOINTS", True,
 )
 
 # Outbound connection slot allocation — mix full-relay (tx + block) peers
@@ -690,11 +766,8 @@ GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 # variable at process start.  Tx signature auth (WOTS+) still gates
 # state changes; RPC auth was an anti-local-privilege-escalation layer,
 # not the primary security boundary.
-import os as _os
-_rpc_auth_env = _os.environ.get("MESSAGECHAIN_RPC_AUTH_ENABLED")
-RPC_AUTH_ENABLED = (
-    False if (_rpc_auth_env is not None and _rpc_auth_env.lower() == "false")
-    else True
+RPC_AUTH_ENABLED = _profile_bool(
+    "MESSAGECHAIN_RPC_AUTH_ENABLED", "RPC_AUTH_ENABLED", True,
 )
 RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
 
