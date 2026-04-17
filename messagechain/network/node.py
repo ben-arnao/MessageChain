@@ -21,7 +21,7 @@ import time
 from collections import OrderedDict
 from messagechain.config import (
     DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
-    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
+    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_BLOCK_RELAY_ONLY_SLOTS, OUTBOUND_FULL_RELAY_SLOTS,
     MEMPOOL_SYNC_INTERVAL_SEC, MEMPOOL_SYNC_FANOUT,
     MEMPOOL_DIGEST_MAX_HASHES, MEMPOOL_DIGEST_MIN_INTERVAL_SEC,
@@ -132,6 +132,14 @@ class Node:
             for cp in file_cps:
                 by_height[cp.block_number] = cp
             checkpoints = list(by_height.values())
+
+        if REQUIRE_CHECKPOINTS and not checkpoints:
+            raise RuntimeError(
+                "No weak-subjectivity checkpoints loaded (TRUSTED_CHECKPOINTS "
+                "is empty and no checkpoints.json found). A node without "
+                "checkpoints is vulnerable to long-range PoS attacks. Set "
+                "REQUIRE_CHECKPOINTS=False only for devnet/testnet."
+            )
 
         self.syncer = ChainSyncer(
             self.blockchain,

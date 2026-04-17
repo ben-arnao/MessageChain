@@ -18,6 +18,9 @@ messagechain.config.MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1
 messagechain.config.ENFORCE_SLOT_TIMING = False
 # Tests run in devnet mode — allow genesis creation without PINNED_GENESIS_HASH.
 messagechain.config.DEVNET = True
+# Tests run without checkpoint files; disable the strict requirement so
+# test nodes don't refuse to start.
+messagechain.config.REQUIRE_CHECKPOINTS = False
 
 
 def register_entity_for_test(chain, entity):

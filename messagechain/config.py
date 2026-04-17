@@ -451,6 +451,14 @@ STATE_ROOT_VERSION = 1
 # local/test networks don't require bootstrap ceremonies.
 TRUSTED_CHECKPOINTS: tuple = ()
 
+# Strict checkpoint requirement — security default for production.
+#
+# When True, a node that ends up with zero checkpoints (neither from
+# TRUSTED_CHECKPOINTS nor from checkpoints.json) refuses to start.
+# This prevents a new node from silently running without long-range-
+# attack protection.  Devnet/testnet deployments can set this to False.
+REQUIRE_CHECKPOINTS = True
+
 # Outbound connection slot allocation — mix full-relay (tx + block) peers
 # with block-relay-only peers to defeat topology inference via tx-relay
 # timing and preserve block flow under partial eclipse. Matches Bitcoin

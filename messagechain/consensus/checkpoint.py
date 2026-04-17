@@ -123,6 +123,11 @@ def load_checkpoints_file(
                 raise ValueError(f"Malformed checkpoint entry in {path}: {e}")
             logger.warning(f"Skipping malformed checkpoint entry: {e}")
             continue
+    if strict and len(result) == 0:
+        raise ValueError(
+            f"Checkpoints file {path} is empty (0 valid entries). "
+            "A node without checkpoints is vulnerable to long-range attacks."
+        )
     logger.info(f"Loaded {len(result)} trusted checkpoint(s) from {path}")
     return result
 

@@ -29,7 +29,7 @@ from collections import OrderedDict
 
 from messagechain.config import (
     DEFAULT_PORT, MAX_TXS_PER_BLOCK,
-    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS,
+    SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
     HANDSHAKE_TIMEOUT, MAX_PEERS,
 )
@@ -138,6 +138,13 @@ class Server:
             for cp in file_cps:
                 by_height[cp.block_number] = cp
             checkpoints = list(by_height.values())
+        if REQUIRE_CHECKPOINTS and not checkpoints:
+            raise RuntimeError(
+                "No weak-subjectivity checkpoints loaded (TRUSTED_CHECKPOINTS "
+                "is empty and no checkpoints.json found). A node without "
+                "checkpoints is vulnerable to long-range PoS attacks. Set "
+                "REQUIRE_CHECKPOINTS=False only for devnet/testnet."
+            )
         self.syncer = ChainSyncer(
             self.blockchain,
             self._get_peer_writer,
