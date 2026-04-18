@@ -18,13 +18,7 @@ WorkingDirectory=/opt/messagechain
 ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
     --data-dir /var/lib/messagechain \
     --rpc-bind 0.0.0.0 \
-    --secret-name projects/messagechain-validator/secrets/mc-validator-hotkey/versions/latest
-# Secret Manager is the default for this deployment.  To run without GCP
-# (e.g. local dev), replace --secret-name with --keyfile /path/to/hex.
-# ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
-#     --data-dir /var/lib/messagechain \
-#     --rpc-bind 0.0.0.0 \
-#     --keyfile /etc/messagechain/keyfile
+    --keyfile /etc/messagechain/keyfile
 # This is the production-default unit: no MESSAGECHAIN_PROFILE override,
 # RPC auth on, full block-time, full Merkle tree height, checkpoints
 # required.  An operator who copy-pastes this file gets the safe posture.
