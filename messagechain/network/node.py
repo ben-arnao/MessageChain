@@ -590,6 +590,10 @@ class Node:
             return True
 
         had_pin = self.pin_store.get(host, port) is not None
+        # Transport-layer pin check runs BEFORE the application handshake,
+        # so we do not yet know the peer's blockchain entity_id.  The
+        # entity→cert binding is sealed later in _handle_message's
+        # HANDSHAKE branch via _bind_peer_entity_to_pin.
         ok = verify_peer_certificate(ssl_obj, host, port, self.pin_store)
         if ok and not had_pin:
             # First-seen: TOFU just recorded a new pin.  Persist so
@@ -609,6 +613,48 @@ class Node:
                 f"Closing connection; run clear_pin({host!r}, {port}) to "
                 f"accept a rotated certificate."
             )
+        return ok
+
+    def _bind_peer_entity_to_pin(
+        self, host: str, port: int, entity_id: bytes,
+    ) -> bool:
+        """Seal the (cert_fingerprint, entity_id) binding at handshake time.
+
+        Called from the HANDSHAKE handler with the entity the peer just
+        declared.  If no TLS pin exists (plain-TCP transport, or TLS was
+        disabled), this is a no-op returning True.  If a pin exists but
+        carries no entity yet (first contact after the M1 fix, or legacy
+        pin upgraded in place), the entity is recorded against the pin.
+        If a pin already carries an entity, the declared entity MUST
+        match — any mismatch means a peer is trying to impersonate the
+        entity previously bound to that cert, and the handshake is
+        rejected.
+
+        Returning True means the caller may trust the peer's declared
+        entity_id going forward.  Returning False means close the
+        connection.
+        """
+        pinned_fp = self.pin_store.get(host, port)
+        if pinned_fp is None:
+            # No TLS pin (plain transport or TLS disabled).  Nothing to
+            # bind against, nothing to verify.
+            return True
+        # Drive the binding through check_or_pin so the upgrade/verify
+        # semantics live in one place (the pin store).  We re-use the
+        # already-pinned fingerprint because we're *not* re-reading a
+        # live cert here — the transport was verified earlier in
+        # _verify_and_pin_peer_tls.
+        ok = self.pin_store.check_or_pin(
+            host, port, pinned_fp, entity_id=entity_id,
+        )
+        if ok:
+            # Persist the (possibly newly-upgraded) binding so it
+            # survives restart.  Best-effort: a disk error here must not
+            # prevent the handshake from completing.
+            try:
+                self.pin_store.save()
+            except Exception as e:
+                logger.debug(f"Failed to save pin store for {host}:{port}: {e}")
         return ok
 
     async def _connect_to_peer(self, host: str, port: int):
@@ -741,6 +787,32 @@ class Node:
                 return
             # Sanity-cap the claim — see _accept_peer_weight.
             peer_weight = self._accept_peer_weight(peer_weight_raw)
+
+            # M1: Bind the TOFU TLS pin to the declared entity_id.
+            # A peer that pinned a legitimate cert on first sight cannot
+            # later re-use that cert to impersonate a DIFFERENT blockchain
+            # entity at the same address.  If binding check fails, reject
+            # the handshake and close the connection.
+            try:
+                peer_eid_bytes = bytes.fromhex(sender_id)
+            except ValueError:
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_sender_id_hex"
+                )
+                peer.is_connected = False
+                return
+            if not self._bind_peer_entity_to_pin(
+                peer.host, peer.port, peer_eid_bytes,
+            ):
+                logger.warning(
+                    f"TLS cert bound to different entity for {peer.address} — "
+                    f"rejecting handshake."
+                )
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "cert_entity_mismatch"
+                )
+                peer.is_connected = False
+                return
 
             peer.entity_id = sender_id
             self.peers[peer.address] = peer

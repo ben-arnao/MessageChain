@@ -67,6 +67,51 @@ def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
 
+def _canonicalize_authority_txs(authority_txs):
+    """Deterministic in-block ordering for authority transactions.
+
+    M4 audit fix: if a single block contains both a Revoke and a
+    SetAuthorityKey for the same entity, their relative order was
+    previously whatever order the block proposer listed them in —
+    giving an attacker with a compromised hot key a race condition
+    against the legitimate cold-key holder.
+
+    The rule is simple: **Revoke precedes SetAuthorityKey**.  A Revoke
+    is issued by the cold authority key specifically because the hot
+    key is suspected compromised; a hot-key-signed SetAuthorityKey in
+    the same block MUST NOT be allowed to land first and rotate the
+    authority key out from under the revoker.
+
+    Within each type we preserve the proposer's given order — this
+    matters because SetAuthorityKey consumes a nonce, and a proposer
+    may legitimately pack multiple Sets for different entities.  The
+    sort is stable so same-type ordering is unchanged.
+
+    Returns a NEW list; callers should iterate the returned list in
+    both the simulation and apply paths so the committed state root
+    matches between proposer and verifier.
+    """
+    if not authority_txs:
+        return []
+
+    def _priority(atx) -> int:
+        # Lower number runs first.
+        name = atx.__class__.__name__
+        if name == "RevokeTransaction":
+            return 0
+        if name == "SetAuthorityKeyTransaction":
+            return 1
+        # KeyRotation and any future authority-tx types land after
+        # SetAuthorityKey by default.  KeyRotation swaps the hot
+        # signing key, which is conceptually independent of the
+        # cold-key Set/Revoke decision, so its relative order among
+        # the non-revoke types is not security-critical — keep it
+        # after Set so a Revoke in the same block still dominates.
+        return 2
+
+    return sorted(authority_txs, key=_priority)
+
+
 def compute_block_sig_cost(block) -> int:
     """Compute the total signature verification cost for a block.
 
@@ -870,6 +915,15 @@ class Blockchain:
     ) -> tuple[bool, str]:
         if tx.entity_id not in self.public_keys:
             return False, "Unknown entity — must register first"
+
+        # M4: a revoked entity's hot key is suspected compromised.  The
+        # whole point of the revoke is that subsequent hot-key actions
+        # (including SetAuthorityKey signed by that hot key) must NOT be
+        # allowed to take effect.  Combined with the canonical Revoke-
+        # before-Set ordering in _apply_block_state, this makes a
+        # same-block race unwinnable for the attacker.
+        if tx.entity_id in self.revoked_entities:
+            return False, "Entity is revoked — authority key is frozen"
 
         expected_nonce = self.nonces.get(tx.entity_id, 0)
         if tx.nonce != expected_nonce:
@@ -2051,12 +2105,30 @@ class Blockchain:
         # with _apply_authority_tx: any field the apply path mutates MUST
         # be mutated here too, or the post-apply state_root won't match
         # and honest validators reject the block.
-        for atx in (authority_txs or []):
+        #
+        # M4: apply the canonical Revoke-before-Set ordering here too
+        # so the simulated state_root matches the deterministic
+        # apply-path ordering below.  Without this mirror, a block
+        # proposer's listed order would drift from the verifier's
+        # iteration order and every such block would be rejected.
+        for atx in _canonicalize_authority_txs(authority_txs or []):
+            cls_name = atx.__class__.__name__
+            # M4: mirror _apply_authority_tx's validation-gated skip.  If
+            # a Revoke for this entity ran earlier in the SAME block
+            # (canonical ordering guarantees it would), the subsequent
+            # SetAuthorityKey is rejected by validate_set_authority_key
+            # and its fee/mutation are NOT applied.  Skip here too so
+            # the simulated state root matches.
+            if (
+                cls_name == "SetAuthorityKeyTransaction"
+                and atx.entity_id in sim_revoked
+            ):
+                continue
+
             effective_base_fee = min(current_base_fee, atx.fee)
             tip = atx.fee - effective_base_fee
             sim_balances[atx.entity_id] = sim_balances.get(atx.entity_id, 0) - atx.fee
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
-            cls_name = atx.__class__.__name__
             if cls_name == "SetAuthorityKeyTransaction":
                 sim_nonces[atx.entity_id] = atx.nonce + 1
                 sim_authority_keys[atx.entity_id] = atx.new_authority_key
@@ -4192,7 +4264,15 @@ class Blockchain:
         # applied on the node receiving the RPC — committing them through
         # the block pipeline is what makes the hot/cold split, emergency
         # revoke, and key rotation consensus-visible across all peers.
-        for atx in getattr(block, "authority_txs", []):
+        #
+        # M4: iterate in CANONICAL order (Revoke before SetAuthorityKey)
+        # so a block that contains both for the same entity always flips
+        # revoked first and ignores the hot-key-signed Set.  Iterating in
+        # the proposer's listed order is nondeterministic and lets a
+        # compromised hot key race the cold-key holder.
+        for atx in _canonicalize_authority_txs(
+            getattr(block, "authority_txs", []),
+        ):
             self._apply_authority_tx(atx, proposer_id, current_base_fee)
 
         # Apply stake transactions.  validate_block already verified the
