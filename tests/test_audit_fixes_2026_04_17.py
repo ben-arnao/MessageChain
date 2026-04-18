@@ -182,8 +182,12 @@ class TestM4RevokeBeforeSetAuthorityOrdering(unittest.TestCase):
         chain = Blockchain()
         proposer = _entity(b"proposer")
         self._register(chain, proposer)
-        chain.supply.balances[proposer.entity_id] = 200_000_000
-        chain.supply.staked[proposer.entity_id] = 100_000_000
+        # Heavy proposer stake swamps stake-weighted RNG in proposer
+        # selection — genesis timestamps are non-deterministic across
+        # runs (see test_authority_tx_block_pipeline.py's long-form
+        # note), so we lean hard on the stake weight to avoid flakes.
+        chain.supply.balances[proposer.entity_id] = 2_000_000_000_000
+        chain.supply.staked[proposer.entity_id] = 1_000_000_000_000
         extras = {}
         for seed, balance, stake in include:
             e = _entity(seed)
@@ -194,7 +198,9 @@ class TestM4RevokeBeforeSetAuthorityOrdering(unittest.TestCase):
             extras[seed] = e
         chain.initialize_genesis(proposer)
         consensus = ProofOfStake()
-        consensus.register_validator(proposer.entity_id, stake_amount=100_000_000)
+        consensus.register_validator(
+            proposer.entity_id, stake_amount=1_000_000_000_000,
+        )
         return chain, proposer, consensus, extras
 
     def _make_revoke(self, target_eid: bytes, cold) -> RevokeTransaction:
