@@ -253,7 +253,78 @@ Operational commands (require chain interaction + key):
 - [ ] `propose` / `vote` — governance flow, not drilled end-to-end
 - [x] RPC-level: `get_chain_info`, `get_entity`, `get_nonce`, `get_messages`, `list_validators`, `get_fee_estimate`, `submit_transaction`, `submit_transfer`, `stake`, `unstake` — all verified
 
-## 14. Concerns raised
+## 14. Deep-dive second pass (2026-04-18)
+
+Additional risk areas reviewed. **No critical vulnerabilities found.**
+
+### 14a. Fork choice + reorg
+
+- [x] **Slashing ratchet**: `slashed_validators` set is deliberately NOT cleared during reorg (`blockchain.py:5064-5068`). `_processed_evidence` similarly persists across reorgs. This is correct — slashing evidence is cryptographic and remains valid regardless of which fork the block appeared on. Without the ratchet, an attacker could "revert" a block containing a slash tx and un-punish themselves.
+- [x] **Balance/nonce/stake rollback**: all properly rolled back via snapshot/journal in the state tree. State-root commitment catches any divergence.
+
+### 14b. RANDAO / proposer selection
+
+- [x] **Deterministic**: `hash(prev_block_hash + randao_mix + round_number)` in `pos.py:88-132`. All nodes compute the same proposer.
+- [x] **Grinding resistant**: each grinding attempt consumes a WOTS+ leaf (pos.py:307-319), observable on-chain via `proposer_sig_counts`. Economic cost > expected gain.
+
+### 14c. State root completeness
+
+- [x] **Complete commitment**: `state_tree._leaf_value` (state_tree.py:82-128) hashes `(entity_id, balance, nonce, stake, authority_key, public_key, leaf_watermark, rotation_count, is_revoked, is_slashed)`. No per-entity state is uncommitted. Any divergence between nodes on any field produces different state_roots and block rejection.
+
+### 14d. MEV / front-running
+
+- [x] **Near-zero surface**: base-layer messaging chain has no DEX/lending/MEV to extract. Proposer can reorder mempool txs but gains no financial advantage. No concern.
+
+### 14e. Dead-key recovery
+
+- [!] **No fund migration path**. If both hot and cold authority keys are lost, funds are permanently stranded at the entity_id. The cold key can:
+  - `emergency-revoke` (flags entity, pushes stake into 7-day unbonding)
+  - `unstake` (same effect during normal ops)
+  - **NOT** transfer remaining balance to a new entity
+- [!] **Design choice, but operators must understand**: "lost key = lost funds, forever." Per the project's quantum-resistance + hash-signature model, this is inherent — there's no master-key or protocol-level recovery.
+
+### 14f. Numerical safety
+
+- [x] **All token math is guarded**: `pay_fee`, `stake`, `transfer`, `treasury_spend` all check balance sufficiency before debit. Python's unbounded ints prevent overflow. `min()`/`max()` clamps in reward cap path.
+- [ ] **SQLite serialization width** not verified — if any column is fixed-width int, very large balances could truncate. Low risk given 1B supply cap but worth a one-time review.
+
+### 14g. Treasury drainage safety
+
+- [x] **Quorum against TOTAL ELIGIBLE stake**, not participants. `tally()` in `governance.py:729` returns `total_eligible = sum(stake_snapshot.values())` computed at proposal creation. Silence counts as NO. A single whale cannot drain the treasury.
+- [x] **Test coverage**: `test_treasury_spend_rejected_at_exact_two_thirds()` verifies the strict `>` check.
+
+### 14h. Governance end-to-end
+
+- [x] **E2E test exists**: `test_governance_pipeline.py` covers create → vote → window advance → auto-execute.
+- [x] **Reorg-during-governance covered**: `test_governance_reorg_audit.py` exists on main (code review spotted its absence from worktrees but it IS on main).
+- [ ] **Edge cases not formally tested**: proposer slashed mid-voting, stake snapshot mutations after creation. Implementation appears correct (stake is snapshotted at creation, slashing doesn't invalidate existing proposals) but coverage is thin.
+
+### 14i. Message retention / pruning
+
+- [x] **Headers retained forever**, transaction bodies pruned after `keep_recent` blocks (`messagechain/storage/pruning.py`). Matches "permanent history" principle: chain integrity via header Merkle root survives full-body pruning.
+- [!] **TTL-based message expiration**: no explicit "flag expired" logic. Messages disappear implicitly when their block is pruned. Operator should tune `keep_recent` to match `MESSAGE_DEFAULT_TTL` (~30 days) or longer for archival nodes.
+
+### 14j. P2P DoS protection
+
+- [x] **Invalid tx from peer → instant high-penalty score** (`OFFENSE_INVALID_TX=100` = `BAN_THRESHOLD=100`). One bad tx gets you banned.
+- [x] **Rate limiting** per-peer (`OFFENSE_RATE_LIMIT=5`).
+- [x] **Nonce-gap txs are not relayed as orphans on P2P**. Only the proposer locally can hold out-of-order nonce txs in orphan pool. Prevents flooding-via-orphans.
+
+### 14k. VM security posture (2026-04-18)
+
+Verified on live VM `validator-1`:
+- [x] **SSH hardened**: `PermitRootLogin no`, `PasswordAuthentication no`. Key-only.
+- [x] **Keyfile**: `/etc/messagechain/keyfile` mode 0400, owner `messagechain:messagechain`.
+- [x] **Keypair cache**: mode 0600, owner `messagechain:messagechain`.
+- [x] **systemd unit**: `NoNewPrivileges`, `ProtectKernel*`, `SystemCallFilter`, `MemoryMax`, `LimitNOFILE`. Full hardening applied.
+- [x] **GCP firewall**: only TCP 9333, 9334, 22 open. Default VPC deny elsewhere.
+- [!] **LLMNR on `0.0.0.0:5355`**: Linux default. Not directly exploitable from the GCP firewall (port not in allow-list), but it's in the process table. `sudo systemctl disable --now systemd-resolved-llmnr` would remove it. Low risk.
+- [!] **`chain.db` world-readable (0644)**: chain state is public anyway via P2P sync, so this isn't a data leak, but tightening to 0640 + group-read-only is a trivial hardening win.
+- [x] **No local iptables but GCP firewall is the edge defense**: acceptable given GCP VPC's cloud firewall rules.
+
+---
+
+## 15. Concerns raised
 
 Ordered by severity.
 
@@ -287,6 +358,20 @@ Ordered by severity.
 
 12. `NEW_ACCOUNT_FEE = 1000` is burned, not routed to treasury. If the design intent shifts toward treasury, it's a one-line flip. Document the choice.
 
+### Newly raised in deep-dive pass
+
+13. **Dead-key recovery is impossible.** If both hot and cold authority keys are lost, funds are stranded at the entity_id forever. No protocol-level recovery path. Intentional (any recovery mechanism would be a master-key backdoor) but must be clearly communicated to users. Paper backup + recovery-phrase workflow is critical.
+
+14. **Governance during reorg: edge-case test coverage thin.** `test_governance_reorg_audit.py` exists but doesn't cover: proposer slashed mid-voting-window, or stake snapshot mutations after proposal creation. Implementation APPEARS correct (stake frozen at creation, slashing doesn't invalidate proposals) but broader test coverage would increase confidence.
+
+15. **Message TTL vs. pruning**: `MESSAGE_DEFAULT_TTL` is a declared retention but there's no explicit expiration mechanism — messages disappear when their block is pruned. Operators need to tune `keep_recent` on full-node pruning to match the retention promise. Archival nodes must disable pruning. Documentation gap.
+
+16. **SQLite column widths not reviewed.** Python unbounded ints prevent in-memory overflow, but if any SQLite column is declared INTEGER (not BLOB) with implicit width, a very large balance could truncate. Unlikely at 1B supply but worth one review pass.
+
+17. **`chain.db` is world-readable (0644) on VM.** Chain state is public, so this isn't a data leak, but 0640 with `messagechain` group membership would be the minimal-surface default.
+
+18. **LLMNR listening on `0.0.0.0:5355`** on the VM. Default systemd-resolved config. Not reachable from outside the GCP VPC (firewall blocks), but hardening checkbox: `sudo systemctl disable --now systemd-resolved-llmnr` or equivalent.
+
 ### Live test items not yet run
 
 13. ~~Forged WOTS+ signature direct test~~ ✅ **DONE** — tampered body + tampered sig both rejected
@@ -301,19 +386,60 @@ Ordered by severity.
 
 ## Next steps
 
-Before pronouncing "production ready," at minimum:
+Updated after deep-dive pass. Sorted by mainnet-blocking severity.
 
-1. **Gate `MIN_VALIDATORS_TO_EXIT_BOOTSTRAP`** — assert ≥3 in mainnet mode
-2. **Decide mainnet genesis parameters** and freeze them in config
-3. **Set up HSM/KMS for founder hot key + 2-of-3 Shamir split for cold key** (Key Custody section of going-live.md)
-4. **Recruit ≥2 independent validators** (network needs it for real finality)
-5. **External security audit** — Trail of Bits, Least Authority, NCC Group, etc.
-6. **Run the remaining stress tests in section 12** — forged sig, leaf reuse, timestamp bounds, oversized payloads
-7. **Run end-user CLI sweep** — all README-listed commands end-to-end with real key prompt flow
-8. **Write and drill backup/restore procedure**
-9. **Code freeze window** — no consensus-breaking merges for at least one month before mainnet genesis mint
+### Blockers (mainnet cannot cut without these)
 
-The **economic design is sound** — inflation, fees, caps, divestment,
-reputation, and slashing are all well-reasoned and implemented. The
-**operational posture is improving but not mainnet-ready** — single
-key, single VM, unverified end-to-end CLI, pending audit.
+1. **Founder key custody** — still a single hot file on one VM. Integrate GCP KMS (or HSM) for the hot key; generate a SEPARATE cold authority key air-gapped with 2-of-3 Shamir split. The current key is rotated (uncompromised) but not defense-in-depth.
+2. **Decide immutable mainnet params** — founder allocation, treasury allocation, CHAIN_ID, tree height, SIG/HASH versions. Once baked into block 0 they cannot change without a hard fork.
+3. **External security audit** — Trail of Bits / Least Authority / NCC Group. Budget $50K–$200K, 4–8 weeks. Do not cut mainnet before.
+4. **Code freeze window** — lock main branch against consensus-breaking merges for ≥4 weeks before genesis mint. Today saw 4 re-mints from parallel merges.
+
+### High priority (before announcing public launch)
+
+5. **Backup + restore runbook** — daily snapshots run, but restore procedure is undocumented + undrilled. A 3-hour exercise.
+6. **Fork-detection / disk-usage / leaf-exhaustion alerting** — liveness done, these aren't. A few hours of Cloud Monitoring work.
+7. **Key-rotation drill** — runbook exists (`docs/key-rotation-runbook.md`); exercise it end-to-end on testnet once to catch any ambiguity.
+8. **Governance reorg edge cases** — formal tests for proposer-slashed-mid-voting and stake-snapshot-mutation paths.
+9. **Tor / onion endpoint** — documented in `going-live.md`, untested in practice. Meaningful for adversarial environments.
+
+### Medium priority (polish, operational)
+
+10. Hardening checkboxes: `chain.db` to 0640, disable LLMNR on VM.
+11. SQLite column-width review for balance/supply fields.
+12. Migrate tests away from `register_entity_for_test` backdoor so test coverage exercises the real receive-to-exist install path.
+13. Honest-near-miss slashing test (needs multi-node testnet to exercise).
+
+### Already sound — no action needed
+
+- Economic design (inflation curve, fees, caps, divestment, reputation, bootstrap lottery)
+- Cryptography (SHA3-256, WOTS+ hash-based signatures, version bytes for future migration)
+- Slashing (100%, finder reward, cryptographic evidence, reorg-resistant ratchet)
+- Governance (strict 2/3 total-eligible supermajority, silence = NO, spam-deterrent fees)
+- Fork choice + state root completeness (all per-entity fields committed)
+- P2P DoS protection (instant ban on invalid tx + rate limits)
+- RANDAO grinding resistance (each grind costs a WOTS+ leaf)
+- MEV surface (near-zero on base-layer messaging chain)
+- Receive-to-exist model (implicit creation on transfer, first-spend pubkey install)
+
+### Accepted by design (operators must understand)
+
+- **Lost-key = lost-funds**: no master recovery. Quantum-resistant hash signatures are one-way.
+- **Reorg slashing is permanent**: cryptographic evidence is valid regardless of fork; punishment sticks.
+- **Messages are public and permanent (header commitment)**: privacy is out of scope.
+
+---
+
+## Verdict
+
+**Economic and cryptographic design: PRODUCTION-READY.** No design-level
+concerns after deep dive. Sound anti-compound, sound bootstrap, sound
+slashing, sound governance, sound fork-choice.
+
+**Operational posture: NOT READY.** Single VM, single hot key, unaudited
+externally, no restore drill. All tractable — weeks of work, not months.
+
+**Recommendation**: work the 4 blockers + 5 high-priority items. When
+done, cut mainnet with the current (post-rotation) genesis key — or
+rotate once more after the HSM/KMS setup so the hot key literally
+never touches a filesystem.
