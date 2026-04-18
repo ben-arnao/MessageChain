@@ -104,7 +104,8 @@ Requirements:
 
 - [ ] Decide final WOTS+ / Merkle tree height for mainnet (production-scale, not 16).
 - [ ] Document founder cold-key ceremony (air-gapped generation, paper backup, witnesses). Custody split is covered by **Key Custody (Mainnet Gating)** above.
-- [ ] Key-rotation runbook: drill `rotate-key` on testnet before leaves exhaust in prod.
+- [x] **Key-rotation runbook written** — [docs/key-rotation-runbook.md](key-rotation-runbook.md). End-to-end procedure for founder hot-key rotation with failure modes documented. Drill on testnet still pending.
+- [ ] Key-rotation **drill**: run `rotate-key` end-to-end against the live testnet before leaves exhaust in prod.
 - [ ] Review choice of hash function(s) and signature scheme against the current quantum-resistance literature.
 
 ### Genesis & chain config
@@ -131,10 +132,16 @@ Requirements:
 
 ### Operations
 
-- [ ] Systemd unit hardening reviewed (user, capabilities, restart policy).
-- [ ] Log rotation + retention policy.
-- [ ] Monitoring + alerting: liveness, fork detection, disk, signature-leaf exhaustion.
-- [ ] Backup + restore runbook for chaindata and keys.
+- [x] **Systemd unit hardening** — `ProtectKernel*`, `PrivateDevices`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `SystemCallFilter=@system-service ~@privileged @resources`, `LockPersonality`, `MemoryMax=1500M`, `LimitNOFILE=65536`, crash-loop guard (`StartLimitBurst=5/hour`). See [deploy/systemd/messagechain-validator.service](../deploy/systemd/messagechain-validator.service).
+- [x] **Log rotation** — journald drop-in at [deploy/systemd/journald-messagechain.conf](../deploy/systemd/journald-messagechain.conf) caps at 500M / 1 month retention. Prevents runaway logs from filling the root partition.
+- [ ] Monitoring + alerting (partial: liveness done, fork detection / disk / signature-leaf exhaustion pending).
+    - [x] **Liveness:** GCP Uptime Check on TCP `35.237.211.12:9334` every 5 min; alert policy `validator-rpc-down` emails `arnaoben@gmail.com` after 60s downtime. Check ID `validator-rpc-check-S5wGEEcMtmI`, alert policy `210243887955051052`.
+    - [ ] Fork detection (two conflicting tips at same height).
+    - [ ] Disk usage alert (predicts when snapshots or chaindata will fill the boot disk).
+    - [ ] Signature-leaf exhaustion alert — the server logs WARN at 80/95%; pipe to PagerDuty or similar.
+- [ ] Backup + restore runbook (partial: daily snapshots done, restore procedure not yet written).
+    - [x] **Daily GCP persistent-disk snapshots** at 04:00 UTC, 30-day retention, attached to `validator-1` boot disk. Resource policy: `validator-daily-snap` in `us-east1`.
+    - [ ] Restore procedure documented + dry-run tested.
 - [ ] Incident response plan (including `emergency-revoke` drill).
 
 ### Governance
@@ -166,6 +173,12 @@ Requirements:
 
 ## Done
 
+- **2026-04-18 — Testnet founder key rotated.** The previous genesis private key had leaked into chat scrollback during the dev session that bootstrapped the prototype. Rotated to a fresh `os.urandom(32)` key, re-minted testnet genesis, updated `_TESTNET_GENESIS_HASH`. Old entity `ad66c101...` is burnt; new entity is `2195a4be011608dffed899613393f52de6ef51f8d822d26c0d3d6cca6acd3576` / `mc12195a4be011608dffed899613393f52de6ef51f8d822d26c0d3d6cca6acd35769cf6094e`. Private key lives only in `/etc/messagechain/keyfile` on the validator VM (mode 0400, owner `messagechain`). **Still a single-file, single-host hot key** — replacing it with an HSM/KMS is the next step in the Key Custody section.
+- **2026-04-18 — Key-rotation runbook written.** [docs/key-rotation-runbook.md](key-rotation-runbook.md) — procedure and failure modes for rotating the founder hot key while the validator is live. Drill on testnet still pending.
+- **2026-04-18 — Systemd unit hardened.** Added `ProtectKernel*`, `PrivateDevices`, `SystemCallFilter=@system-service ~@privileged @resources`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`, `LockPersonality`, `MemoryMax=1500M`, `LimitNOFILE=65536`. A code-execution bug in the validator is now box-local; no kernel tunable access, no new namespaces, no realtime scheduling, no raw sockets.
+- **2026-04-18 — Log rotation configured.** journald drop-in caps system logs at 500M with 1-month max retention, 50M per file. A runaway log spew can no longer fill the boot disk.
+- **2026-04-18 — Liveness monitoring live.** GCP Uptime Check on TCP `35.237.211.12:9334` + email alert to `arnaoben@gmail.com` on 60s downtime. Operator learns about a dead validator in minutes instead of "when someone complains."
+- **2026-04-18 — Daily disk backups live.** GCP persistent-disk snapshot schedule at 04:00 UTC with 30-day retention. VM loss is no longer a chain-loss event (restore procedure still needs to be written + drilled).
 - **2026-04-17 — Keypair cache no longer pickle-based.** Replaced `pickle.load`/`pickle.dump` in `server.py` with HMAC-SHA3-256-authenticated JSON keyed on the validator's private key. A planted file (malware, restored backup, stray `cp`) can no longer execute arbitrary code as the validator user. Regression tests in [tests/test_keypair_cache_versioning.py](../tests/test_keypair_cache_versioning.py) pin the format and prove a planted pickle does not deserialize.
 - **2026-04-17 — `PINNED_GENESIS_HASH` gated on `NETWORK_NAME` selector.** Cutting mainnet now requires two explicit edits (set `_MAINNET_GENESIS_HASH`, flip `NETWORK_NAME`); doing the second without the first raises at config load. A clone of the repo can no longer accidentally trust a testnet hash on mainnet.
 - **2026-04-17 — Production systemd unit purged of dev-time overrides.** Default unit ships with no `MESSAGECHAIN_PROFILE=prototype` (=production posture) and adds `StartLimitBurst` for crash-loop protection. Prototype-phase deployments install the new `messagechain-validator-prototype.conf.example` drop-in. A copy-paste install no longer silently runs in degraded mode.
