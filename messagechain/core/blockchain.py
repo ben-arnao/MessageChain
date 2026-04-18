@@ -2463,25 +2463,25 @@ class Blockchain:
                     sim_tracker.add_vote(gtx, current_block=block_height)
 
             # Phase 2: auto-execute closed treasury spends.  Must mirror
-            # the apply-path ordering and predicates exactly.
-            for pid, state in list(sim_tracker.proposals.items()):
-                proposal = state.proposal
-                if not isinstance(proposal, TreasurySpendTransaction):
-                    continue
-                if block_height - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
-                    continue
-                # New-account surcharge is charged if the recipient is
-                # brand-new.  In sim, "brand-new" means absent from every
-                # live dict.  We use the same helper as the real path so
-                # byte-for-byte burn semantics match.
-                def _sim_is_new(rid: bytes) -> bool:
-                    if rid in sim_supply.balances:
-                        return False
-                    if rid in sim_supply.staked:
-                        return False
-                    return self._recipient_is_new(rid)
+            # the apply-path ordering and predicates exactly — M5 fix
+            # requires hex-sorted proposal_id iteration so the sim and
+            # apply paths agree on which of N competing same-block spends
+            # succeeds when the treasury can't cover them all.
+            def _sim_is_new(rid: bytes) -> bool:
+                if rid in sim_supply.balances:
+                    return False
+                if rid in sim_supply.staked:
+                    return False
+                return self._recipient_is_new(rid)
+            sim_closed_spends = [
+                (pid, state) for pid, state in sim_tracker.proposals.items()
+                if isinstance(state.proposal, TreasurySpendTransaction)
+                and block_height - state.created_at_block > GOVERNANCE_VOTING_WINDOW
+            ]
+            sim_closed_spends.sort(key=lambda kv: kv[0])
+            for pid, state in sim_closed_spends:
                 sim_tracker.execute_treasury_spend(
-                    proposal, sim_supply, current_block=block_height,
+                    state.proposal, sim_supply, current_block=block_height,
                     is_new_account=_sim_is_new,
                 )
 
@@ -4711,15 +4711,23 @@ class Blockchain:
                 tracker.add_vote(gtx, current_block=current_block)
                 self._bump_watermark(gtx.voter_id, gtx.signature.leaf_index)
 
-        # Phase 2: auto-execute binding treasury spends whose window has closed
-        for pid, state in list(tracker.proposals.items()):
-            proposal = state.proposal
-            if not isinstance(proposal, TreasurySpendTransaction):
-                continue
-            if current_block - state.created_at_block <= GOVERNANCE_VOTING_WINDOW:
-                continue
+        # Phase 2: auto-execute binding treasury spends whose window has closed.
+        # M5: when multiple treasury spends close in the same block, process
+        # them in a deterministic order (hex-sorted proposal_id) so the
+        # in-block balance re-check is reproducible across nodes.  Each
+        # execute_treasury_spend re-reads get_balance(TREASURY_ENTITY_ID)
+        # at call time, so prior debits in this loop are visible — the
+        # second spend sees the post-first-debit treasury and overdrafts
+        # predictably instead of racing.
+        closed_spends = [
+            (pid, state) for pid, state in tracker.proposals.items()
+            if isinstance(state.proposal, TreasurySpendTransaction)
+            and current_block - state.created_at_block > GOVERNANCE_VOTING_WINDOW
+        ]
+        closed_spends.sort(key=lambda kv: kv[0])  # proposal_id bytes-sorted
+        for pid, state in closed_spends:
             tracker.execute_treasury_spend(
-                proposal, self.supply, current_block=current_block,
+                state.proposal, self.supply, current_block=current_block,
                 is_new_account=self._recipient_is_new,
             )
 

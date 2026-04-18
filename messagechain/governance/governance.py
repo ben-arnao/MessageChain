@@ -726,21 +726,42 @@ class GovernanceTracker:
         rows.sort(key=lambda r: r["created_at_block"], reverse=True)
         return rows
 
-    def tally(self, proposal_id: bytes) -> tuple[int, int, int, int]:
+    def tally(
+        self, proposal_id: bytes, supply_tracker=None,
+    ) -> tuple[int, int, int, int]:
         """Stakers-only tally for a proposal.
 
         Returns (yes_weight, no_weight, total_participating, total_eligible).
+
+        Two tally modes:
+
+        - **Snapshot mode** (supply_tracker=None) — weights come from
+          the stake snapshot captured at proposal creation.  Used for
+          informational views (list_proposals, get_proposal_info) where
+          freezing the electorate at proposal time makes the display
+          stable and order-independent.
+
+        - **Live-weight mode** (supply_tracker given) — weights come
+          from CURRENT stake, with eligibility still gated by the
+          snapshot.  Used for BINDING outcomes (H6 fix): a voter
+          slashed mid-window must contribute 0; a voter whose stake
+          shrank must count only at current weight.  The snapshot
+          still defines WHO may vote (no late joiners), but HOW MUCH
+          each voter/silent-electorate-member weighs is evaluated at
+          tally time against live state.
 
         Voting rules:
 
         - Only stakers (entities with stake_snapshot[v] > 0) can
           register a vote.  Non-stakers are rejected by add_vote.
-        - Each voting validator V contributes V_weight = own_stake(V)
-          at snapshot.  yes_weight sums the stakes of yes voters;
-          no_weight sums the stakes of no voters.
-        - total_eligible = sum of every snapshotted validator's stake,
-          voter or silent.  Silence is counted in the denominator so
-          it functions as "no" for binding outcomes.
+        - In snapshot mode: each voter's weight = snapshot_stake.
+          total_eligible = sum of snapshot stakes.
+        - In live-weight mode: each voter's weight = current_stake.
+          total_eligible = sum of current_stake for every entity in
+          the snapshot (voters AND silent).  Silent voters whose
+          stake was slashed vanish from the denominator too,
+          otherwise a whale slashing would make supermajority
+          impossible for any proposal.
 
         All arithmetic is integer and order-independent (sums), so
         tally results are deterministic across nodes.
@@ -752,21 +773,38 @@ class GovernanceTracker:
         stake_snapshot = state.stake_snapshot
         direct_votes = state.votes  # voter_id -> bool
 
+        def weight_for(entity_id: bytes) -> int:
+            """Weight for an entity in the electorate at tally time."""
+            if supply_tracker is None:
+                return stake_snapshot.get(entity_id, 0)
+            # Live-weight mode: only entities in the snapshot are
+            # eligible (no late joiners).  Weight is current stake;
+            # slashed → 0, partial unstake → reduced, etc.
+            if entity_id not in stake_snapshot:
+                return 0
+            return supply_tracker.get_staked(entity_id)
+
         yes_weight = 0
         no_weight = 0
         for voter_id, approve in direct_votes.items():
-            own_stake = stake_snapshot.get(voter_id, 0)
-            if own_stake <= 0:
-                # add_vote() rejects these, but be defensive: a zero-
-                # stake voter in the record contributes nothing.
+            w = weight_for(voter_id)
+            if w <= 0:
+                # add_vote() rejects non-snapshot voters, but a
+                # post-snapshot slashing (live-weight mode) drops the
+                # voter's weight to 0.  Be defensive either way.
                 continue
             if approve:
-                yes_weight += own_stake
+                yes_weight += w
             else:
-                no_weight += own_stake
+                no_weight += w
 
         total_participating = yes_weight + no_weight
-        total_eligible = sum(stake_snapshot.values())
+        if supply_tracker is None:
+            total_eligible = sum(stake_snapshot.values())
+        else:
+            total_eligible = sum(
+                weight_for(eid) for eid in stake_snapshot.keys()
+            )
         return yes_weight, no_weight, total_participating, total_eligible
 
     def execute_treasury_spend(
@@ -813,8 +851,13 @@ class GovernanceTracker:
         status = self.get_proposal_status(tx.proposal_id, current_block)
         if status != ProposalStatus.CLOSED:
             return False
+        # H6: binding tally MUST use live stake weights, not the frozen
+        # snapshot.  A voter slashed or who unstaked after casting must
+        # contribute their CURRENT stake (zero if slashed).  Otherwise a
+        # whale attacker could cast a dispositive YES, get slashed for
+        # an unrelated offense, and still carry the proposal.
         yes_weight, _no_weight, _participating, total_eligible = self.tally(
-            tx.proposal_id,
+            tx.proposal_id, supply_tracker=supply_tracker,
         )
         if total_eligible == 0:
             return False
