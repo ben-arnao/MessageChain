@@ -38,10 +38,29 @@ StandardError=journal
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 ReadWritePaths=/var/lib/messagechain
 ReadOnlyPaths=/etc/messagechain /opt/messagechain
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=1500M  # leave 500 MB headroom on e2-small (2 GB total)
 
 [Install]
 WantedBy=multi-user.target
