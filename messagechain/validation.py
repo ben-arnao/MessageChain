@@ -157,3 +157,44 @@ def safe_json_loads(data: str | bytes, max_depth: int = 32) -> dict:
 
 # Maximum sane block height (~31,000 years at 10s blocks)
 MAX_SANE_BLOCK_HEIGHT = 100_000_000  # ~31 years at 10s blocks, generous upper bound
+
+
+def is_valid_peer_address(address: str) -> bool:
+    """Return True if ``address`` parses as a plausible ``host:port``.
+
+    Used by operator RPCs (ban_peer / unban_peer) to reject empty or
+    malformed inputs that would otherwise be forwarded to the ban
+    manager and silently recorded against the empty string, which later
+    matches spurious lookups.
+
+    Accepts both IPv4 ("1.2.3.4:8333") and IPv6 bracket notation
+    ("[::1]:8333").  The host and port must both be non-empty and the
+    port must be a decimal integer in [1, 65535].
+    """
+    if not isinstance(address, str) or not address:
+        return False
+    if address.startswith("["):
+        # IPv6 bracket notation: [host]:port
+        end = address.find("]")
+        if end == -1 or end == 1:
+            return False
+        host = address[1:end]
+        rest = address[end + 1:]
+        if not rest.startswith(":"):
+            return False
+        port_part = rest[1:]
+    else:
+        if ":" not in address:
+            return False
+        host, _, port_part = address.rpartition(":")
+        if not host:
+            return False
+    if not port_part.isdigit():
+        return False
+    try:
+        port = int(port_part)
+    except ValueError:
+        return False
+    if not 1 <= port <= 65535:
+        return False
+    return True
