@@ -72,6 +72,13 @@ python -m messagechain estimate-fee --message "hi"    # or --transfer
 python -m messagechain validators    # entity, stake, share %, blocks produced
 ```
 
+### Chain & connectivity
+
+```bash
+python -m messagechain ping    # first-run sanity check: resolves a seed, prints height
+python -m messagechain info    # chain height, supply, validator count, sync status
+```
+
 ### Governance
 
 ```bash

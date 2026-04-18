@@ -249,21 +249,6 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_seen_sigs_first_seen
                 ON seen_signatures(first_seen_block_height);
-
-            -- Bitcoin anchoring — external immutability proof via OP_RETURN.
-            -- Stores (mc_block_number, mc_block_hash, anchor_hash, btc_txid,
-            -- btc_block_height, timestamp).  btc_txid and btc_block_height
-            -- are NULL until the Bitcoin tx is confirmed.  mc_block_number
-            -- is PRIMARY KEY so a given MC block can only be anchored once
-            -- (INSERT OR IGNORE semantics).
-            CREATE TABLE IF NOT EXISTS bitcoin_anchors (
-                mc_block_number INTEGER PRIMARY KEY,
-                mc_block_hash BLOB NOT NULL,
-                anchor_hash BLOB NOT NULL,
-                btc_txid TEXT,
-                btc_block_height INTEGER,
-                timestamp INTEGER NOT NULL
-            );
         """)
         conn.commit()
 
@@ -1067,94 +1052,6 @@ class ChainDB:
 
     def rollback_transaction(self):
         self._conn.rollback()
-
-    # ── Bitcoin Anchors (external immutability proof) ──────────────
-
-    def store_bitcoin_anchor(
-        self,
-        mc_block_number: int,
-        mc_block_hash: bytes,
-        anchor_hash: bytes,
-        btc_txid: str | None,
-        btc_block_height: int | None,
-        timestamp: int,
-    ) -> None:
-        """Store a Bitcoin anchor record.
-
-        Idempotent per mc_block_number: INSERT OR IGNORE means the first
-        anchor for a block wins. A second call with a different anchor_hash
-        for the same block is silently ignored — this is the correct
-        semantic because an anchor, once committed, is permanent.
-        """
-        self._conn.execute(
-            "INSERT OR IGNORE INTO bitcoin_anchors "
-            "(mc_block_number, mc_block_hash, anchor_hash, btc_txid, "
-            "btc_block_height, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (mc_block_number, mc_block_hash, anchor_hash,
-             btc_txid, btc_block_height, timestamp),
-        )
-        self._conn.commit()
-
-    def update_bitcoin_anchor_confirmation(
-        self,
-        mc_block_number: int,
-        btc_txid: str,
-        btc_block_height: int,
-    ) -> None:
-        """Fill in btc_txid and btc_block_height once the Bitcoin tx confirms."""
-        self._conn.execute(
-            "UPDATE bitcoin_anchors SET btc_txid = ?, btc_block_height = ? "
-            "WHERE mc_block_number = ?",
-            (btc_txid, btc_block_height, mc_block_number),
-        )
-        self._conn.commit()
-
-    def get_bitcoin_anchor(self, mc_block_number: int) -> dict | None:
-        """Get a single anchor record by MC block number."""
-        cur = self._conn.execute(
-            "SELECT mc_block_number, mc_block_hash, anchor_hash, "
-            "btc_txid, btc_block_height, timestamp "
-            "FROM bitcoin_anchors WHERE mc_block_number = ?",
-            (mc_block_number,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return {
-            "mc_block_number": row[0],
-            "mc_block_hash": bytes(row[1]),
-            "anchor_hash": bytes(row[2]),
-            "btc_txid": row[3],
-            "btc_block_height": row[4],
-            "timestamp": row[5],
-        }
-
-    def get_all_bitcoin_anchors(self) -> list[dict]:
-        """Get all anchor records, ordered by MC block number."""
-        cur = self._conn.execute(
-            "SELECT mc_block_number, mc_block_hash, anchor_hash, "
-            "btc_txid, btc_block_height, timestamp "
-            "FROM bitcoin_anchors ORDER BY mc_block_number"
-        )
-        return [
-            {
-                "mc_block_number": row[0],
-                "mc_block_hash": bytes(row[1]),
-                "anchor_hash": bytes(row[2]),
-                "btc_txid": row[3],
-                "btc_block_height": row[4],
-                "timestamp": row[5],
-            }
-            for row in cur.fetchall()
-        ]
-
-    def get_last_anchored_block_number(self) -> int:
-        """Return the highest mc_block_number that has been anchored, or 0."""
-        cur = self._conn.execute(
-            "SELECT MAX(mc_block_number) FROM bitcoin_anchors"
-        )
-        row = cur.fetchone()
-        return row[0] if row and row[0] is not None else 0
 
     # ── Witness Separation (block witness data) ─────────────────────
 
