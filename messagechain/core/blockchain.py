@@ -1977,6 +1977,7 @@ class Blockchain:
         governance_txs: list | None = None,
         finality_votes: list | None = None,
         proposer_signature_leaf_index: int | None = None,
+        slash_transactions: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -2183,7 +2184,17 @@ class Blockchain:
         # so subtracting from sim_staked is all we need.  Liquid balance
         # only changes when unbonding matures UNBONDING_PERIOD blocks
         # later (release_pending_unstakes) — not affected here.
+        #
+        # H5: drop any unstake whose entity is also the offender of a
+        # SlashTransaction in the same block.  The apply path pre-empts
+        # such unstakes (their stake has already been burned by the
+        # slash loop); the sim must match or state_root diverges.
+        _slashed_offenders_sim = {
+            stx.evidence.offender_id for stx in (slash_transactions or [])
+        }
         for utx in (unstake_transactions or []):
+            if utx.entity_id in _slashed_offenders_sim:
+                continue
             effective_base_fee = min(current_base_fee, utx.fee)
             tip = utx.fee - effective_base_fee
             sim_balances[utx.entity_id] = max(
@@ -2603,6 +2614,7 @@ class Blockchain:
             governance_txs=governance_txs,
             finality_votes=finality_votes,
             proposer_signature_leaf_index=expected_proposer_leaf,
+            slash_transactions=slash_transactions,
         )
         mtp = self.get_median_time_past()
         # A small epsilon greater than the minimum float resolution the
@@ -3439,7 +3451,17 @@ class Blockchain:
         # verify under the cold key (which defaults to the signing key for
         # entities that haven't promoted one).  Amount must not exceed
         # current stake.  Nonce is cumulative with other fee-paying txs.
+        #
+        # H5: drop any unstake whose entity is also the offender of a
+        # SlashTransaction in the same block — the apply path pre-empts
+        # it (see _apply_block_state's unstake loop), so the validator
+        # must not pipeline its nonce/balance or state diverges.
+        _slashed_offenders_vb = {
+            stx.evidence.offender_id for stx in block.slash_transactions
+        }
         for utx in getattr(block, "unstake_transactions", []):
+            if utx.entity_id in _slashed_offenders_vb:
+                continue
             ok, reason = self._validate_unstake_tx_in_block(
                 utx, pending_nonces, pending_balance_spent,
             )
@@ -4316,7 +4338,25 @@ class Blockchain:
         # Apply unstake transactions.  Authority-gated; queues stake into
         # the UNBONDING_PERIOD unbond queue (not immediately spendable) so
         # in-flight slashing evidence stays effective during unbonding.
+        #
+        # H5: if this block also carries a SlashTransaction for the same
+        # entity, the slash loop above has already wiped that entity's
+        # stake AND pending_unstakes.  Running the unstake afterwards
+        # would charge a fee for a tx that can no longer have any
+        # effect — a silent fee-burn against a doomed transaction, plus
+        # a nonce bump that diverges from what validators expect.
+        # Drop such unstakes entirely before the apply loop; validate_
+        # block and compute_post_state_root mirror the same skip so
+        # state_root stays consistent across the pipeline.
+        slashed_offenders_this_block = {
+            stx.evidence.offender_id for stx in block.slash_transactions
+        }
         for utx in getattr(block, "unstake_transactions", []):
+            if utx.entity_id in slashed_offenders_this_block:
+                # Pre-empted by a same-block slash.  No fee, no nonce
+                # bump, no watermark bump — the tx is as if it had
+                # never been included.
+                continue
             if not self.supply.pay_fee_with_burn(
                 utx.entity_id, proposer_id, utx.fee, current_base_fee,
             ):
