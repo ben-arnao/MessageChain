@@ -2483,12 +2483,50 @@ async def run(args):
         rpc_bind=args.rpc_bind,
     )
 
-    # Authenticate with private key to unlock block signing.  Two paths:
+    # Authenticate with private key to unlock block signing.  Three paths:
+    #   * --secret-name: fetch from GCP Secret Manager via VM metadata-server
+    #     auth.  Highest security — the key is KMS-encrypted at rest, every
+    #     access is Cloud-Audit-logged, and the key never touches disk.
+    #     Requires the VM's default service account to have
+    #     roles/secretmanager.secretAccessor on the named secret.
     #   * --keyfile: read the hex-encoded key from a 0600 file.  Required
-    #     for unattended (systemd, Docker) operation where no tty exists.
+    #     for unattended (systemd, Docker) operation where no tty exists
+    #     AND Secret Manager is unavailable (non-GCP host, detached env).
     #   * Interactive: getpass prompts for the key.  Default.
     private_key_input: bytes = b""
-    if args.keyfile:
+    if args.secret_name:
+        # Stdlib-only fetch: VM metadata server → access token → Secret
+        # Manager REST API.  No third-party pip deps required.
+        import urllib.request, urllib.error, base64
+        try:
+            md = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/"
+                "instance/service-accounts/default/token",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(md, timeout=5) as r:
+                token = json.loads(r.read().decode())["access_token"]
+            api = (
+                f"https://secretmanager.googleapis.com/v1/"
+                f"{args.secret_name}:access"
+            )
+            req = urllib.request.Request(
+                api, headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as r:
+                secret_json = json.loads(r.read().decode())
+            secret_bytes = base64.b64decode(secret_json["payload"]["data"])
+            hex_key = secret_bytes.decode().strip()
+            private_key_input = bytes.fromhex(hex_key)
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch secret {args.secret_name}: {e}. "
+                f"Is the VM on GCP and does its service account have "
+                f"roles/secretmanager.secretAccessor on the secret?"
+            )
+            sys.exit(1)
+        logger.info(f"Loaded private key from Secret Manager: {args.secret_name}")
+    elif args.keyfile:
         with open(args.keyfile) as _kf:
             hex_key = _kf.read().strip()
         try:
@@ -2617,6 +2655,13 @@ def main():
         "--rpc-bind", type=str, default="127.0.0.1",
         help="RPC bind address (default: 127.0.0.1). Use 0.0.0.0 for a "
              "public validator accepting remote signed transactions.",
+    )
+    parser.add_argument(
+        "--secret-name", type=str, default=None,
+        help="Fetch the hex-encoded private key from GCP Secret Manager. "
+             "Format: projects/PROJECT/secrets/NAME/versions/VERSION (or "
+             "'latest'). Recommended for production: key is KMS-encrypted "
+             "at rest, never touches disk, access audited.",
     )
     parser.add_argument(
         "--keyfile", type=str, default=None,
