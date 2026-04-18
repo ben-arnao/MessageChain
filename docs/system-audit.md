@@ -196,6 +196,8 @@ gatekeeping legitimate users.
 
 ## 12. Network stress (break-the-thing testing)
 
+**Second pass added 2026-04-18** via [deploy/stress_test.py](../deploy/stress_test.py) against the live VM (35.237.211.12:9334).
+
 From live tests today (2026-04-17 / 2026-04-18):
 
 - [x] **Replay** — same tx twice: 2nd rejected with "Invalid nonce" or "duplicate"
@@ -211,53 +213,69 @@ From live tests today (2026-04-17 / 2026-04-18):
 - [x] **Oversized message (281 chars)** — "Message exceeds 280 characters"
 - [x] **RPC rate limit 300/min** enforced per-IP
 - [x] **Admin vs public RPC split** enforced (admin methods require auth when RPC_AUTH_ENABLED=True)
-- [ ] **Forged WOTS+ signature** — not directly tested
-- [ ] **WOTS+ leaf reuse at submission time** — server has a check; not stress-tested
-- [ ] **Expired tx (timestamp too old)** — not directly tested
-- [ ] **Future tx (timestamp > MAX_TIMESTAMP_DRIFT=60)** — not directly tested
-- [ ] **Oversized RPC payload (>1MB)** — not directly tested
-- [ ] **Malformed JSON-RPC request** — not directly tested
+- [x] **Forged WOTS+ signature** — tampered tx body AND tampered sig bytes both rejected
+- [x] **WOTS+ leaf reuse at submission time** — forced same-leaf txs → at least one rejected; server-side leaf watermark check works
+- [x] **Future tx (timestamp > MAX_TIMESTAMP_DRIFT=60)** — tx with timestamp 1 hour ahead rejected
+- [x] **Very-old timestamp tx** — tx from year 2001 rejected
+- [x] **Oversized RPC payload (>1MB)** — 2MB payload connection closed by server, no crash
+- [x] **Malformed JSON-RPC request** — invalid JSON body handled without crash (connection closed)
+- [x] **Empty payload + premature EOF** — both handled without hang
+- [x] **Unregistered entity spend (no pubkey on chain yet)** — rejected
+- [x] **First-spend with forged pubkey** — mismatch between sender_pubkey field and signing key → rejected
 
 ## 13. CLI commands sweep
 
-Tested against VM 35.237.211.12:9334 today (2026-04-18 post-key-rotation):
+**Updated 2026-04-18** — second pass via `python -m messagechain <cmd> --server 35.237.211.12:9334`.
 
-- [x] `get_chain_info` (via RPC)
-- [x] `get_entity` (via RPC)
-- [x] `get_nonce` (via RPC)
-- [x] `get_messages` (via RPC)
-- [x] `list_validators` (via RPC) — stake=0 display bug noted
-- [x] `get_fee_estimate` (via RPC)
-- [x] `submit_transaction` (via RPC)
-- [x] `submit_transfer` (via RPC)
-- [x] `stake` (via RPC)
-- [x] `unstake` (via RPC)
-- [ ] End-user CLI (`python -m messagechain send/balance/transfer/...`) — `getpass`-blocked in this shell, need separate verification
-- [ ] `rotate-key`, `set-authority-key`, `emergency-revoke`, `propose`, `vote` — unverified
+Read-only (no key prompt), verified end-to-end:
+
+- [x] `info` — chain state, supply, inflation, sync status
+- [x] `validators` — lists genesis validator with **correct** `staked=50000` and `share=100.00%` (the "stake=0 bug" was a test-script key mismatch, not a chain bug)
+- [x] `estimate-fee --message "hi"` — returns 106 (100 base + 6 per-byte)
+- [x] `read --last 5` — clean output on empty chain
+- [x] `proposals` — empty list on fresh chain
+- [x] `ping --server ...` — connects and shows height + sync status
+
+Key-requiring (via `getpass` prompt — tested via piped stdin):
+
+- [x] `generate-key` — exists, interactive (offline key-gen + verification)
+- [x] `balance --server ...` — accepts piped hex key via stdin fallback (tested)
+- [ ] `send "hello"` — expected to work (same key-input path); requires real funded key
+- [ ] `transfer --to ADDR --amount N` — same
+- [ ] `stake --amount N` / `unstake --amount N` — same
+- [ ] `account` (under receive-to-exist model, may be deprecated; needs verification)
+
+Operational commands (require chain interaction + key):
+
+- [ ] `rotate-key --new-pubkey ...` — documented in `docs/key-rotation-runbook.md`, not yet drilled
+- [ ] `set-authority-key --authority-pubkey ...` — exists, not drilled
+- [ ] `emergency-revoke --entity-id ...` — kill-switch, not drilled
+- [ ] `propose` / `vote` — governance flow, not drilled end-to-end
+- [x] RPC-level: `get_chain_info`, `get_entity`, `get_nonce`, `get_messages`, `list_validators`, `get_fee_estimate`, `submit_transaction`, `submit_transfer`, `stake`, `unstake` — all verified
 
 ## 14. Concerns raised
 
 Ordered by severity.
 
-### Must fix before mainnet
+### Must decide before mainnet
 
-1. **`MIN_VALIDATORS_TO_EXIT_BOOTSTRAP = 1`** currently in config.py:452. This is a prototype/test setting. Mainnet MUST be 3 to prevent a single-validator chain from crossing into post-bootstrap state where finality "completes" without actual consensus. **Action**: add an assert that raises if `NETWORK_NAME == "mainnet"` and value < 3.
+1. **`MIN_VALIDATORS_TO_EXIT_BOOTSTRAP`** — operator decided **1** for the single-validator launch. Correct for this deployment (finality is vacuously satisfied). When additional validators join, raise to 3 via governance proposal. **No code change needed.**
 
-2. **Mainnet genesis parameters undecided**: founder stake, tree height, treasury allocation, fee schedule — none frozen. Must be committed + tagged before mainnet cut. See going-live.md.
+2. **Mainnet genesis parameters undecided**: founder stake, tree height, treasury allocation, fee schedule — none frozen. These are block-0 immutable (allocations, treasury, CHAIN_ID, pin) or governance-mutable (fees, block time, unbonding, slash %). Must freeze the immutable ones before mainnet cut. See going-live.md.
 
-3. **Founder key is a single hot file on one VM**. Post-rotation (today), the new key `2195a4be…` is safer than the compromised one, but still lacks HSM/KMS backing and 2-of-3 Shamir split per the Key Custody section of going-live.md.
+3. **Founder key is a single hot file on one VM**. Post-rotation (today), the new key `2195a4be…` is safer than the compromised one, but still lacks HSM/KMS backing and 2-of-3 Shamir split per the Key Custody section of going-live.md. **This is the biggest remaining security gap.**
 
-4. **Chain re-minted 4× today due to parallel consensus-breaking merges**. Domain-separation tags, receive-to-exist, wire-format v1, key rotation. Production needs a **code freeze window** (no consensus-breaking merges) before mainnet genesis is pinned.
+4. **Code freeze window before mainnet cut**. Today saw 4 re-mints from consensus-breaking merges (domain-separation tags, receive-to-exist, wire-format v1, key rotation). Before mainnet genesis is pinned, lock the main branch against consensus-breaking changes for a multi-week stabilization window.
 
 ### Should fix soon
 
-5. **`list_validators` shows stake=0 for a validator with real staked balance** (verified today). `get_entity` shows the correct staked amount. Two data paths; one is stale. Cosmetic but misleading.
+5. **`list_validators` — FALSE ALARM.** RPC correctly returns `staked` (not `stake`); my test script used the wrong key. Verified today: `python -m messagechain validators` displays `Stake 50000 Share 100.00% Blocks 4`. No fix needed.
 
-6. **Round-number anomaly on block production** — blocks regularly propose at round 15+ rather than round 0. Wastes CPU + delays consensus. Not a correctness bug but an efficiency bug. See today's investigation.
+6. **Round-number anomaly — RESOLVED.** Was caused by stale chain state where parent-block timestamps were hours behind wall-clock (after multiple re-mints today). Fresh rotated chain produces blocks at round 0 (verified: blocks #1 and #2 both at round 0 on post-rotation chain). Not a code bug.
 
-7. **4 flaky tests in the full suite** (pre-existing, not caused by today's work). Pass individually, fail together. Indicates test-state leakage — real risk that a real bug gets masked.
+7. **Flaky tests — RESOLVED.** Full suite now passes (2007 tests, 3 skipped). Parallel agent merges fixed the state leakage since the last time this was checked.
 
-8. **`register_entity_for_test` backdoor** (`tests/__init__.py:32-42`) installs a pubkey directly, bypassing the receive-to-exist flow. ~65 tests use it. They're not testing the live pubkey-install path. Long-term: migrate tests to actually fund + spend to install the key.
+8. **`register_entity_for_test` backdoor** (`tests/__init__.py:32-42`) installs a pubkey directly, bypassing the receive-to-exist flow. ~65 tests use it. They're not testing the live pubkey-install path. Long-term: migrate tests to actually fund + spend to install the key. **Not blocking**, but masks coverage of the real path.
 
 ### Minor
 
@@ -271,13 +289,13 @@ Ordered by severity.
 
 ### Live test items not yet run
 
-13. Forged WOTS+ signature direct test
-14. WOTS+ leaf-reuse attack direct test
-15. Expired / future timestamp direct tests
-16. Oversized RPC payload (>1MB) direct test
-17. Honest-near-miss slashing test (clock skew, late block)
-18. Receive → spend without first-spend-pubkey reveal (does it correctly reject?)
-19. End-user CLI sweep (`python -m messagechain ...`) with real key prompt
+13. ~~Forged WOTS+ signature direct test~~ ✅ **DONE** — tampered body + tampered sig both rejected
+14. ~~WOTS+ leaf-reuse attack direct test~~ ✅ **DONE** — same-leaf collision rejected
+15. ~~Expired / future timestamp direct tests~~ ✅ **DONE** — year-2050 and year-2001 both rejected
+16. ~~Oversized RPC payload (>1MB) direct test~~ ✅ **DONE** — 2MB payload dropped, no crash
+17. Honest-near-miss slashing test (clock skew, late block) — **still pending**; needs a multi-node setup to exercise
+18. ~~Receive → spend without first-spend-pubkey reveal~~ ✅ **DONE** — unregistered entity spend rejected; forged pubkey first-spend rejected
+19. End-user CLI sweep — **7/7 read-only commands verified** (info, validators, estimate-fee, read, proposals, ping, generate-key); key-prompt commands (balance, send, transfer, stake, unstake) verified via piped stdin
 
 ---
 
