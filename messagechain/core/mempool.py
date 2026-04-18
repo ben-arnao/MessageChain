@@ -11,6 +11,7 @@ Now supports:
 """
 
 import os
+import secrets
 import time
 from collections import defaultdict
 from messagechain.config import (
@@ -372,10 +373,12 @@ class Mempool:
         # pool; random eviction matches Bitcoin Core's approach and keeps
         # the pool rotating under adversarial pressure.
         if len(self.orphan_pool) >= MEMPOOL_MAX_ORPHAN_TXS:
-            # os.urandom for unpredictability — an attacker should not be
-            # able to predict which entries will be evicted.
-            victim_idx = int.from_bytes(os.urandom(4), "big") % len(self.orphan_pool)
-            victim_hash = list(self.orphan_pool.keys())[victim_idx]
+            # secrets.choice gives an unbiased pick from the current
+            # key set without the modulo-bias that `os.urandom(4) % n`
+            # introduces — and crucially without exposing the attacker a
+            # modulo-predictable mapping from a 32-bit draw to a victim
+            # index.
+            victim_hash = secrets.choice(list(self.orphan_pool.keys()))
             victim_tx = self.orphan_pool.pop(victim_hash)
             self._orphan_sender_counts[victim_tx.entity_id] = max(
                 0, self._orphan_sender_counts[victim_tx.entity_id] - 1

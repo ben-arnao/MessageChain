@@ -73,7 +73,10 @@ from messagechain.network.ratelimit import PeerRateLimiter
 
 import hashlib
 from messagechain.config import HASH_ALGO
-from messagechain.validation import parse_hex, sanitize_error, safe_json_loads
+from messagechain.validation import (
+    parse_hex, sanitize_error, safe_json_loads,
+    is_valid_peer_address as _is_valid_peer_address,
+)
 from messagechain.network.ratelimit import RPCRateLimiter
 
 logger = logging.getLogger("messagechain.server")
@@ -767,11 +770,15 @@ class Server:
         elif method == "ban_peer":
             addr = request["params"].get("address", "")
             reason = request["params"].get("reason", "manual_rpc")
+            if not _is_valid_peer_address(addr):
+                return {"ok": False, "error": "Invalid peer address (expected 'host:port')"}
             self.ban_manager.manual_ban(addr, reason=reason)
             return {"ok": True, "result": {"message": f"Banned {addr}"}}
 
         elif method == "unban_peer":
             addr = request["params"].get("address", "")
+            if not _is_valid_peer_address(addr):
+                return {"ok": False, "error": "Invalid peer address (expected 'host:port')"}
             self.ban_manager.manual_unban(addr)
             return {"ok": True, "result": {"message": f"Unbanned {addr}"}}
 
@@ -791,8 +798,15 @@ class Server:
             return self._rpc_submit_vote(request["params"])
 
         elif method == "get_messages":
-            count = request.get("params", {}).get("count", 10)
-            count = min(count, 100)  # cap to prevent abuse
+            raw = request.get("params", {}).get("count", 10)
+            # Coerce + clamp: a bare `min(count, 100)` neither rejected
+            # non-integers (TypeError downstream) nor guarded negative /
+            # zero values (caller could starve the reader thread).
+            try:
+                count = int(raw)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Invalid count (expected integer)"}
+            count = max(1, min(count, 100))
             messages = self.blockchain.get_recent_messages(count)
             return {"ok": True, "result": {"messages": messages}}
 

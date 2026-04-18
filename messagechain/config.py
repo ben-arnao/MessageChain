@@ -676,7 +676,12 @@ TX_RELAY_DELAY_MEAN = 2.0  # average seconds of delay before relaying tx to peer
 
 # Orphan transaction pool — hold out-of-order nonce txs temporarily
 MEMPOOL_MAX_ORPHAN_TXS = 100       # max orphan txs total
-MEMPOOL_MAX_ORPHAN_PER_SENDER = 3  # max orphan txs per entity
+# 3 was too tight for honest users: a legitimate
+# stake -> unstake -> stake pipeline plus a concurrent message or two
+# exhausts the quota and legitimate orphans start being rejected.  10
+# still caps attacker amplification (at most 10 * MEMPOOL_MAX_ORPHAN_NONCE_GAP
+# pending orphans per sender) while giving honest bursts headroom.
+MEMPOOL_MAX_ORPHAN_PER_SENDER = 10 # max orphan txs per entity
 MEMPOOL_MAX_ORPHAN_NONCE_GAP = 3   # max nonce gap allowed for orphan txs
 
 # Minimum cumulative stake weight — reject peers on chains below this during IBD
@@ -938,6 +943,13 @@ WITNESS_RETENTION_BLOCKS = 200          # keep witnesses in main storage for thi
 
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
+# Sanity floor: at 600s/block, 144 blocks is ~1 day.  A misconfigured 0
+# or 1 would close proposals before honest validators could even see
+# them — reject such configurations at import time rather than failing
+# silently at governance time.
+assert GOVERNANCE_VOTING_WINDOW >= 144, (
+    "GOVERNANCE_VOTING_WINDOW must be >= 144 blocks (~1 day at 600s/block)"
+)
 # Supermajority (2/3) required to approve a BINDING proposal (treasury
 # spend).  Denominator is TOTAL ELIGIBLE voting weight (sum of every
 # snapshotted validator's own stake), not just participants — silence
