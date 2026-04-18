@@ -324,7 +324,65 @@ Verified on live VM `validator-1`:
 
 ---
 
-## 15. Concerns raised
+## 15. Adversarial third-pass findings (2026-04-18)
+
+Two focused agent reviews of the P2P/mempool/memory surface and the
+RPC/governance/migration surface. **21 new concerns surfaced.** Not
+all are critical, but all are worth tracking. Sorted by severity.
+
+### HIGH
+
+- **[H1] `peer.known_txs` unbounded — ~~real~~ FALSE ALARM.** `peer.py:39` defines the field as `_LRUSet(SEEN_TX_CACHE_SIZE)`; eviction is implemented at `peer.py:60-79`. Already bounded.
+- **[H2] Pending pools not aggregated — FIXED 2026-04-18.** `_admit_to_pool` now enforces an aggregate cap of `2 × PENDING_POOL_MAX_SIZE` across `_pending_stake_txs`, `_pending_unstake_txs`, `_pending_authority_txs`, `_pending_governance_txs`, `_pending_registration_txs`. On overflow, the global-lowest-fee pending tx is evicted.
+- **[H3] `SEEN_TX_CACHE` eviction amplifies bandwidth — real but low.** 10K-entry cache churn forces re-fetches of ~300KB of already-seen txs under flood. Rate limiter + per-peer ban-on-invalid-tx already mitigate. Defer to audit round.
+- **[H4] `GETDATA` response byte-size cap — ~~real~~ FALSE ALARM.** `protocol.py:161` enforces a 1MB outer length-prefix limit on every P2P message before any deserialization. GETDATA responses therefore can't exceed 1MB. Agent overstated.
+- **[H5] Slash + unstake in same block → token accounting divergence — real, needs careful fix.** If a block contains both `UnstakeTransaction` and `SlashTransaction` for the same entity, unstake moves stake→pending_unstakes first, slash wipes pending_unstakes without returning the fee. Audit trail becomes unclear. Fix requires reordering the apply phase so slashes preempt unstakes for the same entity in the same block. Defer to a focused PR.
+- **[H6] Slashed voter's prior vote still counts at full weight — real, design-adjacent.** `governance.py:752-770`. Stake snapshot is frozen at proposal creation; later slashes don't retroactively invalidate votes already cast. A slashed validator's pre-slash vote still counts. Open question: should we tally votes against CURRENT stake at close time (which would re-compute on every vote) or keep the snapshot semantics? Real decision required before mainnet.
+
+### MEDIUM
+
+- **[M1] TOFU pin on first contact doesn't validate entity_id ↔ cert binding.** `messagechain/network/tls.py:63-66`. On first connection, cert fingerprint is pinned without checking it matches the peer's announced entity_id. An attacker can pin an arbitrary cert and then impersonate a legitimate validator on reconnect.
+- **[M2] Orphan pool eviction uses `os.urandom(4) % len()`.** `messagechain/core/mempool.py:377-378`. Modulo is visible to an attacker; crafting orphans with specific nonce gaps skews survival probability.
+- **[M3] Thread-pool block production races with RPC validators.** `server.py:1642-1753`. `_try_produce_block_sync` runs in thread pool, mutating nonces/balances. RPC handlers on the event loop can read inconsistent mid-mutation state. Not a true double-spend (block re-validates at inclusion) but surfaces as silently-dropped txs that the RPC said `ok:True`.
+- **[M4] `SetAuthorityKey` and `Revoke` in same block have no ordering guarantee.** An attacker who compromises the hot key briefly before losing it could race a malicious authority-key swap against a revoke signed by the old authority.
+- **[M5] Two `TreasurySpendTransaction`s in same block can overdraft.** `governance.py:803-852`. Each is balance-checked independently at apply time; no atomic coordination. If both pass their votes AND both land in the same block, second one debits past balance = 0 and returns False, but the first succeeds → net behavior is confusing.
+- **[M6] RANDAO grinding NOT economically bounded by stake.** `consensus/block_producer.py`. Proposer selection doesn't require minimum stake at proposal time (only that the validator is in the active set). A 1-token validator CAN grind — their cost is WOTS+ leaf consumption, trivial at low tree heights.
+- **[M7] Anchor file corruption silently returns empty list.** `messagechain/network/anchor.py:59`. A truncated/mid-write `anchors.json` causes `json.load` → JSONDecodeError → `return []`. On reboot the node has zero anchor peers → practical eclipse window during recovery.
+- **[M8] Revoke is permanent; no re-activation path.** `blockchain.py:969-974`. An erroneous emergency-revoke (or a recovered-from compromise) cannot be undone. Entity's stake is permanently unstaked to pending, but entity itself can never propose/attest again. **Design choice**, but operators must understand.
+- **[M9] Orphan pool per-sender limit (3) is very tight.** Honest users doing stake → unstake → stake in rapid succession get their 4th tx rejected. Default too conservative.
+- **[M10] Proposer can vote on own proposal.** `governance.py:658-682`. No `proposer_id != voter_id` check. Defensible policy choice (their stake is stake), but worth flagging.
+
+### LOW
+
+- **[L1] `params["transaction"]`-style dict-key access in RPC handlers.** `server.py:684, 687, 811, 858, 906, 1417, 1459`. Missing `"params"` or missing `"transaction"` key → KeyError → caught by outer except as "RPC error" → connection closed without response. Client sees connection reset, not a clear error.
+- **[L2] `ban_peer` / `unban_peer` accept empty/malformed addresses.** `server.py:761-762`. Admin-only methods but still worth validating.
+- **[L3] `get_messages` count param not type-checked.** `server.py:787`. Negative/string values pass through to `get_recent_messages`.
+- **[L4] No byte-size limit on `NetworkMessage` payload dict values.** `messagechain/network/protocol.py`. Outer length prefix bounded, but an attacker can declare 10 GB and force allocation attempt before deserialization.
+- **[L5] Wire-format version gate is a one-way deployment hazard.** Old peers reject new-format blocks → stay on old fork. No upgrade-signaling broadcast. Not a bug, but a deployment foot-gun.
+- **[L6] Signature cache caches only positive results.** `sig_cache.py:79-96`. Re-submitting the same invalid sig triggers WOTS+ verification each time — marginal-cost DoS surface.
+- **[L7] `GOVERNANCE_VOTING_WINDOW` has no lower-bound sanity check.** A misconfiguration to 0 or 1 silently breaks governance without a config-load assertion.
+- **[L8] `os.system` / `subprocess.run` audit**: only 1 instance (`tls.py:167`) as a fallback for self-signed cert generation when the `cryptography` library is missing. Args are hardcoded, no shell=True — safe. Note: `cryptography` is implicitly a 3rd-party dep for cert-gen even though README says "no third-party deps." Minor.
+- **[L9] No `TODO`/`FIXME`/`XXX`/`HACK` markers in the codebase.** Polished or stripped. Either way — no obvious incomplete markers.
+
+### Quick-fix targets (landed this pass)
+
+- ✅ **[H2]** Global aggregate cap across pending pools (done this commit)
+- ✅ **[L1]** RPC `params` dict presence validation (done this commit)
+- ✅ **[H1]** Verified already-bounded (LRU in peer.py)
+- ✅ **[H4]** Verified already-capped (1MB P2P message limit in protocol.py)
+- ✅ **[L4]** Same as H4 — already capped
+
+Remaining work before mainnet:
+- **[H5]** Slash + unstake sequencing: needs apply-order reordering in `blockchain.py` block-apply path so slashes process before unstakes for the same entity. Non-trivial — defer to a focused PR with tests.
+- **[H6]** Slashed-voter vote-weight: policy decision required. Either (a) tally against current stake at window close, or (b) accept the snapshot semantics as-is and document. Needs operator sign-off.
+- **[M1, M2, M3, M4, M5, M6]**: individual PRs, scheduled for pre-audit week.
+- **[M7]** Anchor file corruption handling: add checksum or at least a WARN log.
+- **[M8, M10]**: design decisions — document in `docs/going-live.md`, not fix.
+- **Everything else (L2, L3, L5, L6, L7)**: defer to external audit round.
+
+---
+
+## 16. Concerns raised
 
 Ordered by severity.
 
