@@ -381,5 +381,95 @@ class TestStrictProposerValidation(unittest.TestCase):
             messagechain.config.ENFORCE_SLOT_TIMING = original
 
 
+# ─── M6: RANDAO grinding stake floor ────────────────────────────────
+
+class TestGrindingStakeFloor(unittest.TestCase):
+    """Audit finding M6: RANDAO grinding must be economically bounded by
+    stake. A low-stake validator can re-sign the block header (consuming
+    WOTS+ leaves) to grind the randao_mix for favorable future proposer
+    selection.  The per-grind cost (a WOTS+ leaf) is only de-minimis
+    relative to the expected grinding payoff if the validator's stake
+    is small enough that grinding ROI > 0.
+
+    `should_propose` must therefore refuse to let a sub-VALIDATOR_MIN_STAKE
+    validator propose even if the raw `consensus.select_proposer`
+    function picked them (consensus.select_proposer has no min-stake
+    filter — it is a pure stake-weighted lottery).  This stops grinding
+    at the eligibility gate: no propose, no signature, no mix contribution.
+    """
+
+    def test_one_token_validator_cannot_propose(self):
+        """A validator with 1 token (well below VALIDATOR_MIN_STAKE=100)
+        must NOT be allowed to propose, even if they are the only
+        registered validator and `consensus.select_proposer` picks them."""
+        entity = Entity.create(b"low_stake_validator_key".ljust(32, b"\x00"))
+        chain = Blockchain()
+        chain.initialize_genesis(entity)
+
+        # Register validator with only 1 token — far below
+        # VALIDATOR_MIN_STAKE (100) and below any reasonable grinding
+        # cost floor.
+        consensus = ProofOfStake()
+        consensus.stakes[entity.entity_id] = 1  # bypass register_validator's
+                                                # own min-stake check
+        chain.supply.balances[entity.entity_id] = 1000
+        chain.supply.stake(entity.entity_id, 1)
+
+        latest = chain.get_latest_block()
+
+        # Sanity: consensus.select_proposer (no min-stake filter) WILL
+        # pick this validator — it is the only staker.
+        selected = consensus.select_proposer(
+            latest.block_hash,
+            randao_mix=latest.header.randao_mix,
+            round_number=0,
+        )
+        self.assertEqual(selected, entity.entity_id,
+                         "raw stake-weighted lottery should pick the only staker")
+
+        # But should_propose MUST refuse — the validator's stake is
+        # below the grinding-resistance floor.
+        ok, _round, reason = block_producer.should_propose(
+            chain, consensus, entity.entity_id,
+            now=latest.header.timestamp + BLOCK_TIME_TARGET + 1,
+        )
+        self.assertFalse(ok,
+            f"1-token validator must not be allowed to propose "
+            f"(grinding ROI would be positive); got reason={reason!r}")
+        self.assertIn("stake", reason.lower())
+
+    def test_validator_at_min_stake_can_propose(self):
+        """A validator who meets VALIDATOR_MIN_STAKE remains eligible —
+        this is the baseline case that must still work after the fix."""
+        chain, consensus, entities = _make_chain_with_validators(1)
+        latest = chain.get_latest_block()
+        ok, _round, _reason = block_producer.should_propose(
+            chain, consensus, entities[0].entity_id,
+            now=latest.header.timestamp + BLOCK_TIME_TARGET + 1,
+        )
+        self.assertTrue(ok)
+
+    def test_below_min_stake_validator_not_eligible_at_any_round(self):
+        """The min-stake floor applies across ALL rounds — otherwise a
+        grinder can simply wait for a later round to bypass it."""
+        entity = Entity.create(b"low_stake_validator_key_2".ljust(32, b"\x00"))
+        chain = Blockchain()
+        chain.initialize_genesis(entity)
+        consensus = ProofOfStake()
+        consensus.stakes[entity.entity_id] = 5  # sub-minimum
+        chain.supply.balances[entity.entity_id] = 1000
+        chain.supply.stake(entity.entity_id, 5)
+
+        latest = chain.get_latest_block()
+        for r in range(10):
+            now = latest.header.timestamp + BLOCK_TIME_TARGET * (r + 1) + 1
+            ok, _round, _reason = block_producer.should_propose(
+                chain, consensus, entity.entity_id, now=now,
+            )
+            self.assertFalse(ok,
+                f"1-token validator must not propose at any round, "
+                f"but got ok=True at round {r}")
+
+
 if __name__ == "__main__":
     unittest.main()
