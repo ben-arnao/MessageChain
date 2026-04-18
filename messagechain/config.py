@@ -232,7 +232,7 @@ NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
 _TESTNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "7dfbd378a4bf34c8ac33df3ddc4340efa9d0218d8341dba2c8cdf2438b8f07ae"
+    "235aae03708a04f8a98905b9bc5434d5a69fa03a38e928a444bef2ccf2c15efd"
 )
 _MAINNET_GENESIS_HASH: bytes | None = None  # set before mainnet cut
 
