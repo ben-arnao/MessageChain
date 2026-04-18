@@ -679,6 +679,13 @@ class Server:
     async def _process_rpc(self, request: dict) -> dict:
         """Process a single RPC request from a client."""
         method = request.get("method", "")
+        # Any method that reaches a `request["params"]`-style access below
+        # would KeyError if `params` is missing, bubbling up to the outer
+        # except in _handle_rpc_connection as a bare connection close with
+        # no response body.  Validate once here so every client gets a
+        # clean structured error instead of a reset.
+        if "params" not in request or not isinstance(request.get("params"), dict):
+            request["params"] = {}
 
         if method == "submit_transaction":
             return self._rpc_submit_transaction(request["params"])
@@ -1085,12 +1092,47 @@ class Server:
             setattr(self, pool_attr, pool)
         if tx.tx_hash in pool:
             return True  # idempotent re-admit
+
+        # Aggregate cap across ALL pending pools.  Without this, an attacker
+        # can fill each pool individually for a total 4×PENDING_POOL_MAX_SIZE
+        # memory footprint.  Count sitewide pending txs and refuse admission
+        # if we're above the global cap unless incoming fee beats the global
+        # lowest.
+        _GLOBAL_CAP = PENDING_POOL_MAX_SIZE * 2  # 2x per-pool, not 4x
+        all_pool_attrs = (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+            "_pending_registration_txs",
+        )
+        total_pending = 0
+        global_min: tuple | None = None  # (fee, pool_attr, tx_hash)
+        for attr in all_pool_attrs:
+            p = getattr(self, attr, None)
+            if not p:
+                continue
+            total_pending += len(p)
+            for th, t in p.items():
+                f = getattr(t, "fee", 0)
+                if global_min is None or f < global_min[0]:
+                    global_min = (f, attr, th)
+
+        incoming_fee = getattr(tx, "fee", 0)
+
+        if total_pending >= _GLOBAL_CAP:
+            # At global cap — only accept if incoming beats the sitewide min.
+            if global_min is None or incoming_fee <= global_min[0]:
+                return False
+            # Evict the sitewide min from its origin pool.
+            _, ev_attr, ev_hash = global_min
+            ev_pool = getattr(self, ev_attr, None)
+            if ev_pool is not None and ev_hash in ev_pool:
+                del ev_pool[ev_hash]
+
         if len(pool) >= PENDING_POOL_MAX_SIZE:
             min_tx = min(
                 pool.values(),
                 key=lambda t: getattr(t, "fee", 0),
             )
-            incoming_fee = getattr(tx, "fee", 0)
             if incoming_fee <= getattr(min_tx, "fee", 0):
                 return False
             del pool[min_tx.tx_hash]
