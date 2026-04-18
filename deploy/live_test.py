@@ -18,7 +18,7 @@ from messagechain.identity.identity import Entity
 from messagechain.identity.address import encode_address
 
 SERVER = (os.environ.get("MC_HOST", "35.237.211.12"), int(os.environ.get("MC_PORT", "9334")))
-GEN_KEY = "a896648aa959c0065402f313765628dc2d4136f38b6ce6050c4cd39bfe8174be"
+GEN_KEY = os.environ.get("MC_GEN_KEY", "a896648aa959c0065402f313765628dc2d4136f38b6ce6050c4cd39bfe8174be")
 P, F = 0, 0
 
 
