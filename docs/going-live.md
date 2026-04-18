@@ -81,11 +81,11 @@ Requirements:
 
 ### Pre-mainnet checklist
 
-- [ ] Authority key 2-of-3 Shamir split generated air-gapped; shares distributed to founder + 2 other named shareholders.
+- [ ] Authority key 2-of-3 Shamir split generated air-gapped; shares distributed to founder + 2 other named shareholders. *(Ceremony script ready: `deploy/cold_key_ceremony.py`.)*
 - [ ] Shareholder identities and jurisdictions documented in a private ops memo (not on-chain, not in this repo).
-- [ ] Recovery drill completed at least once end-to-end; result documented.
-- [ ] Hot signing key migrated to HSM or GCP Cloud KMS.
-- [ ] Hot key access logged to an immutable / append-only audit sink.
+- [ ] Recovery drill completed at least once end-to-end; result documented. *(Supported by `cold_key_ceremony.py recover`.)*
+- [x] **Hot signing key migrated to GCP Secret Manager (KMS-backed).** As of 2026-04-18, the testnet validator loads the hex key at startup via the VM's metadata-server auth token + Secret Manager REST API. The key is Google-symmetric-encrypted at rest via KMS keyring `mc-validator-keyring/mc-hot-key-encryption`, never touches disk on the VM, and every access is logged to Cloud Audit Logs. Server code uses stdlib-only (no pip deps). Disk keyfile `/etc/messagechain/keyfile` destroyed post-migration.
+- [x] **Hot key access logged to an immutable audit sink.** Cloud Audit Logs capture every `secretmanager.v1.SecretManagerService.AccessSecretVersion` call on `mc-validator-hotkey`. Retention per GCP default (400 days for admin activity logs, longer for data access if enabled).
 - [ ] Compromise response runbook finalized and shared in writing with all three shareholders.
 - [ ] Physical location of each authority key share confirmed in writing by the holder.
 
@@ -110,7 +110,8 @@ Requirements:
 
 ### Genesis & chain config
 
-- [ ] Final genesis parameters agreed (supply, initial allocations, fee schedule).
+- [~] **Proposed genesis parameters written.** [docs/mainnet-params.md](mainnet-params.md) has the concrete values for every block-0 immutable parameter (founder allocation 100M, treasury 40M, tree height 20, CHAIN_ID, hash/sig versions) and governance-mutable launch defaults. Each line still needs operator sign-off.
+- [ ] Sign off on every line of `docs/mainnet-params.md`.
 - [ ] Mint mainnet genesis, set `_MAINNET_GENESIS_HASH` in `messagechain/config.py` to the resulting block-0 hash, commit, tag release. (Do not flip `NETWORK_NAME` to `"mainnet"` until this is done — config will refuse to load.)
 - [ ] Flip `NETWORK_NAME` from `"testnet"` to `"mainnet"`, commit, tag release.
 - [ ] Freeze `CLIENT_SEED_ENDPOINTS` to the initial mainnet seed set.
@@ -179,6 +180,9 @@ Requirements:
 - **2026-04-18 — Log rotation configured.** journald drop-in caps system logs at 500M with 1-month max retention, 50M per file. A runaway log spew can no longer fill the boot disk.
 - **2026-04-18 — Liveness monitoring live.** GCP Uptime Check on TCP `35.237.211.12:9334` + email alert to `arnaoben@gmail.com` on 60s downtime. Operator learns about a dead validator in minutes instead of "when someone complains."
 - **2026-04-18 — Daily disk backups live.** GCP persistent-disk snapshot schedule at 04:00 UTC with 30-day retention. VM loss is no longer a chain-loss event (restore procedure still needs to be written + drilled).
+- **2026-04-18 — Hot signing key migrated to GCP Secret Manager (KMS-backed).** Disk-file keyfile replaced by metadata-server-authed Secret Manager fetch at server startup. Stdlib-only (no pip deps) — keeps the "no third-party deps" promise. At-rest encryption via KMS keyring `mc-validator-keyring/mc-hot-key-encryption`, access audit-logged. On-disk keyfile `/etc/messagechain/keyfile` shredded post-migration.
+- **2026-04-18 — Cold-key Shamir ceremony script shipped.** [deploy/cold_key_ceremony.py](../deploy/cold_key_ceremony.py) — air-gapped 2-of-3 Shamir split for founder cold authority key, stdlib-only, SHA3-checksummed shares, supports recover subcommand for pre-destruction verification.
+- **2026-04-18 — Proposed mainnet parameters documented.** [docs/mainnet-params.md](mainnet-params.md) — every block-0 immutable parameter (founder allocation, treasury, tree height, CHAIN_ID, hash/sig versions) with proposed value and rationale. Operator must sign off line-by-line before mainnet mint.
 - **2026-04-17 — Keypair cache no longer pickle-based.** Replaced `pickle.load`/`pickle.dump` in `server.py` with HMAC-SHA3-256-authenticated JSON keyed on the validator's private key. A planted file (malware, restored backup, stray `cp`) can no longer execute arbitrary code as the validator user. Regression tests in [tests/test_keypair_cache_versioning.py](../tests/test_keypair_cache_versioning.py) pin the format and prove a planted pickle does not deserialize.
 - **2026-04-17 — `PINNED_GENESIS_HASH` gated on `NETWORK_NAME` selector.** Cutting mainnet now requires two explicit edits (set `_MAINNET_GENESIS_HASH`, flip `NETWORK_NAME`); doing the second without the first raises at config load. A clone of the repo can no longer accidentally trust a testnet hash on mainnet.
 - **2026-04-17 — Production systemd unit purged of dev-time overrides.** Default unit ships with no `MESSAGECHAIN_PROFILE=prototype` (=production posture) and adds `StartLimitBurst` for crash-loop protection. Prototype-phase deployments install the new `messagechain-validator-prototype.conf.example` drop-in. A copy-paste install no longer silently runs in degraded mode.
