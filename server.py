@@ -126,6 +126,18 @@ def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> 
     return os.path.join(data_dir, f"keypair_cache_{h}.bin")
 
 
+def _merkle_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
+    """Filesystem path for the Merkle node cache (one per keypair).
+
+    Separate from the keypair cache so old installations that lack the
+    node cache can still load via the slow path.  Filename embeds the
+    same private-key-dependent digest + height so rotating a key produces
+    a new filename and the old cache is orphaned (then cleanable).
+    """
+    h = _hashlib.sha3_256(private_key + tree_height.to_bytes(4, "big")).hexdigest()[:16]
+    return os.path.join(data_dir, f"merkle_cache_{h}.bin")
+
+
 _CACHE_MAGIC = b"MCKC"  # MessageChain Keypair Cache (HMAC-authenticated)
 _CACHE_FORMAT_VERSION = 1
 _HMAC_SIZE = 32
@@ -312,7 +324,115 @@ def _load_or_create_entity(
             logger.warning("Could not write keypair cache to %s", cache_file)
 
     _bind_leaf_index_path(entity, data_dir)
+    _attach_merkle_node_cache(entity, private_key, tree_height, data_dir, no_cache)
     return entity
+
+
+def _attach_merkle_node_cache(
+    entity: Entity,
+    private_key: bytes,
+    tree_height: int,
+    data_dir: str | None,
+    no_cache: bool,
+) -> None:
+    """Load (or build + persist) the Merkle node cache and attach it to
+    the entity's keypair.  Cache makes sign()'s auth-path step O(height)
+    instead of O(2^height).
+
+    On any failure (missing dir, disk error, corrupt blob, root mismatch)
+    this silently leaves the keypair to use the slow seed-recomputation
+    path — signatures stay correct, just slow.  The server stays
+    functional even if the cache is unavailable.
+    """
+    from messagechain.crypto.merkle_cache import MerkleNodeCache
+
+    if data_dir is None or no_cache:
+        return
+    cache_path = _merkle_cache_path(private_key, tree_height, data_dir)
+
+    # The cache must be built over the SAME seed that KeyPair uses
+    # internally, which is derived from private_key via Entity.create →
+    # _derive_signing_seed (not the raw private_key).  entity.keypair
+    # already holds this derived seed.  Passing private_key straight
+    # through would produce a tree with a different root and the post-
+    # build equality check would (correctly) refuse to attach the cache.
+    tree_seed = entity.keypair._seed
+
+    # Try load.
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                blob = f.read()
+            cache = MerkleNodeCache.from_bytes(blob, private_key, tree_height)
+        except OSError:
+            cache = None
+        if cache is not None and cache.root() == entity.keypair.public_key:
+            entity.keypair._node_cache = cache
+            logger.info("Loaded Merkle node cache from %s", cache_path)
+            return
+        # Any mismatch (corrupt, tampered, wrong root, wrong key) → drop.
+        if cache is None:
+            logger.warning(
+                "Corrupt or unauthenticated Merkle cache %s — deleting "
+                "and rebuilding", cache_path,
+            )
+        else:
+            logger.warning(
+                "Merkle cache root mismatch %s (key rotated?) — deleting "
+                "and rebuilding", cache_path,
+            )
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+
+    # Build fresh.  This re-derives every leaf once — expensive for
+    # height >= 20 but the keypair cache path just did the same work.
+    # Future improvement: let KeyPair.__init__ populate a fresh cache
+    # during keygen so we don't do it twice.
+    logger.info(
+        "Building Merkle node cache for height=%d (one-time cost)",
+        tree_height,
+    )
+    try:
+        cache = MerkleNodeCache.build_from_seed(tree_seed, tree_height)
+    except Exception as e:
+        logger.warning("Merkle cache build failed: %s", e)
+        return
+
+    # Defensive: the cache's root MUST equal the keypair's root.  If it
+    # doesn't, the two computed the tree differently — never trust the
+    # cache for signing in that case.
+    if cache.root() != entity.keypair.public_key:
+        logger.error(
+            "Merkle cache root mismatch after build — refusing to attach",
+        )
+        return
+
+    entity.keypair._node_cache = cache
+
+    # Persist.
+    try:
+        blob = cache.to_bytes(private_key)
+        tmp_file = cache_path + ".tmp"
+        with open(tmp_file, "wb") as f:
+            f.write(blob)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        try:
+            os.chmod(tmp_file, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_file, cache_path)
+        logger.info(
+            "Saved Merkle node cache (%.1f MB) to %s",
+            len(blob) / 1024 / 1024, cache_path,
+        )
+    except OSError:
+        logger.warning("Could not write Merkle cache to %s", cache_path)
 
 
 class Server:

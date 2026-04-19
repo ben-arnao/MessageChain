@@ -208,5 +208,25 @@ class TestRPCReadHasTimeout(unittest.TestCase):
         self.assertIn("readexactly(length)", body)
 
 
+class TestSyncPeerHeightsBounded(unittest.TestCase):
+    """ChainSyncer.peer_heights used to grow without bound — a peer
+    rotating source addresses on reconnect could DoS memory.  Fix caps
+    at 4×MAX_PEERS and evicts by oldest last_response_time.
+    """
+
+    def test_peer_heights_caps_at_4x_max_peers(self):
+        from messagechain.network.sync import ChainSyncer
+        from messagechain.config import MAX_PEERS
+        from messagechain.core.blockchain import Blockchain
+        syncer = ChainSyncer(Blockchain(), get_peer_writer=lambda _a: None)
+        cap = 4 * MAX_PEERS
+        for i in range(cap + 50):
+            syncer.update_peer_height(f"10.{i // 256}.{i % 256}.1:9000", i + 1)
+        self.assertLessEqual(
+            len(syncer.peer_heights), cap,
+            f"peer_heights size {len(syncer.peer_heights)} exceeds cap {cap}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

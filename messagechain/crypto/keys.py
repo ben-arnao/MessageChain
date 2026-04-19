@@ -388,6 +388,12 @@ class KeyPair:
         # reuse after a process restart.
         self.leaf_index_path: str | None = None
 
+        # Optional MerkleNodeCache (messagechain.crypto.merkle_cache).
+        # Attached by the server loader once a cache is built or loaded;
+        # when present, sign() uses it to produce auth paths in O(height)
+        # instead of O(2^height).  None → fall back to recomputation.
+        self._node_cache = None
+
         # Compute the Merkle root (the public key) by building the tree
         # bottom-up over derived leaf public keys. This is the only expensive
         # operation — O(2^height) leaf derivations, done once at creation.
@@ -440,6 +446,7 @@ class KeyPair:
         kp._next_leaf = start_leaf
         kp.leaf_index_path = None
         kp.public_key = bytes(public_key)
+        kp._node_cache = None
         return kp
 
     def advance_to_leaf(self, leaf_index: int):
@@ -472,7 +479,15 @@ class KeyPair:
         priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
         try:
             wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
-            auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
+            if self._node_cache is not None:
+                # Cached path: O(height) slice reads rather than O(2^height)
+                # seed-based recomputation.  The cache is HMAC-authenticated
+                # on disk and its root is cross-checked against
+                # self.public_key at load time, so trusting it here does not
+                # introduce a new attack surface.
+                auth_path = self._node_cache.auth_path(leaf_idx)
+            else:
+                auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
         finally:
             # Best-effort private key zeroing.  priv_keys are bytearray
             # (mutable), so we can overwrite the buffer contents in-place.

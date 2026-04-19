@@ -26,7 +26,7 @@ from enum import Enum
 from typing import Callable
 
 import messagechain.config
-from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT
+from messagechain.config import MIN_CUMULATIVE_STAKE_WEIGHT, MAX_PEERS
 from messagechain.config import MAX_BLOCK_HEX_SIZE, validate_block_hex_size
 from messagechain.consensus.checkpoint import WeakSubjectivityCheckpoint
 from messagechain.validation import MAX_SANE_BLOCK_HEIGHT, parse_hex
@@ -175,6 +175,21 @@ class ChainSyncer:
             last_response_time=time.time(),
             cumulative_weight=cumulative_weight,
         )
+
+        # Cap the bookkeeping map.  A peer rotating source addresses via
+        # repeated reconnects can otherwise grow self.peer_heights without
+        # bound (memory DoS on long-running nodes).  4×MAX_PEERS gives
+        # honest churn plenty of room without letting the map balloon.
+        cap = 4 * MAX_PEERS
+        if len(self.peer_heights) > cap:
+            # Evict the entries with the oldest last_response_time first.
+            by_age = sorted(
+                self.peer_heights.items(),
+                key=lambda kv: kv[1].last_response_time,
+            )
+            to_remove = len(self.peer_heights) - cap
+            for addr, _info in by_age[:to_remove]:
+                self.peer_heights.pop(addr, None)
 
     def needs_sync(self) -> bool:
         """Check if we're behind any peers."""
