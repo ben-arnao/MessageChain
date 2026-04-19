@@ -61,6 +61,22 @@ chain state the moment someone sends you a transfer.
 messagechain send "hello world"
 ```
 
+Every message costs a fee. The floor is `MIN_FEE = 100` tokens and
+cost grows quadratically with message size — roughly
+`100 + 3·bytes + 2·bytes²/1000`. A 100-byte message runs ~420 tokens,
+1 KB runs ~5,100, 10 KB runs ~230,000. Storage is permanent and
+brevity is rewarded. Preview exact cost before you spend:
+
+```bash
+messagechain estimate-fee --message "hello world"
+```
+
+The base fee is **burned** — it's destroyed, not paid out, to keep
+permanent-state creation expensive. Base fee drifts ±12.5%/block
+with mempool pressure (EIP-1559 style), capped at 10,000× the floor.
+Any **tip** you add on top of base fee goes to the proposer who
+includes your message.
+
 Your first outgoing transaction reveals your public key on-chain (the
 "first-spend pubkey install" path). After that, every subsequent
 transaction is verified against the installed key.
