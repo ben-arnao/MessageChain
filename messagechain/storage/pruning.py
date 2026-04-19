@@ -42,9 +42,21 @@ class BlockPruner:
         """Prune old blocks from the chain, retaining only headers.
 
         If a ChainDB instance is provided, block transaction data is actually
-        deleted from SQLite and replaced with header-only records. This is
-        essential for the 1000-year design goal — without it, storage grows
-        without bound.
+        deleted from SQLite and replaced with header-only records.
+
+        IMPORTANT — OPERATOR GUIDANCE:
+          MessageChain's headline guarantee is that messages are permanent
+          and uncensorable forever.  Running a pruned node is compatible
+          with consensus (headers + state root survive), but a pruned node
+          CANNOT serve the original message plaintext for a pruned block
+          and therefore cannot fulfil the permanence guarantee for that
+          message.
+          The core protocol deliberately does NOT call prune() anywhere —
+          this class exists so a relay-only node (one that doesn't claim
+          to archive history) can opt in, e.g. for a memory-constrained
+          mobile full node.  Archive validators (and the reference
+          validator on mainnet) should NEVER invoke this.  The keep_recent
+          policy is therefore a local capability, not a consensus rule.
 
         Returns the number of blocks pruned.
         """

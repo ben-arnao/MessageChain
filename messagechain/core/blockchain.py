@@ -3279,6 +3279,19 @@ class Blockchain:
             # L3: Enforce timestamp drift for txs within blocks (not just standalone)
             if tx.timestamp > _time.time() + MAX_TIMESTAMP_DRIFT:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Timestamp too far in future"
+            # Message timestamp trust: a tx cannot claim to have been sent
+            # AFTER the block that includes it.  Without this, a proposer
+            # can forward-date individual messages (up to MAX_TIMESTAMP_DRIFT)
+            # inside a block stamped at MTP time, making the message log
+            # look like it arrived at a different wall-clock than the block.
+            # For a chain that sells "trusted timestamps" as a feature, the
+            # tx ≤ block bound is the basic sanity check readers rely on.
+            if tx.timestamp > block.header.timestamp:
+                return False, (
+                    f"Invalid tx {tx.tx_hash.hex()[:16]}: tx.timestamp "
+                    f"{tx.timestamp} > block.timestamp "
+                    f"{block.header.timestamp}"
+                )
 
             # Advance pending state for next tx in the same block
             pending_nonces[tx.entity_id] = expected_nonce + 1
@@ -4214,8 +4227,10 @@ class Blockchain:
             per_block_scaled = (divestible * SCALE) // window
             debt = self.seed_divestment_debt.get(eid, 0) + per_block_scaled
             whole = debt // SCALE
-            self.seed_divestment_debt[eid] = debt - whole * SCALE
             if whole <= 0:
+                # Fractional-only step — carry the accumulator forward
+                # unchanged; no whole tokens to drain yet.
+                self.seed_divestment_debt[eid] = debt
                 continue
 
             # Clamp: never drain below the floor, even if cumulative
@@ -4223,7 +4238,21 @@ class Blockchain:
             max_drainable = current_stake - SEED_DIVESTMENT_RETAIN_FLOOR
             divest = min(whole, max_drainable)
             if divest <= 0:
+                # Floor hit this block — keep the fractional remainder
+                # AND the whole tokens we couldn't drain, so they're
+                # still on the schedule for the next block.
+                self.seed_divestment_debt[eid] = debt
                 continue
+
+            # Only subtract the whole tokens we actually drained from the
+            # debt accumulator.  Using `whole * SCALE` here (as earlier
+            # versions did) silently strands `whole - divest` tokens when
+            # the floor clamp trims `divest` below `whole` — typically
+            # triggered by a slashing event mid-window that drops
+            # current_stake close to the floor.  Use `divest * SCALE` so
+            # the undrained remainder rolls over to the next block and
+            # the 95M→1M schedule is conserved regardless of slashing.
+            self.seed_divestment_debt[eid] = debt - divest * SCALE
 
             # Split: treasury gets the exact 25% share (basis points);
             # burn gets the remainder so any integer-rounding remainder

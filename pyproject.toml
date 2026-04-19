@@ -1,3 +1,35 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "messagechain"
+version = "1.0.0"
+description = "Quantum-resistant proof-of-stake message chain"
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+# Intentionally zero runtime deps.  Everything uses the stdlib — SHA3 via
+# hashlib, TCP sockets via asyncio, SQLite via sqlite3.  Keeping the dep
+# graph empty is a security principle (no supply-chain risk) and a
+# long-horizon stability principle (no dep breaks in 2125).
+dependencies = []
+
+[project.scripts]
+messagechain = "messagechain.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ben-arnao/MessageChain"
+
+[tool.setuptools]
+# Ship the `messagechain` package tree + the top-level client.py / server.py
+# so `pip install .` followed by `messagechain generate-key` works.
+py-modules = ["client", "server"]
+
+[tool.setuptools.packages.find]
+include = ["messagechain*"]
+exclude = ["tests*", "deploy*", "docs*", ".claude*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
