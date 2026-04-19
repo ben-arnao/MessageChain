@@ -234,7 +234,9 @@ NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
 _TESTNET_GENESIS_HASH: bytes | None = bytes.fromhex(
     "235aae03708a04f8a98905b9bc5434d5a69fa03a38e928a444bef2ccf2c15efd"
 )
-_MAINNET_GENESIS_HASH: bytes | None = None  # set before mainnet cut
+_MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
+    "5e8bc19ccd4449730684744951f1cca1eabb7d7c008623ea2257fd837fb63d18"
+)
 
 
 def _resolve_pinned_genesis_hash(network: str) -> bytes | None:

@@ -39,6 +39,12 @@ if _ROOT not in sys.path:
 # a pinned genesis hash.
 import messagechain.config as _mc_config
 _mc_config.DEVNET = True
+# A previously-minted chain on this branch left a PINNED_GENESIS_HASH
+# behind (e.g. a testnet pin from an earlier cut).  The one legitimate
+# use of this script is minting a fresh chain whose hash is unknown, so
+# clear any inherited pin for the duration of this process.  The server
+# started after the mint will use the committed config with the new pin.
+_mc_config.PINNED_GENESIS_HASH = None
 
 from messagechain.config import (
     LEAF_INDEX_FILENAME, TREASURY_ENTITY_ID, TREASURY_ALLOCATION,
