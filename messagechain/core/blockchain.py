@@ -5286,6 +5286,22 @@ class Blockchain:
             # not rewind stake would cause double-counted drains on
             # replay.
             "seed_divestment_debt": dict(self.seed_divestment_debt),
+            # Reputation drives lottery winner selection (reputation_lottery.py)
+            # which pays real rewards from inflation.  A reorg that advanced
+            # reputation on a forked branch must roll it back, or two nodes
+            # will disagree on later lottery winners -> different balance
+            # state -> consensus fork.
+            "reputation": dict(self.reputation),
+            # Entity-index assignments are chain-local.  A reorged-out block
+            # that registered a new entity must also roll back that
+            # registration; otherwise _next_entity_index races ahead of what
+            # the canonical chain reflects, and the next registered entity
+            # lands at a different index than on peer nodes that never saw
+            # the reorged block.  The compact wire form embeds these
+            # indices, so divergence silently corrupts tx_hash agreement
+            # for any tx that references the affected entities.
+            "entity_id_to_index": dict(self.entity_id_to_index),
+            "next_entity_index": self._next_entity_index,
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -5360,6 +5376,23 @@ class Blockchain:
                 self.governance._executed_treasury_spends = set(
                     snapshot["gov_executed_treasury_spends"],
                 )
+        # Reputation must roll back with the block state it was earned on.
+        # See the snapshot comment above for the fork rationale.  Default
+        # to empty so pre-field snapshots from older chain.db files still
+        # round-trip.
+        self.reputation = dict(snapshot.get("reputation", {}))
+        # Entity-index registry is chain-local bookkeeping; a reorg that
+        # removed the block that allocated an index must also reclaim
+        # that slot.  Rebuild the reverse map from the restored forward
+        # map so the two stay in sync.
+        if "entity_id_to_index" in snapshot:
+            self.entity_id_to_index = dict(snapshot["entity_id_to_index"])
+            self.entity_index_to_id = {
+                idx: eid for eid, idx in self.entity_id_to_index.items()
+            }
+            self._next_entity_index = int(snapshot.get(
+                "next_entity_index", max(self.entity_id_to_index.values(), default=0) + 1,
+            ))
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
         """Return the WOTS+ Merkle tree height recorded for `entity_id`.
