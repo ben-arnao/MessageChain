@@ -58,28 +58,20 @@ chain state the moment someone sends you a transfer.
 ### 3. Send a message
 
 ```bash
-messagechain send "hello world"
+messagechain send "hello world"                 # auto-priced (default)
+messagechain send "hello world" --fee 500       # pay a specific amount
+messagechain estimate-fee --message "hello world"   # preview cost
 ```
 
-Every message costs a fee. The floor is `MIN_FEE = 100` tokens and
-cost grows quadratically with message size — roughly
-`100 + 3·bytes + 2·bytes²/1000`. A 100-byte message runs ~420 tokens,
-1 KB runs ~5,100, 10 KB runs ~230,000. Storage is permanent and
-brevity is rewarded. Preview exact cost before you spend:
+Default: `send` picks `max(size-floor, network-suggested)` so your
+tx is never rejected for underpayment. Fee grows quadratically with
+size (`100 + 3·bytes + 2·bytes²/1000`); brevity is rewarded because
+storage is permanent. Base fee is burned; any tip above base fee
+goes to the proposer.
 
-```bash
-messagechain estimate-fee --message "hello world"
-```
-
-The base fee is **burned** — it's destroyed, not paid out, to keep
-permanent-state creation expensive. Base fee drifts ±12.5%/block
-with mempool pressure (EIP-1559 style), capped at 10,000× the floor.
-Any **tip** you add on top of base fee goes to the proposer who
-includes your message.
-
-Your first outgoing transaction reveals your public key on-chain (the
-"first-spend pubkey install" path). After that, every subsequent
-transaction is verified against the installed key.
+Your first outgoing transaction reveals your public key on-chain
+(the "first-spend pubkey install" path). After that, every
+subsequent transaction is verified against the installed key.
 
 ### 4. Read messages back
 
