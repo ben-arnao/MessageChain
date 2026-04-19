@@ -122,5 +122,48 @@ class TestRunbookDocsUseDirectCLI(unittest.TestCase):
             )
 
 
+class TestDevnetFlagStaysInSyncWithNetworkName(unittest.TestCase):
+    """config.py previously computed DEVNET once before config_local.py
+    ran.  A config_local.py that flipped NETWORK_NAME to "devnet" would
+    leave DEVNET=False — consumers checking `if DEVNET:` got the wrong
+    answer.  Fix re-derives DEVNET after the local-override block,
+    same pattern as PINNED_GENESIS_HASH."""
+
+    def test_config_re_derives_devnet_after_local_override(self):
+        src = (ROOT / "messagechain" / "config.py").read_text(encoding="utf-8")
+        # Find the local-override load block
+        i = src.index("# ─────────────────────────────────────────────────────────────────────\n# Local overrides")
+        tail = src[i:]
+        self.assertIn('if "DEVNET" not in', tail,
+                      "config.py must re-derive DEVNET after config_local "
+                      "loads, else a config_local NETWORK_NAME='devnet' "
+                      "override leaves DEVNET False")
+        self.assertIn('DEVNET = NETWORK_NAME == "devnet"', tail)
+
+
+class TestStartupLogsTruncateEntityID(unittest.TestCase):
+    """Full entity_id in startup logs is sensitive validator metadata.
+    Truncate to 16 hex chars — correlation within a single node's logs
+    still works, but journald aggregation doesn't leak the full id."""
+
+    def test_server_wallet_log_truncates(self):
+        src = (ROOT / "server.py").read_text(encoding="utf-8")
+        # No "Wallet: " log that includes full .hex() (no slice)
+        self.assertNotIn(
+            'logger.info(f"Wallet: {self.wallet_id.hex() if self.wallet_id else \'NOT SET\'}")',
+            src,
+        )
+        # And the truncated form is present
+        self.assertIn("self.wallet_id.hex()[:16]", src)
+
+    def test_node_entity_id_log_truncates(self):
+        src = (ROOT / "messagechain" / "network" / "node.py").read_text(encoding="utf-8")
+        self.assertNotIn(
+            'logger.info(f"Entity ID: {self.entity.entity_id_hex}")',
+            src,
+        )
+        self.assertIn("self.entity.entity_id_hex[:16]", src)
+
+
 if __name__ == "__main__":
     unittest.main()

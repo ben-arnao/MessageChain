@@ -409,7 +409,9 @@ class Node:
     async def start(self):
         """Start the node: initialize chain, start server, connect to peers."""
         logger.info(f"Starting node on port {self.port}")
-        logger.info(f"Entity ID: {self.entity.entity_id_hex}")
+        # Truncate — full entity_id is sensitive validator metadata
+        # (see server.py's Wallet log for the same treatment).
+        logger.info(f"Entity ID: {self.entity.entity_id_hex[:16]}...")
 
         # Initialize genesis if this is a fresh chain
         if self.blockchain.height == 0:

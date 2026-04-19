@@ -1069,3 +1069,13 @@ if _os_local.path.isfile(_local_path):
 # network's pin, and the validator silently rejects its own chain.
 if "PINNED_GENESIS_HASH" not in (dir(_mod) if _os_local.path.isfile(_local_path) else []):
     PINNED_GENESIS_HASH = _resolve_pinned_genesis_hash(NETWORK_NAME)
+
+# Re-derive DEVNET if NETWORK_NAME was overridden by config_local.py.
+# DEVNET is defined above as a one-shot `NETWORK_NAME == "devnet"`
+# derivation — but if config_local.py flipped NETWORK_NAME after that
+# line ran, the two end up disagreeing.  The original comment at
+# line 282 explicitly says "kept as a derived flag rather than a
+# parallel source of truth so the two can never disagree" — enforcing
+# that invariant requires a second derivation after local overrides.
+if "DEVNET" not in (dir(_mod) if _os_local.path.isfile(_local_path) else []):
+    DEVNET = NETWORK_NAME == "devnet"

@@ -731,7 +731,15 @@ class Server:
         )
 
         logger.info(f"Server running. P2P={self.p2p_port} RPC={self.rpc_port}")
-        logger.info(f"Wallet: {self.wallet_id.hex() if self.wallet_id else 'NOT SET'}")
+        # Log only the first 16 hex chars — full entity_id is sensitive
+        # operator metadata (identifies the validator in journald / log
+        # aggregation).  The truncated prefix is enough to correlate
+        # across this node's logs; the full id is available via
+        # `messagechain account` when needed.
+        if self.wallet_id:
+            logger.info(f"Wallet: {self.wallet_id.hex()[:16]}...")
+        else:
+            logger.info("Wallet: NOT SET")
         if self.db:
             logger.info("Storage: persistent (SQLite)")
         else:

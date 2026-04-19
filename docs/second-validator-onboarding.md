@@ -46,6 +46,54 @@ The new validator operator needs:
 
 ---
 
+## Prerequisite: state-snapshot distribution (ARCHITECTURAL)
+
+**Important:** plain P2P sync from block 0 is not sufficient for a
+joining validator to trust existing mainnet state.  Block 0 commits to
+a `state_root` over the genesis allocation (founder balance, treasury
+allocation, founder pubkey, stake split), but the allocation table
+itself is **not** serialised inside the block — it exists only in the
+founder's in-memory `initialize_genesis` call.  A joining node doing
+raw IBD from block 0 forward will:
+
+1. Accept block 0 (matches the pinned genesis hash)
+2. Fail to validate block 1 with "Unknown proposer" (founder pubkey
+   never registered) or "state_root mismatch" (balances missing)
+
+This is why onboarding a second validator requires **bootstrap-from-
+checkpoint**: the founder exports a signed state snapshot, the candidate
+downloads it, verifies the signature + pinned genesis hash + state_root,
+then loads it into their chain.db before starting normal sync.
+
+The code path already exists (`Blockchain.bootstrap_from_checkpoint` +
+`messagechain/consensus/state_checkpoint.py`).  What's missing today is
+the operator-facing CLI tooling — it's on the post-launch roadmap.
+
+Until that lands, the practical procedure is:
+
+```bash
+# On val-1:
+sudo systemctl stop messagechain-validator
+sudo tar czf /tmp/mainnet-state.tar.gz \
+    /var/lib/messagechain/chain.db \
+    /var/lib/messagechain/leaf_index.json
+# (do NOT include keypair_cache_*.bin — candidate has their own key)
+sudo systemctl start messagechain-validator
+
+# Transfer /tmp/mainnet-state.tar.gz to the candidate over a trusted
+# channel.  The tarball is the authoritative state; anyone with it can
+# run a fully-validating node, but it carries no secrets.
+
+# On candidate's node (before first start):
+sudo tar xzf mainnet-state.tar.gz -C /var/lib/messagechain/
+# Candidate's keyfile stays at /etc/messagechain/keyfile (their own key).
+sudo systemctl start messagechain-validator
+```
+
+The candidate's node then has val-1's chain state, picks up normal
+gossip sync for subsequent blocks, and the candidate proceeds to the
+flow below to acquire tokens and stake.
+
 ## The onboarding flow
 
 ### Step 1 — Candidate generates their key offline

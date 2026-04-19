@@ -185,6 +185,26 @@ class Harness:
 
     # --- setup ----
 
+    def _register_atexit(self):
+        """Ensure config_local.py is always cleaned up, even on crash /
+        SIGKILL.  Using atexit in addition to the try/finally guard
+        because Python exceptions raised during the harness setup were
+        leaving messagechain/config_local.py behind and breaking the
+        unit-test suite afterwards."""
+        import atexit
+        atexit.register(self._cleanup_config_local_best_effort)
+
+    def _cleanup_config_local_best_effort(self):
+        try:
+            self.restore_config_local()
+        except Exception:
+            # Absolute last-resort — just nuke the file so the test
+            # suite doesn't inherit our devnet override.
+            try:
+                (ROOT / "messagechain" / "config_local.py").unlink()
+            except OSError:
+                pass
+
     def write_config_local(self, pinned_hex: str | None = None):
         """Write a devnet config_local.py for all validators to share.
 
@@ -463,6 +483,7 @@ class Harness:
         print()
 
         self.write_config_local()
+        self._register_atexit()
         try:
             # Allocate port pairs starting at 19333 to avoid clashing with
             # the mainnet RPC at 9334 on this box (if anything were to
