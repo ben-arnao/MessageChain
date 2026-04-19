@@ -4781,7 +4781,20 @@ class Blockchain:
         if self.height == 0:
             # Validate genesis block structure
             if block.header.block_number != 0:
-                return False, f"First block must be block 0, got {block.header.block_number}"
+                # We have no chain yet but the gossiping peer is on the
+                # real network producing blocks.  This is exactly what
+                # joining validators see during IBD: the peer's current
+                # tip arrives before we have block 0.  Store as orphan
+                # (parent unknown) so node.py recognises it as a benign
+                # "I'm behind" signal rather than invalid-block-ban.
+                # IBD triggered elsewhere will fetch block 0 and drain
+                # the orphan pool.
+                if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
+                    self.orphan_pool[block.block_hash] = block
+                return False, (
+                    f"Orphan block — chain empty, received block "
+                    f"{block.header.block_number}; need IBD to block 0"
+                )
             if block.header.prev_hash != b"\x00" * 32:
                 return False, "Genesis block must have zero prev_hash"
             # Canonical genesis pin: if the network has a declared block-0

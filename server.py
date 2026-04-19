@@ -2208,7 +2208,16 @@ class Server:
                 # finality if enough honest attesters concur.
                 await self._maybe_attest_accepted_block(block)
             else:
-                self.ban_manager.record_offense(address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}")
+                # Orderly-flow rejections (orphan / already-known) are
+                # not peer misbehaviour — they mean we're behind or
+                # caught up.  Only ban for genuinely invalid blocks.
+                # Twin of the same fix in messagechain/network/node.py.
+                reason_lower = reason.lower()
+                benign_prefixes = ("orphan", "block already known")
+                if not any(reason_lower.startswith(p) for p in benign_prefixes):
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}",
+                    )
 
         elif msg.msg_type == MessageType.REQUEST_CHAIN_HEIGHT:
             latest = self.blockchain.get_latest_block()
@@ -2533,7 +2542,12 @@ class Server:
                 return
             block = self.blockchain.get_block_by_hash(block_hash_bytes)
             if block:
-                blocks.append(block.serialize())
+                # Wire format is hex-encoded binary (Block.to_bytes().hex()):
+                # matches sync.py and messagechain/network/node.py's
+                # _handle_request_blocks_batch.  Earlier this code used
+                # block.serialize() (nested dict) which no receiver reads
+                # today — silent IBD failure for any joining validator.
+                blocks.append(block.to_bytes().hex())
         response = NetworkMessage(
             msg_type=MessageType.RESPONSE_BLOCKS_BATCH,
             payload={"blocks": blocks},

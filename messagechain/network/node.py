@@ -929,8 +929,21 @@ class Node:
                 # Gossip to other peers
                 await self._broadcast(msg, exclude=peer.address)
             else:
-                # Invalid block — penalize peer
-                self.ban_manager.record_offense(address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}")
+                # Not every add_block failure is malicious.  Orderly-flow
+                # rejections — already-known duplicate, orphan-with-unknown-
+                # parent, orphan-chain-empty-before-IBD — are not peer
+                # misbehaviour; they signal we're behind or already caught
+                # up.  Only ban for genuinely invalid content (bad sig,
+                # bad state root, etc).
+                reason_lower = reason.lower()
+                benign_prefixes = ("orphan", "block already known")
+                if any(reason_lower.startswith(p) for p in benign_prefixes):
+                    logger.debug("non-ban add_block fail from %s: %s",
+                                 address, reason)
+                else:
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_INVALID_BLOCK, f"invalid_block:{reason}",
+                    )
 
         elif msg.msg_type == MessageType.REQUEST_CHAIN_HEIGHT:
             latest = self.blockchain.get_latest_block()
