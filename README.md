@@ -4,7 +4,6 @@ A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
 **Status:** mainnet live at `35.237.211.12:9334` since 2026-04-18.
-See [`docs/launch-readiness.md`](docs/launch-readiness.md) for current state.
 
 ## Why
 
@@ -56,15 +55,6 @@ MessageChain uses a **receive-to-exist** model: you do not need to
 register anything on-chain to receive tokens. Your account appears in
 chain state the moment someone sends you a transfer.
 
-Ask the operator of a node you trust (or a faucet, if the chain has
-one) to send you tokens:
-
-```
-Hi, can you send 10,000 tokens to mc1<your address>?
-```
-
-A few minutes later (one block, 600 s block time), you have a balance.
-
 ### 3. Send a message
 
 ```bash
@@ -76,6 +66,8 @@ Your first outgoing transaction reveals your public key on-chain (the
 transaction is verified against the installed key.
 
 ### 4. Read messages back
+
+Wait one block (~10 minutes) for your message to be included, then:
 
 ```bash
 messagechain read --last 20
@@ -117,8 +109,11 @@ messagechain proposals                          # open proposals + tallies
 
 ### Validator operations
 
-See [`docs/second-validator-onboarding.md`](docs/second-validator-onboarding.md)
-for the full multi-validator flow.
+Running a validator requires a host reachable on TCP 9333 (P2P) and
+9334 (RPC), Python 3.10+, and at least `VALIDATOR_MIN_STAKE = 100`
+tokens staked (10K+ recommended to matter in weight-selection). A
+2 vCPU / 2 GB RAM / 30 GB disk VM is enough. Rotate your WOTS+ key
+before leaf watermark hits 80% — `key-status` will warn you.
 
 ```bash
 messagechain start --mine                       # run a validator
@@ -129,55 +124,6 @@ messagechain rotate-key                         # fresh keypair, old key retired
 messagechain set-authority-key --authority-pubkey <cold_hex>
 messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
-
-## Launching a new chain (founder runbook)
-
-If you are minting a fresh MessageChain (not joining mainnet), see
-[`docs/operator-action-items.md`](docs/operator-action-items.md) for the
-full checklist.  The one-shot is:
-
-```bash
-# Offline, on an air-gapped machine:
-python -c "import secrets; print(secrets.token_hex(32))" > /etc/messagechain/keyfile
-chmod 400 /etc/messagechain/keyfile
-
-python deploy/launch_single_validator.py \
-    --data-dir /var/lib/messagechain \
-    --keyfile /etc/messagechain/keyfile \
-    --liquid 5000000 --stake 95000000 --tree-height 20
-# → prints your block-0 hash and validator address
-
-# Commit the block-0 hash into messagechain/config.py _MAINNET_GENESIS_HASH
-# (or _TESTNET_GENESIS_HASH for a testnet), then deploy your validator.
-```
-
-## Deployment profiles
-
-`MESSAGECHAIN_PROFILE` flips a coherent bundle of defaults:
-
-- `production` (default) — 600s blocks, MERKLE_TREE_HEIGHT=20,
-  checkpoints required, RPC auth enabled.
-- `prototype` — bootstrap-phase bundle: 30s blocks,
-  MERKLE_TREE_HEIGHT=16, checkpoints waived, RPC auth disabled.
-
-Individual env vars
-(`MESSAGECHAIN_BLOCK_TIME_TARGET`, `MESSAGECHAIN_MERKLE_TREE_HEIGHT`,
-`MESSAGECHAIN_REQUIRE_CHECKPOINTS`, `MESSAGECHAIN_RPC_AUTH_ENABLED`)
-override individual profile entries.
-
-## Documentation
-
-- [`docs/launch-readiness.md`](docs/launch-readiness.md) — current launch state, dashboard
-- [`docs/security-model.md`](docs/security-model.md) — threat model + external-audit scope
-- [`docs/known-issues.md`](docs/known-issues.md) — triaged deferrals + post-launch roadmap
-- [`docs/operator-action-items.md`](docs/operator-action-items.md) — pre-mainnet checklist
-- [`docs/mainnet-params.md`](docs/mainnet-params.md) — block-0-immutable parameters
-- [`docs/going-live.md`](docs/going-live.md) — operator deployment runbook
-- [`docs/backup-restore-runbook.md`](docs/backup-restore-runbook.md) — disaster recovery
-- [`docs/key-rotation-runbook.md`](docs/key-rotation-runbook.md) — WOTS+ key rotation
-- [`docs/second-validator-onboarding.md`](docs/second-validator-onboarding.md) — bringing N>1
-- [`docs/tor-setup.md`](docs/tor-setup.md) — hidden-service setup for adversarial environments
-- [`docs/system-audit.md`](docs/system-audit.md) — running audit log
 
 ## Tests
 
