@@ -2678,7 +2678,12 @@ class Server:
         loop.create_task(self._broadcast(msg))
 
     async def _broadcast(self, msg: NetworkMessage):
-        for addr, peer in self.peers.items():
+        # Snapshot the peer dict before awaiting.  write_message is async,
+        # so another coroutine can add/remove peers mid-loop, raising
+        # RuntimeError: dictionary changed size during iteration.  Twin
+        # of the same fix in messagechain/network/node.py._broadcast.
+        snapshot = list(self.peers.items())
+        for addr, peer in snapshot:
             if peer.is_connected and peer.writer:
                 try:
                     await write_message(peer.writer, msg)

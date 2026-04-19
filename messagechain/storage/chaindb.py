@@ -30,6 +30,34 @@ class ChainDB:
         self.db_path = db_path
         self._local = threading.local()
         self._init_schema()
+        self._check_db_permissions()
+
+    def _check_db_permissions(self):
+        """Warn if chain.db is world-writable.
+
+        A world-writable DB lets any UID on the host mutate validator state
+        — an attacker on the box could edit balances in place, silently
+        forking consensus without tripping our HMAC/integrity checks
+        (which only protect the keypair & Merkle caches, not chain.db
+        itself).  The production unit's systemd hardening drops privileges
+        and the installer should `chmod 0640 chain.db`; this check catches
+        a botched deploy that missed that step.
+        """
+        import os
+        import stat as _stat
+        try:
+            st = os.stat(self.db_path)
+        except OSError:
+            return  # fresh db, no file yet — fine
+        mode = st.st_mode
+        if mode & _stat.S_IWOTH:
+            import logging
+            logging.getLogger(__name__).error(
+                "chain.db at %s is world-writable (mode=%o) — any local "
+                "process can tamper with chain state.  Run `chmod 0640 "
+                "%s` and verify service user ownership.",
+                self.db_path, mode & 0o777, self.db_path,
+            )
 
     @property
     def _conn(self) -> sqlite3.Connection:

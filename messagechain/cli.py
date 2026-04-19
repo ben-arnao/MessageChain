@@ -421,13 +421,20 @@ def _auto_pick_endpoint():
     (not in every command handler) so all CLI commands share the same
     routing behavior.
     """
-    import random
+    import secrets
     from messagechain.config import CLIENT_SEED_ENDPOINTS
 
     # Stage 1: find a reachable seed.
+    # Use crypto randomness instead of stdlib `random`.  Client-side
+    # validator selection is not itself a consensus operation, but a
+    # predictable RNG lets a surveillance peer correlate CLI traffic
+    # back to specific validators for targeted DoS / censorship.
+    # secrets.SystemRandom gives us the same shuffle API with kernel
+    # randomness underneath.
+    _rng = secrets.SystemRandom()
     reachable_seed = None
     candidates = list(CLIENT_SEED_ENDPOINTS)
-    random.shuffle(candidates)
+    _rng.shuffle(candidates)
     for host, port in candidates:
         if _try_tcp_open(host, port):
             reachable_seed = (host, port)
@@ -480,7 +487,7 @@ def _auto_pick_endpoint():
         total_w = sum(weights)
         if total_w == 0:
             return reachable_seed
-        pick = random.randint(1, total_w)
+        pick = _rng.randint(1, total_w)
         cumulative = 0
         for (host, port, _), w in zip(non_seed, weights):
             cumulative += w

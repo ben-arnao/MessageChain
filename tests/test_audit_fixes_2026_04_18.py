@@ -228,5 +228,69 @@ class TestSyncPeerHeightsBounded(unittest.TestCase):
         )
 
 
+class TestServerBroadcastSnapshotsPeers(unittest.TestCase):
+    """The Server class in server.py has its own _broadcast distinct from
+    Node._broadcast — same race, separate fix.  Pin that the fix is in
+    place via source inspection."""
+
+    def test_server_broadcast_uses_snapshot(self):
+        import pathlib
+        src = pathlib.Path("server.py").read_text(encoding="utf-8")
+        i = src.index("async def _broadcast(self, msg: NetworkMessage):")
+        j = src.index("\n    async def ", i + 1) if "\n    async def " in src[i+1:] else i + 1000
+        body = src[i:j]
+        self.assertIn("snapshot = list(self.peers.items())", body,
+                      "Server._broadcast must snapshot peers before iterating")
+
+
+class TestChainDBPermissionCheck(unittest.TestCase):
+    """chain.db world-writable is a silent-corruption vector.
+    _check_db_permissions logs an error on detection."""
+
+    def test_world_writable_db_logs_error(self):
+        import os
+        import tempfile
+        import logging
+        from messagechain.storage.chaindb import ChainDB
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".db")
+        tmp.close()
+        try:
+            # First init creates the schema.
+            _ = ChainDB(tmp.name)
+            # Now chmod world-writable and re-init; _check_db_permissions
+            # should log an error.
+            os.chmod(tmp.name, 0o666)
+            with self.assertLogs(
+                "messagechain.storage.chaindb", level="ERROR",
+            ) as cm:
+                _ = ChainDB(tmp.name)
+            self.assertTrue(
+                any("world-writable" in m for m in cm.output),
+                f"expected world-writable warning, got {cm.output}",
+            )
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+
+class TestCLIUsesSystemRandom(unittest.TestCase):
+    """CLI validator selection used `random` (deterministic PRNG), which
+    enables targeted surveillance/DoS once an observer predicts routing.
+    Fix swaps to secrets.SystemRandom."""
+
+    def test_auto_pick_endpoint_uses_secrets(self):
+        import pathlib
+        src = pathlib.Path("messagechain/cli.py").read_text(encoding="utf-8")
+        i = src.index("def _auto_pick_endpoint")
+        j = src.index("\ndef ", i + 1)
+        body = src[i:j]
+        self.assertIn("secrets.SystemRandom", body,
+                      "CLI endpoint selection must use secrets.SystemRandom")
+        self.assertNotIn("import random", body,
+                         "CLI endpoint selection must not use stdlib random")
+
+
 if __name__ == "__main__":
     unittest.main()
