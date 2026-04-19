@@ -311,11 +311,20 @@ class Mempool:
         fees = sorted([tx.fee for tx in self.pending.values()], reverse=True)
         return max(MIN_FEE, fees[len(fees) // 2])
 
+    # save_to_file / load_from_file exist so operator tooling (and our
+    # own test suite) can round-trip a pending-pool snapshot for debug
+    # / forensic dumps.  They are deliberately NOT wired into server
+    # startup / shutdown: a persisted mempool would replay stale txs
+    # against a chain that moved forward (wrong nonce, stale fee
+    # estimate, or already-confirmed tx), so the operational rule is
+    # "on restart, pending txs are rebroadcast by their original
+    # senders."  Keep both methods available for manual ops but do not
+    # add an auto-load.
     def save_to_file(self, path: str) -> int:
-        """Save mempool contents to disk for persistence across restarts.
-
-        Returns the number of transactions saved.
-        """
+        """Serialize the pending-message pool to disk for manual ops
+        snapshots (forensics, debugging).  NOT auto-called by the
+        server — see module comment for why.  Returns the number of
+        transactions saved."""
         import json
         txs = [tx.serialize() for tx in self.pending.values()]
         try:
@@ -326,11 +335,9 @@ class Mempool:
             return 0
 
     def load_from_file(self, path: str) -> int:
-        """Load mempool contents from disk.
-
-        Skips expired transactions and corrupt entries.
-        Returns the number of transactions loaded.
-        """
+        """Reload a previously-saved pending-message pool.  Same caveat
+        as save_to_file: not invoked by the server.  Returns the number
+        loaded."""
         import json
         try:
             with open(path, "r") as f:

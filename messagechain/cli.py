@@ -1632,9 +1632,9 @@ def cmd_vote(args):
     entity.keypair.advance_to_leaf(watermark)
 
     from messagechain.validation import parse_hex
-    proposal_id = parse_hex(args.proposal)
+    proposal_id = parse_hex(args.proposal, expected_len=32)
     if proposal_id is None:
-        print(f"Error: Invalid proposal ID (not valid hex): {args.proposal}")
+        print(f"Error: Invalid proposal ID (must be 32 bytes hex): {args.proposal}")
         sys.exit(1)
 
     fee = args.fee if args.fee is not None else GOVERNANCE_VOTE_FEE

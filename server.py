@@ -842,9 +842,9 @@ class Server:
             return {"ok": True, "result": {"fee_estimate": self.mempool.get_fee_estimate()}}
 
         elif method == "get_nonce":
-            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
-                return {"ok": False, "error": "Invalid entity_id hex"}
+                return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
             nonce = self.blockchain.nonces.get(entity_id, 0)
             watermark = self.blockchain.get_leaf_watermark(entity_id)
             # Return both together so clients only need one roundtrip to
@@ -856,16 +856,16 @@ class Server:
             return {"ok": True, "result": {"nonce": nonce, "leaf_watermark": watermark}}
 
         elif method == "get_leaf_watermark":
-            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
-                return {"ok": False, "error": "Invalid entity_id hex"}
+                return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
             watermark = self.blockchain.get_leaf_watermark(entity_id)
             return {"ok": True, "result": {"leaf_watermark": watermark}}
 
         elif method == "get_authority_key":
-            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
-                return {"ok": False, "error": "Invalid entity_id hex"}
+                return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
             ak = self.blockchain.get_authority_key(entity_id)
             return {"ok": True, "result": {
                 "authority_key": ak.hex() if ak else None,
@@ -878,18 +878,18 @@ class Server:
             return self._rpc_emergency_revoke(request["params"])
 
         elif method == "is_revoked":
-            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
-                return {"ok": False, "error": "Invalid entity_id hex"}
+                return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
             return {"ok": True, "result": {"revoked": self.blockchain.is_revoked(entity_id)}}
 
         elif method == "rotate_key":
             return self._rpc_rotate_key(request["params"])
 
         elif method == "get_key_status":
-            entity_id = parse_hex(request["params"].get("entity_id", ""))
+            entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
-                return {"ok": False, "error": "Invalid entity_id hex"}
+                return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
             # Current on-chain public key + rotation count + watermark together
             # tell a client how far through its current tree it is.
             return {"ok": True, "result": {
@@ -1741,7 +1741,7 @@ class Server:
             # surcharge on apply, so surface it here.
             recipient_id_hex = params.get("recipient_id")
             if recipient_id_hex:
-                recipient_id = parse_hex(recipient_id_hex)
+                recipient_id = parse_hex(recipient_id_hex, expected_len=32)
                 if recipient_id is not None:
                     if self.blockchain._recipient_is_new(recipient_id):
                         recipient_is_new = True
@@ -1795,9 +1795,9 @@ class Server:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_get_entity(self, params: dict) -> dict:
-        entity_id = parse_hex(params.get("entity_id", ""))
+        entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
         if entity_id is None:
-            return {"ok": False, "error": "Invalid entity_id hex"}
+            return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
         if entity_id not in self.blockchain.public_keys:
             return {"ok": False, "error": "Entity not found"}
         return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}
