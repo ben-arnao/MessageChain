@@ -606,6 +606,45 @@ class KeyPair:
             self._next_leaf = stored
 
 
+def compute_root_from_signature(signature: "Signature") -> bytes | None:
+    """Reconstruct the Merkle tree root (= the long-term public key) from a
+    one-time WOTS+ signature's auth path.
+
+    The signature carries the leaf public key, the leaf index, and the
+    sibling hashes along the Merkle path.  Hashing upward from
+    (wots_public_key, leaf_index) using auth_path yields the tree root.
+
+    Used by joining validators during IBD to register the genesis
+    entity's pubkey from block 0 alone — without knowing the entity's
+    long-term public key out of band.  Separate from verify_signature
+    so the caller can use the derived root to populate state (e.g.,
+    self.public_keys[genesis_id] = derived_root) before any signature
+    verification runs.
+
+    Returns None if the signature is structurally malformed.
+    """
+    if not isinstance(signature, Signature):
+        return None
+    if not isinstance(signature.wots_public_key, (bytes, bytearray)) or len(signature.wots_public_key) != _HASH_SIZE:
+        return None
+    if not isinstance(signature.auth_path, list):
+        return None
+    for sib in signature.auth_path:
+        if not isinstance(sib, (bytes, bytearray)) or len(sib) != _HASH_SIZE:
+            return None
+    if not isinstance(signature.leaf_index, int) or signature.leaf_index < 0:
+        return None
+    current = bytes(signature.wots_public_key)
+    idx = signature.leaf_index
+    for sibling in signature.auth_path:
+        if idx & 1 == 0:
+            current = _hash(current + bytes(sibling))
+        else:
+            current = _hash(bytes(sibling) + current)
+        idx >>= 1
+    return current
+
+
 def verify_signature(message_hash: bytes, signature: Signature, root_public_key: bytes) -> bool:
     """
     Verify a signature against a Merkle-tree root public key.

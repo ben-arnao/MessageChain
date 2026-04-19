@@ -54,7 +54,10 @@ from messagechain.consensus.finality import (
     FinalityDoubleVoteEvidence,
 )
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.crypto.keys import verify_signature
+from messagechain.crypto.keys import (
+    compute_root_from_signature,
+    verify_signature,
+)
 from messagechain.crypto.sig_cache import get_global_cache
 from messagechain.consensus.fork_choice import (
     ForkChoice, compute_block_stake_weight, find_fork_point, MAX_REORG_DEPTH,
@@ -4776,6 +4779,126 @@ class Blockchain:
         # Phase 3: prune
         tracker.prune_closed_proposals(current_block)
 
+    def _apply_mainnet_genesis_state(self, block: Block) -> tuple[bool, str]:
+        """Reconstruct mainnet post-bootstrap state from block 0 alone.
+
+        The founder's launch flow (deploy/launch_single_validator.py) did
+        `initialize_genesis + bootstrap_seed_local` — block 0 was minted,
+        then off-block direct-state mutations applied (register pubkey,
+        self-authority-key, stake 95M).  A joining validator's IBD must
+        reproduce those mutations exactly, else its pre-block-1 state
+        diverges from the founder's and block 1's state_root rejects.
+
+        The founder's public key is extracted from block 0's proposer
+        signature via Merkle-auth-path reconstruction.  Applying the
+        canonical _MAINNET_FOUNDER_LIQUID / _MAINNET_FOUNDER_STAKE
+        constants then reproduces the exact post-bootstrap state.  Any
+        drift from the founder's actual parameters surfaces as a
+        state_root mismatch at block 1 — constants are self-verifying.
+
+        Called from add_block's synced-genesis branch after the
+        PINNED_GENESIS_HASH check passes.  Only runs when the pinned
+        hash is the mainnet hash (testnet/devnet keep the existing
+        snapshot/tarball workflow).
+        """
+        import messagechain.config as _cfg
+        sig = block.header.proposer_signature
+        if sig is None:
+            return False, "Genesis block has no proposer signature"
+
+        # Step 1: extract founder pubkey from the block-0 signature.
+        founder_pubkey = compute_root_from_signature(sig)
+        if founder_pubkey is None:
+            return False, "Block 0 signature is structurally malformed"
+
+        # Step 2: verify the extracted pubkey matches the header's
+        # proposer_id — if derive_entity_id(pubkey) != proposer_id, we
+        # extracted the wrong root (malformed or manipulated sig).
+        from messagechain.identity.identity import derive_entity_id
+        if derive_entity_id(founder_pubkey) != block.header.proposer_id:
+            return False, (
+                "Block 0 signature's derived pubkey does not match "
+                "the header proposer_id — block is malformed"
+            )
+
+        # Step 3: verify block 0's signature is actually valid under
+        # the derived pubkey.  Extracting the root from auth_path is
+        # arithmetic; this is the cryptographic authentication.
+        from messagechain.core.block import _hash as _block_hash
+        header_hash = _block_hash(block.header.signable_data())
+        if not verify_signature(header_hash, sig, founder_pubkey):
+            return False, "Block 0 signature is invalid under derived pubkey"
+
+        founder_eid = block.header.proposer_id
+        tree_height = len(sig.auth_path)
+
+        # ── initialize_genesis-equivalent mutations ───────────────────
+        self.chain.append(block)
+        self._block_by_hash[block.block_hash] = block
+
+        self.public_keys[founder_eid] = founder_pubkey
+        self.nonces[founder_eid] = 0
+        self._set_tree_height_explicit(founder_eid, tree_height)
+        self._assign_entity_index(founder_eid)
+        self.proposer_sig_counts[founder_eid] = 1
+        self._bump_watermark(founder_eid, sig.leaf_index)
+
+        # Founder gets the full 100M in liquid initially; bootstrap
+        # below then converts 95M of that into stake.
+        self.supply.balances[founder_eid] = (
+            self.supply.balances.get(founder_eid, 0)
+            + _cfg._MAINNET_FOUNDER_TOTAL
+        )
+        self.supply.balances[_cfg.TREASURY_ENTITY_ID] = (
+            self.supply.balances.get(_cfg.TREASURY_ENTITY_ID, 0)
+            + _cfg.TREASURY_ALLOCATION
+        )
+        self._assign_entity_index(_cfg.TREASURY_ENTITY_ID)
+
+        # Seed set: founder is the only seed (treasury is excluded).
+        self.seed_entity_ids = frozenset({founder_eid})
+
+        self.fork_choice.add_tip(block.block_hash, 0, 0)
+
+        # Pin empty stake snapshot at block 0 — matches the founder's
+        # node, where _record_stake_snapshot(0) runs inside
+        # initialize_genesis BEFORE bootstrap_seed_local applies the
+        # 95M stake.
+        self._record_stake_snapshot(0)
+
+        # ── bootstrap_seed_local-equivalent mutations ─────────────────
+        # The founder's launch script ran bootstrap_seed_local between
+        # initialize_genesis and the first server start.  On mainnet,
+        # its three steps reduce to a single net state change:
+        #
+        #   Step 1 (register):           no-op — already installed by
+        #                                initialize_genesis above.
+        #   Step 2 (set_authority_key):  SKIPPED on mainnet because the
+        #                                launch script passes
+        #                                cold_authority_pubkey = hot pubkey,
+        #                                and get_authority_key's fallback
+        #                                already returns the hot pubkey —
+        #                                they test equal, so the tx never
+        #                                runs, no fee burn, no nonce bump.
+        #   Step 3 (stake):              moves 95M from liquid to staked.
+        #
+        # The net effect is just the stake.  authority_keys stays empty
+        # (the fallback in get_authority_key makes this transparent).
+        if not self.supply.stake(founder_eid, _cfg._MAINNET_FOUNDER_STAKE):
+            return False, "Canonical stake application failed — supply.stake rejected"
+
+        # Rebuild the state tree so compute_current_state_root reflects
+        # the fully-populated post-bootstrap state.
+        self._rebuild_state_tree()
+
+        # Persist
+        if self.db is not None:
+            self.db.store_block(block, state=self)
+            self.db.add_chain_tip(block.block_hash, 0, 0)
+            self._persist_state()
+
+        return True, "Genesis block reconstructed from block 0 alone"
+
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
         if self.height == 0:
@@ -4809,6 +4932,22 @@ class Blockchain:
                     f"{block.block_hash.hex()[:16]}... does not match the "
                     f"pinned genesis {pinned.hex()[:16]}..."
                 )
+            # Synced-genesis reconstruction: if this is the mainnet
+            # block 0 arriving via P2P (e.g., a fresh val-2 onboarding),
+            # reproduce the founder's post-bootstrap state using the
+            # canonical allocation constants so val-2's pre-block-1
+            # state matches the founder's.  Without this, block 1's
+            # state_root check rejects because val-2 has no founder
+            # pubkey / stake / authority installed.
+            is_mainnet_genesis = (
+                pinned is not None
+                and pinned == getattr(_cfg, "_MAINNET_GENESIS_HASH", None)
+            )
+            if is_mainnet_genesis:
+                ok, reason = self._apply_mainnet_genesis_state(block)
+                if not ok:
+                    return False, reason
+                return True, reason
             self.chain.append(block)
             self._block_by_hash[block.block_hash] = block
             self.fork_choice.add_tip(block.block_hash, 0, 0)

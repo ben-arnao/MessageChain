@@ -46,53 +46,36 @@ The new validator operator needs:
 
 ---
 
-## Prerequisite: state-snapshot distribution (ARCHITECTURAL)
+## Plain P2P sync works — no state snapshot required
 
-**Important:** plain P2P sync from block 0 is not sufficient for a
-joining validator to trust existing mainnet state.  Block 0 commits to
-a `state_root` over the genesis allocation (founder balance, treasury
-allocation, founder pubkey, stake split), but the allocation table
-itself is **not** serialised inside the block — it exists only in the
-founder's in-memory `initialize_genesis` call.  A joining node doing
-raw IBD from block 0 forward will:
+Val-2 joins via normal initial-block-download (IBD) from val-1.  No
+out-of-band state transfer, no signed checkpoint, no tarball — just
+start the candidate's node and point it at val-1 as a bootstrap peer.
 
-1. Accept block 0 (matches the pinned genesis hash)
-2. Fail to validate block 1 with "Unknown proposer" (founder pubkey
-   never registered) or "state_root mismatch" (balances missing)
+How it works: block 0's proposer signature carries a Merkle auth path
+from the signed leaf up to the founder's long-term public key.  When
+val-2 receives block 0 over gossip, it:
 
-This is why onboarding a second validator requires **bootstrap-from-
-checkpoint**: the founder exports a signed state snapshot, the candidate
-downloads it, verifies the signature + pinned genesis hash + state_root,
-then loads it into their chain.db before starting normal sync.
+1. Verifies the block hash matches `PINNED_GENESIS_HASH` in config
+   (rejects any forked-genesis peer).
+2. Reconstructs the founder's public key from the block-0 signature's
+   auth path (the Merkle root IS the public key).
+3. Verifies `derive_entity_id(pubkey) == block.header.proposer_id` and
+   that the block-0 signature actually validates under that pubkey.
+4. Applies the canonical mainnet genesis allocation from
+   `_MAINNET_FOUNDER_LIQUID` / `_MAINNET_FOUNDER_STAKE` constants in
+   `messagechain/config.py` — pinned at the release the candidate
+   installed, so a malicious peer can't feed different numbers.
+5. Stakes 95M to the founder and pins the seed set.
 
-The code path already exists (`Blockchain.bootstrap_from_checkpoint` +
-`messagechain/consensus/state_checkpoint.py`).  What's missing today is
-the operator-facing CLI tooling — it's on the post-launch roadmap.
+If any constant drifted from val-1's actual setup, block 1's
+`state_root` check rejects immediately — the constants are
+self-verifying against the first real state commitment.  So the
+reconstruction is safe even under a fully-untrusted P2P path.
 
-Until that lands, the practical procedure is:
-
-```bash
-# On val-1:
-sudo systemctl stop messagechain-validator
-sudo tar czf /tmp/mainnet-state.tar.gz \
-    /var/lib/messagechain/chain.db \
-    /var/lib/messagechain/leaf_index.json
-# (do NOT include keypair_cache_*.bin — candidate has their own key)
-sudo systemctl start messagechain-validator
-
-# Transfer /tmp/mainnet-state.tar.gz to the candidate over a trusted
-# channel.  The tarball is the authoritative state; anyone with it can
-# run a fully-validating node, but it carries no secrets.
-
-# On candidate's node (before first start):
-sudo tar xzf mainnet-state.tar.gz -C /var/lib/messagechain/
-# Candidate's keyfile stays at /etc/messagechain/keyfile (their own key).
-sudo systemctl start messagechain-validator
-```
-
-The candidate's node then has val-1's chain state, picks up normal
-gossip sync for subsequent blocks, and the candidate proceeds to the
-flow below to acquire tokens and stake.
+Implementation: `Blockchain._apply_mainnet_genesis_state` in
+`messagechain/core/blockchain.py`; regression coverage in
+`tests/test_ibd_from_genesis.py`.
 
 ## The onboarding flow
 

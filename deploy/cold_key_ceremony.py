@@ -3,11 +3,11 @@
 Run this ONCE, on an **air-gapped machine**, as part of the founder
 cold-key ceremony.  Produces:
 
-  * `cold-key-public.txt`   — the public key (commit this to chain via
+  * `cold-key-public.txt`   - the public key (commit this to chain via
                               `python -m messagechain set-authority-key`)
-  * `cold-share-1.txt`      — Shamir share #1 (keep with founder)
-  * `cold-share-2.txt`      — Shamir share #2 (hand to trusted party A)
-  * `cold-share-3.txt`      — Shamir share #3 (hand to trusted party B)
+  * `cold-share-1.txt`      - Shamir share #1 (keep with founder)
+  * `cold-share-2.txt`      - Shamir share #2 (hand to trusted party A)
+  * `cold-share-3.txt`      - Shamir share #3 (hand to trusted party B)
 
 Any TWO of the three shares can reconstruct the private key.
 The shares and the private key **never touch the network**.
@@ -27,7 +27,7 @@ sign `emergency-revoke` / authority-gated `unstake` in the rare case
 the hot key is compromised.  In routine operation the cold key is
 never online.
 
-**This script uses only Python stdlib** — no pip deps — so it runs
+**This script uses only Python stdlib** - no pip deps - so it runs
 on any clean Python 3.10+ environment without needing to install
 anything on the air-gapped machine.
 """
@@ -42,7 +42,7 @@ import sys
 
 # 257-bit prime (Mersenne): p = 2^521 - 1.  Accepts any 32-byte secret
 # as an integer < p, with 489 bits of headroom for polynomial coeffs.
-# Shamir security is information-theoretic in the prime field — any
+# Shamir security is information-theoretic in the prime field - any
 # t-1 shares leak zero information about the secret.
 _P = 2**521 - 1
 
@@ -101,7 +101,7 @@ def _decode_share(text: str) -> tuple[int, int, int, int]:
     body = ":".join(parts[:-1])
     expect = hashlib.sha3_256(body.encode()).hexdigest()[:16]
     if expect != parts[-1]:
-        raise ValueError("share checksum mismatch — share is corrupted or tampered")
+        raise ValueError("share checksum mismatch - share is corrupted or tampered")
     tn = parts[1].split("/")
     if len(tn) != 2:
         raise ValueError("malformed share: threshold/total field")
@@ -118,9 +118,9 @@ def generate(threshold: int, num_shares: int, out_dir: str) -> None:
     key_int = int.from_bytes(key_bytes, "big")
 
     # Derive the public key the chain will store.  Import from messagechain
-    # locally — never touches the network since Entity.create is pure crypto.
+    # locally - never touches the network since Entity.create is pure crypto.
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-    # Use a small tree for the cold key — it signs rarely (emergency only).
+    # Use a small tree for the cold key - it signs rarely (emergency only).
     from messagechain.identity.identity import Entity
     from messagechain.identity.address import encode_address
     ce = Entity.create(key_bytes, tree_height=10)  # 1024 signing keys
@@ -143,7 +143,7 @@ def generate(threshold: int, num_shares: int, out_dir: str) -> None:
         try:
             os.chmod(path, 0o400)
         except Exception:
-            pass  # Windows or non-POSIX — best-effort
+            pass  # Windows or non-POSIX - best-effort
         print(f"  Wrote {path}  (keep this SECRET; any 2 of {num_shares} shares reconstruct the key)")
 
     # Zero the in-memory key
@@ -183,7 +183,7 @@ def recover(share_files: list[str]) -> None:
     print(f"  Recovered address: {encode_address(ce.entity_id)}")
     print()
     print("  Verify this matches your cold-key-public.txt.  If it does NOT,")
-    print("  one or more shares are wrong — STOP and investigate.")
+    print("  one or more shares are wrong - STOP and investigate.")
 
     # Zero the memory
     key_bytes = b"\x00" * 32
@@ -214,16 +214,19 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # ASCII-only output so the script runs on Windows air-gapped
+    # machines (cp1252 default encoding can't print Unicode box
+    # characters and the whole ceremony aborts mid-generation).
     print()
-    print("  ┌──────────────────────────────────────────────────────────┐")
-    print("  │  Cold-Key Ceremony — air-gapped, quorum-custody shares   │")
-    print("  └──────────────────────────────────────────────────────────┘")
+    print("  ============================================================")
+    print("  Cold-Key Ceremony - air-gapped, quorum-custody shares")
+    print("  ============================================================")
     print()
 
     if args.cmd == "generate":
         generate(args.threshold, args.total, args.out_dir)
         print()
-        print("  ✓ Cold key generated + split into Shamir shares.")
+        print("  [OK] Cold key generated + split into Shamir shares.")
         print()
         print("  Next steps (do these in order, THEN wipe this machine):")
         print("  1. Copy each cold-share-N.txt to its designated holder's")

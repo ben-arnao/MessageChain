@@ -298,6 +298,20 @@ DEFAULT_GENESIS_ALLOCATIONS = {
     # Genesis validator allocation is added dynamically in Blockchain.initialize_genesis
 }
 
+# Mainnet genesis allocation — the canonical founder split baked into the
+# protocol so a joining validator can reconstruct post-genesis state from
+# block 0 + these constants alone (no out-of-band snapshot required).
+# These come from the `launch_single_validator.py --liquid 5000000 --stake
+# 95000000` invocation the founder ran at mainnet launch.  The founder's
+# pubkey is extractable from block 0's proposer_signature via
+# compute_root_from_signature — so a joining node can pin block 0 by hash,
+# extract the pubkey, and apply liquid + stake + treasury per these
+# constants.  Block 1's state_root verification self-checks the values:
+# any mismatch with the founder's original setup is immediate rejection.
+_MAINNET_FOUNDER_LIQUID = 5_000_000
+_MAINNET_FOUNDER_STAKE = 95_000_000
+_MAINNET_FOUNDER_TOTAL = _MAINNET_FOUNDER_LIQUID + _MAINNET_FOUNDER_STAKE
+
 BLOCK_REWARD = 16  # new tokens minted per block (split between proposer + attestors)
 if (BLOCK_REWARD & (BLOCK_REWARD - 1)) != 0:
     raise ValueError("BLOCK_REWARD must be a power of 2 for clean halvings")
