@@ -117,14 +117,31 @@ for their bootstrap privilege" principle).
 
 ## Open decisions
 
-- [ ] Confirm founder allocation: **100M proposed** (range 50M–100M acceptable)
-- [ ] Confirm founder stake at genesis: **95M of 100M** (5M liquid reserve)
-- [ ] Confirm founder tree height: **20** (production standard)
-- [ ] Confirm treasury allocation: **40M (4%)** — unchanged from today
-- [ ] Confirm genesis parameters doc signed off before mainnet mint
-- [ ] Code freeze: ≥4 weeks of no consensus-breaking merges before mint
-- [ ] External audit scheduled / complete before mint
+All block-0-immutable decisions below were signed off 2026-04-18 and
+minted into the live mainnet at block 0 hash
+`5e8bc19ccd4449730684744951f1cca1eabb7d7c008623ea2257fd837fb63d18`.
 
-Once all six items are ticked, regenerate `_MAINNET_GENESIS_HASH` via
-`deploy/launch_single_validator.py` against mainnet params, commit,
-tag release, flip `NETWORK_NAME = "mainnet"` in `messagechain/config.py`.
+- [x] Founder allocation: **100M** (95M staked, 5M liquid)
+- [x] Founder stake at genesis: **95M of 100M**
+- [x] Founder tree height: **16** (temporary — see note below)
+- [x] Treasury allocation: **40M (4%)** — TREASURY_ENTITY_ID derived from `b"messagechain-treasury-v1"`
+- [x] Genesis parameters doc signed off
+- [ ] Code freeze — **debatable**: mainnet already live. See `docs/launch-readiness.md` for the "freeze debate."
+- [ ] External audit — **pending**.  Not a block-0 decision; can be scheduled post-launch.  Shortlist: Trail of Bits / Least Authority / NCC.
+
+**Tree height note:** launched at h=16 (not the spec's h=20) because at
+mainnet mint time the pure-Python signer required ~80 minutes per block
+signature at h=20, exceeding the 600s block time.  The MerkleNodeCache
+(iter 10 fix) gives a 13,714× speedup, which makes h=20 feasible on
+current hardware.  A deliberate key rotation to h=20 via
+`messagechain rotate-key` is part of the post-launch roadmap.
+
+## Post-launch parameter decisions (governance-mutable)
+
+None are blocking.  Logged here so operators know they're adjustable:
+
+- Raise `MIN_VALIDATORS_TO_EXIT_BOOTSTRAP` from 1 → 3 once ≥3 honest
+  validators are active on the chain
+- Bump sig_version / hash_version when a cryptographic migration is
+  needed
+- Publish the first signed weak-subjectivity checkpoint around block 1000

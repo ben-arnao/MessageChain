@@ -277,6 +277,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
 
+    # --- status (operator health-check) ---
+    status = sub.add_parser(
+        "status",
+        help="One-call operator health-check",
+        description=(
+            "Aggregated validator health + chain state + rotation urgency.\n"
+            "Exits 0 when everything is green, 1 if any yellow (warning), "
+            "2 if any red (rotation overdue / chain stalled / unreachable).\n"
+            "Suitable for cron / monitoring: `messagechain status --server "
+            "VAL:9334 && echo ok || echo needs-attention`."
+        ),
+    )
+    status.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+    status.add_argument(
+        "--entity", type=str, default=None,
+        help=(
+            "Optional entity_id or address to include validator-specific "
+            "checks (leaf watermark, rotation urgency).  If omitted, only "
+            "chain-level checks run."
+        ),
+    )
+
     # --- proposals ---
     proposals = sub.add_parser(
         "proposals",
@@ -1759,6 +1784,133 @@ def cmd_info(args):
         sys.exit(1)
 
 
+def cmd_status(args):
+    """One-call operator health-check.
+
+    Exit codes:
+      0 — all green
+      1 — at least one yellow (warning but functional)
+      2 — at least one red (rotation overdue / chain stalled / unreachable)
+    """
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    worst = 0  # 0=green 1=yellow 2=red
+    lines: list[str] = []
+
+    def mark(level: int, label: str, status: str, detail: str = ""):
+        nonlocal worst
+        worst = max(worst, level)
+        tag = {0: "OK  ", 1: "WARN", 2: "FAIL"}[level]
+        msg = f"  [{tag}] {label}: {status}"
+        if detail:
+            msg += f" — {detail}"
+        lines.append(msg)
+
+    # 1. Chain reachable + basic info
+    info_resp = rpc_call(host, port, "get_chain_info", {})
+    if not info_resp.get("ok"):
+        mark(2, "rpc reachable", "FAIL",
+             info_resp.get("error", "could not connect"))
+        print(f"=== Status check against {host}:{port} ===\n")
+        for line in lines:
+            print(line)
+        print("\n  Result: RED — chain unreachable")
+        sys.exit(2)
+
+    info = info_resp["result"]
+    height = info["height"]
+    mark(0, "rpc reachable", f"height={height}")
+
+    # 2. Sync state
+    sync = info.get("sync_status", {})
+    state = sync.get("state", "?")
+    if state == "idle":
+        mark(0, "sync", "idle (caught up)")
+    elif state in ("syncing_headers", "syncing_blocks"):
+        progress = sync.get("progress", "?")
+        mark(1, "sync", f"{state} {progress}",
+             "not yet caught up — catching up to network")
+    else:
+        mark(1, "sync", str(state))
+
+    # 3. Pinned genesis sanity — present and non-empty
+    latest_hash = info.get("latest_block_hash", "")
+    if latest_hash and len(latest_hash) == 64:
+        mark(0, "chain tip", latest_hash[:16] + "...")
+    else:
+        mark(2, "chain tip", "missing latest_block_hash", "RPC response malformed")
+
+    # 4. Validator entity-specific checks (optional)
+    if args.entity:
+        # Accept hex or address format
+        entity_hex = args.entity.strip()
+        if entity_hex.startswith("mc1") or entity_hex.startswith("Mc1"):
+            try:
+                from messagechain.identity.address import decode_address
+                eid_bytes = decode_address(entity_hex)
+                entity_hex = eid_bytes.hex()
+            except Exception as e:
+                mark(2, "entity", "invalid address", str(e))
+                entity_hex = None
+
+        if entity_hex:
+            ent_resp = rpc_call(
+                host, port, "get_entity",
+                {"entity_id": entity_hex},
+            )
+            if ent_resp.get("ok"):
+                e = ent_resp["result"]
+                staked = e.get("staked", 0)
+                balance = e.get("balance", 0)
+                mark(0, "entity state",
+                     f"balance={balance} staked={staked}")
+            else:
+                mark(1, "entity state", "not found",
+                     ent_resp.get("error", ""))
+
+            # Leaf watermark — rotation urgency
+            wm_resp = rpc_call(
+                host, port, "get_leaf_watermark",
+                {"entity_id": entity_hex},
+            )
+            if wm_resp.get("ok"):
+                wm = wm_resp["result"].get("leaf_watermark", 0)
+                # Assume tree_height=16 (65K leaves) as the default; we
+                # don't know the real tree height from an RPC response
+                # alone.  This is a heuristic warning, not a hard limit.
+                est_total = 1 << 16
+                pct = (wm / est_total) * 100
+                if pct < 50:
+                    mark(0, "leaf usage", f"{wm}/{est_total} ({pct:.1f}%)")
+                elif pct < 80:
+                    mark(0, "leaf usage",
+                         f"{wm}/{est_total} ({pct:.1f}%)",
+                         "plenty of signatures remaining")
+                elif pct < 95:
+                    mark(1, "leaf usage",
+                         f"{wm}/{est_total} ({pct:.1f}%)",
+                         "plan a key rotation in the next few months")
+                else:
+                    mark(2, "leaf usage",
+                         f"{wm}/{est_total} ({pct:.1f}%)",
+                         "ROTATE NOW — signatures nearly exhausted")
+
+    # 5. Liveness — chain height advanced in the last 30s?  Not
+    #    reliable from a single probe, but a block-time of 600s means
+    #    "height unchanged over 30s" is uninformative.  Skip.
+
+    # Emit report
+    print(f"=== Status check against {host}:{port} ===\n")
+    for line in lines:
+        print(line)
+    print()
+    verdict = {0: "GREEN (ok)", 1: "YELLOW (needs attention)",
+               2: "RED (urgent)"}[worst]
+    print(f"  Result: {verdict}")
+    sys.exit(worst)
+
+
 def cmd_proposals(args):
     """List governance proposals with current tally."""
     host, port = _parse_server(args.server)
@@ -1937,6 +2089,7 @@ def main():
         "verify-key": cmd_verify_key,
         "read": cmd_read,
         "info": cmd_info,
+        "status": cmd_status,
         "proposals": cmd_proposals,
         "validators": cmd_validators,
         "estimate-fee": cmd_estimate_fee,

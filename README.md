@@ -1,13 +1,25 @@
 # MessageChain
 
-A blockchain for sending messages. Quantum-resistant, proof-of-stake, built to last centuries.
+A blockchain for sending messages. Quantum-resistant, proof-of-stake,
+built to last centuries.
+
+**Status:** mainnet live at `35.237.211.12:9334` since 2026-04-18.
+See [`docs/launch-readiness.md`](docs/launch-readiness.md) for current state.
 
 ## Why
 
-- **Censorship-resistant communication.** No platform, government, or ISP can hide, filter, or silently remove your messages. If it's on-chain, it's there.
-- **Costly to spam.** Every message costs real tokens. Bots can participate, but they pay the same price as everyone else — AI-generated noise has a floor.
-- **Simple and durable.** Designed to run for centuries with minimal moving parts. Slow blocks and expensive fees are features, not bugs.
-- **Democratic by default.** On-chain governance, distributed validation, no privileged operators. L2s can layer reputation, identity, and moderation on top.
+- **Censorship-resistant communication.** No platform, government, or
+  ISP can hide, filter, or silently remove your messages. If it's
+  on-chain, it's there forever.
+- **Costly to spam.** Every message costs real tokens. Bots can
+  participate, but they pay the same price as everyone else —
+  AI-generated noise has a floor.
+- **Simple and durable.** Designed to run for centuries with minimal
+  moving parts. Slow blocks and expensive fees are features, not bugs.
+  Zero runtime dependencies outside the Python stdlib.
+- **Democratic by default.** On-chain governance, distributed
+  validation, no privileged operators. L2s can layer reputation,
+  identity, and moderation on top.
 
 ## Install
 
@@ -16,172 +28,164 @@ Python 3.10+, no third-party deps.
 ```bash
 git clone https://github.com/ben-arnao/MessageChain.git
 cd MessageChain
+pip install .
 ```
 
-All signing commands prompt for your private key. Override the target node with `--server host:port`; otherwise the CLI auto-picks a seed from [`CLIENT_SEED_ENDPOINTS`](messagechain/config.py) and routes by `sqrt(stake)`.
+This puts a `messagechain` command on your PATH. You can run it the
+same way via `python -m messagechain <cmd>` if you prefer.
 
-## CLI
+## Getting started — your first message
 
-### Create a wallet (to receive funds)
-
-**🔌 Go offline first.**
+### 1. Generate a private key (offline)
 
 ```bash
-python -m messagechain generate-key    # write the private key on paper, 2–3 copies
-python -m messagechain verify-key      # re-type to confirm the backup
+messagechain generate-key    # write the printed hex on paper, 2–3 copies
+messagechain verify-key      # re-type to confirm the backup
 ```
 
-Paper beats files: files get swept by cloud-sync, backups, and malware. Don't copy-paste (clipboard managers log history). Close the terminal when done.
+Paper beats files — files get swept by cloud sync, backups, and
+malware. Don't copy-paste (clipboard managers log history). Close
+the terminal when done.
 
-**🔌 Back online.** Register the wallet on-chain (one signature):
+Your entity_id and `mc1…` address are derived deterministically from
+the key.
 
-```bash
-python -m messagechain account
+### 2. Get tokens
+
+MessageChain uses a **receive-to-exist** model: you do not need to
+register anything on-chain to receive tokens. Your account appears in
+chain state the moment someone sends you a transfer.
+
+Ask the operator of a node you trust (or a faucet, if the chain has
+one) to send you tokens:
+
+```
+Hi, can you send 10,000 tokens to mc1<your address>?
 ```
 
-Share the `mc1…` address printed by `balance` to receive funds.
+A few minutes later (one block, 600 s block time), you have a balance.
 
-### Post a message
+### 3. Send a message
 
 ```bash
-python -m messagechain send "hello"
+messagechain send "hello world"
 ```
 
-### Send / receive tokens
+Your first outgoing transaction reveals your public key on-chain (the
+"first-spend pubkey install" path). After that, every subsequent
+transaction is verified against the installed key.
+
+### 4. Read messages back
 
 ```bash
-python -m messagechain transfer --to <mc1…> --amount 100
-python -m messagechain balance
+messagechain read --last 20
 ```
 
-### Read the last N messages
+## CLI reference
+
+### Personal wallet
 
 ```bash
-python -m messagechain read --last 50    # entity_id, timestamp, message
+messagechain generate-key                       # new private key (offline)
+messagechain verify-key                         # confirm backup
+messagechain account                            # print your address + entity_id
+messagechain balance                            # liquid + staked tokens
+messagechain send "hello"                       # post a message
+messagechain transfer --to mc1… --amount 100    # send tokens
+messagechain read --last 50                     # recent messages
+messagechain estimate-fee --message "hi"        # fee preview
 ```
 
-### Estimate the fee
+### Chain & validator info
 
 ```bash
-python -m messagechain estimate-fee --message "hi"    # or --transfer
-```
-
-### Validator set & stake shares
-
-```bash
-python -m messagechain validators    # entity, stake, share %, blocks produced
-```
-
-### Chain & connectivity
-
-```bash
-python -m messagechain ping    # first-run sanity check: resolves a seed, prints height
-python -m messagechain info    # chain height, supply, validator count, sync status
+messagechain info                               # chain height, supply, sync
+messagechain validators                         # validator set, stakes, shares
+messagechain status --server HOST:9334          # one-call health check
+messagechain status --server HOST:9334 --entity YOUR_ID
+                                                # validator-specific leaf usage
+messagechain ping                               # first-run sanity check
 ```
 
 ### Governance
 
 ```bash
-# Propose — link a PR by pasting its URL into the description
-python -m messagechain propose --title "Adopt EIP-X" \
-    --description "See https://github.com/ben-arnao/MessageChain/pull/42"
-
-python -m messagechain vote --proposal <id> --yes        # or --no
-python -m messagechain proposals                         # status, tally, blocks remaining
+messagechain propose --title "…" --description "…"
+messagechain vote --proposal <id> --yes
+messagechain proposals                          # open proposals + tallies
 ```
 
-### Run a validator (stake + mine)
+### Validator operations
 
-Validator must keep `start --mine` running continuously. Use a dedicated machine.
+See [`docs/second-validator-onboarding.md`](docs/second-validator-onboarding.md)
+for the full multi-validator flow.
 
 ```bash
-python -m messagechain start --mine                  # foreground; also syncs the chain
-python -m messagechain stake --amount 100            # min stake graduates 1→10→100 with chain height; 7-day unbonding
-python -m messagechain unstake --amount 100
+messagechain start --mine                       # run a validator
+messagechain stake --amount 10000               # lock as validator stake
+messagechain unstake --amount 5000              # 7-day unbonding
+messagechain key-status                         # WOTS+ leaf usage; when to rotate
+messagechain rotate-key                         # fresh keypair, old key retired
+messagechain set-authority-key --authority-pubkey <cold_hex>
+messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
 
-Chain data: `~/.messagechain/chaindata/` (override with `--data-dir`).
+## Launching a new chain (founder runbook)
 
-**Unattended** (systemd, Docker): put the key in a 0600 file and pass `--keyfile`.
-
-**Bootstrap seed** — one command registers, sets a cold authority key, and stakes:
-
-```bash
-python -m messagechain bootstrap-seed \
-    --authority-pubkey <cold_pubkey_hex> --stake-amount 250000
-```
-
-**Cold-key separation** — after set-up, `unstake` and `emergency-revoke` require the cold key:
+If you are minting a fresh MessageChain (not joining mainnet), see
+[`docs/operator-action-items.md`](docs/operator-action-items.md) for the
+full checklist.  The one-shot is:
 
 ```bash
-python -m messagechain set-authority-key --authority-pubkey <hex>
-python -m messagechain emergency-revoke --entity-id <hex>   # kill-switch, cold-signed
-```
+# Offline, on an air-gapped machine:
+python -c "import secrets; print(secrets.token_hex(32))" > /etc/messagechain/keyfile
+chmod 400 /etc/messagechain/keyfile
 
-**Rotate WOTS+ signing key** before leaves exhaust (~80%):
-
-```bash
-python -m messagechain key-status
-python -m messagechain rotate-key
-```
-
-### Sync the chain (independent audit, no mining)
-
-```bash
-python -m messagechain start    # relay-only: downloads and verifies the full chain
-```
-
-## Founder runbook (launching a new chain)
-
-If you are the first operator of a fresh MessageChain, the repo ships a
-single-command bootstrap script.  Everyone else — including any later
-validators — joins via the normal `start --mine` flow and syncs from
-your node.
-
-```bash
-# 1. Generate a 32-byte key offline, save hex to a 0600 file
-python -c "import os; print(os.urandom(32).hex())" > /etc/messagechain/keyfile
-chmod 600 /etc/messagechain/keyfile
-
-# 2. Mint genesis + stake in one shot
 python deploy/launch_single_validator.py \
     --data-dir /var/lib/messagechain \
-    --keyfile /etc/messagechain/keyfile
-# → prints your address, block-0 hash, balance, stake
+    --keyfile /etc/messagechain/keyfile \
+    --liquid 5000000 --stake 95000000 --tree-height 20
+# → prints your block-0 hash and validator address
 
-# 3. Paste the block-0 hash into messagechain/config.py PINNED_GENESIS_HASH
-#    and commit.  This stops any future cloner from minting a competing
-#    genesis on their own machine.
-
-# 4. Start the server (systemd unit provided at deploy/systemd/)
-sudo cp deploy/systemd/messagechain-validator.service /etc/systemd/system/
-sudo systemctl enable --now messagechain-validator
+# Commit the block-0 hash into messagechain/config.py _MAINNET_GENESIS_HASH
+# (or _TESTNET_GENESIS_HASH for a testnet), then deploy your validator.
 ```
 
-### Deployment profiles
+## Deployment profiles
 
-A single env var, `MESSAGECHAIN_PROFILE`, flips a coherent bundle of
-defaults:
+`MESSAGECHAIN_PROFILE` flips a coherent bundle of defaults:
 
-- `production` (or unset) — strict defaults: 600s blocks,
-  `MERKLE_TREE_HEIGHT=20` (~2 years of hot-key runtime), checkpoints
-  required, RPC auth enabled.
+- `production` (default) — 600s blocks, MERKLE_TREE_HEIGHT=20,
+  checkpoints required, RPC auth enabled.
 - `prototype` — bootstrap-phase bundle: 30s blocks,
-  `MERKLE_TREE_HEIGHT=16` (~5 min keygen on a weak VM), checkpoints
-  waived, RPC auth disabled.
+  MERKLE_TREE_HEIGHT=16, checkpoints waived, RPC auth disabled.
 
-Individual env vars (`MESSAGECHAIN_BLOCK_TIME_TARGET`,
-`MESSAGECHAIN_MERKLE_TREE_HEIGHT`, `MESSAGECHAIN_REQUIRE_CHECKPOINTS`,
-`MESSAGECHAIN_RPC_AUTH_ENABLED`) still override the profile for
-fine-grained control. Precedence: individual env var > profile > hardcoded default.
+Individual env vars
+(`MESSAGECHAIN_BLOCK_TIME_TARGET`, `MESSAGECHAIN_MERKLE_TREE_HEIGHT`,
+`MESSAGECHAIN_REQUIRE_CHECKPOINTS`, `MESSAGECHAIN_RPC_AUTH_ENABLED`)
+override individual profile entries.
 
-Unknown profile values raise a clear error at startup — no silent
-fallback. The shipped systemd unit runs with
-`MESSAGECHAIN_PROFILE=prototype` during the bootstrap phase; flip to
-`production` (or drop the env var) for mainnet-cadence operation.
+## Documentation
+
+- [`docs/launch-readiness.md`](docs/launch-readiness.md) — current launch state, dashboard
+- [`docs/security-model.md`](docs/security-model.md) — threat model + external-audit scope
+- [`docs/known-issues.md`](docs/known-issues.md) — triaged deferrals + post-launch roadmap
+- [`docs/operator-action-items.md`](docs/operator-action-items.md) — pre-mainnet checklist
+- [`docs/mainnet-params.md`](docs/mainnet-params.md) — block-0-immutable parameters
+- [`docs/going-live.md`](docs/going-live.md) — operator deployment runbook
+- [`docs/backup-restore-runbook.md`](docs/backup-restore-runbook.md) — disaster recovery
+- [`docs/key-rotation-runbook.md`](docs/key-rotation-runbook.md) — WOTS+ key rotation
+- [`docs/second-validator-onboarding.md`](docs/second-validator-onboarding.md) — bringing N>1
+- [`docs/tor-setup.md`](docs/tor-setup.md) — hidden-service setup for adversarial environments
+- [`docs/system-audit.md`](docs/system-audit.md) — running audit log
 
 ## Tests
 
 ```bash
 python -m unittest discover tests/
+# 2,065 tests, 3 skipped
 ```
+
+## License
+
+MIT.  See `LICENSE`.
