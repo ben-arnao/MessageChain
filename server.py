@@ -642,12 +642,26 @@ class Server:
                 await writer.drain()
                 return
 
-            length_bytes = await reader.readexactly(4)
-            length = struct.unpack(">I", length_bytes)[0]
-            if length > 1_000_000:  # 1MB limit (reduced from 10MB)
+            # Wrap readexactly in wait_for so a slow-loris client can't
+            # pin this handler open forever.  30s is generous for a 4-byte
+            # length prefix and whatever body fits in 1MB over a normal
+            # network; anything slower is either broken or adversarial.
+            # Without the timeout, an attacker opens a connection, drips
+            # 1 byte every 60s, and consumes an event-loop slot indefinitely.
+            try:
+                length_bytes = await asyncio.wait_for(
+                    reader.readexactly(4), timeout=30,
+                )
+                length = struct.unpack(">I", length_bytes)[0]
+                if length > 1_000_000:  # 1MB limit (reduced from 10MB)
+                    writer.close()
+                    return
+                data = await asyncio.wait_for(
+                    reader.readexactly(length), timeout=30,
+                )
+            except asyncio.TimeoutError:
                 writer.close()
                 return
-            data = await reader.readexactly(length)
             request = safe_json_loads(data.decode("utf-8"), max_depth=16)
 
             # RPC authentication — only admin methods (ban_peer, unban_peer,
@@ -811,11 +825,36 @@ class Server:
             return {"ok": True, "result": {"messages": messages}}
 
         elif method == "list_proposals":
+            # Cap response size — a chain with thousands of proposals would
+            # otherwise let any unauthenticated caller trigger a megabyte+
+            # JSON serialization per RPC.  500 is large enough for any
+            # realistic governance workload and small enough to keep
+            # response time + bandwidth bounded.
             proposals = self.blockchain.governance.list_proposals(self.blockchain.height)
-            return {"ok": True, "result": {"proposals": proposals}}
+            truncated = len(proposals) > 500
+            return {
+                "ok": True,
+                "result": {
+                    "proposals": proposals[:500],
+                    "truncated": truncated,
+                    "total": len(proposals),
+                },
+            }
 
         elif method == "list_validators":
-            return {"ok": True, "result": {"validators": self.blockchain.list_validators()}}
+            # Same response-size cap rationale as list_proposals.  The
+            # mainnet validator set will grow over time; without a cap the
+            # whole set is serialized on every call.
+            vals = self.blockchain.list_validators()
+            truncated = len(vals) > 500
+            return {
+                "ok": True,
+                "result": {
+                    "validators": vals[:500],
+                    "truncated": truncated,
+                    "total": len(vals),
+                },
+            }
 
         elif method == "get_network_validators":
             return {"ok": True, "result": self._rpc_get_network_validators()}

@@ -225,8 +225,15 @@ class Node:
         #       we do NOT re-request — silent give-up until a future
         #       cycle advertises it again.  The set is cleared when a
         #       new digest arrives from the peer.
-        self._mempool_digest_last_seen: dict[str, float] = {}
-        self._mempool_requested_hashes: dict[str, set] = {}
+        # OrderedDict (not dict) so we can evict the oldest entry when the
+        # map grows past _MEMPOOL_PEER_TRACK_CAP.  Without a cap, a peer
+        # churning source ports on reconnect leaves stale entries forever
+        # and the maps grow unbounded (memory DoS on long-running nodes).
+        # We keep 4× MAX_PEERS so brief peer churn during reconnection
+        # doesn't evict live peers.
+        self._mempool_digest_last_seen: "OrderedDict[str, float]" = OrderedDict()
+        self._mempool_requested_hashes: "OrderedDict[str, set]" = OrderedDict()
+        self._mempool_peer_track_cap = 4 * MAX_PEERS
 
         # Equivocation watcher — files slash evidence automatically when
         # any peer double-signs a block header or attestation on the
@@ -1016,6 +1023,17 @@ class Node:
         elif msg.msg_type == MessageType.REQUEST_MEMPOOL_TX:
             await self._handle_request_mempool_tx(msg.payload, peer)
 
+        else:
+            # Unknown/unhandled message type. Includes protocol types that
+            # are defined in MessageType but not yet dispatched here (e.g.
+            # future extensions) AND any junk a peer sends outside the
+            # defined enum.  Both cases need a ban-score penalty — without
+            # one, a peer can burn our CPU on deserialization forever.
+            self.ban_manager.record_offense(
+                address, OFFENSE_PROTOCOL_VIOLATION,
+                f"unhandled_msg_type:{msg.msg_type}",
+            )
+
     @staticmethod
     def _is_valid_peer_address(host: str, port) -> bool:
         """Reject non-routable IPs and out-of-range ports (eclipse resistance).
@@ -1414,6 +1432,10 @@ class Node:
         now = _time.time()
         last = self._mempool_digest_last_seen.get(peer.address)
         self._mempool_digest_last_seen[peer.address] = now
+        self._mempool_digest_last_seen.move_to_end(peer.address)
+        while len(self._mempool_digest_last_seen) > self._mempool_peer_track_cap:
+            evicted, _ = self._mempool_digest_last_seen.popitem(last=False)
+            self._mempool_requested_hashes.pop(evicted, None)
         if last is not None and (now - last) < MEMPOOL_DIGEST_MIN_INTERVAL_SEC:
             # Silently drop — no offense score; honest peers might retry
             # on a tight schedule during catch-up.
@@ -1422,6 +1444,9 @@ class Node:
         # A fresh digest — clear our "requested-in-this-cycle" set so we
         # are willing to ask for hashes that the peer re-advertises.
         self._mempool_requested_hashes[peer.address] = set()
+        self._mempool_requested_hashes.move_to_end(peer.address)
+        while len(self._mempool_requested_hashes) > self._mempool_peer_track_cap:
+            self._mempool_requested_hashes.popitem(last=False)
 
         # Compute the set of hashes we don't already have.  Also skip
         # anything we've already requested from this peer (can't happen
@@ -1688,7 +1713,15 @@ class Node:
 
     async def _broadcast(self, msg: NetworkMessage, exclude: str = ""):
         """Broadcast a message to all connected peers."""
-        for addr, peer in self.peers.items():
+        # Snapshot the peer set first — write_message is async, so another
+        # coroutine can mutate self.peers (handshake completion, disconnect,
+        # ban) across an `await`, which would raise RuntimeError: dictionary
+        # changed size during iteration and crash the broadcast.  The list
+        # copy is O(peers) and only pays the iteration cost; the stale
+        # entries (if a peer disconnects mid-broadcast) are caught by the
+        # is_connected check + try/except per-peer.
+        snapshot = list(self.peers.items())
+        for addr, peer in snapshot:
             if addr != exclude and peer.is_connected and peer.writer:
                 try:
                     await write_message(peer.writer, msg)
