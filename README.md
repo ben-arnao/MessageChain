@@ -131,13 +131,3 @@ messagechain set-authority-key --authority-pubkey <cold_hex>
 messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
 
-## Tests
-
-```bash
-python -m unittest discover tests/
-# 2,065 tests, 3 skipped
-```
-
-## License
-
-MIT.  See `LICENSE`.
