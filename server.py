@@ -285,6 +285,9 @@ def _load_or_create_entity(
             if entity is not None:
                 logger.info("Loaded keypair from cache %s", cache_file)
                 _bind_leaf_index_path(entity, data_dir)
+                _attach_merkle_node_cache(
+                    entity, private_key, tree_height, data_dir, no_cache,
+                )
                 return entity
             logger.warning(
                 "Corrupt or unauthenticated keypair cache %s — deleting "
