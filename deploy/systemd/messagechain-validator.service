@@ -53,6 +53,21 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# MemoryDenyWriteExecute blocks mmap(PROT_WRITE | PROT_EXEC) + mprotect
+# transitions — the primary vector for shellcode execution from a
+# memory-corruption bug.  Python's CPython doesn't JIT, so this never
+# breaks the runtime.
+MemoryDenyWriteExecute=true
+# PrivateIPC + RemoveIPC: no host IPC namespace visibility, and any
+# IPC resources created by this service are removed at stop.  Prevents
+# a compromised service leaving a foothold via SYSV shared memory /
+# semaphores.
+PrivateIPC=true
+RemoveIPC=true
+# ProcSubset=pid hides non-process entries in /proc (cpuinfo, meminfo,
+# etc.) — unnecessary for the validator and useful info for an
+# attacker fingerprinting the host.
+ProcSubset=pid
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 ReadWritePaths=/var/lib/messagechain

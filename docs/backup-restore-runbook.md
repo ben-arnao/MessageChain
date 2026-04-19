@@ -145,7 +145,7 @@ Regardless of scenario, after restore:
 
 - [ ] `systemctl status messagechain-validator` → `active (running)`
 - [ ] `ss -tlnp | grep -E '9333|9334'` → both ports listening
-- [ ] `python -m messagechain info --server 35.237.211.12:9334` → chain
+- [ ] `messagechain info --server 35.237.211.12:9334` → chain
       height matches the snapshot's expected height (within a few blocks
       of the snapshot time — any new blocks produced since the snapshot
       are LOST)

@@ -1707,8 +1707,11 @@ def cmd_generate_key(_args):
     for row in rows:
         print(row)
     print(f"\n  Hex form (alternative): {encoded_hex}")
+    from messagechain.identity.address import encode_address
     print(f"\n  Public key:  {entity.public_key.hex()}")
     print(f"  Entity ID:   {entity.entity_id_hex}")
+    print(f"  Address:     {encode_address(entity.entity_id)}")
+    print(f"               ^ share this `mc1...` form to receive funds")
     print(f"\n  The recovery phrase follows BIP-39 — every word comes from a")
     print("  known 2048-word list, with a built-in checksum that detects")
     print("  single-word transcription errors when you type it back.")
@@ -1735,9 +1738,11 @@ def cmd_verify_key(_args):
         print(f"Error: {e}")
         sys.exit(1)
 
+    from messagechain.identity.address import encode_address
     print(f"\n  Public key:  {entity.public_key.hex()}")
     print(f"  Entity ID:   {entity.entity_id_hex}")
-    print(f"\n  Confirm these match your records.")
+    print(f"  Address:     {encode_address(entity.entity_id)}")
+    print(f"\n  Confirm all three match your records.")
 
 
 def cmd_read(args):

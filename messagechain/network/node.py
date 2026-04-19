@@ -1778,6 +1778,14 @@ class Node:
         if self.syncer.is_syncing:
             return
 
+        # Leaf-reuse defence after snapshot restore.  Twin of the guard
+        # in server.py.  If any known peer has a higher chain height, we
+        # are behind — producing now could reuse a WOTS+ leaf we've
+        # already committed to on the version of history we rolled back.
+        # No peers → no constraint (bootstrap-phase validator runs alone).
+        if self.syncer.needs_sync():
+            return
+
         ok, round_number, _reason = block_producer.should_propose(
             self.blockchain, self.consensus, self.entity.entity_id,
         )

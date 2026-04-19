@@ -1870,6 +1870,18 @@ class Server:
         if self.syncer.is_syncing:
             return None
 
+        # Leaf-reuse defence after snapshot restore.
+        # If any known peer has a higher chain height than us, our local
+        # view is stale.  Producing a block with leaf N could collide with
+        # a signature we produced on the version of the chain we rolled
+        # back — catastrophic for a WOTS+ one-time key.  Refuse to
+        # produce until IBD catches us up.  At N=0 peers (bootstrap-phase
+        # single-validator mainnet), this guard is a no-op — we
+        # produce normally.  As soon as peers exist, we respect their
+        # view before signing.
+        if self.syncer.needs_sync():
+            return None
+
         # Need a full entity (with keypair) to sign blocks
         if self.wallet_entity is None or self.wallet_id not in self.blockchain.public_keys:
             return None

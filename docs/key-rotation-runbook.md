@@ -7,7 +7,7 @@ improvise.
 
 ## When to rotate
 
-- **Leaf watermark ≥ 80% of tree capacity** (`python -m messagechain key-status`
+- **Leaf watermark ≥ 80% of tree capacity** (`messagechain key-status`
   will warn you; the server also logs WARN at 80% and 95%).  Rotation before
   exhaustion is mandatory — a validator that exhausts its WOTS+ leaves mid-slot
   will miss blocks and bleed stake to inactivity penalties.
@@ -18,7 +18,7 @@ improvise.
 
 ## What rotation does
 
-`python -m messagechain rotate-key` submits a `RotateKeyTransaction` signed
+`messagechain rotate-key` submits a `RotateKeyTransaction` signed
 by the **current** hot key.  It swaps in a new public key on-chain.  After
 the next block confirms, the OLD key can no longer sign for this entity —
 the chain refuses any signature whose Merkle root doesn't match the new
@@ -37,10 +37,10 @@ the recipient address to keep sending you funds.
       installing it).
 - [ ] You have enough balance to pay `KEY_ROTATION_FEE` (1000 tokens by
       default — see `messagechain/config.py`).  Check with
-      `python -m messagechain balance`.
+      `messagechain balance`.
 - [ ] The current hot key still has at least 1 unused WOTS+ leaf.  The
       rotate-key tx itself consumes one leaf.  Verify with
-      `python -m messagechain key-status`.
+      `messagechain key-status`.
 
 ## Procedure
 
@@ -80,7 +80,7 @@ From the machine that currently has the **old** key (the validator VM
 or wherever the CLI is authorized):
 
 ```bash
-python -m messagechain rotate-key --new-pubkey <new_public_key_hex>
+messagechain rotate-key --new-pubkey <new_public_key_hex>
 ```
 
 The CLI will:
@@ -93,7 +93,7 @@ The CLI will:
 Wait for the tx to be included in a block (~10 min on production):
 
 ```bash
-python -m messagechain key-status
+messagechain key-status
 # Public key should show the NEW value after confirmation.
 ```
 
@@ -134,7 +134,7 @@ shred -u /tmp/new-keyfile
 
 ```bash
 # From anywhere:
-python -m messagechain key-status
+messagechain key-status
 # public_key should match what you derived in step 2.
 
 # On the VM:
@@ -156,7 +156,7 @@ attempt leaks metadata).  Destroy all copies:
 
 ## After rotation
 
-- [ ] `python -m messagechain key-status` shows the new public key
+- [ ] `messagechain key-status` shows the new public key
 - [ ] The server on the VM is producing blocks (`journalctl | grep "Block #"`)
 - [ ] All paper backups of the NEW key are stored securely in ≥2 locations
 - [ ] All copies of the OLD key are destroyed
