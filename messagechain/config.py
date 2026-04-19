@@ -355,6 +355,13 @@ MAX_PROPOSER_FALLBACK_ROUNDS = 5
 # ProposalTransaction is effectively no-op (fee still paid, proposal
 # not tracked) — the cost falls on the spammer.
 MAX_ACTIVE_PROPOSALS = 500
+# Upper bound on base_fee growth.  Without this, spam-fill attacks can
+# compound +12.5% per block indefinitely (EIP-1559 style adjustments are
+# unbounded above).  10000x MIN_FEE gives ~1M tokens-per-tx at MIN_FEE=100
+# which is clearly pathological — honest org fees sit orders of magnitude
+# below.  Recovery on the way down is symmetric, so the cap also bounds
+# the post-attack recovery tail.
+MAX_BASE_FEE_MULTIPLIER = 10_000
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)

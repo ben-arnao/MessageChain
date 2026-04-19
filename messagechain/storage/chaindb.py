@@ -31,6 +31,51 @@ class ChainDB:
         self._local = threading.local()
         self._init_schema()
         self._check_db_permissions()
+        self._check_and_write_schema_version()
+
+    def _check_and_write_schema_version(self):
+        """Enforce a schema-version pin in the meta table.
+
+        _SCHEMA_VERSION is the binary compatibility token.  On first
+        init we write it; on every subsequent open we refuse to start
+        if the token on disk disagrees with the code's version.  Without
+        this, a newer validator binary silently opens an older schema
+        and CREATE TABLE IF NOT EXISTS papers over missing columns —
+        nodes with the old schema silently return NULL for new fields
+        while peers with the new schema produce real values, which can
+        diverge consensus.
+
+        Migration path: each version bump ships with an explicit
+        ALTER-driven migration function.  This check is the tripwire
+        that forces us to write one rather than ride the silent-
+        default train.
+        """
+        conn = self._conn
+        cur = conn.execute(
+            "SELECT value FROM meta WHERE key = ?", ("schema_version",),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # Fresh DB (or one created before this check landed); stamp it.
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("schema_version", str(_SCHEMA_VERSION)),
+            )
+            conn.commit()
+            return
+        try:
+            on_disk = int(row[0])
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"chain.db meta.schema_version is not an integer: {row[0]!r}"
+            )
+        if on_disk != _SCHEMA_VERSION:
+            raise RuntimeError(
+                f"chain.db schema version mismatch: disk={on_disk}, "
+                f"code={_SCHEMA_VERSION}.  A migration is required before "
+                f"this binary can open this database — do NOT downgrade "
+                f"or upgrade across versions without running the migration."
+            )
 
     def _check_db_permissions(self):
         """Warn if chain.db is world-writable.

@@ -243,11 +243,21 @@ class SupplyTracker:
         if parent_tx_count == TARGET_BLOCK_SIZE:
             return self.base_fee
 
+        from messagechain.config import MIN_FEE, MAX_BASE_FEE_MULTIPLIER
+        max_base_fee = MIN_FEE * MAX_BASE_FEE_MULTIPLIER
         if parent_tx_count > TARGET_BLOCK_SIZE:
             # Block was over target — increase base fee
             excess = parent_tx_count - TARGET_BLOCK_SIZE
             delta = self.base_fee * excess // (TARGET_BLOCK_SIZE * BASE_FEE_MAX_CHANGE_DENOMINATOR)
-            self.base_fee += max(1, delta)  # always increase by at least 1
+            # Upper bound on base_fee: without a cap, a determined attacker
+            # willing to burn tokens on full blocks can compound +12.5% per
+            # block indefinitely, permanently pricing out honest users even
+            # after the attack stops (base_fee only drops 12.5% per
+            # empty-target block on the way down, so recovery is symmetric
+            # but a month-long attack leaves a month-long recovery tail).
+            # Cap at MAX_BASE_FEE_MULTIPLIER × MIN_FEE — well above any
+            # realistic organic fee but finite.
+            self.base_fee = min(self.base_fee + max(1, delta), max_base_fee)
         else:
             # Block was under target — decrease base fee
             deficit = TARGET_BLOCK_SIZE - parent_tx_count
