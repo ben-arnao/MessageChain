@@ -1036,3 +1036,12 @@ if _os_local.path.isfile(_local_path):
     for _name in dir(_mod):
         if not _name.startswith("_"):
             globals()[_name] = getattr(_mod, _name)
+
+# If the local override flipped NETWORK_NAME (e.g. the default "testnet"
+# baked in above was replaced with "mainnet" by an operator's
+# config_local.py), re-resolve PINNED_GENESIS_HASH so it tracks the
+# current network rather than the default.  Without this, flipping
+# NETWORK_NAME alone leaves PINNED_GENESIS_HASH stuck at the original
+# network's pin, and the validator silently rejects its own chain.
+if "PINNED_GENESIS_HASH" not in (dir(_mod) if _os_local.path.isfile(_local_path) else []):
+    PINNED_GENESIS_HASH = _resolve_pinned_genesis_hash(NETWORK_NAME)
