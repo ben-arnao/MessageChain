@@ -338,6 +338,23 @@ MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current t
 # can opt in via MESSAGECHAIN_PROFILE=prototype (30s) or override
 # individually via MESSAGECHAIN_BLOCK_TIME_TARGET.
 BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_TARGET", 600)
+# Cap on how many fallback rounds a block's claimed timestamp can imply
+# past the parent.  Block round is computed as
+# int((block.ts - parent.ts - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET),
+# and at our 2-hour future-drift bound a malicious proposer could otherwise
+# claim round 11 to skip the honest round-0 proposer.  Five fallback rounds
+# covers legitimate missed-slot scenarios with margin; anything beyond is
+# network pathology or abuse.
+MAX_PROPOSER_FALLBACK_ROUNDS = 5
+# Cap on concurrently-active governance proposals.  Without this, an
+# attacker willing to pay PROPOSAL_FEE per proposal can spin up enough
+# proposals to balloon governance state (each snapshot copies the
+# staking electorate) — bounded only by the ~7-day voting window.
+# 500 proposals is already more than a healthy governance cadence;
+# add_proposal returns False past this bound, and the attached
+# ProposalTransaction is effectively no-op (fee still paid, proposal
+# not tracked) — the cost falls on the spammer.
+MAX_ACTIVE_PROPOSALS = 500
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)

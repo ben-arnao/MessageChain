@@ -3171,6 +3171,19 @@ class Blockchain:
                 round_number = 0
             else:
                 round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
+                # Round cap.  Without this a proposer could push the
+                # timestamp forward by the full future-drift window
+                # (~2 hours) to claim a round where someone else is
+                # selected, skipping the honest round-0 proposer.  Cap
+                # at a small constant — legitimate missed-slot fallback
+                # rarely exceeds a handful of rounds, and any gap larger
+                # than that is either network pathology or abuse.
+                if round_number > _cfg.MAX_PROPOSER_FALLBACK_ROUNDS:
+                    return False, (
+                        f"Proposer round {round_number} exceeds cap "
+                        f"{_cfg.MAX_PROPOSER_FALLBACK_ROUNDS} — "
+                        f"timestamp-skew slot hijacking rejected"
+                    )
 
             expected_proposer = self._selected_proposer_for_slot(latest, round_number)
             if expected_proposer != block.header.proposer_id:
@@ -5302,6 +5315,15 @@ class Blockchain:
             # for any tx that references the affected entities.
             "entity_id_to_index": dict(self.entity_id_to_index),
             "next_entity_index": self._next_entity_index,
+            # Attestation-layer finality + escrow are also mutated by
+            # _apply_block_state.  If a block passes structural validation
+            # but its declared state_root disagrees with ours, add_block
+            # rolls back via _restore_memory_snapshot — without these
+            # fields the rollback leaves finality/escrow carrying
+            # mutations from the rejected block.  deepcopy because both
+            # carry nested dicts/sets.
+            "finality": copy.deepcopy(self.finality),
+            "escrow": copy.deepcopy(self._escrow),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -5393,6 +5415,14 @@ class Blockchain:
             self._next_entity_index = int(snapshot.get(
                 "next_entity_index", max(self.entity_id_to_index.values(), default=0) + 1,
             ))
+        # Finality tracker + escrow carry same-block-only mutations that
+        # must be reverted when the containing block's state_root fails
+        # validation.  Default to fresh instances when absent (pre-field
+        # snapshot), since that matches an uninitialised chain.
+        if "finality" in snapshot:
+            self.finality = copy.deepcopy(snapshot["finality"])
+        if "escrow" in snapshot:
+            self._escrow = copy.deepcopy(snapshot["escrow"])
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
         """Return the WOTS+ Merkle tree height recorded for `entity_id`.

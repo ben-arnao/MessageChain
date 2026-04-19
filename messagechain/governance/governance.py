@@ -627,7 +627,20 @@ class GovernanceTracker:
 
         Tally uses this snapshot only, never live state.  Staking or
         unstaking after proposal creation cannot swing the vote.
+
+        Caps the active-proposals map at MAX_ACTIVE_PROPOSALS.  Without
+        a cap, a well-funded attacker could submit proposals at the
+        PROPOSAL_FEE every block for the full voting window (~1008
+        blocks = ~7 days), and each proposal's stake_snapshot copies
+        the whole staking electorate.  A 10k-validator chain with 1000
+        active proposals is ~320 MB of governance state.  The cap
+        caller-side is preferable to forcing opportunistic pruning of
+        older active proposals (which would let an attacker squeeze
+        out honest ones by timing).
         """
+        from messagechain.config import MAX_ACTIVE_PROPOSALS
+        if len(self.proposals) >= MAX_ACTIVE_PROPOSALS:
+            return False
         stake_snapshot = {
             eid: amount
             for eid, amount in supply_tracker.staked.items()
@@ -640,6 +653,7 @@ class GovernanceTracker:
             stake_snapshot=stake_snapshot,
             total_eligible_stake=total_stake,
         )
+        return True
 
     def prune_closed_proposals(self, current_block: int) -> int:
         """Remove proposals whose voting window has closed.
