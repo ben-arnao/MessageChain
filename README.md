@@ -117,11 +117,9 @@ messagechain proposals                          # open proposals + tallies
 
 ### Validator operations
 
-Running a validator requires a host reachable on TCP 9333 (P2P) and
-9334 (RPC), Python 3.10+, and at least `VALIDATOR_MIN_STAKE = 100`
-tokens staked (10K+ recommended to matter in weight-selection). A
-2 vCPU / 2 GB RAM / 30 GB disk VM is enough. Rotate your WOTS+ key
-before leaf watermark hits 80% — `key-status` will warn you.
+Quick start: stake tokens, then run `start --mine` on a host with
+TCP 9333/9334 open. `key-status` warns you when to rotate your
+WOTS+ signing key before it exhausts.
 
 ```bash
 messagechain start --mine                       # run a validator
