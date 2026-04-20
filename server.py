@@ -1000,6 +1000,9 @@ class Server:
         elif method == "get_peers":
             return self._rpc_get_peers()
 
+        elif method == "get_checkpoint_at_height":
+            return self._rpc_get_checkpoint_at_height(request["params"])
+
         elif method == "estimate_fee":
             return self._rpc_estimate_fee(request.get("params", {}))
 
@@ -1891,6 +1894,31 @@ class Server:
                 "entity_id": getattr(peer, "entity_id", "") or "",
             })
         return {"ok": True, "result": {"peers": rows, "count": len(rows)}}
+
+    def _rpc_get_checkpoint_at_height(self, params: dict) -> dict:
+        """Return (block_number, block_hash, state_root) for an in-chain
+        height.  Exactly the fields a WeakSubjectivityCheckpoint needs —
+        no more, no less.  Read-only; leaks nothing not already derivable
+        from the chain.  Backs `messagechain cut-checkpoint --height N`.
+        """
+        height = params.get("height")
+        if height is None:
+            return {"ok": False, "error": "missing required param: height"}
+        if not isinstance(height, int) or isinstance(height, bool):
+            return {"ok": False, "error": "height must be an integer"}
+        if height < 0:
+            return {"ok": False, "error": f"height must be >= 0 (got {height})"}
+        block = self.blockchain.get_block(height)
+        if block is None:
+            return {
+                "ok": False,
+                "error": f"no block at height {height} (chain tip is {self.blockchain.height - 1})",
+            }
+        return {"ok": True, "result": {
+            "block_number": height,
+            "block_hash": block.block_hash.hex(),
+            "state_root": block.header.state_root.hex(),
+        }}
 
     # ── Block Production ────────────────────────────────────────────
 

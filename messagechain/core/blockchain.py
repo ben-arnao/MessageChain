@@ -5814,6 +5814,13 @@ class Blockchain:
         return {
             "height": self.height,
             "latest_block_hash": self.chain[-1].block_hash.hex() if self.chain else None,
+            # state_root of the tip — consumed by operators cutting a
+            # weak-subjectivity checkpoint (see `messagechain cut-checkpoint`).
+            # Already derivable from the chain, so no new information is
+            # leaked; just saves the caller a full get_block round trip.
+            "state_root": (
+                self.chain[-1].header.state_root.hex() if self.chain else None
+            ),
             "latest_block_timestamp": latest_ts,
             "seconds_since_last_block": seconds_since_last,
             "registered_entities": len(self.public_keys),
