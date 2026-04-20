@@ -580,6 +580,31 @@ class KeyPair:
         # Atomic rename — on POSIX this is guaranteed atomic; on Windows
         # os.replace is as close as we get.
         os.replace(tmp_path, path)
+        # Durability: fsync the parent directory so the rename itself
+        # survives a power loss.  Without this, POSIX can lose the
+        # rename entry even when the file contents are flushed — next
+        # boot sees no leaf-index file, load_leaf_index silently
+        # defaults to _next_leaf=0, and the next sign() reuses leaves
+        # that were already published.  WOTS+ leaf reuse = private
+        # key recovery on that leaf.
+        # Windows has no directory fsync primitive and os.open of a
+        # directory is not supported — skip there.  Windows is not a
+        # production validator target.
+        if hasattr(os, "O_DIRECTORY"):
+            try:
+                dir_fd = os.open(
+                    os.path.dirname(os.path.abspath(path)) or ".",
+                    os.O_RDONLY,
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Some filesystems (tmpfs) don't support dir fsync —
+                # best-effort is acceptable there because they're
+                # volatile by design and not production targets.
+                pass
 
     def load_leaf_index(self, path: str) -> None:
         """Restore _next_leaf from a previously-persisted file.

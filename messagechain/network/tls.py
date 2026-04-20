@@ -126,12 +126,36 @@ class CertificatePinStore:
         self._pins.pop(key, None)
 
     def save(self) -> None:
-        """Persist pins to the JSON file."""
+        """Persist pins to the JSON file — atomically.
+
+        Write to a tmp file → fsync → atomic rename → fsync parent dir.
+        Without this, a crash between `open("w")` and full `json.dump`
+        leaves a truncated JSON file; next start's `load` hits
+        JSONDecodeError and resets all pins to empty.  Every previously-
+        pinned peer becomes first-seen-again, letting an active MITM
+        succeed on reconnect and re-pin the attacker's cert.
+        """
         if self._path is None:
             return
         os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
+        tmp_path = self._path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(self._pins, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self._path)
+        if hasattr(os, "O_DIRECTORY"):
+            try:
+                dir_fd = os.open(
+                    os.path.dirname(os.path.abspath(self._path)) or ".",
+                    os.O_RDONLY,
+                )
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
 
     def load(self) -> None:
         """Load pins from the JSON file.
