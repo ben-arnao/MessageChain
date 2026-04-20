@@ -286,7 +286,7 @@ NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 # 32-byte checkpoint field.  Same founder key, same allocation, new hash.
 _TESTNET_GENESIS_HASH: bytes | None = None
 _MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "53a1ce6217436b83aed7dbd2ab5de431e8bfb793803aee904a7e5d64ba0e4b19"
+    "5d37dd1c4b2603a2414300a3e33578119702dba968efde1c5bb2aa0abb974f20"
 )
 
 

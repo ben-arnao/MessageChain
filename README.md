@@ -3,11 +3,11 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live since 2026-04-20 (re-mint; 2026-04-18 chain
-abandoned after a block-header format change for long-horizon sync via
-periodic state-root checkpoints). Chain ID `messagechain-v1`, genesis
-block 0
-`53a1ce6217436b83aed7dbd2ab5de431e8bfb793803aee904a7e5d64ba0e4b19`.
+**Status:** mainnet live since 2026-04-20 (2nd re-mint after adding
+proof-of-custody archive rewards + attestable censorship-evidence
+slashing — both are consensus-level changes that required another
+fresh chain). Chain ID `messagechain-v1`, genesis block 0
+`5d37dd1c4b2603a2414300a3e33578119702dba968efde1c5bb2aa0abb974f20`.
 Seed peers are baked into `messagechain/config.py:CLIENT_SEED_ENDPOINTS`
 and the current tip is one command away:
 
