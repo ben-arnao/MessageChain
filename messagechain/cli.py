@@ -318,6 +318,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validators.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- peers ---
+    peers = sub.add_parser(
+        "peers",
+        help="List P2P peers connected to the target node",
+        description=(
+            "Show direction (inbound/outbound), connection type, reported "
+            "height, duration of the connection, and peer entity_id for "
+            "every currently-tracked peer.  Observability only — "
+            "routing decisions are not made from CLI output."
+        ),
+    )
+    peers.add_argument("--server", type=str, default=None, help="Server address host:port")
+
     # --- estimate-fee ---
     estimate_fee = sub.add_parser(
         "estimate-fee",
@@ -1988,6 +2001,45 @@ def cmd_validators(args):
         print(f"  {eid:<20} {v['staked']:>14} {v['stake_pct']:>7.2f}% {v['blocks_produced']:>8}")
 
 
+def cmd_peers(args):
+    """List peers connected to the target node, with metadata."""
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    response = rpc_call(host, port, "get_peers", {})
+
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    peers = response["result"]["peers"]
+    count = response["result"].get("count", len(peers))
+    if not peers:
+        print(f"=== Peers (0 — this node has no active P2P connections) ===")
+        return
+
+    # Compact, grep-friendly table.  No ANSI color — some operators
+    # pipe this straight to log aggregators.
+    print(f"=== Peers ({count}) ===\n")
+    print(
+        f"  {'Address':<22} {'Dir':<9} {'Type':<18} {'Height':>8} "
+        f"{'Connected':>11} {'Entity':<20}"
+    )
+    def _fmt_elapsed(s: int) -> str:
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m{s % 60}s"
+        return f"{s // 3600}h{(s % 3600) // 60}m"
+    for p in peers:
+        eid = (p.get("entity_id") or "")[:16]
+        eid_disp = (eid + "...") if eid else "(none)"
+        print(
+            f"  {p['address']:<22} {p['direction']:<9} {p['connection_type']:<18} "
+            f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {eid_disp:<20}"
+        )
+
+
 def cmd_estimate_fee(args):
     """Estimate fee for a message or funds transfer."""
     host, port = _parse_server(args.server)
@@ -2120,6 +2172,7 @@ def main():
         "status": cmd_status,
         "proposals": cmd_proposals,
         "validators": cmd_validators,
+        "peers": cmd_peers,
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,

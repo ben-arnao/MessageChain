@@ -997,6 +997,9 @@ class Server:
         elif method == "get_network_validators":
             return {"ok": True, "result": self._rpc_get_network_validators()}
 
+        elif method == "get_peers":
+            return self._rpc_get_peers()
+
         elif method == "estimate_fee":
             return self._rpc_estimate_fee(request.get("params", {}))
 
@@ -1850,6 +1853,45 @@ class Server:
             row["rpc_port"] = endpoint[1] if endpoint else None
         return {"validators": rows}
 
+    def _rpc_get_peers(self) -> dict:
+        """List every Peer object currently tracked by this node.
+
+        Observability-only.  Returns per-peer: address, direction,
+        connection type, height last reported in handshake, seconds
+        connected, entity_id (if the handshake completed), and a
+        boolean `connected` flag (a peer object can linger after its
+        socket dies — surfacing that lets an operator see churn).
+        Sorted by address for stable CLI output.
+
+        Design note: entity_id lives in peer memory only if the peer
+        sent it in their handshake.  Empty string is rendered as-is
+        so clients can distinguish "no id" from "id = all zeroes".
+        """
+        import time as _time_rpc
+        now = _time_rpc.time()
+        rows: list[dict] = []
+        for _addr, peer in sorted(self.peers.items()):
+            connected_at = getattr(peer, "connected_at", 0.0) or 0.0
+            seconds_connected = (
+                int(now - connected_at) if connected_at > 0 else 0
+            )
+            try:
+                conn_type = peer.connection_type.value
+            except AttributeError:
+                conn_type = str(peer.connection_type)
+            rows.append({
+                "address": peer.address,
+                "direction": getattr(peer, "direction", "inbound"),
+                "connection_type": conn_type,
+                "connected": bool(peer.is_connected),
+                "connected_at": int(connected_at),
+                "seconds_connected": seconds_connected,
+                "height": int(getattr(peer, "peer_height", 0) or 0),
+                "version": str(getattr(peer, "peer_version", "") or ""),
+                "entity_id": getattr(peer, "entity_id", "") or "",
+            })
+        return {"ok": True, "result": {"peers": rows, "count": len(rows)}}
+
     # ── Block Production ────────────────────────────────────────────
 
     async def _block_production_loop(self):
@@ -2067,7 +2109,13 @@ class Server:
             writer.close()
             return
 
-        peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
+        import time as _time_peer
+        peer = Peer(
+            host=addr[0], port=addr[1], reader=reader, writer=writer,
+            is_connected=True,
+            direction="inbound",
+            connected_at=_time_peer.time(),
+        )
         # C10: timeout on reads to prevent slow-loris DoS
         first_message = True
         try:
@@ -2102,9 +2150,12 @@ class Server:
                 timeout=HANDSHAKE_TIMEOUT,
             )
             conn_type = self._next_connection_type()
+            import time as _time_peer
             peer = Peer(
                 host=host, port=port, reader=reader, writer=writer,
                 is_connected=True, connection_type=conn_type,
+                direction="outbound",
+                connected_at=_time_peer.time(),
             )
             self.peers[addr] = peer
 
@@ -2166,6 +2217,12 @@ class Server:
                 return
 
             peer.entity_id = sender_id
+            # Mirror the handshake-reported height onto the peer object
+            # so the get_peers RPC can surface it.  The ChainSyncer
+            # tracks peer heights for sync decisions via a separate
+            # path; this field is observability-only.
+            peer.peer_height = peer_height
+            peer.peer_version = str(msg.payload.get("version", ""))
             self.peers[peer.address] = peer
             # Track peer height AND cumulative weight for sync
             best_hash = msg.payload.get("best_block_hash", "")

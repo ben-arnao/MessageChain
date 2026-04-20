@@ -35,6 +35,13 @@ class Peer:
     writer: object = None
     is_connected: bool = False
     connection_type: ConnectionType = ConnectionType.FULL_RELAY
+    # Observability metadata — surfaced via the get_peers RPC.  None of
+    # these participate in consensus; they exist so operators can see
+    # the network shape from the CLI without scraping journald.
+    direction: str = "inbound"       # "inbound" | "outbound"
+    connected_at: float = 0.0        # unix seconds; 0 until socket opens
+    peer_height: int = 0             # peer's last-reported chain height
+    peer_version: str = ""           # peer's self-reported version string
     # inv/getdata: track which tx hashes this peer already knows about
     known_txs: object = field(default_factory=lambda: _LRUSet(SEEN_TX_CACHE_SIZE))
 
