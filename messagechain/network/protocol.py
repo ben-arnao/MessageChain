@@ -40,6 +40,14 @@ class MessageType(Enum):
     # ephemeral per-slot attestation tracker.
     ANNOUNCE_FINALITY_VOTE = "announce_finality_vote"
 
+    # CustodyProof gossip — Proof-of-Custody archive rewards.  Proofs
+    # flow peer-to-peer like txs and live in a dedicated proof mempool
+    # (messagechain.consensus.archive_proof_mempool) until the next
+    # archive-challenge block proposer packs them.  Payload shape:
+    # CustodyProof.serialize() dict.
+    # See messagechain.consensus.archive_challenge for the full spec.
+    ANNOUNCE_CUSTODY_PROOF = "announce_custody_proof"
+
     # Non-message-tx gossip: stake / unstake / authority-tx (SetAuthorityKey,
     # Revoke, KeyRotation) / governance txs. Without this, a pending tx
     # submitted to one node would only land in a block if that specific

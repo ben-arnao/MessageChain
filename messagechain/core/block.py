@@ -395,6 +395,13 @@ class Block:
     # persists across restart, so a cold-booted node inherits the
     # chain's irreversibility commitments.
     finality_votes: list = field(default_factory=list)  # list[FinalityVote]
+    # Proof-of-Custody archive-reward proofs.  Non-empty ONLY on
+    # challenge blocks (heights satisfying is_archive_challenge_block
+    # in messagechain.config).  Every entry's .tx_hash is folded into
+    # merkle_root so a byzantine relayer cannot strip or mutate proofs
+    # in transit — the hygiene pattern mirrors slash_transactions and
+    # finality_votes.  See messagechain.consensus.archive_challenge.
+    custody_proofs: list = field(default_factory=list)  # list[CustodyProof]
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -433,6 +440,8 @@ class Block:
             result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
         if self.finality_votes:
             result["finality_votes"] = [v.serialize() for v in self.finality_votes]
+        if self.custody_proofs:
+            result["custody_proofs"] = [p.serialize() for p in self.custody_proofs]
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -460,6 +469,7 @@ class Block:
             stake_count      (u32)  + N x (stake_len u32 + stake_blob)
             unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
             fvote_count      (u32)  + N x (fvote_len u32 + fvote_blob)
+            cproof_count     (u32)  + N x (cproof_len u32 + cproof_blob)
             32               block_hash
 
         (The `reg_count`/registration-tx block slot was removed with
@@ -568,6 +578,11 @@ class Block:
             enc_list(self.stake_transactions),
             enc_list(self.unstake_transactions),
             enc_list(self.finality_votes),
+            # custody_proofs trails finality_votes — CustodyProof is
+            # the newest participating type.  Empty list encodes as a
+            # single u32 zero, so non-challenge blocks pay only the 4-
+            # byte header.
+            enc_list(self.custody_proofs),
             self.block_hash,
         ])
 
@@ -704,6 +719,12 @@ class Block:
         from messagechain.consensus.finality import FinalityVote
         finality_votes = dec_list(FinalityVote)
 
+        # CustodyProofs — archive-reward proofs.  Non-challenge blocks
+        # decode an empty list; validate_block enforces the hygiene
+        # rule that only challenge blocks may carry non-empty proofs.
+        from messagechain.consensus.archive_challenge import CustodyProof
+        custody_proofs = dec_list(CustodyProof)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -719,6 +740,7 @@ class Block:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             finality_votes=finality_votes,
+            custody_proofs=custody_proofs,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -769,12 +791,19 @@ class Block:
             finality_votes = [
                 FinalityVote.deserialize(v) for v in data["finality_votes"]
             ]
+        custody_proofs = []
+        if data.get("custody_proofs"):
+            from messagechain.consensus.archive_challenge import CustodyProof
+            custody_proofs = [
+                CustodyProof.deserialize(p) for p in data["custody_proofs"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
                     unstake_transactions=unstake_txs,
-                    finality_votes=finality_votes)
+                    finality_votes=finality_votes,
+                    custody_proofs=custody_proofs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

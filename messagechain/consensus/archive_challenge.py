@@ -232,6 +232,108 @@ class CustodyProof:
             merkle_layer_sizes=list(data.get("merkle_layer_sizes", [])),
         )
 
+    def canonical_bytes(self) -> bytes:
+        """Stable byte encoding used as the block-layer commitment.
+
+        Covers every field that binds the proof to its claimed custody
+        act — anyone mutating any of these invalidates the hash,
+        therefore invalidates block.merkle_root, therefore invalidates
+        the proposer's signature.  A MITM that flips `prover_id` alone
+        breaks commitment, so the reward cannot be redirected without
+        re-signing the block.
+        """
+        import struct as _struct
+        parts = [
+            self.prover_id,
+            _struct.pack(">Q", self.target_height),
+            self.target_block_hash,
+            _struct.pack(">I", len(self.header_bytes)),
+            self.header_bytes,
+            self.merkle_root,
+            # tx_index uses a sentinel -1 for the empty-block case so
+            # None and 0 never collide in the commitment.
+            _struct.pack(">q", -1 if self.tx_index is None else int(self.tx_index)),
+            _struct.pack(">I", len(self.tx_bytes)),
+            self.tx_bytes,
+            _struct.pack(">I", len(self.merkle_path)),
+        ]
+        parts.extend(self.merkle_path)
+        parts.append(_struct.pack(">I", len(self.merkle_layer_sizes)))
+        for n in self.merkle_layer_sizes:
+            parts.append(_struct.pack(">Q", int(n)))
+        return b"".join(parts)
+
+    @property
+    def tx_hash(self) -> bytes:
+        """Commitment leaf for block.merkle_root.
+
+        Uniform name with every other block-embedded type so
+        merkle-root construction loops over `.tx_hash` on each leaf
+        without caring about the underlying type.
+        """
+        return _h(self.canonical_bytes())
+
+    def to_bytes(self, state=None) -> bytes:
+        """Compact binary encoding matching canonical_bytes.
+
+        Block.to_bytes length-prefixes this blob via its generic
+        enc_list helper, so no self-length header is needed here.
+        """
+        return self.canonical_bytes()
+
+    @classmethod
+    def from_bytes(cls, data: bytes, state=None) -> "CustodyProof":
+        """Decode a CustodyProof from its canonical_bytes form."""
+        import struct as _struct
+        off = 0
+        if len(data) < 32 + 8 + 32 + 4:
+            raise ValueError("CustodyProof blob too short")
+        prover_id = bytes(data[off:off + 32]); off += 32
+        target_height = _struct.unpack_from(">Q", data, off)[0]; off += 8
+        target_block_hash = bytes(data[off:off + 32]); off += 32
+        hdr_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + hdr_len > len(data):
+            raise ValueError("CustodyProof truncated at header_bytes")
+        header_bytes = bytes(data[off:off + hdr_len]); off += hdr_len
+        if off + 32 + 8 + 4 > len(data):
+            raise ValueError("CustodyProof truncated at merkle_root")
+        merkle_root = bytes(data[off:off + 32]); off += 32
+        tx_idx_raw = _struct.unpack_from(">q", data, off)[0]; off += 8
+        tx_index = None if tx_idx_raw < 0 else int(tx_idx_raw)
+        tx_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + tx_len + 4 > len(data):
+            raise ValueError("CustodyProof truncated at tx_bytes")
+        tx_bytes = bytes(data[off:off + tx_len]); off += tx_len
+        path_count = _struct.unpack_from(">I", data, off)[0]; off += 4
+        merkle_path: list[bytes] = []
+        for _ in range(path_count):
+            if off + 32 > len(data):
+                raise ValueError("CustodyProof truncated in merkle_path")
+            merkle_path.append(bytes(data[off:off + 32]))
+            off += 32
+        if off + 4 > len(data):
+            raise ValueError("CustodyProof truncated at layer_sizes count")
+        ls_count = _struct.unpack_from(">I", data, off)[0]; off += 4
+        merkle_layer_sizes: list[int] = []
+        for _ in range(ls_count):
+            if off + 8 > len(data):
+                raise ValueError("CustodyProof truncated in layer_sizes")
+            merkle_layer_sizes.append(_struct.unpack_from(">Q", data, off)[0])
+            off += 8
+        if off != len(data):
+            raise ValueError("CustodyProof has trailing bytes")
+        return cls(
+            prover_id=prover_id,
+            target_height=target_height,
+            target_block_hash=target_block_hash,
+            header_bytes=header_bytes,
+            merkle_root=merkle_root,
+            tx_index=tx_index,
+            tx_bytes=tx_bytes,
+            merkle_path=merkle_path,
+            merkle_layer_sizes=merkle_layer_sizes,
+        )
+
 
 # ── Merkle path construction + verification ──────────────────────────
 #

@@ -2035,6 +2035,7 @@ class Blockchain:
         finality_votes: list | None = None,
         proposer_signature_leaf_index: int | None = None,
         slash_transactions: list | None = None,
+        custody_proofs: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -2569,6 +2570,35 @@ class Blockchain:
                             sim_balances.get(proposer_id, 0) + _payout
                         )
 
+        # Simulate archive-reward payouts — must mirror
+        # _apply_archive_rewards.  Only changes that reach sim_balances
+        # matter here: the pool scalar (self.archive_reward_pool) is
+        # not in the state-tree commitment, but prover balances are.
+        # Graceful no-op when pool is empty.
+        if custody_proofs:
+            from messagechain.consensus.archive_challenge import (
+                ArchiveRewardPool,
+                apply_archive_rewards,
+            )
+            # Use verify-free simulation here: the commit path runs
+            # after validate_block, so each proof is already known
+            # good.  Mirroring apply_archive_rewards' FCFS + cap +
+            # dedupe invariants is what keeps state_root aligned.
+            sim_pool = ArchiveRewardPool(balance=self.archive_reward_pool)
+            # Take target_block_hash from the first proof to avoid a
+            # second compute_challenge call here — validator has
+            # already bound the list to the correct challenge.
+            sim_expected_hash = custody_proofs[0].target_block_hash
+            sim_result = apply_archive_rewards(
+                proofs=custody_proofs,
+                pool=sim_pool,
+                expected_block_hash=sim_expected_hash,
+            )
+            for payout in sim_result.payouts:
+                sim_balances[payout.prover_id] = (
+                    sim_balances.get(payout.prover_id, 0) + payout.amount
+                )
+
         # Simulate inactivity leak — must mirror _apply_block_state.
         # The counter is incremented first; if the leak is active, inactive
         # validators have their sim_staked reduced.  The counter reset
@@ -2616,6 +2646,7 @@ class Blockchain:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         finality_votes: list | None = None,
+        custody_proofs: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
@@ -2673,6 +2704,7 @@ class Blockchain:
             finality_votes=finality_votes,
             proposer_signature_leaf_index=expected_proposer_leaf,
             slash_transactions=slash_transactions,
+            custody_proofs=custody_proofs,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -2713,6 +2745,7 @@ class Blockchain:
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
             finality_votes=finality_votes,
+            custody_proofs=custody_proofs,
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
             state_root_checkpoint=state_root_checkpoint,
@@ -3041,6 +3074,111 @@ class Blockchain:
         """
         self._stake_snapshots[block_number] = dict(self.supply.staked)
 
+    def _validate_custody_proofs(
+        self, block: Block, parent: Block,
+    ) -> tuple[bool, str]:
+        """Verify block.custody_proofs against the hygiene + validity rules.
+
+        Rules (in order):
+
+          1. **Hygiene:** non-challenge blocks MUST carry an empty list.
+             A non-empty list elsewhere is rejected — same pattern as
+             the state_root_checkpoint zero-on-off-checkpoint rule.
+             Without this, a proposer could smuggle garbage into
+             merkle_root and burn validator CPU on every block.
+
+          2. **Cap:** at most ARCHIVE_PROOFS_PER_CHALLENGE proofs on a
+             challenge block.
+
+          3. **Challenge derivation:** the challenge for block H is
+             derived from H's PARENT block_hash (known when H is being
+             proposed).  Every proof in H MUST target that challenge's
+             `target_height`, and the proof's target_block_hash MUST
+             match the chain's actual block at that height.
+
+          4. **Per-proof verification:** verify_custody_proof against
+             the actual block bytes (full merkle-inclusion proof in
+             non-empty-block case, header-only in empty-block case).
+
+          5. **Dedup:** no two proofs in the same block may share a
+             prover_id.  The mempool already dedupes by (challenge,
+             prover_id); this block-level check is defense-in-depth
+             against a malicious proposer bypassing the mempool.
+
+        Returns (ok, reason).
+        """
+        from messagechain.config import (
+            ARCHIVE_PROOFS_PER_CHALLENGE,
+            is_archive_challenge_block,
+        )
+        from messagechain.consensus.archive_challenge import (
+            compute_challenge,
+            verify_custody_proof,
+        )
+        proofs = getattr(block, "custody_proofs", None) or []
+        height = block.header.block_number
+
+        if not is_archive_challenge_block(height):
+            if proofs:
+                return False, (
+                    f"Non-empty custody_proofs on non-challenge block "
+                    f"(height {height} is not a multiple of the "
+                    f"challenge interval)"
+                )
+            return True, "ok"
+
+        if len(proofs) > ARCHIVE_PROOFS_PER_CHALLENGE:
+            return False, (
+                f"custody_proofs count {len(proofs)} exceeds cap "
+                f"{ARCHIVE_PROOFS_PER_CHALLENGE}"
+            )
+
+        if not proofs:
+            return True, "ok"
+
+        # Derive this block's challenge from the parent's block hash.
+        # Using the parent's hash (not this block's own hash) lets the
+        # proposer resolve the target BEFORE building this block — the
+        # challenge is the same one the mempool has been collecting for.
+        challenge = compute_challenge(parent.block_hash, height)
+        target_block = self.get_block(challenge.target_height)
+        # A validator that is genuinely synced MUST have the target
+        # block — the target is < current height by construction.
+        # Reject outright if we don't have it; loud failure surfaces
+        # a real bug rather than silently accepting unverifiable proofs.
+        if target_block is None:
+            return False, (
+                f"Cannot validate custody_proofs: target block at "
+                f"height {challenge.target_height} is missing locally"
+            )
+        expected_block_hash = target_block.block_hash
+
+        seen_provers: set[bytes] = set()
+        for proof in proofs:
+            if proof.target_height != challenge.target_height:
+                return False, (
+                    f"Custody proof target_height {proof.target_height} "
+                    f"does not match challenge target "
+                    f"{challenge.target_height}"
+                )
+            if proof.target_block_hash != expected_block_hash:
+                return False, (
+                    "Custody proof target_block_hash does not match the "
+                    "chain's block at the challenged height (stale fork?)"
+                )
+            if proof.prover_id in seen_provers:
+                return False, (
+                    f"Duplicate custody proof from prover "
+                    f"{proof.prover_id.hex()[:16]} in challenge block"
+                )
+            seen_provers.add(proof.prover_id)
+            ok, reason = verify_custody_proof(
+                proof, expected_block_hash=expected_block_hash,
+            )
+            if not ok:
+                return False, f"Invalid custody proof: {reason}"
+        return True, "ok"
+
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
         latest = self.get_latest_block()
@@ -3260,6 +3398,7 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
             + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
+            + [p.tx_hash for p in getattr(block, "custody_proofs", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -3642,6 +3781,16 @@ class Blockchain:
             )
             if not ok:
                 return False, f"Invalid unstake tx: {reason}"
+
+        # Custody-proof hygiene + cryptographic validation.  Matches
+        # the state_root_checkpoint hygiene pattern: non-challenge
+        # blocks MUST carry an empty list.  On a challenge block the
+        # proofs are verified against the challenge's target block —
+        # which is derived from the parent block's hash (known at this
+        # point: the parent is already in self.chain).
+        valid, reason = self._validate_custody_proofs(block, latest)
+        if not valid:
+            return False, reason
 
         # Receive-to-exist: no separate registration tx type to validate.
         return True, "Valid"
@@ -4889,16 +5038,53 @@ class Blockchain:
         # Reset regardless — next block's burn accumulates from zero.
         self.supply.fee_burn_this_block = 0
 
-        # Payout step (currently stubbed — no proof field on Block
-        # yet).  When the Block schema gains a `custody_proofs` list
-        # in v2, this loop iterates those proofs, calls
-        # verify_custody_proof against the challenged block, and
-        # credits each winning prover_id's balance.  The scaffolding
-        # lives here so the v2 wiring is a straight addition rather
-        # than a structural edit.
-        # from messagechain.config import is_archive_challenge_block
-        # if is_archive_challenge_block(block.header.block_number):
-        #     ... resolve challenge, iterate block.custody_proofs, ...
+        # Payout step.  Non-challenge blocks always carry an empty
+        # custody_proofs list (validate_block enforces the hygiene rule),
+        # so proofs is non-empty here only on a challenge block that
+        # also validated against the challenge's target block.
+        proofs = getattr(block, "custody_proofs", None) or []
+        if proofs:
+            from messagechain.consensus.archive_challenge import (
+                ArchiveRewardPool,
+                apply_archive_rewards,
+            )
+            # Wrap the scalar pool in the primitive's dataclass so we
+            # reuse its try_pay / cap logic exactly — prevents drift
+            # between the sim (compute_post_state_root) and the apply
+            # path.  After payout we write the leftover back.
+            wrapper = ArchiveRewardPool(balance=self.archive_reward_pool)
+            # Resolve the challenge target using the parent block's
+            # hash — same derivation validate_block used.  parent is
+            # the last block in self.chain BEFORE this block is
+            # appended (add_block appends after state apply).
+            parent = self.chain[-1]
+            expected_block_hash = proofs[0].target_block_hash
+            # Defensive: if validate_block ran before us, every proof
+            # already agrees on target_block_hash — but take it from
+            # the first proof rather than re-resolving the challenge,
+            # so a pool caller that applies an already-validated block
+            # doesn't redundantly recompute compute_challenge here.
+            result = apply_archive_rewards(
+                proofs=proofs,
+                pool=wrapper,
+                expected_block_hash=expected_block_hash,
+            )
+            # Credit every paid prover.  Tokens move from the pool
+            # into circulating balances — pool was already counted in
+            # total_supply when it was funded, so no supply change.
+            for payout in result.payouts:
+                self.supply.balances[payout.prover_id] = (
+                    self.supply.balances.get(payout.prover_id, 0)
+                    + payout.amount
+                )
+            self.archive_reward_pool = wrapper.balance
+            if result.total_paid > 0:
+                logger.info(
+                    f"ARCHIVE REWARDS: block #{block.header.block_number} "
+                    f"paid {result.total_paid} tokens to "
+                    f"{len(result.payouts)} provers "
+                    f"(pool remaining: {self.archive_reward_pool})"
+                )
 
     def _apply_governance_block(self, block: Block):
         """Dispatch governance txs, auto-execute closed binding proposals,
@@ -5305,6 +5491,7 @@ class Blockchain:
                     unstake_transactions=getattr(block, "unstake_transactions", []),
                     governance_txs=getattr(block, "governance_txs", []),
                     finality_votes=getattr(block, "finality_votes", []),
+                    custody_proofs=getattr(block, "custody_proofs", []),
                     proposer_signature_leaf_index=proposer_sig_leaf,
                 )
             except Exception:
