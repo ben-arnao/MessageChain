@@ -26,8 +26,12 @@ from messagechain.crypto.keys import (
 from messagechain.crypto.merkle_cache import MerkleNodeCache
 
 
-# Use a tiny height (h=6 = 64 leaves) so exhaustive tests are fast.
-_H = 6
+# Use a tiny height (h=5 = 32 leaves) so exhaustive tests are fast.
+# h=5 still exercises every level of the tree (including non-leaf internal
+# nodes across 5 layers) so flat-index and off-by-one bugs remain caught;
+# dropping from h=6 shaves ~4× off the reference O(2^h)-per-leaf walk and
+# was the critical-path test in the parallel suite.
+_H = 5
 _SEED = b"\xa7" * 32
 
 
