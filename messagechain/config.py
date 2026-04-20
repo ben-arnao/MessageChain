@@ -1092,10 +1092,11 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 #
 # Two-phase slashing (critical — see docs/attestable-submission-receipts.md
 # "Security Analysis"):
-#   1. Accuser posts CensorshipEvidenceTx (pays EVIDENCE_SUBMISSION_FEE).
+#   1. Accuser posts CensorshipEvidenceTx (pays MIN_FEE).
 #   2. Evidence is recorded in pending state, NOT yet applied.
-#   3. Accused validator has EVIDENCE_CHALLENGE_BLOCKS to void the
-#      evidence by producing any block that includes the receipted tx.
+#   3. Accused validator has EVIDENCE_MATURITY_BLOCKS (defined below) to
+#      void the evidence by producing any block that includes the
+#      receipted tx.
 #   4. If the window elapses with no inclusion, slash fires:
 #      CENSORSHIP_SLASH_BPS of stake is BURNED (not paid to accuser,
 #      to prevent forge-for-profit).
@@ -1104,12 +1105,12 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 # forge receipts (if WOTS+ was ever broken) and profit from the
 # slash.  Burning means the accuser's only reward is "this validator
 # no longer censors me" — a public good, not a private profit.
+#
+# Timing constants (EVIDENCE_INCLUSION_WINDOW, EVIDENCE_MATURITY_BLOCKS,
+# EVIDENCE_EXPIRY_BLOCKS, CENSORSHIP_SLASH_BPS) are defined together in
+# the "Attestable submission receipts" block farther down, calibrated
+# for BLOCK_TIME_TARGET=600s.  Don't duplicate them here.
 SUBMISSION_FEE = MIN_FEE              # anti-spam; paid to validator regardless of inclusion
-CENSORSHIP_GRACE_BLOCKS = 6           # 2x FORCED_INCLUSION_WAIT_BLOCKS
-CENSORSHIP_SLASH_BPS = 1000           # 10.00% of stake (1000 bps)
-EVIDENCE_EXPIRY_BLOCKS = 10_000       # ~70 days at 600s — receipts past this are stale
-EVIDENCE_CHALLENGE_BLOCKS = 14_400    # 24h at 6s block time (spec-driven value)
-EVIDENCE_SUBMISSION_FEE = MIN_FEE     # fee to submit evidence — bounds forgery-spam
 RECEIPT_VERSION = 1                   # on-wire version of SubmissionReceipt
 # Dedicated WOTS+ subtree for receipts.  Receipts consume leaves faster
 # than blocks (per-submission vs per-block), and we want receipt-signing
@@ -1302,11 +1303,18 @@ EVIDENCE_MATURITY_BLOCKS = 16
 
 # Dedicated WOTS+ subtree height for receipt-signing.  Separate from
 # the block-signing tree (MERKLE_TREE_HEIGHT) so receipt traffic cannot
-# burn leaves that the proposer needs for block production.  Height 24
-# gives 2**24 ≈ 16.7M receipts — orders of magnitude larger than the
-# block-signing tree because a validator may receipt many txs per
-# block.  Generated lazily on first startup and cached to disk.
-RECEIPT_SUBTREE_HEIGHT = 24
+# burn leaves that the proposer needs for block production.
+#
+# Height 16 (65K leaves) matches the block-signing tree.  At realistic
+# receipt rates (tens to hundreds per day early on), this is years of
+# headroom before key rotation is needed.  An earlier h=24 setting was
+# measured on a 2-vCPU VM to take ~36 hours of blocking startup keygen,
+# which is unacceptable as a boot-time operation.  If receipt throughput
+# grows to the point where 65K leaves becomes limiting, either bump this
+# height with async keygen machinery added, or rotate the receipt
+# subtree via SetReceiptSubtreeRootTransaction.  Generated lazily on
+# first startup and cached to disk.
+RECEIPT_SUBTREE_HEIGHT = 16
 
 # Block deserialization size limit — maximum hex-encoded block size
 # accepted from peers over the network.  A block with MAX_TXS_PER_BLOCK=20
