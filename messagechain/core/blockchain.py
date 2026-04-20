@@ -2661,6 +2661,25 @@ class Blockchain:
             proposer_signature_leaf_index=expected_proposer_leaf,
             slash_transactions=slash_transactions,
         )
+        # Periodic state-root checkpoint commitment — zero on every block
+        # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
+        # height the field commits to the FULL snapshot root of the
+        # chain state AS OF the parent block — i.e., the state that
+        # serves as INPUT to this block.  A bootstrapping node that
+        # downloads a finalized checkpoint block at height H reads the
+        # committed snapshot root, downloads a matching state snapshot
+        # from any archive, and then replays blocks H, H+1, ... forward
+        # from that state.  Using the parent's post-apply state keeps
+        # the commitment deterministic with a single hash call against
+        # the live chain — no dry-run apply / rollback needed — because
+        # by the time propose_block runs, the parent block has already
+        # been applied.  Scope: sync UX only; archives still retain
+        # every block.
+        from messagechain.config import is_state_root_checkpoint_block
+        if is_state_root_checkpoint_block(block_height):
+            state_root_checkpoint = self._compute_snapshot_root_live()
+        else:
+            state_root_checkpoint = b"\x00" * 32
         mtp = self.get_median_time_past()
         # Float timestamps retained: switching to integer-seconds here
         # breaks tests that create multiple blocks in the same wall-
@@ -2683,7 +2702,25 @@ class Blockchain:
             finality_votes=finality_votes,
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
+            state_root_checkpoint=state_root_checkpoint,
         )
+
+    def _compute_snapshot_root_live(self) -> bytes:
+        """Snapshot-root commitment over the current live chain state.
+
+        Thin wrapper that composes serialize_state + compute_state_root
+        from storage.state_snapshot.  Used by propose_block (to fill
+        the header's state_root_checkpoint on checkpoint-height blocks)
+        and by validate_block (to re-derive the expected commitment on
+        checkpoint-height blocks).  Keeping the two call sites on a
+        single helper eliminates a silent drift risk — if the snapshot
+        encoding ever changes, both callers move in lockstep.
+        """
+        from messagechain.storage.state_snapshot import (
+            serialize_state,
+            compute_state_root as compute_snapshot_root,
+        )
+        return compute_snapshot_root(serialize_state(self))
 
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
         """Validate all attestations included in a block.
@@ -3011,6 +3048,32 @@ class Blockchain:
         # Check block number
         if block.header.block_number != latest.header.block_number + 1:
             return False, "Invalid block number"
+
+        # Periodic state-root checkpoint commitment.  At checkpoint heights
+        # (block_number a positive multiple of CHECKPOINT_INTERVAL) the
+        # header must commit to the snapshot root of the chain state as of
+        # the parent — i.e., OUR current live state, since at validation
+        # time the parent has already been applied.  At all other heights
+        # the field MUST be zero; allowing garbage in the field off-checkpoint
+        # would let a proposer silently corrupt the commitment stream for a
+        # future bootstrap consumer who trusts "this header bit holds a valid
+        # snapshot commitment at every checkpoint height I look at."
+        from messagechain.config import is_state_root_checkpoint_block as _is_ckpt
+        if _is_ckpt(block.header.block_number):
+            expected_ckpt = self._compute_snapshot_root_live()
+            if block.header.state_root_checkpoint != expected_ckpt:
+                return False, (
+                    f"Invalid state_root_checkpoint — expected "
+                    f"{expected_ckpt.hex()[:16]}, got "
+                    f"{block.header.state_root_checkpoint.hex()[:16]}"
+                )
+        else:
+            if block.header.state_root_checkpoint != b"\x00" * 32:
+                return False, (
+                    "Non-zero state_root_checkpoint on non-checkpoint "
+                    f"block (height {block.header.block_number} is not a "
+                    f"multiple of CHECKPOINT_INTERVAL)"
+                )
 
         # Check block timestamp against Median Time Past (BIP 113)
         mtp = self.get_median_time_past()

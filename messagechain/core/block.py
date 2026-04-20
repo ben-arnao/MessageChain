@@ -158,6 +158,16 @@ class BlockHeader:
     # at proposal time.  Committed via signable_data so the proposer's
     # block signature covers it transitively — no separate snapshot sig.
     mempool_snapshot_root: bytes = b"\x00" * 32
+    # On-chain periodic state-root checkpoint — see
+    # config.CHECKPOINT_INTERVAL / is_state_root_checkpoint_block.  Zero
+    # on non-checkpoint blocks; at a checkpoint height, commits to the
+    # full snapshot root (storage.state_snapshot.compute_state_root)
+    # over the post-application state.  Lets a future joiner trust a
+    # finalized checkpoint block's header as ground-truth for a matching
+    # state-snapshot download, without downloading full history.
+    # Archive operators still retain every block — this is purely a
+    # sync UX affordance.
+    state_root_checkpoint: bytes = b"\x00" * 32
 
     def signable_data(self) -> bytes:
         # NOTE: randao_mix is intentionally NOT included here. It is derived
@@ -168,6 +178,13 @@ class BlockHeader:
         # hash_version is committed here so the header hash itself is
         # tamper-evident against a version swap: flipping the byte changes
         # the hash, breaking the prev_hash chain and the proposer signature.
+        # state_root_checkpoint is bound into signable_data so the
+        # proposer's signature covers it transitively — a relay that
+        # mutates the checkpoint field in transit invalidates the
+        # signature and the block is rejected.  Zero on non-checkpoint
+        # heights (the common case), so the field contributes no
+        # entropy there and the hash stays identical to a checkpoint-
+        # field-less legacy header whose trailing bytes were 32 zeros.
         return (
             struct.pack(">I", self.version)
             + struct.pack(">B", self.hash_version)
@@ -179,6 +196,7 @@ class BlockHeader:
             + struct.pack(">Q", int(self.timestamp))
             + self.proposer_id
             + self.mempool_snapshot_root
+            + self.state_root_checkpoint
         )
 
     def serialize(self) -> dict:
@@ -194,6 +212,7 @@ class BlockHeader:
             "proposer_id": self.proposer_id.hex(),
             "randao_mix": self.randao_mix.hex(),
             "mempool_snapshot_root": self.mempool_snapshot_root.hex(),
+            "state_root_checkpoint": self.state_root_checkpoint.hex(),
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
         }
 
@@ -211,7 +230,8 @@ class BlockHeader:
             f64  timestamp
             32   proposer_id
             32   randao_mix
-            32   mempool_snapshot_root  <- inclusion attestation
+            32   mempool_snapshot_root   <- inclusion attestation
+            32   state_root_checkpoint   <- periodic snapshot commitment
             u32  sig_blob_len  (0 = no proposer signature)
             N    sig_blob
 
@@ -219,6 +239,10 @@ class BlockHeader:
         unambiguously one flavor of hash commitment end-to-end — a
         validator's decoder reads the version before any 32-byte hash
         field and can dispatch when multiple schemes are active.
+
+        state_root_checkpoint trails mempool_snapshot_root so the field
+        order here matches the signable_data() layout exactly, keeping
+        the wire-format and the signed-payload layout aligned.
         """
         if self.proposer_signature is None:
             sig_blob = b""
@@ -236,6 +260,7 @@ class BlockHeader:
             self.proposer_id,
             self.randao_mix,
             self.mempool_snapshot_root,
+            self.state_root_checkpoint,
             struct.pack(">I", len(sig_blob)),
             sig_blob,
         ])
@@ -246,7 +271,11 @@ class BlockHeader:
         # +1 byte for the u8 hash_version field (crypto agility).
         # +32 bytes for the witness_root field.
         # +32 bytes for the mempool_snapshot_root field.
-        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32 + 4
+        # +32 bytes for the state_root_checkpoint field (see
+        # config.CHECKPOINT_INTERVAL) — zero on non-checkpoint heights
+        # so the minimum stays 32 bytes regardless of whether the block
+        # is a checkpoint.
+        expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32 + 32 + 4
         if len(data) < expected_min:
             raise ValueError("BlockHeader blob too short")
         version = struct.unpack_from(">I", data, off)[0]; off += 4
@@ -267,6 +296,7 @@ class BlockHeader:
         proposer_id = bytes(data[off:off + 32]); off += 32
         randao_mix = bytes(data[off:off + 32]); off += 32
         mempool_snapshot_root = bytes(data[off:off + 32]); off += 32
+        state_root_checkpoint = bytes(data[off:off + 32]); off += 32
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
         if off + sig_len > len(data):
             raise ValueError("BlockHeader truncated at signature")
@@ -286,6 +316,7 @@ class BlockHeader:
             proposer_signature=proposer_signature,
             hash_version=hash_version,
             mempool_snapshot_root=mempool_snapshot_root,
+            state_root_checkpoint=state_root_checkpoint,
         )
 
     @classmethod
@@ -294,6 +325,12 @@ class BlockHeader:
         # migration dicts round-trip cleanly; a present-but-unknown value
         # falls through to validate_block's consensus check and is rejected
         # there with a human-readable reason.
+        #
+        # state_root_checkpoint defaults to 32 zero bytes when absent so
+        # pre-checkpoint-field dicts round-trip cleanly.  Non-checkpoint
+        # blocks always carry the zero value anyway, so the default
+        # produces the identical header the producer intended — not a
+        # silent format change.
         return cls(
             version=data["version"],
             block_number=data["block_number"],
@@ -307,6 +344,7 @@ class BlockHeader:
             proposer_signature=Signature.deserialize(data["proposer_signature"]) if data.get("proposer_signature") else None,
             hash_version=data.get("hash_version", HASH_VERSION_CURRENT),
             mempool_snapshot_root=bytes.fromhex(data["mempool_snapshot_root"]) if data.get("mempool_snapshot_root") else b"\x00" * 32,
+            state_root_checkpoint=bytes.fromhex(data["state_root_checkpoint"]) if data.get("state_root_checkpoint") else b"\x00" * 32,
         )
 
 
