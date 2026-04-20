@@ -356,6 +356,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     peers.add_argument("--server", type=str, default=None, help="Server address host:port")
 
+    # --- cut-checkpoint ---
+    cut_cp = sub.add_parser(
+        "cut-checkpoint",
+        help="Cut a weak-subjectivity checkpoint from a running node",
+        description=(
+            "Query a MessageChain node and emit a "
+            "WeakSubjectivityCheckpoint JSON object "
+            "{block_number, block_hash, state_root}.  Without --out, "
+            "prints one JSON object to stdout.  With --out PATH, writes "
+            "a JSON array consumable by load_checkpoints_file (single "
+            "entry by default, or appended/deduplicated with --append)."
+        ),
+    )
+    cut_cp.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+    cut_cp.add_argument(
+        "--height", type=int, default=None,
+        help="Block height to cut at (default: current chain tip)",
+    )
+    cut_cp.add_argument(
+        "--out", type=str, default=None,
+        help=(
+            "Write output as a JSON array to PATH "
+            "(default: print single object to stdout)"
+        ),
+    )
+    cut_cp.add_argument(
+        "--append", action="store_true",
+        help=(
+            "With --out: merge into an existing JSON array, "
+            "deduplicating entries by block_number."
+        ),
+    )
+
     # --- estimate-fee ---
     estimate_fee = sub.add_parser(
         "estimate-fee",
@@ -2092,6 +2128,121 @@ def cmd_peers(args):
         )
 
 
+def cmd_cut_checkpoint(args):
+    """Cut a weak-subjectivity checkpoint from a running node.
+
+    Queries the target node for (block_number, block_hash, state_root)
+    at the requested height (tip by default) and emits the result either
+    to stdout (single JSON object) or to a file (JSON array — the shape
+    that load_checkpoints_file consumes).
+
+    With --append, an existing file is merged in and entries are
+    deduplicated by block_number so an operator can run the cutter on a
+    cron without ballooning the file.
+
+    Exits non-zero on any RPC failure or malformed response so a cron
+    wrapper can treat stale/missing output as a hard error.
+    """
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+
+    # Pick the RPC: tip → get_chain_info (already ubiquitous), explicit
+    # height → get_checkpoint_at_height (narrow, returns only the three
+    # fields we need).  Doing both saves the --height path from fetching
+    # a full block we'd otherwise throw away.
+    if args.height is None:
+        response = rpc_call(host, port, "get_chain_info", {})
+        if not response.get("ok"):
+            print(
+                f"Error: {response.get('error', 'Could not connect')}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        info = response["result"]
+        height = info.get("height")
+        # get_chain_info returns the *count* of blocks as `height` — the
+        # tip's block_number is height - 1.  An empty chain has nothing
+        # to checkpoint.
+        if not height or info.get("latest_block_hash") is None:
+            print("Error: chain is empty — nothing to checkpoint", file=sys.stderr)
+            sys.exit(1)
+        if info.get("state_root") is None:
+            print(
+                "Error: node did not return state_root "
+                "(is it running an older version?)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        checkpoint = {
+            "block_number": height - 1,
+            "block_hash": info["latest_block_hash"],
+            "state_root": info["state_root"],
+        }
+    else:
+        response = rpc_call(
+            host, port, "get_checkpoint_at_height", {"height": args.height},
+        )
+        if not response.get("ok"):
+            print(
+                f"Error: {response.get('error', 'Could not connect')}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        checkpoint = response["result"]
+        # Defensive: malformed response should not silently produce a
+        # broken checkpoint.  Every field is required.
+        for field in ("block_number", "block_hash", "state_root"):
+            if field not in checkpoint:
+                print(
+                    f"Error: RPC response missing '{field}'",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    import json
+
+    if args.out is None:
+        # Stdout: single object (pipe-friendly, matches
+        # WeakSubjectivityCheckpoint.serialize()).
+        print(json.dumps(checkpoint, indent=2, sort_keys=True))
+        return
+
+    # File mode: always write a JSON array (load_checkpoints_file's shape).
+    entries: list[dict] = []
+    if args.append:
+        try:
+            with open(args.out, "r") as f:
+                existing = json.load(f)
+            if isinstance(existing, list):
+                entries = [e for e in existing if isinstance(e, dict)]
+            else:
+                print(
+                    f"Error: --append requires {args.out} to contain a "
+                    f"JSON array (got {type(existing).__name__})",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        except FileNotFoundError:
+            entries = []
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Error: failed to read {args.out}: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # Dedupe by block_number — keep the latest cut for that height so a
+    # re-run picks up any hash correction.
+    entries = [
+        e for e in entries
+        if e.get("block_number") != checkpoint["block_number"]
+    ]
+    entries.append(checkpoint)
+    entries.sort(key=lambda e: e.get("block_number", 0))
+
+    with open(args.out, "w") as f:
+        json.dump(entries, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
 def cmd_estimate_fee(args):
     """Estimate fee for a message or funds transfer."""
     host, port = _parse_server(args.server)
@@ -2225,6 +2376,7 @@ def main():
         "proposals": cmd_proposals,
         "validators": cmd_validators,
         "peers": cmd_peers,
+        "cut-checkpoint": cmd_cut_checkpoint,
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,

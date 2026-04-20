@@ -95,5 +95,59 @@ class TestLenientCheckpointLoading(unittest.TestCase):
             self.assertEqual(result, [])
 
 
+class TestCutterOutputUnblocksStrictNode(unittest.TestCase):
+    """Cross-cut: a file written by `messagechain cut-checkpoint` must
+    pass strict loading.  This is the production gate — a node past
+    bootstrap with REQUIRE_CHECKPOINTS=True refuses to start unless
+    load_checkpoints_file(..., strict=True) returns at least one entry.
+    """
+
+    def test_cutter_output_passes_strict_load(self):
+        # Locally import to avoid adding a hard dep on server at module
+        # import time of test_require_checkpoints.
+        from unittest.mock import patch
+        from messagechain.cli import cmd_cut_checkpoint
+        from messagechain.core.blockchain import Blockchain
+        from messagechain.consensus.pos import ProofOfStake
+        from messagechain.identity.identity import Entity
+        from messagechain.consensus.checkpoint import validate_checkpoint
+
+        chain = Blockchain()
+        alice = Entity.create(b"alice_strictunblock" + b"\x00" * 13)
+        chain.initialize_genesis(alice)
+        consensus = ProofOfStake()
+        for _ in range(3):
+            block = chain.propose_block(consensus, alice, [])
+            ok, _reason = chain.add_block(block)
+            assert ok
+
+        from server import Server
+
+        def _fake_rpc(host, port, method, params):
+            fake = Server.__new__(Server)
+            fake.blockchain = chain
+            if method == "get_chain_info":
+                return {"ok": True, "result": chain.get_chain_info()}
+            elif method == "get_checkpoint_at_height":
+                return Server._rpc_get_checkpoint_at_height(fake, params)
+            return {"ok": False, "error": f"unknown method: {method}"}
+
+        import argparse
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "checkpoints.json")
+            args = argparse.Namespace(
+                command="cut-checkpoint", verbose=False,
+                server="127.0.0.1:9334", height=None, out=out, append=False,
+            )
+            with patch("client.rpc_call", _fake_rpc):
+                cmd_cut_checkpoint(args)
+
+            # Strict load must succeed, and the checkpoint must validate.
+            loaded = load_checkpoints_file(out, strict=True)
+            self.assertGreaterEqual(len(loaded), 1)
+            for cp in loaded:
+                self.assertTrue(validate_checkpoint(chain, cp))
+
+
 if __name__ == "__main__":
     unittest.main()
