@@ -34,6 +34,15 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
+# Give the node up to 30s to run its SIGTERM handler: close the SQLite
+# connection, flush leaf_index.json, shut down the submission server.
+# Without this, systemd sends SIGKILL after 90s default — fine in most
+# cases but tight if the node is mid-flush of a large state tree or
+# mid-WOTS+ keygen after a key rotation.  KillSignal=SIGTERM is the
+# default but pinned here so `systemctl stop` triggers the graceful
+# shutdown path wired in server.py.
+TimeoutStopSec=30
+KillSignal=SIGTERM
 
 # Hardening
 NoNewPrivileges=true

@@ -5745,9 +5745,24 @@ class Blockchain:
     def get_chain_info(self) -> dict:
         best_tip = self.fork_choice.get_best_tip()
         tip_count = len(self.fork_choice.tips)
+        # Liveness signal: `seconds_since_last_block` lets a cron'd
+        # `messagechain status` page if the chain has stalled (e.g.,
+        # BLOCK_TIME_TARGET * 3 without a new block = something is
+        # wrong).  Computed from wall-clock NOW on the server; a big
+        # clock-skewed client query will see a slightly-off number but
+        # the sign (stalled vs advancing) is always correct.
+        import time as _time
+        latest_ts = (
+            self.chain[-1].header.timestamp if self.chain else None
+        )
+        seconds_since_last = (
+            int(_time.time() - latest_ts) if latest_ts is not None else None
+        )
         return {
             "height": self.height,
             "latest_block_hash": self.chain[-1].block_hash.hex() if self.chain else None,
+            "latest_block_timestamp": latest_ts,
+            "seconds_since_last_block": seconds_since_last,
             "registered_entities": len(self.public_keys),
             "chain_tips": tip_count,
             "best_tip_weight": best_tip[2] if best_tip else 0,

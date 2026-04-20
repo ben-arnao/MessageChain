@@ -2746,6 +2746,33 @@ async def run(args):
     #   * Interactive: getpass prompts for the key.  Default.
     private_key_input: bytes = b""
     if args.keyfile:
+        # Permission audit: on POSIX, refuse to read a keyfile that's
+        # group- or world-accessible.  Catches the classic `cp keyfile
+        # /etc/messagechain/keyfile` without chmod 0400 — the file lands
+        # at the VM's umask (typically 0644) and anyone on the box can
+        # exfiltrate the private key.  Windows stat lacks this bit
+        # structure; skip the check there (Windows is not a production
+        # validator target).
+        try:
+            _st = os.stat(args.keyfile)
+            if hasattr(os, "geteuid"):
+                if _st.st_mode & 0o077:
+                    logger.error(
+                        f"keyfile {args.keyfile} has unsafe permissions "
+                        f"(mode={_st.st_mode & 0o777:o}); expected 0400.  "
+                        f"Run: chmod 0400 {args.keyfile}"
+                    )
+                    sys.exit(1)
+                if _st.st_uid != os.geteuid():
+                    logger.error(
+                        f"keyfile {args.keyfile} is owned by uid {_st.st_uid}, "
+                        f"not the running uid {os.geteuid()}.  Run: "
+                        f"chown $(id -u) {args.keyfile}"
+                    )
+                    sys.exit(1)
+        except FileNotFoundError:
+            logger.error(f"keyfile {args.keyfile} not found")
+            sys.exit(1)
         with open(args.keyfile) as _kf:
             hex_key = _kf.read().strip()
         try:
@@ -2856,14 +2883,40 @@ async def run(args):
             args.submission_bind, args.submission_port,
         )
 
+    # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run
+    # the same cleanup path as Ctrl-C.  Without this, Python's default
+    # SIGTERM action is immediate exit — server.stop() never runs, the
+    # SQLite connection closes abruptly, and any leaf_index the node
+    # consumed mid-block-production is silently burned with no block
+    # ever broadcast.  Signal handlers aren't supported on Windows'
+    # asyncio event loop, so catch that cleanly.
+    import signal
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(sig_name: str):
+        logger.info(f"Received {sig_name}, shutting down gracefully")
+        shutdown_event.set()
+
+    for _sig_name, _sig in (("SIGTERM", signal.SIGTERM), ("SIGINT", signal.SIGINT)):
+        try:
+            loop.add_signal_handler(_sig, _request_shutdown, _sig_name)
+        except (NotImplementedError, RuntimeError):
+            # Windows asyncio doesn't support add_signal_handler — fall
+            # back to KeyboardInterrupt for SIGINT and skip SIGTERM
+            # (Windows systemd is not a supported deployment target).
+            pass
+
     try:
-        while True:
-            await asyncio.sleep(1)
+        await shutdown_event.wait()
     except KeyboardInterrupt:
-        logger.info("Shutting down")
-        if submission_server is not None:
-            submission_server.stop()
-        await server.stop()
+        # Windows fallback: Ctrl-C arrives as KeyboardInterrupt.
+        pass
+
+    logger.info("Shutting down")
+    if submission_server is not None:
+        submission_server.stop()
+    await server.stop()
 
 
 def main():

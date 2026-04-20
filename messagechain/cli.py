@@ -1846,6 +1846,29 @@ def cmd_status(args):
     else:
         mark(2, "chain tip", "missing latest_block_hash", "RPC response malformed")
 
+    # 3b. Liveness — warn if no block in 2x block-time, fail at 6x.
+    # Stalls are the single most useful thing a cron check can detect;
+    # "height=122" alone doesn't distinguish a healthy idle chain from
+    # a halted one.
+    try:
+        from messagechain.config import BLOCK_TIME_TARGET
+    except ImportError:
+        BLOCK_TIME_TARGET = 600
+    seconds_since = info.get("seconds_since_last_block")
+    if seconds_since is None:
+        mark(1, "liveness", "no timestamp", "server returned null")
+    elif seconds_since < 0:
+        mark(1, "liveness", f"future timestamp ({seconds_since}s)",
+             "clock skew between client and validator")
+    elif seconds_since > 6 * BLOCK_TIME_TARGET:
+        mark(2, "liveness", f"STALLED {seconds_since}s",
+             f">6x block-time ({6 * BLOCK_TIME_TARGET}s) since last block")
+    elif seconds_since > 2 * BLOCK_TIME_TARGET:
+        mark(1, "liveness", f"slow {seconds_since}s",
+             f">2x block-time since last block")
+    else:
+        mark(0, "liveness", f"{seconds_since}s since last block")
+
     # 4. Validator entity-specific checks (optional)
     if args.entity:
         # Accept hex or address format
