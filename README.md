@@ -3,15 +3,12 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live since 2026-04-18. Chain ID `messagechain-v1`,
-genesis block 0
-`5e8bc19ccd4449730684744951f1cca1eabb7d7c008623ea2257fd837fb63d18`.
-Seed peers are baked into `messagechain/config.py:CLIENT_SEED_ENDPOINTS`
-and the current tip is one command away:
-
-```bash
-messagechain status    # or `info` for full chain stats
-```
+**Status:** mainnet re-mint in progress (hard reset 2026-04-20). The
+2026-04-18 launch is abandoned: a block-header format change
+(periodic state-root checkpoints for long-horizon sync) broke
+forward-decoding of existing block DBs, and rather than ship a
+migration we're cutting a fresh chain. Genesis hash and chain ID will
+be updated here once the new block 0 is minted.
 
 ## Why
 

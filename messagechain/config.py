@@ -249,16 +249,31 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 #   2. Flip NETWORK_NAME to "mainnet".
 # Doing (2) without (1) raises at config load — a mainnet build cannot
 # silently fall back to the testnet hash.
-NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
+NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
 
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
-_TESTNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "235aae03708a04f8a98905b9bc5434d5a69fa03a38e928a444bef2ccf2c15efd"
-)
-_MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "5e8bc19ccd4449730684744951f1cca1eabb7d7c008623ea2257fd837fb63d18"
-)
+#
+# HARD RESET 2026-04-20: both genesis hashes cleared. The previous mainnet
+# (live since 2026-04-18) is abandoned because the state-root-checkpoint
+# block-header field changed wire format, and existing block DBs cannot
+# decode forward. Re-launch procedure:
+#
+#   1. Wipe chain.db on every validator and on the bootstrap node.
+#   2. On the canonical bootstrap node only: run the genesis mint
+#      (deploy/launch_single_validator.py or equivalent) with
+#      NETWORK_NAME still "testnet" — initialize_genesis will mint and
+#      record a block-0 hash.
+#   3. Copy that block-0 hash into _MAINNET_GENESIS_HASH below as a
+#      bytes.fromhex("...") literal.
+#   4. Flip NETWORK_NAME to "mainnet".
+#   5. Commit + push + redeploy to every validator with fresh chain.db.
+#
+# Both hashes are None until the mint; a "mainnet" NETWORK_NAME with
+# _MAINNET_GENESIS_HASH=None raises at config load, which is the
+# intended failsafe against shipping the reset state as production.
+_TESTNET_GENESIS_HASH: bytes | None = None
+_MAINNET_GENESIS_HASH: bytes | None = None
 
 
 def _resolve_pinned_genesis_hash(network: str) -> bytes | None:
