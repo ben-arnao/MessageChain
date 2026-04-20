@@ -305,7 +305,6 @@ class TestMempoolInjectionUnit(unittest.TestCase):
             fee=tx.fee + 1,
             signature=tx.signature,
             compression_flag=tx.compression_flag,
-            ttl=tx.ttl,
         )
         result = submit_transaction_to_mempool(bad_tx, self.chain, self.mempool)
         self.assertFalse(result.ok)

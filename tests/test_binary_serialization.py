@@ -67,7 +67,6 @@ class TestMessageTransactionBinary(unittest.TestCase):
         self.assertEqual(decoded.timestamp, tx.timestamp)
         self.assertEqual(decoded.nonce, tx.nonce)
         self.assertEqual(decoded.fee, tx.fee)
-        self.assertEqual(decoded.ttl, tx.ttl)
         self.assertEqual(decoded.version, tx.version)
         self.assertEqual(decoded.tx_hash, tx.tx_hash)
         self.assertEqual(decoded.signature.wots_signature, tx.signature.wots_signature)

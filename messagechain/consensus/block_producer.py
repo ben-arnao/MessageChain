@@ -24,7 +24,7 @@ Key concepts:
 
 - **Empty blocks**: when the mempool is empty we still produce a block.
   Empty blocks carry attestations, advance block-denominated timers
-  (TTLs, unbonding periods), and serve as the chain's heartbeat.
+  (unbonding periods), and serve as the chain's heartbeat.
 """
 
 import time

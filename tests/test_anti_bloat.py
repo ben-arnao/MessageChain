@@ -4,7 +4,6 @@ Validates the parameter changes that differentiate MessageChain from BTC:
 - Slower block time (600s / 10 min) to reduce header chain growth
 - Non-linear size-based fees (quadratic) to punish large messages
 - Per-block byte budget (MAX_BLOCK_MESSAGE_BYTES) to cap storage per block
-- Message TTL for explicit retention bounds
 - Higher dynamic fee ceiling to punish congestion-era spam
 - Dependent parameter recalculation (halving, unbonding, governance)
 """
@@ -27,16 +26,12 @@ from messagechain.config import (
     FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF,
     BLOCK_REWARD,
-    MESSAGE_DEFAULT_TTL,
-    MESSAGE_MIN_TTL,
-    MESSAGE_MAX_TTL,
 )
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 from messagechain.core.transaction import (
     create_transaction,
     verify_transaction,
     calculate_min_fee,
-    _validate_ttl,
 )
 from messagechain.identity.identity import Entity
 
@@ -210,66 +205,6 @@ class TestDynamicFeeCeiling(unittest.TestCase):
         self.assertEqual(fee, MIN_FEE)
 
 
-class TestMessageTTL(unittest.TestCase):
-    """Messages have a TTL (time-to-live) for explicit retention bounds."""
-
-    def test_default_ttl_is_30_days(self):
-        blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
-        days = MESSAGE_DEFAULT_TTL / blocks_per_day
-        self.assertAlmostEqual(days, 30.0, delta=0.5)
-
-    def test_min_ttl_is_1_day(self):
-        blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
-        days = MESSAGE_MIN_TTL / blocks_per_day
-        self.assertAlmostEqual(days, 1.0, delta=0.1)
-
-    def test_max_ttl_is_1_year(self):
-        blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
-        years = MESSAGE_MAX_TTL / blocks_per_year
-        self.assertAlmostEqual(years, 1.0, delta=0.05)
-
-    def test_validate_ttl_zero_is_default(self):
-        valid, _ = _validate_ttl(0)
-        self.assertTrue(valid)
-
-    def test_validate_ttl_rejects_below_minimum(self):
-        valid, _ = _validate_ttl(MESSAGE_MIN_TTL - 1)
-        self.assertFalse(valid)
-
-    def test_validate_ttl_rejects_above_maximum(self):
-        valid, _ = _validate_ttl(MESSAGE_MAX_TTL + 1)
-        self.assertFalse(valid)
-
-    def test_validate_ttl_accepts_valid_range(self):
-        valid, _ = _validate_ttl(MESSAGE_MIN_TTL)
-        self.assertTrue(valid)
-        valid, _ = _validate_ttl(MESSAGE_MAX_TTL)
-        self.assertTrue(valid)
-        valid, _ = _validate_ttl(MESSAGE_DEFAULT_TTL)
-        self.assertTrue(valid)
-
-    def test_transaction_includes_ttl(self):
-        alice = Entity.create(b"alice-ttl-test".ljust(32, b"\x00"))
-        fee = calculate_min_fee(b"hello")
-        tx = create_transaction(alice, "hello", fee=fee, nonce=0)
-        # Default TTL is 0 (meaning protocol default)
-        self.assertEqual(tx.ttl, 0)
-        self.assertEqual(tx.effective_ttl, MESSAGE_DEFAULT_TTL)
-
-    def test_transaction_custom_ttl(self):
-        alice = Entity.create(b"alice-custom-ttl".ljust(32, b"\x00"))
-        fee = calculate_min_fee(b"hello")
-        tx = create_transaction(alice, "hello", fee=fee, nonce=0, ttl=MESSAGE_MIN_TTL)
-        self.assertEqual(tx.ttl, MESSAGE_MIN_TTL)
-        self.assertEqual(tx.effective_ttl, MESSAGE_MIN_TTL)
-
-    def test_transaction_rejects_invalid_ttl(self):
-        alice = Entity.create(b"alice-bad-ttl".ljust(32, b"\x00"))
-        fee = calculate_min_fee(b"hello")
-        with self.assertRaises(ValueError):
-            create_transaction(alice, "hello", fee=fee, nonce=0, ttl=1)  # below min
-
-
 class TestGovernanceFees(unittest.TestCase):
     """Governance fees scaled appropriately."""
 
@@ -319,13 +254,15 @@ class TestChainGrowthAnalysis(unittest.TestCase):
         self.assertLess(annual_bytes, 600_000_000)  # under 600MB/year
 
     def test_1000_year_projection(self):
-        """Even over 1000 years, message data stays manageable with pruning."""
+        """Over 1000 years, permanent-message storage stays bounded by the
+        per-block byte budget — no pruning, no deletion, ever."""
         blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
         annual_bytes = blocks_per_year * MAX_BLOCK_MESSAGE_BYTES
-        # Without pruning: ~526GB over 1000 years
-        # With pruning (MESSAGE_DEFAULT_TTL): only retain ~30 days of data
-        retained_bytes = MESSAGE_DEFAULT_TTL * MAX_BLOCK_MESSAGE_BYTES
-        self.assertLess(retained_bytes, 100_000_000)  # under 100MB retained
+        # Permanent storage: ~526GB over 1000 years at the byte-budget ceiling.
+        # Fees, size caps, compression, and witness separation are the only
+        # bloat levers — the chain itself is append-only forever.
+        thousand_year_bytes = 1000 * annual_bytes
+        self.assertLess(thousand_year_bytes, 600_000_000_000)  # under 600GB over 1000 years
 
 
 if __name__ == "__main__":

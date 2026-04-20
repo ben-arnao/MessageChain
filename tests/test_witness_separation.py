@@ -162,7 +162,6 @@ class TestTransactionWitnessStripping(unittest.TestCase):
         self.assertEqual(stripped.nonce, tx.nonce)
         self.assertEqual(stripped.fee, tx.fee)
         self.assertEqual(stripped.version, tx.version)
-        self.assertEqual(stripped.ttl, tx.ttl)
         self.assertEqual(stripped.compression_flag, tx.compression_flag)
 
     def test_witness_round_trip(self):

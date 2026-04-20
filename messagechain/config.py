@@ -408,12 +408,6 @@ MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx 
 COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
 MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
 
-# Message TTL — messages expire after a protocol-defined retention period.
-# Expired message data can be pruned; hash commitments remain in headers for auditability.
-MESSAGE_DEFAULT_TTL = 4_320   # default message retention in blocks (~30 days at 600s)
-MESSAGE_MIN_TTL = 144         # minimum TTL (~1 day at 600s) — prevents gaming fees via short TTL
-MESSAGE_MAX_TTL = 52_560      # maximum TTL (~1 year at 600s) — bounds long-term storage commitment
-
 # Cryptography (HASH_ALGO defined at top of file)
 WOTS_W = 16  # Winternitz parameter (base-16)
 WOTS_KEY_CHAINS = 64  # number of hash chains per WOTS keypair

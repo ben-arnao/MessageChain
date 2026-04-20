@@ -178,57 +178,6 @@ class TestRANDAO(unittest.TestCase):
         self.assertGreater(len(selections), 1)
 
 
-# ─── 3. Block Pruning ────────────────────────────────────────────────
-
-class TestBlockPruning(unittest.TestCase):
-    """Block pruning allows nodes to delete old block data while
-    retaining headers for chain verification."""
-
-    def test_prune_old_blocks(self):
-        """Blocks older than the pruning threshold can be pruned."""
-        chain, entities = _make_chain_and_entities()
-        consensus = ProofOfStake()
-        for _ in range(6):
-            _propose_and_add(chain, consensus, entities[0])
-
-        from messagechain.storage.pruning import BlockPruner
-        pruner = BlockPruner(keep_recent=5)
-        pruned_count = pruner.prune(chain)
-        self.assertGreater(pruned_count, 0)
-
-    def test_pruned_blocks_headers_still_available(self):
-        """After pruning, block headers remain accessible."""
-        chain, entities = _make_chain_and_entities()
-        consensus = ProofOfStake()
-        for _ in range(6):
-            _propose_and_add(chain, consensus, entities[0])
-
-        from messagechain.storage.pruning import BlockPruner
-        pruner = BlockPruner(keep_recent=5)
-        pruner.prune(chain)
-
-        # Headers should still be available for pruned blocks
-        for i in range(chain.height):
-            header = pruner.get_header(chain, i)
-            self.assertIsNotNone(header)
-
-    def test_recent_blocks_not_pruned(self):
-        """Blocks within the keep_recent window are not pruned."""
-        chain, entities = _make_chain_and_entities()
-        consensus = ProofOfStake()
-        for _ in range(6):
-            _propose_and_add(chain, consensus, entities[0])
-
-        from messagechain.storage.pruning import BlockPruner
-        pruner = BlockPruner(keep_recent=5)
-        pruner.prune(chain)
-
-        # Recent blocks should still have full data
-        for i in range(chain.height - 5, chain.height):
-            block = chain.get_block(i)
-            self.assertIsNotNone(block)
-
-
 # ─── 4. Compact Block Relay ──────────────────────────────────────────
 
 class TestCompactBlockRelay(unittest.TestCase):

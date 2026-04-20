@@ -1396,9 +1396,9 @@ class Blockchain:
             return False, "Transaction must have a valid timestamp"
         # Upper bound: reject future-dated txs at the same threshold the
         # block-pack path enforces.  Without this, a future-stamped tx
-        # in mempool lands with `now - tx.timestamp < 0`, so its TTL
-        # subtraction is negative and `expire_transactions` never evicts
-        # it — the slot is pinned forever until fee-based eviction.
+        # in mempool lands with `now - tx.timestamp < 0`, so its mempool
+        # TTL subtraction is negative and `expire_transactions` never
+        # evicts it — the slot is pinned forever until fee-based eviction.
         import time as _time
         from messagechain.config import MAX_TIMESTAMP_DRIFT
         _now = int(_time.time())
@@ -1867,8 +1867,8 @@ class Blockchain:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
 
         Returns the median timestamp of the most recent blocks. This prevents
-        proposers from manipulating timestamps to affect timelocks, unbonding
-        periods, and TTLs. Same mechanism as Bitcoin (BIP 113).
+        proposers from manipulating timestamps to affect timelocks and
+        unbonding periods. Same mechanism as Bitcoin (BIP 113).
         """
         if not self.chain:
             return 0.0
