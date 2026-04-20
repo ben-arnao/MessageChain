@@ -47,16 +47,22 @@ from typing import Callable, Optional
 from messagechain.config import (
     MAX_SUBMISSION_BODY_BYTES,
     SUBMISSION_BURST,
+    SUBMISSION_FEE,
     SUBMISSION_RATE_LIMIT_PER_SEC,
 )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.network.ratelimit import TokenBucket
+from messagechain.network.submission_receipt import (
+    SubmissionReceipt,
+    sign_receipt,
+)
 
 
 logger = logging.getLogger("messagechain.submission")
 
 
 __all__ = [
+    "ReceiptIssuer",
     "SubmissionServer",
     "SubmissionResult",
     "submit_transaction_to_mempool",
@@ -69,6 +75,11 @@ class SubmissionResult:
 
     Separate from HTTP status so the helper is usable from non-HTTP
     callers (tests, future RPC clients).
+
+    If a `ReceiptIssuer` is configured on the SubmissionServer, the
+    `receipt` field is populated on success with the validator's
+    signed SubmissionReceipt.  Callers that want to prove they
+    submitted the tx should hold this receipt.
     """
     ok: bool
     tx_hash: bytes = b""
@@ -76,24 +87,97 @@ class SubmissionResult:
     # True iff the tx was already in the mempool — the HTTP layer
     # treats this as success (200) for idempotency.
     duplicate: bool = False
+    # Set when the ingress point is configured to issue receipts and
+    # the tx was accepted (including duplicate re-submissions).
+    receipt: Optional[SubmissionReceipt] = None
+
+
+class ReceiptIssuer:
+    """Wraps a validator's dedicated receipt-signing keypair.
+
+    Rationale for a separate class: receipts consume WOTS+ leaves far
+    faster than blocks.  Mixing the receipt tree with the block-signing
+    tree would risk bricking block-signing under submission load.  We
+    keep them isolated at the type level so the receipt-signing
+    surface area is small and auditable — only this class ever calls
+    keypair.sign() for a receipt.
+
+    Thread safety: the underlying KeyPair.sign() is not reentrant, so
+    an internal lock serializes concurrent /submit requests.  The
+    critical section is tiny (one WOTS+ sign), so contention is
+    negligible even at high submission rates.
+    """
+
+    def __init__(self, receipt_keypair, validator_pubkey: bytes):
+        if not isinstance(validator_pubkey, (bytes, bytearray)) or len(validator_pubkey) != 32:
+            raise ValueError("validator_pubkey must be 32 bytes")
+        self.receipt_keypair = receipt_keypair
+        self.validator_pubkey = bytes(validator_pubkey)
+        self._lock = threading.Lock()
+
+    def issue(
+        self,
+        tx_hash: bytes,
+        received_at_height: int,
+        submission_fee_paid: int = SUBMISSION_FEE,
+    ) -> SubmissionReceipt:
+        with self._lock:
+            return sign_receipt(
+                keypair=self.receipt_keypair,
+                tx_hash=tx_hash,
+                validator_pubkey=self.validator_pubkey,
+                received_at_height=received_at_height,
+                submission_fee_paid=submission_fee_paid,
+            )
+
+    @property
+    def receipt_tree_root(self) -> bytes:
+        """The Merkle root of the receipt-signing tree.
+
+        This is the value that gets published on-chain so verifiers
+        can check receipt signatures.  Stable across the lifetime of
+        the receipt tree (changes only on rotation).
+        """
+        return self.receipt_keypair.public_key
 
 
 def submit_transaction_to_mempool(
     tx: MessageTransaction,
     blockchain,
     mempool,
+    receipt_issuer: Optional["ReceiptIssuer"] = None,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
     Mirrors the Server._rpc_submit_transaction ingress path so
     forced-inclusion arrival tracking stays consistent across ingress
     points (local RPC, P2P gossip, public HTTPS submission).
+
+    If `receipt_issuer` is provided and the tx is accepted into the
+    mempool (or was already there), a SubmissionReceipt is issued and
+    returned on the result.  Failed submissions (bad signature, bad
+    nonce, rejected by mempool) do NOT produce a receipt — a receipt
+    is proof the validator took custody of a tx, and a validator
+    should never attest to a tx it rejected.
+
+    SUBMISSION_FEE is satisfied via the tx's own `fee` field.  We
+    require `tx.fee >= SUBMISSION_FEE` explicitly so a receipt is
+    never issued for an unpaid submission — the tx is still admitted
+    to the mempool under its normal fee rules, but no receipt attaches.
     """
-    # Idempotency: if the tx is already in the pool, treat as success.
-    # An honest retry (client that lost its connection) must not see
-    # a "duplicate" error.
+    # Idempotency: if the tx is already in the pool, treat as success
+    # and re-issue a receipt (the user may have lost the first one).
     if tx.tx_hash in mempool.pending:
-        return SubmissionResult(ok=True, tx_hash=tx.tx_hash, duplicate=True)
+        receipt = None
+        if receipt_issuer is not None and tx.fee >= SUBMISSION_FEE:
+            receipt = receipt_issuer.issue(
+                tx_hash=tx.tx_hash,
+                received_at_height=blockchain.height,
+                submission_fee_paid=SUBMISSION_FEE,
+            )
+        return SubmissionResult(
+            ok=True, tx_hash=tx.tx_hash, duplicate=True, receipt=receipt,
+        )
 
     on_chain_nonce = blockchain.nonces.get(tx.entity_id, 0)
     pending_nonce = mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
@@ -113,12 +197,29 @@ def submit_transaction_to_mempool(
         # under dynamic minimum).  If the tx still ended up pending
         # this call, treat as success; otherwise report rejection.
         if tx.tx_hash in mempool.pending:
-            return SubmissionResult(ok=True, tx_hash=tx.tx_hash, duplicate=True)
+            receipt = None
+            if receipt_issuer is not None and tx.fee >= SUBMISSION_FEE:
+                receipt = receipt_issuer.issue(
+                    tx_hash=tx.tx_hash,
+                    received_at_height=blockchain.height,
+                    submission_fee_paid=SUBMISSION_FEE,
+                )
+            return SubmissionResult(
+                ok=True, tx_hash=tx.tx_hash, duplicate=True, receipt=receipt,
+            )
         return SubmissionResult(
             ok=False, error="Mempool rejected transaction (rate / fee / cap)",
         )
 
-    return SubmissionResult(ok=True, tx_hash=tx.tx_hash)
+    # Success path — issue a receipt if configured and fee is sufficient.
+    receipt = None
+    if receipt_issuer is not None and tx.fee >= SUBMISSION_FEE:
+        receipt = receipt_issuer.issue(
+            tx_hash=tx.tx_hash,
+            received_at_height=blockchain.height,
+            submission_fee_paid=SUBMISSION_FEE,
+        )
+    return SubmissionResult(ok=True, tx_hash=tx.tx_hash, receipt=receipt)
 
 
 class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
@@ -243,9 +344,22 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 — relay is best-effort
                 logger.exception("submission relay hook raised")
 
-        resp = (
-            b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii") + b'"}'
-        )
+        # If a receipt was issued, embed its hex-encoded binary blob in
+        # the response.  We send the COMPACT binary form (base16-hex
+        # encoded for JSON safety) rather than a dict, because the blob
+        # is the authoritative wire format that evidence submission
+        # expects — the client can forward the same bytes to a later
+        # CensorshipEvidenceTx without any re-serialization risk.
+        if result.receipt is not None:
+            receipt_hex = result.receipt.to_bytes().hex().encode("ascii")
+            resp = (
+                b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii")
+                + b'","receipt":"' + receipt_hex + b'"}'
+            )
+        else:
+            resp = (
+                b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii") + b'"}'
+            )
         self._ok(resp)
 
 
@@ -262,10 +376,12 @@ class _HandlerContext:
         blockchain,
         mempool,
         relay_callback: Optional[Callable[[MessageTransaction], None]],
+        receipt_issuer: Optional[ReceiptIssuer] = None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
         self.relay_callback = relay_callback
+        self.receipt_issuer = receipt_issuer
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
@@ -315,7 +431,10 @@ class _HandlerContext:
         self._last_active.pop(oldest_ip, None)
 
     def submit(self, tx: MessageTransaction) -> SubmissionResult:
-        return submit_transaction_to_mempool(tx, self.blockchain, self.mempool)
+        return submit_transaction_to_mempool(
+            tx, self.blockchain, self.mempool,
+            receipt_issuer=self.receipt_issuer,
+        )
 
 
 class _ThreadingHTTPSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -354,6 +473,7 @@ class SubmissionServer:
         port: int,
         bind: str = "0.0.0.0",
         relay_callback: Optional[Callable[[MessageTransaction], None]] = None,
+        receipt_issuer: Optional[ReceiptIssuer] = None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -362,6 +482,7 @@ class SubmissionServer:
         self.port = port
         self.bind = bind
         self.relay_callback = relay_callback
+        self.receipt_issuer = receipt_issuer
         self._httpd: Optional[_ThreadingHTTPSServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -396,6 +517,7 @@ class SubmissionServer:
             blockchain=self.blockchain,
             mempool=self.mempool,
             relay_callback=self.relay_callback,
+            receipt_issuer=self.receipt_issuer,
         )
         ssl_context = self._build_ssl_context()
         self._httpd.socket = ssl_context.wrap_socket(
