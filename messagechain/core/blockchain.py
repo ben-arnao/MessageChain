@@ -682,15 +682,25 @@ class Blockchain:
         # updates instead of a full rebuild.
         self._rebuild_state_tree()
 
-        # Persist
+        # Persist atomically.  Without the wrapping transaction, a
+        # SIGKILL between store_block and _persist_state leaves block 0
+        # on disk with NO founder pubkey / balances / stake — and
+        # block 1 later fails state_root verification forever (val-2
+        # operator sees a stuck height=1 with no repair path).
         if self.db is not None:
-            # Thread `self` as state so the compact entity-index wire form
-            # lands on disk.  The genesis entity is already registered in
-            # self.entity_id_to_index by this point, so the tx encoder
-            # can swap its 32-byte id for a 1-byte varint index.
-            self.db.store_block(genesis_block, state=self)
-            self.db.add_chain_tip(genesis_block.block_hash, 0, 0)
-            self._persist_state()
+            self.db.begin_transaction()
+            try:
+                # Thread `self` as state so the compact entity-index wire form
+                # lands on disk.  The genesis entity is already registered in
+                # self.entity_id_to_index by this point, so the tx encoder
+                # can swap its 32-byte id for a 1-byte varint index.
+                self.db.store_block(genesis_block, state=self)
+                self.db.add_chain_tip(genesis_block.block_hash, 0, 0)
+                self._persist_state()
+                self.db.commit_transaction()
+            except BaseException:
+                self.db.rollback_transaction()
+                raise
 
         return genesis_block
 
@@ -4928,11 +4938,22 @@ class Blockchain:
         # the fully-populated post-bootstrap state.
         self._rebuild_state_tree()
 
-        # Persist
+        # Persist atomically.  A SIGKILL between store_block and
+        # _persist_state (e.g., OOM killer, power loss, operator kill -9)
+        # would otherwise leave block 0 on disk with no founder state —
+        # val-2 restarts into height=1 with empty public_keys/balances
+        # and every subsequent block 1 fails state_root verification
+        # forever, with no clear repair path short of `rm -rf data-dir`.
         if self.db is not None:
-            self.db.store_block(block, state=self)
-            self.db.add_chain_tip(block.block_hash, 0, 0)
-            self._persist_state()
+            self.db.begin_transaction()
+            try:
+                self.db.store_block(block, state=self)
+                self.db.add_chain_tip(block.block_hash, 0, 0)
+                self._persist_state()
+                self.db.commit_transaction()
+            except BaseException:
+                self.db.rollback_transaction()
+                raise
 
         # Drain any orphans that were waiting on block 0.  During IBD,
         # val-2 often receives block 1+ before block 0 and they land in
