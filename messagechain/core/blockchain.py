@@ -40,6 +40,10 @@ from messagechain.core.authority_key import (
 from messagechain.core.emergency_revoke import (
     RevokeTransaction, verify_revoke_transaction,
 )
+from messagechain.core.receipt_subtree_root import (
+    SetReceiptSubtreeRootTransaction,
+    verify_set_receipt_subtree_root_transaction,
+)
 from messagechain.core.transfer import (
     TransferTransaction, verify_transfer_transaction,
 )
@@ -1857,6 +1861,84 @@ class Blockchain:
 
         return True, "Key rotated successfully"
 
+    def validate_set_receipt_subtree_root(
+        self, tx: SetReceiptSubtreeRootTransaction,
+    ) -> tuple[bool, str]:
+        """Validate a SetReceiptSubtreeRoot tx against current chain state.
+
+        Gated by the entity's authority (cold) key — same cold-key
+        promise as Revoke / Unstake.  A compromised hot key cannot
+        swap out the receipt-subtree root and invalidate in-flight
+        evidence against this validator.
+        """
+        if tx.entity_id not in self.public_keys:
+            return False, "Unknown entity — must register first"
+
+        # A revoked entity is suspected compromised on its hot key; the
+        # cold key is still in operator control, so the registration
+        # path MUST remain available (operators need to publish the
+        # receipt root when first onboarding after a cold-key ceremony,
+        # even on a hot-key-frozen identity).  We therefore do NOT
+        # reject revoked entities here — the signature is verified
+        # against the cold key below, which is uncompromised by design.
+
+        if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
+            return False, f"Insufficient balance for fee of {tx.fee}"
+
+        authority_pk = self.get_authority_key(tx.entity_id)
+        if authority_pk is None or not verify_set_receipt_subtree_root_transaction(
+            tx, authority_pk,
+        ):
+            return False, (
+                "Invalid signature — set_receipt_subtree_root must be signed by "
+                "the authority (cold) key.  The hot signing key cannot register "
+                "a receipt-subtree root."
+            )
+
+        return True, "Valid"
+
+    def apply_set_receipt_subtree_root(
+        self,
+        tx: SetReceiptSubtreeRootTransaction,
+        proposer_id: bytes,
+    ) -> tuple[bool, str]:
+        """Validate, pay the fee, and install the receipt-subtree root.
+
+        Idempotent: if the root already matches, the fee is still burned
+        (a tx with a fee in-block consumes a block slot — we don't let
+        operators sneak no-ops in for free) and the mapping is
+        refreshed.  Rotation-safe: a new root replaces the old entry.
+        """
+        ok, reason = self.validate_set_receipt_subtree_root(tx)
+        if not ok:
+            return False, reason
+
+        if not self.supply.pay_fee_with_burn(
+            tx.entity_id, proposer_id, tx.fee, self.supply.base_fee,
+        ):
+            return False, (
+                f"Fee payment failed (fee {tx.fee} vs "
+                f"base_fee {self.supply.base_fee})"
+            )
+
+        self.receipt_subtree_roots[tx.entity_id] = tx.root_public_key
+
+        # Persist through the chain-db so a cold restart recovers the
+        # mapping without a full replay.
+        if self.db is not None and hasattr(self.db, "set_receipt_subtree_root"):
+            self.db.set_receipt_subtree_root(tx.entity_id, tx.root_public_key)
+            # Best-effort flush — same pattern as Revoke / SetAuthorityKey.
+            try:
+                self.db.flush_state()
+            except Exception:
+                pass
+
+        # Nonce-free (see module docstring).  Signature consumed a
+        # leaf in the COLD tree, so the apply path deliberately does
+        # NOT bump the hot-key watermark — mirrors Revoke.
+
+        return True, "Receipt subtree root registered"
+
     def validate_slash_transaction(
         self, tx: SlashTransaction, chain_height: int | None = None,
     ) -> tuple[bool, str]:
@@ -2448,6 +2530,16 @@ class Blockchain:
                 sim_public_keys[atx.entity_id] = atx.new_public_key
                 sim_rotation_counts[atx.entity_id] = atx.rotation_number + 1
                 sim_leaf_watermarks[atx.entity_id] = 0
+            elif cls_name == "SetReceiptSubtreeRootTransaction":
+                # Nonce-free, cold-key-signed registration of the
+                # receipt-subtree root.  The root lives in
+                # receipt_subtree_roots (committed via the snapshot
+                # state root, NOT the per-entity SMT that compute_state_root
+                # builds below) so we only need to simulate the fee-side
+                # impact here.  The apply path does not bump the hot
+                # watermark (leaf was consumed in the COLD tree), so we
+                # don't bump it here either.
+                pass
 
         # Simulate stake transactions — fee (burn + tip), nonce bump, and
         # the actual stake movement from liquid balance to staked balance.
@@ -4634,6 +4726,28 @@ class Blockchain:
                     self.db.set_key_rotation_count(
                         atx.entity_id, self.key_rotation_counts[atx.entity_id],
                     )
+        elif cls_name == "SetReceiptSubtreeRootTransaction":
+            ok, _ = self.validate_set_receipt_subtree_root(atx)
+            if not ok:
+                return
+            if not self.supply.pay_fee_with_burn(
+                atx.entity_id, proposer_id, atx.fee, base_fee,
+            ):
+                logger.error(
+                    f"SetReceiptSubtreeRoot fee payment failed (fee "
+                    f"{atx.fee} vs base_fee {base_fee}) — skipping"
+                )
+                return
+            self.receipt_subtree_roots[atx.entity_id] = atx.root_public_key
+            if self.db is not None and hasattr(
+                self.db, "set_receipt_subtree_root",
+            ):
+                self.db.set_receipt_subtree_root(
+                    atx.entity_id, atx.root_public_key,
+                )
+            # Nonce-free; signature consumed a leaf in the COLD tree —
+            # deliberately do NOT bump the hot-key watermark, matching
+            # Revoke.
         # Unknown class: silently skip. deserialize() would have rejected
         # an unknown type before reaching here, so this branch is defensive.
 

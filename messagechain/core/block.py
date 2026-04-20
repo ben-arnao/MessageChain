@@ -68,6 +68,9 @@ def _deserialize_authority_tx(data: dict):
     from messagechain.core.authority_key import SetAuthorityKeyTransaction
     from messagechain.core.emergency_revoke import RevokeTransaction
     from messagechain.core.key_rotation import KeyRotationTransaction
+    from messagechain.core.receipt_subtree_root import (
+        SetReceiptSubtreeRootTransaction,
+    )
     tag = data.get("type")
     if tag == "set_authority_key":
         return SetAuthorityKeyTransaction.deserialize(data)
@@ -75,6 +78,8 @@ def _deserialize_authority_tx(data: dict):
         return RevokeTransaction.deserialize(data)
     if tag == "key_rotation":
         return KeyRotationTransaction.deserialize(data)
+    if tag == "set_receipt_subtree_root":
+        return SetReceiptSubtreeRootTransaction.deserialize(data)
     raise ValueError(f"Unknown authority tx type: {tag!r}")
 
 
@@ -503,6 +508,9 @@ class Block:
         from messagechain.core.authority_key import SetAuthorityKeyTransaction
         from messagechain.core.emergency_revoke import RevokeTransaction
         from messagechain.core.key_rotation import KeyRotationTransaction
+        from messagechain.core.receipt_subtree_root import (
+            SetReceiptSubtreeRootTransaction,
+        )
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
@@ -543,6 +551,14 @@ class Block:
                     kind = 1
                 elif isinstance(t, KeyRotationTransaction):
                     kind = 2
+                elif isinstance(t, SetReceiptSubtreeRootTransaction):
+                    # kind=3: appended to the authority-tx union.  Old
+                    # blocks (all kind in {0,1,2}) still deserialize
+                    # unchanged — the union is additive.  A NEW block
+                    # carrying kind=3 cannot be parsed by pre-receipt-
+                    # bootstrap binaries; that is flagged as a
+                    # consensus-format change in the commit message.
+                    kind = 3
                 else:
                     raise ValueError(f"Unknown authority tx: {type(t).__name__}")
                 b = _tx_bytes(t)
@@ -614,6 +630,9 @@ class Block:
         from messagechain.core.authority_key import SetAuthorityKeyTransaction
         from messagechain.core.emergency_revoke import RevokeTransaction
         from messagechain.core.key_rotation import KeyRotationTransaction
+        from messagechain.core.receipt_subtree_root import (
+            SetReceiptSubtreeRootTransaction,
+        )
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
@@ -707,10 +726,14 @@ class Block:
                 _call_from_bytes(gov_classes[kind], take(ln))
             )
 
-        # Authority txs with 1-byte kind discriminator
+        # Authority txs with 1-byte kind discriminator.
+        # kind 0: SetAuthorityKey, kind 1: Revoke, kind 2: KeyRotation,
+        # kind 3: SetReceiptSubtreeRoot (appended — older binaries reject
+        # kind=3 with a clear "Unknown authority tx kind" error).
         auth_count = take_u32()
         auth_classes = (
-            SetAuthorityKeyTransaction, RevokeTransaction, KeyRotationTransaction,
+            SetAuthorityKeyTransaction, RevokeTransaction,
+            KeyRotationTransaction, SetReceiptSubtreeRootTransaction,
         )
         authority_txs = []
         for _ in range(auth_count):

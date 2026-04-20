@@ -438,6 +438,402 @@ def _attach_merkle_node_cache(
         logger.warning("Could not write Merkle cache to %s", cache_path)
 
 
+# ---------------------------------------------------------------------------
+# Receipt-subtree keypair generation + cache.
+#
+# The submission-receipt pipeline (messagechain.network.submission_receipt)
+# requires a validator to sign receipts with a WOTS+ keypair that is
+# SEPARATE from the block-signing keypair — otherwise receipt traffic burns
+# leaves that the proposer needs for block production, and a DoS attacker
+# who spams the submission endpoint can effectively exhaust the validator's
+# block-signing tree.
+#
+# This module builds that separate subtree, caches it on disk (same
+# HMAC-authenticated pattern as the block-signing keypair cache), and
+# binds it to a DEDICATED leaf-index file so receipt leaves and
+# block-signing leaves NEVER collide.  Sharing a leaf-index file would
+# silently let a receipt sign at leaf 5 AND a block sign at leaf 5 —
+# even though the trees are different, the cross-service bookkeeping
+# would conflate "next leaf to use" for two independent consumers and
+# misorder them into a crash.  They're isolated on purpose.
+#
+# CRITICAL security invariant: the receipt subtree's SEED is derived
+# from the validator's private key by HASHING WITH A DIFFERENT DOMAIN
+# TAG than the block-signing seed.  Identical private key → identical
+# block-signing seed; adding the dedicated domain tag yields a seed
+# with no algebraic relationship to the block-signing tree — so no
+# leaf from one tree can ever collide with a leaf from the other.
+# ---------------------------------------------------------------------------
+
+_RECEIPT_SEED_DOMAIN = b"mc-receipt-subtree-seed-v1|"
+_RECEIPT_LEAF_INDEX_FILENAME = "receipt_leaf_index.json"
+
+
+def _derive_receipt_subtree_seed(private_key: bytes) -> bytes:
+    """Derive the receipt subtree's seed from the validator's private key.
+
+    Domain-separated from _derive_signing_seed (which produces the
+    block-signing seed) so the two trees are cryptographically
+    independent.  A 32-byte digest is fed to KeyPair — same shape as
+    every other seed in the codebase.
+    """
+    return _hashlib.sha3_256(_RECEIPT_SEED_DOMAIN + private_key).digest()
+
+
+def _receipt_keypair_cache_path(
+    private_key: bytes, entity_id: bytes, tree_height: int, data_dir: str,
+) -> str:
+    """Filesystem path for the cached receipt-subtree keypair.
+
+    Filename pattern: `receipt_keypair_cache_<entity_id_prefix>.bin`.
+    Operators eyeballing the data dir can tell at a glance which cache
+    belongs to which validator.  entity_id is derived from the public
+    key which derives from the private key, so a per-key cache is
+    uniquely identified by the entity-id prefix in any sane setup.
+    Tamper resistance comes from the HMAC inside the file (keyed on
+    private_key), not the filename.
+    """
+    prefix = entity_id.hex()[:16]
+    return os.path.join(data_dir, f"receipt_keypair_cache_{prefix}.bin")
+
+
+_RECEIPT_CACHE_MAGIC = b"MCRC"  # MessageChain Receipt Cache
+_RECEIPT_CACHE_FORMAT_VERSION = 1
+_RECEIPT_CACHE_HMAC_DOMAIN = b"messagechain-receipt-keypair-cache-v1|"
+
+
+def _receipt_cache_mac_key(private_key: bytes) -> bytes:
+    return _hashlib.sha3_256(
+        _RECEIPT_CACHE_HMAC_DOMAIN + private_key
+    ).digest()
+
+
+def _encode_receipt_keypair_cache(
+    keypair, private_key: bytes, tree_height: int,
+) -> bytes:
+    payload_obj = {
+        "version": _RECEIPT_CACHE_FORMAT_VERSION,
+        "tree_height": tree_height,
+        "public_key": keypair.public_key.hex(),
+    }
+    payload = json.dumps(
+        payload_obj, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    mac = hmac.new(
+        _receipt_cache_mac_key(private_key), payload, _hashlib.sha3_256,
+    ).digest()
+    return _RECEIPT_CACHE_MAGIC + mac + payload
+
+
+def _decode_receipt_keypair_cache(
+    data: bytes, private_key: bytes, tree_height: int,
+):
+    """Return a KeyPair reconstructed from a trusted cache blob, or None.
+
+    Mirrors _decode_keypair_cache's fail-silent policy: any rejection
+    (wrong magic, bad MAC, malformed JSON, wrong version or height)
+    returns None so the caller deletes and regenerates.
+    """
+    header_len = len(_RECEIPT_CACHE_MAGIC) + _HMAC_SIZE
+    if len(data) < header_len:
+        return None
+    if not data.startswith(_RECEIPT_CACHE_MAGIC):
+        return None
+    mac = data[len(_RECEIPT_CACHE_MAGIC):header_len]
+    payload = data[header_len:]
+    expected = hmac.new(
+        _receipt_cache_mac_key(private_key), payload, _hashlib.sha3_256,
+    ).digest()
+    if not hmac.compare_digest(mac, expected):
+        return None
+    try:
+        obj = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("version") != _RECEIPT_CACHE_FORMAT_VERSION:
+        return None
+    if obj.get("tree_height") != tree_height:
+        return None
+    try:
+        public_key = bytes.fromhex(obj["public_key"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if len(public_key) != 32:
+        return None
+    seed = _derive_receipt_subtree_seed(private_key)
+    return KeyPair._from_trusted_root(seed, tree_height, public_key)
+
+
+def _load_or_create_receipt_subtree_keypair(
+    private_key: bytes,
+    tree_height: int,
+    entity_id: bytes,
+    data_dir: str | None,
+    *,
+    no_cache: bool = False,
+    progress_every: int = 65_536,
+):
+    """Return a KeyPair for the receipt subtree, generating if needed.
+
+    The keypair is deterministic in private_key + tree_height, so a
+    restart reuses the exact same subtree (same root) when the cache
+    is available.  Generation at RECEIPT_SUBTREE_HEIGHT=24 derives 16M
+    leaves — expect minutes on a fresh boot.
+
+    The returned KeyPair has its leaf_index_path bound to a DEDICATED
+    file (`receipt_leaf_index.json`) that block-signing NEVER touches.
+    This is load-bearing: sharing a leaf-index file between the two
+    signers would let one service's sign() silently consume the
+    other's next leaf, forcing a leaf-index skip that looks like
+    leaf-reuse on restart.
+    """
+    seed = _derive_receipt_subtree_seed(private_key)
+    use_cache = data_dir is not None and not no_cache
+    keypair = None
+
+    if use_cache:
+        cache_file = _receipt_keypair_cache_path(
+            private_key, entity_id, tree_height, data_dir,
+        )
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "rb") as f:
+                    blob = f.read()
+                keypair = _decode_receipt_keypair_cache(
+                    blob, private_key, tree_height,
+                )
+            except OSError:
+                keypair = None
+            if keypair is not None:
+                logger.info(
+                    "Loaded receipt-subtree keypair from cache %s",
+                    cache_file,
+                )
+            else:
+                logger.warning(
+                    "Corrupt or unauthenticated receipt-subtree cache %s — "
+                    "deleting and regenerating", cache_file,
+                )
+                try:
+                    os.remove(cache_file)
+                except OSError:
+                    pass
+
+    if keypair is None:
+        logger.info(
+            "Generating receipt-subtree keypair at height=%d "
+            "(this takes minutes — cached on success)",
+            tree_height,
+        )
+        _progress_counter = {"n": 0}
+
+        def _progress(leaf_idx: int):
+            _progress_counter["n"] = leaf_idx
+            if leaf_idx and leaf_idx % progress_every == 0:
+                logger.info(
+                    "receipt-subtree keygen progress: %d / %d leaves",
+                    leaf_idx, 1 << tree_height,
+                )
+
+        keypair = KeyPair.generate(
+            seed, height=tree_height, progress=_progress,
+        )
+        logger.info(
+            "Generated receipt-subtree keypair: root=%s",
+            keypair.public_key.hex()[:16] + "...",
+        )
+
+        if use_cache:
+            try:
+                blob = _encode_receipt_keypair_cache(
+                    keypair, private_key, tree_height,
+                )
+                tmp_file = cache_file + ".tmp"
+                with open(tmp_file, "wb") as f:
+                    f.write(blob)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                try:
+                    os.chmod(tmp_file, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp_file, cache_file)
+                logger.info(
+                    "Saved receipt-subtree keypair cache to %s", cache_file,
+                )
+            except OSError:
+                logger.warning(
+                    "Could not write receipt-subtree cache to %s",
+                    cache_file,
+                )
+
+    # Bind a DEDICATED leaf-index file.  NEVER share with block signing —
+    # the two signers track independent "next leaf to use" counters and
+    # conflating them causes silent crashes / apparent leaf reuse.
+    if data_dir is not None:
+        leaf_path = os.path.join(data_dir, _RECEIPT_LEAF_INDEX_FILENAME)
+        keypair.leaf_index_path = leaf_path
+        keypair.load_leaf_index(leaf_path)
+
+    return keypair
+
+
+def _bootstrap_receipt_subtree(
+    server,
+    *,
+    private_key: bytes,
+    entity,
+    data_dir: str | None,
+    no_cache: bool = False,
+) -> None:
+    """Boot-time hook: build the receipt subtree, bind it to the server,
+    and auto-submit SetReceiptSubtreeRoot if chain state is out of date.
+
+    Idempotent across restarts:
+      * Fresh node: subtree is generated, cached, ReceiptIssuer
+        installed, tx submitted.
+      * Warm restart with matching on-chain root: subtree is loaded
+        from cache, ReceiptIssuer installed, NO tx submitted (no-op).
+      * Warm restart after key rotation: regeneration happens, new
+        root lands on-chain via SetReceiptSubtreeRoot (replaces old).
+
+    Cold-key-unavailable case: the tx must be signed by the
+    authority (cold) key.  If the authority key registered in chain
+    state for this entity differs from the operator's hot signing key
+    (the standard hot/cold split), we DO NOT have the cold key on
+    disk and CANNOT sign the registration tx here.  Log a clear
+    warning + instructions and let service start proceed — the
+    operator submits the tx manually from their cold environment.
+    """
+    from messagechain.config import RECEIPT_SUBTREE_HEIGHT
+    from messagechain.core.receipt_subtree_root import (
+        create_set_receipt_subtree_root_transaction,
+    )
+    from messagechain.network.submission_receipt import ReceiptIssuer
+
+    if not private_key:
+        logger.info(
+            "Receipt subtree bootstrap skipped: no private key available "
+            "(relay-only node)."
+        )
+        return
+
+    # Build (or load cached) receipt-subtree keypair.
+    receipt_keypair = _load_or_create_receipt_subtree_keypair(
+        private_key=private_key,
+        tree_height=RECEIPT_SUBTREE_HEIGHT,
+        entity_id=entity.entity_id,
+        data_dir=data_dir,
+        no_cache=no_cache,
+    )
+
+    local_root = receipt_keypair.public_key
+
+    # Install the ReceiptIssuer on the server so the submission-RPC
+    # endpoint can issue receipts for admitted txs.  The
+    # height_fn closure lets the issuer stamp the live chain height
+    # without needing a direct Blockchain reference.
+    server.receipt_issuer = ReceiptIssuer(
+        issuer_id=entity.entity_id,
+        subtree_keypair=receipt_keypair,
+        height_fn=lambda: server.blockchain.height,
+    )
+    logger.info(
+        "Receipt issuer installed: entity=%s root=%s",
+        entity.entity_id_hex[:16],
+        local_root.hex()[:16] + "...",
+    )
+
+    # Check against chain state: if the registered root already
+    # matches the locally-generated tree's root, we're done — do NOT
+    # resubmit (idempotent on restart).
+    registered_root = server.blockchain.receipt_subtree_roots.get(
+        entity.entity_id,
+    )
+    if registered_root == local_root:
+        logger.info(
+            "Receipt-subtree root already registered on-chain — no tx needed"
+        )
+        return
+
+    # Mismatch (or never registered).  We need to submit a
+    # SetReceiptSubtreeRoot tx signed by the AUTHORITY key.  If the
+    # authority key matches the local signing public key (default
+    # single-key model), we can sign locally.  If it's been promoted
+    # to a separate cold key, we do NOT have it on disk here — log
+    # instructions and let service start proceed.
+    authority_pk = server.blockchain.get_authority_key(entity.entity_id)
+    if authority_pk is None:
+        # Entity not yet registered on chain.  Nothing to do on the
+        # auto-register path — the first message/transfer from this
+        # entity registers it implicitly (receive-to-exist), and a
+        # subsequent boot will re-enter this branch.
+        logger.info(
+            "Entity not yet on-chain; receipt-subtree root registration "
+            "deferred until entity is registered."
+        )
+        return
+
+    if authority_pk != entity.public_key:
+        # Cold key is not on this host.  Print actionable instructions
+        # and continue — the operator can submit the tx from their cold
+        # environment using the CLI path.
+        logger.warning(
+            "Receipt-subtree root NOT registered on-chain, but the "
+            "authority (cold) key for this validator differs from the "
+            "local signing key — cannot auto-submit.\n"
+            "  entity_id:        %s\n"
+            "  local root:       %s\n"
+            "  currently on-chain: %s\n"
+            "ACTION: sign a SetReceiptSubtreeRoot tx with the cold key "
+            "and broadcast via `client.py set-receipt-subtree-root`.  "
+            "Until this lands, receipts issued by this validator will "
+            "fail verification at evidence-admission time.",
+            entity.entity_id_hex[:16],
+            local_root.hex()[:16] + "...",
+            registered_root.hex()[:16] + "..." if registered_root else "<none>",
+        )
+        return
+
+    # Single-key model: hot signing key IS the authority key.  We can
+    # sign and submit directly.  Use the blockchain's own admission
+    # path so the tx goes through the same mempool / gossip plumbing
+    # as any other authority tx.
+    try:
+        tx = create_set_receipt_subtree_root_transaction(
+            entity_id=entity.entity_id,
+            root_public_key=local_root,
+            authority_signer=entity,
+        )
+        ok, reason = server._queue_authority_tx(
+            tx,
+            validate_fn=server.blockchain.validate_set_receipt_subtree_root,
+        )
+        if ok:
+            logger.info(
+                "Queued SetReceiptSubtreeRoot tx %s for block inclusion "
+                "(root=%s)",
+                tx.tx_hash.hex()[:16],
+                local_root.hex()[:16] + "...",
+            )
+        else:
+            logger.warning(
+                "SetReceiptSubtreeRoot auto-queue rejected: %s — operator "
+                "may need to submit manually.",
+                reason,
+            )
+    except Exception:
+        logger.exception(
+            "Failed to build/queue SetReceiptSubtreeRoot tx — operator "
+            "can submit manually later."
+        )
+
+
 class Server:
     """MessageChain full node with RPC interface for clients."""
 
@@ -465,6 +861,7 @@ class Server:
 
         self.wallet_id: bytes | None = None  # the entity_id that earns fees
         self.wallet_entity: Entity | None = None  # full entity for block signing
+        self.receipt_issuer = None  # ReceiptIssuer for submission receipts
         self._running = False
 
         # Network protection — must exist before syncer for the offense callback
@@ -891,6 +1288,9 @@ class Server:
 
         elif method == "emergency_revoke":
             return self._rpc_emergency_revoke(request["params"])
+
+        elif method == "set_receipt_subtree_root":
+            return self._rpc_set_receipt_subtree_root(request["params"])
 
         elif method == "is_revoked":
             entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
@@ -1636,6 +2036,37 @@ class Server:
                 return {"ok": False, "error": reason}
             return {"ok": True, "result": {
                 "entity_id": tx.entity_id.hex(),
+                "tx_hash": tx.tx_hash.hex(),
+                "status": "pending — will be included in next block",
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_set_receipt_subtree_root(self, params: dict) -> dict:
+        """Accept a SetReceiptSubtreeRoot tx signed by the cold authority key.
+
+        Registers (or rotates) this validator's receipt-subtree root
+        public key in chain state.  Without this mapping, submission
+        receipts are unverifiable — the whole censorship-evidence
+        pipeline collapses.  Cold-key gated so a compromised hot key
+        cannot swap out the receipting identity mid-flight.
+        """
+        try:
+            from messagechain.core.receipt_subtree_root import (
+                SetReceiptSubtreeRootTransaction,
+            )
+            tx = SetReceiptSubtreeRootTransaction.deserialize(
+                params["transaction"],
+            )
+            ok, reason = self._queue_authority_tx(
+                tx,
+                validate_fn=self.blockchain.validate_set_receipt_subtree_root,
+            )
+            if not ok:
+                return {"ok": False, "error": reason}
+            return {"ok": True, "result": {
+                "entity_id": tx.entity_id.hex(),
+                "root_public_key": tx.root_public_key.hex(),
                 "tx_hash": tx.tx_hash.hex(),
                 "status": "pending — will be included in next block",
             }}
@@ -2951,6 +3382,38 @@ async def run(args):
 
         server.set_wallet_entity(entity)
         logger.info(f"Authenticated as: {entity.entity_id_hex[:16]}...")
+
+        # Receipt-subtree bootstrap (attestable submission receipts).
+        # On first boot, generate a dedicated WOTS+ subtree for signing
+        # submission receipts.  Cached on disk so subsequent restarts
+        # reuse the same tree.  If the generated root does not match
+        # what chain state has registered for this entity, submit a
+        # SetReceiptSubtreeRoot tx to bring chain state into agreement.
+        # Without this, the receipt_subtree_roots map in state stays
+        # empty and no validator can issue verifiable receipts — the
+        # censorship-evidence pipeline collapses to plumbing with no
+        # power plug.
+        try:
+            _bootstrap_receipt_subtree(
+                server,
+                private_key=private_key_input,
+                entity=entity,
+                data_dir=args.data_dir,
+                no_cache=getattr(args, "no_keypair_cache", False),
+            )
+        except Exception:
+            # Receipt bootstrap is best-effort at boot.  If it fails
+            # here (e.g. cold-key unavailable, disk full, cache corrupt),
+            # log the exception and let the node continue to start —
+            # operators can fix and re-run; the chain is not at risk
+            # just because receipts aren't issuable today.  Blocking
+            # service start on this would turn a recoverable setup
+            # issue into a liveness incident.
+            logger.exception(
+                "Receipt-subtree bootstrap failed — node will continue, "
+                "but submission receipts will not be issuable until "
+                "SetReceiptSubtreeRoot is submitted by an operator."
+            )
     elif args.wallet:
         server.set_wallet(args.wallet)
         logger.warning("Wallet set but no private key — node cannot sign blocks.")
