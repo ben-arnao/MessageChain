@@ -6,3 +6,5 @@ CLAUDE.md
 messagechain/config_local.py
 docs/
 deploy/
+.claude/
+*.egg-info/

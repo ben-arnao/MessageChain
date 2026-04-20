@@ -3,9 +3,15 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live at `35.237.211.12:9334` since 2026-04-18.
-Chain ID `messagechain-v1`, genesis block 0:
+**Status:** mainnet live since 2026-04-18. Chain ID `messagechain-v1`,
+genesis block 0
 `5e8bc19ccd4449730684744951f1cca1eabb7d7c008623ea2257fd837fb63d18`.
+Seed peers are baked into `messagechain/config.py:CLIENT_SEED_ENDPOINTS`
+and the current tip is one command away:
+
+```bash
+messagechain status    # or `info` for full chain stats
+```
 
 ## Why
 
