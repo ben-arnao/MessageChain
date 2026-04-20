@@ -186,7 +186,7 @@ def create_set_authority_key_transaction(
         entity_id=entity.entity_id,
         new_authority_key=new_authority_key,
         nonce=nonce,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),
     )

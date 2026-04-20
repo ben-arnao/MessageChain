@@ -182,7 +182,7 @@ def create_key_rotation(
         old_public_key=entity.public_key,
         new_public_key=new_keypair.public_key,
         rotation_number=rotation_number,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )

@@ -234,7 +234,7 @@ def create_transfer_transaction(
         recipient_id=recipient_id,
         amount=amount,
         nonce=nonce,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
         sender_pubkey=entity.public_key if include_pubkey else b"",

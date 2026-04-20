@@ -108,8 +108,27 @@ HASH_ALGO = "sha3_256"
 HASH_VERSION_SHA256 = 1
 HASH_VERSION_CURRENT = HASH_VERSION_SHA256
 
-SIG_VERSION_WOTS_W16_K64 = 1  # current: WOTS W=16 chains=64 merkle h=20
-SIG_VERSION_CURRENT = SIG_VERSION_WOTS_W16_K64
+SIG_VERSION_WOTS_W16_K64 = 1      # WOTS W=16 chains=64 merkle h=20.
+                                  # NOTE: checksum encoding in this version
+                                  # truncates to always-zero — see V2 below.
+SIG_VERSION_WOTS_W16_K64_V2 = 2   # Same parameters, but with the fixed
+                                  # base-w checksum encoding (2-byte big-
+                                  # endian packed as exactly 4 nibbles,
+                                  # no truncation).  V1 checksum chains
+                                  # always fired at digit 0 regardless of
+                                  # message content, reducing the WOTS+
+                                  # security from 128-bit to ~2^56
+                                  # grinding.  V2 closes this gap.
+SIG_VERSION_CURRENT = SIG_VERSION_WOTS_W16_K64_V2
+# Accepted sig versions: legacy V1 must still validate (the live
+# mainnet chain up to the V2 cutover has V1 signatures baked into
+# every committed block); V2 is the go-forward scheme for all new
+# signatures.  Either version produces an identical Signature wire
+# format — only the checksum-nibble derivation differs.
+_ACCEPTED_SIG_VERSIONS: frozenset[int] = frozenset({
+    SIG_VERSION_WOTS_W16_K64,
+    SIG_VERSION_WOTS_W16_K64_V2,
+})
 
 
 def validate_hash_version(hash_version: int) -> tuple[bool, str]:
@@ -131,14 +150,17 @@ def validate_hash_version(hash_version: int) -> tuple[bool, str]:
 def validate_sig_version(sig_version: int) -> tuple[bool, str]:
     """Reject any unknown sig_version at the consensus boundary.
 
-    Same forward-compatibility shape as validate_hash_version. A future
-    signature scheme (XMSS, SPHINCS+, a larger WOTS profile) is activated
-    by governance; until then, only SIG_VERSION_CURRENT is accepted.
+    Accepts any version in `_ACCEPTED_SIG_VERSIONS`.  V1 signatures
+    remain valid because the live mainnet chain committed blocks under
+    V1 before the V2 checksum fix shipped; V2 is used for all new
+    signatures.  Future schemes (XMSS, SPHINCS+, larger WOTS profiles)
+    add themselves to the accepted set via governance.
     """
-    if sig_version != SIG_VERSION_CURRENT:
+    if sig_version not in _ACCEPTED_SIG_VERSIONS:
         return False, (
             f"Unknown sig version {sig_version} "
-            f"(current = {SIG_VERSION_CURRENT})"
+            f"(accepted = {sorted(_ACCEPTED_SIG_VERSIONS)}, "
+            f"current = {SIG_VERSION_CURRENT})"
         )
     return True, "OK"
 

@@ -392,7 +392,7 @@ def create_stake_transaction(
         entity_id=entity.entity_id,
         amount=amount,
         nonce=nonce,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
         sender_pubkey=entity.public_key if include_pubkey else b"",
@@ -414,7 +414,7 @@ def create_unstake_transaction(
         entity_id=entity.entity_id,
         amount=amount,
         nonce=nonce,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )

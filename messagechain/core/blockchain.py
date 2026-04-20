@@ -2662,9 +2662,13 @@ class Blockchain:
             slash_transactions=slash_transactions,
         )
         mtp = self.get_median_time_past()
-        # A small epsilon greater than the minimum float resolution the
-        # timestamp will be serialized at. Microsecond granularity is
-        # plenty — real block production is on the order of seconds.
+        # Float timestamps retained: switching to integer-seconds here
+        # breaks tests that create multiple blocks in the same wall-
+        # clock second (the MTP-advance check `timestamp > mtp` needs
+        # strictly-greater, which sub-second precision provides
+        # naturally).  The sub-second bits are not signed (see
+        # `signable_data` which truncates to int) so mutation of those
+        # bits has no consensus effect — the dual-encoding is cosmetic.
         now = _time.time()
         timestamp = now if now > mtp else mtp + 1e-6
         return consensus.create_block(

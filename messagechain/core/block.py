@@ -760,7 +760,7 @@ def create_genesis_block(proposer_entity) -> Block:
         block_number=0,
         prev_hash=b"\x00" * 32,
         merkle_root=_hash(b"genesis"),
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         proposer_id=proposer_entity.entity_id,
     )
 

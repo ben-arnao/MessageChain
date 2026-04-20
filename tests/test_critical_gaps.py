@@ -152,9 +152,11 @@ class TestMedianTimePast(unittest.TestCase):
 
     def test_mtp_calculation(self):
         """Median time past should return median of last N block timestamps."""
-        # Genesis block has some timestamp
         mtp = self.chain.get_median_time_past()
-        self.assertIsInstance(mtp, float)
+        # MTP can be int (genesis path uses int(time.time())) or float
+        # (ongoing blocks use time.time()).  Accept both — the only
+        # consensus-relevant property is numeric comparability.
+        self.assertIsInstance(mtp, (int, float))
 
     def test_block_timestamp_must_exceed_mtp(self):
         """A block with timestamp <= MTP must be rejected."""

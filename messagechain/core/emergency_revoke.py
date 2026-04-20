@@ -170,7 +170,7 @@ def create_revoke_transaction(
     target = entity_id if entity_id is not None else signer.entity_id
     tx = RevokeTransaction(
         entity_id=target,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),
     )

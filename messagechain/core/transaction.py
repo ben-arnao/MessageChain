@@ -362,7 +362,7 @@ def create_transaction(
     tx = MessageTransaction(
         entity_id=entity.entity_id,
         message=stored,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         nonce=nonce,
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder

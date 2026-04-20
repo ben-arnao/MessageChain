@@ -18,6 +18,7 @@ import unittest
 from messagechain.config import (
     HASH_VERSION_CURRENT, HASH_VERSION_SHA256,
     SIG_VERSION_CURRENT, SIG_VERSION_WOTS_W16_K64,
+    SIG_VERSION_WOTS_W16_K64_V2, _ACCEPTED_SIG_VERSIONS,
 )
 from messagechain.core.block import BlockHeader, Block, create_genesis_block
 from messagechain.core.blockchain import Blockchain
@@ -41,8 +42,21 @@ class TestCryptoAgilityConstants(unittest.TestCase):
     def test_sig_version_wots_w16_k64_is_one(self):
         self.assertEqual(SIG_VERSION_WOTS_W16_K64, 1)
 
-    def test_sig_version_current_is_wots(self):
-        self.assertEqual(SIG_VERSION_CURRENT, SIG_VERSION_WOTS_W16_K64)
+    def test_sig_version_wots_w16_k64_v2_is_two(self):
+        self.assertEqual(SIG_VERSION_WOTS_W16_K64_V2, 2)
+
+    def test_sig_version_current_is_v2(self):
+        """V2 ships the fixed base-w checksum encoding.  V1 is retained
+        in _ACCEPTED_SIG_VERSIONS so the pre-V2 committed chain still
+        verifies, but every NEW signature uses V2."""
+        self.assertEqual(SIG_VERSION_CURRENT, SIG_VERSION_WOTS_W16_K64_V2)
+
+    def test_v1_still_accepted_for_legacy_chain(self):
+        """V1 must remain accepted — the live mainnet chain has V1
+        signatures baked into every block committed before the V2
+        cutover; rejecting V1 would halt existing-chain validation."""
+        self.assertIn(SIG_VERSION_WOTS_W16_K64, _ACCEPTED_SIG_VERSIONS)
+        self.assertIn(SIG_VERSION_WOTS_W16_K64_V2, _ACCEPTED_SIG_VERSIONS)
 
 
 class TestBlockHeaderHashVersion(unittest.TestCase):
@@ -122,7 +136,7 @@ class TestSignatureSigVersion(unittest.TestCase):
     def test_unknown_sig_version_rejected_by_binary_decoder(self):
         entity = Entity.create(b"crypto-agility-test-key-32bytes!")
         sig = entity.keypair.sign(b"\x00" * 32)
-        sig.sig_version = 2  # unknown/future version
+        sig.sig_version = 99  # unknown/future version
         blob = sig.to_bytes()
         with self.assertRaises(ValueError):
             Signature.from_bytes(blob)
@@ -151,7 +165,8 @@ class TestTxSigVersionCommitment(unittest.TestCase):
         entity = Entity.create(b"crypto-agility-test-key-32bytes!")
         tx = create_transaction(entity, "hello", fee=10_000, nonce=0)
         original_hash = tx.tx_hash
-        tx.signature.sig_version = 2  # flip version
+        # Flip to a clearly different value (not in _ACCEPTED_SIG_VERSIONS).
+        tx.signature.sig_version = 99
         new_hash = tx._compute_hash()
         self.assertNotEqual(
             original_hash, new_hash,
@@ -248,7 +263,7 @@ class TestValidateCryptoVersionGate(unittest.TestCase):
         # Tamper after signing: flip the version on the signature.  Normally
         # this would also invalidate the tx hash commitment; we re-compute it
         # so the gate fires on VERSION, not on HASH_MISMATCH.
-        tx.signature.sig_version = 2
+        tx.signature.sig_version = 99  # unknown/future
         tx.tx_hash = tx._compute_hash()
 
         valid, reason = chain.validate_transaction(tx)

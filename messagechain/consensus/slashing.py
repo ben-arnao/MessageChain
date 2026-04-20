@@ -508,7 +508,7 @@ def create_slash_transaction(
     tx = SlashTransaction(
         evidence=evidence,
         submitter_id=submitter_entity.entity_id,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )

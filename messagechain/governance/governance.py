@@ -504,7 +504,7 @@ def create_proposal(
         proposer_id=proposer_entity.entity_id,
         title=title,
         description=description,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
         reference_hash=reference_hash,
@@ -526,7 +526,7 @@ def create_vote(
         voter_id=voter_entity.entity_id,
         proposal_id=proposal_id,
         approve=approve,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )
@@ -551,7 +551,7 @@ def create_treasury_spend_proposal(
         amount=amount,
         title=title,
         description=description,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )

@@ -693,9 +693,13 @@ def verify_signature(message_hash: bytes, signature: Signature, root_public_key:
     if signature.leaf_index < 0 or signature.leaf_index >= num_leaves:
         return False
 
-    # Step 1: Verify WOTS+ signature
+    # Step 1: Verify WOTS+ signature.  Pass through the signature's
+    # own sig_version so legacy V1 sigs are verified under the old
+    # checksum encoding (which the live chain committed with before
+    # the V2 fix) while V2 sigs go through the corrected encoder.
     if not wots_verify(message_hash, signature.wots_signature,
-                       signature.wots_public_key, signature.wots_public_seed):
+                       signature.wots_public_key, signature.wots_public_seed,
+                       sig_version=signature.sig_version):
         return False
 
     # Step 2: Verify Merkle path from leaf to root

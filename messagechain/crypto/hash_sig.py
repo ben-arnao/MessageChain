@@ -10,7 +10,11 @@ because their security reduces to the preimage/collision resistance of the hash 
 import hashlib
 import hmac
 import struct
-from messagechain.config import HASH_ALGO, WOTS_W, WOTS_KEY_CHAINS, WOTS_CHAIN_LENGTH
+from messagechain.config import (
+    HASH_ALGO, WOTS_W, WOTS_KEY_CHAINS, WOTS_CHAIN_LENGTH,
+    SIG_VERSION_WOTS_W16_K64, SIG_VERSION_WOTS_W16_K64_V2,
+    SIG_VERSION_CURRENT,
+)
 
 
 def _hash(data: bytes) -> bytes:
@@ -68,19 +72,52 @@ def wots_keygen(seed: bytes) -> tuple[list[bytes], bytes, bytes]:
     return private_keys, public_key, public_seed
 
 
-def _message_to_base_w(msg_hash: bytes) -> list[int]:
-    """Convert message hash to base-W digits for signing."""
+def _message_to_base_w(
+    msg_hash: bytes, sig_version: int = SIG_VERSION_CURRENT,
+) -> list[int]:
+    """Convert message hash to base-W digits for signing.
+
+    WOTS+ security rests on the checksum: it ensures that any attempt
+    to advance a message chain forward (forging a higher digit) must
+    be balanced by a DECREASE in some checksum chain — which is
+    preimage-hard.  That guarantee requires the checksum value to
+    actually land in the retained chain positions.
+
+    Two encodings are supported for crypto-agility:
+
+    V1 (SIG_VERSION_WOTS_W16_K64): `struct.pack(">I", checksum)` (4
+    bytes = 8 nibbles) truncated to `[:WOTS_KEY_CHAINS]` which kept
+    only the FIRST 4 of those 8 nibbles — the high nibbles of the top
+    16 bits.  Max checksum is 60*15 = 900 = 0x384, so the top 16 bits
+    were always zero, meaning every checksum chain always fired at
+    digit 0.  The checksum was effectively constant, collapsing WOTS+
+    security from the intended 128-bit margin to ~2^56 grinding
+    (60 monotonic-digit constraints each at ≈0.53 probability).
+    Retained only so the live mainnet chain (committed under V1) still
+    validates; all new signatures use V2.
+
+    V2 (SIG_VERSION_WOTS_W16_K64_V2): `struct.pack(">H", checksum)`
+    gives exactly 4 nibbles — enough to represent 900 (fits in 10
+    bits) and no truncation is needed.  All 4 checksum chains carry
+    the real checksum value; WOTS+ security is at its intended level.
+    """
     digits = []
     for byte in msg_hash:
         digits.append(byte >> 4)   # high nibble (0-15)
         digits.append(byte & 0x0F)  # low nibble (0-15)
-    # Pad or truncate to WOTS_KEY_CHAINS
-    # First part: message digits. Remainder: checksum digits.
     msg_digits = digits[:WOTS_KEY_CHAINS - 4]
 
-    # Checksum: prevents attacker from advancing chains further
     checksum = sum(WOTS_CHAIN_LENGTH - d for d in msg_digits)
-    checksum_bytes = struct.pack(">I", checksum)
+
+    if sig_version == SIG_VERSION_WOTS_W16_K64_V2:
+        # 2 bytes = 4 nibbles exactly, matching the 4 retained checksum
+        # chain positions.  Max encoded value 65535 ≫ max checksum 900.
+        checksum_bytes = struct.pack(">H", checksum)
+    else:
+        # Legacy V1 encoding.  Preserved byte-for-byte for backward
+        # compatibility with pre-V2 signatures on the committed chain.
+        checksum_bytes = struct.pack(">I", checksum)
+
     for byte in checksum_bytes:
         msg_digits.append(byte >> 4)
         msg_digits.append(byte & 0x0F)
@@ -88,15 +125,20 @@ def _message_to_base_w(msg_hash: bytes) -> list[int]:
     return msg_digits[:WOTS_KEY_CHAINS]
 
 
-def wots_sign(msg_hash: bytes, private_keys: list[bytes], public_seed: bytes) -> list[bytes]:
+def wots_sign(
+    msg_hash: bytes, private_keys: list[bytes], public_seed: bytes,
+    sig_version: int = SIG_VERSION_CURRENT,
+) -> list[bytes]:
     """
     Sign a message hash with WOTS+.
 
     Each digit d of the base-W message determines how many times we hash
     the corresponding private key chain. The verifier can hash the remaining
     (W-1-d) times to reach the public chain endpoint.
+
+    `sig_version` selects the base-w encoding — see `_message_to_base_w`.
     """
-    digits = _message_to_base_w(msg_hash)
+    digits = _message_to_base_w(msg_hash, sig_version=sig_version)
     signature = []
     for i, d in enumerate(digits):
         sig_i = _chain(private_keys[i], 0, d, public_seed, i)
@@ -107,7 +149,10 @@ def wots_sign(msg_hash: bytes, private_keys: list[bytes], public_seed: bytes) ->
     return signature
 
 
-def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, public_seed: bytes) -> bool:
+def wots_verify(
+    msg_hash: bytes, signature: list[bytes], public_key: bytes,
+    public_seed: bytes, sig_version: int = SIG_VERSION_CURRENT,
+) -> bool:
     """
     Verify a WOTS+ signature.
 
@@ -116,6 +161,9 @@ def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, publ
 
     Returns False on malformed input rather than raising — callers rely on
     this being total over all inputs to avoid DoS via uncaught exceptions.
+
+    `sig_version` selects the base-w encoding used at sign time.  Legacy
+    V1 sigs use the old checksum-truncation encoding; V2+ uses the fix.
     """
     # Strict structural validation. A WOTS+ verification must be total
     # (never raise) so that adversarial peers cannot crash validation
@@ -132,7 +180,7 @@ def wots_verify(msg_hash: bytes, signature: list[bytes], public_key: bytes, publ
         if not isinstance(part, (bytes, bytearray)) or len(part) != 32:
             return False
 
-    digits = _message_to_base_w(msg_hash)
+    digits = _message_to_base_w(msg_hash, sig_version=sig_version)
     pk_parts = []
     dummy = b'\x00' * 32
     for i, d in enumerate(digits):
