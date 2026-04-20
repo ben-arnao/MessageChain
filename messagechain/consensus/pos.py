@@ -225,6 +225,7 @@ class ProofOfStake:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         finality_votes: list | None = None,
+        censorship_evidence_txs: list | None = None,
         timestamp: float | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
         state_root_checkpoint: bytes = b"\x00" * 32,
@@ -257,6 +258,7 @@ class ProofOfStake:
         stake_txs = list(stake_transactions or [])
         unstake_txs = list(unstake_transactions or [])
         fin_votes = list(finality_votes or [])
+        censorship_txs = list(censorship_evidence_txs or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
             + [tx.tx_hash for tx in transfer_txs]
@@ -266,6 +268,7 @@ class ProofOfStake:
             + [tx.tx_hash for tx in stake_txs]
             + [tx.tx_hash for tx in unstake_txs]
             + [v.consensus_hash() for v in fin_votes]
+            + [tx.tx_hash for tx in censorship_txs]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -331,6 +334,7 @@ class ProofOfStake:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             finality_votes=fin_votes,
+            censorship_evidence_txs=censorship_txs,
         )
         block.block_hash = block._compute_hash()
         return block

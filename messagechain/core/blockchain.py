@@ -26,6 +26,7 @@ from messagechain.config import (
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
+    EVIDENCE_INCLUSION_WINDOW, EVIDENCE_EXPIRY_BLOCKS,
 )
 from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
 from messagechain.core.state_tree import SparseMerkleTree
@@ -133,6 +134,9 @@ def compute_block_sig_cost(block) -> int:
         + 1  # proposer signature
         + len(block.attestations)
         + len(getattr(block, "finality_votes", []))
+        # Each censorship-evidence tx carries one submitter signature +
+        # one receipt signature — cost both.
+        + 2 * len(getattr(block, "censorship_evidence_txs", []))
     )
 
 
@@ -303,6 +307,37 @@ class Blockchain:
         # honest participants regain 2/3 supermajority.
         self.blocks_since_last_finalization: int = 0
 
+        # Censorship-evidence processor.  Lifecycle: every admitted
+        # CensorshipEvidenceTx goes through processor.submit(), every
+        # block triggers processor.observe_block() to void evidence
+        # whose tx just landed, and at the end of _apply_block_state
+        # processor.mature(height) returns evidences ready to slash.
+        # Both maps (pending + processed) participate in the state
+        # root so every node reaches identical slashing outcomes.
+        # See messagechain.consensus.censorship_evidence for the
+        # two-phase design rationale.
+        from messagechain.consensus.censorship_evidence import (
+            CensorshipEvidenceProcessor,
+        )
+        self.censorship_processor: CensorshipEvidenceProcessor = (
+            CensorshipEvidenceProcessor()
+        )
+
+        # Per-validator receipt-subtree root registry.  Receipts are
+        # signed with a DIFFERENT WOTS+ subtree than block-signing;
+        # every validator that wants to issue receipts registers the
+        # subtree root here.  Maps entity_id -> 32-byte root pubkey.
+        # The CensorshipEvidenceTx validation path cross-checks that
+        # the receipt's embedded root matches the registered root for
+        # the issuer, so a stale receipt signed by an old subtree
+        # cannot be weaponized against an operator who rotated.  An
+        # unregistered issuer's receipts are treated as self-
+        # contained: if the receipt signature verifies against its
+        # embedded root, that's enough — the slashing check verifies
+        # the embedded root IS the registered root only when the
+        # issuer has one on file.
+        self.receipt_subtree_roots: dict[bytes, bytes] = {}
+
         # Entity-index registry: bidirectional map for bloat reduction.
         # Every registered entity is assigned a monotonic integer index
         # (starting at 1; 0 reserved as the "invalid / unassigned"
@@ -403,6 +438,30 @@ class Blockchain:
         # a validator be slashed twice for the same offence).
         if hasattr(self.db, 'get_all_processed_evidence'):
             self._processed_evidence = self.db.get_all_processed_evidence()
+
+        # Restore pending censorship-evidence + receipt-subtree roots.
+        # Without these a cold-booted node loses the maturity pipeline
+        # and silently fails to slash evidences admitted pre-restart.
+        if hasattr(self.db, "get_all_pending_censorship_evidence"):
+            from messagechain.consensus.censorship_evidence import (
+                _PendingEvidence,
+            )
+            self.censorship_processor.pending = {}
+            # Populate the processor's processed set from the main
+            # processed_evidence table — censorship-evidence hashes
+            # are recorded there too on mature/void.
+            self.censorship_processor.processed = set(self._processed_evidence)
+            for ev_hash, payload in self.db.get_all_pending_censorship_evidence().items():
+                offender_id, tx_hash, admitted_height, evidence_tx_hash = payload
+                self.censorship_processor.pending[ev_hash] = _PendingEvidence(
+                    evidence_hash=ev_hash,
+                    offender_id=offender_id,
+                    tx_hash=tx_hash,
+                    admitted_height=admitted_height,
+                    evidence_tx_hash=evidence_tx_hash,
+                )
+        if hasattr(self.db, "get_all_receipt_subtree_roots"):
+            self.receipt_subtree_roots = self.db.get_all_receipt_subtree_roots()
 
         # Restore entity-index registry (bloat reduction). Indices are
         # assigned monotonically at registration time; rebuilding the
@@ -528,6 +587,29 @@ class Blockchain:
             if hasattr(self.db, 'set_entity_index'):
                 for eid, idx in self.entity_id_to_index.items():
                     self.db.set_entity_index(eid, idx)
+            # Persist pending censorship-evidence so a restart picks
+            # up the maturity pipeline mid-flight.
+            if hasattr(self.db, "set_pending_censorship_evidence"):
+                # The full set is written each flush; REPLACE
+                # semantics make re-persisting unchanged entries a
+                # no-op at the storage layer.
+                for ev_hash, entry in self.censorship_processor.pending.items():
+                    self.db.set_pending_censorship_evidence(
+                        ev_hash,
+                        entry.offender_id,
+                        entry.tx_hash,
+                        entry.admitted_height,
+                        entry.evidence_tx_hash,
+                    )
+                # Persist processed censorship-evidence hashes into the
+                # shared processed_evidence table (single source of
+                # truth for evidence-dedupe across both slashing types).
+                if hasattr(self.db, "mark_evidence_processed"):
+                    for ev_hash in self.censorship_processor.processed:
+                        self.db.mark_evidence_processed(ev_hash, self.height)
+            if hasattr(self.db, "set_receipt_subtree_root"):
+                for eid, rk in self.receipt_subtree_roots.items():
+                    self.db.set_receipt_subtree_root(eid, rk)
             self.db.commit_transaction()
         except Exception:
             self.db.rollback_transaction()
@@ -921,6 +1003,32 @@ class Blockchain:
         # state_snapshot._TAG_SEED_DIVEST_DEBT.
         self.seed_divestment_debt = dict(
             snap.get("seed_divestment_debt", {})
+        )
+
+        # Censorship-evidence processor state.  Install BEFORE
+        # rebuilding the state tree so a subsequent state-root
+        # computation reflects the installed pending/processed dicts.
+        from messagechain.storage.state_snapshot import (
+            _bytes_dict_to_pending,
+        )
+        from messagechain.consensus.censorship_evidence import (
+            _PendingEvidence,
+        )
+        self.censorship_processor.pending = {}
+        self.censorship_processor.processed = set(
+            snap.get("censorship_processed", set())
+        )
+        for entry in _bytes_dict_to_pending(snap.get("censorship_pending", {})):
+            ev_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash = entry
+            self.censorship_processor.pending[ev_hash] = _PendingEvidence(
+                evidence_hash=ev_hash,
+                offender_id=offender_id,
+                tx_hash=tx_hash,
+                admitted_height=admitted_height,
+                evidence_tx_hash=evidence_tx_hash,
+            )
+        self.receipt_subtree_roots = dict(
+            snap.get("receipt_subtree_roots", {})
         )
 
         # Rebuild the per-entity sparse Merkle tree from the installed
@@ -1864,6 +1972,138 @@ class Blockchain:
             f"reward={finder_reward})"
         )
 
+    def _apply_censorship_slash(self, matured) -> None:
+        """Apply a matured CensorshipEvidence as a partial stake slash.
+
+        Unlike the full-100%-burn slash for equivocation, censorship
+        slashing is PARTIAL (CENSORSHIP_SLASH_BPS of stake) and the
+        tokens are BURNED — no finder reward.  No burn of escrow.  The
+        offender remains a validator (unlike equivocation, which adds
+        them to slashed_validators and takes them out of the set
+        permanently) because censorship is a weaker offense.
+
+        The `slashed_validators` set is NOT mutated here — an offender
+        who is slashed for censorship stays in the validator set with
+        reduced stake.  `_processed_evidence` IS mutated so the same
+        evidence can never be applied twice.
+        """
+        from messagechain.consensus.censorship_evidence import (
+            compute_slash_amount,
+        )
+        offender_id = matured.offender_id
+        current_stake = self.supply.staked.get(offender_id, 0)
+        slash_amount = compute_slash_amount(current_stake)
+        if slash_amount <= 0:
+            # No stake to slash — still record the evidence as
+            # processed so it cannot be re-submitted.
+            self._processed_evidence.add(matured.evidence_hash)
+            logger.info(
+                f"Censorship evidence {matured.evidence_hash.hex()[:16]} "
+                f"matured but offender has no stake — no slash, marked processed"
+            )
+            return
+
+        # Debit stake + burn (reduce total_supply, bump total_burned).
+        self.supply.staked[offender_id] = current_stake - slash_amount
+        self.supply.total_supply -= slash_amount
+        self.supply.total_burned += slash_amount
+
+        # Record as processed to prevent double-slashing.
+        self._processed_evidence.add(matured.evidence_hash)
+
+        logger.info(
+            f"CENSORSHIP-SLASHED validator {offender_id.hex()[:16]}: "
+            f"stake_burned={slash_amount}, "
+            f"stake_after={current_stake - slash_amount}, "
+            f"evidence={matured.evidence_hash.hex()[:16]}"
+        )
+
+    def validate_censorship_evidence_tx(
+        self, tx, chain_height: int | None = None,
+    ) -> tuple[bool, str]:
+        """Admission-time validation for a CensorshipEvidenceTx.
+
+        Checks (in order, cheap-first):
+          * submitter is a registered entity
+          * offender is a registered entity
+          * offender has NOT been already slashed
+          * evidence_hash has NOT already been processed (dedupe)
+          * evidence is NOT already pending (dedupe)
+          * receipt window elapsed: commit_height + WINDOW < height
+          * receipt not stale: height - commit_height <= EXPIRY
+          * receipted tx NOT already on-chain (nonce check)
+          * receipt issuer root matches registered root (if any)
+          * submitter can afford the fee
+          * receipt signature + submitter signature verify
+        """
+        from messagechain.consensus.censorship_evidence import (
+            verify_censorship_evidence_tx,
+        )
+        height = chain_height if chain_height is not None else self.height
+
+        if tx.submitter_id not in self.public_keys:
+            return False, "Unknown submitter — must register first"
+
+        if tx.offender_id not in self.public_keys:
+            return False, "Unknown offender"
+
+        if tx.offender_id in self.slashed_validators:
+            return False, "Offender already slashed"
+
+        evidence_hash = tx.evidence_hash
+
+        # Processor-level dedupe — prevents re-admitting the same
+        # evidence after it has already matured / voided.
+        if self.censorship_processor.has_processed(evidence_hash):
+            return False, "Evidence already processed"
+        if self.censorship_processor.is_pending(evidence_hash):
+            return False, "Evidence already pending"
+        # Belt-and-braces: the legacy slashing pipeline also records
+        # processed evidence hashes in `_processed_evidence`.  Honor it.
+        if evidence_hash in self._processed_evidence:
+            return False, "Evidence already processed (legacy dedupe)"
+
+        # Window gate: receipt must be old enough that an honest
+        # proposer would have included the tx by now.
+        if tx.receipt.commit_height + EVIDENCE_INCLUSION_WINDOW > height:
+            return False, "Receipt too fresh — inclusion window not elapsed"
+
+        # Staleness gate: a very old receipt is rejected to prevent
+        # weaponizing ancient receipts against a long-past offender.
+        if height - tx.receipt.commit_height > EVIDENCE_EXPIRY_BLOCKS:
+            return False, "Receipt expired — older than EVIDENCE_EXPIRY_BLOCKS"
+
+        # The receipted tx MUST still be absent from chain state.  We
+        # detect presence via the entity's on-chain nonce: if
+        # chain_nonce > receipt_tx.nonce, the tx has already been
+        # applied (or a replacement with higher nonce has — either
+        # way the offender isn't censoring).
+        chain_nonce = self.nonces.get(tx.message_tx.entity_id, 0)
+        if chain_nonce > tx.message_tx.nonce:
+            return False, "Receipted tx already on-chain (nonce advanced)"
+
+        # Registered-root check: if the chain knows a receipt-subtree
+        # root for this issuer, the receipt's embedded root must match.
+        registered_root = self.receipt_subtree_roots.get(tx.offender_id)
+        if (
+            registered_root is not None
+            and registered_root != tx.receipt.issuer_root_public_key
+        ):
+            return False, (
+                "Receipt signed with a different subtree root than "
+                "the issuer's registered root"
+            )
+
+        if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
+            return False, "Submitter cannot afford fee"
+
+        submitter_pk = self.public_keys[tx.submitter_id]
+        valid, reason = verify_censorship_evidence_tx(tx, submitter_pk)
+        if not valid:
+            return False, reason
+
+        return True, "Valid"
+
     def get_median_time_past(self) -> float:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
 
@@ -2023,6 +2263,7 @@ class Blockchain:
         finality_votes: list | None = None,
         proposer_signature_leaf_index: int | None = None,
         slash_transactions: list | None = None,
+        censorship_evidence_txs: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -2581,6 +2822,47 @@ class Blockchain:
                 _ail(sim_staked, sim_blocks_since_fin, _inactive,
                      min_stake=VALIDATOR_MIN_STAKE)
 
+        # Simulate censorship-evidence pipeline: submitter pays fee,
+        # pending entries whose tx landed above get voided, then any
+        # matured entries get partially slashed.  Mirror the apply-
+        # time ordering exactly so the sim state root matches apply.
+        from messagechain.consensus.censorship_evidence import (
+            compute_slash_amount as _cslash,
+        )
+        # Step 1: mirror observe_block — any pending evidence whose
+        # tx appears in this block's `transactions` slot is voided.
+        # Build a local copy of pending to simulate.
+        sim_pending = {
+            ev_hash: entry
+            for ev_hash, entry in self.censorship_processor.pending.items()
+        }
+        block_tx_hashes = {tx.tx_hash for tx in transactions}
+        for ev_hash in list(sim_pending.keys()):
+            if sim_pending[ev_hash].tx_hash in block_tx_hashes:
+                del sim_pending[ev_hash]
+        # Step 2: admit new evidence txs — submitter pays fee; new
+        # pending entries land in sim_pending.  Admission may not
+        # trigger a slash this same block (maturity > 0 by design).
+        for etx in (censorship_evidence_txs or []):
+            effective_base_fee = min(current_base_fee, etx.fee)
+            tip = etx.fee - effective_base_fee
+            sim_balances[etx.submitter_id] = (
+                sim_balances.get(etx.submitter_id, 0) - etx.fee
+            )
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + tip
+            )
+            _bump_wm(etx.submitter_id, etx.signature.leaf_index)
+        # Step 3: mature — any pending entry whose
+        # admitted_height + MATURITY <= block_height gets slashed.
+        from messagechain.config import EVIDENCE_MATURITY_BLOCKS as _EMB
+        for ev_hash, entry in list(sim_pending.items()):
+            if entry.admitted_height + _EMB <= block_height:
+                current_stake = sim_staked.get(entry.offender_id, 0)
+                slash_amount = _cslash(current_stake)
+                if slash_amount > 0:
+                    sim_staked[entry.offender_id] = current_stake - slash_amount
+
         return compute_state_root(
             sim_balances, sim_nonces, sim_staked,
             authority_keys=sim_authority_keys,
@@ -2604,6 +2886,7 @@ class Blockchain:
         stake_transactions: list | None = None,
         unstake_transactions: list | None = None,
         finality_votes: list | None = None,
+        censorship_evidence_txs: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
@@ -2661,6 +2944,7 @@ class Blockchain:
             finality_votes=finality_votes,
             proposer_signature_leaf_index=expected_proposer_leaf,
             slash_transactions=slash_transactions,
+            censorship_evidence_txs=censorship_evidence_txs,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -2701,6 +2985,7 @@ class Blockchain:
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
             finality_votes=finality_votes,
+            censorship_evidence_txs=censorship_evidence_txs,
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
             state_root_checkpoint=state_root_checkpoint,
@@ -3248,6 +3533,7 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
             + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
             + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
+            + [tx.tx_hash for tx in getattr(block, "censorship_evidence_txs", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -4461,6 +4747,52 @@ class Blockchain:
             )
             self._bump_watermark(stx.submitter_id, stx.signature.leaf_index)
 
+        # Observe: any pending censorship-evidence whose receipted tx
+        # just landed above is voided.  Runs BEFORE evidence-tx
+        # admission in the same block so a tx+evidence included
+        # together does not land as a pending entry and get slashed
+        # later — the block that includes the tx proves there was no
+        # censorship.  Voided entries go into processor.processed to
+        # prevent re-submission.
+        self.censorship_processor.observe_block(block)
+
+        # Admit newly-submitted CensorshipEvidenceTx.  Validator block
+        # verification has already run validate_censorship_evidence_tx
+        # on each entry; we still defensively re-check here so the
+        # apply path never slashes on an unverified claim.
+        for etx in getattr(block, "censorship_evidence_txs", []):
+            ok, reason = self.validate_censorship_evidence_tx(
+                etx, chain_height=block.header.block_number,
+            )
+            if not ok:
+                logger.warning(
+                    f"CensorshipEvidenceTx {etx.tx_hash.hex()[:16]} rejected at "
+                    f"apply-time: {reason}"
+                )
+                continue
+            if not self.supply.pay_fee_with_burn(
+                etx.submitter_id, proposer_id, etx.fee, current_base_fee,
+            ):
+                logger.error(
+                    f"CensorshipEvidenceTx {etx.tx_hash.hex()[:16]} fee payment "
+                    f"failed — skipping"
+                )
+                continue
+            admitted = self.censorship_processor.submit(
+                evidence_hash=etx.evidence_hash,
+                offender_id=etx.offender_id,
+                tx_hash=etx.message_tx.tx_hash,
+                admitted_height=block.header.block_number,
+                evidence_tx_hash=etx.tx_hash,
+            )
+            if not admitted:
+                logger.warning(
+                    f"CensorshipEvidenceTx {etx.tx_hash.hex()[:16]} already "
+                    f"pending/processed — fee charged but no new admission"
+                )
+            # Consume submitter's WOTS+ leaf.
+            self._bump_watermark(etx.submitter_id, etx.signature.leaf_index)
+
         # Apply authority transactions (SetAuthorityKey / Revoke / KeyRotation).
         # These all carry block-level state changes that previously only
         # applied on the node receiving the RPC — committing them through
@@ -4807,6 +5139,20 @@ class Blockchain:
                         f"{len(inactive)} inactive validators "
                         f"(stall={self.blocks_since_last_finalization} blocks)"
                     )
+
+        # Mature any censorship-evidence whose maturity window has
+        # elapsed without the receipted tx landing on-chain.  Runs
+        # AFTER tx/evidence application so a same-block evidence
+        # cannot mature before its counter-proof (the tx landing) has
+        # had a chance to void it.  Each matured entry is a slash:
+        # burn CENSORSHIP_SLASH_BPS of the offender's stake and record
+        # the evidence_hash in _processed_evidence so the dedupe
+        # pipeline prevents re-submission.
+        matured = self.censorship_processor.mature(
+            block.header.block_number,
+        )
+        for m in matured:
+            self._apply_censorship_slash(m)
 
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
@@ -5227,6 +5573,9 @@ class Blockchain:
                     governance_txs=getattr(block, "governance_txs", []),
                     finality_votes=getattr(block, "finality_votes", []),
                     proposer_signature_leaf_index=proposer_sig_leaf,
+                    censorship_evidence_txs=getattr(
+                        block, "censorship_evidence_txs", [],
+                    ),
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and

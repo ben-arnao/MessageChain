@@ -1128,6 +1128,57 @@ SUBMISSION_RATE_LIMIT_PER_SEC = 2
 SUBMISSION_BURST = 10
 MAX_SUBMISSION_BODY_BYTES = 16384
 
+# ─────────────────────────────────────────────────────────────────────
+# Attestable submission receipts + censorship-evidence slashing
+# ─────────────────────────────────────────────────────────────────────
+# Validators issue signed "submission receipts" committing to having
+# accepted a tx for inclusion. If the receipted tx is NOT included in
+# any block within EVIDENCE_INCLUSION_WINDOW blocks, anyone can submit
+# a CensorshipEvidenceTx binding (receipt, window) as proof of
+# censorship.  Evidence enters a pending-matrix for a challenge window
+# during which the accused proposer can include the tx on-chain and
+# void the evidence; if the window closes with the tx still missing,
+# the validator is slashed CENSORSHIP_SLASH_BPS of their stake.
+#
+# This is deliberately LESS SEVERE than the 100%-burn slashes for
+# equivocation / double-attestation, because censorship is a weaker
+# offense than corrupting consensus state itself — see the design
+# discussion in consensus/slashing.py.  A partial slash gives honest
+# validators an economic nudge to include what they receipt without
+# pushing a temporary mistake to existential penalty.
+CENSORSHIP_SLASH_BPS = 1000  # 10% of stake, in basis points (10_000 = 100%)
+
+# Blocks after a receipt's commit_height by which the receipted tx
+# must appear on-chain.  If the tx is not included within this window,
+# the receipt becomes evidence-eligible.  Generous enough to absorb
+# fork-choice churn yet short enough that a censor cannot stall
+# indefinitely.
+EVIDENCE_INCLUSION_WINDOW = 32
+
+# Maximum age (blocks) of a receipt at evidence-submission time.
+# Beyond this, evidence is stale and rejected at mempool admission —
+# prevents weaponizing ancient receipts against a validator who may
+# have already unstaked.  Mirrors the UNBONDING_PERIOD idea from
+# equivocation slashing.
+EVIDENCE_EXPIRY_BLOCKS = 512
+
+# Maturity delay (blocks) between evidence admission and actual slash
+# application.  During this window, the accused proposer (or any other
+# party) can include the receipted tx in a block, which voids the
+# pending evidence.  Prevents griefing: an attacker who files evidence
+# against a proposer who was about-to-include a tx does not land the
+# slash, because the proposer's good-faith inclusion cancels the
+# pending evidence before maturity.
+EVIDENCE_MATURITY_BLOCKS = 16
+
+# Dedicated WOTS+ subtree height for receipt-signing.  Separate from
+# the block-signing tree (MERKLE_TREE_HEIGHT) so receipt traffic cannot
+# burn leaves that the proposer needs for block production.  Height 24
+# gives 2**24 ≈ 16.7M receipts — orders of magnitude larger than the
+# block-signing tree because a validator may receipt many txs per
+# block.  Generated lazily on first startup and cached to disk.
+RECEIPT_SUBTREE_HEIGHT = 24
+
 # Block deserialization size limit — maximum hex-encoded block size
 # accepted from peers over the network.  A block with MAX_TXS_PER_BLOCK=20
 # transactions each carrying MAX_BLOCK_MESSAGE_BYTES of payload plus WOTS+

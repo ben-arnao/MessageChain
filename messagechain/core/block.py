@@ -395,6 +395,13 @@ class Block:
     # persists across restart, so a cold-booted node inherits the
     # chain's irreversibility commitments.
     finality_votes: list = field(default_factory=list)  # list[FinalityVote]
+    # Censorship-evidence txs: first-class block slot so every peer
+    # processes the same admissions.  An evidence tx carries a signed
+    # submission receipt + the receipted MessageTransaction; when
+    # admitted, the CensorshipEvidenceProcessor marks it pending and
+    # begins a maturity countdown.  See
+    # messagechain.consensus.censorship_evidence.
+    censorship_evidence_txs: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -433,6 +440,10 @@ class Block:
             result["unstake_transactions"] = [tx.serialize() for tx in self.unstake_transactions]
         if self.finality_votes:
             result["finality_votes"] = [v.serialize() for v in self.finality_votes]
+        if self.censorship_evidence_txs:
+            result["censorship_evidence_txs"] = [
+                tx.serialize() for tx in self.censorship_evidence_txs
+            ]
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -568,6 +579,7 @@ class Block:
             enc_list(self.stake_transactions),
             enc_list(self.unstake_transactions),
             enc_list(self.finality_votes),
+            enc_list(self.censorship_evidence_txs),
             self.block_hash,
         ])
 
@@ -704,6 +716,15 @@ class Block:
         from messagechain.consensus.finality import FinalityVote
         finality_votes = dec_list(FinalityVote)
 
+        # Censorship-evidence txs (new slot).  Always present on
+        # post-wiring blobs; pre-wiring blobs had this slot absent, but
+        # the pre-launch hard reset (see CLAUDE.md — wire-format
+        # breakage is OK) means no legacy blobs cross this decoder.
+        from messagechain.consensus.censorship_evidence import (
+            CensorshipEvidenceTx,
+        )
+        censorship_evidence_txs = dec_list(CensorshipEvidenceTx)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -719,6 +740,7 @@ class Block:
             stake_transactions=stake_txs,
             unstake_transactions=unstake_txs,
             finality_votes=finality_votes,
+            censorship_evidence_txs=censorship_evidence_txs,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -769,12 +791,22 @@ class Block:
             finality_votes = [
                 FinalityVote.deserialize(v) for v in data["finality_votes"]
             ]
+        censorship_evidence_txs = []
+        if data.get("censorship_evidence_txs"):
+            from messagechain.consensus.censorship_evidence import (
+                CensorshipEvidenceTx,
+            )
+            censorship_evidence_txs = [
+                CensorshipEvidenceTx.deserialize(e)
+                for e in data["censorship_evidence_txs"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
                     unstake_transactions=unstake_txs,
-                    finality_votes=finality_votes)
+                    finality_votes=finality_votes,
+                    censorship_evidence_txs=censorship_evidence_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

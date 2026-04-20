@@ -69,6 +69,13 @@ class SubmissionResult:
 
     Separate from HTTP status so the helper is usable from non-HTTP
     callers (tests, future RPC clients).
+
+    If the submission was accepted AND the server has a
+    ReceiptIssuer configured, `receipt` carries the signed
+    SubmissionReceipt the validator commits to.  Clients can hold
+    this receipt and, if the tx isn't included within
+    EVIDENCE_INCLUSION_WINDOW blocks, file a CensorshipEvidenceTx to
+    trigger a partial slash of the validator.
     """
     ok: bool
     tx_hash: bytes = b""
@@ -76,18 +83,31 @@ class SubmissionResult:
     # True iff the tx was already in the mempool — the HTTP layer
     # treats this as success (200) for idempotency.
     duplicate: bool = False
+    # Receipt bytes (hex) when issued.  Populated only when the
+    # server-side ReceiptIssuer is configured AND the tx was
+    # newly admitted (no receipt on duplicate — a retry must not
+    # consume a fresh leaf from the receipt subtree).
+    receipt_hex: str = ""
 
 
 def submit_transaction_to_mempool(
     tx: MessageTransaction,
     blockchain,
     mempool,
+    receipt_issuer=None,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
     Mirrors the Server._rpc_submit_transaction ingress path so
     forced-inclusion arrival tracking stays consistent across ingress
     points (local RPC, P2P gossip, public HTTPS submission).
+
+    `receipt_issuer` (optional): if provided, a SubmissionReceipt is
+    issued on fresh admission and returned via result.receipt_hex.
+    No receipt is issued on duplicate admission (retries do not
+    consume a new leaf from the issuer's subtree).  Content-neutral:
+    the issuer has NO discretion to refuse receipts for
+    already-accepted txs.
     """
     # Idempotency: if the tx is already in the pool, treat as success.
     # An honest retry (client that lost its connection) must not see
@@ -118,7 +138,25 @@ def submit_transaction_to_mempool(
             ok=False, error="Mempool rejected transaction (rate / fee / cap)",
         )
 
-    return SubmissionResult(ok=True, tx_hash=tx.tx_hash)
+    # Content-neutral receipt issuance.  No blocklists, no
+    # size-based refusal — if the mempool accepted the tx, the
+    # validator MUST commit to having seen it, on pain of
+    # censorship-evidence slashing if the tx is not eventually
+    # included.
+    receipt_hex = ""
+    if receipt_issuer is not None:
+        try:
+            receipt = receipt_issuer.issue(tx.tx_hash)
+            receipt_hex = receipt.to_bytes().hex()
+        except Exception:
+            # A broken issuer must NOT block submission success —
+            # the tx is already in the mempool and the client's
+            # best response is to proceed without a receipt.
+            logger.exception("receipt issuance failed")
+
+    return SubmissionResult(
+        ok=True, tx_hash=tx.tx_hash, receipt_hex=receipt_hex,
+    )
 
 
 class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
@@ -243,9 +281,22 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             except Exception:  # noqa: BLE001 — relay is best-effort
                 logger.exception("submission relay hook raised")
 
-        resp = (
-            b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii") + b'"}'
-        )
+        # JSON body.  Include receipt iff the server-side issuer
+        # produced one — clients that don't care about censorship
+        # evidence can ignore the extra field, clients that do hold
+        # onto it for EVIDENCE_INCLUSION_WINDOW blocks.
+        if result.receipt_hex:
+            resp = (
+                b'{"ok":true,"tx_hash":"'
+                + tx.tx_hash.hex().encode("ascii")
+                + b'","receipt":"'
+                + result.receipt_hex.encode("ascii")
+                + b'"}'
+            )
+        else:
+            resp = (
+                b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii") + b'"}'
+            )
         self._ok(resp)
 
 
@@ -262,10 +313,12 @@ class _HandlerContext:
         blockchain,
         mempool,
         relay_callback: Optional[Callable[[MessageTransaction], None]],
+        receipt_issuer=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
         self.relay_callback = relay_callback
+        self.receipt_issuer = receipt_issuer
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
@@ -315,7 +368,10 @@ class _HandlerContext:
         self._last_active.pop(oldest_ip, None)
 
     def submit(self, tx: MessageTransaction) -> SubmissionResult:
-        return submit_transaction_to_mempool(tx, self.blockchain, self.mempool)
+        return submit_transaction_to_mempool(
+            tx, self.blockchain, self.mempool,
+            receipt_issuer=self.receipt_issuer,
+        )
 
 
 class _ThreadingHTTPSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -354,6 +410,7 @@ class SubmissionServer:
         port: int,
         bind: str = "0.0.0.0",
         relay_callback: Optional[Callable[[MessageTransaction], None]] = None,
+        receipt_issuer=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -362,6 +419,11 @@ class SubmissionServer:
         self.port = port
         self.bind = bind
         self.relay_callback = relay_callback
+        # Optional ReceiptIssuer — see submission_receipt.ReceiptIssuer.
+        # When set, every fresh admission returns a signed receipt the
+        # client can later weaponize as CensorshipEvidenceTx if the
+        # receipted tx doesn't land on-chain within EVIDENCE_INCLUSION_WINDOW.
+        self.receipt_issuer = receipt_issuer
         self._httpd: Optional[_ThreadingHTTPSServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -396,6 +458,7 @@ class SubmissionServer:
             blockchain=self.blockchain,
             mempool=self.mempool,
             relay_callback=self.relay_callback,
+            receipt_issuer=self.receipt_issuer,
         )
         ssl_context = self._build_ssl_context()
         self._httpd.socket = ssl_context.wrap_socket(
