@@ -646,41 +646,21 @@ class TestSlashThenPay(_HarnessMixin, unittest.TestCase):
 
 class TestColdRestartDeterminism(_HarnessMixin, unittest.TestCase):
 
-    def test_FAILING_pending_evidence_and_pool_survive_snapshot_round_trip(self):
-        """# FAILING: `Blockchain._install_state_snapshot` does NOT
-        restore `archive_reward_pool` from the snapshot dict.
+    def test_pending_evidence_and_pool_survive_snapshot_round_trip(self):
+        """Cold-restart determinism: a snapshot carrying a non-zero
+        `archive_reward_pool` + pending evidence must survive a
+        serialize → decode → `_install_state_snapshot` round-trip
+        with the snapshot root preserved.
 
-        Root cause: `storage.state_snapshot.serialize_state` includes
-        `archive_reward_pool` in the snapshot, and `compute_state_root`
-        hashes it under `_TAG_GLOBAL` / `_GLOBAL_ARCHIVE_REWARD_POOL`
-        — so it's part of the consensus-visible snapshot root.  But
-        `Blockchain._install_state_snapshot` at
-        messagechain/core/blockchain.py has no line setting
-        `self.archive_reward_pool = int(snap["archive_reward_pool"])`.
-        A cold-booted node whose snapshot carries a non-zero pool
-        will have `archive_reward_pool = 0` after install, and its
-        subsequent snapshot will hash differently than the source's
-        (the per-entity state tree root agrees, but the snapshot root
-        does not).
-
-        Consequence: a real cold-bootstrap against a snapshot that
-        contains a non-empty archive_reward_pool would silently
-        underfund the bootstrapping node's pool — the next challenge
-        block would pay a different number of provers on the cold-
-        booted node vs the replaying node, and the chain would fork.
-
-        Suggested fix: add
+        Was previously a FAILING canary — `_install_state_snapshot`
+        in `messagechain/core/blockchain.py` did not restore
+        `archive_reward_pool` from the snapshot dict, even though
+        the pool is hashed into the snapshot root under
+        `_TAG_GLOBAL` / `_GLOBAL_ARCHIVE_REWARD_POOL`.  Fixed by
+        adding
             `self.archive_reward_pool = int(snap.get("archive_reward_pool", 0))`
-        to `_install_state_snapshot` after the `base_fee` block.
-        Maybe also the legacy `_processed_evidence` set.
-
-        Remove the skipTest to surface the real state-root mismatch.
+        after the `base_fee` restore block.
         """
-        self.skipTest(
-            "FAILING: _install_state_snapshot does not restore "
-            "archive_reward_pool from the snapshot dict.  See "
-            "docstring for the full analysis + suggested one-line fix."
-        )
         chain, off, sub, _, rcpt = self._single_chain()
         pos = ProofOfStake()
         chain.archive_reward_pool = ARCHIVE_REWARD * 4
@@ -782,52 +762,19 @@ class TestColdRestartDeterminism(_HarnessMixin, unittest.TestCase):
 
 class TestConflictingEvidenceDedup(_HarnessMixin, unittest.TestCase):
 
-    def test_FAILING_duplicate_evidence_in_same_block_blocks_itself(self):
-        """# FAILING: two CensorshipEvidenceTx's with the same
-        evidence_hash in the same block cause a sim-vs-apply drift
-        that makes the whole block unshippable.
+    def test_duplicate_evidence_in_same_block_blocks_itself(self):
+        """Two CensorshipEvidenceTx's with the same evidence_hash in
+        the same block: the first is admitted, the second is rejected
+        by the dedupe gate (`is_pending` hits), and the block
+        validates with matching sim / apply state roots.
 
-        Root cause — same class as the submitter-nonce collision:
-
-          * `compute_post_state_root` (sim) unconditionally debits the
-            evidence tx fee, tips the proposer, and bumps the
-            submitter's WOTS+ leaf watermark — for BOTH etxs.
-          * `_apply_block_state` (apply) runs `validate_censorship_
-            evidence_tx` at apply-time.  By the time the second etx is
-            considered, the first has been admitted to `pending`, so
-            the second's evidence_hash hits `is_pending()` and the
-            apply path skips fee/admission/watermark-bump entirely.
-
-        The header's state_root was committed under the sim's
-        assumption that both fees were paid and both watermarks
-        bumped.  The apply path produces a different state_root.  The
-        block is rejected with "Invalid state_root".
-
-        What this means in practice: a proposer that naively includes
-        two competing evidences (a common mempool-race scenario — two
-        peers independently submit evidence for the same censored tx)
-        cannot assemble a block from both.  The mempool must de-
-        duplicate by evidence_hash BEFORE the proposer picks, which
-        is a policy responsibility not currently enforced.
-
-        Suggested fixes (any one unblocks the scenario):
-
-          * The sim should pre-dedupe by evidence_hash and simulate
-            only the first occurrence's fee/bump — matching the
-            apply-time reject-duplicates behavior.
-          * Or the apply path should pay the fee + bump the watermark
-            even when admission is refused by the dedupe gate, so the
-            book-keeping matches the sim.
-
-        This canary documents the bug.  Remove the skipTest to see
-        the "Invalid state_root" reject.
+        Was previously a FAILING canary — the sim path unconditionally
+        paid the fee + bumped the submitter's leaf watermark for
+        every etx, while the apply path correctly skipped both for
+        the second (duplicate) etx.  Fixed by making the sim run the
+        same `validate_censorship_evidence_tx` admission gate as
+        apply, and skipping fee/bump/pending-insert when rejected.
         """
-        self.skipTest(
-            "FAILING: duplicate evidence_hash in same block triggers "
-            "sim-vs-apply drift (sim pays fee/bump for both, apply "
-            "skips on dedupe).  Block is rejected — blocking a sensible "
-            "mempool-race scenario.  See class docstring for analysis."
-        )
         (a_ctx, b_ctx) = self._twin_chains(extras_seeds=[_SECOND_SEED])
         chain_a, a_off, a_sub, a_ext, a_rcpt = a_ctx
         chain_b, *_ = b_ctx
@@ -900,18 +847,17 @@ class TestConflictingEvidenceDedup(_HarnessMixin, unittest.TestCase):
         root_b = compute_state_root(serialize_state(chain_b))
         self.assertEqual(root_a, root_b)
 
-    def test_FAILING_proposer_listed_order_is_canonical(self):
-        """# FAILING: same root cause as the dup-evidence block test.
+    def test_proposer_listed_order_is_canonical(self):
+        """Proposer's listed order of CensorshipEvidenceTx's is
+        canonical for admission: the FIRST etx in the block's list
+        admits, any subsequent dup (same evidence_hash, possibly
+        different submitter) is rejected.  The sim and apply paths
+        agree on this ordering so the block validates.
 
-        A block with two evidences sharing an evidence_hash (even in
-        reverse order) still cannot validate because the sim doesn't
-        match the apply's de-duplicate-on-admit behavior.  Skipped so
-        the suite stays green; keep as a regression canary.
+        Was previously a FAILING canary — same sim-vs-apply drift
+        as `test_duplicate_evidence_in_same_block_blocks_itself`.
+        Fixed by the sim running the same admission gate as apply.
         """
-        self.skipTest(
-            "FAILING: same sim-vs-apply drift as "
-            "test_FAILING_duplicate_evidence_in_same_block_blocks_itself"
-        )
         chain, off, sub, ext, rcpt = self._single_chain(
             extras_seeds=[_SECOND_SEED],
         )
@@ -1196,30 +1142,20 @@ class TestSubmitterNonceCollisionWithEvidence(_HarnessMixin, unittest.TestCase):
     so any future fix can flip this test green.
     """
 
-    def test_FAILING_sim_and_apply_diverge_on_nonce_collision(self):
-        # FAILING: apply-time validate_censorship_evidence_tx rejects
-        # the evidence (nonce advanced), sim does not re-validate, so
-        # the committed state_root mismatches the applied state_root.
-        # The apply path then rejects the whole block.  Either:
-        #   (a) the sim should also skip the evidence's fee/bump when
-        #       the receipted tx's nonce would be "already advanced
-        #       past" within this block's own tx loop, or
-        #   (b) the apply path should not re-run the nonce-advanced
-        #       check at apply-time once admission has been simulated.
-        # Until fixed, a proposer cannot atomically include both an
-        # ordinary tx from a submitter AND a same-submitter evidence
-        # whose receipted tx shares a nonce with the ordinary tx —
-        # which is exactly the honest "I sent a tx, they ignored it,
-        # here's the receipt" scenario.
-        self.skipTest(
-            "FAILING: same-block ordinary tx + evidence tx from same "
-            "submitter with nonce collision is rejected (sim/apply drift). "
-            "See class docstring for the full analysis.  Remove the "
-            "skipTest to surface the bug."
-        )
+    def test_sim_and_apply_diverge_on_nonce_collision(self):
+        """Same-block ordinary tx + evidence tx from the same submitter
+        with a nonce collision: the apply path correctly rejects the
+        evidence (receipted tx's nonce has been bumped past), and the
+        sim now matches by predicting the same rejection.  Block
+        validates, no state_root mismatch.
 
-        # Kept below as the would-be-passing assertion body.  If a
-        # future fix lands, delete the skipTest and run:
+        Was previously a FAILING canary — sim paid evidence fee +
+        bumped the submitter's leaf watermark unconditionally while
+        apply's `validate_censorship_evidence_tx` rejected the
+        evidence (chain_nonce > message_tx.nonce).  Fixed by making
+        the sim read the nonce gate against `sim_nonces`, which
+        already reflects the same-block ordinary tx's nonce bump.
+        """
         chain, off, sub, _, rcpt = self._single_chain()
         pos = ProofOfStake()
         chain.archive_reward_pool = ARCHIVE_REWARD * 2

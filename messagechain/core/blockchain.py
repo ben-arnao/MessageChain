@@ -994,6 +994,17 @@ class Blockchain:
         self.supply.base_fee = int(snap["base_fee"])
         self.base_fee = int(snap["base_fee"])
 
+        # Archive reward pool — consensus-visible balance that funds
+        # custody-proof payouts.  Must be restored from the snapshot or
+        # a cold-booted node starts with pool=0 while a replaying node
+        # has pool=N; their next challenge block pays a different
+        # number of provers and the chain forks.  The pool is hashed
+        # into the snapshot root under _TAG_GLOBAL /
+        # _GLOBAL_ARCHIVE_REWARD_POOL (see storage.state_snapshot), so
+        # drift here is immediately detectable as a snapshot-root
+        # mismatch.
+        self.archive_reward_pool = int(snap.get("archive_reward_pool", 0))
+
         # Finalized checkpoints (long-range-attack defense — must carry
         # across the bootstrap boundary or the new node would accept a
         # competing chain that contradicts a known-finalized block).
@@ -2960,8 +2971,18 @@ class Blockchain:
         # pending entries whose tx landed above get voided, then any
         # matured entries get partially slashed.  Mirror the apply-
         # time ordering exactly so the sim state root matches apply.
+        #
+        # The apply path runs `validate_censorship_evidence_tx` on
+        # every etx at admit-time and SKIPS fee/admission/watermark-
+        # bump for any etx the gate rejects (see _apply_block_state).
+        # The sim MUST mirror this exactly: a block that bundles an
+        # ordinary tx + a same-submitter evidence whose receipted tx
+        # shares a nonce, or two evidences with the same evidence_hash,
+        # otherwise drifts — sim charges both, apply rejects the
+        # doomed ones, state_root mismatches, block rejected.
         from messagechain.consensus.censorship_evidence import (
             compute_slash_amount as _cslash,
+            _PendingEvidence,
         )
         # Step 1: mirror observe_block — any pending evidence whose
         # tx appears in this block's `transactions` slot is voided.
@@ -2970,14 +2991,77 @@ class Blockchain:
             ev_hash: entry
             for ev_hash, entry in self.censorship_processor.pending.items()
         }
+        sim_processed = set(self.censorship_processor.processed)
+        sim_legacy_processed = set(self._processed_evidence)
         block_tx_hashes = {tx.tx_hash for tx in transactions}
         for ev_hash in list(sim_pending.keys()):
             if sim_pending[ev_hash].tx_hash in block_tx_hashes:
                 del sim_pending[ev_hash]
-        # Step 2: admit new evidence txs — submitter pays fee; new
-        # pending entries land in sim_pending.  Admission may not
-        # trigger a slash this same block (maturity > 0 by design).
+                # observe_block also records voided evidence in
+                # processed; mirror so a same-block evidence targeting
+                # the same hash is correctly rejected.
+                sim_processed.add(ev_hash)
+        # Step 2: admit new evidence txs — run the same admission
+        # gate `validate_censorship_evidence_tx` uses at apply-time
+        # so the sim and apply paths agree on which evidences are
+        # admitted.  For each admitted etx: submitter pays fee,
+        # watermark bumps, and a pending entry lands in sim_pending.
+        # For each rejected etx: NO fee, NO bump, NO pending entry.
         for etx in (censorship_evidence_txs or []):
+            # ── admission gate (mirrors validate_censorship_evidence_tx) ──
+            # Cheap unknown-entity gates first.
+            if etx.submitter_id not in self.public_keys:
+                continue
+            if etx.offender_id not in self.public_keys:
+                continue
+            # Slashed/already-processed/pending gates.  Use sim-local
+            # sets so a same-block dup etx is caught (first admits,
+            # second hits is_pending and is rejected).
+            if etx.offender_id in sim_slashed:
+                continue
+            if etx.evidence_hash in sim_processed:
+                continue
+            if etx.evidence_hash in sim_pending:
+                continue
+            if etx.evidence_hash in sim_legacy_processed:
+                continue
+            # Receipt window + staleness gates.
+            if etx.receipt.commit_height + EVIDENCE_INCLUSION_WINDOW > block_height:
+                continue
+            if block_height - etx.receipt.commit_height > EVIDENCE_EXPIRY_BLOCKS:
+                continue
+            # Nonce-advanced gate — CRITICAL: read against sim_nonces
+            # so a same-block ordinary tx from the same submitter that
+            # bumped the nonce past the receipted tx's nonce correctly
+            # causes us to reject the evidence here (same as apply).
+            chain_nonce_sim = sim_nonces.get(
+                etx.message_tx.entity_id,
+                self.nonces.get(etx.message_tx.entity_id, 0),
+            )
+            if chain_nonce_sim > etx.message_tx.nonce:
+                continue
+            # Registered-root gate — use the LIVE receipt_subtree_roots.
+            # This map is only mutated by SetReceiptSubtreeRoot authority
+            # txs and the apply path re-reads the live value too; the sim
+            # does not currently model same-block mutation of the map.
+            registered_root = self.receipt_subtree_roots.get(etx.offender_id)
+            if (
+                registered_root is not None
+                and registered_root != etx.receipt.issuer_root_public_key
+            ):
+                continue
+            # Fee affordability — check against sim_balances so a
+            # same-block ordinary tx draining the submitter's balance
+            # is reflected.
+            if sim_balances.get(etx.submitter_id, 0) < etx.fee:
+                continue
+            # Signature verification is independent of same-block state
+            # (keys don't rotate mid-block in a way that affects this
+            # etx's already-bound signatures), so skip at sim-time —
+            # validate_block has already run the full check.  Any honest
+            # proposer's etx that reaches the sim has passed signature
+            # verification.
+            # ── admission accepted ── charge fee, bump leaf, track pending.
             effective_base_fee = min(current_base_fee, etx.fee)
             tip = etx.fee - effective_base_fee
             sim_balances[etx.submitter_id] = (
@@ -2987,6 +3071,16 @@ class Blockchain:
                 sim_balances.get(proposer_id, 0) + tip
             )
             _bump_wm(etx.submitter_id, etx.signature.leaf_index)
+            # Track newly-admitted evidence so a subsequent same-block
+            # etx with the same evidence_hash is rejected by the
+            # is_pending gate above.
+            sim_pending[etx.evidence_hash] = _PendingEvidence(
+                evidence_hash=etx.evidence_hash,
+                offender_id=etx.offender_id,
+                tx_hash=etx.message_tx.tx_hash,
+                admitted_height=block_height,
+                evidence_tx_hash=etx.tx_hash,
+            )
         # Step 3: mature — any pending entry whose
         # admitted_height + MATURITY <= block_height gets slashed.
         from messagechain.config import EVIDENCE_MATURITY_BLOCKS as _EMB
