@@ -4796,10 +4796,10 @@ class Blockchain:
     def _apply_mainnet_genesis_state(self, block: Block) -> tuple[bool, str]:
         """Reconstruct mainnet post-bootstrap state from block 0 alone.
 
-        The founder's launch flow (deploy/launch_single_validator.py) did
-        `initialize_genesis + bootstrap_seed_local` — block 0 was minted,
-        then off-block direct-state mutations applied (register pubkey,
-        self-authority-key, stake 95M).  A joining validator's IBD must
+        The founder's launch flow did `initialize_genesis +
+        bootstrap_seed_local` — block 0 was minted, then off-block
+        direct-state mutations applied (register pubkey, self-authority-
+        key, stake 95M).  A joining validator's IBD must
         reproduce those mutations exactly, else its pre-block-1 state
         diverges from the founder's and block 1's state_root rejects.
 

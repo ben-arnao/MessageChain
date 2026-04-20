@@ -2754,7 +2754,20 @@ async def run(args):
         # structure; skip the check there (Windows is not a production
         # validator target).
         try:
-            _st = os.stat(args.keyfile)
+            # lstat (not stat) so a symlink to a world-readable file
+            # doesn't pass the check just because the symlink itself is
+            # 0777 (symlink modes are not meaningful — os.stat would
+            # follow to the target).  Require the configured path to be
+            # a real regular file owned by the service user.
+            _st = os.lstat(args.keyfile)
+            import stat as _stat_mod
+            if _stat_mod.S_ISLNK(_st.st_mode):
+                logger.error(
+                    f"keyfile {args.keyfile} is a symbolic link; refuse "
+                    f"to follow it.  Copy the target to the canonical "
+                    f"location and chmod 0400."
+                )
+                sys.exit(1)
             if hasattr(os, "geteuid"):
                 if _st.st_mode & 0o077:
                     logger.error(

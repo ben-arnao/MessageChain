@@ -328,6 +328,64 @@ class TestSeedEntityIdsRehydration(unittest.TestCase):
             db2.close()
 
 
+class TestAtomicGenesisWrite(_PinOverrideMixin, unittest.TestCase):
+    """CRITICAL from iter 46 audit: `_apply_mainnet_genesis_state` used
+    to call `store_block`, `add_chain_tip`, and `_persist_state` as
+    three separate auto-commits.  A SIGKILL between them landed block 0
+    on disk with NO founder pubkey / balances / stake — val-2 restarted
+    into a permanently-stuck height=1.  Iter 46 wraps all three in one
+    begin/commit transaction; this test asserts that a raised exception
+    AFTER store_block runs rolls the block 0 INSERT back."""
+
+    def test_crash_during_persist_rolls_back_block0(self):
+        import tempfile, os
+        from messagechain.core.blockchain import Blockchain
+        from messagechain.storage.chaindb import ChainDB
+        from messagechain.identity.identity import Entity
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "chain.db")
+            founder = Entity.create(
+                private_key=b"atomic-genesis-test-founder-key!" * 1,
+                tree_height=4,
+            )
+            self._install_pin(founder.entity_id)
+            self.addCleanup(self._restore_pin)
+
+            # Build a real block 0 to feed to the joiner.
+            tmp_chain = Blockchain(db=None)
+            allocation = {
+                founder.entity_id: _MAINNET_FOUNDER_TOTAL,
+                TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
+            }
+            block0 = tmp_chain.initialize_genesis(founder, allocation)
+
+            db = ChainDB(db_path)
+            joiner = Blockchain(db=db)
+
+            # Monkey-patch _persist_state to raise AFTER store_block ran.
+            original_persist = joiner._persist_state
+            def _failing_persist():
+                raise RuntimeError("simulated SIGKILL between store_block and persist")
+            joiner._persist_state = _failing_persist
+
+            with self.assertRaises(RuntimeError):
+                joiner._apply_mainnet_genesis_state(block0)
+            db.close()
+
+            # Reopen and confirm: NOTHING committed.  The block 0
+            # INSERT was rolled back with the rest of the transaction.
+            db2 = ChainDB(db_path)
+            chain2 = Blockchain(db=db2)
+            self.assertEqual(
+                chain2.height, 0,
+                "a crash between store_block and _persist_state must "
+                "leave the DB empty — block 0 must NOT be committed "
+                "without its matching founder state",
+            )
+            db2.close()
+
+
 class TestMainnetFounderConstants(unittest.TestCase):
     """Config-load sanity checks: the canonical mainnet allocation must
     be internally consistent.  If these raise at import time, a joining

@@ -368,7 +368,7 @@ class ChainDB:
             "INSERT OR REPLACE INTO blocks (block_hash, block_number, prev_hash, data) VALUES (?, ?, ?, ?)",
             (block.block_hash, block.header.block_number, block.header.prev_hash, data),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_block_by_hash(self, block_hash: bytes, state=None, include_witnesses=False) -> Block | None:
         """Get a block by hash.
@@ -525,11 +525,11 @@ class ChainDB:
             "INSERT OR REPLACE INTO chain_tips (block_hash, block_number, cumulative_stake) VALUES (?, ?, ?)",
             (block_hash, block_number, cumulative_stake),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def remove_chain_tip(self, block_hash: bytes):
         self._conn.execute("DELETE FROM chain_tips WHERE block_hash = ?", (block_hash,))
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_best_tip(self) -> tuple[bytes, int, int] | None:
         """Get the chain tip with highest cumulative stake (then highest block number)."""
@@ -1117,13 +1117,54 @@ class ChainDB:
         """Commit any pending writes."""
         self._conn.commit()
 
+    def _txn_depth(self) -> int:
+        """Thread-local counter: how many begin_transaction scopes are
+        currently nested.  Enables atomic composition of higher-level
+        chain-write sequences (see _apply_mainnet_genesis_state and
+        initialize_genesis) without rewriting the dozens of mutator
+        methods that currently call _conn.commit() directly — only the
+        OUTER begin commits; inner begin_transaction calls by
+        _persist_state become no-ops at depth > 0.
+        """
+        return int(getattr(self._local, "txn_depth", 0))
+
+    def _in_txn(self) -> bool:
+        return self._txn_depth() > 0
+
+    def _maybe_commit(self):
+        """Commit iff no wrapping begin_transaction is active."""
+        if not self._in_txn():
+            self._conn.commit()
+
     def begin_transaction(self):
-        self._conn.execute("BEGIN")
+        if self._txn_depth() == 0:
+            # Flush any implicit autocommit txn the sqlite3 module may
+            # have auto-opened on a prior INSERT (default
+            # isolation_level="" autostarts on DML).  Without this,
+            # `BEGIN` raises "cannot start a transaction within a
+            # transaction" when the outer scope runs right after
+            # _init_schema's INSERTs or similar setup writes.
+            if self._conn.in_transaction:
+                self._conn.commit()
+            self._conn.execute("BEGIN")
+        self._local.txn_depth = self._txn_depth() + 1
 
     def commit_transaction(self):
-        self._conn.commit()
+        d = self._txn_depth()
+        if d <= 0:
+            # Tolerate spurious commit — historically some paths called
+            # commit_transaction without a matching BEGIN.
+            self._conn.commit()
+            return
+        self._local.txn_depth = d - 1
+        if self._local.txn_depth == 0:
+            self._conn.commit()
 
     def rollback_transaction(self):
+        # Rollback always unwinds the entire transaction stack — SQLite
+        # doesn't support nested rollbacks without SAVEPOINTs, and the
+        # callers here (genesis / IBD) treat any failure as fatal.
+        self._local.txn_depth = 0
         self._conn.rollback()
 
     # ── Witness Separation (block witness data) ─────────────────────
