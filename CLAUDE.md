@@ -10,6 +10,10 @@
 
 - **Slow transactions and expensive fees are acceptable** if they combat ledger bloat, strengthen security, or preserve long-term node/validator incentives. Never optimize for speed or cheapness at the expense of these goals.
 
+## Repo Hygiene
+
+- **`docs/` and `deploy/` are git-ignored and local-only.** They hold operator/founder-facing content — launch checklists, runbooks referencing real infra, systemd units, launch scripts — that shouldn't be in the public repo. Public-facing documentation lives in `README.md`. Don't reintroduce either directory under a tracked path.
+
 ## Workflow
 
 - **Test-driven development** — This is a TDD environment. Write tests first, then implement the code to make them pass.
