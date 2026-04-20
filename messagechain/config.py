@@ -223,6 +223,32 @@ def validate_tx_serialization_version(version: int) -> tuple[bool, str]:
     return True, "OK"
 
 
+# Submission-receipt wire-format version.  Carried on every
+# SubmissionReceipt so a future format bump (new fields, different
+# domain tag) can be negotiated via the same governance-widen-accept
+# pattern as BLOCK_SERIALIZATION_VERSION.  Defined up here (before
+# the submission-receipt constants further down the file) so the
+# module is import-order-agnostic — code that imports only
+# RECEIPT_VERSION doesn't pay the whole-file cost.
+def validate_receipt_version(version: int) -> tuple[bool, str]:
+    """Reject unknown receipt versions at the parse boundary.
+
+    Separated from sig_version because receipts are a separate wire
+    object: bumping RECEIPT_VERSION doesn't require a sig-scheme change
+    and vice versa.  Reserved: 0 is invalid (traps truncated input that
+    decodes as all-zero bytes).
+    """
+    # RECEIPT_VERSION is defined later in this module; reference it
+    # lazily via globals() so the function can be called during
+    # module re-import without NameError on cold init.
+    current = globals().get("RECEIPT_VERSION", 1)
+    if version != current:
+        return False, (
+            f"Unknown receipt version {version} (current = {current})"
+        )
+    return True, "OK"
+
+
 # Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
 MAX_MESSAGE_CHARS = 280  # max characters per message
 MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
@@ -822,7 +848,10 @@ STATE_CHECKPOINT_THRESHOLD_DENOMINATOR = 3
 MAX_STATE_SNAPSHOT_BYTES = 500_000_000
 # v2: added seed_divestment_debt section to the snapshot Merkle tree
 # (partial-divestment-to-floor schedule).
-STATE_ROOT_VERSION = 2
+# v3: added archive_reward_pool (proof-of-custody archive rewards —
+# the pool balance scalar must participate in the root so bootstrapping
+# nodes see the same value as replaying nodes).
+STATE_ROOT_VERSION = 3
 
 # ── On-chain state-root checkpoints ──────────────────────────────────
 # Periodic commitments of the full snapshot root into the block header
@@ -874,6 +903,62 @@ def is_state_root_checkpoint_block(block_number: int) -> bool:
     if block_number <= 0:
         return False
     return (block_number % CHECKPOINT_INTERVAL) == 0
+
+# ── Proof-of-custody archive rewards ─────────────────────────────────
+#
+# Consensus-enforced reward stream that pays nodes for provably holding
+# historical block data, defending the 1000-year permanence principle
+# against archive-operator attrition.  See
+# docs/proof-of-custody-archive-rewards.md for the full design.
+#
+# Each challenge block, the chain selects a random past height via
+# VRF-over-block-hash.  Any operator holding that block may submit a
+# custody proof (header + sampled tx + Merkle inclusion) within
+# ARCHIVE_SUBMISSION_WINDOW blocks.  The first
+# ARCHIVE_PROOFS_PER_CHALLENGE valid proofs get paid ARCHIVE_REWARD
+# tokens each from the ArchiveRewardPool.
+#
+# Funding: ARCHIVE_BURN_REDIRECT_PCT of what would otherwise burn from
+# the EIP-1559 base-fee stream is redirected into the pool.  The rest
+# still burns.  Pool persists in the snapshot root (bootstrapping nodes
+# see the same value as replaying nodes).  When empty, no rewards pay
+# out that block — graceful degradation, no minting.
+#
+# Cadence sizing (100 blocks / ~1 day at 600s): low enough to detect
+# archive dropouts quickly, high enough to bound reward pressure.
+# Redirect PCT (25) caps the ongoing archive-reward cost at one-quarter
+# of the fee-burn stream — preserves most of the deflationary pressure
+# while giving archives a meaningful paycheck.
+ARCHIVE_CHALLENGE_INTERVAL = 100
+ARCHIVE_PROOFS_PER_CHALLENGE = 10
+ARCHIVE_REWARD = 1_000
+ARCHIVE_SUBMISSION_WINDOW = 100
+ARCHIVE_BURN_REDIRECT_PCT = 25
+# Carry-only crypto-agility register.  A future governance proposal can
+# widen the accepted proof format (e.g., switch to witness-archive
+# rewards) without a chain reset.  Reserved: 0 traps uninitialized.
+ARCHIVE_CHALLENGE_VERSION = 1
+
+assert 0 <= ARCHIVE_BURN_REDIRECT_PCT <= 100, (
+    "ARCHIVE_BURN_REDIRECT_PCT must be in [0, 100]"
+)
+assert ARCHIVE_CHALLENGE_INTERVAL > 0
+assert ARCHIVE_PROOFS_PER_CHALLENGE > 0
+assert ARCHIVE_REWARD > 0
+assert ARCHIVE_SUBMISSION_WINDOW > 0
+
+
+def is_archive_challenge_block(block_number: int) -> bool:
+    """True iff this block height fires an archive-custody challenge.
+
+    Same shape as is_state_root_checkpoint_block: positive multiples of
+    ARCHIVE_CHALLENGE_INTERVAL, with genesis (0) excluded — there is
+    no historical block to challenge over at height 0.
+    """
+    if block_number <= 0:
+        return False
+    return (block_number % ARCHIVE_CHALLENGE_INTERVAL) == 0
+
 
 # Weak-subjectivity checkpoints — the PoS long-range-attack defense.
 # A list of (block_number, block_hash, state_root) snapshots that new nodes
@@ -988,6 +1073,50 @@ AUTO_RESTAKE_LIQUID_BUFFER = 1_000    # always keep at least this much liquid fo
 # Slashing
 SLASH_PENALTY_PCT = 100       # % of stake slashed on double-sign (100% = full slash)
 SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
+
+# Attestable submission receipts — gossip-layer censorship defense.
+#
+# Consensus-layer forced-inclusion (see FORCED_INCLUSION_*) punishes a
+# proposer that drops a tx from its own block, BUT only if the tx is
+# already in the proposer's mempool.  A captured gossip neighborhood
+# that silently refuses to relay a user's tx bypasses the whole
+# mechanism — no proposer ever sees the tx, so no consensus rule is
+# broken.
+#
+# Attestable submission receipts close the gap: when a user submits a
+# tx via a validator's public /submit endpoint, the validator signs a
+# receipt attesting "I received this tx_hash at height H."  If the
+# validator subsequently fails to include the tx (and doesn't relay
+# it so someone else does) within the grace window, the user can
+# publish the receipt as slashable evidence on-chain.
+#
+# Two-phase slashing (critical — see docs/attestable-submission-receipts.md
+# "Security Analysis"):
+#   1. Accuser posts CensorshipEvidenceTx (pays EVIDENCE_SUBMISSION_FEE).
+#   2. Evidence is recorded in pending state, NOT yet applied.
+#   3. Accused validator has EVIDENCE_CHALLENGE_BLOCKS to void the
+#      evidence by producing any block that includes the receipted tx.
+#   4. If the window elapses with no inclusion, slash fires:
+#      CENSORSHIP_SLASH_BPS of stake is BURNED (not paid to accuser,
+#      to prevent forge-for-profit).
+#
+# Why burn rather than pay the accuser: a payer-funded attack could
+# forge receipts (if WOTS+ was ever broken) and profit from the
+# slash.  Burning means the accuser's only reward is "this validator
+# no longer censors me" — a public good, not a private profit.
+SUBMISSION_FEE = MIN_FEE              # anti-spam; paid to validator regardless of inclusion
+CENSORSHIP_GRACE_BLOCKS = 6           # 2x FORCED_INCLUSION_WAIT_BLOCKS
+CENSORSHIP_SLASH_BPS = 1000           # 10.00% of stake (1000 bps)
+EVIDENCE_EXPIRY_BLOCKS = 10_000       # ~70 days at 600s — receipts past this are stale
+EVIDENCE_CHALLENGE_BLOCKS = 14_400    # 24h at 6s block time (spec-driven value)
+EVIDENCE_SUBMISSION_FEE = MIN_FEE     # fee to submit evidence — bounds forgery-spam
+RECEIPT_VERSION = 1                   # on-wire version of SubmissionReceipt
+# Dedicated WOTS+ subtree for receipts.  Receipts consume leaves faster
+# than blocks (per-submission vs per-block), and we want receipt-signing
+# exhaustion to NEVER brick the block-signing tree.  h=24 → 16,777,216
+# leaves → ~6 months at 1 receipt/sec.  Production deployments that
+# see sustained higher throughput can raise this via a governance bump.
+RECEIPT_MERKLE_TREE_HEIGHT = 24
 
 # Chain identity — included in all transaction signatures to prevent cross-fork replay.
 # If MessageChain forks, each fork MUST change this value.

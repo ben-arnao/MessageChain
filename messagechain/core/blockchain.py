@@ -272,6 +272,18 @@ class Blockchain:
         # by 1 token per seed per reload.
         self.seed_divestment_debt: dict[bytes, int] = {}
 
+        # Proof-of-custody archive reward pool — single scalar balance
+        # consensus-visible in the state root.  Funded by redirecting
+        # ARCHIVE_BURN_REDIRECT_PCT of what would have burned from
+        # EIP-1559 base fees; drained by apply_archive_rewards every
+        # ARCHIVE_CHALLENGE_INTERVAL blocks to pay up to
+        # ARCHIVE_PROOFS_PER_CHALLENGE custody-proof submitters.
+        # Persists forever across blocks — unused rewards never expire
+        # (permanence aligns with CLAUDE.md principle #2: the pool is
+        # on-chain state like any balance).  See
+        # docs/proof-of-custody-archive-rewards.md for the design.
+        self.archive_reward_pool: int = 0
+
         # Attester-reward escrow (stage 3).  Bootstrap-era committee
         # rewards sit here for escrow_blocks_for_progress(progress)
         # blocks before unlocking to spendable balance.  Slashable
@@ -4412,6 +4424,13 @@ class Blockchain:
         proposer_id = block.header.proposer_id
         current_base_fee = self.supply.base_fee
 
+        # Reset the per-block fee-burn ticker so this block's
+        # pay_fee_with_burn calls accumulate cleanly.  Read back at
+        # end-of-block to redirect ARCHIVE_BURN_REDIRECT_PCT into the
+        # archive reward pool.  See docs/proof-of-custody-archive-
+        # rewards.md.
+        self.supply.fee_burn_this_block = 0
+
         # Count total txs for base fee adjustment
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
 
@@ -4808,6 +4827,15 @@ class Blockchain:
                         f"(stall={self.blocks_since_last_finalization} blocks)"
                     )
 
+        # Proof-of-custody archive rewards — redirect a fraction of
+        # this block's fee-burn into the archive reward pool, and pay
+        # rewards to any valid custody proofs against the challenge
+        # block.  Runs AFTER all fee-bearing txs so the pool captures
+        # the true post-block burn amount, and BEFORE update_base_fee
+        # so the next-block base fee reflects the accounting as
+        # committed.  See docs/proof-of-custody-archive-rewards.md.
+        self._apply_archive_rewards(block)
+
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
         self.base_fee = self.supply.base_fee
@@ -4820,6 +4848,57 @@ class Blockchain:
         # selection and the sim path see a consistent value until the
         # next apply ticks the ratchet forward.
         self._update_bootstrap_ratchet()
+
+    def _apply_archive_rewards(self, block: Block):
+        """Redirect fee-burn into archive pool + pay custody-proof rewards.
+
+        Two steps, in order:
+
+          1. Redirect: take ARCHIVE_BURN_REDIRECT_PCT of this block's
+             fee_burn_this_block; add it to archive_reward_pool;
+             subtract it from total_burned and add it back to
+             total_supply (those tokens are moving from "burned" to
+             "held in pool," not destroyed).  Reset the ticker.
+          2. Payout: if this is a challenge block, verify any custody
+             proofs in the block body (future field) against the
+             challenge's target height and pay the FCFS winners from
+             the pool.
+
+        Custody-proof application is a no-op today: no block field
+        carries proofs yet.  The pool-funding half is the load-
+        bearing consensus change for v1 — it establishes the money
+        stream that makes the later proof-submission pipeline
+        possible.  Balance is committed to the state snapshot root
+        via storage.state_snapshot so a bootstrapping node sees the
+        same scalar as a replaying node.
+        """
+        from messagechain.consensus.archive_challenge import split_burn_for_pool
+
+        fee_burn = self.supply.fee_burn_this_block
+        if fee_burn > 0:
+            pool_add, _burn_keep = split_burn_for_pool(fee_burn)
+            if pool_add > 0:
+                # Move tokens from "burned" back into circulation (the
+                # pool).  total_supply rises by pool_add because those
+                # tokens are once again held somewhere, but they aren't
+                # in any per-entity balance yet — they sit in the
+                # consensus-visible archive_reward_pool scalar.
+                self.supply.total_burned -= pool_add
+                self.supply.total_supply += pool_add
+                self.archive_reward_pool += pool_add
+        # Reset regardless — next block's burn accumulates from zero.
+        self.supply.fee_burn_this_block = 0
+
+        # Payout step (currently stubbed — no proof field on Block
+        # yet).  When the Block schema gains a `custody_proofs` list
+        # in v2, this loop iterates those proofs, calls
+        # verify_custody_proof against the challenged block, and
+        # credits each winning prover_id's balance.  The scaffolding
+        # lives here so the v2 wiring is a straight addition rather
+        # than a structural edit.
+        # from messagechain.config import is_archive_challenge_block
+        # if is_archive_challenge_block(block.header.block_number):
+        #     ... resolve challenge, iterate block.custody_proofs, ...
 
     def _apply_governance_block(self, block: Block):
         """Dispatch governance txs, auto-execute closed binding proposals,

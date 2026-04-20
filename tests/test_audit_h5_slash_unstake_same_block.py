@@ -145,12 +145,20 @@ class TestH5SlashPreemptsUnstakeInSameBlock(unittest.TestCase):
         return block, slash_tx, unstake_tx
 
     def _live_tokens(self):
-        """Tokens still alive on-chain (balances + staked + pending).
+        """Tokens still alive on-chain (balances + staked + pending + pool).
 
         Invariant: live tokens == total_supply.  Every burn path must
         subtract from total_supply; if slash silently loses tokens
         (wipes pending_unstakes without zeroing total_supply), this
         identity breaks.
+
+        The archive reward pool (proof-of-custody reward scalar) is
+        counted here because pool credits flow OUT of the burn stream
+        — tokens redirected to the pool are removed from total_burned
+        and re-added to total_supply, so they need a home on the
+        "live" side of the invariant.  Without this term, a pool-
+        funded block would break token conservation by exactly the
+        redirected amount.
         """
         bal = sum(self.chain.supply.balances.values())
         staked = sum(self.chain.supply.staked.values())
@@ -158,7 +166,8 @@ class TestH5SlashPreemptsUnstakeInSameBlock(unittest.TestCase):
             amt for lst in self.chain.supply.pending_unstakes.values()
             for amt, _ in lst
         )
-        return bal + staked + pending
+        archive_pool = getattr(self.chain, "archive_reward_pool", 0)
+        return bal + staked + pending + archive_pool
 
     def test_unstake_dropped_when_slash_targets_same_entity(self):
         """The unstake must NOT apply when a same-block slash preempts it.
