@@ -227,6 +227,7 @@ class ProofOfStake:
         finality_votes: list | None = None,
         timestamp: float | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
+        state_root_checkpoint: bytes = b"\x00" * 32,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -286,6 +287,7 @@ class ProofOfStake:
             proposer_id=proposer_entity.entity_id,
             state_root=state_root,
             mempool_snapshot_root=snapshot_root,
+            state_root_checkpoint=state_root_checkpoint,
         )
 
         # Guard against WOTS+ leaf reuse: if the proposer also has

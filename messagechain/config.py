@@ -821,6 +821,57 @@ MAX_STATE_SNAPSHOT_BYTES = 500_000_000
 # (partial-divestment-to-floor schedule).
 STATE_ROOT_VERSION = 2
 
+# ── On-chain state-root checkpoints ──────────────────────────────────
+# Periodic commitments of the full snapshot root into the block header
+# itself, one every CHECKPOINT_INTERVAL blocks.  Distinct from the
+# off-chain-signed StateCheckpoint in consensus/state_checkpoint.py (a
+# multi-sig ceremony over a pre-existing block) and from the per-entity
+# BlockHeader.state_root (which covers only account dicts, not treasury
+# / supply / finalized_checkpoints / seed state).
+#
+# Purpose: a new node joining in year N can pick any finalized block at
+# a checkpoint height, read the committed snapshot root out of that
+# block's header, download a matching snapshot from any archive peer,
+# verify the root matches, and start participating — without either
+# replaying centuries of history or trusting an out-of-band signing
+# ceremony.  The commitment is consensus-bound: every validator that
+# accepted the checkpoint block agreed on the snapshot root it carries.
+#
+# CHECKPOINT_INTERVAL: 10,000 blocks at 600s = ~70 days.  Sparse enough
+# that the ~32-bytes-per-interval chain-state overhead is negligible;
+# dense enough that a first-time joiner in any calendar quarter has a
+# recent finalized checkpoint to anchor on.  Non-multiples of the
+# interval MUST carry a zero state_root_checkpoint — any other value is
+# rejected at validation so a proposer cannot silently corrupt the
+# commitment stream.  Block 0 (genesis) is also excluded: the zero
+# field there keeps the commitment stream clean and the genesis block
+# self-contained rather than carrying a snapshot root of an "empty"
+# chain.
+#
+# CHECKPOINT_VERSION: carry-only register matching HASH_VERSION_CURRENT
+# / BLOCK_SERIALIZATION_VERSION.  A future governance proposal can bump
+# this to widen the accepted set (e.g., shift from snapshot-root-v2 to
+# a future SMT-based commitment) without a chain reset.  Reserved: 0
+# traps uninitialized.
+#
+# Scope discipline — this is a SYNC UX affordance, NOT a pruning
+# mechanism.  Archive nodes still retain every block; the checkpoint
+# just saves a joiner from downloading all of that history.
+CHECKPOINT_INTERVAL = 10_000
+CHECKPOINT_VERSION = 1
+
+
+def is_state_root_checkpoint_block(block_number: int) -> bool:
+    """True iff this block height must commit to a state-root checkpoint.
+
+    Rule: positive multiples of CHECKPOINT_INTERVAL.  Genesis (height 0)
+    is excluded so the commitment stream starts cleanly at the first
+    real checkpoint, not at a snapshot of the pre-application state.
+    """
+    if block_number <= 0:
+        return False
+    return (block_number % CHECKPOINT_INTERVAL) == 0
+
 # Weak-subjectivity checkpoints — the PoS long-range-attack defense.
 # A list of (block_number, block_hash, state_root) snapshots that new nodes
 # treat as ground truth during IBD. Any peer that serves a header at one of
