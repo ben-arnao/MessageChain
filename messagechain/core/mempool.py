@@ -73,6 +73,12 @@ class Mempool:
         # a moderately large validator set fully gossip a checkpoint
         # without eviction, yet bounds memory against spam.
         self.finality_pool_max_size: int = 2000
+        # Censorship-evidence pool: CensorshipEvidenceTx objects
+        # awaiting block inclusion.  Shape mirrors slash_pool — small,
+        # rare, high-value messages.  Drained by the proposer into
+        # the next block's censorship_evidence_txs slot.
+        self.censorship_evidence_pool: dict[bytes, object] = {}
+        self.censorship_evidence_pool_max_size: int = 1000
 
     def add_transaction(
         self,
@@ -493,6 +499,35 @@ class Mempool:
         """Remove finality votes after inclusion in a block."""
         for k in keys:
             self.finality_pool.pop(k, None)
+
+    # ── Censorship-evidence pool ─────────────────────────────────
+
+    def add_censorship_evidence_tx(self, tx) -> bool:
+        """Admit a CensorshipEvidenceTx into the pool.
+
+        Returns True on insertion, False if the tx is already present
+        or the pool is full.  No fee-based eviction — evidence txs
+        are small and rare.  Strict FIFO (refuse new entries when
+        full).
+        """
+        if tx.tx_hash in self.censorship_evidence_pool:
+            return False
+        if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
+            return False
+        if tx.fee < MIN_FEE:
+            return False
+        self.censorship_evidence_pool[tx.tx_hash] = tx
+        return True
+
+    def get_censorship_evidence_txs(self, max_count: int | None = None) -> list:
+        items = list(self.censorship_evidence_pool.values())
+        if max_count is not None:
+            items = items[:max_count]
+        return items
+
+    def remove_censorship_evidence_txs(self, tx_hashes: list[bytes]):
+        for h in tx_hashes:
+            self.censorship_evidence_pool.pop(h, None)
 
     @property
     def size(self) -> int:

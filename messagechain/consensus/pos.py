@@ -226,6 +226,7 @@ class ProofOfStake:
         unstake_transactions: list | None = None,
         finality_votes: list | None = None,
         custody_proofs: list | None = None,
+        censorship_evidence_txs: list | None = None,
         timestamp: float | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
         state_root_checkpoint: bytes = b"\x00" * 32,
@@ -259,6 +260,7 @@ class ProofOfStake:
         unstake_txs = list(unstake_transactions or [])
         fin_votes = list(finality_votes or [])
         cust_proofs = list(custody_proofs or [])
+        censorship_txs = list(censorship_evidence_txs or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
             + [tx.tx_hash for tx in transfer_txs]
@@ -273,6 +275,7 @@ class ProofOfStake:
             # the proposer's signature (signature covers header, header
             # covers merkle_root).
             + [p.tx_hash for p in cust_proofs]
+            + [tx.tx_hash for tx in censorship_txs]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -339,6 +342,7 @@ class ProofOfStake:
             unstake_transactions=unstake_txs,
             finality_votes=fin_votes,
             custody_proofs=cust_proofs,
+            censorship_evidence_txs=censorship_txs,
         )
         block.block_hash = block._compute_hash()
         return block

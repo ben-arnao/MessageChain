@@ -215,6 +215,29 @@ class ChainDB:
                 processed_at_block INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Pending censorship-evidence.  Mirrors
+            -- CensorshipEvidenceProcessor.pending so a cold-booted node
+            -- resumes the maturity pipeline.  Rows are removed at void
+            -- time (observe_block) or mature time (mature()), matching
+            -- the in-memory transition.  See
+            -- messagechain.consensus.censorship_evidence.
+            CREATE TABLE IF NOT EXISTS pending_censorship_evidence (
+                evidence_hash BLOB PRIMARY KEY,
+                offender_id BLOB NOT NULL,
+                tx_hash BLOB NOT NULL,
+                admitted_height INTEGER NOT NULL,
+                evidence_tx_hash BLOB NOT NULL
+            );
+
+            -- Per-validator receipt-subtree root public keys.  A
+            -- 32-byte pubkey per registered entity identifies the WOTS+
+            -- subtree the validator uses to sign submission receipts.
+            -- Separate from public_keys (block-signing root).
+            CREATE TABLE IF NOT EXISTS receipt_subtree_roots (
+                entity_id BLOB PRIMARY KEY,
+                root_public_key BLOB NOT NULL
+            );
+
             -- Entity-index registry (bloat reduction).  Bidirectional
             -- map entity_id <-> entity_index, assigned monotonically on
             -- registration.  Persistence lets a restart rehydrate the
@@ -783,6 +806,63 @@ class ChainDB:
     def get_all_processed_evidence(self) -> set[bytes]:
         cur = self._conn.execute("SELECT evidence_hash FROM processed_evidence")
         return {bytes(row[0]) for row in cur.fetchall()}
+
+    # ── Pending Censorship Evidence ─────────────────────────────────
+
+    def set_pending_censorship_evidence(
+        self,
+        evidence_hash: bytes,
+        offender_id: bytes,
+        tx_hash: bytes,
+        admitted_height: int,
+        evidence_tx_hash: bytes,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_censorship_evidence "
+            "(evidence_hash, offender_id, tx_hash, admitted_height, "
+            "evidence_tx_hash) VALUES (?, ?, ?, ?, ?)",
+            (evidence_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash),
+        )
+
+    def remove_pending_censorship_evidence(self, evidence_hash: bytes) -> None:
+        self._conn.execute(
+            "DELETE FROM pending_censorship_evidence WHERE evidence_hash = ?",
+            (evidence_hash,),
+        )
+
+    def get_all_pending_censorship_evidence(self) -> dict:
+        """Return {evidence_hash -> (offender_id, tx_hash, admitted_height,
+        evidence_tx_hash)}."""
+        cur = self._conn.execute(
+            "SELECT evidence_hash, offender_id, tx_hash, admitted_height, "
+            "evidence_tx_hash FROM pending_censorship_evidence"
+        )
+        out: dict[bytes, tuple] = {}
+        for row in cur.fetchall():
+            out[bytes(row[0])] = (
+                bytes(row[1]),
+                bytes(row[2]),
+                int(row[3]),
+                bytes(row[4]),
+            )
+        return out
+
+    # ── Receipt-subtree Roots ───────────────────────────────────────
+
+    def set_receipt_subtree_root(
+        self, entity_id: bytes, root_public_key: bytes,
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO receipt_subtree_roots "
+            "(entity_id, root_public_key) VALUES (?, ?)",
+            (entity_id, root_public_key),
+        )
+
+    def get_all_receipt_subtree_roots(self) -> dict:
+        cur = self._conn.execute(
+            "SELECT entity_id, root_public_key FROM receipt_subtree_roots"
+        )
+        return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
 
     # ── Equivocation Watcher: Seen Signatures ───────────────────────
 

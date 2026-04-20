@@ -100,9 +100,13 @@ from messagechain.config import (
 # v2: added seed_divestment_debt (partial-divestment-to-floor schedule).
 # v3: added archive_reward_pool (proof-of-custody archive rewards).  Single
 #     scalar balance that participates in the snapshot root so bootstrapping
-#     nodes see the same value as replaying nodes.  See
-#     docs/proof-of-custody-archive-rewards.md.
-STATE_SNAPSHOT_VERSION = 3  # wire format version for encode/decode
+#     nodes see the same value as replaying nodes.
+# v4: added censorship-evidence pending/processed maps +
+#     receipt_subtree_roots (attestable-submission-receipts wiring).
+#     Canonical section order for encode + root-hash: archive_reward_pool
+#     (under _TAG_GLOBAL) first, then pending, processed, and receipt
+#     subtree roots.
+STATE_SNAPSHOT_VERSION = 4  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -138,6 +142,23 @@ _TAG_SEED_INIT_STAKES = b"seed_init"
 # block than a replaying node.  Same consensus criticality as
 # seed_initial_stakes.
 _TAG_SEED_DIVEST_DEBT = b"seed_debt"
+# Pending censorship-evidence keyed by evidence_hash; value hash
+# covers (offender_id || tx_hash || admitted_height).  Pending set
+# MUST live in the snapshot root so two state-synced nodes agree on
+# which evidences are mid-maturity — otherwise one node would slash a
+# validator the other doesn't, and consensus forks silently.
+_TAG_CENSORSHIP_PENDING = b"cpend"
+# Processed censorship-evidence set: every evidence_hash that has
+# ever been matured OR voided.  Participates in the root so a
+# cold-booted node inherits the full dedupe set and a re-submission of
+# an already-used evidence is rejected identically on every node.
+_TAG_CENSORSHIP_PROCESSED = b"cproc"
+# Per-validator receipt-subtree root public keys.  Used by
+# validate_censorship_evidence_tx to cross-check that a receipt was
+# signed with the issuer's currently-registered subtree root.  Must
+# participate in the state root because two nodes that disagreed on
+# an issuer's root would accept/reject the same evidence differently.
+_TAG_RECEIPT_ROOT = b"rrk"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -208,7 +229,69 @@ def serialize_state(blockchain) -> dict:
         "archive_reward_pool": int(
             getattr(blockchain, "archive_reward_pool", 0)
         ),
+        # Censorship-evidence processor state.  `pending` maps
+        # evidence_hash -> (offender_id, tx_hash, admitted_height,
+        # evidence_tx_hash) serialized into a single flat bytes
+        # value for snapshot-root hashing; `processed` is the set of
+        # evidence_hashes already matured/voided.  See
+        # consensus.censorship_evidence.CensorshipEvidenceProcessor.
+        "censorship_pending": _pending_to_bytes_dict(
+            getattr(blockchain, "censorship_processor", None),
+        ),
+        "censorship_processed": _processor_processed(
+            getattr(blockchain, "censorship_processor", None),
+        ),
+        # Receipt-subtree roots.  entity_id -> 32-byte root pubkey.
+        "receipt_subtree_roots": dict(
+            getattr(blockchain, "receipt_subtree_roots", {})
+        ),
     }
+
+
+def _pending_to_bytes_dict(processor) -> dict:
+    """Serialize processor.pending into a bytes-keyed, bytes-valued
+    dict suitable for the standard section encoder.  Value layout:
+        32 offender_id || 32 tx_hash || u64 admitted_height ||
+        32 evidence_tx_hash
+    """
+    out: dict[bytes, bytes] = {}
+    if processor is None:
+        return out
+    for ev_hash, entry in processor.pending.items():
+        payload = (
+            entry.offender_id
+            + entry.tx_hash
+            + struct.pack(">Q", int(entry.admitted_height))
+            + entry.evidence_tx_hash
+        )
+        out[ev_hash] = payload
+    return out
+
+
+def _processor_processed(processor) -> set:
+    if processor is None:
+        return set()
+    return set(processor.processed)
+
+
+def _bytes_dict_to_pending(d: dict):
+    """Inverse of _pending_to_bytes_dict.  Returns an iterable of
+    (evidence_hash, offender_id, tx_hash, admitted_height,
+    evidence_tx_hash) tuples.  Raises ValueError on a malformed entry.
+    """
+    out = []
+    for ev_hash, payload in d.items():
+        if len(payload) != 32 + 32 + 8 + 32:
+            raise ValueError(
+                f"pending censorship entry has wrong length: "
+                f"{len(payload)} (expected 104)"
+            )
+        offender_id = payload[0:32]
+        tx_hash = payload[32:64]
+        admitted_height = struct.unpack_from(">Q", payload, 64)[0]
+        evidence_tx_hash = payload[72:104]
+        out.append((ev_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash))
+    return out
 
 
 def deserialize_state(snapshot: dict) -> dict:
@@ -222,7 +305,12 @@ def deserialize_state(snapshot: dict) -> dict:
     if not isinstance(snapshot, dict):
         raise ValueError("state snapshot must be a dict")
     version = snapshot.get("version", STATE_SNAPSHOT_VERSION)
-    if version != STATE_SNAPSHOT_VERSION:
+    # Accept any version from 1..STATE_SNAPSHOT_VERSION — older
+    # in-memory dicts default their missing sections via setdefault
+    # below, and binary decode has its own strict version check in
+    # decode_snapshot.  This lets test helpers that hand-build v2
+    # snapshot dicts continue to work after a wire-format bump.
+    if not isinstance(version, int) or version < 1 or version > STATE_SNAPSHOT_VERSION:
         raise ValueError(
             f"Unsupported snapshot version {version} "
             f"(current = {STATE_SNAPSHOT_VERSION})"
@@ -256,10 +344,17 @@ def deserialize_state(snapshot: dict) -> dict:
     # Blockchain.seed_divestment_debt init comment for the one-block
     # timing note on migration.
     out.setdefault("seed_divestment_debt", {})
-    # Default to 0 for pre-v3 snapshots (archive reward pool was not
-    # present).  A fresh chain starts with an empty pool; the first
-    # funded block credits it from the redirected burn.
+    # Default to 0 for pre-archive-rewards snapshots (archive reward
+    # pool was not present).  A fresh chain starts with an empty pool;
+    # the first funded block credits it from the redirected burn.
     out.setdefault("archive_reward_pool", 0)
+    # Pre-v4 snapshots lack the censorship-evidence sections.  A
+    # migrating chain starts with empty pending/processed/roots —
+    # acceptable since censorship-evidence wiring was introduced
+    # specifically at this wire-version bump.
+    out.setdefault("censorship_pending", {})
+    out.setdefault("censorship_processed", set())
+    out.setdefault("receipt_subtree_roots", {})
     return out
 
 
@@ -374,6 +469,24 @@ def compute_state_root(snapshot: dict) -> bytes:
         # divestment block and silently fork until END.
         _TAG_SEED_DIVEST_DEBT: _merkle(_entries_for_section(
             _TAG_SEED_DIVEST_DEBT, snap["seed_divestment_debt"])),
+        # Pending censorship-evidence.  Values are variable-length
+        # bytes blobs encoding (offender_id || tx_hash || admitted_height
+        # || evidence_tx_hash) — see _pending_to_bytes_dict.  Every
+        # node computing the state root must agree bit-for-bit on this
+        # section or a mature() call would slash on one node but not
+        # another.
+        _TAG_CENSORSHIP_PENDING: _merkle(_entries_for_section(
+            _TAG_CENSORSHIP_PENDING, snap["censorship_pending"])),
+        # Processed censorship-evidence set — the double-slash defense.
+        _TAG_CENSORSHIP_PROCESSED: _merkle(_entries_for_section(
+            _TAG_CENSORSHIP_PROCESSED, snap["censorship_processed"])),
+        # Receipt-subtree roots.  Per-validator 32-byte pubkeys that
+        # identify the subtree used for receipt signatures.  The
+        # validate_censorship_evidence_tx path checks a candidate
+        # receipt's embedded root against this dict — any disagreement
+        # here forks on admission.
+        _TAG_RECEIPT_ROOT: _merkle(_entries_for_section(
+            _TAG_RECEIPT_ROOT, snap["receipt_subtree_roots"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -535,8 +648,11 @@ def encode_snapshot(snap: dict) -> bytes:
         u64                 base_fee
         <int→bytes dict>    finalized_checkpoints
         <bytes→int  dict>   seed_initial_stakes
-        <bytes→int  dict>   seed_divestment_debt  (v2+)
+        <bytes→int  dict>   seed_divestment_debt   (v2+)
         u64                 archive_reward_pool    (v3+)
+        <bytes→bytes dict>  censorship_pending     (v4+)
+        <bytes set>         censorship_processed   (v4+)
+        <bytes→bytes dict>  receipt_subtree_roots  (v4+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -569,6 +685,16 @@ def encode_snapshot(snap: dict) -> bytes:
     # v3: archive reward pool balance (proof-of-custody archive rewards).
     # Bounded above by total_supply, so u64 is ample.
     out += struct.pack(">Q", int(snap["archive_reward_pool"]))
+    # v4: censorship-evidence + receipt-subtree sections.  Canonical
+    # order (matches compute_state_root and decode_snapshot): pending,
+    # processed, then receipt_subtree_roots — appended AFTER the v3
+    # archive_reward_pool u64 so a v3 blob remains a prefix of a v4
+    # blob up to the end of v3's final field.  (Version byte still
+    # bumps, so decode cannot confuse the two — this invariant is
+    # purely for the reader's mental model.)
+    out += _encode_bytes_bytes_dict(snap["censorship_pending"])
+    out += _encode_bytes_set(snap["censorship_processed"])
+    out += _encode_bytes_bytes_dict(snap["receipt_subtree_roots"])
     return bytes(out)
 
 
@@ -624,6 +750,12 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # v3+ blobs; decode strictly — absent byte means truncated input.
     (archive_reward_pool,) = struct.unpack_from(">Q", blob, off)
     off += 8
+    # v4+: censorship-evidence + receipt-subtree roots, in canonical
+    # order: pending, processed, receipt_subtree_roots.  Must match
+    # encode_snapshot's ordering exactly.
+    censorship_pending, off = _decode_bytes_bytes_dict(blob, off)
+    censorship_processed, off = _decode_bytes_set(blob, off)
+    receipt_subtree_roots, off = _decode_bytes_bytes_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -651,4 +783,7 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "seed_initial_stakes": seed_initial_stakes,
         "seed_divestment_debt": seed_divestment_debt,
         "archive_reward_pool": archive_reward_pool,
+        "censorship_pending": censorship_pending,
+        "censorship_processed": censorship_processed,
+        "receipt_subtree_roots": receipt_subtree_roots,
     }

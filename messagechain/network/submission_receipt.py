@@ -1,44 +1,37 @@
-"""Attestable submission receipts — gossip-layer censorship defense.
+"""
+Attestable submission receipts.
 
-A SubmissionReceipt is a notarized timestamp: the validator's signed
-attestation that "I received tx_hash at height H, and the user paid
-SUBMISSION_FEE for the privilege."  The receipt is returned to the
-user synchronously from the /submit RPC; the user holds it until:
+When a validator's submission endpoint admits a tx into its mempool,
+it can return a signed *receipt* committing (tx_hash, commit_height,
+issuer_id).  If the tx does NOT appear on-chain within
+EVIDENCE_INCLUSION_WINDOW blocks of `commit_height`, anyone holding
+the receipt can submit a `CensorshipEvidenceTx` proving the validator
+receipted-then-censored.  The processor at
+messagechain.consensus.censorship_evidence turns matured evidence
+into a stake slash (CENSORSHIP_SLASH_BPS).
 
-  * The tx is included on-chain — the receipt is discarded.
-  * The grace window (CENSORSHIP_GRACE_BLOCKS) elapses without
-    inclusion — the receipt becomes slashable evidence (see
-    messagechain.consensus.censorship_evidence).
+Key design points:
 
-The signature is produced with a DEDICATED WOTS+ subtree kept separate
-from the validator's block-signing tree.  Receipt signing consumes
-leaves far faster than block signing (per-submission vs per-block), so
-mixing them would risk bricking the block-signing key material under
-load.  Separation also means an exhausted receipt tree does not lock
-the validator out of consensus participation — receipts just stop
-being issued, which is a degraded-but-safe failure mode.
+1. **Content-neutral**: the receipt binds only (tx_hash, height,
+   issuer_id).  A validator MUST issue a receipt for any tx their
+   mempool accepts, regardless of content — no blocklists, no
+   discretionary suppression.  The security property ("included or
+   slashed") attaches to the validator, not the tx.
 
-Design trade-offs:
+2. **Dedicated WOTS+ subtree**: receipt signatures come from a
+   separate WOTS+ Merkle tree than block-signing, so receipt traffic
+   cannot burn leaves that the proposer needs for block production.
+   See config.RECEIPT_SUBTREE_HEIGHT.
 
-  * Receipts are signed with a one-time WOTS+ leaf, same primitive as
-    every other signature on the chain.  No new crypto primitive is
-    introduced; the existing `messagechain.crypto.keys.KeyPair` does
-    the heavy lifting.  Only the leaf-index accounting is distinct.
+3. **Self-contained verification**: verify_receipt() needs only the
+   issuer's receipt-subtree root public key + the receipt bytes.  No
+   chain state required — the slashing path accepts receipts from any
+   subtree the chain has seen the root of.
 
-  * The signable body is a deterministic concatenation of domain tag
-    + version + tx_hash + validator_pubkey + height + fee.  Domain
-    separation ("receipt") prevents any cross-tx-type signature
-    replay under the same WOTS+ leaf (which must not happen anyway,
-    because a leaf is one-time; the domain tag is defense in depth).
-
-  * Height is packed as u64 big-endian.  Fee is u64 big-endian.
-    Version is u8.  All fixed-width — no varints — because the
-    signable body is short and a predictable layout makes both
-    Python and future-language verifiers trivial.
-
-  * The wire format trails the signature with explicit length
-    prefixes so a mis-parse raises ValueError instead of silently
-    decoding a truncated blob into a valid-looking receipt.
+4. **Domain-separated**: signable bytes carry the literal tag
+   b"mc-submission-receipt-v1" so a receipt signature can never be
+   replayed as a block or tx signature (the chain's other signing
+   paths use different domain tags).
 """
 
 from __future__ import annotations
@@ -46,238 +39,224 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
-from messagechain.config import (
-    CHAIN_ID,
-    HASH_ALGO,
-    RECEIPT_VERSION,
-    validate_receipt_version,
-)
-from messagechain.crypto.keys import KeyPair, Signature, verify_signature
+from messagechain.config import HASH_ALGO, SIG_VERSION_CURRENT
+from messagechain.crypto.keys import Signature, KeyPair, verify_signature
 
 
-__all__ = [
-    "SubmissionReceipt",
-    "build_receipt_signable",
-    "sign_receipt",
-    "verify_receipt",
-]
+_DOMAIN_TAG = b"mc-submission-receipt-v1"
 
 
-# Domain-separation tag: prevents a receipt signature from ever being
-# accepted as any other signed object under the same pubkey.  Kept
-# short (single-byte tag would be enough for safety, but we spell it
-# out because readability wins in consensus-critical paths).
-_RECEIPT_DOMAIN = b"submission-receipt"
-
-
-def build_receipt_signable(
-    tx_hash: bytes,
-    validator_pubkey: bytes,
-    received_at_height: int,
-    submission_fee_paid: int,
-    version: int = RECEIPT_VERSION,
-) -> bytes:
-    """Canonical bytes the validator signs when issuing a receipt.
-
-    Layout:
-        CHAIN_ID || "submission-receipt" || u8 version ||
-        32 tx_hash || 32 validator_pubkey || u64 height || u64 fee
-
-    The hash algorithm only matters for the caller that hashes the
-    output before calling KeyPair.sign; WOTS+ operates on 32-byte
-    digests.  We return the pre-hash bytes so the caller can drive
-    both signing and verification through the same canonical form.
-    """
-    if not isinstance(tx_hash, (bytes, bytearray)) or len(tx_hash) != 32:
-        raise ValueError("tx_hash must be 32 bytes")
-    if not isinstance(validator_pubkey, (bytes, bytearray)) or len(validator_pubkey) != 32:
-        raise ValueError("validator_pubkey must be 32 bytes")
-    if not isinstance(received_at_height, int) or received_at_height < 0:
-        raise ValueError("received_at_height must be non-negative int")
-    if not isinstance(submission_fee_paid, int) or submission_fee_paid < 0:
-        raise ValueError("submission_fee_paid must be non-negative int")
-    ok, reason = validate_receipt_version(version)
-    if not ok:
-        raise ValueError(reason)
-    return (
-        CHAIN_ID
-        + _RECEIPT_DOMAIN
-        + struct.pack(">B", version)
-        + bytes(tx_hash)
-        + bytes(validator_pubkey)
-        + struct.pack(">Q", received_at_height)
-        + struct.pack(">Q", submission_fee_paid)
-    )
+def _h(data: bytes) -> bytes:
+    return hashlib.new(HASH_ALGO, data).digest()
 
 
 @dataclass
 class SubmissionReceipt:
-    """Signed attestation: validator saw tx_hash at height H.
+    """A validator's commitment that they accepted `tx_hash` at height
+    `commit_height`, with issuer_id `issuer_id`.
 
-    Size (serialized, typical): ~3.5KB at WOTS_KEY_CHAINS=64, h=24.
-    The big contributor is the WOTS+ signature itself (64 chain
-    hashes * 32 B = 2048 B) plus the 24-level auth path (768 B).
+    `issuer_root_public_key` is the 32-byte root of the issuer's
+    RECEIPT subtree (NOT the block-signing root).  Verification uses
+    this root directly; nodes that want to trust a given issuer's
+    receipts must learn this root through the chain (installed at
+    validator-registration time — see Blockchain.receipt_subtree_roots).
+
+    `signature` is a WOTS+ signature over _signable_data().
     """
 
-    tx_hash: bytes                # 32 — the tx the user submitted
-    validator_pubkey: bytes       # 32 — the validator's receipt-tree root
-    received_at_height: int       # u64 — chain height when accepted
-    submission_fee_paid: int      # u64 — fee charged to the submitter
-    signature: Signature          # WOTS+ sig from the receipt subtree
-    version: int = RECEIPT_VERSION
+    tx_hash: bytes             # 32 B — the tx that was accepted
+    commit_height: int         # block height at receipt time
+    issuer_id: bytes           # 32 B — validator entity_id
+    issuer_root_public_key: bytes  # 32 B — receipt-subtree root
+    signature: Signature       # WOTS+ sig from the receipt subtree
+    receipt_hash: bytes = b""
 
-    def signable_data(self) -> bytes:
-        return build_receipt_signable(
-            tx_hash=self.tx_hash,
-            validator_pubkey=self.validator_pubkey,
-            received_at_height=self.received_at_height,
-            submission_fee_paid=self.submission_fee_paid,
-            version=self.version,
-        )
+    def __post_init__(self):
+        if not self.receipt_hash:
+            self.receipt_hash = self._compute_hash()
+
+    def _signable_data(self) -> bytes:
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        return b"".join([
+            _DOMAIN_TAG,
+            struct.pack(">B", sig_version),
+            self.tx_hash,
+            struct.pack(">Q", int(self.commit_height)),
+            self.issuer_id,
+            self.issuer_root_public_key,
+        ])
+
+    def _compute_hash(self) -> bytes:
+        return _h(self._signable_data())
 
     def serialize(self) -> dict:
         return {
-            "version": self.version,
             "tx_hash": self.tx_hash.hex(),
-            "validator_pubkey": self.validator_pubkey.hex(),
-            "received_at_height": self.received_at_height,
-            "submission_fee_paid": self.submission_fee_paid,
+            "commit_height": self.commit_height,
+            "issuer_id": self.issuer_id.hex(),
+            "issuer_root_public_key": self.issuer_root_public_key.hex(),
             "signature": self.signature.serialize(),
+            "receipt_hash": self.receipt_hash.hex(),
         }
 
-    @classmethod
-    def deserialize(cls, data: dict) -> "SubmissionReceipt":
-        version = data.get("version", RECEIPT_VERSION)
-        ok, reason = validate_receipt_version(version)
-        if not ok:
-            raise ValueError(reason)
-        return cls(
-            tx_hash=bytes.fromhex(data["tx_hash"]),
-            validator_pubkey=bytes.fromhex(data["validator_pubkey"]),
-            received_at_height=data["received_at_height"],
-            submission_fee_paid=data["submission_fee_paid"],
-            signature=Signature.deserialize(data["signature"]),
-            version=version,
-        )
-
     def to_bytes(self) -> bytes:
-        """Compact binary encoding.
-
-        Layout:
-            u8   version
-            32   tx_hash
-            32   validator_pubkey
-            u64  received_at_height
-            u64  submission_fee_paid
-            u32  sig_blob_len
-            N    sig_blob
-        """
-        ok, reason = validate_receipt_version(self.version)
-        if not ok:
-            raise ValueError(reason)
         sig_blob = self.signature.to_bytes()
         return b"".join([
-            struct.pack(">B", self.version),
             self.tx_hash,
-            self.validator_pubkey,
-            struct.pack(">Q", self.received_at_height),
-            struct.pack(">Q", self.submission_fee_paid),
+            struct.pack(">Q", int(self.commit_height)),
+            self.issuer_id,
+            self.issuer_root_public_key,
             struct.pack(">I", len(sig_blob)),
             sig_blob,
+            self.receipt_hash,
         ])
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "SubmissionReceipt":
-        if len(data) < 1 + 32 + 32 + 8 + 8 + 4:
-            raise ValueError("SubmissionReceipt blob too short")
         off = 0
-        version = struct.unpack_from(">B", data, off)[0]
-        off += 1
-        ok, reason = validate_receipt_version(version)
-        if not ok:
-            raise ValueError(reason)
+        if len(data) < 32 + 8 + 32 + 32 + 4 + 32:
+            raise ValueError("SubmissionReceipt blob too short")
         tx_hash = bytes(data[off:off + 32]); off += 32
-        validator_pubkey = bytes(data[off:off + 32]); off += 32
-        received_at_height = struct.unpack_from(">Q", data, off)[0]; off += 8
-        submission_fee_paid = struct.unpack_from(">Q", data, off)[0]; off += 8
+        commit_height = struct.unpack_from(">Q", data, off)[0]; off += 8
+        issuer_id = bytes(data[off:off + 32]); off += 32
+        issuer_root_public_key = bytes(data[off:off + 32]); off += 32
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
-        if off + sig_len != len(data):
-            raise ValueError("SubmissionReceipt blob has wrong trailing length")
-        signature = Signature.from_bytes(bytes(data[off:off + sig_len]))
-        return cls(
+        if off + sig_len + 32 > len(data):
+            raise ValueError("SubmissionReceipt truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("SubmissionReceipt has trailing bytes")
+        r = cls(
             tx_hash=tx_hash,
-            validator_pubkey=validator_pubkey,
-            received_at_height=received_at_height,
-            submission_fee_paid=submission_fee_paid,
-            signature=signature,
-            version=version,
+            commit_height=commit_height,
+            issuer_id=issuer_id,
+            issuer_root_public_key=issuer_root_public_key,
+            signature=sig,
         )
+        expected = r._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"SubmissionReceipt hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return r
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "SubmissionReceipt":
+        r = cls(
+            tx_hash=bytes.fromhex(data["tx_hash"]),
+            commit_height=int(data["commit_height"]),
+            issuer_id=bytes.fromhex(data["issuer_id"]),
+            issuer_root_public_key=bytes.fromhex(data["issuer_root_public_key"]),
+            signature=Signature.deserialize(data["signature"]),
+        )
+        expected = r._compute_hash()
+        declared = bytes.fromhex(data["receipt_hash"])
+        if expected != declared:
+            raise ValueError(
+                f"SubmissionReceipt hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return r
 
 
-def sign_receipt(
-    keypair: KeyPair,
-    tx_hash: bytes,
-    validator_pubkey: bytes,
-    received_at_height: int,
-    submission_fee_paid: int,
-    version: int = RECEIPT_VERSION,
-) -> SubmissionReceipt:
-    """Issue a receipt by signing with the validator's receipt-subtree keypair.
+def verify_receipt(receipt: SubmissionReceipt) -> tuple[bool, str]:
+    """Stateless verification of a submission receipt.
 
-    `keypair` MUST be the dedicated receipt-signing tree — the caller
-    is responsible for keeping this instance separate from the
-    block-signing tree.  Mixing them is a leaf-reuse bug that would
-    brick consensus participation.
+    Checks:
+      * fixed-length fields have correct sizes
+      * receipt_hash matches _compute_hash()
+      * WOTS+ signature is valid under issuer_root_public_key
 
-    `validator_pubkey` is the validator's on-chain identity (their
-    block-signing tree root).  It's recorded in the receipt so the
-    accuser can prove which validator is being challenged; the
-    receipt's SIGNATURE is verified against the RECEIPT tree root
-    (carried separately on-chain per validator).
+    Does NOT consult chain state — so a receipt is verifiable by any
+    client that holds the bytes.  The slashing path additionally
+    checks that issuer_root_public_key matches the on-chain record
+    for issuer_id (via Blockchain.receipt_subtree_roots).
     """
-    signable = build_receipt_signable(
-        tx_hash=tx_hash,
-        validator_pubkey=validator_pubkey,
-        received_at_height=received_at_height,
-        submission_fee_paid=submission_fee_paid,
-        version=version,
-    )
-    msg_hash = hashlib.new(HASH_ALGO, signable).digest()
-    sig = keypair.sign(msg_hash)
-    return SubmissionReceipt(
-        tx_hash=bytes(tx_hash),
-        validator_pubkey=bytes(validator_pubkey),
-        received_at_height=received_at_height,
-        submission_fee_paid=submission_fee_paid,
-        signature=sig,
-        version=version,
-    )
+    if len(receipt.tx_hash) != 32:
+        return False, "tx_hash must be 32 bytes"
+    if len(receipt.issuer_id) != 32:
+        return False, "issuer_id must be 32 bytes"
+    if len(receipt.issuer_root_public_key) != 32:
+        return False, "issuer_root_public_key must be 32 bytes"
+    if receipt.commit_height < 0:
+        return False, "commit_height must be non-negative"
+    # Recompute hash.
+    expected = receipt._compute_hash()
+    if expected != receipt.receipt_hash:
+        return False, "receipt_hash mismatch"
+    msg_hash = _h(receipt._signable_data())
+    if not verify_signature(
+        msg_hash, receipt.signature, receipt.issuer_root_public_key,
+    ):
+        return False, "invalid receipt signature"
+    return True, "Valid"
 
 
-def verify_receipt(
-    receipt: SubmissionReceipt,
-    receipt_tree_root: bytes,
-) -> bool:
-    """Verify the receipt signature against the validator's receipt-tree root.
+class ReceiptIssuer:
+    """Wraps a validator's receipt-subtree keypair and issues receipts.
 
-    Returns False on any structural defect.  Never raises on malformed
-    input — all rejection is via False return, so the caller can chain
-    verify_receipt(...) && ... safely.
+    Callers are the submission endpoint + the local RPC submit path.
+    Every accepted tx triggers exactly one issue() call.
 
-    `receipt_tree_root` is the Merkle root of the validator's dedicated
-    receipt-signing tree.  On-chain, validators publish this via a
-    separate registration path (future work); for v1 the root is
-    accepted out-of-band (the user already trusted the validator enough
-    to submit a tx to it).
+    `subtree_keypair` MUST be a distinct KeyPair from the
+    block-signing keypair.  Using the block-signing keypair would
+    burn leaves needed for block production — the spec calls for a
+    dedicated subtree here.  Enforcement lives in the server-side
+    wiring that constructs the issuer (see server.py), not in this
+    class: we cannot detect an aliased keypair from here, but any
+    caller that misuses this will find their block-signing leaves
+    burned by receipt traffic.
     """
-    if not isinstance(receipt, SubmissionReceipt):
-        return False
-    if not isinstance(receipt_tree_root, (bytes, bytearray)) or len(receipt_tree_root) != 32:
-        return False
-    try:
-        signable = receipt.signable_data()
-    except (ValueError, TypeError):
-        return False
-    msg_hash = hashlib.new(HASH_ALGO, signable).digest()
-    return verify_signature(msg_hash, receipt.signature, receipt_tree_root)
+
+    def __init__(
+        self,
+        issuer_id: bytes,
+        subtree_keypair: KeyPair,
+        height_fn=None,
+    ):
+        if len(issuer_id) != 32:
+            raise ValueError("issuer_id must be 32 bytes")
+        self.issuer_id = issuer_id
+        self.subtree_keypair = subtree_keypair
+        # height_fn() -> int, callable returning current chain height.
+        # Injected so the issuer is testable without a live chain.
+        self._height_fn = height_fn or (lambda: 0)
+
+    @property
+    def root_public_key(self) -> bytes:
+        return self.subtree_keypair.public_key
+
+    def issue(self, tx_hash: bytes) -> SubmissionReceipt:
+        """Produce a signed receipt for `tx_hash` at current chain height.
+
+        Consumes exactly one WOTS+ leaf from the receipt subtree.
+        """
+        if len(tx_hash) != 32:
+            raise ValueError("tx_hash must be 32 bytes")
+        height = int(self._height_fn())
+        # Build the receipt with a placeholder signature, compute
+        # _signable_data, sign it, then re-stamp the signature + hash.
+        placeholder = Signature([], 0, [], b"", b"")
+        r = SubmissionReceipt(
+            tx_hash=tx_hash,
+            commit_height=height,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            signature=placeholder,
+        )
+        msg_hash = _h(r._signable_data())
+        sig = self.subtree_keypair.sign(msg_hash)
+        # Re-instantiate with real signature so receipt_hash is
+        # freshly computed.  The _signable_data is sig-agnostic
+        # (signature is not part of it) so the hash is stable.
+        return SubmissionReceipt(
+            tx_hash=tx_hash,
+            commit_height=height,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            signature=sig,
+        )

@@ -402,6 +402,13 @@ class Block:
     # in transit — the hygiene pattern mirrors slash_transactions and
     # finality_votes.  See messagechain.consensus.archive_challenge.
     custody_proofs: list = field(default_factory=list)  # list[CustodyProof]
+    # Censorship-evidence txs: first-class block slot so every peer
+    # processes the same admissions.  An evidence tx carries a signed
+    # submission receipt + the receipted MessageTransaction; when
+    # admitted, the CensorshipEvidenceProcessor marks it pending and
+    # begins a maturity countdown.  See
+    # messagechain.consensus.censorship_evidence.
+    censorship_evidence_txs: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -442,6 +449,10 @@ class Block:
             result["finality_votes"] = [v.serialize() for v in self.finality_votes]
         if self.custody_proofs:
             result["custody_proofs"] = [p.serialize() for p in self.custody_proofs]
+        if self.censorship_evidence_txs:
+            result["censorship_evidence_txs"] = [
+                tx.serialize() for tx in self.censorship_evidence_txs
+            ]
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -470,6 +481,7 @@ class Block:
             unstake_count    (u32)  + N x (unstake_len u32 + unstake_blob)
             fvote_count      (u32)  + N x (fvote_len u32 + fvote_blob)
             cproof_count     (u32)  + N x (cproof_len u32 + cproof_blob)
+            cev_count        (u32)  + N x (cev_len u32 + cev_blob)
             32               block_hash
 
         (The `reg_count`/registration-tx block slot was removed with
@@ -583,6 +595,11 @@ class Block:
             # single u32 zero, so non-challenge blocks pay only the 4-
             # byte header.
             enc_list(self.custody_proofs),
+            # censorship_evidence_txs appended after custody_proofs in
+            # the combined wire layout (archive-rewards + submission-
+            # receipts).  Empty list is a single u32 zero on blocks
+            # without evidence traffic.
+            enc_list(self.censorship_evidence_txs),
             self.block_hash,
         ])
 
@@ -725,6 +742,15 @@ class Block:
         from messagechain.consensus.archive_challenge import CustodyProof
         custody_proofs = dec_list(CustodyProof)
 
+        # Censorship-evidence txs.  Always present on post-wiring blobs;
+        # pre-wiring blobs had this slot absent, but the pre-launch
+        # hard reset (see CLAUDE.md — wire-format breakage is OK)
+        # means no legacy blobs cross this decoder.
+        from messagechain.consensus.censorship_evidence import (
+            CensorshipEvidenceTx,
+        )
+        censorship_evidence_txs = dec_list(CensorshipEvidenceTx)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -741,6 +767,7 @@ class Block:
             unstake_transactions=unstake_txs,
             finality_votes=finality_votes,
             custody_proofs=custody_proofs,
+            censorship_evidence_txs=censorship_evidence_txs,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -797,13 +824,23 @@ class Block:
             custody_proofs = [
                 CustodyProof.deserialize(p) for p in data["custody_proofs"]
             ]
+        censorship_evidence_txs = []
+        if data.get("censorship_evidence_txs"):
+            from messagechain.consensus.censorship_evidence import (
+                CensorshipEvidenceTx,
+            )
+            censorship_evidence_txs = [
+                CensorshipEvidenceTx.deserialize(e)
+                for e in data["censorship_evidence_txs"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
                     authority_txs=authority_txs, stake_transactions=stake_txs,
                     unstake_transactions=unstake_txs,
                     finality_votes=finality_votes,
-                    custody_proofs=custody_proofs)
+                    custody_proofs=custody_proofs,
+                    censorship_evidence_txs=censorship_evidence_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])
