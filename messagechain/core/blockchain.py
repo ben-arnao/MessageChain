@@ -213,9 +213,10 @@ class Blockchain:
         # (which vote for block N-1 but arrive bundled in block N) so the
         # 2/3 finality denominator is pinned to the stake set that existed
         # at the attestation's target block, not the post-churn live set.
-        # Bounded to the last STAKE_SNAPSHOT_RETENTION blocks to cap memory.
+        # Retained permanently: CLAUDE.md principle #2 (permanence) —
+        # historical finality proofs must remain reconstructible forever.
+        # See _record_stake_snapshot for the storage-cost argument.
         self._stake_snapshots: dict[int, dict[bytes, int]] = {}
-        self._stake_snapshot_retention: int = 1024
         # Incremental state commitment. Kept in sync with supply.balances,
         # supply.staked, and self.nonces via _touch_state. O(TREE_DEPTH)
         # per update vs the O(N log N) full-rebuild compute_state_root was
@@ -2958,14 +2959,38 @@ class Blockchain:
             self._pending_finality_slashes.extend(pending)
 
     def _record_stake_snapshot(self, block_number: int):
-        """Pin the current stake map for a block. See _process_attestations."""
+        """Pin the current stake map for a block.
+
+        Snapshots are permanent.  CLAUDE.md principle #2 (message
+        permanence & censorship resistance) applies equally to
+        consensus-critical state: a finality proof or attestation-
+        validity check that works today must still work in 100+
+        years, and that requires the stake map at every block to
+        remain reconstructible from chain state.
+
+        Snapshots are small — dict[entity_id_32B, int] — so the
+        per-block footprint scales with live validator-set size,
+        not chain length.  At ~500 validators with 40-byte entries
+        (32B id + 8B int + dict overhead) a snapshot is ~20 KB.
+        One block per ~12 s gives ~2.6M blocks/year, so an upper-
+        bound annual cost is ~50 GB even if the validator set is
+        saturated every single block — and in practice the set
+        churns slowly and most snapshots share structure, so this
+        is a comfortable ceiling, not a typical cost.  Relative to
+        message payloads (every on-chain message lives forever too),
+        stake snapshots are negligible.
+
+        See `_process_attestations`: attestations in block N vote
+        for block N-1, so the 2/3 denominator must be pinned to
+        the stake set that existed at the attestation's target
+        block, not the post-churn live set.  Finality votes
+        (`_apply_finality_votes`) consult the same map for the
+        long-range-defense threshold — both callers used to have
+        "snapshot may have been pruned" fallbacks, but with
+        unbounded retention those fallbacks only fire during cold-
+        load bootstrap, never for organic traffic.
+        """
         self._stake_snapshots[block_number] = dict(self.supply.staked)
-        # Prune old snapshots past retention window
-        if len(self._stake_snapshots) > self._stake_snapshot_retention:
-            cutoff = block_number - self._stake_snapshot_retention
-            stale = [n for n in self._stake_snapshots if n < cutoff]
-            for n in stale:
-                del self._stake_snapshots[n]
 
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
