@@ -1,8 +1,12 @@
 # Fee-model findings (fee_economic_analysis)
 
 Generated from `tools/fee_model.py` against live parameters in
-`messagechain/config.py` and `messagechain/core/transaction.calculate_min_fee`.
-Re-run the script any time a fee constant is changed to re-score.
+`messagechain/config.py` and `messagechain/core/transaction.calculate_min_fee`,
+plus `messagechain/consensus/archive_challenge.py` and
+`messagechain/consensus/censorship_evidence.py` for the two new
+consensus-level features (v2 of this model).  Re-run the script any time a
+fee constant, archive-challenge parameter, or censorship-evidence parameter
+is changed.
 
 ## Summary of live parameters
 
@@ -19,86 +23,166 @@ Re-run the script any time a fee constant is changed to re-score.
 | BLOCK_TIME_TARGET              | 600 s (52,560 blocks/year)    |
 | MAX_BASE_FEE_MULTIPLIER        | 10,000 (cap = 1,000,000)      |
 | GENESIS_SUPPLY                 | 1,000,000,000 tokens          |
+| ARCHIVE_CHALLENGE_INTERVAL     | 100 blocks (525 challenge blocks/yr) |
+| ARCHIVE_PROOFS_PER_CHALLENGE   | 10                            |
+| EVIDENCE_INCLUSION_WINDOW      | 32                            |
+| EVIDENCE_MATURITY_BLOCKS       | 16                            |
+| CENSORSHIP_SLASH_BPS           | 1000 (10% of stake)           |
 
-Under the current values, the byte-budget cap `MAX_BLOCK_MESSAGE_BYTES=10,000`
-is slack: the tx-count cap `MAX_TXS_PER_BLOCK=20` binds first
-(20 * 280 = 5,600 < 10,000). The MESSAGE_BYTES budget is therefore unreachable
-via message-txs and is effectively reserved headroom for other tx types.
+## Scenario results (messages, unchanged from v1)
 
-## Scenario results
+Stored bloat now includes the amortized custody-proof overhead (+82 B / block).
 
 | Scenario | stored bloat / year | attacker fee / year | fee as % of GENESIS_SUPPLY |
 |---|---:|---:|---:|
-| 1. Full-size spam at MIN_FEE            | 274 MB | 1.07 B tokens  | 107 %      |
-| 2. Small-tx spam at MIN_FEE             | 1.05 MB | 108 M tokens  | 10.8 %     |
-| 3. TARGET_BLOCK_SIZE (non-adversarial)  | 137 MB | 535 M tokens  | 53.6 %     |
-| 4. Worst-case, base_fee saturated       | 274 MB | 1.05 T tokens | 105,120 %  |
+| 1. Full-size spam at MIN_FEE            | 278.7 MB | 1.07 B tokens  | 107 %      |
+| 2. Small-tx spam at MIN_FEE             | 5.36 MB  | 108 M tokens   | 10.8 %     |
+| 3. TARGET_BLOCK_SIZE (non-adversarial)  | 141.5 MB | 535 M tokens   | 53.6 %     |
+| 4. Worst-case, base_fee saturated       | 278.7 MB | 1.05 T tokens  | 105,120 %  |
 
-Century scale (x100): scenario 1 produces ~27 GB of stored bloat. Millennium
-scale (x1000): ~274 GB. These are modest compared to modern disk and are
-small enough to not push away archival nodes over the 100-1000 year horizon.
+## New: custody-proof overhead (on-chain, permanent)
 
-## Is MIN_FEE / quadratic coefficient tight enough?
+- Measured real `CustodyProof.to_bytes()` at max-txs target block, 280B tx,
+  20-leaf Merkle path: **820 B per proof**.
+- Per challenge block: 10 × 820 = 8,200 B.
+- Amortized: 8,200 / 100 = **82 B / block**.
+- Throughput: **4.31 MB / year → 431 MB / 100 y → 4.31 GB / 1000 y.**
 
-**Short answer: yes, raise nothing.** The quadratic term plus the 280-byte
-message cap already makes a full-size message cost 1,019 tokens (10.2x
-MIN_FEE). At that rate, a 24/7 attacker filling every block with max-size
-messages spends **107 % of the entire genesis supply in one year** just to
-add 274 MB of bloat. No realistic adversary sustains that.
+This is negligible relative to message bloat (~1–3 orders of magnitude
+smaller).  The spec's "2–4 KB per proof" estimate was conservative; actual
+encoding is much tighter (no signature on proofs in v1, Merkle path is
+<5 siblings).
 
-The weaker spot is scenario 2 (small-tx spam): it costs only 10.8 %/yr of
-supply but produces only ~1 MB/yr, so the storage externality is trivially
-small. Even at the 1000-year horizon it's ~1 GB, less than one modern ISO.
+## New: censorship-evidence overhead (on-chain, permanent)
 
-### Specific recommendations
+`CensorshipEvidenceTx` ≈ 4,000 B / tx (receipt blob + embedded
+MessageTransaction + submitter WOTS signature).  **No dedicated
+per-block cap — shares MAX_TXS_PER_BLOCK=20 with everything else.**
 
-1. **Keep MIN_FEE at 100 and FEE_QUADRATIC_COEFF at 2.** The compound cost
-   of 1,019 tokens per max-size tx already exceeds 1000x the small-tx fee
-   (103 tokens), meaning the quadratic term is doing its job of pricing
-   bloat-heavy messages much higher than conciseness-rewarded ones.
+Two regimes:
 
-2. **Consider lowering MAX_BLOCK_MESSAGE_BYTES from 10,000 to 5,600**
-   (= `MAX_TXS_PER_BLOCK * MAX_MESSAGE_BYTES`), or deleting the constant
-   entirely. As shipped, it is unreachable for message-txs (the tx-count
-   cap binds first), so it provides no real protection and is dead code
-   from the attacker's perspective. Tightening it aligns code with
-   reality; deleting it if no other tx type uses it reduces surprise.
-   This is a hygiene fix, not a security fix.
+| Regime | Evidence / year | Bytes / year | Bytes / 1000 y |
+|---|---:|---:|---:|
+| Organic (non-censoring chain)                              | ~0          | 0      | 0       |
+| Light adversarial (e.g., 100/yr griefing attempts)         | 100         | 400 KB | 400 MB  |
+| Full-block adversarial (MAX_TXS_PER_BLOCK every block)     | 1,051,200   | 4.2 GB | 4.2 TB  |
 
-3. **No raise to MIN_FEE.** Raising MIN_FEE would make small txs more
-   expensive without meaningfully improving the bloat ceiling — the
-   bloat ceiling is already set by the quadratic, not by MIN_FEE.
-   Doubling MIN_FEE to 200 only lifts scenario 1 from 107 % to ~117 %
-   of supply per year (fee_per_tx = 1,119). Marginal benefit, real UX cost.
+**Adversarial affordability**: each evidence tx costs MIN_FEE = 100
+tokens.  `GENESIS_SUPPLY / MIN_FEE = 10,000,000` evidence txs — roughly
+**9.5 years of full-block evidence spam** before the attacker exhausts
+the entire money supply.  After that the model's cap flips from
+block-budget to affordability and growth slows.
 
-4. **No raise to FEE_QUADRATIC_COEFF.** Going from 2 to 4 roughly doubles
-   the cost of max-size messages to ~2,000 tokens but leaves small-tx
-   fees essentially unchanged. Since scenario 1 already prices out a
-   well-funded nation-state, there's no realistic attacker this would
-   defend against that isn't already priced out.
+**Additional economic friction not in the pure-fee model**: to craft a
+valid evidence the attacker needs a `SubmissionReceipt` signed by a
+registered validator (receipt-subtree key).  That validator is the
+named offender; successful maturation slashes them for
+CENSORSHIP_SLASH_BPS = 10% of stake.  So the real per-evidence cost to
+a self-colluding attacker is `MIN_FEE + (10% × sybil_validator_stake)`,
+which is always much greater than MIN_FEE alone.  The model therefore
+overstates the attack rate; the 4.2 TB/1000y figure is a genuine upper
+bound.
 
-5. **Base-fee dynamics are healthy.** Under saturated attack (scenario 4),
-   the base_fee cap (1,000,000 tokens/tx) would consume 1.05T tokens per
-   year — a 1000x multiple of genesis supply. The 10,000x multiplier cap
-   is correctly placed: high enough to deter, finite so the chain recovers.
+## New: `processed_censorship_evidence` state growth
 
-### Minor surprise / callout
+32 bytes per hash, append-only (double-slash defense).
 
-- The **byte-budget cap is slack under current params** (MAX_TXS_PER_BLOCK
-  binds first). If MAX_MESSAGE_BYTES is ever raised above 500 or
-  MAX_TXS_PER_BLOCK is raised, re-run this model before shipping the
-  change — the analysis assumes the current binding constraint.
-- Compression on 280 bytes of high-entropy ASCII yields only ~1.07x
-  (261/280 stored bytes). zlib adds zero meaningful bloat reduction on
-  worst-case spam payloads. This is expected and doesn't weaken the
-  model — attackers already maximize raw bytes.
+| Regime | Entries / yr | 100 y bytes | 1000 y bytes |
+|---|---:|---:|---:|
+| Organic                         | 0            | 0        | 0        |
+| Light adversarial (100 /yr)     | 100          | 320 KB   | 3.2 MB   |
+| Full-block adversarial          | 1,051,200    | 3.36 GB  | 33.6 GB  |
+
+Economic floor bounding this set: an attacker who wants to grow
+`processed_censorship_evidence` by N entries must pay ≥ N × MIN_FEE
+tokens.  Floor is therefore strict: 10M entries total across all time
+without burning the entire genesis supply.  At 32 B/hash, that is a
+**permanent ceiling of 320 MB of `processed_censorship_evidence`** if
+*all* of genesis supply is diverted to evidence spam.  Plenty safe.
+
+## Big-picture: does 1000 y still fit on commodity hardware?
+
+Two disjoint adversarial modes (the block-tx budget is shared, so you
+can't run both at once):
+
+| Horizon | Mode A: all-message-spam | Mode B: all-evidence-spam |
+|---|---:|---:|
+| 100 y   | **27.9 GB**        | **424.3 GB**        |
+| 1000 y  | **278.7 GB**       | **4.24 TB**         |
+
+Mode B (all-evidence-spam) is the strictly worse storage scenario —
+each evidence tx is ~15x larger than a max-size message tx.  Even so:
+
+- **100 y worst case: 424 GB** — fits on a $25 consumer SSD.
+- **1000 y worst case: 4.24 TB** — fits on a single commodity drive
+  (current 6–8 TB HDDs are ~$120; 10 TB ~$200 consumer retail).  Still
+  comfortably under any archival operator's pain threshold.
+
+**But note**: Mode B requires 9.5 years of sustained attack before
+exhausting genesis supply.  Beyond year 9.5, the attacker can only
+sustain the attack from *recycled* inflation (block rewards), which is
+bounded.  The pure 1000-year evidence-spam figure is an
+economic-impossibility upper bound, not a realistic sustained rate.
+
+## Parameter recommendations
+
+1. **Keep all current parameters.**  Storage at 1000 y under
+   the worst adversarial mode is **4.24 TB**, well under any
+   credible operator-pain threshold.  Under organic rates it's
+   ~280 GB including custody-proof overhead — dominated by message
+   bloat, not by features.
+
+2. **Do NOT add per-block cap for CensorshipEvidenceTx.**  Sharing
+   MAX_TXS_PER_BLOCK with message txs is already a tight cap.  A
+   dedicated cap would fragment the block budget with no storage
+   benefit: the evidence attacker and message spammer can't both
+   run concurrently anyway.
+
+3. **Keep `processed_censorship_evidence` unpruned.**  Economic
+   bound (320 MB ceiling at full genesis-supply burn) is tighter
+   than any pruning window we'd pick, and the determinism /
+   double-slash-defense arguments for permanence remain.
+
+4. **Monitor CustodyProof size.**  At 820 B actual vs 2–4 KB
+   in the spec, we have headroom — but if `MAX_TXS_PER_BLOCK`
+   grows, the Merkle-path term grows logarithmically and the
+   proof grows sub-linearly.  Safe for 2x, 4x, 8x growth
+   (path +1 hash = +32 B each doubling).
+
+5. **No change to MIN_FEE.**  Raising it would price-deter
+   evidence spam but also price-deter legitimate user txs; the
+   storage math doesn't justify it.
+
+## Surprises / callouts from v2
+
+- **Custody proofs are much cheaper than spec.**  820 B real vs
+  the 2–4 KB documented bound.  No witness-stripping, no
+  signature on the proof (v1), small Merkle path.  If we later
+  add per-proof signatures (spec mentions as v2), proof size
+  will roughly double to ~1.9 KB — still fits comfortably.
+
+- **Evidence-spam dwarfs message-spam per byte.**  4,000 B per
+  evidence tx vs 261 B per stored message tx.  Storage-adversary
+  mode shifts from message-spam to evidence-spam under these
+  parameters.  Still economically bounded.
+
+- **Economic attack on `processed_censorship_evidence` is
+  affordability-capped, not block-capped.**  At MIN_FEE=100 and
+  GENESIS_SUPPLY=1B, the set cannot exceed ~10M entries =
+  320 MB ever.  This set IS a permanence concern but not a
+  bloat concern.
+
+- **Block-slot sharing is the key insulator.**
+  MAX_TXS_PER_BLOCK=20 acts as a unified cap across message-txs
+  AND evidence-txs.  An attacker choosing evidence-spam gives up
+  message-spam, so worst-case total bloat does not compound.
 
 ## Bottom line
 
-Current fee parameters are **economically tight** against sustained spam
-over 100-1000 year horizons. The quadratic coefficient plus the 280-byte
-message cap produce a pricing curve where any attacker willing to fill
-the chain pays more than the entire token supply within the first year.
-No parameter change is needed for security; the only recommended change
-is hygiene (tighten or remove the currently-unreachable
-`MAX_BLOCK_MESSAGE_BYTES=10,000`).
+Current parameters are **still economically tight** after the v2
+feature set lands.  Worst-case 1000-year storage is **4.24 TB**
+under sustained full-block evidence-spam (requiring economic
+exhaustion of the attacker before horizon end).  Under organic
+rates: **~280 GB at 1000 y, 28 GB at 100 y**.  Both fit on
+commodity hardware the founder can host at GCP or on a home
+server with no stress.  **No parameter tuning required.**
