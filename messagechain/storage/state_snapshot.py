@@ -98,7 +98,11 @@ from messagechain.config import (
 
 # Re-exported so callers don't need to import from both places.
 # v2: added seed_divestment_debt (partial-divestment-to-floor schedule).
-STATE_SNAPSHOT_VERSION = 2  # wire format version for encode/decode
+# v3: added archive_reward_pool (proof-of-custody archive rewards).  Single
+#     scalar balance that participates in the snapshot root so bootstrapping
+#     nodes see the same value as replaying nodes.  See
+#     docs/proof-of-custody-archive-rewards.md.
+STATE_SNAPSHOT_VERSION = 3  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -142,6 +146,15 @@ _GLOBAL_TOTAL_FEES = b"total_fees_collected"
 _GLOBAL_TOTAL_BURNED = b"total_burned"
 _GLOBAL_BASE_FEE = b"base_fee"
 _GLOBAL_NEXT_ENTITY_INDEX = b"next_entity_index"
+# Proof-of-custody archive reward pool balance.  See
+# docs/proof-of-custody-archive-rewards.md and
+# messagechain/consensus/archive_challenge.py.  Single scalar; lives
+# under _TAG_GLOBAL so it shares the root-commitment path with other
+# supply-level counters.  MUST participate in the snapshot root for
+# consensus reasons: two state-synced nodes that disagree on the pool
+# balance silently fork at the next challenge block (different payout
+# amounts flow into different balances).
+_GLOBAL_ARCHIVE_REWARD_POOL = b"archive_reward_pool"
 
 
 def _h(data: bytes) -> bytes:
@@ -187,6 +200,13 @@ def serialize_state(blockchain) -> dict:
         # snapshot root for state-sync parity with replaying nodes.
         "seed_divestment_debt": dict(
             getattr(blockchain, "seed_divestment_debt", {})
+        ),
+        # Archive reward pool — proof-of-custody rewards scalar.
+        # See messagechain/consensus/archive_challenge.py.  Exposed as
+        # a plain scalar int; absence defaults to 0 (fresh chain or
+        # pre-archive-rewards replay).
+        "archive_reward_pool": int(
+            getattr(blockchain, "archive_reward_pool", 0)
         ),
     }
 
@@ -236,6 +256,10 @@ def deserialize_state(snapshot: dict) -> dict:
     # Blockchain.seed_divestment_debt init comment for the one-block
     # timing note on migration.
     out.setdefault("seed_divestment_debt", {})
+    # Default to 0 for pre-v3 snapshots (archive reward pool was not
+    # present).  A fresh chain starts with an empty pool; the first
+    # funded block credits it from the redirected burn.
+    out.setdefault("archive_reward_pool", 0)
     return out
 
 
@@ -358,6 +382,12 @@ def compute_state_root(snapshot: dict) -> bytes:
                 _GLOBAL_TOTAL_BURNED: snap["total_burned"],
                 _GLOBAL_BASE_FEE: snap["base_fee"],
                 _GLOBAL_NEXT_ENTITY_INDEX: snap["next_entity_index"],
+                # v3: archive reward pool balance participates in the
+                # root so bootstrapping nodes see the same scalar as
+                # replaying nodes.  A bootstrapper that inherits a
+                # stale pool would compute different payout amounts at
+                # the next challenge block and silently fork.
+                _GLOBAL_ARCHIVE_REWARD_POOL: snap["archive_reward_pool"],
             })),
     }
 
@@ -506,6 +536,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <int→bytes dict>    finalized_checkpoints
         <bytes→int  dict>   seed_initial_stakes
         <bytes→int  dict>   seed_divestment_debt  (v2+)
+        u64                 archive_reward_pool    (v3+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -535,6 +566,9 @@ def encode_snapshot(snap: dict) -> bytes:
     # always < 2 * SCALE at block boundaries (each block adds a small
     # fraction; drain removes whole tokens), so u64 is ample.
     out += _encode_bytes_int_dict(snap["seed_divestment_debt"])
+    # v3: archive reward pool balance (proof-of-custody archive rewards).
+    # Bounded above by total_supply, so u64 is ample.
+    out += struct.pack(">Q", int(snap["archive_reward_pool"]))
     return bytes(out)
 
 
@@ -584,8 +618,12 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     off += 8
     finalized_checkpoints, off = _decode_int_bytes_dict(blob, off)
     seed_initial_stakes, off = _decode_bytes_int_dict(blob, off)
-    # v2+: seed_divestment_debt.  Always present on v2 blobs.
+    # v2+: seed_divestment_debt.  Always present on v2+ blobs.
     seed_divestment_debt, off = _decode_bytes_int_dict(blob, off)
+    # v3+: archive_reward_pool (single scalar, u64).  Always present on
+    # v3+ blobs; decode strictly — absent byte means truncated input.
+    (archive_reward_pool,) = struct.unpack_from(">Q", blob, off)
+    off += 8
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -612,4 +650,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "finalized_checkpoints": finalized_checkpoints,
         "seed_initial_stakes": seed_initial_stakes,
         "seed_divestment_debt": seed_divestment_debt,
+        "archive_reward_pool": archive_reward_pool,
     }

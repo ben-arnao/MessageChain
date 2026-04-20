@@ -47,6 +47,16 @@ class SupplyTracker:
         self.pending_unstakes: dict[bytes, list[tuple[int, int]]] = {}
         # EIP-1559 dynamic base fee
         self.base_fee: int = BASE_FEE_INITIAL
+        # Per-block fee-burn ticker.  Incremented by every
+        # pay_fee_with_burn call that actually burns a base_fee; read
+        # and reset by Blockchain._apply_block_state after all txs have
+        # been applied, to compute how much of this block's burn should
+        # be redirected into the ArchiveRewardPool.  See
+        # ARCHIVE_BURN_REDIRECT_PCT in config.py / the
+        # proof-of-custody-archive-rewards design doc.  Kept separate
+        # from total_burned so other burn sources (slashing, inactivity
+        # leak, new-account surcharge) are not mistakenly redirected.
+        self.fee_burn_this_block: int = 0
 
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
@@ -224,6 +234,11 @@ class SupplyTracker:
         self.balances[to_proposer_id] = self.balances.get(to_proposer_id, 0) + tip
         self.total_supply -= base_fee  # burn
         self.total_burned += base_fee
+        # Fee-burn-only ticker: tracks the CURRENT block's fee-burn so
+        # Blockchain._apply_block_state can redirect the configured
+        # fraction into the archive-reward pool.  Not double-counted —
+        # the redirect step subtracts from total_burned to compensate.
+        self.fee_burn_this_block += base_fee
         self.total_fees_collected += fee
         return True
 

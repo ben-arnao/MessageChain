@@ -330,7 +330,14 @@ class TestBaseFeeBlockchainIntegration(unittest.TestCase):
         self.assertEqual(initial_base_fee, BASE_FEE_INITIAL)
 
     def test_fee_burned_on_block_add(self):
-        """When a block is added, the base fee portion of tx fees is burned."""
+        """When a block is added, the base fee portion of tx fees is burned.
+
+        Post proof-of-custody archive rewards: the archive-reward pool
+        captures ARCHIVE_BURN_REDIRECT_PCT of what would have burned
+        (those tokens re-enter total_supply as pool balance rather
+        than being destroyed).  The remaining portion still burns.
+        """
+        from messagechain.config import ARCHIVE_BURN_REDIRECT_PCT
         initial_supply = self.chain.supply.total_supply
         nonce = self.chain.nonces.get(self.bob.entity_id, 0)
         fee = max(self.chain.base_fee + 50, 1500)  # must exceed identity creation fee
@@ -339,11 +346,16 @@ class TestBaseFeeBlockchainIntegration(unittest.TestCase):
         success, _ = self.chain.add_block(block)
         self.assertTrue(success)
 
-        # Supply increased by block reward but decreased by base_fee burn
+        # Supply increased by block reward but decreased by the
+        # burned-and-not-redirected portion of the base fee.
         reward = self.chain.supply.calculate_block_reward(1)
-        # base_fee was BASE_FEE_INITIAL when the block was applied
-        expected_supply = initial_supply + reward - BASE_FEE_INITIAL
+        # base_fee was BASE_FEE_INITIAL when the block was applied.
+        pool_add = BASE_FEE_INITIAL * ARCHIVE_BURN_REDIRECT_PCT // 100
+        net_burn = BASE_FEE_INITIAL - pool_add
+        expected_supply = initial_supply + reward - net_burn
         self.assertEqual(self.chain.supply.total_supply, expected_supply)
+        # And the archive reward pool captured exactly the redirected portion.
+        self.assertEqual(self.chain.archive_reward_pool, pool_add)
 
     def test_empty_blocks_decrease_base_fee(self):
         """Empty blocks cause the base fee to decrease over time."""
