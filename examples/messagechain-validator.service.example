@@ -1,0 +1,137 @@
+[Unit]
+Description=MessageChain validator node
+After=network-online.target
+Wants=network-online.target
+# Crash-loop guard.  StartLimitBurst=5 / StartLimitIntervalSec=3600 means
+# systemd stops trying after 5 restarts in an hour — a block-level DoS bug
+# that segfaults the validator each time it sees a particular block won't
+# burn CPU and log volume forever.  The operator gets a halted unit they
+# can investigate instead of an indefinite restart loop.
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Create this user + group before enabling the service:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin messagechain
+User=messagechain
+Group=messagechain
+WorkingDirectory=/opt/messagechain
+# REQUIRED EDITS before first install:
+#   1. Replace ENTITY_ID_HEX with your validator's entity_id.  Generate
+#      with `messagechain generate-key` (prints both the private-key
+#      mnemonic and the public entity_id hex).  --wallet pins the
+#      entity so the server looks up the chain-stored WOTS+ tree_height
+#      instead of regenerating a multi-hour 1M-leaf cache on restart.
+#   2. Put the matching private key (hex, one line) at
+#      /etc/messagechain/keyfile with mode 0400 and owner messagechain.
+#      The server refuses to start if the file is readable by anyone
+#      else — see server.py:2748-2770.
+ExecStart=/usr/bin/python3 /opt/messagechain/server.py \
+    --data-dir /var/lib/messagechain \
+    --rpc-bind 0.0.0.0 \
+    --keyfile /etc/messagechain/keyfile \
+    --wallet ENTITY_ID_HEX
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Give the node up to 30s to run its SIGTERM handler: close the SQLite
+# connection, flush leaf_index.json, shut down the submission server.
+# Without this, systemd sends SIGKILL after 90s default — fine in most
+# cases but tight if the node is mid-flush of a large state tree or
+# mid-WOTS+ keygen after a key rotation.  KillSignal=SIGTERM is pinned
+# so `systemctl stop` triggers the graceful shutdown path in server.py.
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute blocks mmap(PROT_WRITE | PROT_EXEC) + mprotect
+# transitions — the primary vector for shellcode execution from a
+# memory-corruption bug.  CPython doesn't JIT, so this never breaks
+# the runtime.
+MemoryDenyWriteExecute=true
+# PrivateIPC + RemoveIPC: no host IPC namespace visibility, and any
+# IPC resources created by this service are removed at stop.  Prevents
+# a compromised service leaving a foothold via SYSV shared memory /
+# semaphores.
+PrivateIPC=true
+RemoveIPC=true
+# ProcSubset=pid hides non-process entries in /proc (cpuinfo, meminfo,
+# etc.) — unnecessary for the validator and useful info for an
+# attacker fingerprinting the host.
+ProcSubset=pid
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadWritePaths=/var/lib/messagechain
+ReadOnlyPaths=/etc/messagechain /opt/messagechain
+
+# Resource limits.  Leave ~500 MB headroom on a 2 GB VM.  NOTE: systemd
+# does NOT support inline comments on directive lines — keep comments
+# on their own lines above.
+LimitNOFILE=65536
+MemoryMax=1500M
+
+[Install]
+WantedBy=multi-user.target
+
+# ─────────────────────────────────────────────────────────────────────
+# Install instructions
+# ─────────────────────────────────────────────────────────────────────
+#
+# 1. Create the service user:
+#      sudo useradd --system --no-create-home --shell /usr/sbin/nologin messagechain
+#
+# 2. Lay out directories:
+#      sudo mkdir -p /opt/messagechain /var/lib/messagechain /etc/messagechain
+#      sudo chown -R messagechain:messagechain /opt/messagechain /var/lib/messagechain
+#      sudo chown root:messagechain /etc/messagechain
+#      sudo chmod 0750 /etc/messagechain
+#
+# 3. Install the code.  One of:
+#      # Option A: pip install from a release tarball
+#      sudo -u messagechain pip install --target /opt/messagechain messagechain
+#      # Option B: direct clone + pip install (requires repo read access)
+#      sudo -u messagechain git clone https://github.com/ben-arnao/MessageChain /opt/messagechain
+#      cd /opt/messagechain && sudo -u messagechain pip install -e .
+#
+# 4. Put your private key at /etc/messagechain/keyfile (hex, one line):
+#      sudo install -m 0400 -o messagechain -g messagechain \
+#        my-private-key.hex /etc/messagechain/keyfile
+#
+# 5. Edit this file: replace ENTITY_ID_HEX with the entity_id that
+#    `messagechain verify-key --keyfile /etc/messagechain/keyfile`
+#    prints.  Copy the result to /etc/systemd/system/:
+#      sudo cp messagechain-validator.service.example \
+#        /etc/systemd/system/messagechain-validator.service
+#      # edit the ExecStart line in the installed copy
+#
+# 6. Enable + start:
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now messagechain-validator
+#      sudo systemctl status messagechain-validator
+#      journalctl -fu messagechain-validator
+#
+# 7. Verify from another machine:
+#      messagechain status --server <your-host>:9334
+#
+# You earn block rewards and attestation rewards once your stake lands
+# on chain.  See README.md "Validator operations" for `stake` / `unstake`.

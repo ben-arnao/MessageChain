@@ -29,6 +29,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verbose", action="store_true", help="Verbose logging"
     )
+    # Global --keyfile.  Any subcommand that signs a transaction (send,
+    # transfer, stake, unstake, rotate-key, emergency-revoke,
+    # set-authority-key, propose, vote, account) can read the private
+    # key from this file instead of prompting via getpass.  Enables
+    # scripting / unattended usage; previously only `start --keyfile`
+    # worked and every other spending command forced interactive input.
+    # File should be 0400/0600 and contain the checksummed hex key OR
+    # the 24-word mnemonic on a single line.
+    parser.add_argument(
+        "--keyfile", type=str, default=None,
+        help="Path to a file containing the private key (hex or 24-word "
+             "mnemonic, one line).  Allows unattended signing.  Ensure "
+             "file permissions are 0400 or 0600.",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -42,16 +56,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--mine", action="store_true",
         help="Produce blocks and earn rewards (requires private key)",
     )
-    start.add_argument(
-        "--keyfile", type=str, default=None,
-        help="Path to file containing the checksummed private key. "
-             "Enables unattended restart (e.g. from systemd). "
-             "Ensure file permissions are 0600.",
-    )
+    # --keyfile is a GLOBAL flag (defined on the top-level parser).
+    # Kept callable here as `messagechain start --keyfile ...` for
+    # systemd-unit compatibility; redundant but not conflicting.
     start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
+    start.add_argument(
+        "--rpc-bind", type=str, default="127.0.0.1",
+        help="RPC bind address.  Default 127.0.0.1 (localhost-only).  "
+             "Use 0.0.0.0 for a public validator that accepts remote signed txs.",
+    )
     start.add_argument("--seed", nargs="*", help="Seed nodes (host:port)")
     start.add_argument("--data-dir", type=str, default=None, help="Chain data directory")
+    start.add_argument(
+        "--wallet", type=str, default=None,
+        help="Your validator entity_id in hex (the 64-char public one, "
+             "NOT the private key).  Pinning this lets the server look "
+             "up the chain-stored WOTS+ tree_height for this wallet "
+             "instead of regenerating a multi-hour cache if the config "
+             "default doesn't match.  Same flag that the systemd unit "
+             "example uses (see examples/messagechain-validator.service.example).",
+    )
 
     # --- account ---
     account = sub.add_parser(
@@ -695,8 +720,28 @@ def _load_key_from_file(path: str) -> bytes:
     return key
 
 
+def _resolve_private_key(args=None):
+    """Resolve the private key for a signing command.
+
+    If the user passed --keyfile on the command line (global flag),
+    read the key from that file.  Otherwise fall back to the
+    interactive prompt in `_collect_private_key`.
+
+    This is the single entry point for spending commands — putting the
+    branch here means every signing subcommand supports --keyfile for
+    free, enabling unattended/scripted operation.
+    """
+    if args is not None and getattr(args, "keyfile", None):
+        try:
+            return _load_key_from_file(args.keyfile)
+        except KeyFileError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+    return _collect_private_key()
+
+
 def _collect_private_key():
-    """Collect a private key from the user.
+    """Collect a private key from the user interactively.
 
     Accepts either a 24-word BIP-39 recovery phrase (preferred) or the
     72-char hex-checksummed form. Both formats carry a checksum, so a
@@ -765,7 +810,14 @@ def cmd_start(args):
         rpc_port=args.rpc_port,
         seed_nodes=seed_nodes,
         data_dir=args.data_dir,
+        rpc_bind=args.rpc_bind,
     )
+    if getattr(args, "wallet", None):
+        # Let server.py resolve the WOTS+ tree_height from chain state
+        # rather than config default.  Avoids multi-hour keygen after a
+        # profile flip (matches the --wallet behavior of server.py
+        # directly — see examples/messagechain-validator.service.example).
+        server.set_wallet(args.wallet)
 
     entity = None
     if args.mine:
@@ -780,7 +832,7 @@ def cmd_start(args):
         else:
             print("To produce blocks and earn rewards, authenticate with your private key.")
             print("(tip: use --keyfile <path> for unattended restart)\n")
-            private_key = _collect_private_key()
+            private_key = _resolve_private_key(args)
         from messagechain.config import MERKLE_TREE_HEIGHT
         progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Loading key tree")
         entity = Entity.create(private_key, progress=progress)
@@ -847,12 +899,12 @@ def cmd_account(args):
     from messagechain.identity.address import encode_address
 
     if getattr(args, "sigs_remaining", False):
-        _cmd_account_sigs_remaining()
+        _cmd_account_sigs_remaining(args)
         return
 
     print("=== Create Account ===\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
 
     print(f"\nAccount derived from your private key.")
@@ -869,7 +921,7 @@ def cmd_account(args):
     print("Your private key is your sole credential. Never share it.")
 
 
-def _cmd_account_sigs_remaining():
+def _cmd_account_sigs_remaining(args=None):
     """Print WOTS+ one-time-signature capacity for the current wallet.
 
     Uses ONLY the local keypair — no RPC required.  This is deliberate:
@@ -885,7 +937,7 @@ def _cmd_account_sigs_remaining():
 
     print("=== Signatures Remaining ===\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
 
     total = entity.keypair.num_leaves
@@ -925,7 +977,7 @@ def cmd_send(args):
     print(f"=== Send Message ({char_count} chars) ===\n")
 
     # Authenticate
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
@@ -1068,7 +1120,7 @@ def cmd_transfer(args):
         print("Transfer cancelled.")
         sys.exit(0)
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
 
@@ -1146,7 +1198,7 @@ def cmd_balance(args):
 
     print("=== Account Balance ===\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
 
     host, port = _parse_server(args.server)
@@ -1177,7 +1229,7 @@ def cmd_stake(args):
 
     print("=== Stake Tokens ===\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nStaking as: {entity.entity_id_hex[:16]}...")
 
@@ -1223,7 +1275,7 @@ def cmd_unstake(args):
 
     print("=== Unstake Tokens ===\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nUnstaking as: {entity.entity_id_hex[:16]}...")
 
@@ -1294,7 +1346,7 @@ def cmd_bootstrap_seed(args):
         print("Error: --stake-amount must be positive.")
         sys.exit(1)
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nSeed entity: {entity.entity_id_hex}")
     print(f"Cold authority: {authority_pubkey.hex()}")
@@ -1416,7 +1468,7 @@ def cmd_set_authority_key(args):
         print(f"Error: authority public key must be 32 bytes, got {len(authority_pubkey)}.")
         sys.exit(1)
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
@@ -1466,7 +1518,7 @@ def cmd_rotate_key(args):
     print("This moves your entity to a freshly-derived Merkle tree.")
     print("Your entity ID, balance, and stake are preserved.\n")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
@@ -1519,7 +1571,7 @@ def cmd_key_status(args):
     from messagechain.identity.identity import Entity
     from messagechain.config import MERKLE_TREE_HEIGHT
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
 
     host, port = _parse_server(args.server)
@@ -1568,7 +1620,7 @@ def cmd_emergency_revoke(args):
         print(f"Error: entity ID must be 32 bytes, got {len(target_entity_id)}.")
         sys.exit(1)
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     cold = Entity.create(private_key)
 
     host, port = _parse_server(args.server)
@@ -1608,7 +1660,7 @@ def cmd_propose(args):
     print(f"  Title: {args.title}")
     print(f"  Description: {args.description}")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nProposing as: {entity.entity_id_hex[:16]}...")
 
@@ -1652,7 +1704,7 @@ def cmd_vote(args):
     print(f"=== Cast Vote ({'YES' if approve else 'NO'}) ===\n")
     print(f"  Proposal: {args.proposal[:16]}...")
 
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
     print(f"\nVoting as: {entity.entity_id_hex[:16]}...")
 
@@ -1734,7 +1786,7 @@ def cmd_generate_key(_args):
     print("  There is no recovery. This phrase will NOT be shown again.")
 
 
-def cmd_verify_key(_args):
+def cmd_verify_key(args):
     """Re-derive public key and entity ID from a private key (offline)."""
     from messagechain.identity.identity import Entity
 
@@ -1742,7 +1794,7 @@ def cmd_verify_key(_args):
     print("Enter your private key to verify it derives the expected identity.\n")
 
     from messagechain.config import MERKLE_TREE_HEIGHT
-    private_key = _collect_private_key()
+    private_key = _resolve_private_key(args)
     progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Rebuilding key tree")
 
     try:
