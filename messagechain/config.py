@@ -249,31 +249,19 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 #   2. Flip NETWORK_NAME to "mainnet".
 # Doing (2) without (1) raises at config load — a mainnet build cannot
 # silently fall back to the testnet hash.
-NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
+NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
 #
-# HARD RESET 2026-04-20: both genesis hashes cleared. The previous mainnet
-# (live since 2026-04-18) is abandoned because the state-root-checkpoint
-# block-header field changed wire format, and existing block DBs cannot
-# decode forward. Re-launch procedure:
-#
-#   1. Wipe chain.db on every validator and on the bootstrap node.
-#   2. On the canonical bootstrap node only: run the genesis mint
-#      (deploy/launch_single_validator.py or equivalent) with
-#      NETWORK_NAME still "testnet" — initialize_genesis will mint and
-#      record a block-0 hash.
-#   3. Copy that block-0 hash into _MAINNET_GENESIS_HASH below as a
-#      bytes.fromhex("...") literal.
-#   4. Flip NETWORK_NAME to "mainnet".
-#   5. Commit + push + redeploy to every validator with fresh chain.db.
-#
-# Both hashes are None until the mint; a "mainnet" NETWORK_NAME with
-# _MAINNET_GENESIS_HASH=None raises at config load, which is the
-# intended failsafe against shipping the reset state as production.
+# Mainnet re-minted 2026-04-20 under the new state-root-checkpoint block
+# header format.  Previous 2026-04-18 mainnet (block 0 = 5e8bc19c...) was
+# abandoned because that header format cannot forward-decode the new
+# 32-byte checkpoint field.  Same founder key, same allocation, new hash.
 _TESTNET_GENESIS_HASH: bytes | None = None
-_MAINNET_GENESIS_HASH: bytes | None = None
+_MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
+    "53a1ce6217436b83aed7dbd2ab5de431e8bfb793803aee904a7e5d64ba0e4b19"
+)
 
 
 def _resolve_pinned_genesis_hash(network: str) -> bytes | None:

@@ -20,13 +20,13 @@ import messagechain.config as cfg
 
 class TestNetworkNameSelector(unittest.TestCase):
     def test_default_network_is_testnet(self):
-        """During the 2026-04-20 hard-reset window, NETWORK_NAME is 'testnet'.
+        """NETWORK_NAME default is 'mainnet' — mainnet is live.
 
-        Pre-launch this was 'testnet'.  At 2026-04-18 launch it flipped to
-        'mainnet'.  On 2026-04-20 we hard-reset (state-root-checkpoint
-        wire-format change breaks forward-decode of existing block DBs)
-        and flipped back to 'testnet' until the new mainnet genesis is
-        minted.  After re-mint, this assertion flips back to 'mainnet'.
+        Mainnet was re-minted 2026-04-20 under the new state-root-checkpoint
+        block-header format (the 2026-04-18 chain was abandoned because that
+        format broke forward-decode of existing blocks).  _TESTNET_GENESIS_HASH
+        is None — no active testnet; testnet/devnet deployments must set
+        NETWORK_NAME explicitly via config_local.py.
 
         Asserted against the source file rather than cfg.NETWORK_NAME so
         this test stays meaningful even when a test harness mutates the
@@ -43,20 +43,21 @@ class TestNetworkNameSelector(unittest.TestCase):
         self.assertIsNotNone(match, "NETWORK_NAME default not found in config.py")
         self.assertEqual(
             match.group(1),
-            "testnet",
-            "NETWORK_NAME default must be 'testnet' during the hard-reset "
-            "re-mint window.  _MAINNET_GENESIS_HASH is None until the new "
-            "block 0 is minted; flipping NETWORK_NAME to 'mainnet' before "
-            "that point raises at config load.  Flip this assertion back "
-            "to 'mainnet' once the new mainnet genesis hash is pinned.",
+            "mainnet",
+            "NETWORK_NAME default must be 'mainnet' now that mainnet is "
+            "live (block 0 minted 2026-04-20 under the new header format). "
+            "Operators running the live mainnet validator otherwise get the "
+            "testnet pin (None), which breaks the genesis-pin check. "
+            "Testnet/devnet deployments must set NETWORK_NAME explicitly "
+            "via config_local.py.",
         )
 
     def test_testnet_selector_returns_testnet_hash(self):
         """_resolve_pinned_genesis_hash('testnet') returns _TESTNET_GENESIS_HASH.
 
-        During the 2026-04-20 reset window _TESTNET_GENESIS_HASH is None
-        (also stale after the wire-format change); the resolver must still
-        return that value verbatim rather than raising or substituting.
+        There is no active testnet post-2026-04-20 re-mint — _TESTNET_GENESIS_HASH
+        is None.  The resolver must still return that value verbatim rather
+        than raising or substituting.
 
         Tested via the resolver, not via the module-level
         PINNED_GENESIS_HASH, because the test harness overrides
@@ -66,8 +67,8 @@ class TestNetworkNameSelector(unittest.TestCase):
             cfg._resolve_pinned_genesis_hash("testnet"),
             cfg._TESTNET_GENESIS_HASH,
         )
-        # When the testnet hash is repopulated after re-mint, it must
-        # be exactly 32 bytes — the selector never reshapes it.
+        # If a testnet is ever re-minted, its hash must be exactly
+        # 32 bytes — the selector never reshapes it.
         if cfg._TESTNET_GENESIS_HASH is not None:
             self.assertEqual(len(cfg._TESTNET_GENESIS_HASH), 32)
 
