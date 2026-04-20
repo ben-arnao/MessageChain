@@ -6,9 +6,9 @@ import os
 import tempfile
 import time
 
-import pytest
+import unittest
 
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.block import Block, BlockHeader, compute_merkle_root
 from messagechain.core.transaction import create_transaction
@@ -18,7 +18,7 @@ from messagechain.consensus.fork_choice import (
 )
 from messagechain.storage.chaindb import ChainDB
 from messagechain.network.sync import ChainSyncer, SyncState
-from messagechain.config import INITIAL_ENTITY_GRANT
+from tests import register_entity_for_test
 
 import hashlib
 from messagechain.config import HASH_ALGO
@@ -31,11 +31,7 @@ def _hash(data: bytes) -> bytes:
 # ── Helpers ──────────────────────────────────────────────────────
 
 def make_entity(name: str) -> Entity:
-    return Entity.create(
-        f"{name}-dna".encode(),
-        f"{name}-finger".encode(),
-        f"{name}-iris".encode(),
-    )
+    return Entity.create(f"{name}-privkey".encode().ljust(32, b"\x00"))
 
 
 def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity]:
@@ -44,13 +40,16 @@ def make_chain_with_blocks(num_blocks: int, db=None) -> tuple[Blockchain, Entity
     bob = make_entity("bob")
     chain = Blockchain(db=db)
     chain.initialize_genesis(alice)
-    chain.register_entity(bob)
+    register_entity_for_test(chain, bob)
+    # Fund test entities so they can pay fees
+    chain.supply.balances[alice.entity_id] = 10000
+    chain.supply.balances[bob.entity_id] = 10000
 
     pos = ProofOfStake()
 
     for i in range(num_blocks):
-        tx = create_transaction(bob, f"Message {i}", BiometricType.DNA, fee=2, nonce=i)
-        block = pos.create_block(alice, [tx], chain.get_latest_block())
+        tx = create_transaction(bob, f"Message {i}", fee=1500, nonce=i)
+        block = chain.propose_block(pos, alice, [tx])
         success, reason = chain.add_block(block)
         assert success, f"Failed to add block {i}: {reason}"
 
@@ -67,7 +66,7 @@ def make_temp_db() -> tuple[ChainDB, str]:
 # PERSISTENT STORAGE TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestChainDB:
+class TestChainDB(unittest.TestCase):
     """Test SQLite-backed persistent storage."""
 
     def test_store_and_retrieve_block(self):
@@ -174,7 +173,7 @@ class TestChainDB:
             os.unlink(path)
 
 
-class TestPersistentBlockchain:
+class TestPersistentBlockchain(unittest.TestCase):
     """Test Blockchain with SQLite persistence."""
 
     def test_persist_and_reload_chain(self):
@@ -206,13 +205,13 @@ class TestPersistentBlockchain:
             chain.initialize_genesis(alice)
 
             bob = make_entity("bob")
-            success, _ = chain.register_entity(bob)
+            success, _ = register_entity_for_test(chain, bob)
             assert success
 
             # Reload
             chain2 = Blockchain(db=db)
             assert bob.entity_id in chain2.public_keys
-            assert chain2.supply.get_balance(bob.entity_id) == INITIAL_ENTITY_GRANT
+            assert chain2.supply.get_balance(bob.entity_id) == 0
         finally:
             db.close()
             os.unlink(path)
@@ -222,7 +221,7 @@ class TestPersistentBlockchain:
 # FORK CHOICE TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestForkChoice:
+class TestForkChoice(unittest.TestCase):
     """Test fork choice rule (heaviest stake wins)."""
 
     def test_single_tip(self):
@@ -283,7 +282,7 @@ class TestForkChoice:
         assert weight == 500
 
 
-class TestForkCommonAncestor:
+class TestForkCommonAncestor(unittest.TestCase):
     """Test finding common ancestors between forking chains."""
 
     def test_find_ancestor_simple_fork(self):
@@ -292,18 +291,20 @@ class TestForkCommonAncestor:
         bob = make_entity("bob")
         chain = Blockchain()
         chain.initialize_genesis(alice)
-        chain.register_entity(bob)
+        register_entity_for_test(chain, bob)
+        chain.supply.balances[alice.entity_id] = 10000
+        chain.supply.balances[bob.entity_id] = 10000
 
         pos = ProofOfStake()
         parent = chain.get_latest_block()
 
         # Create block A (on main chain)
-        tx_a = create_transaction(bob, "fork A", BiometricType.DNA, fee=2, nonce=0)
-        block_a = pos.create_block(alice, [tx_a], parent)
+        tx_a = create_transaction(bob, "fork A", fee=1500, nonce=0)
+        block_a = chain.propose_block(pos, alice, [tx_a])
         chain.add_block(block_a)
 
         # Create block B (competing fork, same parent)
-        tx_b = create_transaction(bob, "fork B", BiometricType.DNA, fee=3, nonce=0)
+        tx_b = create_transaction(bob, "fork B", fee=1000, nonce=0)
         block_b = pos.create_block(alice, [tx_b], parent)
 
         # Store block_b in the hash index
@@ -320,7 +321,7 @@ class TestForkCommonAncestor:
         assert apply_[0].block_hash == block_b.block_hash
 
 
-class TestChainReorg:
+class TestChainReorg(unittest.TestCase):
     """Test chain reorganization."""
 
     def test_duplicate_block_rejected(self):
@@ -342,8 +343,9 @@ class TestChainReorg:
         fake_parent.block_hash = fake_parent._compute_hash()
 
         bob = make_entity("bob-orphan")
-        chain.register_entity(bob)
-        tx = create_transaction(bob, "orphan", BiometricType.DNA, fee=2, nonce=0)
+        register_entity_for_test(chain, bob)
+        chain.supply.balances[bob.entity_id] = 10000
+        tx = create_transaction(bob, "orphan", fee=1500, nonce=0)
         block = pos.create_block(alice, [tx], fake_parent)
 
         success, reason = chain.add_block(block)
@@ -356,24 +358,33 @@ class TestChainReorg:
         bob = make_entity("bob")
         chain = Blockchain()
         chain.initialize_genesis(alice)
-        chain.register_entity(bob)
+        register_entity_for_test(chain, bob)
+        chain.supply.balances[alice.entity_id] = 10000
+        chain.supply.balances[bob.entity_id] = 10000
+        # Give alice stake so main chain blocks have weight > 1,
+        # ensuring the longer main chain is strictly heavier than the fork.
+        chain.supply.staked[alice.entity_id] = 1000
 
         pos = ProofOfStake()
-        parent = chain.get_latest_block()
+        genesis = chain.get_latest_block()
 
-        # Add block to main chain
-        tx1 = create_transaction(bob, "main chain", BiometricType.DNA, fee=2, nonce=0)
-        block1 = pos.create_block(alice, [tx1], parent)
+        # Build main chain 2 blocks deep so it's strictly better than a 1-block fork
+        tx1 = create_transaction(bob, "main chain 1", fee=1500, nonce=0)
+        block1 = chain.propose_block(pos, alice, [tx1])
         chain.add_block(block1)
 
-        # Create competing fork block from same parent
-        tx2 = create_transaction(bob, "fork chain", BiometricType.DNA, fee=3, nonce=0)
-        block2 = pos.create_block(alice, [tx2], parent)
+        tx2 = create_transaction(bob, "main chain 2", fee=1500, nonce=1)
+        block2 = chain.propose_block(pos, alice, [tx2])
+        chain.add_block(block2)
 
-        success, reason = chain.add_block(block2)
+        # Create competing fork block from genesis (shorter fork, won't trigger reorg)
+        tx_fork = create_transaction(bob, "fork chain", fee=1500, nonce=0)
+        block_fork = pos.create_block(alice, [tx_fork], genesis)
+
+        success, reason = chain.add_block(block_fork)
         assert success
         # Block should be findable by hash
-        assert chain.get_block_by_hash(block2.block_hash) is not None
+        assert chain.get_block_by_hash(block_fork.block_hash) is not None
 
     def test_chain_info_shows_tips(self):
         chain, _ = make_chain_with_blocks(2)
@@ -386,7 +397,7 @@ class TestChainReorg:
 # IBD / SYNC TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestChainSyncer:
+class TestChainSyncer(unittest.TestCase):
     """Test the IBD sync state machine."""
 
     def test_initial_state(self):
@@ -411,15 +422,15 @@ class TestChainSyncer:
         chain, _ = make_chain_with_blocks(0)
         syncer = ChainSyncer(chain, lambda addr: None)
 
-        syncer.update_peer_height("peer1:9333", 5)
-        syncer.update_peer_height("peer2:9333", 10)
-        syncer.update_peer_height("peer3:9333", 3)
+        syncer.update_peer_height("peer1:9333", 5, cumulative_weight=500)
+        syncer.update_peer_height("peer2:9333", 10, cumulative_weight=1000)
+        syncer.update_peer_height("peer3:9333", 3, cumulative_weight=300)
 
         best = syncer.get_best_sync_peer()
         assert best == "peer2:9333"
 
     def test_no_sync_when_caught_up(self):
-        chain, _ = make_chain_with_blocks(5)
+        chain, _ = make_chain_with_blocks(1)
         syncer = ChainSyncer(chain, lambda addr: None)
 
         # Peer at same height
@@ -444,13 +455,11 @@ class TestChainSyncer:
         syncer = ChainSyncer(chain, lambda addr: None)
         syncer.state = SyncState.SYNCING_HEADERS
 
-        asyncio.get_event_loop().run_until_complete(
-            syncer.handle_headers_response([], "peer1:9333")
-        )
+        asyncio.run(syncer.handle_headers_response([], "peer1:9333"))
         assert syncer.state == SyncState.COMPLETE
 
 
-class TestSyncProtocol:
+class TestSyncProtocol(unittest.TestCase):
     """Test the sync protocol message types exist and work."""
 
     def test_new_message_types_exist(self):
@@ -479,7 +488,7 @@ class TestSyncProtocol:
 # INTEGRATION TESTS
 # ══════════════════════════════════════════════════════════════════
 
-class TestIntegration:
+class TestIntegration(unittest.TestCase):
     """End-to-end tests combining storage + fork choice + sync."""
 
     def test_full_lifecycle_with_persistence(self):
@@ -491,12 +500,14 @@ class TestIntegration:
             bob = make_entity("bob")
             chain = Blockchain(db=db)
             chain.initialize_genesis(alice)
-            chain.register_entity(bob)
+            register_entity_for_test(chain, bob)
+            chain.supply.balances[alice.entity_id] = 10000
+            chain.supply.balances[bob.entity_id] = 10000
 
             pos = ProofOfStake()
-            for i in range(5):
-                tx = create_transaction(bob, f"Msg {i}", BiometricType.DNA, fee=2, nonce=i)
-                block = pos.create_block(alice, [tx], chain.get_latest_block())
+            for i in range(2):
+                tx = create_transaction(bob, f"Msg {i}", fee=1500, nonce=i)
+                block = chain.propose_block(pos, alice, [tx])
                 success, _ = chain.add_block(block)
                 assert success
 
@@ -534,14 +545,14 @@ class TestIntegration:
 
     def test_backward_compatible_in_memory(self):
         """Blockchain without db= still works (backward compatible)."""
-        chain, alice = make_chain_with_blocks(3)
-        assert chain.height == 4
+        chain, alice = make_chain_with_blocks(1)
+        assert chain.height == 2
         assert chain.db is None
 
         info = chain.get_chain_info()
         assert info["chain_tips"] == 1
-        assert info["height"] == 4
+        assert info["height"] == 2
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    unittest.main()

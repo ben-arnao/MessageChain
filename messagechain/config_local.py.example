@@ -1,0 +1,31 @@
+# Template for messagechain/config_local.py — copy to config_local.py
+# (which is gitignored) and uncomment the values you want to override.
+#
+# config.py imports this at the end, so anything here replaces the
+# default.  Ideal for per-deployment settings that should survive
+# `git pull`: peer addresses, tree heights, dev-mode flags.
+
+# ── Validator VM running on public internet ─────────────────────────
+# SEED_NODES = []                      # genesis seed — no peers to connect to yet
+# REQUIRE_CHECKPOINTS = False          # chain < 1000 blocks; auto-waived anyway
+# MERKLE_TREE_HEIGHT = 16              # ~65K signing keys, faster keygen
+
+# ── Dev / localhost testing ─────────────────────────────────────────
+# NETWORK_NAME = "devnet"              # preferred switch — implies no pin
+# DEVNET = True                        # kept as a legacy alias; NETWORK_NAME is the source of truth
+# PINNED_GENESIS_HASH = None           # skip pin check (NETWORK_NAME=devnet already does this)
+# BLOCK_TIME_TARGET = 10               # fast blocks for quick iteration
+# P2P_TLS_ENABLED = False              # skip TLS setup in dev
+
+# ── Public validator accepting remote RPC ───────────────────────────
+# RPC_AUTH_ENABLED = False             # only affects admin RPCs after the
+                                       # public/admin split
+
+# ── Auto-restake (opt-in node-local policy) ─────────────────────────
+# Uncomment to have the node automatically sweep liquid balance above
+# AUTO_RESTAKE_LIQUID_BUFFER into stake whenever the sweep amount is at
+# least AUTO_RESTAKE_MIN_AMOUNT.  No consensus change — the node just
+# emits a normal StakeTransaction through its own RPC admission path.
+# AUTO_RESTAKE = True
+# AUTO_RESTAKE_MIN_AMOUNT = 1_000      # minimum sweep size (avoid dust)
+# AUTO_RESTAKE_LIQUID_BUFFER = 1_000   # keep this much liquid for fees

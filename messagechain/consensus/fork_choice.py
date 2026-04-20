@@ -10,6 +10,7 @@ we compare cumulative stake weight. If a competing chain has more weight,
 we reorganize: roll back our current tip, replay the better chain.
 
 Reorg safety:
+- Finalized blocks (2/3+ attestations) cannot be reverted — finality boundary
 - State snapshots are taken before reorg so we can roll back if the new
   chain fails validation
 - Deep reorgs (beyond MAX_REORG_DEPTH) are rejected to prevent long-range attacks
@@ -89,6 +90,7 @@ def find_common_ancestor(
     chain_a_tip: bytes,
     chain_b_tip: bytes,
     get_block: callable,
+    finalized_hashes: set[bytes] | None = None,
 ) -> tuple[bytes | None, list[Block], list[Block]]:
     """
     Find the common ancestor of two chain tips.
@@ -120,13 +122,21 @@ def find_common_ancestor(
             # Found common ancestor
             return a_hash, chain_a_blocks, chain_b_blocks
 
+        # H3: Reject reorgs past finalized blocks. If any block we would
+        # roll back is finalized, the reorg is invalid.
+        if finalized_hashes:
+            for blk in chain_a_blocks:
+                if blk.block_hash in finalized_hashes:
+                    logger.warning(
+                        f"Reorg rejected: would roll back finalized block "
+                        f"{blk.block_hash.hex()[:16]} at height {blk.header.block_number}"
+                    )
+                    return None, [], []
+
         # Check if a's current hash is in b's history
         if a_hash in b_hashes:
-            # a_hash is the ancestor, trim b's list
-            while chain_b_blocks and chain_b_blocks[0].header.prev_hash != a_hash:
-                # We need to find where a_hash appears
-                pass
-            # Simpler: rebuild b's list from ancestor
+            # a_hash is the ancestor — rebuild b's list to only include
+            # blocks after the ancestor, connected by prev_hash linkage
             trimmed = []
             for blk in chain_b_blocks:
                 if blk.header.prev_hash == a_hash or (trimmed and trimmed[-1].block_hash == blk.header.prev_hash):
@@ -134,6 +144,7 @@ def find_common_ancestor(
             return a_hash, chain_a_blocks, trimmed
 
         if b_hash in a_hashes:
+            # b_hash is the ancestor — rebuild a's list similarly
             trimmed = []
             for blk in chain_a_blocks:
                 if blk.header.prev_hash == b_hash or (trimmed and trimmed[-1].block_hash == blk.header.prev_hash):

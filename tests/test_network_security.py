@@ -6,7 +6,7 @@ Tests for Tier 1 network security features:
 """
 
 import time
-import pytest
+import unittest
 
 from messagechain.network.ban import (
     PeerBanManager, PeerScore, BAN_THRESHOLD, BAN_DURATION,
@@ -23,7 +23,7 @@ from messagechain.network.protocol import MessageType
 # Peer Ban Manager Tests
 # ══════════════════════════════════════════════════════════════════
 
-class TestPeerScore:
+class TestPeerScore(unittest.TestCase):
     def test_initial_state(self):
         ps = PeerScore()
         assert ps.score == 0
@@ -43,7 +43,7 @@ class TestPeerScore:
         assert ps.offenses == []
 
 
-class TestPeerBanManager:
+class TestPeerBanManager(unittest.TestCase):
     def test_fresh_peer_not_banned(self):
         mgr = PeerBanManager()
         assert not mgr.is_banned("192.168.1.1:9333")
@@ -158,7 +158,7 @@ class TestPeerBanManager:
 # Rate Limiter Tests
 # ══════════════════════════════════════════════════════════════════
 
-class TestTokenBucket:
+class TestTokenBucket(unittest.TestCase):
     def test_initial_full(self):
         bucket = TokenBucket(rate=10, max_tokens=50)
         assert bucket.tokens == 50
@@ -191,7 +191,7 @@ class TestTokenBucket:
         assert bucket.tokens <= 10
 
 
-class TestPeerRateLimiter:
+class TestPeerRateLimiter(unittest.TestCase):
     def test_fresh_peer_allowed(self):
         rl = PeerRateLimiter()
         assert rl.check("10.0.0.1:9333", "tx")
@@ -272,7 +272,7 @@ class TestPeerRateLimiter:
 # LRU Set Tests (used for peer known_txs tracking)
 # ══════════════════════════════════════════════════════════════════
 
-class TestLRUSet:
+class TestLRUSet(unittest.TestCase):
     def test_add_and_contains(self):
         s = _LRUSet(10)
         s.add("a")
@@ -318,7 +318,7 @@ class TestLRUSet:
 # inv/getdata Protocol Tests
 # ══════════════════════════════════════════════════════════════════
 
-class TestInvGetdataProtocol:
+class TestInvGetdataProtocol(unittest.TestCase):
     def test_inv_message_type_exists(self):
         assert MessageType.INV.value == "inv"
 
@@ -343,7 +343,7 @@ class TestInvGetdataProtocol:
 # Integration: Ban + Rate Limit interaction
 # ══════════════════════════════════════════════════════════════════
 
-class TestBanRateLimitIntegration:
+class TestBanRateLimitIntegration(unittest.TestCase):
     def test_repeated_rate_limits_lead_to_ban(self):
         """If a peer keeps hitting rate limits, they accumulate enough points to get banned."""
         ban_mgr = PeerBanManager()
@@ -378,13 +378,13 @@ class TestBanRateLimitIntegration:
 # Node message category mapping
 # ══════════════════════════════════════════════════════════════════
 
-class TestMessageCategoryMapping:
+class TestMessageCategoryMapping(unittest.TestCase):
     """Test that the Node._msg_category method correctly maps message types."""
 
     def test_tx_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
-        entity = Entity.create(b"test-dna", b"test-finger", b"test-iris")
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
         node = Node(entity, port=19333)
         assert node._msg_category(MessageType.ANNOUNCE_TX) == "tx"
         assert node._msg_category(MessageType.INV) == "tx"
@@ -392,23 +392,31 @@ class TestMessageCategoryMapping:
 
     def test_block_req_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
-        entity = Entity.create(b"test-dna", b"test-finger", b"test-iris")
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
         node = Node(entity, port=19334)
         assert node._msg_category(MessageType.REQUEST_BLOCK) == "block_req"
         assert node._msg_category(MessageType.REQUEST_BLOCKS_BATCH) == "block_req"
 
     def test_headers_req_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
-        entity = Entity.create(b"test-dna", b"test-finger", b"test-iris")
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
         node = Node(entity, port=19335)
         assert node._msg_category(MessageType.REQUEST_HEADERS) == "headers_req"
 
     def test_general_category(self):
         from messagechain.network.node import Node
-        from messagechain.identity.biometrics import Entity
-        entity = Entity.create(b"test-dna", b"test-finger", b"test-iris")
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
         node = Node(entity, port=19336)
         assert node._msg_category(MessageType.HANDSHAKE) == "general"
-        assert node._msg_category(MessageType.PEER_LIST) == "general"
+
+    def test_peer_list_addr_category(self):
+        """PEER_LIST is ADDR-equivalent and must route to the strict `addr`
+        bucket (BTC PR #22387) — not the generic high-rate `general` bucket."""
+        from messagechain.network.node import Node
+        from messagechain.identity.identity import Entity
+        entity = Entity.create(b"test-privkey".ljust(32, b"\x00"))
+        node = Node(entity, port=19337)
+        assert node._msg_category(MessageType.PEER_LIST) == "addr"

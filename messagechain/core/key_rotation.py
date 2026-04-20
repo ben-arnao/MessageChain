@@ -1,10 +1,10 @@
 """
 Key rotation transaction for MessageChain.
 
-WOTS+ keys exhaust after 2^MERKLE_TREE_HEIGHT (1024) signatures. Without
-key rotation, an entity's funds and identity are permanently locked once
-all one-time keys are used. This module provides an on-chain mechanism to
-rotate to a fresh Merkle tree before exhaustion.
+WOTS+ keys exhaust after 2^MERKLE_TREE_HEIGHT signatures (default: 2^20 =
+1,048,576). Without key rotation, an entity's funds and identity are
+permanently locked once all one-time keys are used. This module provides
+an on-chain mechanism to rotate to a fresh Merkle tree before exhaustion.
 
 The rotation is authorized by the entity's CURRENT key — they sign the
 new public key with their old key, proving ownership. The chain then
@@ -17,9 +17,12 @@ import hashlib
 import struct
 import time
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, KEY_ROTATION_FEE
+from messagechain.config import (
+    HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID, MAX_TIMESTAMP_DRIFT,
+    SIG_VERSION_CURRENT,
+)
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
-from messagechain.identity.biometrics import Entity
+from messagechain.identity.identity import Entity
 
 
 @dataclass
@@ -39,13 +42,22 @@ class KeyRotationTransaction:
             self.tx_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
-        """Canonical byte representation for signing."""
+        """Canonical byte representation for signing.
+
+        Includes sig_version from the attached signature so the tx_hash
+        commits to the signer's crypto scheme (crypto-agility register).
+        getattr fallback keeps None-signature test fixtures working.
+        """
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return (
-            self.entity_id
+            CHAIN_ID
+            + b"key_rotation"  # domain-separation tag: prevents cross-type sig replay
+            + struct.pack(">B", sig_version)
+            + self.entity_id
             + self.old_public_key
             + self.new_public_key
             + struct.pack(">Q", self.rotation_number)
-            + struct.pack(">d", self.timestamp)
+            + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
 
@@ -65,6 +77,62 @@ class KeyRotationTransaction:
             "tx_hash": self.tx_hash.hex(),
         }
 
+    def to_bytes(self, state=None) -> bytes:
+        """Binary: ENT entity_ref | 32 old_pk | 32 new_pk | u64 rotation_number |
+        f64 timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+
+        old_public_key and new_public_key are raw pubkeys, not entity
+        references — they do not resolve through the state's
+        entity_id↔entity_index registry.  The rotation tx carries both
+        keys directly so a verifier can confirm the signature without
+        any additional state lookup.
+        """
+        from messagechain.core.entity_ref import encode_entity_ref
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            encode_entity_ref(self.entity_id, state=state),
+            self.old_public_key,
+            self.new_public_key,
+            struct.pack(">Q", self.rotation_number),
+            struct.pack(">d", float(self.timestamp)),
+            struct.pack(">Q", self.fee),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes, state=None) -> "KeyRotationTransaction":
+        from messagechain.core.entity_ref import decode_entity_ref
+        off = 0
+        if len(data) < 1 + 32 + 32 + 8 + 8 + 8 + 4 + 32:
+            raise ValueError("KeyRotation blob too short")
+        entity_id, n = decode_entity_ref(data, off, state=state); off += n
+        old_pk = bytes(data[off:off + 32]); off += 32
+        new_pk = bytes(data[off:off + 32]); off += 32
+        rotation_number = struct.unpack_from(">Q", data, off)[0]; off += 8
+        timestamp = struct.unpack_from(">d", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("KeyRotation truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("KeyRotation has trailing bytes")
+        tx = cls(
+            entity_id=entity_id, old_public_key=old_pk,
+            new_public_key=new_pk, rotation_number=rotation_number,
+            timestamp=timestamp, fee=fee, signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"KeyRotation tx hash mismatch: declared {declared.hex()[:16]}, "
+                f"computed {expected.hex()[:16]}"
+            )
+        return tx
+
     @classmethod
     def deserialize(cls, data: dict) -> "KeyRotationTransaction":
         sig = Signature.deserialize(data["signature"])
@@ -77,7 +145,14 @@ class KeyRotationTransaction:
             fee=data["fee"],
             signature=sig,
         )
-        tx.tx_hash = bytes.fromhex(data["tx_hash"])
+        # Recompute hash and verify integrity — never trust declared hashes
+        expected_hash = tx._compute_hash()
+        declared_hash = bytes.fromhex(data["tx_hash"])
+        if expected_hash != declared_hash:
+            raise ValueError(
+                f"KeyRotation tx hash mismatch: declared {data['tx_hash'][:16]}, "
+                f"computed {expected_hash.hex()[:16]}"
+            )
         return tx
 
 
@@ -107,7 +182,7 @@ def create_key_rotation(
         old_public_key=entity.public_key,
         new_public_key=new_keypair.public_key,
         rotation_number=rotation_number,
-        timestamp=time.time(),
+        timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )
@@ -125,10 +200,15 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
     Verify a key rotation transaction.
 
     Checks that:
-    1. The old_public_key matches the entity's current key on chain
-    2. The signature is valid under the old key
-    3. The new key is different from the old key
+    1. Timestamp is sane (positive and within drift window)
+    2. The old_public_key matches the entity's current key on chain
+    3. The signature is valid under the old key
+    4. The new key is different from the old key
     """
+    if tx.timestamp <= 0:
+        return False
+    if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
+        return False
     if tx.old_public_key != current_public_key:
         return False
     if tx.new_public_key == tx.old_public_key:
@@ -140,16 +220,25 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
     return verify_signature(msg_hash, tx.signature, current_public_key)
 
 
-def derive_rotated_keypair(entity: Entity, rotation_number: int) -> KeyPair:
+def derive_rotated_keypair(
+    entity: Entity,
+    rotation_number: int,
+    progress=None,
+) -> KeyPair:
     """
     Derive a new KeyPair for key rotation.
 
-    Uses the biometric seed + rotation number to deterministically generate
-    a fresh Merkle tree. Same biometrics + same rotation number = same new keys.
-    This means the entity can always re-derive their rotated keys from their body.
+    Uses the entity's seed + rotation number to deterministically generate
+    a fresh Merkle tree. Same private key + same rotation number = same new keys.
+    This means the entity can always re-derive their rotated keys from their key.
+
+    `progress`, if provided, is called with each leaf index as it is derived —
+    the same callback shape KeyPair.generate accepts. Use this to drive a
+    status indicator during rotations on full-height trees (MERKLE_TREE_HEIGHT
+    = 20 means ~1M derivations, minutes of work with no visible output).
     """
     rotation_seed = hashlib.new(
         HASH_ALGO,
-        entity._biometric_seed + struct.pack(">Q", rotation_number),
+        entity._seed + struct.pack(">Q", rotation_number),
     ).digest()
-    return KeyPair.generate(rotation_seed)
+    return KeyPair.generate(rotation_seed, progress=progress)

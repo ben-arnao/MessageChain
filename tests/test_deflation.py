@@ -2,7 +2,10 @@
 
 import unittest
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.config import GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE
+from messagechain.config import (
+    GENESIS_SUPPLY, BLOCK_REWARD, HALVING_INTERVAL, MIN_FEE, BLOCK_REWARD_FLOOR,
+    PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID,
+)
 
 
 class TestInflation(unittest.TestCase):
@@ -10,8 +13,8 @@ class TestInflation(unittest.TestCase):
         self.tracker = SupplyTracker()
         self.entity_id = b"\x01" * 32
         self.proposer_id = b"\x02" * 32
-        self.tracker.initialize_balance(self.entity_id, 10000)
-        self.tracker.initialize_balance(self.proposer_id, 0)
+        self.tracker.balances[self.entity_id] = 10000
+        self.tracker.balances[self.proposer_id] = 0
 
     def test_initial_state(self):
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY)
@@ -19,9 +22,15 @@ class TestInflation(unittest.TestCase):
 
     def test_block_reward_minting(self):
         reward = self.tracker.mint_block_reward(self.proposer_id, block_height=1)
-        self.assertEqual(reward, BLOCK_REWARD)
+        self.assertEqual(reward["total_reward"], BLOCK_REWARD)
+        # No attester committee → proposer absorbs the whole reward.
+        # Previously the cap applied here and siphoned excess into the
+        # treasury; that was unintended governance-fund inflation
+        # (treasury should only grow via explicit governance action).
+        # Supply net-grows by the full reward; treasury stays at zero.
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY + BLOCK_REWARD)
         self.assertEqual(self.tracker.get_balance(self.proposer_id), BLOCK_REWARD)
+        self.assertEqual(self.tracker.get_balance(TREASURY_ENTITY_ID), 0)
 
     def test_supply_increases_over_blocks(self):
         """Supply should increase with each block (inflation)."""
@@ -32,12 +41,22 @@ class TestInflation(unittest.TestCase):
     def test_halving_reduces_reward(self):
         reward_early = self.tracker.calculate_block_reward(0)
         reward_after_halving = self.tracker.calculate_block_reward(HALVING_INTERVAL)
-        self.assertEqual(reward_after_halving, reward_early // 2)
+        self.assertEqual(reward_early, 16)
+        self.assertEqual(reward_after_halving, 8)
+
+    def test_four_meaningful_halvings(self):
+        """BLOCK_REWARD=16 gives 2 meaningful halvings: 16 -> 8 -> 4 (floor)."""
+        self.assertEqual(self.tracker.calculate_block_reward(0), 16)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL), 8)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 2), 4)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 3), 4)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 4), 4)
+        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 5), 4)
 
     def test_reward_never_reaches_zero(self):
-        """Even after many halvings, reward stays at least 1."""
+        """Even after many halvings, reward stays at least BLOCK_REWARD_FLOOR."""
         reward = self.tracker.calculate_block_reward(HALVING_INTERVAL * 100)
-        self.assertGreaterEqual(reward, 1)
+        self.assertGreaterEqual(reward, BLOCK_REWARD_FLOOR)
 
     def test_fee_payment(self):
         self.assertTrue(self.tracker.pay_fee(self.entity_id, self.proposer_id, 100))
@@ -58,7 +77,7 @@ class TestInflation(unittest.TestCase):
 
     def test_transfer(self):
         other = b"\x03" * 32
-        self.tracker.initialize_balance(other, 0)
+        self.tracker.balances[other] = 0
         self.assertTrue(self.tracker.transfer(self.entity_id, other, 100))
         self.assertEqual(self.tracker.get_balance(other), 100)
 

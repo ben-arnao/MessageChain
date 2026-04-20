@@ -1,9 +1,10 @@
 """Tests for key rotation — entities can rotate to fresh WOTS+ Merkle trees."""
 
 import unittest
-from messagechain.identity.biometrics import Entity, BiometricType
+from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
+from tests import register_entity_for_test
 from messagechain.core.key_rotation import (
     KeyRotationTransaction,
     create_key_rotation,
@@ -15,15 +16,23 @@ from messagechain.config import KEY_ROTATION_FEE
 
 
 class TestKeyRotation(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.alice = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        cls.bob = Entity.create(b"bob-private-key".ljust(32, b"\x00"))
+
     def setUp(self):
-        self.alice = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
-        self.bob = Entity.create(b"bob-dna", b"bob-finger", b"bob-iris")
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
-        self.chain.register_entity(self.bob)
+        register_entity_for_test(self.chain, self.bob)
+        # Fund test entities so they can pay fees
+        self.chain.supply.balances[self.alice.entity_id] = 10000
+        self.chain.supply.balances[self.bob.entity_id] = 10000
 
     def test_derive_rotated_keypair_deterministic(self):
-        """Same biometrics + same rotation number = same new keys."""
+        """Same private key + same rotation number = same new keys."""
         kp1 = derive_rotated_keypair(self.alice, rotation_number=0)
         kp2 = derive_rotated_keypair(self.alice, rotation_number=0)
         self.assertEqual(kp1.public_key, kp2.public_key)
@@ -109,7 +118,7 @@ class TestKeyRotation(unittest.TestCase):
 
         # Second rotation — need to use new keypair to sign
         # Simulate entity with new keypair
-        alice_rotated = Entity.create(b"alice-dna", b"alice-finger", b"alice-iris")
+        alice_rotated = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         alice_rotated.keypair = new_kp0  # swap in the rotated keypair
 
         new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)
@@ -131,7 +140,10 @@ class TestKeyRotation(unittest.TestCase):
         bob_bal_after = self.chain.supply.get_balance(self.bob.entity_id)
 
         self.assertEqual(alice_bal_after, alice_bal_before - KEY_ROTATION_FEE)
-        self.assertEqual(bob_bal_after, bob_bal_before + KEY_ROTATION_FEE)
+        # EIP-1559: base fee is burned, only the tip goes to proposer
+        base_fee = self.chain.supply.base_fee
+        expected_tip = KEY_ROTATION_FEE - base_fee
+        self.assertEqual(bob_bal_after, bob_bal_before + expected_tip)
 
     def test_rotation_insufficient_balance_rejected(self):
         """Rotation rejected if entity can't afford the fee."""
