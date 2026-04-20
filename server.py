@@ -495,18 +495,25 @@ class Server:
                 by_height[cp.block_number] = cp
             checkpoints = list(by_height.values())
         if REQUIRE_CHECKPOINTS and not checkpoints:
-            # Young chains (< 1000 blocks) have nothing meaningful to
-            # checkpoint against.  Auto-waive the requirement with a
-            # warning instead of crashing — the long-range attack vector
-            # is effectively theoretical when the chain is this fresh.
-            # Once the chain matures past 1000 blocks, operators MUST
-            # ship checkpoints or explicitly set REQUIRE_CHECKPOINTS=False.
-            if self.blockchain.height < 1000:
+            # Auto-waive threshold: previously 1000 blocks (~1 week at 600s).
+            # A new community validator cloning the repo after the chain
+            # crossed 1000 blocks would fail to start with a confusing
+            # RuntimeError, and public launch was imminent.  Bumped to
+            # 105_192 (~2 years, matches BOOTSTRAP_END_HEIGHT) so a fresh
+            # community clone works throughout the bootstrap window.
+            # Before the chain crosses this, the release process must
+            # bake signed checkpoints into config.TRUSTED_CHECKPOINTS
+            # (or deploy a checkpoints.json).  Long-range attack surface
+            # is genuinely theoretical during bootstrap — the single
+            # validator is also the single keyholder.
+            _WAIVE_THRESHOLD = 105_192
+            if self.blockchain.height < _WAIVE_THRESHOLD:
                 logger.warning(
                     "No weak-subjectivity checkpoints loaded but chain is "
-                    "young (height=%d < 1000) — proceeding without. "
-                    "Ship checkpoints before the chain crosses block 1000.",
-                    self.blockchain.height,
+                    "in bootstrap window (height=%d < %d) — proceeding "
+                    "without.  Ship signed checkpoints via a release update "
+                    "before the chain crosses block %d.",
+                    self.blockchain.height, _WAIVE_THRESHOLD, _WAIVE_THRESHOLD,
                 )
             else:
                 raise RuntimeError(
