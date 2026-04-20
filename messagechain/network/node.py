@@ -98,6 +98,14 @@ class Node:
         self.data_dir = data_dir
         self.blockchain = Blockchain(db=db)
         self.mempool = Mempool()
+        # Dedicated mempool for archive-reward custody proofs — their
+        # eviction rule (submission window) differs from the tx TTL
+        # rule in Mempool, so they get their own pool.  See
+        # messagechain.consensus.archive_proof_mempool.
+        from messagechain.consensus.archive_proof_mempool import (
+            ArchiveProofMempool,
+        )
+        self.proof_pool = ArchiveProofMempool()
         self.consensus = ProofOfStake()
         self.peers: dict[str, Peer] = {}
         self._server = None
@@ -1032,6 +1040,9 @@ class Node:
         elif msg.msg_type == MessageType.ANNOUNCE_FINALITY_VOTE:
             await self._handle_announce_finality_vote(msg.payload, peer)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_CUSTODY_PROOF:
+            await self._handle_announce_custody_proof(msg.payload, peer)
+
         elif msg.msg_type == MessageType.MEMPOOL_DIGEST:
             await self._handle_mempool_digest(msg.payload, peer)
 
@@ -1359,6 +1370,45 @@ class Node:
         if added:
             relay_msg = NetworkMessage(
                 msg_type=MessageType.ANNOUNCE_FINALITY_VOTE,
+                payload=payload,
+                sender_id=self.entity.entity_id_hex,
+            )
+            await self._broadcast(relay_msg, exclude=peer.address)
+
+    async def _handle_announce_custody_proof(self, payload: dict, peer: Peer):
+        """Handle a gossiped CustodyProof.
+
+        Shape mirrors _handle_announce_finality_vote / _handle_announce_slash:
+        validate via the shared ingress helper (same acceptance
+        semantics as the HTTP endpoint), add to the proof pool, relay
+        on accept.
+
+        Only hard-bans on malformed decoding — a v1 proof has no
+        signature, so a peer could legitimately relay a proof this
+        node rejects because it hasn't IBD'd to the target height yet.
+        """
+        from messagechain.consensus.archive_challenge import CustodyProof
+        from messagechain.network.submission_server import (
+            submit_custody_proof_to_pool,
+        )
+        try:
+            proof = CustodyProof.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION,
+                "invalid_custody_proof_data",
+            )
+            return
+
+        result = submit_custody_proof_to_pool(
+            proof, self.blockchain, self.proof_pool,
+        )
+        if not result.ok:
+            return
+
+        if not result.duplicate:
+            relay_msg = NetworkMessage(
+                msg_type=MessageType.ANNOUNCE_CUSTODY_PROOF,
                 payload=payload,
                 sender_id=self.entity.entity_id_hex,
             )
@@ -1809,10 +1859,20 @@ class Node:
         # 2/3-stake commitment that finalizes their target block.
         from messagechain.config import MAX_FINALITY_VOTES_PER_BLOCK
         fin_votes = self.mempool.get_finality_votes(MAX_FINALITY_VOTES_PER_BLOCK)
+        # Pull pending CustodyProofs if this is a challenge block.
+        # Non-challenge blocks MUST carry an empty list — validate_block
+        # enforces the hygiene rule that bans non-empty on the wrong
+        # height.
+        from messagechain.config import is_archive_challenge_block
+        cust_proofs = []
+        next_height = self.blockchain.height
+        if is_archive_challenge_block(next_height):
+            cust_proofs = self.proof_pool.top_for_challenge(next_height)
         block = self.blockchain.propose_block(
             self.consensus, self.entity, txs,
             slash_transactions=slash_txs,
             finality_votes=fin_votes,
+            custody_proofs=cust_proofs,
         )
 
         success, reason = self.blockchain.add_block(block)
@@ -1827,6 +1887,13 @@ class Node:
                 self.mempool.remove_finality_votes(
                     [v.consensus_hash() for v in fin_votes]
                 )
+            if cust_proofs:
+                self.proof_pool.remove_proofs(
+                    [(next_height, p.prover_id) for p in cust_proofs],
+                )
+            # Also evict any expired proofs from the pool — cheap,
+            # bounded by pool size.
+            self.proof_pool.evict_expired(self.blockchain.height)
             logger.info(
                 f"Proposed block #{block.header.block_number} with {len(txs)} txs "
                 f"(round {round_number})"

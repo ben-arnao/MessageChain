@@ -66,6 +66,7 @@ __all__ = [
     "SubmissionServer",
     "SubmissionResult",
     "submit_transaction_to_mempool",
+    "submit_custody_proof_to_pool",
 ]
 
 
@@ -222,6 +223,127 @@ def submit_transaction_to_mempool(
     return SubmissionResult(ok=True, tx_hash=tx.tx_hash, receipt=receipt)
 
 
+def submit_custody_proof_to_pool(
+    proof,
+    blockchain,
+    proof_pool,
+    *,
+    challenge_block_number: int | None = None,
+) -> SubmissionResult:
+    """Validate and inject a CustodyProof into the archive-proof mempool.
+
+    Mirrors `submit_transaction_to_mempool` in shape: a single ingress
+    helper reusable by HTTP, RPC, and gossip code paths so acceptance
+    semantics never drift across surfaces.
+
+    Steps (cheap-first to limit CPU burn on a flood):
+      1. Resolve the target challenge.  Callers that know the intended
+         challenge block number pass it explicitly; callers that don't
+         (e.g., a gossip relay) get it derived from the proof's
+         target_height via the chain's challenge schedule.
+      2. Reject if the submission window has closed.
+      3. Look up the target block locally.  Its block_hash is the
+         challenge's expected_block_hash — absent means the node is
+         out of sync; drop but do not ban.
+      4. Full verify_custody_proof (merkle + header rehash).
+      5. Insert into the pool keyed by (challenge, prover_id).
+
+    No prover signature in v1 (see archive_challenge module docstring).
+    """
+    from messagechain.config import (
+        ARCHIVE_CHALLENGE_INTERVAL,
+        is_archive_challenge_block,
+    )
+    from messagechain.consensus.archive_challenge import (
+        compute_challenge,
+        is_within_submission_window,
+        verify_custody_proof,
+    )
+    # Use a stable ID for the return value so callers can key on
+    # "did this proof land?".  Proof hash covers every binding field.
+    proof_id = getattr(proof, "tx_hash", b"")
+
+    # Resolve the challenge.  If the caller didn't supply one, pick
+    # the most-recent challenge whose target is proof.target_height.
+    current = blockchain.height - 1 if blockchain.height > 0 else 0
+    if challenge_block_number is None:
+        # Derive the most recent challenge block whose target could
+        # match.  We walk from `current` down by intervals until the
+        # computed target matches proof.target_height.  Bounded by
+        # ARCHIVE_SUBMISSION_WINDOW / ARCHIVE_CHALLENGE_INTERVAL — a
+        # handful of iterations at most.
+        from messagechain.config import ARCHIVE_SUBMISSION_WINDOW
+        challenge_block_number = None
+        max_lookback = ARCHIVE_SUBMISSION_WINDOW // max(ARCHIVE_CHALLENGE_INTERVAL, 1) + 2
+        h = (current // ARCHIVE_CHALLENGE_INTERVAL) * ARCHIVE_CHALLENGE_INTERVAL
+        for _ in range(max_lookback + 1):
+            if h <= 0 or not is_archive_challenge_block(h):
+                h -= ARCHIVE_CHALLENGE_INTERVAL
+                continue
+            parent = blockchain.get_block(h - 1)
+            if parent is None:
+                h -= ARCHIVE_CHALLENGE_INTERVAL
+                continue
+            ch = compute_challenge(parent.block_hash, h)
+            if ch.target_height == proof.target_height:
+                challenge_block_number = h
+                break
+            h -= ARCHIVE_CHALLENGE_INTERVAL
+        if challenge_block_number is None:
+            return SubmissionResult(
+                ok=False, tx_hash=proof_id,
+                error="no active challenge matches proof target_height",
+            )
+
+    if not is_archive_challenge_block(challenge_block_number):
+        return SubmissionResult(
+            ok=False, tx_hash=proof_id,
+            error="challenge_block_number is not a challenge height",
+        )
+    if not is_within_submission_window(challenge_block_number, current):
+        return SubmissionResult(
+            ok=False, tx_hash=proof_id,
+            error="submission window closed",
+        )
+
+    # Resolve the target block from local archive.
+    target_block = blockchain.get_block(proof.target_height)
+    if target_block is None:
+        return SubmissionResult(
+            ok=False, tx_hash=proof_id,
+            error="target block unknown locally",
+        )
+    expected_block_hash = target_block.block_hash
+    if proof.target_block_hash != expected_block_hash:
+        return SubmissionResult(
+            ok=False, tx_hash=proof_id,
+            error="proof target_block_hash does not match chain's block hash",
+        )
+
+    ok, reason = verify_custody_proof(
+        proof, expected_block_hash=expected_block_hash,
+    )
+    if not ok:
+        return SubmissionResult(ok=False, tx_hash=proof_id, error=reason)
+
+    # Idempotent: same proof re-submitted is a success.
+    key = (challenge_block_number, bytes(proof.prover_id))
+    if key in proof_pool:
+        return SubmissionResult(
+            ok=True, tx_hash=proof_id, duplicate=True,
+        )
+    added = proof_pool.add_proof(
+        proof, challenge_block_number=challenge_block_number,
+    )
+    if not added:
+        # Race: another thread added it between the contains-check
+        # and add_proof.  Still a success.
+        return SubmissionResult(
+            ok=True, tx_hash=proof_id, duplicate=True,
+        )
+    return SubmissionResult(ok=True, tx_hash=proof_id)
+
+
 class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
     """Per-request handler.
 
@@ -280,7 +402,12 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         ctx = self.server._submission_context
 
-        # Path gate — reject anything that isn't our single endpoint.
+        # Path gate — two supported endpoints, both write-only:
+        #   /v1/submit                — signed MessageTransaction
+        #   /v1/submit-custody-proof  — unsigned CustodyProof (v1)
+        if self.path == "/v1/submit-custody-proof":
+            self._handle_custody_proof_submit(ctx)
+            return
         if self.path != "/v1/submit":
             self._reject(404, "Not Found")
             return
@@ -362,6 +489,82 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             )
         self._ok(resp)
 
+    def _handle_custody_proof_submit(self, ctx):
+        """POST /v1/submit-custody-proof — accept a CustodyProof blob.
+
+        Same wire contract as /v1/submit: rate-limit, size gate, binary
+        body (proof.to_bytes()), 200 with a receipt-style JSON on
+        acceptance.  On success the proof lives in ctx.proof_pool and
+        the next challenge-block proposer will pick it up (FCFS, up to
+        ARCHIVE_PROOFS_PER_CHALLENGE).
+
+        No proof pool on the server means the endpoint is disabled —
+        a 404 keeps operators who don't want archive-proof ingress
+        from accidentally exposing an unused surface.
+
+        Optional `?challenge=<int>` query arg lets a client pin which
+        challenge the proof answers; otherwise the helper infers it
+        from proof.target_height.
+        """
+        if ctx.proof_pool is None:
+            self._reject(404, "Not Found")
+            return
+
+        if not ctx.rate_limit_check(self._client_ip()):
+            self._reject(429, "Too Many Requests")
+            return
+
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/octet-stream":
+            self._reject(415, "Unsupported Media Type — use application/octet-stream")
+            return
+
+        try:
+            declared_length = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            self._reject(400, "Invalid Content-Length")
+            return
+        if declared_length < 0 or declared_length > MAX_SUBMISSION_BODY_BYTES:
+            self._reject(413, f"Payload too large (max {MAX_SUBMISSION_BODY_BYTES} bytes)")
+            return
+
+        to_read = min(declared_length, MAX_SUBMISSION_BODY_BYTES)
+        try:
+            body = self.rfile.read(to_read)
+        except (ConnectionResetError, OSError):
+            return
+        if len(body) > MAX_SUBMISSION_BODY_BYTES:
+            self._reject(413, "Payload too large")
+            return
+
+        from messagechain.consensus.archive_challenge import CustodyProof
+        try:
+            proof = CustodyProof.from_bytes(body)
+        except Exception as e:
+            logger.debug(
+                "custody proof decode failed from %s: %s",
+                self._client_ip(), e,
+            )
+            self._reject(400, "Invalid custody proof encoding")
+            return
+
+        result = ctx.submit_proof(proof)
+        if not result.ok:
+            self._reject(400, f"Rejected: {result.error}")
+            return
+
+        if ctx.proof_relay_callback is not None and not result.duplicate:
+            try:
+                ctx.proof_relay_callback(proof)
+            except Exception:  # noqa: BLE001 — relay is best-effort
+                logger.exception("custody proof relay hook raised")
+
+        resp = (
+            b'{"ok":true,"proof_hash":"'
+            + result.tx_hash.hex().encode("ascii") + b'"}'
+        )
+        self._ok(resp)
+
 
 class _HandlerContext:
     """Shared state for all handlers on a single SubmissionServer.
@@ -377,11 +580,18 @@ class _HandlerContext:
         mempool,
         relay_callback: Optional[Callable[[MessageTransaction], None]],
         receipt_issuer: Optional[ReceiptIssuer] = None,
+        proof_pool=None,
+        proof_relay_callback=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
         self.relay_callback = relay_callback
         self.receipt_issuer = receipt_issuer
+        # Optional archive-proof mempool + gossip hook.  Operators who
+        # don't participate in archive rewards leave these None; the
+        # /v1/submit-custody-proof endpoint returns 404 in that case.
+        self.proof_pool = proof_pool
+        self.proof_relay_callback = proof_relay_callback
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
@@ -436,6 +646,14 @@ class _HandlerContext:
             receipt_issuer=self.receipt_issuer,
         )
 
+    def submit_proof(self, proof) -> SubmissionResult:
+        """Shared ingress for CustodyProof.  Returns SubmissionResult."""
+        if self.proof_pool is None:
+            return SubmissionResult(ok=False, error="proof pool not configured")
+        return submit_custody_proof_to_pool(
+            proof, self.blockchain, self.proof_pool,
+        )
+
 
 class _ThreadingHTTPSServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """HTTPS server with threaded request handling.
@@ -474,6 +692,8 @@ class SubmissionServer:
         bind: str = "0.0.0.0",
         relay_callback: Optional[Callable[[MessageTransaction], None]] = None,
         receipt_issuer: Optional[ReceiptIssuer] = None,
+        proof_pool=None,
+        proof_relay_callback=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -483,6 +703,8 @@ class SubmissionServer:
         self.bind = bind
         self.relay_callback = relay_callback
         self.receipt_issuer = receipt_issuer
+        self.proof_pool = proof_pool
+        self.proof_relay_callback = proof_relay_callback
         self._httpd: Optional[_ThreadingHTTPSServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -518,6 +740,8 @@ class SubmissionServer:
             mempool=self.mempool,
             relay_callback=self.relay_callback,
             receipt_issuer=self.receipt_issuer,
+            proof_pool=self.proof_pool,
+            proof_relay_callback=self.proof_relay_callback,
         )
         ssl_context = self._build_ssl_context()
         self._httpd.socket = ssl_context.wrap_socket(
