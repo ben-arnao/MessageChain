@@ -41,9 +41,13 @@ class TestNetworkNameSelector(unittest.TestCase):
         self.assertIsNotNone(match, "NETWORK_NAME default not found in config.py")
         self.assertEqual(
             match.group(1),
-            "testnet",
-            "NETWORK_NAME default must be 'testnet' — never 'mainnet' — "
-            "so a fresh clone can't accidentally trust a mainnet pin.",
+            "mainnet",
+            "NETWORK_NAME default must be 'mainnet' now that mainnet is "
+            "live (block 0 minted 2026-04-18).  Operators running the "
+            "live mainnet validator otherwise get the testnet pin, which "
+            "mismatches the real mainnet block 0 hash and breaks any "
+            "genesis-re-sync path.  Testnet/devnet deployments must set "
+            "NETWORK_NAME explicitly via config_local.py.",
         )
 
     def test_testnet_selector_returns_testnet_hash(self):

@@ -1394,6 +1394,19 @@ class Blockchain:
 
         if tx.timestamp <= 0:
             return False, "Transaction must have a valid timestamp"
+        # Upper bound: reject future-dated txs at the same threshold the
+        # block-pack path enforces.  Without this, a future-stamped tx
+        # in mempool lands with `now - tx.timestamp < 0`, so its TTL
+        # subtraction is negative and `expire_transactions` never evicts
+        # it — the slot is pinned forever until fee-based eviction.
+        import time as _time
+        from messagechain.config import MAX_TIMESTAMP_DRIFT
+        _now = int(_time.time())
+        if tx.timestamp > _now + MAX_TIMESTAMP_DRIFT:
+            return False, (
+                f"Transaction timestamp {tx.timestamp} is >{MAX_TIMESTAMP_DRIFT}s "
+                f"in the future (now={_now}) — reject future-dated tx"
+            )
 
         if self.get_spendable_balance(tx.entity_id) < tx.fee:
             return False, f"Insufficient spendable balance for fee of {tx.fee}"
@@ -1815,12 +1828,16 @@ class Blockchain:
         if escrow_burned > 0:
             # Reduce both balance (tokens were credited there at mint)
             # and total_supply (escrow-burn is a permanent destruction,
-            # same as stake-burn).
+            # same as stake-burn).  Also bump total_burned so the
+            # net-inflation invariant (total_supply == GENESIS_SUPPLY +
+            # total_minted - total_burned) holds.  Previously only
+            # total_supply moved, silently breaking the audit math.
             cur_balance = self.supply.balances.get(tx.evidence.offender_id, 0)
             self.supply.balances[tx.evidence.offender_id] = max(
                 0, cur_balance - escrow_burned,
             )
             self.supply.total_supply -= escrow_burned
+            self.supply.total_burned += escrow_burned
 
         slashed, finder_reward = self.supply.slash_validator(
             tx.evidence.offender_id, tx.submitter_id
@@ -5456,6 +5473,15 @@ class Blockchain:
         # _processed_evidence (also not cleared) stays consistent.
         self.reputation = {}
         self._immature_rewards = []
+        # Reset first-divestment stake reference.  This is NOT a security
+        # ratchet — it's the "stake at first observed divestment" anchor
+        # used to measure drain debt.  On a reorg that rolls past the
+        # first-divestment block, the anchor from the old fork is stale:
+        # replay will re-capture the correct canonical-chain anchor via
+        # the same first-write-wins logic that set it originally.  Not
+        # clearing it leaves the joiner permanently reading an orphaned
+        # reference and miscalculating debt.
+        self.seed_initial_stakes = {}
         # Reset the bootstrap ratchet — it will rebuild deterministically
         # as blocks replay via _update_bootstrap_ratchet.  Every node
         # replaying the same chain reaches the same ratchet peak.

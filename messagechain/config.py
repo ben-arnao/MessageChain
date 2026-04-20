@@ -227,7 +227,7 @@ GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstr
 #   2. Flip NETWORK_NAME to "mainnet".
 # Doing (2) without (1) raises at config load — a mainnet build cannot
 # silently fall back to the testnet hash.
-NETWORK_NAME = "testnet"  # "mainnet" | "testnet" | "devnet"
+NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.

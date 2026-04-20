@@ -418,8 +418,14 @@ class SupplyTracker:
         # Pay finder
         self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward
 
-        # Burn the rest — permanently removed from supply
+        # Burn the rest — permanently removed from supply.  Both totals
+        # must be updated so `get_supply_stats["net_inflation"]` stays
+        # consistent with the invariant `total_supply == GENESIS_SUPPLY
+        # + total_minted - total_burned`.  Previously only total_supply
+        # moved, silently breaking the invariant and inflating every
+        # "net inflation" auditor calculation on the chain.
         self.total_supply -= burned
+        self.total_burned += burned
 
         return slashed_amount, finder_reward
 
