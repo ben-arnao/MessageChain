@@ -215,13 +215,6 @@ class ChainDB:
                 processed_at_block INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS block_headers (
-                block_hash BLOB PRIMARY KEY,
-                block_number INTEGER NOT NULL,
-                header_data BLOB NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_headers_number ON block_headers(block_number);
-
             -- Entity-index registry (bloat reduction).  Bidirectional
             -- map entity_id <-> entity_index, assigned monotonically on
             -- registration.  Persistence lets a restart rehydrate the
@@ -450,73 +443,6 @@ class ChainDB:
             (start_height, end_height),
         )
         return [(row[0], bytes(row[1])) for row in cur.fetchall()]
-
-    # ── Block Pruning ────────────────────────────────────────────
-
-    def prune_block_to_header(self, block_number: int, state=None):
-        """Replace a full block with its header only.
-
-        Deletes the full block data and stores just the header in the
-        block_headers table. Storage reclamation for long-term
-        sustainability; the header keeps the chain continuous for
-        light clients and header-sync peers.
-
-        `state` is threaded through `Block.from_bytes` so a compact-
-        form block (varint entity indices on disk) can be decoded far
-        enough to extract the header blob.  The header itself is
-        state-independent and is stored as-is.
-        """
-        cur = self._conn.execute(
-            "SELECT data, block_hash FROM blocks WHERE block_number = ?",
-            (block_number,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return  # already pruned or doesn't exist
-
-        block_bytes = bytes(row[0])
-        block_hash = bytes(row[1])
-
-        # Decode the full block just to pull out the header blob.  Keeping
-        # the header in its binary encoding (rather than re-serializing to
-        # dict/JSON) preserves the size win pruning is supposed to deliver.
-        block = Block.from_bytes(block_bytes, state=state)
-        header_data = block.header.to_bytes()
-
-        self._conn.execute(
-            "INSERT OR REPLACE INTO block_headers (block_hash, block_number, header_data) VALUES (?, ?, ?)",
-            (block_hash, block_number, header_data),
-        )
-
-        self._conn.execute(
-            "DELETE FROM blocks WHERE block_number = ? AND block_hash = ?",
-            (block_number, block_hash),
-        )
-        self._conn.commit()
-
-    def has_block_header(self, block_number: int) -> bool:
-        """Check if a header-only record exists for a pruned block."""
-        cur = self._conn.execute(
-            "SELECT 1 FROM block_headers WHERE block_number = ?", (block_number,)
-        )
-        return cur.fetchone() is not None
-
-    def get_block_header(self, block_number: int) -> "BlockHeader | None":
-        """Get a stored BlockHeader by block number (for pruned blocks).
-
-        Returns the decoded BlockHeader object (None if no record).
-        Callers that need the old dict form can call `.serialize()` on
-        the returned header.
-        """
-        cur = self._conn.execute(
-            "SELECT header_data FROM block_headers WHERE block_number = ?",
-            (block_number,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        from messagechain.core.block import BlockHeader
-        return BlockHeader.from_bytes(bytes(row[0]))
 
     # ── Chain Tips ───────────────────────────────────────────────
 

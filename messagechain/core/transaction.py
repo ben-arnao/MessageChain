@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from messagechain.config import (
     HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
-    MESSAGE_DEFAULT_TTL, MESSAGE_MIN_TTL, MESSAGE_MAX_TTL,
     SIG_VERSION_CURRENT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
 )
@@ -38,7 +37,6 @@ class MessageTransaction:
     fee: int  # user-set fee (higher = more likely to be included in next block)
     signature: Signature
     version: int = 1  # transaction format version (enables future upgrades without hard forks)
-    ttl: int = 0  # message retention in blocks (0 = protocol default MESSAGE_DEFAULT_TTL)
     # compression_flag: 0 = raw, 1 = raw-deflate (zlib level 9, header/adler32 stripped).
     # Part of _signable_data — tx_hash commits to the canonical encoding.
     compression_flag: int = RAW_FLAG
@@ -81,18 +79,12 @@ class MessageTransaction:
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
-            + struct.pack(">I", self.effective_ttl)
         )
 
     @property
     def plaintext(self) -> bytes:
         """The user's original ASCII bytes, decoded from the canonical form."""
         return decode_payload(self.message, self.compression_flag)
-
-    @property
-    def effective_ttl(self) -> int:
-        """Resolve TTL: 0 means protocol default."""
-        return self.ttl if self.ttl > 0 else MESSAGE_DEFAULT_TTL
 
     def _compute_hash(self) -> bytes:
         return hashlib.new(HASH_ALGO, self._signable_data()).digest()
@@ -135,7 +127,6 @@ class MessageTransaction:
             "timestamp": self.timestamp,
             "nonce": self.nonce,
             "fee": self.fee,
-            "ttl": self.ttl,
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
@@ -153,7 +144,6 @@ class MessageTransaction:
             f64  timestamp (seconds, float)
             u64  nonce
             u64  fee
-            u32  ttl
             u32  signature_blob_len
             M    signature_blob (Signature.to_bytes)
             32   tx_hash
@@ -193,7 +183,6 @@ class MessageTransaction:
             struct.pack(">d", float(self.timestamp)),
             struct.pack(">Q", self.nonce),
             struct.pack(">Q", self.fee),
-            struct.pack(">I", self.ttl),
             struct.pack(">I", len(sig_blob)),
             sig_blob,
             self.tx_hash,
@@ -231,12 +220,11 @@ class MessageTransaction:
         if offset + msg_len > len(data):
             raise ValueError("MessageTransaction message truncated")
         message = bytes(data[offset:offset + msg_len]); offset += msg_len
-        if offset + 8 + 8 + 8 + 4 + 4 > len(data):
+        if offset + 8 + 8 + 8 + 4 > len(data):
             raise ValueError("MessageTransaction blob truncated at fixed fields")
         timestamp = struct.unpack_from(">d", data, offset)[0]; offset += 8
         nonce = struct.unpack_from(">Q", data, offset)[0]; offset += 8
         fee = struct.unpack_from(">Q", data, offset)[0]; offset += 8
-        ttl = struct.unpack_from(">I", data, offset)[0]; offset += 4
         sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
         if offset + sig_len > len(data):
             raise ValueError("MessageTransaction signature truncated")
@@ -255,7 +243,6 @@ class MessageTransaction:
             fee=fee,
             signature=sig,
             version=version,
-            ttl=ttl,
             compression_flag=compression_flag,
         )
         # Recompute hash and verify integrity — never trust declared hashes
@@ -301,7 +288,6 @@ class MessageTransaction:
             fee=data["fee"],
             signature=sig,
             version=data.get("version", 1),
-            ttl=data.get("ttl", 0),
             compression_flag=flag,
         )
         # Recompute hash and verify integrity — never trust declared hashes
@@ -340,37 +326,19 @@ def _validate_message(message: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def _validate_ttl(ttl: int) -> tuple[bool, str]:
-    """Check TTL is within protocol bounds (0 means default)."""
-    if ttl == 0:
-        return True, "OK"  # 0 = use protocol default
-    if ttl < MESSAGE_MIN_TTL:
-        return False, f"TTL {ttl} below minimum {MESSAGE_MIN_TTL}"
-    if ttl > MESSAGE_MAX_TTL:
-        return False, f"TTL {ttl} exceeds maximum {MESSAGE_MAX_TTL}"
-    return True, "OK"
-
-
 def create_transaction(
     entity: Entity,
     message: str,
     fee: int,
     nonce: int,
-    ttl: int = 0,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
 
     The fee is set by the user — higher fee means higher priority for
     block inclusion (BTC-style fee bidding).
-
-    TTL sets message retention in blocks (0 = protocol default).
     """
     valid, reason = _validate_message(message)
-    if not valid:
-        raise ValueError(reason)
-
-    valid, reason = _validate_ttl(ttl)
     if not valid:
         raise ValueError(reason)
 
@@ -398,7 +366,6 @@ def create_transaction(
         nonce=nonce,
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
-        ttl=ttl,
         compression_flag=flag,
     )
 
@@ -441,10 +408,6 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
         return False
     # Fee applies to stored size
     if tx.fee < calculate_min_fee(tx.message):
-        return False
-    # Validate TTL bounds
-    valid, _ = _validate_ttl(tx.ttl)
-    if not valid:
         return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
