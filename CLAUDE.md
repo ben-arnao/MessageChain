@@ -3,8 +3,13 @@
 ## Principles (in order of priority)
 
 1. **Security** — The most important principle of this project. Never compromise on it.
-2. **Simplicity** — Keep things simple and straightforward.
-3. **Long-term thinking** — Design for durability on the scale of 100 to 1000+ years into the future.
+2. **Message permanence & censorship resistance** — Every message included on-chain lasts forever. No pruning, no deletion, no expiration, no TTL on message content. No blocklists, no content-based admission rules, no discretionary suppression. If it's on-chain, it's there forever and no one can take it down.
+3. **Simplicity** — Keep things simple and straightforward.
+4. **Long-term thinking** — Design for durability on the scale of 100 to 1000+ years into the future.
+
+## High-Priority Concerns
+
+- **Minimize chain bloat & maximize storage efficiency.** Because every message is permanent, bloat is fought only through protocol-level levers: fees (ideally superlinear in size), strict size caps, canonical compression, witness/signature separation, and similar storage optimizations. Never fight bloat via pruning, TTLs, or deletion of ledger content.
 
 ## Design Trade-offs
 
