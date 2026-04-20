@@ -446,6 +446,20 @@ class Blockchain:
         if self.chain:
             self._record_stake_snapshot(self.chain[-1].header.block_number)
 
+        # Rehydrate seed_entity_ids from block 0.  This set is consensus-
+        # visible (attester committee tilt, reputation-lottery exclusion,
+        # seed-divestment schedule) but was not previously persisted —
+        # a restart would reset it to frozenset() and silently change
+        # committee weights / lottery eligibility compared to a node
+        # that never restarted.  Re-deriving from block 0 is safe: the
+        # current protocol enforces exactly one seed (bootstrap.py line
+        # `if len(seed_entity_ids) != 1`), and that seed is by
+        # construction the proposer of block 0.
+        if self.chain:
+            genesis_proposer = self.chain[0].header.proposer_id
+            if genesis_proposer and genesis_proposer != b"\x00" * 32:
+                self.seed_entity_ids = frozenset({genesis_proposer})
+
         # Rebuild the incremental state tree from the loaded dicts so
         # that subsequent compute_current_state_root calls return the
         # right commitment without a full rebuild on every block.
@@ -4830,6 +4844,19 @@ class Blockchain:
             return False, "Block 0 signature is invalid under derived pubkey"
 
         founder_eid = block.header.proposer_id
+        # Defense in depth: the pinned block-0 hash already authenticates
+        # the chain, but also cross-check that the founder's entity_id
+        # matches a hardcoded mainnet pin.  This traps any future edit
+        # to _MAINNET_GENESIS_HASH that forgets to update the allocation
+        # constants, and limits the attack surface of the synced-
+        # reconstruction path to a single cryptographically-pinned
+        # identity.
+        expected_eid = getattr(_cfg, "_MAINNET_FOUNDER_ENTITY_ID", None)
+        if expected_eid is not None and founder_eid != expected_eid:
+            return False, (
+                "Block 0 proposer_id does not match pinned "
+                "_MAINNET_FOUNDER_ENTITY_ID — config drift or malicious peer"
+            )
         tree_height = len(sig.auth_path)
 
         # ── initialize_genesis-equivalent mutations ───────────────────
@@ -4884,8 +4911,18 @@ class Blockchain:
         #
         # The net effect is just the stake.  authority_keys stays empty
         # (the fallback in get_authority_key makes this transparent).
+        # Cannot fail: we just credited founder_eid with TOTAL (100M) and
+        # STAKE (95M) is strictly less.  A failure here means a config
+        # invariant is violated AND we have already mutated self.chain /
+        # public_keys / balances — leaving state half-built.  Raise
+        # rather than return False so the node halts loudly instead of
+        # silently corrupting.
         if not self.supply.stake(founder_eid, _cfg._MAINNET_FOUNDER_STAKE):
-            return False, "Canonical stake application failed — supply.stake rejected"
+            raise RuntimeError(
+                "BUG: _apply_mainnet_genesis_state stake step failed "
+                "despite canonical TOTAL >= STAKE invariant — refusing "
+                "to continue with half-built genesis state"
+            )
 
         # Rebuild the state tree so compute_current_state_root reflects
         # the fully-populated post-bootstrap state.
@@ -4896,6 +4933,12 @@ class Blockchain:
             self.db.store_block(block, state=self)
             self.db.add_chain_tip(block.block_hash, 0, 0)
             self._persist_state()
+
+        # Drain any orphans that were waiting on block 0.  During IBD,
+        # val-2 often receives block 1+ before block 0 and they land in
+        # the orphan pool (add_block orphan branch); without this drain
+        # the node stalls until a peer happens to resend them.
+        self._process_orphans(block.block_hash)
 
         return True, "Genesis block reconstructed from block 0 alone"
 
@@ -4954,6 +4997,8 @@ class Blockchain:
             if self.db is not None:
                 self.db.store_block(block, state=self)
                 self.db.add_chain_tip(block.block_hash, 0, 0)
+            # Drain orphans waiting on block 0 — see _apply_mainnet_genesis_state.
+            self._process_orphans(block.block_hash)
             return True, "Genesis block added"
 
         # Check if we already have this block

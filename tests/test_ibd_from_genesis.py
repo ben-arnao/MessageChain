@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import unittest
 
+import messagechain.config as _cfg
 from messagechain.config import (
     _MAINNET_FOUNDER_LIQUID,
     _MAINNET_FOUNDER_STAKE,
@@ -36,7 +37,24 @@ from messagechain.crypto.keys import compute_root_from_signature
 from messagechain.identity.identity import Entity, derive_entity_id
 
 
-class TestIBDFromGenesisReconstruction(unittest.TestCase):
+class _PinOverrideMixin:
+    """Redirects `_MAINNET_FOUNDER_ENTITY_ID` to the test founder's
+    entity_id so the defense-in-depth pin check passes for test
+    fixtures that use ephemeral keys (we don't have the real mainnet
+    founder's private key at test time)."""
+    _saved_pin: object = object()
+
+    @classmethod
+    def _install_pin(cls, eid: bytes):
+        cls._saved_pin = _cfg._MAINNET_FOUNDER_ENTITY_ID
+        _cfg._MAINNET_FOUNDER_ENTITY_ID = eid
+
+    @classmethod
+    def _restore_pin(cls):
+        _cfg._MAINNET_FOUNDER_ENTITY_ID = cls._saved_pin
+
+
+class TestIBDFromGenesisReconstruction(_PinOverrideMixin, unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -47,6 +65,11 @@ class TestIBDFromGenesisReconstruction(unittest.TestCase):
             tree_height=cls.tree_height,
         )
         cls.founder_eid = cls.founder.entity_id
+        cls._install_pin(cls.founder_eid)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._restore_pin()
 
     def _build_founder_chain(self):
         """Replicate launch_single_validator.py exactly, in-memory."""
@@ -198,6 +221,131 @@ class TestIBDFromGenesisReconstruction(unittest.TestCase):
         ok, reason = chain._apply_mainnet_genesis_state(bad_block)
         self.assertFalse(ok)
         self.assertIn("proposer_id", reason)
+
+
+class TestIBDOrphanDrain(_PinOverrideMixin, unittest.TestCase):
+    """Val-2 during IBD often receives block 1+ before block 0.  Those
+    land in the orphan pool; after block 0 arrives the orphans must be
+    re-examined automatically, not left stranded until a peer happens
+    to resend them.
+    """
+
+    def test_orphan_drained_after_synced_genesis(self):
+        from messagechain.core.blockchain import Blockchain
+        from messagechain.identity.identity import Entity
+
+        founder = Entity.create(
+            private_key=b"orphan-drain-test-founder-key!!!" * 1,
+            tree_height=4,
+        )
+        self._install_pin(founder.entity_id)
+        self.addCleanup(self._restore_pin)
+        founder_chain = Blockchain(db=None)
+        allocation = {
+            founder.entity_id: _MAINNET_FOUNDER_TOTAL,
+            TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
+        }
+        block0 = founder_chain.initialize_genesis(founder, allocation)
+        ok, _ = bootstrap_seed_local(
+            founder_chain, founder,
+            cold_authority_pubkey=founder.public_key,
+            stake_amount=_MAINNET_FOUNDER_STAKE,
+        )
+        self.assertTrue(ok)
+
+        # Val-2 joiner: receives a NON-zero block first (land as orphan),
+        # then receives block 0 and should drain the orphan.
+        joiner = Blockchain(db=None)
+        # Give joiner a fake "future" block with prev_hash=block0.hash.
+        # add_block's empty-chain guard stores it in the orphan pool.
+        # We don't need it to be *valid* block 1 — the orphan pool is a
+        # structure-only cache, and _process_orphans will attempt to
+        # apply it but benignly fail (not panic) when the block doesn't
+        # validate.  What we verify is the DRAIN ATTEMPT happened.
+        import copy
+        fake_block1 = copy.deepcopy(block0)
+        fake_block1.header.block_number = 1
+        fake_block1.header.prev_hash = block0.block_hash
+        fake_block1.block_hash = fake_block1._compute_hash()
+        # Step 1: submit "block 1" first — chain is empty, stored as orphan.
+        joiner.add_block(fake_block1)
+        self.assertIn(fake_block1.block_hash, joiner.orphan_pool,
+                      "fake block-1 should be orphaned on empty chain")
+        # Step 2: submit block 0 via synced-reconstruction path.
+        ok, _ = joiner._apply_mainnet_genesis_state(block0)
+        self.assertTrue(ok)
+        # The orphan should have been examined (drained out of the pool).
+        # The fake block is malformed so it won't actually be appended,
+        # but _process_orphans should have removed it.  Structure-valid
+        # orphans would be applied in the same pass.
+        self.assertNotIn(fake_block1.block_hash, joiner.orphan_pool,
+                         "orphan pool should be drained after block 0 "
+                         "applied — _process_orphans must run")
+
+
+class TestSeedEntityIdsRehydration(unittest.TestCase):
+    """seed_entity_ids is consensus-visible (attester committee tilt,
+    reputation-lottery exclusion) but was never persisted.  _load_from_db
+    now re-derives it from block 0's proposer_id."""
+
+    def test_load_from_db_restores_seed_entity_ids(self):
+        import tempfile, os
+        from messagechain.core.blockchain import Blockchain
+        from messagechain.storage.chaindb import ChainDB
+        from messagechain.identity.identity import Entity
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "chain.db")
+            founder = Entity.create(
+                private_key=b"seed-rehydration-test-founder-ky" * 1,
+                tree_height=4,
+            )
+            db1 = ChainDB(db_path)
+            chain1 = Blockchain(db=db1)
+            allocation = {
+                founder.entity_id: _MAINNET_FOUNDER_TOTAL,
+                TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
+            }
+            chain1.initialize_genesis(founder, allocation)
+            bootstrap_seed_local(
+                chain1, founder,
+                cold_authority_pubkey=founder.public_key,
+                stake_amount=_MAINNET_FOUNDER_STAKE,
+            )
+            chain1._persist_state()
+            self.assertEqual(chain1.seed_entity_ids,
+                             frozenset({founder.entity_id}))
+            db1.close()
+
+            # Reload from disk — seed_entity_ids must survive.
+            db2 = ChainDB(db_path)
+            chain2 = Blockchain(db=db2)
+            self.assertEqual(chain2.seed_entity_ids,
+                             frozenset({founder.entity_id}),
+                             "seed_entity_ids must be re-derived from "
+                             "block 0 on restart — empty set changes "
+                             "committee weights and breaks consensus")
+            db2.close()
+
+
+class TestMainnetFounderConstants(unittest.TestCase):
+    """Config-load sanity checks: the canonical mainnet allocation must
+    be internally consistent.  If these raise at import time, a joining
+    node crashes loudly at config load instead of silently IBD'ing into
+    a bad state."""
+
+    def test_constants_fit_in_supply(self):
+        from messagechain.config import (
+            _MAINNET_FOUNDER_TOTAL, TREASURY_ALLOCATION, GENESIS_SUPPLY,
+        )
+        self.assertLessEqual(
+            _MAINNET_FOUNDER_TOTAL + TREASURY_ALLOCATION, GENESIS_SUPPLY,
+        )
+
+    def test_founder_entity_id_pin_length(self):
+        from messagechain.config import _MAINNET_FOUNDER_ENTITY_ID
+        self.assertIsNotNone(_MAINNET_FOUNDER_ENTITY_ID)
+        self.assertEqual(len(_MAINNET_FOUNDER_ENTITY_ID), 32)
 
 
 if __name__ == "__main__":

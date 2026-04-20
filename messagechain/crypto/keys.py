@@ -634,6 +634,13 @@ def compute_root_from_signature(signature: "Signature") -> bytes | None:
             return None
     if not isinstance(signature.leaf_index, int) or signature.leaf_index < 0:
         return None
+    # leaf_index must be within the tree described by auth_path length.
+    # Without this check, a crafted leaf_index past 2**tree_height walks
+    # past the tree and produces a meaningless root.  verify_signature
+    # enforces this, but compute_root_from_signature may be used without
+    # a subsequent verify (e.g., state reconstruction) so we harden here.
+    if signature.leaf_index >= (1 << len(signature.auth_path)):
+        return None
     current = bytes(signature.wots_public_key)
     idx = signature.leaf_index
     for sibling in signature.auth_path:

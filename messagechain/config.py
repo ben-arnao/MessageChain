@@ -312,6 +312,31 @@ _MAINNET_FOUNDER_LIQUID = 5_000_000
 _MAINNET_FOUNDER_STAKE = 95_000_000
 _MAINNET_FOUNDER_TOTAL = _MAINNET_FOUNDER_LIQUID + _MAINNET_FOUNDER_STAKE
 
+# Pinned founder entity_id (= derive_entity_id(founder_pubkey)).  Cross-
+# checked against block 0's proposer_id in _apply_mainnet_genesis_state
+# as defense-in-depth: the PINNED_GENESIS_HASH already authenticates the
+# chain via collision resistance, but pinning the identity separately
+# traps any future edit to _MAINNET_GENESIS_HASH that forgets to update
+# the allocation constants (which are identity-dependent via block-1
+# state_root).  If this is None, the cross-check is skipped (testnet).
+_MAINNET_FOUNDER_ENTITY_ID: bytes | None = bytes.fromhex(
+    "7a72f1ec1ff9df12318043c91a444daecf7b82731c072371479fba371d6b930e"
+)
+
+# Load-time sanity check: the canonical mainnet allocation must fit
+# inside GENESIS_SUPPLY alongside the treasury.  Catches a typo at
+# import, not at first IBD attempt.  _MAINNET_FOUNDER_STAKE must also
+# meet VALIDATOR_MIN_STAKE (checked below once that constant is defined).
+assert _MAINNET_FOUNDER_LIQUID > 0, "mainnet founder liquid must be positive"
+assert _MAINNET_FOUNDER_STAKE > 0, "mainnet founder stake must be positive"
+assert _MAINNET_FOUNDER_TOTAL + TREASURY_ALLOCATION <= GENESIS_SUPPLY, (
+    "mainnet founder + treasury allocation exceeds GENESIS_SUPPLY"
+)
+if _MAINNET_FOUNDER_ENTITY_ID is not None:
+    assert len(_MAINNET_FOUNDER_ENTITY_ID) == 32, (
+        "_MAINNET_FOUNDER_ENTITY_ID must be a 32-byte SHA3-256 digest"
+    )
+
 BLOCK_REWARD = 16  # new tokens minted per block (split between proposer + attestors)
 if (BLOCK_REWARD & (BLOCK_REWARD - 1)) != 0:
     raise ValueError("BLOCK_REWARD must be a power of 2 for clean halvings")
@@ -429,6 +454,9 @@ LEAF_INDEX_FILENAME = "leaf_index.json"
 # Consensus — flat minimum stake from block 0.
 # 100 tokens required to register as a validator at any block height.
 VALIDATOR_MIN_STAKE = 100
+assert _MAINNET_FOUNDER_STAKE >= VALIDATOR_MIN_STAKE, (
+    "mainnet founder stake must meet VALIDATOR_MIN_STAKE"
+)
 CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fraction)
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
 MIN_TOTAL_STAKE = 1000  # minimum total stake to prevent bootstrap re-entry
