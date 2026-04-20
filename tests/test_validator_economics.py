@@ -79,17 +79,20 @@ class TestAttestationRewards(unittest.TestCase):
         """Proposer share must be < 100% (leaving room for attestors)."""
         self.assertLess(PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR)
 
-    def test_no_committee_proposer_gets_capped_reward(self):
-        """When no committee is supplied, proposer gets reward up to cap."""
-        from messagechain.config import PROPOSER_REWARD_CAP
+    def test_no_committee_proposer_gets_full_reward(self):
+        """No committee → proposer gets full reward.  Cap exists only
+        to protect a multi-validator committee from mega-staker capture;
+        with no committee there is no capture to guard against.  Any
+        excess used to flow to the treasury, which was unintended
+        governance-fund inflation."""
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         reward = tracker.calculate_block_reward(1)
         distributed = tracker.mint_block_reward(proposer, 1, attester_committee=[])
-        expected = min(reward, PROPOSER_REWARD_CAP)
-        self.assertEqual(distributed["proposer_reward"], expected)
+        self.assertEqual(distributed["proposer_reward"], reward)
         self.assertEqual(distributed["total_attestor_reward"], 0)
-        self.assertEqual(tracker.get_balance(proposer), expected)
+        self.assertEqual(distributed["treasury_excess"], 0)
+        self.assertEqual(tracker.get_balance(proposer), reward)
 
     def test_reward_split_with_committee(self):
         """Proposer gets 1/4; each committee slot pays 1 token."""
@@ -130,8 +133,13 @@ class TestAttestationRewards(unittest.TestCase):
         self.assertEqual(tracker.get_balance(att_big), ATTESTER_REWARD_PER_SLOT)
         self.assertEqual(tracker.get_balance(att_small), ATTESTER_REWARD_PER_SLOT)
 
-    def test_total_minted_equals_reward(self):
-        """Total tokens distributed = block reward (no tokens created or lost)."""
+    def test_total_minted_equals_paid_plus_burned(self):
+        """Reward = proposer_share + attester_pool_paid + burned.
+
+        Conservation under the new burn-not-treasury policy: whatever
+        isn't paid to an active validator is BURNED (supply reduction),
+        not credited to the treasury.
+        """
         from messagechain.config import TREASURY_ENTITY_ID
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
@@ -139,43 +147,49 @@ class TestAttestationRewards(unittest.TestCase):
         att_b = b"\x03" * 32
 
         initial_supply = tracker.total_supply
+        initial_burned = tracker.total_burned
         reward = tracker.calculate_block_reward(1)
-        tracker.mint_block_reward(
+        result = tracker.mint_block_reward(
             proposer, 1, attester_committee=[att_a, att_b],
         )
 
-        # Supply increased by exactly the reward.
-        self.assertEqual(tracker.total_supply, initial_supply + reward)
-        # All minted tokens accounted for across validators + treasury.
-        total_distributed = (
+        # Proposer + attesters + burned == reward.
+        burned = result["burned"]
+        total_paid = (
             tracker.get_balance(proposer)
             + tracker.get_balance(att_a)
             + tracker.get_balance(att_b)
-            + tracker.get_balance(TREASURY_ENTITY_ID)
         )
-        self.assertEqual(total_distributed, reward)
+        self.assertEqual(total_paid + burned, reward)
+        # Supply netted by: +reward (mint) - burned (cap/unfilled overflow).
+        self.assertEqual(tracker.total_supply, initial_supply + reward - burned)
+        self.assertEqual(tracker.total_burned, initial_burned + burned)
+        # Treasury untouched by the reward pipeline.
+        self.assertEqual(tracker.get_balance(TREASURY_ENTITY_ID), 0)
 
     def test_proposer_on_committee_is_capped(self):
-        """Proposer-share + committee-slot combined respects the cap."""
+        """Proposer-share + committee-slot combined respects the cap.
+        Cap overflow now BURNS (previously went to treasury)."""
         from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
         tracker = SupplyTracker()
         proposer = b"\x01" * 32
         other = b"\x02" * 32
 
         reward = tracker.calculate_block_reward(1)
-        tracker.mint_block_reward(
+        result = tracker.mint_block_reward(
             proposer, 1, attester_committee=[proposer, other],
         )
 
         proposer_balance = tracker.get_balance(proposer)
         other_balance = tracker.get_balance(other)
         treasury_balance = tracker.get_balance(TREASURY_ENTITY_ID)
+        burned = result["burned"]
         self.assertLessEqual(proposer_balance, PROPOSER_REWARD_CAP)
         self.assertGreater(other_balance, 0)
-        # Nothing is created or destroyed.
-        self.assertEqual(
-            proposer_balance + other_balance + treasury_balance, reward,
-        )
+        # Treasury stays empty — no auto-crediting from reward flow.
+        self.assertEqual(treasury_balance, 0)
+        # Conservation: paid + burned == reward.
+        self.assertEqual(proposer_balance + other_balance + burned, reward)
 
 
 class TestBaseFee(unittest.TestCase):

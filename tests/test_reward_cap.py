@@ -55,22 +55,25 @@ class TestRewardCap(unittest.TestCase):
         )
         self.assertLessEqual(total_proposer_earned, PROPOSER_REWARD_CAP)
 
-    def test_excess_goes_to_treasury_no_committee(self):
-        """Capped excess when there's no committee (pure proposer path)."""
+    def test_no_committee_proposer_gets_full_reward(self):
+        """No committee → no cap.  Treasury does not auto-earn.
+
+        Previously the cap applied here and siphoned BLOCK_REWARD -
+        PROPOSER_REWARD_CAP into the treasury every no-committee block
+        (every genesis / bootstrap / solo-validator block).  That was
+        unintended governance-fund inflation — the treasury should
+        grow only via explicit governance action.
+        """
         supply = SupplyTracker()
         proposer = b"p" * 32
         supply.balances[proposer] = 0
-        treasury_before = supply.balances.get(TREASURY_ENTITY_ID, 0)
 
         result = supply.mint_block_reward(proposer, block_height=0)
 
-        if BLOCK_REWARD > PROPOSER_REWARD_CAP:
-            treasury_after = supply.balances.get(TREASURY_ENTITY_ID, 0)
-            self.assertGreater(treasury_after, treasury_before)
-            self.assertEqual(result["proposer_reward"], PROPOSER_REWARD_CAP)
-            self.assertEqual(
-                result["treasury_excess"], BLOCK_REWARD - PROPOSER_REWARD_CAP,
-            )
+        self.assertEqual(result["proposer_reward"], BLOCK_REWARD)
+        self.assertEqual(result["treasury_excess"], 0)
+        self.assertEqual(supply.balances.get(TREASURY_ENTITY_ID, 0), 0)
+        self.assertEqual(supply.get_balance(proposer), BLOCK_REWARD)
 
     def test_cap_does_not_affect_committee_members(self):
         """Non-proposer committee members always get their 1-token slot."""

@@ -23,12 +23,14 @@ class TestInflation(unittest.TestCase):
     def test_block_reward_minting(self):
         reward = self.tracker.mint_block_reward(self.proposer_id, block_height=1)
         self.assertEqual(reward["total_reward"], BLOCK_REWARD)
+        # No attester committee → proposer absorbs the whole reward.
+        # Previously the cap applied here and siphoned excess into the
+        # treasury; that was unintended governance-fund inflation
+        # (treasury should only grow via explicit governance action).
+        # Supply net-grows by the full reward; treasury stays at zero.
         self.assertEqual(self.tracker.total_supply, GENESIS_SUPPLY + BLOCK_REWARD)
-        # Proposer gets capped amount, excess goes to treasury
-        self.assertEqual(self.tracker.get_balance(self.proposer_id), PROPOSER_REWARD_CAP)
-        treasury_excess = BLOCK_REWARD - PROPOSER_REWARD_CAP
-        if treasury_excess > 0:
-            self.assertEqual(self.tracker.get_balance(TREASURY_ENTITY_ID), treasury_excess)
+        self.assertEqual(self.tracker.get_balance(self.proposer_id), BLOCK_REWARD)
+        self.assertEqual(self.tracker.get_balance(TREASURY_ENTITY_ID), 0)
 
     def test_supply_increases_over_blocks(self):
         """Supply should increase with each block (inflation)."""

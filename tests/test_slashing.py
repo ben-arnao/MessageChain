@@ -367,16 +367,12 @@ class TestSlashTransaction(unittest.TestCase):
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         sim_staked[self.alice.entity_id] = 0
         sim_balances[slash_tx.submitter_id] = sim_balances.get(slash_tx.submitter_id, 0) + finder_reward
-        # Block reward to proposer (no attestors)
-        from messagechain.config import PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID
+        # Block reward to proposer (no attestors).  No cap applies
+        # when there's no committee — proposer absorbs the full reward.
+        # Previously the cap siphoned excess to the treasury; that auto-
+        # credit was removed so treasury grows only via governance.
         reward = self.chain.supply.calculate_block_reward(block_height)
-        is_bootstrap = not any(s > 0 for s in sim_staked.values())
-        effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
-        proposer_reward = min(reward, effective_cap)
-        treasury_excess = reward - proposer_reward
-        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
-        if treasury_excess > 0:
-            sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+        sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
         # State root now commits to authority fields too; pass them
         # through from the live chain (slashing doesn't mutate keys or
         # revoke state).  Leaf watermarks advance on EVERY signature the

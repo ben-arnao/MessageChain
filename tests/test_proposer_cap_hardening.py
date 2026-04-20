@@ -14,8 +14,9 @@ But the original implementation had a latent bug: if governance ever
 changed numerator/denominator/cap such that
 `proposer_share > effective_cap`, the code would silently over-mint
 tokens and violate conservation of supply.  These tests lock in the
-fix: `proposer_share` is trimmed to the cap, and the over-mint goes
-to the treasury.
+fix: `proposer_share` is trimmed to the cap, and the over-mint BURNS
+(previously flowed to treasury, which was unintended governance-fund
+inflation — treasury should grow only via explicit governance action).
 
 Invariant under test
 --------------------
@@ -23,11 +24,12 @@ For every scenario:
 
     delta_proposer_balance
   + sum(delta_other_attester_balances)
-  + delta_treasury_balance
+  + result["burned"]
   == block_reward_for_height
 
-(Supply tracker's `total_supply` must increase by exactly
-`block_reward_for_height` — no over-mint, no phantom burn.)
+Treasury balance is NEVER credited by the reward pipeline, so its
+delta is always zero here.  `total_supply` increases by exactly
+`reward - burned`.
 """
 
 import unittest
@@ -59,24 +61,23 @@ class TestProposerShareAloneExceedsCap(unittest.TestCase):
     """If governance ever sets proposer_share > cap, we must trim it."""
 
     def test_proposer_share_capped_when_exceeds_alone_no_committee(self):
-        """With share=8 and cap=3 and no committee, proposer gets exactly cap."""
+        """No committee → cap does NOT apply.  The cap exists to
+        protect a multi-validator committee from mega-staker capture;
+        with no committee the proposer IS all the work.  Proposer
+        receives the full reward regardless of the cap configuration.
+        """
         supply = SupplyTracker()
         proposer = b"p" * 32
         supply.balances[proposer] = 0
         supply.balances[TREASURY_ENTITY_ID] = 0
 
-        # Override: share = 16 * 1 / 2 = 8, cap = 3
-        # No committee → the "no committee" branch already handles this,
-        # but we test it explicitly for completeness.
         with _with_overrides(numerator=1, denominator=2, cap=3):
             result = supply.mint_block_reward(proposer, block_height=0)
 
-        self.assertEqual(result["proposer_reward"], 3)
-        self.assertEqual(supply.balances[proposer], 3)
-        self.assertEqual(
-            supply.balances[TREASURY_ENTITY_ID],
-            BLOCK_REWARD - 3,
-        )
+        self.assertEqual(result["proposer_reward"], BLOCK_REWARD)
+        self.assertEqual(supply.balances[proposer], BLOCK_REWARD)
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
+        self.assertEqual(result["burned"], 0)
 
     def test_proposer_share_capped_when_exceeds_alone_with_committee(self):
         """Share=4, cap=3, proposer in committee → proposer gets exactly 3."""
@@ -103,11 +104,13 @@ class TestProposerShareAloneExceedsCap(unittest.TestCase):
         self.assertEqual(result["attestor_rewards"].get(proposer, 0), 0)
         # Other attester still earns the flat slot.
         self.assertEqual(supply.balances[other], ATTESTER_REWARD_PER_SLOT)
-        # Conservation: proposer(3) + other(1) + treasury = 16.
+        # Treasury stays empty — overflow burns rather than credits it.
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
+        # Conservation: proposer(3) + other(1) + burned == reward.
         self.assertEqual(
             supply.balances[proposer]
             + supply.balances[other]
-            + supply.balances[TREASURY_ENTITY_ID],
+            + result["burned"],
             BLOCK_REWARD,
         )
 
@@ -136,12 +139,14 @@ class TestProposerShareAloneExceedsCap(unittest.TestCase):
         self.assertEqual(supply.balances[proposer], 3)
         self.assertEqual(supply.balances[a1], ATTESTER_REWARD_PER_SLOT)
         self.assertEqual(supply.balances[a2], ATTESTER_REWARD_PER_SLOT)
-        # Conservation.
+        # Treasury stays empty.
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
+        # Conservation: paid + burned == reward.
         self.assertEqual(
             supply.balances[proposer]
             + supply.balances[a1]
             + supply.balances[a2]
-            + supply.balances[TREASURY_ENTITY_ID],
+            + result["burned"],
             BLOCK_REWARD,
         )
 
@@ -188,26 +193,39 @@ class TestConservationUnderAllCapScenarios(unittest.TestCase):
             )
 
         reward = result["total_reward"]
-        # Supply increases by exactly the block reward.
-        self.assertEqual(supply.total_supply, supply_before + reward)
+        burned = result["burned"]
+        # Supply increases by exactly reward - burned.
+        self.assertEqual(supply.total_supply, supply_before + reward - burned)
 
-        # Sum of per-entity balance deltas == reward.
+        # Sum of per-entity balance deltas + burned == reward.
         delta_sum = sum(
             supply.balances.get(eid, 0) - balances_before[eid]
             for eid in [proposer, *others, TREASURY_ENTITY_ID]
         )
         self.assertEqual(
-            delta_sum, reward,
-            f"conservation violated: deltas={delta_sum}, reward={reward}, "
+            delta_sum + burned, reward,
+            f"conservation violated: deltas={delta_sum}, burned={burned}, "
+            f"reward={reward}, "
             f"config=(num={numerator}, den={denominator}, cap={cap})",
         )
-
-        # Proposer never gets more than the effective cap.
-        effective_cap = reward if bootstrap else cap
-        proposer_delta = (
-            supply.balances.get(proposer, 0) - balances_before[proposer]
+        # Treasury delta must be exactly zero — reward pipeline never
+        # auto-credits treasury.  Any governance-directed credit would
+        # arrive via a separate path (treasury-spend tx, seed divestment).
+        self.assertEqual(
+            supply.balances.get(TREASURY_ENTITY_ID, 0)
+            - balances_before[TREASURY_ENTITY_ID],
+            0,
+            "treasury received reward pipeline funds — regression",
         )
-        self.assertLessEqual(proposer_delta, effective_cap)
+
+        # Proposer never gets more than the effective cap WHEN a
+        # committee exists.  No-committee case: no cap applies.
+        if committee:
+            effective_cap = reward if bootstrap else cap
+            proposer_delta = (
+                supply.balances.get(proposer, 0) - balances_before[proposer]
+            )
+            self.assertLessEqual(proposer_delta, effective_cap)
 
     def test_conservation_no_cap_hit(self):
         """Default-ish config where share < cap and no cap trimming needed."""
@@ -285,16 +303,13 @@ class TestNoRegressionWithDefaultConstants(unittest.TestCase):
 
         result = supply.mint_block_reward(proposer, block_height=0)
 
-        # Default: proposer gets the cap (4), treasury gets the rest (12).
-        self.assertEqual(result["proposer_reward"], PROPOSER_REWARD_CAP)
-        self.assertEqual(
-            result["treasury_excess"], BLOCK_REWARD - PROPOSER_REWARD_CAP,
-        )
-        self.assertEqual(supply.balances[proposer], PROPOSER_REWARD_CAP)
-        self.assertEqual(
-            supply.balances[TREASURY_ENTITY_ID],
-            BLOCK_REWARD - PROPOSER_REWARD_CAP,
-        )
+        # No committee → no cap, proposer gets the full reward.
+        # Treasury stays empty; nothing burns.
+        self.assertEqual(result["proposer_reward"], BLOCK_REWARD)
+        self.assertEqual(result["treasury_excess"], 0)
+        self.assertEqual(result["burned"], 0)
+        self.assertEqual(supply.balances[proposer], BLOCK_REWARD)
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
 
     def test_with_committee_proposer_included_default(self):
         supply = SupplyTracker()
@@ -310,16 +325,17 @@ class TestNoRegressionWithDefaultConstants(unittest.TestCase):
             attester_committee=[proposer, other],
         )
 
-        # Default: share=4=cap. Proposer on committee triggers cap hit
+        # Default: share=4=cap.  Proposer on committee triggers cap hit
         # on slot clawback path: proposer_total = 4+1 = 5 > 4.
         # After clawback: share(4) == cap(4), no further trim.
-        # Net: proposer = 4, other = 1, treasury = 16 - 4 - 1 = 11.
+        # Net: proposer = 4, other = 1, burned = 11.
         self.assertEqual(supply.balances[proposer], PROPOSER_REWARD_CAP)
         self.assertEqual(supply.balances[other], ATTESTER_REWARD_PER_SLOT)
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
         self.assertEqual(
             supply.balances[proposer]
             + supply.balances[other]
-            + supply.balances[TREASURY_ENTITY_ID],
+            + result["burned"],
             BLOCK_REWARD,
         )
         self.assertEqual(result["attestor_rewards"].get(proposer, 0), 0)
@@ -338,19 +354,21 @@ class TestNoRegressionWithDefaultConstants(unittest.TestCase):
         supply.balances[a2] = 0
         supply.balances[TREASURY_ENTITY_ID] = 0
 
-        supply.mint_block_reward(
+        result = supply.mint_block_reward(
             proposer,
             block_height=0,
             attester_committee=[a1, a2],
         )
 
-        # share=4, cap=4, proposer not on committee → no cap hit.
-        # proposer gets 4, each attester gets 1, treasury = 16-4-2 = 10.
+        # share=4, cap=4, proposer not on committee → no cap hit on
+        # proposer's own earnings, but attester_pool has 12 tokens for
+        # only 2 filled slots → 10 unfilled-slot tokens burn.
         self.assertEqual(supply.balances[proposer], PROPOSER_REWARD_CAP)
         self.assertEqual(supply.balances[a1], ATTESTER_REWARD_PER_SLOT)
         self.assertEqual(supply.balances[a2], ATTESTER_REWARD_PER_SLOT)
+        self.assertEqual(supply.balances[TREASURY_ENTITY_ID], 0)
         self.assertEqual(
-            supply.balances[TREASURY_ENTITY_ID],
+            result["burned"],
             BLOCK_REWARD
             - PROPOSER_REWARD_CAP
             - 2 * ATTESTER_REWARD_PER_SLOT,

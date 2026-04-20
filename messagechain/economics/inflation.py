@@ -109,23 +109,26 @@ class SupplyTracker:
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         attester_pool = reward - proposer_share
 
-        # No committee: proposer absorbs the whole reward (capped).
+        # No committee: proposer absorbs the whole reward.  Previously
+        # the cap fired here and siphoned the difference into the
+        # treasury, which was surprising (treasury accumulated purely
+        # because no attesters existed yet — not because governance
+        # directed funds there).  The cap protects against a mega-
+        # staker capturing disproportionate reward in a MULTI-validator
+        # committee; with no committee the proposer IS all the work,
+        # so no cap applies.
         if not attester_committee:
-            proposer_reward = min(reward, effective_cap)
-            treasury_excess = reward - proposer_reward
+            proposer_reward = reward
             self.balances[proposer_id] = (
                 self.balances.get(proposer_id, 0) + proposer_reward
             )
-            if treasury_excess > 0:
-                self.balances[TREASURY_ENTITY_ID] = (
-                    self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
-                )
             return {
                 "total_reward": reward,
                 "proposer_reward": proposer_reward,
                 "total_attestor_reward": 0,
                 "attestor_rewards": {},
-                "treasury_excess": treasury_excess,
+                "treasury_excess": 0,
+                "burned": 0,
             }
 
         # Cap committee size at what the attester pool can pay for.
@@ -142,60 +145,53 @@ class SupplyTracker:
             )
             attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
 
-        # Unfilled slots (attester pool had more tokens than committee
-        # members to pay) flow to treasury — same pattern as the
-        # proposer-cap overflow so there is exactly one sink for
-        # "reward earmarked but not paid to a validator."
-        treasury_excess = attester_pool - attester_tokens_paid
+        # Unfilled slots + any cap overflow BURN — reduce total_supply
+        # rather than credit the treasury.  Rationale: the treasury is
+        # a governance-controlled pool; auto-crediting it without a
+        # vote is not how governance-spent funds should accumulate.
+        # Burning any "earmarked but unpaid" reward keeps the active-
+        # participation invariant intact: tokens in circulation were
+        # earned by a validator who did real work, the rest is
+        # deflationary.
+        burned = attester_pool - attester_tokens_paid
 
-        # Proposer-cap check: the proposer's combined earnings
-        # (proposer share + committee slot if they're on the committee)
-        # must not exceed effective_cap.  Two-step trim:
-        #   1. Claw back the committee-slot credit if it alone pushes
-        #      proposer over the cap (preferred — attester rewards are
-        #      smaller and trimming them first preserves the most of
-        #      the primary proposer_share).
-        #   2. If proposer_share *alone* still exceeds the cap (only
-        #      reachable if governance reconfigures numerator /
-        #      denominator / cap such that share > cap — unreachable
-        #      with default constants where share == cap), also trim
-        #      proposer_share down to the cap.
-        # All trimmed tokens flow to the treasury.  Conservation of
-        # supply: attesters_paid + proposer_credited + treasury ==
-        # reward, under every (share, slot, cap) combination.
+        # Proposer-cap check: in a multi-validator committee, the
+        # proposer's combined earnings (proposer share + committee
+        # slot if they're on it) must not exceed effective_cap.  This
+        # prevents a mega-staker from capturing disproportionate
+        # reward when they both propose AND sit on the committee.
+        # Trim attester credit first (smaller), then proposer share.
+        # Trimmed tokens BURN (previously flowed to treasury).
         proposer_att_reward = attestor_rewards.get(proposer_id, 0)
         proposer_total = proposer_share + proposer_att_reward
         if proposer_total > effective_cap:
-            # Step 1: claw back the attester credit (if any).
             self.balances[proposer_id] = (
                 self.balances.get(proposer_id, 0) - proposer_att_reward
             )
             attestor_rewards[proposer_id] = 0
-            # The clawed-back attester reward went to the proposer's
-            # balance via the committee loop above — redirect it to
-            # the treasury now.
-            treasury_excess += proposer_att_reward
+            burned += proposer_att_reward
             proposer_att_reward = 0
-            # Step 2: if proposer_share alone still exceeds cap, trim
-            # it and route the extra to treasury.
             if proposer_share > effective_cap:
-                treasury_excess += proposer_share - effective_cap
+                burned += proposer_share - effective_cap
                 proposer_share = effective_cap
 
         self.balances[proposer_id] = (
             self.balances.get(proposer_id, 0) + proposer_share
         )
-        if treasury_excess > 0:
-            self.balances[TREASURY_ENTITY_ID] = (
-                self.balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
-            )
+        if burned > 0:
+            # Supply-reduction: undo the mint for the unpaid portion.
+            # Both totals must move to keep the net-inflation invariant
+            # (total_supply == GENESIS_SUPPLY + total_minted - total_burned).
+            self.total_supply -= burned
+            self.total_burned += burned
 
         return {
             "total_reward": reward,
             "proposer_reward": proposer_share,
             "total_attestor_reward": attester_tokens_paid,
             "attestor_rewards": attestor_rewards,
-            "treasury_excess": treasury_excess,
+            "treasury_excess": 0,
+            "burned": burned,
         }
 
     def pay_fee(self, from_id: bytes, to_proposer_id: bytes, fee: int) -> bool:

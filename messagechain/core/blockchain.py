@@ -2368,34 +2368,35 @@ class Blockchain:
             for eid in attester_committee[:committee_size]:
                 sim_balances[eid] = sim_balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
                 attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
-            treasury_excess = attester_pool - attester_tokens_paid
 
-            # Proposer-cap check (matches mint_block_reward).
+            # Proposer-cap check (matches mint_block_reward).  Cap
+            # overflow BURNs now — previously this flowed to treasury
+            # which quietly accumulated rewards without a governance
+            # vote.  Burn is supply-reduction only; no sim_balances
+            # change needed beyond the cap-trim clawback below.
             proposer_att_reward = (
                 ATTESTER_REWARD_PER_SLOT if proposer_id in attester_committee else 0
             )
             proposer_total = proposer_share + proposer_att_reward
             if proposer_total > effective_cap:
-                overage = proposer_total - effective_cap
-                treasury_excess += overage
                 sim_balances[proposer_id] = (
                     sim_balances.get(proposer_id, 0) - proposer_att_reward
                 )
+                if proposer_share > effective_cap:
+                    proposer_share = effective_cap
 
             sim_balances[proposer_id] = (
                 sim_balances.get(proposer_id, 0) + proposer_share
             )
-            if treasury_excess > 0:
-                sim_balances[TREASURY_ENTITY_ID] = (
-                    sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
-                )
+            # Burn portion (unfilled slots + cap overflow) reduces
+            # total_supply — not represented in the per-entity state
+            # tree, so no sim_balances change.
         else:
-            # No attesters — proposer absorbs whole reward (capped).
-            proposer_reward = min(reward, effective_cap)
-            treasury_excess = reward - proposer_reward
-            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + proposer_reward
-            if treasury_excess > 0:
-                sim_balances[TREASURY_ENTITY_ID] = sim_balances.get(TREASURY_ENTITY_ID, 0) + treasury_excess
+            # No attesters — proposer absorbs whole reward.  No cap
+            # applies because the cap exists to protect a multi-
+            # validator committee from mega-staker capture; with no
+            # committee, proposer IS all the work.
+            sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
 
         # Simulate bootstrap lottery.  Must byte-mirror apply path —
         # at block_height % LOTTERY_INTERVAL == 0, compute the
@@ -4357,6 +4358,7 @@ class Blockchain:
                     0, cur_balance - escrow_burned,
                 )
                 self.supply.total_supply -= escrow_burned
+                self.supply.total_burned += escrow_burned
             self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
             self.slashed_validators.add(stx.evidence.offender_id)
             # Reputation reset: same policy as apply_slash_transaction;
