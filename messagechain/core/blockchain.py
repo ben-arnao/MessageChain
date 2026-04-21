@@ -1987,7 +1987,16 @@ class Blockchain:
         if tx.evidence.evidence_hash in self._processed_evidence:
             return False, "Evidence already submitted"
 
-        if self.supply.get_staked(tx.evidence.offender_id) == 0:
+        # Include pending_unstakes: an offender who races their own
+        # evidence by immediately unstaking would otherwise zero out
+        # `staked` and escape the slash, even though slash_validator()
+        # burns stake + unbonding.  Evidence stays valid for the full
+        # evidence_ttl window below, so the gating check has to match.
+        slashable = (
+            self.supply.get_staked(tx.evidence.offender_id)
+            + self.supply.get_pending_unstake(tx.evidence.offender_id)
+        )
+        if slashable == 0:
             return False, "Offender has no stake to slash"
 
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
