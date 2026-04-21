@@ -285,9 +285,19 @@ MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
 # At BLOCK_TIME_TARGET=600s, ~52,600 blocks/year.
-# Year 1: 16 tokens/block * 52,600 ≈ 841K minted against 1B supply ≈ 0.084%/year
+# GENESIS_SUPPLY is set to the sum of the canonical mainnet allocations
+# (founder 100M + treasury 40M = 140M) so that
+#     total_supply == sum(balances) + sum(staked)
+# holds at genesis by construction.  An earlier value of 1_000_000_000
+# left 860M phantom tokens (counted in total_supply but owned by nobody),
+# which inflated every "% of supply" denominator in the fee model,
+# governance thresholds, and analytics.  This is a correctness repair,
+# not a rule change — see test_genesis_supply_invariant.py.
+#
+# Year 1: 16 tokens/block * 52,600 ≈ 841.6K minted against 140M supply ≈ 0.60%/year
 # 2 meaningful halvings over ~8 years (16→8→4), then floor of 4 forever.
-GENESIS_SUPPLY = 1_000_000_000  # 1 billion initial supply
+# Perpetual floor: 4 tokens/block * 52,600 ≈ 210.4K/year against 140M ≈ 0.15%/year
+GENESIS_SUPPLY = 140_000_000  # 140 million — matches founder (100M) + treasury (40M)
 GENESIS_ALLOCATION = 10_000     # tokens allocated to genesis entity for bootstrapping
 
 # Canonical genesis block hash.  When set (bytes, length 32), nodes MUST NOT
@@ -368,7 +378,7 @@ DEVNET = NETWORK_NAME == "devnet"
 # Funds can only leave the treasury via approved governance proposals.
 import hashlib as _hashlib
 TREASURY_ENTITY_ID = _hashlib.new(HASH_ALGO, b"messagechain-treasury-v1").digest()
-TREASURY_ALLOCATION = 40_000_000  # 4% of genesis supply
+TREASURY_ALLOCATION = 40_000_000  # ~28.6% of genesis supply (40M / 140M)
 
 # Default genesis allocation table: genesis validator + treasury.
 # The genesis_entity's ID is filled in at chain init time.

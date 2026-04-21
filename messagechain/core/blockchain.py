@@ -414,6 +414,21 @@ class Blockchain:
         self.nonces = self.db.get_all_nonces()
         self.entity_message_count = self.db.get_all_message_counts()
 
+        # One-shot phantom-supply migration: legacy mainnet state has
+        # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
+        # and rebase to the corrected 140M value before populating the
+        # in-memory SupplyTracker, so the rest of this load path sees a
+        # clean invariant.  Idempotent; no-op on fresh / already-migrated
+        # chains.  See ChainDB.migrate_phantom_supply_if_needed.
+        if hasattr(self.db, "migrate_phantom_supply_if_needed"):
+            if self.db.migrate_phantom_supply_if_needed():
+                logger.warning(
+                    "Phantom-supply migration applied: rebased persisted "
+                    "total_supply from 1_000_000_000 to 140_000_000 to "
+                    "restore invariant total_supply == sum(balances) "
+                    "+ sum(staked) + net inflation."
+                )
+
         # Restore supply tracker
         self.supply.balances = self.db.get_all_balances()
         self.supply.staked = self.db.get_all_staked()
