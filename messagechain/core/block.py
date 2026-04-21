@@ -66,6 +66,43 @@ def _decode_optional_bundle(data: bytes, off: int):
     return bundle, off
 
 
+def _encode_optional_inclusion_list(lst) -> bytes:
+    """Wire encoding for Block.inclusion_list (optional scalar).
+
+    Same shape as _encode_optional_bundle: 1 byte presence flag, then
+    u32 length + canonical blob when present.  Hot path on blocks
+    without an inclusion list pays the single zero byte.
+    """
+    import struct as _struct
+    if lst is None:
+        return b"\x00"
+    blob = lst.to_bytes()
+    return b"\x01" + _struct.pack(">I", len(blob)) + blob
+
+
+def _decode_optional_inclusion_list(data: bytes, off: int):
+    """Inverse of _encode_optional_inclusion_list.  Returns (lst, new_off)."""
+    import struct as _struct
+    if off >= len(data):
+        raise ValueError("Block blob truncated at inclusion_list flag")
+    flag = data[off]; off += 1
+    if flag == 0:
+        return None, off
+    if flag != 1:
+        raise ValueError(
+            f"inclusion_list flag must be 0 or 1, got {flag}"
+        )
+    if off + 4 > len(data):
+        raise ValueError("Block blob truncated at inclusion_list length")
+    blob_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+    if off + blob_len > len(data):
+        raise ValueError("Block blob truncated at inclusion_list body")
+    from messagechain.consensus.inclusion_list import InclusionList
+    lst = InclusionList.from_bytes(bytes(data[off:off + blob_len]))
+    off += blob_len
+    return lst, off
+
+
 def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     """Compute Merkle root from a list of transaction hashes.
 
@@ -136,6 +173,10 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     cust_proofs  = list(getattr(block, "custody_proofs", []) or [])
     cens_txs     = list(getattr(block, "censorship_evidence_txs", []) or [])
     bogus_txs    = list(getattr(block, "bogus_rejection_evidence_txs", []) or [])
+    ilv_txs      = list(
+        getattr(block, "inclusion_list_violation_evidence_txs", []) or []
+    )
+    inclusion_list_obj = getattr(block, "inclusion_list", None)
 
     out: list[bytes] = []
     out.extend(tx.tx_hash for tx in msg_txs)
@@ -154,6 +195,18 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     out.extend(p.tx_hash for p in cust_proofs)
     out.extend(tx.tx_hash for tx in cens_txs)
     out.extend(tx.tx_hash for tx in bogus_txs)
+    # InclusionListViolationEvidenceTx commits via tx_hash.  Order
+    # follows the wire-format slot order — append-only, never reorder.
+    out.extend(tx.tx_hash for tx in ilv_txs)
+    # The InclusionList itself (the consensus-objective forced-inclusion
+    # commitment) commits via its list_hash.  At most one per block, so
+    # contribute exactly one hash on populated blocks and zero
+    # otherwise.  Folding it into the merkle_root means a byzantine
+    # relayer cannot strip or swap the list without invalidating the
+    # proposer's header signature — same hygiene as every other
+    # block-body type.
+    if inclusion_list_obj is not None:
+        out.append(inclusion_list_obj.list_hash)
 
     # Archive-proof bundle (aggregated custody commitment) — derived,
     # not read from the block's optional bundle slot, so the proposer
@@ -536,6 +589,23 @@ class Block:
     # the issuer if the rejection was bogus.  One-phase, no maturity
     # window — see messagechain.consensus.bogus_rejection_evidence.
     bogus_rejection_evidence_txs: list = field(default_factory=list)
+    # Inclusion-list violation evidence txs: first-class block slot.
+    # An entry carries the full InclusionList that mandated a tx + the
+    # omitted tx_hash + the accused proposer's height + entity_id.  At
+    # admission, the chain slashes the proposer
+    # INCLUSION_VIOLATION_SLASH_BPS of stake (burned, no finder reward)
+    # via process_inclusion_list_violation.  Double-slash defence via
+    # InclusionListProcessor.processed_violations.
+    # See messagechain.consensus.inclusion_list.
+    inclusion_list_violation_evidence_txs: list = field(default_factory=list)
+    # The InclusionList PUBLISHED at this height, applying forward to
+    # the next INCLUSION_LIST_WINDOW blocks.  At most one per block.
+    # None on the common path; populated only when the proposer has
+    # collected >= 2/3 of attester-stake's mempool reports for at least
+    # one tx_hash.  list_hash folds into merkle_root via
+    # canonical_block_tx_hashes so a relayer cannot strip or mutate the
+    # list in transit.  See messagechain.consensus.inclusion_list.
+    inclusion_list: object = None  # Optional[InclusionList]
     # Aggregated commitment to this epoch's archive-custody participants.
     # Auto-derived from custody_proofs when left as None on construction
     # (see __post_init__) so proposers and tests that only populate
@@ -610,6 +680,13 @@ class Block:
             result["bogus_rejection_evidence_txs"] = [
                 tx.serialize() for tx in self.bogus_rejection_evidence_txs
             ]
+        if self.inclusion_list_violation_evidence_txs:
+            result["inclusion_list_violation_evidence_txs"] = [
+                tx.serialize()
+                for tx in self.inclusion_list_violation_evidence_txs
+            ]
+        if self.inclusion_list is not None:
+            result["inclusion_list"] = self.inclusion_list.serialize()
         if self.archive_proof_bundle is not None:
             # Serialized as hex of canonical bytes — a scalar blob, not
             # a list; the bundle is a single aggregated commitment per
@@ -783,6 +860,17 @@ class Block:
             # consensus-format change; pre-bogus-rejection binaries
             # cannot decode blocks emitted with this slot populated.
             enc_list(self.bogus_rejection_evidence_txs),
+            # inclusion_list_violation_evidence_txs trails the bogus-
+            # rejection slot — newest tx type.  Empty list pays a
+            # single u32 zero.  Consensus-format change: pre-inclusion-
+            # list binaries cannot decode blocks emitted with this slot
+            # populated.
+            enc_list(self.inclusion_list_violation_evidence_txs),
+            # inclusion_list — optional scalar, hot-path empty case is
+            # one zero byte.  Trails the violation-evidence slot so the
+            # decoder reads tx lists before any optional scalars (a
+            # convention shared with archive_proof_bundle).
+            _encode_optional_inclusion_list(self.inclusion_list),
             # archive_proof_bundle is optional — 1 byte presence flag
             # then u32 length + blob when present.  Absent on blocks
             # without custody_proofs (the common case) so non-challenge
@@ -957,6 +1045,22 @@ class Block:
         )
         bogus_rejection_evidence_txs = dec_list(BogusRejectionEvidenceTx)
 
+        # Inclusion-list violation evidence txs — appended after the
+        # bogus-rejection slot.  Same hard-fork caveat: pre-inclusion-
+        # list binaries cannot decode blocks with this slot populated.
+        from messagechain.consensus.inclusion_list import (
+            InclusionListViolationEvidenceTx,
+        )
+        inclusion_list_violation_evidence_txs = dec_list(
+            InclusionListViolationEvidenceTx,
+        )
+
+        # Inclusion list — optional scalar, hot path on regular blocks
+        # is a single zero byte.  Decoded through the shared optional-
+        # inclusion-list helper.  Trails the violation-evidence slot so
+        # tx-list decoding completes before any optional scalars.
+        inclusion_list_obj, off = _decode_optional_inclusion_list(data, off)
+
         # Archive-proof bundle — optional scalar, hot path on non-
         # challenge blocks is a single zero byte.  Decoded through the
         # shared optional-bundle helper so the wire format is
@@ -981,6 +1085,10 @@ class Block:
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+            inclusion_list_violation_evidence_txs=(
+                inclusion_list_violation_evidence_txs
+            ),
+            inclusion_list=inclusion_list_obj,
             archive_proof_bundle=archive_proof_bundle,
         )
         expected_hash = block._compute_hash()
@@ -1056,6 +1164,19 @@ class Block:
                 BogusRejectionEvidenceTx.deserialize(e)
                 for e in data["bogus_rejection_evidence_txs"]
             ]
+        inclusion_list_violation_evidence_txs = []
+        if data.get("inclusion_list_violation_evidence_txs"):
+            from messagechain.consensus.inclusion_list import (
+                InclusionListViolationEvidenceTx,
+            )
+            inclusion_list_violation_evidence_txs = [
+                InclusionListViolationEvidenceTx.deserialize(e)
+                for e in data["inclusion_list_violation_evidence_txs"]
+            ]
+        inclusion_list_obj = None
+        if data.get("inclusion_list"):
+            from messagechain.consensus.inclusion_list import InclusionList
+            inclusion_list_obj = InclusionList.deserialize(data["inclusion_list"])
         archive_proof_bundle = None
         if data.get("archive_proof_bundle"):
             from messagechain.consensus.archive_challenge import (
@@ -1073,6 +1194,10 @@ class Block:
                     custody_proofs=custody_proofs,
                     censorship_evidence_txs=censorship_evidence_txs,
                     bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+                    inclusion_list_violation_evidence_txs=(
+                        inclusion_list_violation_evidence_txs
+                    ),
+                    inclusion_list=inclusion_list_obj,
                     archive_proof_bundle=archive_proof_bundle)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()

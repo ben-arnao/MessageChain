@@ -12,8 +12,9 @@ iteration lands the two remaining pieces:
       time; withheld tokens route into archive_reward_pool instead of
       being credited to the validator's balance.
 
-STATE_SNAPSHOT_VERSION bumps from 5 to 6 — pre-v6 binary blobs cannot
-decode because the new fields are strictly appended at the end.
+STATE_SNAPSHOT_VERSION bumps to 7 (v6 was taken by inclusion-list
+processor state) — pre-v7 binary blobs cannot decode because the new
+fields are strictly appended after the v6 inclusion-list sections.
 """
 
 from __future__ import annotations
@@ -104,7 +105,12 @@ def _minimal_snap(**overrides) -> dict:
         "censorship_processed": set(),
         "receipt_subtree_roots": {},
         "bogus_rejection_processed": set(),
-        # New v6 fields:
+        # v6 fields (added by inclusion-list; other test modules can
+        # exercise these, we just need them present so encode_snapshot
+        # doesn't KeyError):
+        "inclusion_list_active": {},
+        "inclusion_list_processed_violations": set(),
+        # New v7 fields (this iteration):
         "validator_archive_misses": {},
         "validator_first_active_block": {},
         "archive_active_snapshot": None,
@@ -119,10 +125,10 @@ def _minimal_snap(**overrides) -> dict:
 
 
 class TestVersionBump(unittest.TestCase):
-    def test_version_is_6(self):
-        """v6 is the wire format for this iteration — codifies the
-        three duty fields."""
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 6)
+    def test_version_is_7(self):
+        """v7 is the wire format for this iteration — codifies the
+        three duty fields (v6 was taken by inclusion-list)."""
+        self.assertEqual(STATE_SNAPSHOT_VERSION, 7)
 
 
 # ---------------------------------------------------------------------------

@@ -148,6 +148,21 @@ def compute_block_sig_cost(block) -> int:
         # Each bogus-rejection-evidence tx carries one submitter
         # signature + one rejection signature — cost both.
         + 2 * len(getattr(block, "bogus_rejection_evidence_txs", []))
+        # Each inclusion-list violation evidence tx carries ONE
+        # submitter signature.  The bundled InclusionList carries
+        # variable-many attester report sigs, but those are amortised
+        # via the inclusion_list field below — counting them again
+        # here would double-charge.
+        + len(getattr(block, "inclusion_list_violation_evidence_txs", []))
+        # Inclusion-list scalar slot: each attester report inside the
+        # quorum_attestation carries one signature.  Cap-bounded by
+        # MAX_INCLUSION_LIST_ENTRIES + the number of staked validators,
+        # so this stays within the existing per-block sig budget.
+        + (
+            len(block.inclusion_list.quorum_attestation)
+            if getattr(block, "inclusion_list", None) is not None
+            else 0
+        )
     )
 
 
@@ -193,6 +208,18 @@ class Blockchain:
         # In-memory rotation cooldown tracking (iter 6 H2).  See comment
         # at the _reset_state twin-init below for the rationale.
         self.key_rotation_last_height: dict[bytes, int] = {}
+        # R6-A: Historical public-key record per entity.  Maps
+        # entity_id -> [(installed_at_height, public_key), ...] sorted
+        # ascending by install height.  Captured on first install
+        # (registration / first-spend / genesis / founder bootstrap) and
+        # every KeyRotation.  Consulted by slash verification to resolve
+        # the key that was ACTIVE at evidence_height — without this, an
+        # offender could equivocate at height N, rotate at N+1, and then
+        # silently defeat any slash tx (evidence signature fails to
+        # verify against the NEW current key).  Cheap: a handful of
+        # entries per validator, permanent retention simplifies the code
+        # path.
+        self.key_history: dict[bytes, list[tuple[int, bytes]]] = {}
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
         self.attestation_sig_counts: dict[bytes, int] = {}  # entity_id -> attestation signatures made
         self.slash_sig_counts: dict[bytes, int] = {}  # entity_id -> slash submission signatures made
@@ -409,6 +436,30 @@ class Blockchain:
         )
         self.bogus_rejection_processor: BogusRejectionProcessor = (
             BogusRejectionProcessor()
+        )
+
+        # Inclusion-list processor.  Tracks active forward windows for
+        # quorum-signed inclusion lists and the (tx_hash, proposer_id)
+        # set of violations already slashed (double-slash defence).
+        # Lifecycle:
+        #   - register(list, height) when a block carrying an
+        #     inclusion_list is applied.
+        #   - observe_block(block) every block apply: records which
+        #     mandated txs landed and which proposer was active at
+        #     each height.
+        #   - expire(height) at end of each apply: drops lists whose
+        #     window has closed; emits InclusionViolation records for
+        #     missed txs.  Caller (Blockchain) handles the slashing
+        #     via process_inclusion_list_violation when an evidence-tx
+        #     arrives in a later block.
+        # Snapshot-serialised so every node reaches identical slashing
+        # outcomes after replay.  See
+        # messagechain.consensus.inclusion_list.
+        from messagechain.consensus.inclusion_list import (
+            InclusionListProcessor,
+        )
+        self.inclusion_list_processor: InclusionListProcessor = (
+            InclusionListProcessor()
         )
 
         # Per-validator receipt-subtree root registry.  Receipts are
@@ -810,6 +861,9 @@ class Blockchain:
 
         # Register genesis entity
         self.public_keys[genesis_entity.entity_id] = genesis_entity.public_key
+        self._record_key_history(
+            genesis_entity.entity_id, genesis_entity.public_key,
+        )
         self.nonces[genesis_entity.entity_id] = 0
         # Capture the genesis entity's WOTS+ tree_height in chain state so
         # a server restart can reconstruct the same keypair from the
@@ -1196,6 +1250,41 @@ class Blockchain:
             snap.get("bogus_rejection_processed", set())
         )
 
+        # Inclusion-list processor: install active forward-window
+        # lists + processed_violations from snapshot.  Active lists are
+        # canonical-bytes encoded under publish_height keys; the
+        # processed-violations set is bytes(tx_hash || proposer_id)
+        # concatenations.  Per-list bookkeeping (inclusions_seen +
+        # proposers_by_height) is rebuilt empty — those are derived
+        # from observe_block calls during forward replay and don't
+        # affect any consensus decision once the active window has
+        # closed (only the `expire()` time fires from them).  At the
+        # snapshot height the chain is mid-window and observe_block
+        # will repopulate as new blocks arrive.
+        from messagechain.consensus.inclusion_list import (
+            InclusionList as _InclusionList,
+        )
+        active = {}
+        for ph, blob in snap.get("inclusion_list_active", {}).items():
+            active[int(ph)] = _InclusionList.from_bytes(bytes(blob))
+        self.inclusion_list_processor.active_lists = active
+        self.inclusion_list_processor.proposers_by_height = {
+            lst.list_hash: {} for lst in active.values()
+        }
+        self.inclusion_list_processor.inclusions_seen = {}
+        violations: set[tuple[bytes, bytes]] = set()
+        for compound in snap.get("inclusion_list_processed_violations", set()):
+            # Each entry is bytes(tx_hash || proposer_id) — both 32
+            # bytes.  Strict-shape check guards against a malformed
+            # snapshot from a forked node.
+            if len(compound) != 64:
+                raise ValueError(
+                    "inclusion_list_processed_violations entry must be "
+                    f"64 bytes, got {len(compound)}"
+                )
+            violations.add((bytes(compound[:32]), bytes(compound[32:])))
+        self.inclusion_list_processor.processed_violations = violations
+
         # Rebuild the per-entity sparse Merkle tree from the installed
         # state so compute_current_state_root reflects the snapshot.
         self._rebuild_state_tree()
@@ -1432,6 +1521,7 @@ class Blockchain:
             return False, "Registration proof reuses an already-consumed WOTS+ leaf"
 
         self.public_keys[entity_id] = public_key
+        self._record_key_history(entity_id, public_key)
         self.nonces[entity_id] = 0
         self._bump_watermark(entity_id, registration_proof.leaf_index)
         self._assign_entity_index(entity_id)
@@ -1880,6 +1970,7 @@ class Blockchain:
         # the same _touch_state sweep the caller is about to do.
         if tx.sender_pubkey and tx.entity_id not in self.public_keys:
             self.public_keys[tx.entity_id] = tx.sender_pubkey
+            self._record_key_history(tx.entity_id, tx.sender_pubkey)
             # Nonce 0 is the genesis nonce for first-spend; the
             # `self.nonces[tx.entity_id] = tx.nonce + 1` at the bottom
             # of this function bumps it to 1.
@@ -1926,6 +2017,7 @@ class Blockchain:
             and tx.entity_id not in self.public_keys
         ):
             self.public_keys[tx.entity_id] = tx.sender_pubkey
+            self._record_key_history(tx.entity_id, tx.sender_pubkey)
             self.nonces.setdefault(tx.entity_id, 0)
             self._assign_entity_index(tx.entity_id)
             # Capture WOTS+ tree_height on first-spend (see
@@ -2021,6 +2113,10 @@ class Blockchain:
 
         # Update the entity's public key
         self.public_keys[tx.entity_id] = tx.new_public_key
+        # R6-A: record the rotation in key_history so slash verification
+        # of evidence predating the rotation uses the OLD key (which
+        # signed the equivocation).
+        self._record_key_history(tx.entity_id, tx.new_public_key)
         self.key_rotation_counts[tx.entity_id] = tx.rotation_number + 1
         # Track rotation block height for cooldown enforcement (iter 6 H2).
         self.key_rotation_last_height[tx.entity_id] = self.height
@@ -2116,6 +2212,41 @@ class Blockchain:
 
         return True, "Receipt subtree root registered"
 
+    def _record_key_history(self, entity_id: bytes, public_key: bytes) -> None:
+        """Append (self.height, public_key) to the entity's key history.
+
+        Called at every public-key install/rotation site so slash
+        verification can look up the historical key that was active at
+        evidence_height (R6-A).  Monotonic by construction: callers only
+        invoke this when they're about to set/overwrite
+        `self.public_keys[entity_id]`, and block application walks
+        height forward.  We do not guard against duplicate entries at
+        the same height — replay fidelity is more important than
+        deduplication.
+        """
+        self.key_history.setdefault(entity_id, []).append(
+            (self.height, public_key),
+        )
+
+    def _public_key_at_height(
+        self, entity_id: bytes, height: int,
+    ) -> bytes | None:
+        """Return the public key that was active for entity_id at the given block height.
+
+        Returns None if the entity had no key installed at that height (e.g., height
+        before their first-spend registration)."""
+        history = self.key_history.get(entity_id)
+        if not history:
+            return self.public_keys.get(entity_id)  # no history → fall back to current
+        # history is sorted ascending by height; find the last entry with installed_at <= height
+        active = None
+        for installed_at, pk in history:
+            if installed_at <= height:
+                active = pk
+            else:
+                break
+        return active
+
     def validate_slash_transaction(
         self, tx: SlashTransaction, chain_height: int | None = None,
     ) -> tuple[bool, str]:
@@ -2186,8 +2317,21 @@ class Blockchain:
                 f"(unbonding + escrow window)"
             )
 
-        # Verify the evidence itself (two valid conflicting signatures)
-        offender_pk = self.public_keys[tx.evidence.offender_id]
+        # Verify the evidence itself (two valid conflicting signatures).
+        # R6-A: Use the key that was ACTIVE at the evidence height, not
+        # the current public key.  An offender who equivocated at height
+        # H and then rotated keys at H+1 must still be slashable with
+        # evidence from H; the old key verifies the old signatures, the
+        # new key does not.  Without this lookup the rotation silently
+        # defeats the 100% stake burn.
+        ev_height = self._evidence_block_number(tx.evidence)
+        if ev_height is None:
+            return False, "cannot determine evidence block height"
+        offender_pk = self._public_key_at_height(
+            tx.evidence.offender_id, ev_height,
+        )
+        if offender_pk is None:
+            return False, "offender had no key at evidence height"
         from messagechain.consensus.finality import (
             FinalityDoubleVoteEvidence, verify_finality_double_vote_evidence,
         )
@@ -5361,9 +5505,25 @@ class Blockchain:
                 )
                 return
             self.public_keys[atx.entity_id] = atx.new_public_key
+            # R6-A: mirror apply_key_rotation's key_history update so
+            # the block-replay path (used during normal block apply and
+            # reorg replay) also records the rotation.
+            self._record_key_history(atx.entity_id, atx.new_public_key)
             self.key_rotation_counts[atx.entity_id] = atx.rotation_number + 1
             # New Merkle tree = independent leaf namespace, so reset.
             self.leaf_watermarks[atx.entity_id] = 0
+            # WHY: mirrors apply_key_rotation (the RPC path) so the
+            # KEY_ROTATION_COOLDOWN_BLOCKS check fires for rotations
+            # applied via blocks too.  Without this update, the block-
+            # apply path silently forgot the cooldown — meaning any
+            # rotation included in a block (i.e. every rotation on the
+            # live network, since authority txs propagate through blocks)
+            # left last_height empty and `validate_key_rotation` saw
+            # `elapsed = height - (-COOLDOWN) = height + COOLDOWN` and
+            # accepted a follow-up rotation immediately.  Also restores
+            # the cooldown after a reorg: _reset_state clears the map,
+            # and replay through this path rebuilds it (R6-B).
+            self.key_rotation_last_height[atx.entity_id] = self.height
             if self.db is not None:
                 self.db.set_public_key(atx.entity_id, atx.new_public_key)
                 if hasattr(self.db, "set_leaf_watermark"):
@@ -7225,6 +7385,9 @@ class Blockchain:
         # which is a deliberate trade-off: cheap, doesn't require a DB
         # schema change, and restart timing isn't attacker-controllable.
         self.key_rotation_last_height = {}
+        # R6-A: key_history is in-memory state that replay rebuilds
+        # via _record_key_history at every install / rotation site.
+        self.key_history = {}
         self.public_keys = {}
         # slashed_validators is deliberately NOT cleared here — it is a
         # security ratchet, like revoked_entities and leaf_watermarks.
@@ -7312,6 +7475,20 @@ class Blockchain:
             "attestation_sig_counts": dict(self.attestation_sig_counts),
             "slash_sig_counts": dict(self.slash_sig_counts),
             "key_rotation_counts": dict(self.key_rotation_counts),
+            # R6-A: key_history must roll back with the chain so slash
+            # verification uses the historical key relative to the
+            # canonical chain, not a rolled-back fork's history.
+            "key_history": {
+                eid: list(entries) for eid, entries in self.key_history.items()
+            },
+            # R6-B: Cooldown tracking (KEY_ROTATION_COOLDOWN_BLOCKS, iter 6 H2).
+            # Snapshotted so a failed-reorg rollback restores the pre-reorg
+            # cooldown state — otherwise the rollback would leave whatever
+            # mid-reorg replay produced, silently letting the attacker
+            # retry the rotation that tripped the rollback.  Paired with
+            # the _apply_authority_tx update that rebuilds this map
+            # during the successful-reorg replay path.
+            "key_rotation_last_height": dict(self.key_rotation_last_height),
             # Cold authority keys are set via a SetAuthorityKey tx that
             # lives inside a block. If that block is rolled back the
             # authority binding must also revert, otherwise a reorged-out
@@ -7409,6 +7586,17 @@ class Blockchain:
         self.attestation_sig_counts = snapshot.get("attestation_sig_counts", {})
         self.slash_sig_counts = snapshot.get("slash_sig_counts", {})
         self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
+        self.key_history = {
+            eid: list(entries)
+            for eid, entries in snapshot.get("key_history", {}).items()
+        }
+        # Cooldown tracking for KEY_ROTATION_COOLDOWN_BLOCKS — default
+        # to empty so pre-field snapshots restore to a pristine map
+        # (matches a freshly-initialised Blockchain).  See the snapshot
+        # comment for the reorg-rollback rationale (R6-B).
+        self.key_rotation_last_height = dict(
+            snapshot.get("key_rotation_last_height", {}),
+        )
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
         self._processed_evidence = snapshot.get("processed_evidence", set())

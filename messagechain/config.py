@@ -705,6 +705,82 @@ MAX_TRACKED_PEERS = 5000  # memory cap for peer score tracking
 FORCED_INCLUSION_WAIT_BLOCKS = 3
 FORCED_INCLUSION_SET_SIZE = 5
 
+# ─────────────────────────────────────────────────────────────────────
+# Quorum-signed inclusion lists — slashing-bearing forced inclusion
+# ─────────────────────────────────────────────────────────────────────
+#
+# Forced inclusion (FORCED_INCLUSION_*) is attester-subjective and
+# slashing-free: each attester votes against blocks that omit txs from
+# its own mempool view.  A coordinated minority of validators that
+# refuses to attest against a censoring proposer can defeat that defense
+# while staying under the 1/3 attestation-blocking threshold.
+#
+# Quorum-signed inclusion lists close the gap.  An InclusionList is a
+# CONSENSUS-OBJECTIVE commitment to a set of tx_hashes that >= 2/3 of
+# attester stake has independently seen for at least
+# INCLUSION_LIST_WAIT_BLOCKS blocks.  The list published in block N
+# applies forward to blocks N+1..N+INCLUSION_LIST_WINDOW; any
+# proposer in that window MUST include each list-mandated tx (or attach
+# a valid structural excuse).  After expiry, anyone can submit an
+# InclusionListViolationEvidenceTx slashing the negligent proposer
+# INCLUSION_VIOLATION_SLASH_BPS of stake (burned, no finder reward —
+# matches censorship-evidence and bogus-rejection-evidence posture).
+#
+# Parameters tuned for BLOCK_TIME_TARGET=600s:
+#   WAIT=4    → ~40 min before a tx becomes list-eligible.  Long enough
+#               that gossip lag does not falsely include a tx that
+#               hasn't propagated to most attesters; short enough to
+#               keep censorship punitive.
+#   WINDOW=4  → ~40 min in which proposers must include a listed tx.
+#               Multiple proposers cycle through the window so a single
+#               coerced proposer cannot single-handedly censor.
+#   QUORUM=6667 bps → 2/3 of stake, matches the finality threshold so
+#               an inclusion list cannot be assembled by a smaller
+#               coalition than would already be needed to finalize.
+#   MAX_ENTRIES=64 → bounds the per-block size growth induced by lists
+#               (sig-bearing reports dominate; 64 entries × ~4 KB ≈
+#               256 KB worst case before fee-market gating).
+INCLUSION_LIST_WAIT_BLOCKS = 4
+INCLUSION_LIST_WINDOW = 4
+INCLUSION_LIST_QUORUM_BPS = 6667  # 2/3 of stake; mirrors finality threshold
+MAX_INCLUSION_LIST_ENTRIES = 64
+# Stake fraction burned per inclusion-violation evidence.  Hard-coded to
+# the same value as CENSORSHIP_SLASH_BPS (= 1000 bps = 10%) — both are
+# "soft censorship" offenses, not consensus-corruption equivocation.
+# An assertion at the bottom of this file (after CENSORSHIP_SLASH_BPS is
+# defined) cross-checks the two and raises on drift.
+INCLUSION_VIOLATION_SLASH_BPS = 1000
+
+# Crypto-agility version register for InclusionList wire format.  Bump
+# this and widen _ACCEPTED_INCLUSION_LIST_VERSIONS when the on-disk /
+# on-wire layout changes.  Reserved: 0 is invalid (traps zero-init blobs).
+INCLUSION_LIST_VERSION = 1
+_ACCEPTED_INCLUSION_LIST_VERSIONS: frozenset[int] = frozenset({
+    INCLUSION_LIST_VERSION,
+})
+
+
+def validate_inclusion_list_version(version: int) -> tuple[bool, str]:
+    """Reject unknown InclusionList wire-format versions.
+
+    Read lazily via globals() so test monkeypatching sees mutations and
+    import-order is flexible — same shape as
+    validate_block_serialization_version.
+    """
+    current = globals().get(
+        "INCLUSION_LIST_VERSION", INCLUSION_LIST_VERSION,
+    )
+    accepted = globals().get(
+        "_ACCEPTED_INCLUSION_LIST_VERSIONS",
+        frozenset({current}),
+    )
+    if version not in accepted:
+        return False, (
+            f"Unknown inclusion-list version {version} "
+            f"(accepted = {sorted(accepted)}, current = {current})"
+        )
+    return True, "OK"
+
 # Inclusion attestation — proposer mempool-snapshot accountability
 #
 # When enabled, each proposer embeds a Merkle root of their mempool's
@@ -1525,6 +1601,15 @@ MAX_SUBMISSION_BODY_BYTES = 16384
 # validators an economic nudge to include what they receipt without
 # pushing a temporary mistake to existential penalty.
 CENSORSHIP_SLASH_BPS = 1000  # 10% of stake, in basis points (10_000 = 100%)
+
+# Cross-check: inclusion-list violations and submission-receipt
+# censorship are both "soft censorship" offenses and intentionally
+# carry the same slash percentage.  Catching drift here at import time
+# prevents a future tweak from accidentally desyncing the two paths.
+assert INCLUSION_VIOLATION_SLASH_BPS == CENSORSHIP_SLASH_BPS, (
+    "INCLUSION_VIOLATION_SLASH_BPS must equal CENSORSHIP_SLASH_BPS — "
+    "both are soft-censorship slashes and should move together"
+)
 
 # Blocks after a receipt's commit_height by which the receipted tx
 # must appear on-chain.  If the tx is not included within this window,
