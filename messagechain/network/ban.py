@@ -15,9 +15,30 @@ Score assignments follow Bitcoin Core's logic:
 
 import time
 import logging
+import ipaddress
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_ip_for_bucket(ip_str: str) -> str:
+    """Normalize an IP string to the ban/rate-limit bucket key.
+
+    IPv4 -> canonical dotted-quad ("1.2.3.4").
+    IPv6 -> /64 network prefix ("2001:db8::/64") because a /64 is the
+    standard end-site allocation; rotating within it is free for any
+    IPv6-enabled adversary and defeats per-address bucketing.
+    Non-IP strings pass through unchanged so 'unknown' etc. still work.
+    """
+    try:
+        addr = ipaddress.ip_address(ip_str.strip())
+    except (ValueError, AttributeError):
+        return ip_str
+    if isinstance(addr, ipaddress.IPv4Address):
+        return str(addr)
+    # IPv6: mask to /64.
+    net = ipaddress.ip_network(f"{addr}/64", strict=False)
+    return str(net)
 
 # Thresholds
 BAN_THRESHOLD = 100       # score at which a peer gets banned
@@ -86,16 +107,27 @@ class PeerBanManager:
         self._scores: dict[str, PeerScore] = {}  # ip -> PeerScore
 
     def _get_ip(self, address: str) -> str:
-        """Extract IP from 'host:port' address string.
+        """Extract a bucket key from 'host:port' for ban accounting.
 
-        Handles both IPv4 ('1.2.3.4:8333') and IPv6 ('[::1]:8333') formats.
+        IPv4 bucket is the full /32 address (flooding at scale requires
+        real v4 allocations, which are scarce).  IPv6 bucket is the
+        /64 prefix because a /64 is the standard end-site allocation
+        and a cloud attacker trivially rotates addresses within it —
+        keying on /128 gives every rotation a fresh ban score, defeating
+        the defense for any IPv6-enabled adversary.  Matches Bitcoin
+        Core's 2021-era netgroup bucketing.
         """
+        raw = address
         if address.startswith("["):
-            # IPv6 bracket notation: [::1]:8333
             bracket_end = address.find("]")
             if bracket_end != -1:
-                return address[1:bracket_end]
-        return address.rsplit(":", 1)[0] if ":" in address else address
+                raw = address[1:bracket_end]
+        elif ":" in address:
+            # IPv4:port — count colons to distinguish from bare IPv6.
+            if address.count(":") == 1:
+                raw = address.rsplit(":", 1)[0]
+            # else: bare IPv6 literal without brackets, leave as-is.
+        return _normalize_ip_for_bucket(raw)
 
     def _get_score(self, ip: str) -> PeerScore:
         if ip not in self._scores:

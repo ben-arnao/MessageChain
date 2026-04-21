@@ -156,13 +156,30 @@ class RPCRateLimiter:
 
     MAX_TRACKED_IPS = 1000
 
-    def __init__(self, max_requests: int = 60, window_seconds: float = 60.0):
+    def __init__(self, max_requests: int = 60, window_seconds: float = 60.0,
+                 max_per_minute: int | None = None):
+        # Back-compat: tests use max_per_minute; keep window as 60s in that case.
+        if max_per_minute is not None:
+            max_requests = max_per_minute
+            window_seconds = 60.0
         self.max_requests = max_requests
         self.window_seconds = window_seconds
         self._requests: dict[str, list[float]] = {}
 
-    def check(self, ip: str) -> bool:
-        """Check if a request from this IP is allowed. Returns True if allowed."""
+    def check(self, ip: str, cost: int = 1) -> bool:
+        """Check if a request from this IP is allowed. Returns True if allowed.
+
+        `cost` charges a weighted amount against the budget — expensive
+        methods (submit_transaction, stake, etc. = WOTS+ verify) should
+        pay more tokens than cheap ones (get_chain_info = dict lookup).
+        Default 1 preserves the existing 1-token-per-call semantics for
+        callers that haven't been migrated yet.
+
+        IPv6 addresses are aggregated to /64 before bucketing so a cloud
+        attacker can't rotate within their allocation to bypass limits.
+        """
+        from messagechain.network.ban import _normalize_ip_for_bucket
+        ip = _normalize_ip_for_bucket(ip)
         now = time.time()
         cutoff = now - self.window_seconds
 
@@ -179,10 +196,15 @@ class RPCRateLimiter:
         # Prune expired entries
         self._requests[ip] = [t for t in self._requests[ip] if t > cutoff]
 
-        if len(self._requests[ip]) >= self.max_requests:
+        if len(self._requests[ip]) + cost > self.max_requests:
             return False
 
-        self._requests[ip].append(now)
+        # Charge `cost` tokens by inserting `cost` timestamps.  Each
+        # participating token decays from the window independently, so
+        # a cost=10 submit burns 10 of the next 300 tokens and frees
+        # them over the next 60s window.
+        for _ in range(cost):
+            self._requests[ip].append(now)
         return True
 
     def cleanup_stale(self, max_age: float = 600):

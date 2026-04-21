@@ -66,7 +66,7 @@ from messagechain.consensus.slashing import (
     SlashingEvidence, AttestationSlashingEvidence,
 )
 from messagechain.network.ban import (
-    PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
+    PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX, OFFENSE_MINOR,
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
 )
 from messagechain.network.ratelimit import PeerRateLimiter
@@ -92,6 +92,33 @@ _ADMIN_RPC_METHODS = frozenset({
     "unban_peer",
     "get_banned_peers",
 })
+
+
+def _is_stale_tx_reason(reason: str) -> bool:
+    """Classify a validate_transaction rejection as "stale" (peer's
+    mempool view lags) vs "invalid" (peer is lying or buggy).
+
+    Stale = recoverable on next sync; honest peers see this during
+    normal partition-recovery overlap.  Instant-banning on stale
+    causes a cascading ban storm across a recovering network.
+
+    Invalid = cryptographic or structural fail; no honest cause.
+
+    Keep this conservative: when unsure, treat as INVALID (instant ban).
+    The list must track the reason strings used in
+    messagechain.core.blockchain.validate_transaction.
+    """
+    if not isinstance(reason, str):
+        return False
+    lower = reason.lower()
+    stale_markers = (
+        "invalid nonce",              # stale-nonce drift during recovery
+        "already consumed",           # leaf watermark below current
+        "leaf reuse rejected",
+        "timestamp is >",             # future-dated by a slow clock
+        "insufficient spendable",     # balance drifted, retry after sync
+    )
+    return any(m in lower for m in stale_markers)
 
 
 def _hash(data: bytes) -> bytes:
@@ -1465,24 +1492,28 @@ class Server:
             if entity_id not in self.blockchain.public_keys:
                 return {"ok": False, "error": "Unknown entity"}
 
-            public_key = self.blockchain.public_keys[entity_id]
-            if not verify_stake_transaction(tx, public_key, block_height=self.blockchain.height):
-                return {"ok": False, "error": "Invalid stake transaction signature"}
-
-            # Validate nonce — use pending nonce so consecutive submissions
-            # are accepted without waiting for block inclusion.
+            # Order matters: run cheap nonce/leaf/balance checks BEFORE
+            # the expensive WOTS+ verify.  An attacker flooding malformed
+            # stake txs otherwise burns a full verify cycle per
+            # attempt; with reordering, they waste only a dict lookup.
+            # Mirrors the order in blockchain.validate_transaction.
             expected_nonce = self._get_pending_nonce_all_pools(entity_id)
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
 
             if tx.signature.leaf_index < self.blockchain.get_leaf_watermark(entity_id):
-                return {"ok": False, "error": "WOTS+ leaf already consumed — leaf reuse rejected"}
+                return {"ok": False, "error": "WOTS+ leaf already consumed - leaf reuse rejected"}
 
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee + tx.amount):
                 return {"ok": False, "error": "Insufficient balance for staking + fee"}
 
             if not self._check_leaf_across_all_pools(tx):
-                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx - leaf reuse rejected"}
+
+            # Cheap gates passed; now run the expensive WOTS+ verify.
+            public_key = self.blockchain.public_keys[entity_id]
+            if not verify_stake_transaction(tx, public_key, block_height=self.blockchain.height):
+                return {"ok": False, "error": "Invalid stake transaction signature"}
 
             # Queue for block inclusion — do NOT mutate state directly.
             # State changes only happen when a block containing this tx is
@@ -1513,22 +1544,15 @@ class Server:
             if entity_id not in self.blockchain.public_keys:
                 return {"ok": False, "error": "Unknown entity"}
 
-            # Unstake is an authority-gated operation: it requires the cold
-            # authority key, not the hot signing key. If the entity has not
-            # promoted a separate cold key, authority_key == signing key and
-            # this resolves to the same behavior as before.
-            authority_key = self.blockchain.get_authority_key(entity_id)
-            if not verify_unstake_transaction(tx, authority_key):
-                return {"ok": False, "error": "Invalid unstake signature — unstake must be signed by the authority (cold) key"}
-
-            # Validate nonce — use pending nonce so consecutive submissions
-            # are accepted without waiting for block inclusion.
+            # Cheap gates before expensive WOTS+ verify (same hardening
+            # as _rpc_stake).  Validate nonce via pending so consecutive
+            # submissions are accepted without waiting for block inclusion.
             expected_nonce = self._get_pending_nonce_all_pools(entity_id)
             if tx.nonce != expected_nonce:
                 return {"ok": False, "error": f"Invalid nonce: expected {expected_nonce}, got {tx.nonce}"}
 
             if tx.signature.leaf_index < self.blockchain.get_leaf_watermark(entity_id):
-                return {"ok": False, "error": "WOTS+ leaf already consumed — leaf reuse rejected"}
+                return {"ok": False, "error": "WOTS+ leaf already consumed - leaf reuse rejected"}
 
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
                 return {"ok": False, "error": "Insufficient balance for fee"}
@@ -1537,7 +1561,15 @@ class Server:
                 return {"ok": False, "error": "Insufficient staked amount"}
 
             if not self._check_leaf_across_all_pools(tx):
-                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx — leaf reuse rejected"}
+                return {"ok": False, "error": "WOTS+ leaf already used by another pending tx - leaf reuse rejected"}
+
+            # Cheap gates passed; run the expensive authority-key verify.
+            # Unstake is an authority-gated operation: requires the cold
+            # authority key.  If the entity has not promoted a separate
+            # cold key, authority_key == signing key.
+            authority_key = self.blockchain.get_authority_key(entity_id)
+            if not verify_unstake_transaction(tx, authority_key):
+                return {"ok": False, "error": "Invalid unstake signature - unstake must be signed by the authority (cold) key"}
 
             # Queue for block inclusion — do NOT mutate state directly.
             if not self._admit_to_pool("_pending_unstake_txs", tx):
@@ -2725,13 +2757,27 @@ class Server:
             )
             if valid:
                 self._track_seen_tx(tx_hash_hex)
-                # Record arrival height — see _rpc_submit_transaction for rationale.
+                # Record arrival height - see _rpc_submit_transaction for rationale.
                 self.mempool.add_transaction(
                     tx, arrival_block_height=self.blockchain.height,
                 )
                 await self._relay_tx_inv([tx_hash_hex], exclude=address)
             else:
-                self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
+                # Differentiate "peer is lying / malicious" from "peer's
+                # mempool drifted during normal partition recovery".  A
+                # stale-but-structurally-valid tx (nonce below pending,
+                # leaf below watermark) deserves OFFENSE_MINOR at most;
+                # instant-banning on those causes honest peers to ban
+                # each other during normal catch-up.  Only cryptographic
+                # or structural fail is a true "invalid tx".
+                if _is_stale_tx_reason(reason):
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_MINOR, f"stale_tx:{reason}",
+                    )
+                else:
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}",
+                    )
 
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
             try:

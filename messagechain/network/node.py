@@ -75,7 +75,7 @@ from messagechain.consensus.finality import (
 )
 from messagechain.consensus.equivocation_watcher import EquivocationWatcher
 from messagechain.network.ban import (
-    PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX,
+    PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX, OFFENSE_MINOR,
     OFFENSE_INVALID_HEADERS, OFFENSE_UNREQUESTED_DATA,
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
 )
@@ -887,8 +887,19 @@ class Node:
                 # Relay via inv to other peers
                 await self._relay_tx_inv([tx_hash_hex], exclude=address)
             else:
-                # Invalid transaction — penalize peer
-                self.ban_manager.record_offense(address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}")
+                # Differentiate "stale" (mempool drift during partition
+                # recovery) from "invalid" (cryptographic/structural fail).
+                # Stale = OFFENSE_MINOR, invalid = instant-ban OFFENSE_INVALID_TX.
+                # See server.py:_is_stale_tx_reason for the classifier.
+                from server import _is_stale_tx_reason
+                if _is_stale_tx_reason(reason):
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_MINOR, f"stale_tx:{reason}",
+                    )
+                else:
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_INVALID_TX, f"invalid_tx:{reason}",
+                    )
 
         elif msg.msg_type == MessageType.ANNOUNCE_BLOCK:
             try:
