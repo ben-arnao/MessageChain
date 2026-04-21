@@ -30,6 +30,7 @@ from messagechain.config import (
     PROPOSER_REWARD_CAP,
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
+    get_unbonding_period,
 )
 
 
@@ -331,7 +332,16 @@ class SupplyTracker:
                 return False
 
         self.staked[entity_id] -= amount
-        release_block = current_block + UNBONDING_PERIOD
+        # Hard-fork-gated unbonding period: pre-activation uses the legacy
+        # 1008-block window so historical chain state is reproducible;
+        # at/after ``UNBONDING_PERIOD_EXTENSION_HEIGHT`` the longer
+        # evidence-covering window applies so a validator cannot
+        # equivocate, unstake, and outrun slow slashing evidence.
+        # The per-entry release_block is baked in here and never mutated
+        # later — in-flight unstakes queued pre-activation keep their
+        # original (legacy) maturity even after the chain crosses the
+        # activation height.  See messagechain/config.py.
+        release_block = current_block + get_unbonding_period(current_block)
         if entity_id not in self.pending_unstakes:
             self.pending_unstakes[entity_id] = []
         self.pending_unstakes[entity_id].append((amount, release_block))
