@@ -473,7 +473,30 @@ class KeyPair:
             raise RuntimeError("Key exhausted: all one-time keys have been used")
 
         leaf_idx = self._next_leaf
-        self._next_leaf += 1
+
+        # Persist-BEFORE-sign: durably record "leaf_idx has been consumed"
+        # before wots_sign() can produce bytes that might escape this
+        # process.  If we instead signed first and persisted after, a
+        # crash between the two would leave the broadcast signature on
+        # the wire while the on-disk counter still pointed at leaf_idx —
+        # on restart we would reuse leaf_idx and sign a second message
+        # with the same one-time key, which mathematically reveals the
+        # WOTS+ private key for that leaf.  Burning a leaf without a
+        # corresponding sign is cheap; reusing one is catastrophic.
+        # If persist_leaf_index raises (disk full, I/O error), we abort
+        # the sign entirely — no signature is returned and _next_leaf
+        # stays put, so the next attempt retries the same leaf.
+        if self.leaf_index_path is not None:
+            # persist_leaf_index reads self._next_leaf, so temporarily
+            # advance it for the write then roll back on failure.
+            self._next_leaf = leaf_idx + 1
+            try:
+                self.persist_leaf_index(self.leaf_index_path)
+            except Exception:
+                self._next_leaf = leaf_idx
+                raise
+        else:
+            self._next_leaf = leaf_idx + 1
 
         # Derive the leaf keypair on demand — no private keys stored
         priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
@@ -496,12 +519,6 @@ class KeyPair:
                 if isinstance(pk, bytearray):
                     for j in range(len(pk)):
                         pk[j] = 0
-
-        # Write-ahead persistence: commit the new _next_leaf to disk
-        # BEFORE returning the signature, so a crash after signing but
-        # before the caller processes the result cannot cause leaf reuse.
-        if self.leaf_index_path is not None:
-            self.persist_leaf_index(self.leaf_index_path)
 
         # Exhaustion-visibility warnings.  Emit at 80% and 95% usage so
         # operators notice in their normal log pipeline long before the
