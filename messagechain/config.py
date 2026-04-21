@@ -1618,6 +1618,34 @@ MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 # 50_000" headroom so honest nodes have time to upgrade.
 FEE_INCLUDES_SIGNATURE_HEIGHT = 50_000
 
+# Activation height for decoupling attester committee size from the
+# reward-pool token budget.  Pre-activation the committee was implicitly
+# capped at `attester_pool // ATTESTER_REWARD_PER_SLOT` (== 1 token/slot,
+# so committee <= 12 tokens at BLOCK_REWARD=16 and only 3 at the
+# BLOCK_REWARD_FLOOR=4 floor — a permanent 3-attester decentralization
+# failure once halvings drive reward to the floor).  At/after this
+# height the committee is sized by consensus policy
+# (`ATTESTER_COMMITTEE_TARGET_SIZE`) and the `attester_pool` is divided
+# pro-rata across the full committee; integer-division remainder BURNS.
+# If the pool is smaller than the committee, per-slot reward rounds to
+# zero and the whole pool burns — the committee still attests for
+# finality-weight credit, the reward is a bonus not a gate on
+# participation.  Operators MUST replace this placeholder with a
+# concrete coordinated-fork height before deploying to mainnet.
+ATTESTER_REWARD_SPLIT_HEIGHT = 50_000
+
+# Target attester committee size post-activation.  Decoupled from the
+# per-block reward pool so a floor-era reward budget (3 tokens/block
+# under PROPOSER_REWARD_NUMERATOR=1/DENOMINATOR=4 at BLOCK_REWARD_FLOOR=4)
+# does not permanently cap the committee at 3 validators.  128 is
+# generous enough to accommodate a large active validator set while
+# keeping per-slot reward non-trivial in the early issuance regime
+# (BLOCK_REWARD=16 → attester_pool=12 → under-pool for the first few
+# halvings; see corner-case handling in mint_block_reward).  Not yet
+# used pre-activation; the old committee_size derivation continues to
+# drive selection until ATTESTER_REWARD_SPLIT_HEIGHT fires.
+ATTESTER_COMMITTEE_TARGET_SIZE = 128
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.

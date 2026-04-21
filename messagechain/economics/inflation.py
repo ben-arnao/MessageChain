@@ -31,6 +31,7 @@ from messagechain.config import (
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
     get_unbonding_period,
+    ATTESTER_REWARD_SPLIT_HEIGHT,
 )
 
 
@@ -142,19 +143,52 @@ class SupplyTracker:
                 "burned": 0,
             }
 
-        # Cap committee size at what the attester pool can pay for.
-        max_slots = attester_pool // ATTESTER_REWARD_PER_SLOT
-        paid_committee = list(attester_committee)[:max_slots]
-
-        # Credit one ATTESTER_REWARD_PER_SLOT per committee member.
+        # Reward-distribution policy gate.  Pre-activation (legacy):
+        # cap the PAID committee at what the pool can afford at 1 token
+        # per slot — remaining committee members truncate to 0.  This
+        # permanently caps paid slots at BLOCK_REWARD_FLOOR // 4 == 3
+        # once halvings drive reward to the floor, which is a
+        # structural decentralization failure.  Post-activation: divide
+        # the full attester_pool pro-rata across the full committee,
+        # integer-division remainder burns.  If the committee is larger
+        # than the pool, per-slot rounds to zero and the whole pool
+        # burns — the committee still attests for finality-weight
+        # credit, reward is a bonus not a gate on participation.
         attestor_rewards: dict[bytes, int] = {}
         attester_tokens_paid = 0
-        for eid in paid_committee:
-            attestor_rewards[eid] = attestor_rewards.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
-            self.balances[eid] = (
-                self.balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
-            )
-            attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
+        if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
+            paid_committee = list(attester_committee)
+            n = len(paid_committee)
+            # n == 0 is unreachable here because the early `if not
+            # attester_committee` branch above already returns, but be
+            # defensive so a future refactor can't silently divide by
+            # zero.
+            per_slot_reward = (attester_pool // n) if n > 0 else 0
+            for eid in paid_committee:
+                attestor_rewards[eid] = (
+                    attestor_rewards.get(eid, 0) + per_slot_reward
+                )
+                if per_slot_reward > 0:
+                    self.balances[eid] = (
+                        self.balances.get(eid, 0) + per_slot_reward
+                    )
+                attester_tokens_paid += per_slot_reward
+        else:
+            # Legacy path: first `max_slots` committee members paid 1
+            # token each, rest truncated.  Preserved byte-for-byte for
+            # any height strictly below ATTESTER_REWARD_SPLIT_HEIGHT so
+            # the fork is cleanly reversible and pre-fork blocks remain
+            # re-validatable.
+            max_slots = attester_pool // ATTESTER_REWARD_PER_SLOT
+            paid_committee = list(attester_committee)[:max_slots]
+            for eid in paid_committee:
+                attestor_rewards[eid] = (
+                    attestor_rewards.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+                )
+                self.balances[eid] = (
+                    self.balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+                )
+                attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
 
         # Unfilled slots + any cap overflow BURN — reduce total_supply
         # rather than credit the treasury.  Rationale: the treasury is
