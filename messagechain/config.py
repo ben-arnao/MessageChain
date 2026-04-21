@@ -1140,11 +1140,9 @@ assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
 
 # Partial divestment: the founder's initial stake is drained DOWN TO
 # this floor, not to zero.  Sized to be "one of the bigger players but
-# not dominant" post-bootstrap: 0.1% of GENESIS_SUPPLY, roughly 10x
-# the expected average non-seed validator stake after bootstrap
-# distributes ~1.68M tokens across non-seeds.  The founder can still
-# voluntarily unstake this floor later via an UnstakeTransaction; no
-# protocol mechanism drains below it.
+# not dominant" post-bootstrap.  The founder can still voluntarily
+# unstake this floor later via an UnstakeTransaction; no protocol
+# mechanism drains below it.
 #
 # Rationale:
 #   * Preserves a meaningful founder stake commensurate with the
@@ -1152,8 +1150,59 @@ assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
 #   * Keeps the floor well below any individual quorum threshold so
 #     the founder can never single-handedly block consensus.
 #   * Floor is a CONSENSUS CONSTANT — changing it is a hard fork.
-SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # tokens the founder always keeps
+#
+# The legacy value (1M) was sized against a 1B GENESIS_SUPPLY; after
+# the 1B→140M supply rebase the relative weight of the routed-to-
+# treasury 25% share climbed and the 94M-burn schedule became
+# co-complicit in a governance-captured-treasury outcome.  The
+# post-retune values (floor=20M, burn=95%, treasury=5%) are the
+# correct sizing for 140M supply — founder ends with 5M liquid + 20M
+# stake = 25M (~14% of supply), dominant-but-not-decisive.  Activation
+# gated by SEED_DIVESTMENT_RETUNE_HEIGHT below.  Pre-activation the
+# legacy values apply byte-for-byte.
+SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # LEGACY — see get_seed_divestment_params
 # The founder's initial stake is divested DOWN TO this floor, not to zero.
+SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE = 20_000_000
+SEED_DIVESTMENT_BURN_BPS_POST_RETUNE = 9500       # 95% burn after retune
+SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE = 500    # 5% treasury after retune
+assert (
+    SEED_DIVESTMENT_BURN_BPS_POST_RETUNE
+    + SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE
+    == 10_000
+)
+
+# Activation height for the seed-divestment retune hard fork.
+# Operators MUST replace this placeholder with a concrete coordinated-
+# fork height BEFORE BOOTSTRAP_END_HEIGHT = 105_192; otherwise the
+# first divestment block fires under old-schedule terms and the
+# network cannot uniformly transition.  Placeholder matches the
+# convention used by the three prior forks (50_000).
+SEED_DIVESTMENT_RETUNE_HEIGHT = 50_000
+
+
+def get_seed_divestment_params(block_height: int) -> tuple[int, int, int]:
+    """Return (retain_floor, burn_bps, treasury_bps) at `block_height`.
+
+    Hard-fork-gated: pre-activation returns the legacy values baked
+    into genesis so historical chain state is reproducible; at/after
+    activation returns the post-retune values sized for a 140M
+    GENESIS_SUPPLY.
+
+    Used by both the apply path (_apply_seed_divestment) and the sim
+    path (compute_post_state_root) so the two remain in lockstep
+    across the activation boundary.
+    """
+    if block_height >= SEED_DIVESTMENT_RETUNE_HEIGHT:
+        return (
+            SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE,
+            SEED_DIVESTMENT_BURN_BPS_POST_RETUNE,
+            SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE,
+        )
+    return (
+        SEED_DIVESTMENT_RETAIN_FLOOR,
+        SEED_DIVESTMENT_BURN_BPS,
+        SEED_DIVESTMENT_TREASURY_BPS,
+    )
 
 # Staking
 #
@@ -1645,6 +1694,45 @@ ATTESTER_REWARD_SPLIT_HEIGHT = 50_000
 # used pre-activation; the old committee_size derivation continues to
 # drive selection until ATTESTER_REWARD_SPLIT_HEIGHT fires.
 ATTESTER_COMMITTEE_TARGET_SIZE = 128
+
+# ─────────────────────────────────────────────────────────────────────
+# Treasury rebase — one-shot burn + per-epoch spend-rate cap
+# ─────────────────────────────────────────────────────────────────────
+# When GENESIS_SUPPLY was rebased from 1_000_000_000 to 140_000_000,
+# TREASURY_ALLOCATION (40M) went from ~4% to ~28.6% of supply.  Once
+# the seed-divestment schedule routes another ~23.5M to the treasury,
+# ~91% of post-bootstrap circulating supply sits in a single
+# governance-captured pool — an existential censorship-resistance
+# failure.  TREASURY_ALLOCATION cannot be changed (it lives in
+# genesis state); the fix is a hard-fork burn-down at activation
+# height plus a per-epoch spend-rate cap that even a supermajority
+# cannot bypass.
+#
+# At block_height == TREASURY_REBASE_HEIGHT:
+#   * TREASURY_REBASE_BURN_AMOUNT (33M) is deducted from the treasury
+#     balance and burned (total_supply and total_burned update).
+#     Post-burn treasury = 40M - 33M = 7M = 5% of 140M supply.
+#   * Fires exactly once per canonical chain history.  The step is
+#     idempotent: an adjacent re-apply at the same height is a no-op.
+#
+# At block_height >= TREASURY_REBASE_HEIGHT:
+#   * treasury_spend enforces a cap of TREASURY_MAX_SPEND_BPS_PER_EPOCH
+#     (100 bps = 1%) of treasury balance per epoch, measured in
+#     TREASURY_SPEND_CAP_EPOCH_BLOCKS (= FINALITY_INTERVAL = 100)
+#     block windows.  A second spend in the same epoch that exceeds
+#     the remaining budget reverts regardless of governance approval.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.
+TREASURY_REBASE_HEIGHT = 50_000
+TREASURY_REBASE_BURN_AMOUNT = 33_000_000  # 40M - 33M = 7M ≈ 5% of 140M
+TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # 1% per-epoch cap (basis points)
+TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
+
+assert TREASURY_REBASE_BURN_AMOUNT < TREASURY_ALLOCATION, (
+    "TREASURY_REBASE_BURN_AMOUNT cannot exceed TREASURY_ALLOCATION — "
+    "rebase would underflow the genesis treasury."
+)
 
 
 def validate_block_hex_size(block_data) -> bool:

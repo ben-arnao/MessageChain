@@ -36,6 +36,23 @@ from messagechain.core.bootstrap import (
 from messagechain.identity.identity import Entity
 
 
+# This file exercises the LEGACY divestment schedule (1M floor, 75/25
+# split).  The retune hard fork activates at SEED_DIVESTMENT_RETUNE_HEIGHT,
+# which fires before the legacy divestment window in production.  To keep
+# this file's coverage of legacy behavior intact, push the retune height
+# past the end of this file's simulated range — pre-retune params apply
+# throughout, exactly as on a pre-fork chain.
+_ORIG_RETUNE_HEIGHT = config.SEED_DIVESTMENT_RETUNE_HEIGHT
+
+
+def setUpModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = 10 ** 9
+
+
+def tearDownModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = _ORIG_RETUNE_HEIGHT
+
+
 TREASURY = config.TREASURY_ENTITY_ID
 START = config.SEED_DIVESTMENT_START_HEIGHT
 END = config.SEED_DIVESTMENT_END_HEIGHT

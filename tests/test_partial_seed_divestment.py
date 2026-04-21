@@ -36,6 +36,21 @@ from messagechain.core.bootstrap import (
 from messagechain.identity.identity import Entity
 
 
+# Legacy-schedule coverage: push SEED_DIVESTMENT_RETUNE_HEIGHT past this
+# file's simulated range so pre-retune params (1M floor, 75/25 split)
+# apply throughout.  Post-retune coverage lives in
+# tests/test_seed_divestment_retune.py.
+_ORIG_RETUNE_HEIGHT = config.SEED_DIVESTMENT_RETUNE_HEIGHT
+
+
+def setUpModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = 10 ** 9
+
+
+def tearDownModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = _ORIG_RETUNE_HEIGHT
+
+
 TREASURY = config.TREASURY_ENTITY_ID
 START = config.SEED_DIVESTMENT_START_HEIGHT
 END = config.SEED_DIVESTMENT_END_HEIGHT
