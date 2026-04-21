@@ -1001,6 +1001,17 @@ ARCHIVE_PROOFS_PER_CHALLENGE = 10
 ARCHIVE_REWARD = 1_000
 ARCHIVE_SUBMISSION_WINDOW = 100
 ARCHIVE_BURN_REDIRECT_PCT = 25
+# Multi-height sampling: K distinct historical heights challenged per
+# epoch, so a validator keeping only a small slice of history cannot
+# reliably pass the custody check.  Each validator submits K proofs
+# per epoch; all K must land for the validator to be credited (the
+# duty-enforcement layer applies the all-or-nothing rule — sampling
+# layer just produces K challenges and K leaves per submitter).
+# Starting value 3 balances sample strength against gossip/storage
+# overhead — at ~100 validators this is ~300 bundle leaves per epoch
+# (~20 KB canonical bytes), well inside the bloat budget.  Tunable
+# via future governance proposal.
+ARCHIVE_CHALLENGE_K = 3
 # Carry-only crypto-agility register.  A future governance proposal can
 # widen the accepted proof format (e.g., switch to witness-archive
 # rewards) without a chain reset.  Reserved: 0 traps uninitialized.
@@ -1013,6 +1024,7 @@ assert ARCHIVE_CHALLENGE_INTERVAL > 0
 assert ARCHIVE_PROOFS_PER_CHALLENGE > 0
 assert ARCHIVE_REWARD > 0
 assert ARCHIVE_SUBMISSION_WINDOW > 0
+assert ARCHIVE_CHALLENGE_K > 0, "ARCHIVE_CHALLENGE_K must be positive"
 
 
 def is_archive_challenge_block(block_number: int) -> bool:
