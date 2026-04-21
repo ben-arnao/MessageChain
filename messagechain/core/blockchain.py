@@ -5598,6 +5598,7 @@ class Blockchain:
         # docstring — same semantics, inline here for the burn path).
         if tx.sender_pubkey and tx.entity_id not in self.public_keys:
             self.public_keys[tx.entity_id] = tx.sender_pubkey
+            self._record_key_history(tx.entity_id, tx.sender_pubkey)
             self.nonces.setdefault(tx.entity_id, 0)
             self._assign_entity_index(tx.entity_id)
             self._record_tree_height(tx.entity_id, tx.signature)
@@ -6033,6 +6034,7 @@ class Blockchain:
                 and stx.entity_id not in self.public_keys
             ):
                 self.public_keys[stx.entity_id] = stx.sender_pubkey
+                self._record_key_history(stx.entity_id, stx.sender_pubkey)
                 self.nonces.setdefault(stx.entity_id, 0)
                 self._assign_entity_index(stx.entity_id)
                 # Record tree_height on first-spend stake install.
@@ -6839,6 +6841,7 @@ class Blockchain:
         self._block_by_hash[block.block_hash] = block
 
         self.public_keys[founder_eid] = founder_pubkey
+        self._record_key_history(founder_eid, founder_pubkey)
         self.nonces[founder_eid] = 0
         self._set_tree_height_explicit(founder_eid, tree_height)
         self._assign_entity_index(founder_eid)
@@ -7677,7 +7680,6 @@ class Blockchain:
         self.supply.total_fees_collected = snapshot["total_fees_collected"]
         self.supply.total_burned = snapshot.get("total_burned", 0)
         self.supply.base_fee = snapshot.get("base_fee", BASE_FEE_INITIAL)
-        self.base_fee = self.supply.base_fee
         # Treasury rebase flag — default False so older snapshots
         # (pre-fork) restore cleanly with the rebase not yet applied.
         self.supply.treasury_rebase_applied = snapshot.get(
@@ -7692,6 +7694,7 @@ class Blockchain:
         self.supply._treasury_spend_debited_this_epoch = snapshot.get(
             "treasury_spend_debited_this_epoch", 0,
         )
+        self.base_fee = self.supply.base_fee
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
         # Tree heights are paired with public_keys in the snapshot so
