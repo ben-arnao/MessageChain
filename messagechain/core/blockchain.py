@@ -1188,7 +1188,9 @@ class Blockchain:
         # Signed by the current signing key — the user is authenticating
         # themselves before handing the authority role to the new cold key.
         signing_pk = self.public_keys[tx.entity_id]
-        if not verify_set_authority_key_transaction(tx, signing_pk):
+        if not verify_set_authority_key_transaction(
+            tx, signing_pk, current_height=self.height + 1,
+        ):
             return False, "Invalid signature"
 
         # Reject the cold == hot no-op.  Operators legitimately share a
@@ -1244,7 +1246,9 @@ class Blockchain:
         # unavailable.  Replay protection comes from the "already revoked"
         # guard above: any second submission with the same effect is a no-op.
         authority_pk = self.get_authority_key(tx.entity_id)
-        if authority_pk is None or not verify_revoke_transaction(tx, authority_pk):
+        if authority_pk is None or not verify_revoke_transaction(
+            tx, authority_pk, current_height=self.height + 1,
+        ):
             return False, (
                 "Invalid signature — revoke must be signed by the authority "
                 "(cold) key. The hot signing key cannot self-revoke."
@@ -1789,7 +1793,9 @@ class Blockchain:
                 f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
             )
 
-        if not verify_transfer_transaction(tx, verifying_pubkey):
+        if not verify_transfer_transaction(
+            tx, verifying_pubkey, current_height=self.height + 1,
+        ):
             return False, "Invalid signature"
 
         return True, "Valid"
@@ -1935,7 +1941,9 @@ class Blockchain:
                 f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
             )
 
-        if not verify_key_rotation(tx, current_pk):
+        if not verify_key_rotation(
+            tx, current_pk, current_height=self.height + 1,
+        ):
             return False, "Invalid key rotation signature or parameters"
 
         return True, "Valid"
@@ -2002,7 +2010,7 @@ class Blockchain:
 
         authority_pk = self.get_authority_key(tx.entity_id)
         if authority_pk is None or not verify_set_receipt_subtree_root_transaction(
-            tx, authority_pk,
+            tx, authority_pk, current_height=self.height + 1,
         ):
             return False, (
                 "Invalid signature — set_receipt_subtree_root must be signed by "
@@ -2085,6 +2093,26 @@ class Blockchain:
 
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
+
+        # R5-A: At/after FEE_INCLUDES_SIGNATURE_HEIGHT every tx type must
+        # price its witness bytes to stop WOTS+ bloat at MIN_FEE.  Slash
+        # has no flat-fee floor (historically fee=1 was legal), so we
+        # apply MIN_FEE as the baseline, then max against the sig-aware
+        # minimum.
+        from messagechain.core.transaction import (
+            MIN_FEE as _MIN_FEE, enforce_signature_aware_min_fee,
+        )
+        _height_for_fee = chain_height if chain_height is not None else self.height
+        if not enforce_signature_aware_min_fee(
+            tx.fee,
+            signature_bytes=len(tx.signature.to_bytes()),
+            current_height=_height_for_fee,
+            flat_floor=_MIN_FEE,
+        ):
+            return False, (
+                f"Fee {tx.fee} below signature-aware minimum at height "
+                f"{_height_for_fee}"
+            )
 
         # H6: Reject expired evidence.  Evidence window must cover the
         # longer of (a) unbonding (stake is slashable until unbonded)
@@ -4533,7 +4561,10 @@ class Blockchain:
                     f"Insufficient balance for transfer of {ttx.amount} + fee {ttx.fee}"
                 )
 
-            if not verify_transfer_transaction(ttx, verifying_pubkey):
+            if not verify_transfer_transaction(
+                ttx, verifying_pubkey,
+                current_height=block.header.block_number,
+            ):
                 return False, f"Invalid transfer {ttx.tx_hash.hex()[:16]}: Invalid signature"
 
             if known_pk is None:
@@ -4758,6 +4789,7 @@ class Blockchain:
         if not verify_stake_transaction(
             stx, verifying_pubkey, block_height=self.height,
             min_stake_override=progress_min,
+            current_height=self.height + 1,
         ):
             return False, "Invalid signature or fields"
 
@@ -4838,7 +4870,9 @@ class Blockchain:
 
         # Authority-gated signature check.
         authority_pk = self.get_authority_key(utx.entity_id)
-        if authority_pk is None or not verify_unstake_transaction(utx, authority_pk):
+        if authority_pk is None or not verify_unstake_transaction(
+            utx, authority_pk, current_height=self.height + 1,
+        ):
             return False, (
                 "Invalid signature — unstake must be signed by the authority "
                 "(cold) key. The hot signing key cannot authorize withdrawal."
@@ -4934,7 +4968,9 @@ class Blockchain:
             return False, f"Unknown governance tx type {type(gtx).__name__}"
         if sender not in self.public_keys:
             return False, f"Unknown sender {sender.hex()[:16]}"
-        if not verifier(gtx, self.public_keys[sender]):
+        if not verifier(
+            gtx, self.public_keys[sender], current_height=self.height + 1,
+        ):
             return False, "Invalid signature or fields"
         if not self.supply.can_afford_fee(sender, gtx.fee):
             return False, (
@@ -5125,7 +5161,9 @@ class Blockchain:
             if ttx.entity_id not in self.public_keys:
                 return False, f"Unknown sender in transfer {ttx.tx_hash.hex()[:16]}"
             pk = self.public_keys[ttx.entity_id]
-            if not verify_transfer_transaction(ttx, pk):
+            if not verify_transfer_transaction(
+                ttx, pk, current_height=block.header.block_number,
+            ):
                 return False, f"Invalid signature in transfer {ttx.tx_hash.hex()[:16]}"
 
         # Per-block new-account cap — mirrors validate_block.  Count

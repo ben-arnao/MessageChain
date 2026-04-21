@@ -430,6 +430,7 @@ def verify_stake_transaction(
     block_height: int = 0,
     *,
     min_stake_override: int | None = None,
+    current_height: int | None = None,
 ) -> bool:
     """Verify a stake transaction's signature and structural fields.
 
@@ -440,7 +441,14 @@ def verify_stake_transaction(
     `min_stake_override`: if provided, the caller (typically Blockchain,
     which has access to `bootstrap_progress`) dictates the minimum stake
     amount.  When None, falls back to the flat VALIDATOR_MIN_STAKE.
+
+    `current_height` selects the fee rule: at/after
+    FEE_INCLUDES_SIGNATURE_HEIGHT the admission floor is the larger of
+    MIN_FEE and the signature-aware minimum so an attacker can't bloat
+    the chain with large WOTS+ witnesses at MIN_FEE (R5-A).  Legacy
+    callers (None) get the plain MIN_FEE floor.
     """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if tx.amount <= 0:
         return False
     if min_stake_override is not None:
@@ -450,7 +458,12 @@ def verify_stake_transaction(
         from messagechain.config import VALIDATOR_MIN_STAKE
         if tx.amount < VALIDATOR_MIN_STAKE:
             return False
-    if tx.fee < MIN_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False
@@ -460,11 +473,24 @@ def verify_stake_transaction(
     return verify_signature(msg_hash, tx.signature, public_key)
 
 
-def verify_unstake_transaction(tx: UnstakeTransaction, public_key: bytes) -> bool:
-    """Verify an unstake transaction's signature and structural fields."""
+def verify_unstake_transaction(
+    tx: UnstakeTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
+    """Verify an unstake transaction's signature and structural fields.
+
+    `current_height` selects the fee rule (see verify_stake_transaction).
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if tx.amount <= 0:
         return False
-    if tx.fee < MIN_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False

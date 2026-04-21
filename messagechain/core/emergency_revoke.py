@@ -183,6 +183,7 @@ def create_revoke_transaction(
 def verify_revoke_transaction(
     tx: RevokeTransaction,
     authority_public_key: bytes,
+    current_height: int | None = None,
 ) -> bool:
     """Verify structural fields and the authority-key signature.
 
@@ -190,8 +191,18 @@ def verify_revoke_transaction(
     kept on paper for months should still apply when needed. Only
     future timestamps beyond MAX_TIMESTAMP_DRIFT are rejected, to
     prevent a malicious proposer from pre-dating an attack.
+
+    `current_height` selects the fee rule: post
+    FEE_INCLUDES_SIGNATURE_HEIGHT the floor becomes max(MIN_FEE,
+    sig-aware min) to price witness bytes (R5-A).
     """
-    if tx.fee < MIN_FEE:
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False

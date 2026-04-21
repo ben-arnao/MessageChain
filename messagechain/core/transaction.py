@@ -323,6 +323,44 @@ def calculate_min_fee(message_bytes: bytes, signature_bytes: int = 0) -> int:
     return MIN_FEE + linear + quadratic
 
 
+def enforce_signature_aware_min_fee(
+    tx_fee: int,
+    signature_bytes: int,
+    current_height: int | None,
+    flat_floor: int,
+) -> bool:
+    """Return True if `tx_fee` satisfies the post-activation fee rule.
+
+    Shared fee-admission gate for EVERY non-MessageTransaction tx type.
+    MessageTransaction has its own copy inline in `verify_transaction`
+    because it also prices the payload bytes; everything else has no
+    payload and only needs to cover the signature witness above the
+    existing flat floor.
+
+    Pre-activation (`current_height is None` or < activation height):
+      * Accept iff `tx_fee >= flat_floor` (unchanged legacy rule).
+
+    Post-activation (`current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT`):
+      * Accept iff `tx_fee >= max(flat_floor, calculate_min_fee(b"",
+        signature_bytes=signature_bytes))`.
+
+    Pricing witnesses uniformly plugs the R5-A hole where a small-flat-
+    fee tx type (transfer, stake, unstake, vote, revoke, authority,
+    receipt-root, slash) could carry a ~2.7 KB WOTS+ signature at
+    MIN_FEE and bloat permanent chain state at nearly zero cost.
+    """
+    if tx_fee < flat_floor:
+        return False
+    if (
+        current_height is not None
+        and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
+    ):
+        sig_min = calculate_min_fee(b"", signature_bytes=signature_bytes)
+        if tx_fee < sig_min:
+            return False
+    return True
+
+
 def _validate_message(message: str) -> tuple[bool, str]:
     """Check message contains only printable ASCII (32-126) and is within limits."""
     for ch in message:
