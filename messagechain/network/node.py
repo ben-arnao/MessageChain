@@ -198,12 +198,16 @@ class Node:
         checkpoints = list(TRUSTED_CHECKPOINTS)
         if data_dir:
             cp_path = os.path.join(data_dir, "checkpoints.json")
-            file_cps = load_checkpoints_file(cp_path)
-            # Replace any config entry with a file entry at the same height
-            by_height = {cp.block_number: cp for cp in checkpoints}
-            for cp in file_cps:
-                by_height[cp.block_number] = cp
-            checkpoints = list(by_height.values())
+            # WHY: check existence first so absence falls back to the
+            # embedded TRUSTED_CHECKPOINTS tuple; if the operator did
+            # ship a file, validate it strictly (malformed → raise).
+            if os.path.exists(cp_path):
+                file_cps = load_checkpoints_file(cp_path, strict=True)
+                # Replace any config entry with a file entry at the same height
+                by_height = {cp.block_number: cp for cp in checkpoints}
+                for cp in file_cps:
+                    by_height[cp.block_number] = cp
+                checkpoints = list(by_height.values())
 
         if REQUIRE_CHECKPOINTS and not checkpoints:
             raise RuntimeError(

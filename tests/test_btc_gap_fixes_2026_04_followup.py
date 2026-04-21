@@ -61,7 +61,9 @@ class TestCheckpointFileLoader(unittest.TestCase):
             self.assertEqual(result[1].block_hash, bytes.fromhex("11" * 32))
 
     def test_missing_file_returns_empty_list(self):
-        result = load_checkpoints_file("/nonexistent/path/cp.json")
+        # WHY: this test asserts the explicit-permissive contract; the
+        # loader's default is strict (raises) to block long-range attacks.
+        result = load_checkpoints_file("/nonexistent/path/cp.json", strict=False)
         self.assertEqual(result, [])
 
     def test_corrupt_file_returns_empty_list(self):
@@ -69,7 +71,8 @@ class TestCheckpointFileLoader(unittest.TestCase):
             path = os.path.join(td, "checkpoints.json")
             with open(path, "w") as f:
                 f.write("{{{ not valid json")
-            result = load_checkpoints_file(path)
+            # WHY: explicit permissive mode — default is strict.
+            result = load_checkpoints_file(path, strict=False)
             self.assertEqual(result, [])
 
     def test_node_loads_checkpoints_from_data_dir(self):

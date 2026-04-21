@@ -153,9 +153,12 @@ class TestD3StrictCheckpointLoading(unittest.TestCase):
             os.unlink(path)
 
     def test_permissive_mode_still_works(self):
-        """Default (permissive) mode returns empty list on missing file."""
+        """Explicit permissive mode returns empty list on missing file."""
         from messagechain.consensus.checkpoint import load_checkpoints_file
-        result = load_checkpoints_file("/nonexistent/path/checkpoints.json")
+        # WHY: default is now strict; permissive is an explicit opt-out.
+        result = load_checkpoints_file(
+            "/nonexistent/path/checkpoints.json", strict=False,
+        )
         self.assertEqual(result, [])
 
 

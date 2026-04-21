@@ -74,7 +74,7 @@ def create_checkpoint(chain, block_number: int) -> WeakSubjectivityCheckpoint:
 
 
 def load_checkpoints_file(
-    path: str, strict: bool = False,
+    path: str, strict: bool = True,
 ) -> list[WeakSubjectivityCheckpoint]:
     """Load trusted weak-subjectivity checkpoints from a JSON file.
 
@@ -83,14 +83,11 @@ def load_checkpoints_file(
 
     Args:
         path: Path to the checkpoints JSON file.
-        strict: If True, raise on missing/malformed files instead of
-            returning an empty list.  Production nodes SHOULD use
-            strict=True so operators are forced to notice when the
-            checkpoint file is absent — a node without checkpoints is
-            vulnerable to long-range attacks.
-
-    Returns an empty list on missing/malformed files in permissive mode
-    so a first-run node still starts successfully.
+        strict: If True (default), raise on missing/malformed files.
+            Default is strict because a silently empty checkpoint set
+            lets a fresh node sync without a weak-subjectivity anchor
+            and be fed a long-range fork.  Tests and ephemeral dev
+            nodes may pass strict=False explicitly.
     """
     try:
         with open(path, "r") as f:
