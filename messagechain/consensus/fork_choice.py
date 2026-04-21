@@ -66,22 +66,34 @@ class ForkChoice:
         """Return (hash, height, weight) of the best chain tip."""
         if not self.tips:
             return None
+        # Tie-break on lex-smaller tip hash, not height: grinding the hash
+        # costs a full proposer signature per attempt, so an attacker can't
+        # cheaply produce an equal-weight longer fork to force a reorg.
         best_hash = max(
             self.tips,
-            key=lambda h: (self.tips[h][1], self.tips[h][0]),  # weight, then height
+            key=lambda h: (self.tips[h][1], tuple(255 - b for b in h)),
         )
         height, weight = self.tips[best_hash]
         return (best_hash, height, weight)
 
-    def is_better_chain(self, new_weight: int, new_height: int) -> bool:
-        """Check if a chain with given weight/height beats our current best."""
+    def is_better_chain(
+        self,
+        new_weight: int,
+        new_height: int,
+        new_tip_hash: bytes | None = None,
+    ) -> bool:
+        """Check if a chain with given weight/tip-hash beats our current best.
+
+        Height is retained in the signature for call-site compatibility but
+        is NOT used in tie-breaking (see get_best_tip for rationale).
+        """
         best = self.get_best_tip()
         if best is None:
             return True
-        _, cur_height, cur_weight = best
+        cur_hash, _, cur_weight = best
         if new_weight > cur_weight:
             return True
-        if new_weight == cur_weight and new_height > cur_height:
+        if new_weight == cur_weight and new_tip_hash is not None and new_tip_hash < cur_hash:
             return True
         return False
 

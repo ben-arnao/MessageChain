@@ -242,13 +242,15 @@ class TestForkChoice(unittest.TestCase):
         best = fc.get_best_tip()
         assert best[0] == b"\x02" * 32  # heavier chain wins
 
-    def test_tiebreak_by_height(self):
+    def test_tiebreak_by_hash(self):
         fc = ForkChoice()
         fc.add_tip(b"\x01" * 32, 5, 100)
-        fc.add_tip(b"\x02" * 32, 6, 100)  # same weight, taller
+        fc.add_tip(b"\x02" * 32, 6, 100)  # same weight, taller, but lex-larger hash
 
         best = fc.get_best_tip()
-        assert best[0] == b"\x02" * 32  # taller wins on tie
+        # Lex-smaller tip hash wins; height is not a tiebreak (grinding
+        # hash requires a proposer signature per attempt).
+        assert best[0] == b"\x01" * 32
 
     def test_remove_tip(self):
         fc = ForkChoice()
@@ -261,11 +263,13 @@ class TestForkChoice(unittest.TestCase):
 
     def test_is_better_chain(self):
         fc = ForkChoice()
-        fc.add_tip(b"\x01" * 32, 5, 100)
+        fc.add_tip(b"\x05" * 32, 5, 100)
 
-        assert fc.is_better_chain(200, 4)  # heavier
-        assert not fc.is_better_chain(50, 10)  # lighter
-        assert fc.is_better_chain(100, 6)  # same weight, taller
+        assert fc.is_better_chain(200, 4, b"\xff" * 32)  # heavier
+        assert not fc.is_better_chain(50, 10, b"\x00" * 32)  # lighter
+        # Equal weight: lex-smaller hash wins, height is NOT a tiebreak.
+        assert fc.is_better_chain(100, 3, b"\x01" * 32)  # equal weight, smaller hash
+        assert not fc.is_better_chain(100, 99, b"\xee" * 32)  # equal weight, larger hash
 
     def test_compute_block_stake_weight(self):
         alice = make_entity("alice")
