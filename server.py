@@ -965,6 +965,10 @@ class Server(SharedRuntimeMixin):
             trusted_checkpoints=checkpoints,
             on_peer_offense=self._on_sync_offense,
         )
+        # R2-#6: mirror the checkpoint set onto Blockchain so the gate
+        # guards every block-entry path (announce/response/reorg), not
+        # only IBD header batches.
+        self.blockchain.set_trusted_checkpoints(checkpoints)
 
         # RPC rate limiting.  60 req/min was too tight for real workflows —
         # a typical session is balance -> nonce -> estimate_fee -> submit

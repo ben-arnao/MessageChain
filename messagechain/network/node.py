@@ -78,6 +78,7 @@ from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX, OFFENSE_MINOR,
     OFFENSE_INVALID_HEADERS, OFFENSE_UNREQUESTED_DATA,
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
+    OFFENSE_CHECKPOINT_VIOLATION,
 )
 from messagechain.network.ratelimit import PeerRateLimiter
 from messagechain.network.eviction import PeerEvictionProtector
@@ -226,6 +227,10 @@ class Node(SharedRuntimeMixin):
             trusted_checkpoints=checkpoints,
             on_peer_offense=self._on_sync_offense,
         )
+        # R2-#6: push the same checkpoint set down into Blockchain so
+        # the gate fires on every block-entry path (announce/response/
+        # reorg), not only the IBD header handler.
+        self.blockchain.set_trusted_checkpoints(checkpoints)
 
         # inv/getdata: track recently seen tx hashes (avoid re-requesting)
         self._seen_txs: OrderedDict = OrderedDict()
@@ -921,7 +926,16 @@ class Node(SharedRuntimeMixin):
                 # bad state root, etc).
                 reason_lower = reason.lower()
                 benign_prefixes = ("orphan", "block already known")
-                if any(reason_lower.startswith(p) for p in benign_prefixes):
+                if reason_lower.startswith("checkpoint violation"):
+                    # Weak-subjectivity gate fired — the peer served a
+                    # block at a checkpointed height with a different
+                    # hash.  Matches the sync-layer penalty used when
+                    # the same miss happens via header batches.
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_CHECKPOINT_VIOLATION,
+                        f"checkpoint_mismatch:{reason}",
+                    )
+                elif any(reason_lower.startswith(p) for p in benign_prefixes):
                     logger.debug("non-ban add_block fail from %s: %s",
                                  address, reason)
                 else:
@@ -1003,7 +1017,16 @@ class Node(SharedRuntimeMixin):
                         address, OFFENSE_PROTOCOL_VIOLATION, "invalid_response_block"
                     )
                     return
-                self.blockchain.add_block(block)
+                success, reason = self.blockchain.add_block(block)
+                if not success and reason.lower().startswith("checkpoint violation"):
+                    # Same gate as ANNOUNCE_BLOCK: a peer serving a
+                    # mismatched block at a checkpointed height earns an
+                    # instant ban regardless of which block-carrying
+                    # message they used.
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_CHECKPOINT_VIOLATION,
+                        f"checkpoint_mismatch:{reason}",
+                    )
 
         elif msg.msg_type == MessageType.ANNOUNCE_ATTESTATION:
             await self._handle_announce_attestation(msg.payload, peer)
