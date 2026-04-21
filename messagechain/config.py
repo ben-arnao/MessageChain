@@ -1106,19 +1106,46 @@ ARCHIVE_BURN_REDIRECT_PCT = 25
 # per epoch; all K must land for the validator to be credited (the
 # duty-enforcement layer applies the all-or-nothing rule — sampling
 # layer just produces K challenges and K leaves per submitter).
-# Starting value 3 balances sample strength against gossip/storage
-# overhead — at ~100 validators this is ~300 bundle leaves per epoch
-# (~20 KB canonical bytes), well inside the bloat budget.  Tunable
-# via future governance proposal.
-ARCHIVE_CHALLENGE_K = 3
+#
+# Bumped from 3 to 5 in iteration 3c.  Evasion probability at p=0.5
+# (keep half the history) drops from ~12% to ~3%; at p=0.7 from 34%
+# to 17%.  First K//2 challenges sample uniformly across all history;
+# the remaining K - K//2 are age-skewed (see ARCHIVE_AGE_SKEW_FRACTION)
+# so a pruner keeping only recent blocks fails deterministically.
+#
+# At ~100 validators this is ~500 bundle leaves per epoch (~35 KB
+# canonical bytes), still well inside the bloat budget.  Tunable via
+# future governance proposal.
+ARCHIVE_CHALLENGE_K = 5
+# Age-skewed sampling: the second half of each epoch's challenges
+# targets the oldest AGE_SKEW_FRACTION of history.  Prevents a
+# validator from passing by retaining only recent blocks — the
+# weakest-incentivized data (ancient blocks with no recent access)
+# gets sampled disproportionately.
+#
+# 0.1 = oldest 10%.  A validator keeping only the newest 90% fails
+# every age-skewed challenge deterministically; keeping only the
+# newest 99% fails ~90% of them.  At very small B (bootstrap era)
+# the age-skewed bucket collapses to full-range sampling — see
+# compute_challenges for the degradation path.
+ARCHIVE_AGE_SKEW_FRACTION = 0.1
 # Graduated reward-withhold tiers applied to a validator who misses
 # successive archive-custody epochs.  Index i = withhold% at miss
 # count i; any miss count >= len(tiers)-1 uses the final tier
 # (saturates at 100%).  Three-strike ramp gives operators room to
-# recover from honest disk failure before hitting full withhold.  Miss
-# counter decays by 1 per successfully-completed epoch (floor 0) so
-# an operator who fixes their archive rebuilds goodwill.
+# recover from honest disk failure before hitting full withhold.
+#
+# Miss decay: see ARCHIVE_MISS_DECAY_STREAK — iteration 3c replaced
+# the old per-epoch-decrement rule (attackers could cycle prune/serve
+# with amortized ~50% withhold) with a consecutive-successes rule.
 ARCHIVE_WITHHOLD_TIERS = (0, 25, 50, 100)
+# Miss-counter decay: number of CONSECUTIVE successful epochs
+# required before the miss counter decrements by 1.  Streak is per-
+# validator, persisted in state, and resets on any miss.  3 epochs
+# ≈ 3 days at default cadence — short enough for honest operators
+# recovering from disk failure, long enough that a cycling pruner
+# cannot cheaply wash out reputation.
+ARCHIVE_MISS_DECAY_STREAK = 3
 # Highest miss count the tier table indexes directly.  Counter may
 # exceed this but the tier saturates at 100%.  Kept in sync with the
 # last index of ARCHIVE_WITHHOLD_TIERS.
@@ -1158,6 +1185,13 @@ assert all(
 ), "withhold tiers must be monotonically non-decreasing"
 assert ARCHIVE_BOOTSTRAP_GRACE_BLOCKS > 0, (
     "bootstrap grace must be positive"
+)
+assert 0 < ARCHIVE_AGE_SKEW_FRACTION < 1, (
+    "ARCHIVE_AGE_SKEW_FRACTION must be in (0, 1)"
+)
+assert ARCHIVE_MISS_DECAY_STREAK > 0, (
+    "ARCHIVE_MISS_DECAY_STREAK must be positive — "
+    "1 would make decay equivalent to the old per-epoch rule"
 )
 
 

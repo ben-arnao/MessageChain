@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from messagechain.config import (
+    ARCHIVE_AGE_SKEW_FRACTION,
     ARCHIVE_BURN_REDIRECT_PCT,
     ARCHIVE_CHALLENGE_INTERVAL,
     ARCHIVE_CHALLENGE_K,
@@ -162,6 +163,27 @@ def compute_challenges(
             f"block_hash must be 32 bytes, got {len(block_hash)}"
         )
 
+    # Age-skew split: the FIRST (k+1)//2 challenges sample uniformly
+    # across all history [0, block_number); the REMAINING k - (k+1)//2
+    # challenges sample only within the oldest ARCHIVE_AGE_SKEW_FRACTION
+    # of history [0, age_bucket).  This forces validators to actually
+    # retain ancient blocks — the data least incentivized to hold —
+    # because a pruner keeping only recent blocks fails every
+    # age-skewed challenge deterministically.
+    #
+    # (k+1)//2 biases toward uniform when K is odd so the single-
+    # challenge case (K=1) stays full-range — the compute_challenge
+    # wrapper relies on this, and broad-coverage sampling is the
+    # sensible default when only one challenge is drawn.
+    #
+    # Graceful degradation at small B (bootstrap era): if the age
+    # bucket would be zero-sized, fall back to full-range sampling
+    # for the skewed half.  Math: max(1, floor(B * fraction)).  At
+    # B = 1 this means the sole block is always the target, which
+    # is fine — any validator claiming to hold the chain must hold
+    # block 0.
+    uniform_count = (k + 1) // 2
+    age_bucket = max(1, int(block_number * ARCHIVE_AGE_SKEW_FRACTION))
     challenges: list[ArchiveChallenge] = []
     for i in range(k):
         # Per-index domain separation.  u32 suffix lets K scale to ~4B
@@ -169,8 +191,11 @@ def compute_challenges(
         index_tag = struct.pack(">I", i)
         seed = _h(bytes(block_hash) + _CHALLENGE_DOMAIN_TAG + index_tag)
         seed_int = int.from_bytes(seed, "big")
+        # First half uniform over all history; second half confined
+        # to the oldest age_bucket blocks.
+        modulus = block_number if i < uniform_count else age_bucket
         challenges.append(ArchiveChallenge(
-            target_height=seed_int % block_number,
+            target_height=seed_int % modulus,
             target_leaf_seed=seed_int,
         ))
     return challenges

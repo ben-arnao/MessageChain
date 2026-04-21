@@ -48,6 +48,7 @@ from typing import Iterable
 from messagechain.config import (
     ARCHIVE_BOOTSTRAP_GRACE_BLOCKS,
     ARCHIVE_MAX_MISS_COUNT,
+    ARCHIVE_MISS_DECAY_STREAK,
     ARCHIVE_WITHHOLD_TIERS,
 )
 
@@ -126,23 +127,34 @@ def compute_miss_updates(
     snapshot: ActiveValidatorSnapshot,
     bundles_in_window: Iterable,
     current_misses: dict,
+    current_streaks: dict,
     current_block: int,
     validator_first_active_block: dict,
-) -> dict:
-    """Compute the post-epoch-close miss counter state.
+) -> tuple:
+    """Compute the post-epoch-close miss counter + streak state.
+
+    Iteration 3c: miss decay is now STREAK-BASED.  A miss decrements
+    only after ARCHIVE_MISS_DECAY_STREAK consecutive successful epochs;
+    any miss resets the streak.  This closes the cycling-pruner loophole
+    where a validator could fail 3 epochs (100% withhold), then serve 1
+    successful epoch to fully recover.
 
     For each validator v in the snapshot's active_set:
-        * If bootstrap-exempt: no change (copy through).
+        * If bootstrap-exempt: copy through both counters unchanged.
         * Else, check whether some bundle in the window contains
           (v, h) for EVERY h in the K challenge_heights.
-        * If all K present: decrement miss counter (floor 0).
-        * If any missing: increment miss counter.
+        * If all K present (success):
+            - streak += 1
+            - If streak >= DECAY_STREAK AND miss > 0:
+                miss -= 1, streak = 0
+        * If any missing (miss):
+            - miss += 1, streak = 0
 
     Non-active submitters are ignored — duty is a validator-side rule;
     outside submissions are fine and may still earn the open bounty
     reward separately, but don't affect miss state.
 
-    Returns a NEW dict (doesn't mutate `current_misses`).  Absent
+    Returns (new_misses, new_streaks) — both NEW dicts.  Absent
     entries are implicitly 0; we only materialize non-zero counts to
     keep state lean, and omit a key rather than storing a 0.
 
@@ -154,11 +166,12 @@ def compute_miss_updates(
                                           challenge_block +
                                           ARCHIVE_SUBMISSION_WINDOW).
         current_misses:                   pre-update miss counts.
+        current_streaks:                  pre-update success streaks.
         current_block:                    for bootstrap-grace check.
         validator_first_active_block:    per-entity first-active block.
 
     Notes on determinism:
-        * Iteration is over `sorted(active_set)` so the output dict's
+        * Iteration is over `sorted(active_set)` so the output dicts'
           content is order-invariant across nodes.
         * `bundles_in_window` is read-only; ordering doesn't affect
           result (we compute set membership, not ordered folding).
@@ -175,10 +188,13 @@ def compute_miss_updates(
 
     heights = tuple(snapshot.challenge_heights)
     new_misses: dict = {}
+    new_streaks: dict = {}
 
     # Sort for determinism — frozenset has no guaranteed iteration
     # order across Python builds.
     for eid in sorted(snapshot.active_set):
+        prior_miss = current_misses.get(eid, 0)
+        prior_streak = current_streaks.get(eid, 0)
         if is_bootstrap_exempt(
             entity_id=eid,
             current_block=current_block,
@@ -187,24 +203,40 @@ def compute_miss_updates(
             # Copy through — grace-window validators don't accrue
             # misses and don't earn decrements either (they haven't
             # completed a duty epoch).
-            prior = current_misses.get(eid, 0)
-            if prior:
-                new_misses[eid] = prior
+            if prior_miss:
+                new_misses[eid] = prior_miss
+            if prior_streak:
+                new_streaks[eid] = prior_streak
             continue
 
         fully_credited = all((eid, h) in credited for h in heights)
-        prior = current_misses.get(eid, 0)
         if fully_credited:
-            # Successful epoch → decrement toward 0.
-            new = max(0, prior - 1)
+            # Successful epoch → streak accumulates.
+            streak_after = prior_streak + 1
+            if prior_miss > 0 and streak_after >= ARCHIVE_MISS_DECAY_STREAK:
+                # Decay fires: decrement miss, reset streak.
+                new_miss = prior_miss - 1
+                new_streak = 0
+            else:
+                # Not yet at decay threshold, or already at miss=0.
+                new_miss = prior_miss
+                new_streak = streak_after
+                # At miss=0 the streak is harmless but pointless — don't
+                # let it grow unboundedly.  Cap at the decay threshold
+                # so it can't wrap or bloat state indefinitely.
+                if prior_miss == 0 and new_streak > ARCHIVE_MISS_DECAY_STREAK:
+                    new_streak = 0
         else:
-            # Missed → increment.  No cap on the raw counter; the
-            # withhold_pct tier table saturates at 100% for the
-            # consumer side.
-            new = prior + 1
-        if new:
-            new_misses[eid] = new
-        # new == 0: omit the key entirely (state-lean invariant)
+            # Missed → increment miss, reset streak.  No cap on the raw
+            # miss counter; the withhold_pct tier table saturates at
+            # 100% for the consumer side.
+            new_miss = prior_miss + 1
+            new_streak = 0
+        if new_miss:
+            new_misses[eid] = new_miss
+        if new_streak:
+            new_streaks[eid] = new_streak
+        # 0 values: omit key entirely (state-lean invariant)
 
     # Preserve miss entries for validators NOT in this epoch's active
     # set — they dropped out mid-epoch but may rejoin later, and their
@@ -217,5 +249,14 @@ def compute_miss_updates(
             continue  # already handled above
         if count:
             new_misses[eid] = count
+    # Same preservation rule applies to streaks: a validator who rotated
+    # out mid-epoch keeps their in-flight streak.  If they rejoin a few
+    # epochs later and submit cleanly, their streak picks up where it
+    # left off rather than restarting from zero.
+    for eid, streak in current_streaks.items():
+        if eid in snapshot.active_set:
+            continue
+        if streak:
+            new_streaks[eid] = streak
 
-    return new_misses
+    return new_misses, new_streaks
