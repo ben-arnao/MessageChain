@@ -1012,6 +1012,25 @@ ARCHIVE_BURN_REDIRECT_PCT = 25
 # (~20 KB canonical bytes), well inside the bloat budget.  Tunable
 # via future governance proposal.
 ARCHIVE_CHALLENGE_K = 3
+# Graduated reward-withhold tiers applied to a validator who misses
+# successive archive-custody epochs.  Index i = withhold% at miss
+# count i; any miss count >= len(tiers)-1 uses the final tier
+# (saturates at 100%).  Three-strike ramp gives operators room to
+# recover from honest disk failure before hitting full withhold.  Miss
+# counter decays by 1 per successfully-completed epoch (floor 0) so
+# an operator who fixes their archive rebuilds goodwill.
+ARCHIVE_WITHHOLD_TIERS = (0, 25, 50, 100)
+# Highest miss count the tier table indexes directly.  Counter may
+# exceed this but the tier saturates at 100%.  Kept in sync with the
+# last index of ARCHIVE_WITHHOLD_TIERS.
+ARCHIVE_MAX_MISS_COUNT = len(ARCHIVE_WITHHOLD_TIERS) - 1
+# Bootstrap grace: a newly-joined validator has this many blocks to
+# sync full history before the archive duty applies.  Chosen as
+# 10 challenge epochs so a new operator has ~10 days at current
+# cadence to download history before being scored.  Tradeoff: a
+# malicious joiner can dodge duty for this window, but they've also
+# earned no reputation/rewards yet to exploit.
+ARCHIVE_BOOTSTRAP_GRACE_BLOCKS = 10 * ARCHIVE_CHALLENGE_INTERVAL
 # Carry-only crypto-agility register.  A future governance proposal can
 # widen the accepted proof format (e.g., switch to witness-archive
 # rewards) without a chain reset.  Reserved: 0 traps uninitialized.
@@ -1025,6 +1044,22 @@ assert ARCHIVE_PROOFS_PER_CHALLENGE > 0
 assert ARCHIVE_REWARD > 0
 assert ARCHIVE_SUBMISSION_WINDOW > 0
 assert ARCHIVE_CHALLENGE_K > 0, "ARCHIVE_CHALLENGE_K must be positive"
+assert ARCHIVE_WITHHOLD_TIERS[0] == 0, (
+    "first withhold tier must be 0% (clean validator pays nothing)"
+)
+assert ARCHIVE_WITHHOLD_TIERS[-1] == 100, (
+    "last withhold tier must be 100% (full withhold at max strikes)"
+)
+assert all(0 <= t <= 100 for t in ARCHIVE_WITHHOLD_TIERS), (
+    "every withhold tier must be in [0, 100]"
+)
+assert all(
+    ARCHIVE_WITHHOLD_TIERS[i] <= ARCHIVE_WITHHOLD_TIERS[i + 1]
+    for i in range(len(ARCHIVE_WITHHOLD_TIERS) - 1)
+), "withhold tiers must be monotonically non-decreasing"
+assert ARCHIVE_BOOTSTRAP_GRACE_BLOCKS > 0, (
+    "bootstrap grace must be positive"
+)
 
 
 def is_archive_challenge_block(block_number: int) -> bool:
