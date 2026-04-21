@@ -606,8 +606,10 @@ def _load_or_create_receipt_subtree_keypair(
 
     The keypair is deterministic in private_key + tree_height, so a
     restart reuses the exact same subtree (same root) when the cache
-    is available.  Generation at RECEIPT_SUBTREE_HEIGHT=24 derives 16M
-    leaves — expect minutes on a fresh boot.
+    is available.  At the current RECEIPT_SUBTREE_HEIGHT=16 setting,
+    fresh-boot keygen derives 65k leaves in seconds.  An earlier
+    h=24 setting was reduced after on-VM measurements showed ~36 hours
+    of blocking startup keygen.
 
     The returned KeyPair has its leaf_index_path bound to a DEDICATED
     file (`receipt_leaf_index.json`) that block-signing NEVER touches.

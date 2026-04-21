@@ -1150,12 +1150,12 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 # for BLOCK_TIME_TARGET=600s.  Don't duplicate them here.
 SUBMISSION_FEE = MIN_FEE              # anti-spam; paid to validator regardless of inclusion
 RECEIPT_VERSION = 1                   # on-wire version of SubmissionReceipt
-# Dedicated WOTS+ subtree for receipts.  Receipts consume leaves faster
-# than blocks (per-submission vs per-block), and we want receipt-signing
-# exhaustion to NEVER brick the block-signing tree.  h=24 → 16,777,216
-# leaves → ~6 months at 1 receipt/sec.  Production deployments that
-# see sustained higher throughput can raise this via a governance bump.
-RECEIPT_MERKLE_TREE_HEIGHT = 24
+# NOTE: the actual per-validator receipt-signing tree is
+# RECEIPT_SUBTREE_HEIGHT (defined further down, currently 16).  An
+# earlier RECEIPT_MERKLE_TREE_HEIGHT=24 constant lived here but was
+# never referenced — auditors kept asking "why two receipt-tree
+# heights?" so it was removed in the iter-1 hardening audit.  Don't
+# reintroduce it; configure receipt tree sizing via RECEIPT_SUBTREE_HEIGHT.
 
 # Chain identity — included in all transaction signatures to prevent cross-fork replay.
 # If MessageChain forks, each fork MUST change this value.
