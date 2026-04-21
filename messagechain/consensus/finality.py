@@ -422,6 +422,19 @@ class FinalityCheckpoints:
             >= total_stake_at_target * FINALITY_THRESHOLD_NUMERATOR
         )
         if stake_ok and not already_finalized:
+            # Defense-in-depth: the equivocation gate above precludes
+            # two different hashes reaching 2/3 at the same height on
+            # the honest path.  Hitting a conflict here implies state
+            # corruption or an unforeseen attack — fail loudly rather
+            # than silently overwrite an earlier finalization and
+            # produce arrival-order-dependent divergence across nodes.
+            existing = self.finalized_by_height.get(height)
+            if existing is not None and existing != sh:
+                raise RuntimeError(
+                    f"FinalityCheckpoints.add_vote: conflicting finalization "
+                    f"at height {height}: existing {existing.hex()[:16]} vs "
+                    f"new {sh.hex()[:16]}"
+                )
             self.finalized_hashes.add(sh)
             self.finalized_by_height[height] = sh
             return True
@@ -440,7 +453,21 @@ class FinalityCheckpoints:
 
     def mark_finalized(self, block_hash: bytes, block_number: int):
         """Load a (height, hash) pair directly — used on restart to
-        rehydrate from persistent storage without replaying votes."""
+        rehydrate from persistent storage without replaying votes.
+
+        Defense-in-depth: cold-load with a conflicting hash at the same
+        height is a hard stop.  A node must refuse to start with
+        ambiguous finality rather than silently pick the last-loaded
+        hash (which would depend on chaindb iteration order and could
+        diverge across peers).  Idempotent on identical reload.
+        """
+        existing = self.finalized_by_height.get(block_number)
+        if existing is not None and existing != block_hash:
+            raise RuntimeError(
+                f"FinalityCheckpoints.mark_finalized: conflicting finalized "
+                f"hash at height {block_number}: existing "
+                f"{existing.hex()[:16]} vs new {block_hash.hex()[:16]}"
+            )
         self.finalized_hashes.add(block_hash)
         self.finalized_by_height[block_number] = block_hash
 
