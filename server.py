@@ -863,7 +863,10 @@ def _bootstrap_receipt_subtree(
         )
 
 
-class Server:
+from messagechain.runtime.shared import SharedRuntimeMixin
+
+
+class Server(SharedRuntimeMixin):
     """MessageChain full node with RPC interface for clients."""
 
     def __init__(self, p2p_port: int, rpc_port: int, seed_nodes: list[tuple[str, int]],
@@ -989,51 +992,18 @@ class Server:
         # the configured RPC_AUTH_TOKEN env var or the keyfile, not logs.
         logger.info("RPC auth enabled")
 
-    def _track_seen_tx(self, tx_hash_hex: str):
-        if tx_hash_hex in self._seen_txs:
-            self._seen_txs.move_to_end(tx_hash_hex)
-            return
-        if len(self._seen_txs) >= SEEN_TX_CACHE_SIZE:
-            self._seen_txs.popitem(last=False)
-        self._seen_txs[tx_hash_hex] = True
-
-    def _get_peer_writer(self, address: str):
-        peer = self.peers.get(address)
-        if peer and peer.is_connected and peer.writer:
-            return (peer.writer, peer)
-        return None
-
-    def _on_sync_offense(self, peer_address: str, points: int, reason: str):
-        """Callback for sync-time misbehavior (checkpoint mismatch, stall)."""
-        self.ban_manager.record_offense(peer_address, points, reason)
-
-    def _handle_task_exception(self, task_name: str, task: asyncio.Task) -> None:
-        """Log uncaught exceptions from background tasks so they don't die silently.
-
-        Without this callback, an exception escaping a ``create_task``-launched
-        coroutine is swallowed by asyncio's default handler. The task dies, the
-        server keeps running as a zombie (listening but not producing blocks or
-        syncing), and in a PoS system with an inactivity leak, the operator's
-        stake gets slowly drained to zero before anyone notices. Loud CRITICAL
-        logging is the minimum viable alarm.
-        """
-        if task.cancelled():
-            return
-        exc = task.exception()
-        if exc is None:
-            return
-        logger.critical(
-            f"Background task {task_name} crashed: {exc!r}",
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-
-    def _current_cumulative_weight(self) -> int:
-        """Our best-tip cumulative stake weight, for handshakes."""
-        best = self.blockchain.fork_choice.get_best_tip()
-        return best[2] if best else 0
+    # _track_seen_tx, _get_peer_writer, _on_sync_offense,
+    # _handle_task_exception, _current_cumulative_weight,
+    # _next_connection_type now live on SharedRuntimeMixin.
 
     def _accept_peer_weight(self, claimed: int) -> int:
-        """Sanity-cap a peer-reported cumulative weight. See Node._accept_peer_weight."""
+        """Sanity-cap a peer-reported cumulative weight. See Node._accept_peer_weight.
+
+        NOT on the shared mixin: this implementation has drifted from
+        node.py's version (server.py is more defensive — sanitizes
+        non-int / negative claims before capping).  Reconciliation is
+        logged as a B-small follow-up; for now both copies stay.
+        """
         from messagechain.network.node import (
             PEER_WEIGHT_CAP_MULTIPLIER, PEER_WEIGHT_CAP_FLOOR,
         )
@@ -1044,22 +1014,6 @@ class Server:
             self._current_cumulative_weight() * PEER_WEIGHT_CAP_MULTIPLIER,
         )
         return min(claimed, cap)
-
-    def _next_connection_type(self) -> ConnectionType:
-        """Decide the ConnectionType for the next outbound slot."""
-        full_relay_count = sum(
-            1 for p in self.peers.values()
-            if p.is_connected and p.connection_type == ConnectionType.FULL_RELAY
-        )
-        block_only_count = sum(
-            1 for p in self.peers.values()
-            if p.is_connected and p.connection_type == ConnectionType.BLOCK_RELAY_ONLY
-        )
-        if full_relay_count < OUTBOUND_FULL_RELAY_SLOTS:
-            return ConnectionType.FULL_RELAY
-        if block_only_count < OUTBOUND_BLOCK_RELAY_ONLY_SLOTS:
-            return ConnectionType.BLOCK_RELAY_ONLY
-        return ConnectionType.FULL_RELAY
 
     def set_wallet(self, wallet_id_hex: str):
         """Set which wallet receives block rewards and fees."""
@@ -2453,26 +2407,7 @@ class Server:
         }}
 
     # ── Block Production ────────────────────────────────────────────
-
-    async def _block_production_loop(self):
-        """Slot-aligned block production. Fees + rewards go to the configured wallet.
-
-        Shares timing/rotation/RANDAO logic with messagechain/network/node.py
-        via messagechain.consensus.block_producer so the two implementations
-        cannot drift.
-        """
-        from messagechain.consensus import block_producer
-
-        await asyncio.sleep(1)
-
-        while self._running:
-            try:
-                await self._try_produce_block()
-            except Exception:
-                logger.exception("Block production iteration failed")
-
-            sleep_seconds = block_producer.next_wake_seconds(self.blockchain)
-            await asyncio.sleep(sleep_seconds)
+    # _block_production_loop now lives on SharedRuntimeMixin.
 
     def _try_produce_block_sync(self):
         """CPU-bound block production (runs in thread pool).
@@ -2642,15 +2577,7 @@ class Server:
                     await self.syncer.start_sync()
 
     # ── P2P Network ─────────────────────────────────────────────────
-
-    def _msg_category(self, msg_type: MessageType) -> str:
-        """Map message type to rate limit category.
-
-        Delegates to the shared dispatch module so Node and Server can
-        never drift on rate-limit policy (they did in the past).
-        """
-        from messagechain.network.dispatch import message_category
-        return message_category(msg_type)
+    # _msg_category now lives on SharedRuntimeMixin.
 
     async def _handle_p2p_connection(self, reader, writer):
         addr = writer.get_extra_info("peername")

@@ -71,7 +71,11 @@ class TestNodeHandleTaskException(unittest.TestCase):
             # Yield one more loop tick so done_callbacks run.
             await asyncio.sleep(0)
 
-        with patch("messagechain.network.node.logger") as mock_logger:
+        # _handle_task_exception was unified onto SharedRuntimeMixin,
+        # so logging happens via messagechain.runtime.shared.logger
+        # regardless of whether the caller was Node or Server.  Patch
+        # there to observe the CRITICAL call.
+        with patch("messagechain.runtime.shared.logger") as mock_logger:
             _run(run())
             # Helper must have issued a CRITICAL log with the task name
             # and the original exception included.
@@ -158,7 +162,10 @@ class TestServerHandleTaskException(unittest.TestCase):
                 pass
             await asyncio.sleep(0)
 
-        with patch.object(self.server_module, "logger") as mock_logger:
+        # _handle_task_exception was unified onto SharedRuntimeMixin,
+        # so logging happens via messagechain.runtime.shared.logger
+        # regardless of whether the caller was Node or Server.
+        with patch("messagechain.runtime.shared.logger") as mock_logger:
             _run(run())
             self.assertTrue(mock_logger.critical.called)
             call_args = mock_logger.critical.call_args
