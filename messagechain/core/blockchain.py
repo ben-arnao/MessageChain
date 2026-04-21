@@ -6759,6 +6759,14 @@ class Blockchain:
         # data must not persist.  Note: finalized_checkpoints (persistent,
         # long-range-attack defense) is deliberately NOT reset.
         self.finality = FinalityTracker()
+        # Reset inactivity-leak stall counter.  Pair with the finality
+        # tracker: reorg replay rebuilds finality from scratch, so the
+        # "blocks since finality" counter must also restart from 0.
+        # Leaving it stale lets replay stack a fresh leak window on top
+        # of the old one — if finality stalls again after the merge,
+        # honest validators take a SECOND quadratic inactivity-leak
+        # penalty for the same outage.
+        self.blocks_since_last_finalization = 0
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
