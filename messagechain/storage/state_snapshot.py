@@ -128,7 +128,12 @@ from messagechain.config import (
 #         validator_archive_misses         (bytes→int dict)
 #         validator_first_active_block     (bytes→int dict)
 #         archive_active_snapshot          (optional struct: flag + body)
-STATE_SNAPSHOT_VERSION = 7  # wire format version for encode/decode
+# v8: added validator_archive_success_streak — per-validator count of
+#     consecutive successful epochs, read by the iteration-3c
+#     streak-based decay rule.  Decay timing affects withhold_pct on
+#     the next reward block, so two nodes must agree bit-for-bit on
+#     streak state.  Trails the v7 sections.
+STATE_SNAPSHOT_VERSION = 8  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -203,6 +208,9 @@ _TAG_INCLUSION_LIST_VIOLATIONS = b"ilist_vio"
 _TAG_ARCHIVE_MISSES = b"adm"         # bytes→int miss counter
 _TAG_ARCHIVE_FIRST_ACTIVE = b"adfa"  # bytes→int first-active-block
 _TAG_ARCHIVE_OPEN_SNAP = b"adsnap"   # optional open challenge epoch
+# v8: success-streak counter — per-validator count of consecutive
+# successful epochs, used by streak-based decay (iter 3c).
+_TAG_ARCHIVE_STREAK = b"adstreak"    # bytes→int success streak
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -322,6 +330,12 @@ def serialize_state(blockchain) -> dict:
         ),
         "archive_active_snapshot": getattr(
             blockchain, "archive_active_snapshot", None,
+        ),
+        # v8: consecutive-success streak counter.  Part of the state
+        # root because decay timing (which relies on streak >= DECAY
+        # threshold) affects withhold_pct on the next reward block.
+        "validator_archive_success_streak": dict(
+            getattr(blockchain, "validator_archive_success_streak", {})
         ),
     }
 
@@ -477,6 +491,11 @@ def deserialize_state(snapshot: dict) -> dict:
     out.setdefault("validator_archive_misses", {})
     out.setdefault("validator_first_active_block", {})
     out.setdefault("archive_active_snapshot", None)
+    # Pre-v8 snapshots lack the success-streak counter.  Migrating
+    # chains start with empty streaks — the decay rule re-builds them
+    # from block replay going forward (streak accumulates only after
+    # activation, so starting empty is correct, not lossy).
+    out.setdefault("validator_archive_success_streak", {})
     return out
 
 
@@ -647,6 +666,11 @@ def compute_state_root(snapshot: dict) -> bytes:
             [_h(_TAG_ARCHIVE_OPEN_SNAP
                 + _encode_active_snapshot(snap["archive_active_snapshot"]))],
         ),
+        # v8: success streaks participate in the root so two nodes
+        # agree on when decay fires for each validator.
+        _TAG_ARCHIVE_STREAK: _merkle(_entries_for_section(
+            _TAG_ARCHIVE_STREAK,
+            snap["validator_archive_success_streak"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -879,6 +903,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes→int  dict>   validator_archive_misses       (v7+)
         <bytes→int  dict>   validator_first_active_block   (v7+)
         <optional struct>   archive_active_snapshot        (v7+)
+        <bytes→int  dict>   validator_archive_success_streak (v8+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -937,6 +962,8 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_int_dict(snap["validator_archive_misses"])
     out += _encode_bytes_int_dict(snap["validator_first_active_block"])
     out += _encode_active_snapshot(snap["archive_active_snapshot"])
+    # v8: success-streak counter, strictly appended after v7 fields.
+    out += _encode_bytes_int_dict(snap["validator_archive_success_streak"])
     return bytes(out)
 
 
@@ -1012,6 +1039,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     validator_archive_misses, off = _decode_bytes_int_dict(blob, off)
     validator_first_active_block, off = _decode_bytes_int_dict(blob, off)
     archive_active_snapshot, off = _decode_active_snapshot(blob, off)
+    # v8+: success-streak counter.  Always present on v8+ blobs.
+    validator_archive_success_streak, off = _decode_bytes_int_dict(
+        blob, off,
+    )
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1050,4 +1081,7 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "validator_archive_misses": validator_archive_misses,
         "validator_first_active_block": validator_first_active_block,
         "archive_active_snapshot": archive_active_snapshot,
+        "validator_archive_success_streak": (
+            validator_archive_success_streak
+        ),
     }

@@ -110,10 +110,12 @@ def _minimal_snap(**overrides) -> dict:
         # doesn't KeyError):
         "inclusion_list_active": {},
         "inclusion_list_processed_violations": set(),
-        # New v7 fields (this iteration):
+        # v7 fields:
         "validator_archive_misses": {},
         "validator_first_active_block": {},
         "archive_active_snapshot": None,
+        # v8 field (iter 3c success streak):
+        "validator_archive_success_streak": {},
     }
     snap.update(overrides)
     return snap
@@ -125,10 +127,10 @@ def _minimal_snap(**overrides) -> dict:
 
 
 class TestVersionBump(unittest.TestCase):
-    def test_version_is_7(self):
-        """v7 is the wire format for this iteration — codifies the
-        three duty fields (v6 was taken by inclusion-list)."""
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 7)
+    def test_version_is_at_least_7(self):
+        """This iteration introduced v7 (duty fields).  Later
+        iterations may bump further — assert the floor only."""
+        self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 7)
 
 
 # ---------------------------------------------------------------------------

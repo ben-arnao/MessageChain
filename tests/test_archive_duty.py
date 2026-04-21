@@ -253,9 +253,11 @@ class TestComputeMissUpdates(unittest.TestCase):
         self.v2 = _eid(2)
         self.v3 = _eid(3)
 
-    def test_full_submission_all_heights_decrements_miss(self):
-        """Validator submits valid proofs for ALL K heights → miss
-        counter decrements (floor 0).
+    def test_full_submission_advances_streak_not_miss(self):
+        """Under iteration-3c streak-based decay, a single successful
+        epoch advances the success streak but does NOT decrement the
+        miss counter on its own.  Decay fires only after
+        ARCHIVE_MISS_DECAY_STREAK consecutive successes.
         """
         snap = ActiveValidatorSnapshot(
             challenge_block=1000,
@@ -264,14 +266,18 @@ class TestComputeMissUpdates(unittest.TestCase):
         )
         bundles = [_bundle_for({self.v1: list(self.heights)})]
         old_misses = {self.v1: 2}
-        new_misses = compute_miss_updates(
+        new_misses, new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses=old_misses,
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0},
         )
-        self.assertEqual(new_misses[self.v1], 1)
+        # Miss unchanged after a single success.
+        self.assertEqual(new_misses[self.v1], 2)
+        # Streak starts counting toward the decay threshold.
+        self.assertEqual(new_streaks[self.v1], 1)
 
     def test_partial_submission_missing_one_height_increments(self):
         """Partial credit is no credit: missing one of K heights
@@ -285,10 +291,11 @@ class TestComputeMissUpdates(unittest.TestCase):
         # Submit only 2 of 3 heights
         bundles = [_bundle_for({self.v1: [100, 200]})]
         old_misses = {self.v1: 0}
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses=old_misses,
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0},
         )
@@ -303,10 +310,11 @@ class TestComputeMissUpdates(unittest.TestCase):
         )
         # v1 submits, v2 doesn't.
         bundles = [_bundle_for({self.v1: list(self.heights)})]
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses={},
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0, self.v2: 0},
         )
@@ -323,10 +331,11 @@ class TestComputeMissUpdates(unittest.TestCase):
             challenge_heights=self.heights,
         )
         bundles = [_bundle_for({self.v1: list(self.heights)})]
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses={self.v1: 0},
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0},
         )
@@ -345,10 +354,11 @@ class TestComputeMissUpdates(unittest.TestCase):
             challenge_heights=self.heights,
         )
         bundles = []  # no one submitted
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses={},
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 999},  # joined last block
         )
@@ -370,16 +380,18 @@ class TestComputeMissUpdates(unittest.TestCase):
             _bundle_for({self.v1: [200]}),
             _bundle_for({self.v1: [300]}),
         ]
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses={self.v1: 1},
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0},
         )
-        # v1 covered all K heights via multiple bundles → decrement.
-        # state-lean invariant: 0 entries are omitted, so use .get.
-        self.assertEqual(new_misses.get(self.v1, 0), 0)
+        # v1 covered all K heights via multiple bundles → streak++
+        # but (under new iter-3c rule) miss does NOT decrement after
+        # a single success.  Miss stays where it was.
+        self.assertEqual(new_misses.get(self.v1, 0), 1)
 
     def test_non_active_submitters_do_not_affect_misses(self):
         """A non-validator who happens to submit a proof bundle is
@@ -396,10 +408,11 @@ class TestComputeMissUpdates(unittest.TestCase):
             self.v1: list(self.heights),
             non_active: list(self.heights),
         })]
-        new_misses = compute_miss_updates(
+        new_misses, _new_streaks = compute_miss_updates(
             snapshot=snap,
             bundles_in_window=bundles,
             current_misses={},
+            current_streaks={},
             current_block=1000 + 50,
             validator_first_active_block={self.v1: 0},
         )
@@ -425,12 +438,14 @@ class TestComputeMissUpdates(unittest.TestCase):
 
         out_a = compute_miss_updates(
             snapshot=snap, bundles_in_window=bundles_a,
-            current_misses={}, current_block=1000 + 50,
+            current_misses={}, current_streaks={},
+            current_block=1000 + 50,
             validator_first_active_block=first_active,
         )
         out_b = compute_miss_updates(
             snapshot=snap, bundles_in_window=bundles_b,
-            current_misses={}, current_block=1000 + 50,
+            current_misses={}, current_streaks={},
+            current_block=1000 + 50,
             validator_first_active_block=first_active,
         )
         self.assertEqual(out_a, out_b)

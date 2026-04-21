@@ -375,6 +375,13 @@ class Blockchain:
         self.archive_active_snapshot = None  # Optional[ActiveValidatorSnapshot]
         self.validator_archive_misses: dict[bytes, int] = {}
         self.validator_first_active_block: dict[bytes, int] = {}
+        # Iteration 3c streak-based decay: per-validator count of
+        # consecutive successful epochs.  Resets on any miss; when
+        # it reaches ARCHIVE_MISS_DECAY_STREAK the miss counter
+        # decrements by 1 and the streak resets to 0.  Persisted in
+        # state snapshot (v8) and state root, so two nodes always
+        # agree on decay timing.
+        self.validator_archive_success_streak: dict[bytes, int] = {}
 
         # Attester-reward escrow (stage 3).  Bootstrap-era committee
         # rewards sit here for escrow_blocks_for_progress(progress)
@@ -1189,6 +1196,10 @@ class Blockchain:
         )
         self.archive_active_snapshot = snap.get(
             "archive_active_snapshot", None,
+        )
+        # v8: success streaks for streak-based decay (iter 3c).
+        self.validator_archive_success_streak = dict(
+            snap.get("validator_archive_success_streak", {})
         )
 
         # Finalized checkpoints (long-range-attack defense — must carry
@@ -6648,16 +6659,18 @@ class Blockchain:
                 if bundle_here is not None and window_start <= height < window_end:
                     bundles.append(bundle_here)
 
-            new_misses = compute_miss_updates(
+            new_misses, new_streaks = compute_miss_updates(
                 snapshot=snap,
                 bundles_in_window=bundles,
                 current_misses=self.validator_archive_misses,
+                current_streaks=self.validator_archive_success_streak,
                 current_block=height,
                 validator_first_active_block=(
                     self.validator_first_active_block
                 ),
             )
             self.validator_archive_misses = new_misses
+            self.validator_archive_success_streak = new_streaks
             self.archive_active_snapshot = None
 
         # 3. Capture a new snapshot at a challenge block.
@@ -7497,6 +7510,7 @@ class Blockchain:
         self.archive_active_snapshot = None
         self.validator_archive_misses = {}
         self.validator_first_active_block = {}
+        self.validator_archive_success_streak = {}
         # Reset first-divestment stake reference.  This is NOT a security
         # ratchet — it's the "stake at first observed divestment" anchor
         # used to measure drain debt.  On a reorg that rolls past the
