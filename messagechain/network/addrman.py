@@ -50,18 +50,24 @@ def _network_group(ip: str) -> str:
     """Extract network group from an IP address.
 
     IPv4: groups by /16 (first two octets).
-    IPv6: groups by /48 (first three hextets).
-    This prevents a single AS from dominating the address tables.
+    IPv6: groups by /64 (standard end-site subnet, matching Bitcoin Core
+    and messagechain.network.ban._normalize_ip_for_bucket).  Grouping
+    by /48 here previously let a sybil with a single /48 share one
+    per-source addrman bucket across 65,536 /64s — defeating both the
+    addrman source cap and the ban manager's /64 aggregation.
     """
-    parts = ip.split(".")
-    if len(parts) == 4:
-        return f"{parts[0]}.{parts[1]}"
-    # IPv6: strip brackets and group by /48 (first 3 hextets)
-    v6 = ip.strip("[]")
-    hextets = v6.split(":")
-    if len(hextets) >= 3:
-        return ":".join(hextets[:3])
-    return v6
+    # Use ipaddress for canonical form so "2001:db8::1" and its expanded
+    # equivalent produce the same group key (a naive string split on ':'
+    # loses zero-run compression).
+    try:
+        addr = ipaddress.ip_address(ip.strip("[]"))
+    except ValueError:
+        return ip
+    if isinstance(addr, ipaddress.IPv4Address):
+        octets = str(addr).split(".")
+        return f"{octets[0]}.{octets[1]}"
+    net = ipaddress.ip_network(f"{addr}/64", strict=False)
+    return str(net)
 
 
 @dataclass
