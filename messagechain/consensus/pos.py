@@ -284,6 +284,17 @@ class ProofOfStake:
             # without invalidating the merkle root.
             + [tx.tx_hash for tx in bogus_rej_txs]
         )
+        # Archive-proof bundle (aggregated custody commitment) folds in
+        # as a single tx_hash so a relayer cannot strip or mutate it in
+        # transit.  Derived from cust_proofs — when cust_proofs is empty
+        # there is nothing to commit to, so no hash enters the merkle
+        # input.
+        if cust_proofs:
+            from messagechain.consensus.archive_challenge import (
+                ArchiveProofBundle,
+            )
+            _bundle_for_root = ArchiveProofBundle.from_proofs(cust_proofs)
+            tx_hashes = tx_hashes + [_bundle_for_root.tx_hash]
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
         # Inclusion attestation: commit to mempool state at proposal time.
