@@ -594,11 +594,27 @@ CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
     ("35.237.211.12", RPC_DEFAULT_PORT),
 ]
 MAX_PEERS = 50
-HANDSHAKE_TIMEOUT = 5  # seconds
+HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
+                        # over high-latency links (sat, constrained mobile).
+                        # A TLS + MC handshake can take 4+ round-trips; at
+                        # 300ms RTT that consumes ~1.2s before any margin.
+                        # Honest peers on slow connections should not fail
+                        # first-contact for want of a few extra seconds.
+PEER_READ_TIMEOUT = 300  # seconds - idle timeout for post-handshake peer
+                         # reads.  Previously a magic 300 literal scattered
+                         # across server.py + network/node.py (4 sites);
+                         # centralized so ops changes touch one knob.
 
 # Peer banning
 BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
 BAN_DURATION = 86400      # ban length in seconds (24 hours)
+DECAY_INTERVAL = 3600     # score decays by 1 every hour of good behavior
+MAX_TRACKED_PEERS = 5000  # memory cap for peer score tracking
+# The four ban-accounting knobs above are the authoritative values.
+# messagechain/network/ban.py imports from here — do NOT redefine them
+# in ban.py (iter 5 found a dead-code duplication that silently made
+# config_local.py overrides no-ops for operators trying to tighten
+# peer policing).
 
 # Censorship resistance — forced inclusion list (attester-enforced)
 #

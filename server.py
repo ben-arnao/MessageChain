@@ -32,7 +32,7 @@ from messagechain.config import (
     DEFAULT_PORT, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
-    HANDSHAKE_TIMEOUT, MAX_PEERS,
+    HANDSHAKE_TIMEOUT, PEER_READ_TIMEOUT, MAX_PEERS,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -2611,7 +2611,7 @@ class Server:
         first_message = True
         try:
             while self._running:
-                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                timeout = HANDSHAKE_TIMEOUT if first_message else PEER_READ_TIMEOUT
                 try:
                     msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
                 except asyncio.TimeoutError:
@@ -2664,7 +2664,7 @@ class Server:
             await write_message(writer, handshake)
             while self._running and peer.is_connected:
                 try:
-                    msg = await asyncio.wait_for(read_message(reader), timeout=300)
+                    msg = await asyncio.wait_for(read_message(reader), timeout=PEER_READ_TIMEOUT)
                 except asyncio.TimeoutError:
                     logger.debug(f"Peer {addr} read timed out")
                     break

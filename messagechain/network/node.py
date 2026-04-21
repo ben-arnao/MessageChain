@@ -520,7 +520,7 @@ class Node:
         opens a connection and simply never sends data. A peer that stays
         silent for longer than the timeout is disconnected.
         """
-        from messagechain.config import HANDSHAKE_TIMEOUT
+        from messagechain.config import HANDSHAKE_TIMEOUT, PEER_READ_TIMEOUT
         addr = writer.get_extra_info("peername")
         address = f"{addr[0]}:{addr[1]}"
         logger.info(f"Incoming connection from {address}")
@@ -558,7 +558,7 @@ class Node:
         first_message = True
         try:
             while self._running:
-                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                timeout = HANDSHAKE_TIMEOUT if first_message else PEER_READ_TIMEOUT
                 try:
                     msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
                 except asyncio.TimeoutError:
@@ -685,7 +685,7 @@ class Node:
             logger.debug(f"Skipping banned peer {addr}")
             return
 
-        from messagechain.config import HANDSHAKE_TIMEOUT
+        from messagechain.config import HANDSHAKE_TIMEOUT, PEER_READ_TIMEOUT
         from messagechain import config as _cfg
         client_ssl = (
             create_client_ssl_context()
@@ -740,7 +740,7 @@ class Node:
             # Listen for messages with a bounded idle timeout
             first_message = True
             while self._running and peer.is_connected:
-                timeout = HANDSHAKE_TIMEOUT if first_message else 300
+                timeout = HANDSHAKE_TIMEOUT if first_message else PEER_READ_TIMEOUT
                 try:
                     msg = await asyncio.wait_for(read_message(reader), timeout=timeout)
                 except asyncio.TimeoutError:

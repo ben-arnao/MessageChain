@@ -40,11 +40,13 @@ def _normalize_ip_for_bucket(ip_str: str) -> str:
     net = ipaddress.ip_network(f"{addr}/64", strict=False)
     return str(net)
 
-# Thresholds
-BAN_THRESHOLD = 100       # score at which a peer gets banned
-BAN_DURATION = 86400      # 24 hours in seconds
-DECAY_INTERVAL = 3600     # score decays by 1 every hour of good behavior
-MAX_TRACKED_PEERS = 5000  # limit memory usage for tracking
+# Thresholds - authoritative definitions live in messagechain.config.
+# Importing via the config module so config_local.py overrides actually
+# take effect (iter 5 audit found these were previously redefined here,
+# silently breaking any operator's attempt to tune ban policy).
+from messagechain.config import (
+    BAN_THRESHOLD, BAN_DURATION, DECAY_INTERVAL, MAX_TRACKED_PEERS,
+)
 # Non-decaying cumulative offense ceiling. A patient attacker who offends
 # just under BAN_THRESHOLD and waits for decay to reset the score can
 # otherwise misbehave indefinitely. This "lifetime" counter never decays,
