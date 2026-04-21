@@ -156,8 +156,17 @@ class Blockchain:
     - Persistent (SQLite): pass a ChainDB instance
     """
 
-    def __init__(self, db=None):
+    def __init__(self, db=None, trusted_checkpoints=None):
         self.db = db  # optional ChainDB for persistence
+        # Weak-subjectivity checkpoints — long-range-attack defense.
+        # The gate lives in add_block so EVERY block-entry path inherits
+        # it (IBD, ANNOUNCE_BLOCK, RESPONSE_BLOCK, reorg replay).  Keyed
+        # by block_number → expected block_hash (32 bytes).  Accepts
+        # either a list of WeakSubjectivityCheckpoint objects (duck-typed:
+        # .block_number + .block_hash) or a pre-built dict.
+        self._trusted_checkpoints: dict[int, bytes] = {}
+        if trusted_checkpoints is not None:
+            self.set_trusted_checkpoints(trusted_checkpoints)
         self.chain: list[Block] = []
         self.supply = SupplyTracker()
         self.base_fee: int = self.supply.base_fee  # mirror for easy access
@@ -400,6 +409,35 @@ class Blockchain:
         # If db exists, try to load persisted state
         if self.db is not None:
             self._load_from_db()
+
+    def set_trusted_checkpoints(self, checkpoints) -> None:
+        """Install (or refresh) the weak-subjectivity checkpoint set.
+
+        Called at Node/Server startup after loading from config +
+        data_dir/checkpoints.json, and can be called again later if the
+        operator ships a newer checkpoint file.  Replaces the current
+        set entirely (no merge) so removing a stale checkpoint is
+        possible from the operator side.
+
+        Accepts either:
+          - list[WeakSubjectivityCheckpoint] (or any duck-typed object
+            exposing .block_number:int and .block_hash:bytes)
+          - dict[int, bytes] mapping block_number → expected block_hash
+        """
+        new_map: dict[int, bytes] = {}
+        if isinstance(checkpoints, dict):
+            for bn, bh in checkpoints.items():
+                if not isinstance(bn, int) or not isinstance(bh, (bytes, bytearray)):
+                    continue
+                new_map[int(bn)] = bytes(bh)
+        else:
+            for cp in (checkpoints or []):
+                bn = getattr(cp, "block_number", None)
+                bh = getattr(cp, "block_hash", None)
+                if not isinstance(bn, int) or not isinstance(bh, (bytes, bytearray)):
+                    continue
+                new_map[bn] = bytes(bh)
+        self._trusted_checkpoints = new_map
 
     def _load_from_db(self):
         """Restore chain state from persistent storage on startup."""
@@ -6228,6 +6266,24 @@ class Blockchain:
 
     def add_block(self, block: Block) -> tuple[bool, str]:
         """Validate and append a block, updating state (fees + inflation)."""
+        # ── Weak-subjectivity checkpoint gate ───────────────────────────
+        # Universal long-range-attack defense: if this block's height is
+        # checkpointed and its hash doesn't match, reject.  Lives here
+        # (not only in sync.py) so ANNOUNCE_BLOCK / RESPONSE_BLOCK /
+        # reorg-replay all inherit the gate.  The network layer turns
+        # this "Checkpoint violation..." return into an
+        # OFFENSE_CHECKPOINT_VIOLATION against the offending peer; the
+        # Blockchain itself is peer-agnostic so it just reports the fact.
+        if self._trusted_checkpoints:
+            bn = block.header.block_number
+            expected = self._trusted_checkpoints.get(bn)
+            if expected is not None and block.block_hash != expected:
+                return False, (
+                    f"Checkpoint violation at height {bn}: got "
+                    f"{block.block_hash.hex()[:16]}... expected "
+                    f"{expected.hex()[:16]}..."
+                )
+
         if self.height == 0:
             # Validate genesis block structure
             if block.header.block_number != 0:
