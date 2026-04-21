@@ -3507,6 +3507,27 @@ class Blockchain:
                 )
         return True, "OK"
 
+    def _validate_authority_tx_sizes(self, authority_txs) -> tuple[bool, str]:
+        """Per-tx byte ceiling on authority txs.
+
+        Safety rail that complements the per-block COUNT cap
+        (MAX_AUTHORITY_TXS_PER_BLOCK).  A real authority tx is
+        dominated by its ~2.8 KB WOTS+ signature and can't
+        meaningfully grow beyond that; the cap is here to reject
+        malformed or future-incompatible variants on size alone
+        before any signature verification.
+        """
+        from messagechain.config import MAX_AUTHORITY_TX_BYTES
+        for atx in authority_txs:
+            size = len(atx.to_bytes())
+            if size > MAX_AUTHORITY_TX_BYTES:
+                tx_hash_hex = getattr(atx, "tx_hash", b"").hex()[:16]
+                return False, (
+                    f"Authority tx {tx_hash_hex} exceeds size cap: "
+                    f"{size} > {MAX_AUTHORITY_TX_BYTES} bytes"
+                )
+        return True, "OK"
+
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
         """Validate all attestations included in a block.
 
@@ -4305,6 +4326,15 @@ class Blockchain:
                     f"Invalid authority tx {atx.tx_hash.hex()[:16]}: "
                     f"fee {atx.fee} below current base_fee {current_base_fee}"
                 )
+        # Safety rail: reject any authority tx whose serialized size
+        # exceeds the per-tx byte ceiling.  Checked after the fee
+        # gate so an obviously-oversized tx can't burn signature-
+        # verification CPU.
+        ok, reason = self._validate_authority_tx_sizes(
+            getattr(block, "authority_txs", []),
+        )
+        if not ok:
+            return False, reason
         for stx in getattr(block, "stake_transactions", []):
             if stx.fee < current_base_fee:
                 return False, (

@@ -1280,6 +1280,13 @@ MAX_VALIDATOR_SIGNATURES_PER_BLOCK = 200
 MAX_GOVERNANCE_TXS_PER_BLOCK = 16
 MAX_AUTHORITY_TXS_PER_BLOCK = 16
 MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK = 16
+# Per-tx byte ceiling for authority txs (SetAuthorityKey / Revoke /
+# KeyRotation).  Each authority tx is structurally bounded by its
+# ~2.8 KB WOTS+ signature; this cap is a safety rail that catches
+# malformed or future-incompatible variants before they land as
+# unpriced permanent data.  Headroom above the real ~2.8 KB size
+# keeps legitimate txs safe while closing the oversize escape hatch.
+MAX_AUTHORITY_TX_BYTES = 3_200
 # A finality vote for a block older than FINALITY_VOTE_MAX_AGE blocks is
 # rejected — prevents spam gossip of votes targeting ancient blocks that
 # are already beyond the rewrite horizon anyway.  10 × FINALITY_INTERVAL

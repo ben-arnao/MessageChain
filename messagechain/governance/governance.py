@@ -959,6 +959,14 @@ class GovernanceTracker:
 
 MAX_PROPOSAL_TITLE_LENGTH = 200
 MAX_PROPOSAL_DESCRIPTION_LENGTH = 10_000
+# UTF-8 byte caps close the emoji/CJK amplification gap.  A 200-char
+# title can be 800 bytes of emoji; a 10k-char description can be 40
+# KB.  Because every byte of an admitted governance tx is permanent,
+# the on-chain ceiling is the byte count, not the character count.
+# Set to 2x the char cap so ASCII inputs always pass (same UX as
+# before) while pure emoji hits the cap at half the char count.
+MAX_PROPOSAL_TITLE_BYTES = 400
+MAX_PROPOSAL_DESCRIPTION_BYTES = 20_000
 
 
 def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
@@ -971,6 +979,10 @@ def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
     if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
         return False
     if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
+        return False
+    if len(tx.title.encode("utf-8")) > MAX_PROPOSAL_TITLE_BYTES:
+        return False
+    if len(tx.description.encode("utf-8")) > MAX_PROPOSAL_DESCRIPTION_BYTES:
         return False
     if tx.reference_hash and len(tx.reference_hash) != 32:
         return False
@@ -1000,5 +1012,16 @@ def verify_treasury_spend(tx: TreasurySpendTransaction, public_key: bytes) -> bo
         return False
     if tx.recipient_id == TREASURY_ENTITY_ID:
         return False  # treasury cannot send to itself
+    # Same length/byte caps as ProposalTransaction — treasury-spend
+    # proposals were missing these entirely, which left their
+    # title/description fields as an unbounded escape hatch.
+    if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
+        return False
+    if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
+        return False
+    if len(tx.title.encode("utf-8")) > MAX_PROPOSAL_TITLE_BYTES:
+        return False
+    if len(tx.description.encode("utf-8")) > MAX_PROPOSAL_DESCRIPTION_BYTES:
+        return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)
