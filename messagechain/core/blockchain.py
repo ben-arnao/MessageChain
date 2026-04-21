@@ -29,7 +29,10 @@ from messagechain.config import (
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
     EVIDENCE_INCLUSION_WINDOW, EVIDENCE_EXPIRY_BLOCKS,
 )
-from messagechain.core.block import Block, compute_merkle_root, compute_state_root, create_genesis_block
+from messagechain.core.block import (
+    Block, compute_merkle_root, compute_state_root, create_genesis_block,
+    canonical_block_tx_hashes,
+)
 from messagechain.core.state_tree import SparseMerkleTree
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
@@ -4137,21 +4140,18 @@ class Blockchain:
         # stripping them in transit.  FinalityVotes use consensus_hash
         # (no tx_hash field; they're not transactions) in the same
         # commitment position so a stripped vote fails merkle verification.
-        tx_hashes = (
-            [tx.tx_hash for tx in all_txs]
-            + [tx.tx_hash for tx in block.slash_transactions]
-            + [tx.tx_hash for tx in block.governance_txs]
-            + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
-            + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
-            + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
-            + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
-            + [p.tx_hash for p in getattr(block, "custody_proofs", [])]
-            + [tx.tx_hash for tx in getattr(block, "censorship_evidence_txs", [])]
-            + [tx.tx_hash for tx in getattr(block, "bogus_rejection_evidence_txs", [])]
-        )
-        # Archive-proof bundle: commit the aggregated custody blob so
-        # it cannot be stripped in transit.  Derivation-integrity
-        # (bundle matches custody_proofs) is enforced separately below.
+        # Canonical tx-hash list — single source of truth across this
+        # validator, the fork-path validator, pos.create_block, and
+        # spv.generate_merkle_proof.  Includes the archive_proof_bundle
+        # hash derived from custody_proofs when present.
+        tx_hashes = canonical_block_tx_hashes(block)
+
+        # Derivation-integrity check for archive_proof_bundle: whatever
+        # the proposer placed in the block-body bundle slot must match
+        # what the canonical helper just derived from custody_proofs.
+        # A forged bundle fails merkle verification regardless, but
+        # catching it here gives a clear reason rather than a cryptic
+        # root mismatch.
         _cust_proofs_for_bundle = getattr(block, "custody_proofs", [])
         if _cust_proofs_for_bundle:
             from messagechain.consensus.archive_challenge import (
@@ -4160,12 +4160,6 @@ class Blockchain:
             _expected_bundle = _ArchiveProofBundle.from_proofs(
                 _cust_proofs_for_bundle,
             )
-            tx_hashes = tx_hashes + [_expected_bundle.tx_hash]
-            # Derivation-integrity check: whatever the proposer placed
-            # in the block-body bundle slot must match what we just
-            # derived from custody_proofs.  A forged bundle fails this
-            # check even before merkle_root comparison — catch it with
-            # a clear reason rather than a cryptic root mismatch.
             actual_bundle = getattr(block, "archive_proof_bundle", None)
             if actual_bundle is None:
                 return False, (
@@ -4946,16 +4940,15 @@ class Blockchain:
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds limit"
 
-        # Merkle root — includes governance, authority, and stake txs so a
-        # relayer cannot strip them.
-        tx_hashes = (
-            [tx.tx_hash for tx in all_txs]
-            + [tx.tx_hash for tx in block.slash_transactions]
-            + [tx.tx_hash for tx in block.governance_txs]
-            + [tx.tx_hash for tx in getattr(block, "authority_txs", [])]
-            + [tx.tx_hash for tx in getattr(block, "stake_transactions", [])]
-            + [tx.tx_hash for tx in getattr(block, "unstake_transactions", [])]
-        )
+        # Merkle root via the canonical tx-hash builder — single source
+        # of truth so this fork-path validator stays in lockstep with
+        # the primary validator (validate_block) and pos.create_block.
+        # The prior hand-rolled list here was missing finality_votes,
+        # custody_proofs, censorship_evidence_txs,
+        # bogus_rejection_evidence_txs, and the archive_proof_bundle
+        # hash — so any block carrying those variants was spuriously
+        # rejected when re-validated via the fork path.
+        tx_hashes = canonical_block_tx_hashes(block)
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"

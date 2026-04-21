@@ -263,38 +263,27 @@ class ProofOfStake:
         cust_proofs = list(custody_proofs or [])
         censorship_txs = list(censorship_evidence_txs or [])
         bogus_rej_txs = list(bogus_rejection_evidence_txs or [])
-        tx_hashes = (
-            [tx.tx_hash for tx in txs]
-            + [tx.tx_hash for tx in transfer_txs]
-            + [tx.tx_hash for tx in slash_txs]
-            + [tx.tx_hash for tx in gov_txs]
-            + [tx.tx_hash for tx in auth_txs]
-            + [tx.tx_hash for tx in stake_txs]
-            + [tx.tx_hash for tx in unstake_txs]
-            + [v.consensus_hash() for v in fin_votes]
-            # CustodyProofs commit via their canonical identity hash so
-            # a MITM cannot strip or rewrite them without invalidating
-            # the proposer's signature (signature covers header, header
-            # covers merkle_root).
-            + [p.tx_hash for p in cust_proofs]
-            + [tx.tx_hash for tx in censorship_txs]
-            # Bogus-rejection evidence binds the same way: the tx_hash
-            # commits to (rejection_hash || message_tx.tx_hash || ...),
-            # so a relay cannot strip or substitute these in flight
-            # without invalidating the merkle root.
-            + [tx.tx_hash for tx in bogus_rej_txs]
+        # Route through the canonical tx-hash builder so proposer and
+        # validator cannot drift on what's in the merkle tree.  We
+        # assemble a minimal namespace-like object that exposes the
+        # attributes `canonical_block_tx_hashes` reads from a Block —
+        # we don't have a Block yet at this point (we're building it).
+        from types import SimpleNamespace
+        _block_like = SimpleNamespace(
+            transactions=txs,
+            transfer_transactions=transfer_txs,
+            slash_transactions=slash_txs,
+            governance_txs=gov_txs,
+            authority_txs=auth_txs,
+            stake_transactions=stake_txs,
+            unstake_transactions=unstake_txs,
+            finality_votes=fin_votes,
+            custody_proofs=cust_proofs,
+            censorship_evidence_txs=censorship_txs,
+            bogus_rejection_evidence_txs=bogus_rej_txs,
         )
-        # Archive-proof bundle (aggregated custody commitment) folds in
-        # as a single tx_hash so a relayer cannot strip or mutate it in
-        # transit.  Derived from cust_proofs — when cust_proofs is empty
-        # there is nothing to commit to, so no hash enters the merkle
-        # input.
-        if cust_proofs:
-            from messagechain.consensus.archive_challenge import (
-                ArchiveProofBundle,
-            )
-            _bundle_for_root = ArchiveProofBundle.from_proofs(cust_proofs)
-            tx_hashes = tx_hashes + [_bundle_for_root.tx_hash]
+        from messagechain.core.block import canonical_block_tx_hashes
+        tx_hashes = canonical_block_tx_hashes(_block_like)
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
         # Inclusion attestation: commit to mempool state at proposal time.

@@ -16,11 +16,19 @@ This is the same mechanism Bitcoin uses for SPV wallets (BIP 37).
 import hashlib
 from dataclasses import dataclass, field
 from messagechain.config import HASH_ALGO
-from messagechain.core.block import Block
+from messagechain.core.block import Block, canonical_block_tx_hashes
 
 
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
+
+
+# Cap on siblings.  A path for a tree with N leaves is at most
+# ceil(log2(N)) levels deep.  At N = 2^30 (~1B leaves, well beyond
+# any realistic block cap) the path is 30 levels.  64 gives generous
+# headroom while preventing a malicious peer from pumping an unbounded
+# proof through verify_merkle_proof.
+_MAX_PROOF_SIBLINGS = 64
 
 
 @dataclass
@@ -49,11 +57,31 @@ class MerkleProof:
 
     @classmethod
     def deserialize(cls, data: dict) -> "MerkleProof":
+        tx_index = data["tx_index"]
+        if not isinstance(tx_index, int) or isinstance(tx_index, bool):
+            raise ValueError(f"tx_index must be int, got {type(tx_index).__name__}")
+        if tx_index < 0:
+            raise ValueError(f"tx_index must be non-negative, got {tx_index}")
+        directions = data["directions"]
+        if not isinstance(directions, list):
+            raise ValueError("directions must be a list of bool")
+        directions = [bool(d) for d in directions]
+        siblings = [bytes.fromhex(s) for s in data["siblings"]]
+        if len(siblings) != len(directions):
+            raise ValueError(
+                f"siblings/directions length mismatch: "
+                f"{len(siblings)} vs {len(directions)}"
+            )
+        if len(siblings) > _MAX_PROOF_SIBLINGS:
+            raise ValueError(
+                f"proof too deep: {len(siblings)} siblings exceeds "
+                f"cap {_MAX_PROOF_SIBLINGS}"
+            )
         return cls(
             tx_hash=bytes.fromhex(data["tx_hash"]),
-            tx_index=data["tx_index"],
-            siblings=[bytes.fromhex(s) for s in data["siblings"]],
-            directions=data["directions"],
+            tx_index=tx_index,
+            siblings=siblings,
+            directions=directions,
         )
 
 
@@ -62,19 +90,34 @@ def generate_merkle_proof(block: Block, tx_index: int) -> MerkleProof:
 
     Args:
         block: The block containing the transaction.
-        tx_index: Index of the transaction in block.transactions.
+        tx_index: Index in the CANONICAL merkle-input ordering — the
+            order that `canonical_block_tx_hashes(block)` produces.
+            Covers message, transfer, slash, governance, authority,
+            stake, unstake, finality_votes, custody_proofs,
+            censorship_evidence, bogus_rejection_evidence, and
+            archive_proof_bundle commitments.
 
     Returns:
-        A MerkleProof that can verify the transaction's inclusion.
+        A MerkleProof that can verify the transaction's inclusion
+        against the block header's merkle_root.
 
     Raises:
         IndexError: If tx_index is out of range.
-    """
-    all_txs = list(block.transactions) + list(block.transfer_transactions)
-    if tx_index < 0 or tx_index >= len(all_txs):
-        raise IndexError(f"tx_index {tx_index} out of range (block has {len(all_txs)} txs)")
 
-    tx_hashes = [tx.tx_hash for tx in all_txs]
+    Note: prior versions built the tree from only `block.transactions
+    + block.transfer_transactions`.  That produced proofs which did
+    NOT verify against the real block merkle_root whenever the block
+    contained any other commitment variant — a trap for future
+    light-client / block-explorer integrations.  Routing through the
+    canonical helper closes it.
+    """
+    tx_hashes = canonical_block_tx_hashes(block)
+    if tx_index < 0 or tx_index >= len(tx_hashes):
+        raise IndexError(
+            f"tx_index {tx_index} out of range "
+            f"(block has {len(tx_hashes)} merkle entries)"
+        )
+
     tx_hash = tx_hashes[tx_index]
 
     # Build Merkle tree layer by layer, recording siblings.
@@ -137,6 +180,18 @@ def verify_merkle_proof(tx_hash: bytes, proof: MerkleProof, merkle_root: bytes) 
     """
     # Validate proof structure: siblings and directions must match in length
     if len(proof.siblings) != len(proof.directions):
+        return False
+    # Bound the path length.  A real path for a tree with 2^30 leaves
+    # is 30 siblings deep; we cap at 64.  Reject excessive proofs
+    # before doing any hashing so an untrusted verifier call stays
+    # cheap on malicious inputs.
+    if len(proof.siblings) > _MAX_PROOF_SIBLINGS:
+        return False
+    # proof.tx_hash is metadata; the caller-supplied tx_hash argument
+    # is authoritative.  Treat mismatch as invalid instead of silently
+    # tolerating it — catches a wrapper that passes proof.tx_hash and
+    # a divergent tx_hash argument.
+    if proof.tx_hash != tx_hash:
         return False
 
     # Start from the tagged leaf (matches compute_merkle_root)

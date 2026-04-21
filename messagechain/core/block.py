@@ -95,6 +95,81 @@ def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     return layer[0]
 
 
+def canonical_block_tx_hashes(block) -> list[bytes]:
+    """Return the ordered list of tx hashes that feed the block merkle root.
+
+    Single source of truth for the four call sites that used to
+    independently rebuild this list:
+      * consensus.pos.create_block   (proposer side)
+      * core.blockchain.validate_block
+      * core.blockchain.validate_block_standalone   (fork path)
+      * core.spv.generate_merkle_proof              (SPV proof builder)
+
+    Drift between these bit an SPV-correctness bug (proofs built from
+    only 2 of the 10+ tx variants) AND a fork-validator consensus
+    disagreement (merkle recompute used 6 of 10+ variants, so any
+    block carrying finality_votes / custody_proofs / censorship /
+    bogus-rejection evidence was spuriously rejected when re-validated
+    via the fork path).  Routing every caller through this helper
+    means a future tx-variant addition only has to update one place.
+
+    Order is load-bearing — it matches the legacy on-chain merkle
+    roots, so this function MUST NOT reorder existing entries.  Append-
+    only for new variants.
+
+    The archive_proof_bundle hash is auto-derived from custody_proofs
+    when they exist (not read from `block.archive_proof_bundle`), so
+    the proposer and the validator agree on the bundle commitment
+    regardless of whether the proposer assembled the bundle eagerly or
+    left it for the helper to derive.
+    """
+    # getattr with default-[] so a Block variant that hasn't populated
+    # an attribute (tests, forward-compat) doesn't KeyError here.
+    msg_txs      = list(getattr(block, "transactions", []) or [])
+    xfer_txs     = list(getattr(block, "transfer_transactions", []) or [])
+    slash_txs    = list(getattr(block, "slash_transactions", []) or [])
+    gov_txs      = list(getattr(block, "governance_txs", []) or [])
+    auth_txs     = list(getattr(block, "authority_txs", []) or [])
+    stake_txs    = list(getattr(block, "stake_transactions", []) or [])
+    unstake_txs  = list(getattr(block, "unstake_transactions", []) or [])
+    fin_votes    = list(getattr(block, "finality_votes", []) or [])
+    cust_proofs  = list(getattr(block, "custody_proofs", []) or [])
+    cens_txs     = list(getattr(block, "censorship_evidence_txs", []) or [])
+    bogus_txs    = list(getattr(block, "bogus_rejection_evidence_txs", []) or [])
+
+    out: list[bytes] = []
+    out.extend(tx.tx_hash for tx in msg_txs)
+    out.extend(tx.tx_hash for tx in xfer_txs)
+    out.extend(tx.tx_hash for tx in slash_txs)
+    out.extend(tx.tx_hash for tx in gov_txs)
+    out.extend(tx.tx_hash for tx in auth_txs)
+    out.extend(tx.tx_hash for tx in stake_txs)
+    out.extend(tx.tx_hash for tx in unstake_txs)
+    # Finality votes commit via consensus_hash() (not tx_hash — they
+    # aren't transactions).  Binding via consensus_hash ensures a
+    # relayer cannot strip or rewrite a vote without invalidating
+    # the proposer's signature.
+    out.extend(v.consensus_hash() for v in fin_votes)
+    # CustodyProof commits via its identity hash for the same reason.
+    out.extend(p.tx_hash for p in cust_proofs)
+    out.extend(tx.tx_hash for tx in cens_txs)
+    out.extend(tx.tx_hash for tx in bogus_txs)
+
+    # Archive-proof bundle (aggregated custody commitment) — derived,
+    # not read from the block's optional bundle slot, so the proposer
+    # cannot smuggle a mismatched bundle past the merkle check.  When
+    # cust_proofs is empty there's nothing to commit to, so no hash is
+    # appended.
+    if cust_proofs:
+        # Lazy import to avoid a consensus<->core import cycle.
+        from messagechain.consensus.archive_challenge import (
+            ArchiveProofBundle as _ArchiveProofBundle,
+        )
+        out.append(_ArchiveProofBundle.from_proofs(cust_proofs).tx_hash)
+
+    return out
+
+
 def _deserialize_authority_tx(data: dict):
     """Rehydrate an authority-related transaction by its "type" tag.
 
