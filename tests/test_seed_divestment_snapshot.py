@@ -50,6 +50,19 @@ from messagechain.storage.state_snapshot import (
 )
 
 
+# Legacy-schedule coverage: push SEED_DIVESTMENT_RETUNE_HEIGHT past this
+# file's simulated range so pre-retune params apply throughout.
+_ORIG_RETUNE_HEIGHT = config.SEED_DIVESTMENT_RETUNE_HEIGHT
+
+
+def setUpModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = 10 ** 9
+
+
+def tearDownModule():
+    config.SEED_DIVESTMENT_RETUNE_HEIGHT = _ORIG_RETUNE_HEIGHT
+
+
 TREASURY = config.TREASURY_ENTITY_ID
 START = config.SEED_DIVESTMENT_START_HEIGHT
 END = config.SEED_DIVESTMENT_END_HEIGHT

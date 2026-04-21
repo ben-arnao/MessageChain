@@ -60,6 +60,26 @@ class SupplyTracker:
         # leak, new-account surcharge) are not mistakenly redirected.
         self.fee_burn_this_block: int = 0
 
+        # Treasury rebase (hard fork): once-per-chain flag that the
+        # one-shot burn at TREASURY_REBASE_HEIGHT has fired.  Guards
+        # against double-burn from an adjacent re-apply of the same
+        # block height.  Snapshotted alongside balances/total_supply
+        # for reorg safety; a reorg that undoes the rebase block rolls
+        # this back to False so the replay re-fires cleanly.
+        self.treasury_rebase_applied: bool = False
+
+        # Treasury spend-rate cap bookkeeping (hard fork): per-epoch
+        # rolling window of debited amounts.  A spend at current_block
+        # is charged against the epoch whose start is
+        # (current_block // TREASURY_SPEND_CAP_EPOCH_BLOCKS) * epoch.
+        # The cap is recomputed against the treasury balance at spend
+        # time (1% of current, not frozen at epoch start) so the cap
+        # naturally shrinks alongside the treasury.  Using -1 as a
+        # sentinel for "no epoch recorded yet" sidesteps a real epoch
+        # 0 collision.
+        self._treasury_spend_epoch_start: int = -1
+        self._treasury_spend_debited_this_epoch: int = 0
+
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
         return self.balances.get(entity_id, 0)
@@ -421,6 +441,7 @@ class SupplyTracker:
         amount: int,
         *,
         new_account_surcharge: int = 0,
+        current_block: int | None = None,
     ) -> bool:
         """Move funds from treasury to recipient (governance-authorized only).
 
@@ -434,6 +455,17 @@ class SupplyTracker:
         by `amount + new_account_surcharge`, and the surcharge is added
         to total_burned.  If the treasury cannot cover
         `amount + new_account_surcharge`, the spend is rejected.
+
+        **Spend-rate cap (hard fork, active at
+        block_height >= TREASURY_REBASE_HEIGHT)**: a single epoch of
+        TREASURY_SPEND_CAP_EPOCH_BLOCKS blocks may debit at most
+        TREASURY_MAX_SPEND_BPS_PER_EPOCH / 10_000 of the treasury
+        balance (measured at spend time).  The cap is a hard gate —
+        even a supermajority-approved governance proposal that would
+        exceed it is rejected.  Callers that pass `current_block=None`
+        (legacy tests, off-chain introspection) bypass the cap for
+        back-compat, matching the legacy-rule pattern used by
+        `verify_transaction(current_height=None)`.
         """
         if amount <= 0:
             return False
@@ -442,11 +474,73 @@ class SupplyTracker:
         debit_total = amount + new_account_surcharge
         if self.get_balance(TREASURY_ENTITY_ID) < debit_total:
             return False
+
+        # Per-epoch spend-rate cap (post-activation only).  Runs BEFORE
+        # any balance mutation so a cap-rejected spend is a clean
+        # no-op.  Imports deferred to avoid a config import cycle on
+        # module load.
+        cap_active = False
+        if current_block is not None:
+            from messagechain.config import (
+                TREASURY_REBASE_HEIGHT,
+                TREASURY_MAX_SPEND_BPS_PER_EPOCH,
+                TREASURY_SPEND_CAP_EPOCH_BLOCKS,
+            )
+            if current_block >= TREASURY_REBASE_HEIGHT:
+                cap_active = True
+                epoch_start = (
+                    current_block
+                    // TREASURY_SPEND_CAP_EPOCH_BLOCKS
+                    * TREASURY_SPEND_CAP_EPOCH_BLOCKS
+                )
+                if self._treasury_spend_epoch_start != epoch_start:
+                    # New epoch — roll the rolling window forward.
+                    self._treasury_spend_epoch_start = epoch_start
+                    self._treasury_spend_debited_this_epoch = 0
+                # Cap is 1% of CURRENT treasury balance, so as the
+                # treasury shrinks over time the cap shrinks with it
+                # — no permanent "spend budget" frozen at fork time.
+                treasury_balance = self.get_balance(TREASURY_ENTITY_ID)
+                epoch_cap = (
+                    treasury_balance
+                    * TREASURY_MAX_SPEND_BPS_PER_EPOCH
+                    // 10_000
+                )
+                already = self._treasury_spend_debited_this_epoch
+                if already + debit_total > epoch_cap:
+                    return False
+
         self.balances[TREASURY_ENTITY_ID] -= debit_total
         self.balances[recipient_id] = self.balances.get(recipient_id, 0) + amount
         if new_account_surcharge > 0:
             self.total_supply -= new_account_surcharge
             self.total_burned += new_account_surcharge
+        if cap_active:
+            self._treasury_spend_debited_this_epoch += debit_total
+        return True
+
+    def burn_from_treasury(self, amount: int) -> bool:
+        """Burn `amount` tokens out of the treasury balance.
+
+        Used exclusively by the treasury-rebase hard fork
+        (Blockchain._apply_treasury_rebase) to apply the one-shot
+        33M burn at activation height.  Updates total_supply and
+        total_burned to preserve the net-inflation invariant.
+
+        Returns False if `amount` is non-positive or the treasury
+        balance would underflow; neither failure mode should happen
+        in normal operation because the fork constants are
+        import-time-asserted to fit, but the guard is defense-in-depth
+        against operator-replaced placeholder heights that happen to
+        line up with a drained treasury.
+        """
+        if amount <= 0:
+            return False
+        if self.get_balance(TREASURY_ENTITY_ID) < amount:
+            return False
+        self.balances[TREASURY_ENTITY_ID] -= amount
+        self.total_supply -= amount
+        self.total_burned += amount
         return True
 
     def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:

@@ -3031,8 +3031,7 @@ class Blockchain:
         from messagechain.config import (
             SEED_DIVESTMENT_START_HEIGHT as _SDS,
             SEED_DIVESTMENT_END_HEIGHT as _SDE,
-            SEED_DIVESTMENT_RETAIN_FLOOR as _SDRF,
-            SEED_DIVESTMENT_TREASURY_BPS as _SDT,
+            get_seed_divestment_params as _gsdp,
         )
         if (
             block_height > _SDS
@@ -3041,6 +3040,10 @@ class Blockchain:
         ):
             _window = _SDE - _SDS
             _SCALE = self._DIVESTMENT_SCALE
+            # Activation-gated parameters — pre-activation returns the
+            # legacy (1M floor, 25% treasury) values so sim/apply match
+            # at every height across the fork boundary.
+            _SDRF, _burn_bps, _SDT = _gsdp(block_height)
             for _seid in self.seed_entity_ids:
                 # Apply path snapshots at the first divestment block from
                 # live stake; on replay the same capture reproduces.  We
@@ -3072,6 +3075,24 @@ class Blockchain:
                     )
                 # Burn portion reduces total_supply — not represented in
                 # the per-entity state tree, so no sim_balances change.
+
+        # Simulate treasury rebase (hard fork): must byte-mirror
+        # _apply_treasury_rebase, which runs AFTER seed divestment in
+        # _apply_block_state.  Only sim_balances[TREASURY_ENTITY_ID]
+        # is visible to the state root; total_supply is a supply-level
+        # scalar outside the state-tree commitment, so we only touch
+        # the treasury balance here.
+        from messagechain.config import (
+            TREASURY_REBASE_HEIGHT as _TRH,
+            TREASURY_REBASE_BURN_AMOUNT as _TRBA,
+        )
+        if (
+            block_height == _TRH
+            and not self.supply.treasury_rebase_applied
+        ):
+            _cur_treasury = sim_balances.get(TREASURY_ENTITY_ID, 0)
+            if _cur_treasury >= _TRBA:
+                sim_balances[TREASURY_ENTITY_ID] = _cur_treasury - _TRBA
 
         # Simulate block reward: committee-based attester distribution +
         # proposer share + PROPOSER_REWARD_CAP overflow.  Must mirror
@@ -5649,17 +5670,64 @@ class Blockchain:
     # amount cleanly over a 210K-block window without float arithmetic.
     _DIVESTMENT_SCALE: int = 10 ** 9
 
+    def _apply_treasury_rebase(self, block_height: int) -> None:
+        """Burn TREASURY_REBASE_BURN_AMOUNT from the treasury at activation.
+
+        Fires exactly once, at ``block_height == TREASURY_REBASE_HEIGHT``.
+        All other heights are no-ops (both pre- and post-activation).
+
+        Idempotent: an adjacent re-apply at the same height is guarded
+        by ``self.supply.treasury_rebase_applied``.  The flag is
+        snapshotted for reorg safety — a reorged-out rebase block
+        correctly un-burns on rollback via the supply-level snapshot
+        of total_supply / total_burned / balances plus the flag reset.
+
+        Motivation: the 1B→140M GENESIS_SUPPLY rebase left
+        TREASURY_ALLOCATION = 40M (~28.6% of supply) which, combined
+        with seed-divestment routing ~23.5M more to treasury, would
+        leave ~91% of post-bootstrap circulating supply in a
+        governance-captured pool.  Burning 33M at activation returns
+        the treasury to ~5% of supply.
+        """
+        from messagechain.config import (
+            TREASURY_REBASE_HEIGHT,
+            TREASURY_REBASE_BURN_AMOUNT,
+        )
+        if block_height != TREASURY_REBASE_HEIGHT:
+            return
+        if self.supply.treasury_rebase_applied:
+            return
+        # If the treasury somehow cannot cover the burn (e.g. operator
+        # has mis-set the placeholder activation height to a point
+        # deep in chain history where the treasury has already been
+        # drained by governance), burn_from_treasury returns False.
+        # We log and DO NOT set the applied flag — the failure mode
+        # stays observable rather than silent.
+        ok = self.supply.burn_from_treasury(TREASURY_REBASE_BURN_AMOUNT)
+        if not ok:
+            logger.error(
+                "Treasury rebase burn at height %d failed: treasury "
+                "balance insufficient.  Chain state may drift from "
+                "peers that applied the burn earlier.",
+                block_height,
+            )
+            return
+        self.supply.treasury_rebase_applied = True
+
     def _apply_seed_divestment(self, block_height: int) -> None:
         """Forcibly divest the founder's stake DOWN TO the retain floor.
 
         Non-discretionary, always-on schedule.  Between SEED_DIVESTMENT_START
         (exclusive) and SEED_DIVESTMENT_END (inclusive), each block drains
-        a linear portion of the DIVESTIBLE amount — 75% burned, 25% to
-        treasury.  Outside that window this is a no-op.
+        a linear portion of the DIVESTIBLE amount.  The burn / treasury
+        split is activation-gated (see
+        ``messagechain.config.get_seed_divestment_params``): pre-retune
+        it is 75/25 against a 1M floor; post-retune it is 95/5 against
+        a 20M floor.  Outside that window this is a no-op.
 
-        Divestible = max(0, initial_seed_stake - SEED_DIVESTMENT_RETAIN_FLOOR).
+        Divestible = max(0, initial_seed_stake - retain_floor(block_height)).
         Only the excess above the floor is subject to divestment; the
-        founder keeps at least RETAIN_FLOOR tokens of stake permanently
+        founder keeps at least retain_floor tokens of stake permanently
         through protocol enforcement.  They can voluntarily unstake via
         a normal UnstakeTransaction post-END.
 
@@ -5685,15 +5753,14 @@ class Blockchain:
         so the divestment operates on the post-tx staked balance.  Any
         integer-rounding remainder in the per-block burn/treasury split
         accrues to burn (cleaner: smaller supply).  Stake is clamped at
-        the floor — once a seed's stake hits RETAIN_FLOOR no further
+        the floor — once a seed's stake hits the floor no further
         tokens move regardless of the schedule.
         """
         from messagechain.config import (
             SEED_DIVESTMENT_START_HEIGHT,
             SEED_DIVESTMENT_END_HEIGHT,
-            SEED_DIVESTMENT_RETAIN_FLOOR,
-            SEED_DIVESTMENT_TREASURY_BPS,
             TREASURY_ENTITY_ID,
+            get_seed_divestment_params,
         )
         if block_height <= SEED_DIVESTMENT_START_HEIGHT:
             return
@@ -5704,6 +5771,16 @@ class Blockchain:
         window = SEED_DIVESTMENT_END_HEIGHT - SEED_DIVESTMENT_START_HEIGHT
         assert window > 0, "divestment window must be positive"
 
+        # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT):
+        # pre-activation the legacy (floor=1M, burn=75%, treasury=25%)
+        # values apply byte-for-byte; post-activation the retune
+        # (floor=20M, burn=95%, treasury=5%) values apply.  The sim
+        # path in compute_post_state_root reads the same helper so sim
+        # and apply stay in lockstep at every height.
+        retain_floor, _burn_bps, treasury_bps = get_seed_divestment_params(
+            block_height,
+        )
+
         SCALE = self._DIVESTMENT_SCALE
 
         for eid in self.seed_entity_ids:
@@ -5713,15 +5790,15 @@ class Blockchain:
             if eid not in self.seed_initial_stakes:
                 self.seed_initial_stakes[eid] = self.supply.get_staked(eid)
             initial = self.seed_initial_stakes[eid]
-            if initial <= SEED_DIVESTMENT_RETAIN_FLOOR:
+            if initial <= retain_floor:
                 # Nothing divestible — a tiny-stake seed keeps its full
                 # balance.  Explicit early-exit so no fractional debt
                 # accrues for this seed.
                 continue
 
-            divestible = initial - SEED_DIVESTMENT_RETAIN_FLOOR
+            divestible = initial - retain_floor
             current_stake = self.supply.get_staked(eid)
-            if current_stake <= SEED_DIVESTMENT_RETAIN_FLOOR:
+            if current_stake <= retain_floor:
                 # Current stake already at/below floor — freeze.  This
                 # handles external shocks (slashing, unstaking) that
                 # pushed stake below the floor mid-window.
@@ -5739,7 +5816,7 @@ class Blockchain:
 
             # Clamp: never drain below the floor, even if cumulative
             # fractional drift would overshoot by a token.
-            max_drainable = current_stake - SEED_DIVESTMENT_RETAIN_FLOOR
+            max_drainable = current_stake - retain_floor
             divest = min(whole, max_drainable)
             if divest <= 0:
                 # Floor hit this block — keep the fractional remainder
@@ -5755,13 +5832,15 @@ class Blockchain:
             # triggered by a slashing event mid-window that drops
             # current_stake close to the floor.  Use `divest * SCALE` so
             # the undrained remainder rolls over to the next block and
-            # the 95M→1M schedule is conserved regardless of slashing.
+            # the full divestible schedule is conserved regardless of
+            # slashing.
             self.seed_divestment_debt[eid] = debt - divest * SCALE
 
-            # Split: treasury gets the exact 25% share (basis points);
+            # Split: treasury gets the activation-gated bps share;
             # burn gets the remainder so any integer-rounding remainder
-            # always favors burn — smaller supply is the cleaner invariant.
-            treasury_share = divest * SEED_DIVESTMENT_TREASURY_BPS // 10_000
+            # always favors burn — smaller supply is the cleaner
+            # invariant.
+            treasury_share = divest * treasury_bps // 10_000
             burn_share = divest - treasury_share
             assert treasury_share + burn_share == divest
 
@@ -6040,6 +6119,15 @@ class Blockchain:
         # balance, and before committee selection so the seed's reduced
         # stake is reflected in the same block's attester weights.
         self._apply_seed_divestment(block.header.block_number)
+
+        # Treasury rebase (hard fork, once-per-chain at activation
+        # height).  Runs after seed divestment: a same-block divestment
+        # step that routes treasury_share into the treasury does so
+        # BEFORE the burn, so the burn sees the post-divestment
+        # treasury balance.  This keeps the simulation path in
+        # compute_post_state_root (which mirrors this ordering) and the
+        # apply path byte-consistent.
+        self._apply_treasury_rebase(block.header.block_number)
 
         # Candidate attesters for the reward committee: everyone whose
         # attestation was included in this block.  Stake is 0 during
@@ -7499,6 +7587,22 @@ class Blockchain:
             "total_fees_collected": self.supply.total_fees_collected,
             "total_burned": self.supply.total_burned,
             "base_fee": self.supply.base_fee,
+            # Treasury rebase (hard fork) — "already-applied" flag is
+            # part of in-memory supply state.  A reorg that undoes the
+            # rebase block MUST reset this flag so the canonical replay
+            # re-fires the burn.  The accompanying balance/total_supply
+            # rewind is already captured above.
+            "treasury_rebase_applied": self.supply.treasury_rebase_applied,
+            # Treasury per-epoch spend-rate cap bookkeeping — reorg
+            # rollback restores the rolling-window state so a
+            # cap-approved spend in the re-orged chain gets the same
+            # epoch accounting on replay.
+            "treasury_spend_epoch_start": (
+                self.supply._treasury_spend_epoch_start
+            ),
+            "treasury_spend_debited_this_epoch": (
+                self.supply._treasury_spend_debited_this_epoch
+            ),
             "chain_length": len(self.chain),
             "slashed_validators": set(self.slashed_validators),
             "immature_rewards": list(self._immature_rewards),
@@ -7574,6 +7678,20 @@ class Blockchain:
         self.supply.total_burned = snapshot.get("total_burned", 0)
         self.supply.base_fee = snapshot.get("base_fee", BASE_FEE_INITIAL)
         self.base_fee = self.supply.base_fee
+        # Treasury rebase flag — default False so older snapshots
+        # (pre-fork) restore cleanly with the rebase not yet applied.
+        self.supply.treasury_rebase_applied = snapshot.get(
+            "treasury_rebase_applied", False,
+        )
+        # Treasury spend-rate cap rolling window.  Defaults match the
+        # __init__ sentinels so pre-fork snapshots restore to a
+        # pristine cap state.
+        self.supply._treasury_spend_epoch_start = snapshot.get(
+            "treasury_spend_epoch_start", -1,
+        )
+        self.supply._treasury_spend_debited_this_epoch = snapshot.get(
+            "treasury_spend_debited_this_epoch", 0,
+        )
         self.nonces = snapshot["nonces"]
         self.public_keys = snapshot["public_keys"]
         # Tree heights are paired with public_keys in the snapshot so

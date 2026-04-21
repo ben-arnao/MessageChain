@@ -894,6 +894,7 @@ class GovernanceTracker:
         result = supply_tracker.treasury_spend(
             tx.recipient_id, tx.amount,
             new_account_surcharge=surcharge,
+            current_block=current_block,
         )
         if result:
             self._executed_treasury_spends.add(tx.tx_hash)
