@@ -757,6 +757,52 @@ class ChainDB:
             (key, value),
         )
 
+    # ── Phantom-Supply Migration (one-shot correctness repair) ──────────
+    #
+    # Earlier mainnet builds set GENESIS_SUPPLY = 1_000_000_000 while the
+    # canonical allocation table only distributed 140_000_000 tokens
+    # (founder 100M + treasury 40M).  The 860M gap was phantom — counted
+    # in total_supply but owned by no entity — which broke the invariant
+    #     total_supply == sum(balances) + sum(staked) + (minted - burned)
+    # and inflated every "% of supply" denominator (fee model, governance
+    # thresholds, analytics).
+    #
+    # The fix rebases GENESIS_SUPPLY to 140_000_000 in config.py.  But
+    # existing mainnet state files have total_supply=1B persisted here
+    # via _create_tables' initial INSERT (see _create_tables above).  A
+    # joining validator or a restarting mainnet node needs a one-shot
+    # migration that detects the anomaly and rebases on load.
+    #
+    # Detection: any stored total_supply that exceeds the correct
+    # GENESIS_SUPPLY by EXACTLY 860_000_000 is the phantom-supply
+    # signature — rebase by subtracting 860M.  Idempotent: after the
+    # first run, stored == GENESIS_SUPPLY and the check is false.
+    _PHANTOM_SUPPLY_GAP: int = 860_000_000
+
+    def migrate_phantom_supply_if_needed(self) -> bool:
+        """One-shot migration: detect legacy total_supply=1B and rebase
+        to the corrected 140M value.
+
+        Returns True iff a rebase actually occurred (phantom gap was
+        detected).  Idempotent — subsequent calls after a successful
+        rebase see the corrected value and return False.
+
+        Called automatically from Blockchain._load_from_db on startup,
+        so existing mainnet state gets repaired in place.  No-op on a
+        fresh chain (total_supply already matches GENESIS_SUPPLY).
+        """
+        from messagechain.config import GENESIS_SUPPLY
+        stored = self.get_supply_meta("total_supply")
+        expected_gap = stored - GENESIS_SUPPLY
+        # Also repair total_minted/total_burned nets: net_inflation
+        # equals total_minted - total_burned, independent of the
+        # constant rebase.  Only total_supply itself was inflated.
+        if expected_gap == self._PHANTOM_SUPPLY_GAP:
+            self.set_supply_meta("total_supply", stored - self._PHANTOM_SUPPLY_GAP)
+            self._maybe_commit()
+            return True
+        return False
+
     # ── Slashed Validators ─────────────────────────────────────────
 
     def add_slashed_validator(self, entity_id: bytes, block_number: int, evidence_hash: bytes):

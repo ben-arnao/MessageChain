@@ -22,7 +22,7 @@ is changed.
 | TARGET_BLOCK_SIZE              | 10                            |
 | BLOCK_TIME_TARGET              | 600 s (52,560 blocks/year)    |
 | MAX_BASE_FEE_MULTIPLIER        | 10,000 (cap = 1,000,000)      |
-| GENESIS_SUPPLY                 | 1,000,000,000 tokens          |
+| GENESIS_SUPPLY                 | 140,000,000 tokens            |
 | ARCHIVE_CHALLENGE_INTERVAL     | 100 blocks (525 challenge blocks/yr) |
 | ARCHIVE_PROOFS_PER_CHALLENGE   | 10                            |
 | EVIDENCE_INCLUSION_WINDOW      | 32                            |
@@ -33,12 +33,18 @@ is changed.
 
 Stored bloat now includes the amortized custody-proof overhead (+82 B / block).
 
+Note: the "% of GENESIS_SUPPLY" column denominates against the corrected
+GENESIS_SUPPLY of 140M (post phantom-supply fix).  Figures for attacks
+that would need to spend >100% of supply mean the attacker must also be
+continuously re-earning tokens through inflation to sustain the rate —
+they cannot run the attack purely from initial holdings.
+
 | Scenario | stored bloat / year | attacker fee / year | fee as % of GENESIS_SUPPLY |
 |---|---:|---:|---:|
-| 1. Full-size spam at MIN_FEE            | 278.7 MB | 1.07 B tokens  | 107 %      |
-| 2. Small-tx spam at MIN_FEE             | 5.36 MB  | 108 M tokens   | 10.8 %     |
-| 3. TARGET_BLOCK_SIZE (non-adversarial)  | 141.5 MB | 535 M tokens   | 53.6 %     |
-| 4. Worst-case, base_fee saturated       | 278.7 MB | 1.05 T tokens  | 105,120 %  |
+| 1. Full-size spam at MIN_FEE            | 278.7 MB | 1.07 B tokens  | 765 %      |
+| 2. Small-tx spam at MIN_FEE             | 5.36 MB  | 108 M tokens   | 77.3 %     |
+| 3. TARGET_BLOCK_SIZE (non-adversarial)  | 141.5 MB | 535 M tokens   | 382.6 %    |
+| 4. Worst-case, base_fee saturated       | 278.7 MB | 1.05 T tokens  | 750,857 %  |
 
 ## New: custody-proof overhead (on-chain, permanent)
 
@@ -68,10 +74,12 @@ Two regimes:
 | Full-block adversarial (MAX_TXS_PER_BLOCK every block)     | 1,051,200   | 4.2 GB | 4.2 TB  |
 
 **Adversarial affordability**: each evidence tx costs MIN_FEE = 100
-tokens.  `GENESIS_SUPPLY / MIN_FEE = 10,000,000` evidence txs — roughly
-**9.5 years of full-block evidence spam** before the attacker exhausts
+tokens.  `GENESIS_SUPPLY / MIN_FEE = 1,400,000` evidence txs — roughly
+**1.3 years of full-block evidence spam** before the attacker exhausts
 the entire money supply.  After that the model's cap flips from
-block-budget to affordability and growth slows.
+block-budget to affordability and growth slows dramatically (the
+attacker can only keep going from inflationary block rewards they
+themselves earn, which is a tiny fraction of the block-cap rate).
 
 **Additional economic friction not in the pure-fee model**: to craft a
 valid evidence the attacker needs a `SubmissionReceipt` signed by a
@@ -95,9 +103,9 @@ bound.
 
 Economic floor bounding this set: an attacker who wants to grow
 `processed_censorship_evidence` by N entries must pay ≥ N × MIN_FEE
-tokens.  Floor is therefore strict: 10M entries total across all time
+tokens.  Floor is therefore strict: 1.4M entries total across all time
 without burning the entire genesis supply.  At 32 B/hash, that is a
-**permanent ceiling of 320 MB of `processed_censorship_evidence`** if
+**permanent ceiling of ~44.8 MB of `processed_censorship_evidence`** if
 *all* of genesis supply is diverted to evidence spam.  Plenty safe.
 
 ## Big-picture: does 1000 y still fit on commodity hardware?
@@ -118,11 +126,14 @@ each evidence tx is ~15x larger than a max-size message tx.  Even so:
   (current 6–8 TB HDDs are ~$120; 10 TB ~$200 consumer retail).  Still
   comfortably under any archival operator's pain threshold.
 
-**But note**: Mode B requires 9.5 years of sustained attack before
-exhausting genesis supply.  Beyond year 9.5, the attacker can only
-sustain the attack from *recycled* inflation (block rewards), which is
-bounded.  The pure 1000-year evidence-spam figure is an
-economic-impossibility upper bound, not a realistic sustained rate.
+**But note**: Mode B requires only ~1.3 years of sustained attack
+before exhausting genesis supply (post phantom-supply fix, the
+affordability-cap dropped from 10M to 1.4M evidence txs).  Beyond
+that, the attacker can only sustain the attack from *recycled*
+inflation (block rewards), which is bounded.  The pure 1000-year
+evidence-spam figure is an economic-impossibility upper bound, not a
+realistic sustained rate — in practice the attacker runs out of money
+in year 2 and the curve flattens hard after that.
 
 ## Parameter recommendations
 
@@ -168,9 +179,10 @@ economic-impossibility upper bound, not a realistic sustained rate.
 
 - **Economic attack on `processed_censorship_evidence` is
   affordability-capped, not block-capped.**  At MIN_FEE=100 and
-  GENESIS_SUPPLY=1B, the set cannot exceed ~10M entries =
-  320 MB ever.  This set IS a permanence concern but not a
-  bloat concern.
+  GENESIS_SUPPLY=140M, the set cannot exceed ~1.4M entries =
+  ~44.8 MB ever.  This set IS a permanence concern but not a
+  bloat concern (and the cap is ~7x tighter than pre-phantom-supply-fix
+  since the affordability denominator dropped from 1B to 140M).
 
 - **Block-slot sharing is the key insulator.**
   MAX_TXS_PER_BLOCK=20 acts as a unified cap across message-txs

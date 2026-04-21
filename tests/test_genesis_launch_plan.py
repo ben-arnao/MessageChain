@@ -183,33 +183,59 @@ class TestRecommendedLaunchPlan(unittest.TestCase):
         """Founder allocation sits above the security floor and below the
         optics ceiling.
 
-        Security floor (>=1% of supply): the founder must hold enough
-        stake to dominate cumulative non-seed bootstrap earnings by at
-        least a factor of 10.  With BOOTSTRAP_END_HEIGHT ≈ 105K blocks
-        × 16 tokens/block, the non-seed envelope is ~1.68M tokens
-        (0.168% of supply); 1% keeps the seed at ~6x dominance even in
-        the worst case.  The 20M default provides >10x dominance.
+        Security floor (>= 10x the bootstrap-era non-seed mint):
+        the founder must hold enough stake to dominate cumulative
+        non-seed bootstrap earnings by at least a factor of 10.  With
+        BOOTSTRAP_END_HEIGHT ≈ 105K blocks × 16 tokens/block, the
+        non-seed envelope is ~1.68M tokens; the recommended 20M
+        stake gives >10x dominance.
 
-        Optics ceiling (<=10% of supply): hoarding more than this signals
-        an extractive genesis distribution and deters outside validators
-        from participating.  The treasury (4%) is excluded from this
-        calculation -- it's governance-controlled and flows via proposals.
+        Optics ceiling (<= 90% of post-treasury supply):
+        hoarding more than this signals an extractive genesis
+        distribution and deters outside validators from
+        participating.  The treasury is excluded from the optics
+        denominator -- it's governance-controlled and flows via
+        proposals, so "founder share of validator-distributable
+        supply" is the economically meaningful metric.
 
-        Post-divestment the founder drains down to SEED_DIVESTMENT_RETAIN_FLOOR
-        (0.1% of supply), so any over-concentration here is transient.
+        Post-divestment the founder drains down to
+        SEED_DIVESTMENT_RETAIN_FLOOR, so any over-concentration
+        here is transient.
+
+        Note: prior to the phantom-supply fix (GENESIS_SUPPLY =
+        1_000_000_000 with only 140M actually allocated), this test
+        used absolute "% of GENESIS_SUPPLY" bounds (1%-10%).  Those
+        percentages were artifacts of the 860M phantom denominator.
+        With GENESIS_SUPPLY correctly == sum of actual allocations
+        (140M), the security argument is the dominance ratio over
+        bootstrap non-seed mint — denominator-independent.
         """
-        from messagechain.config import GENESIS_SUPPLY
-        founder_total = RECOMMENDED_GENESIS_PER_SEED
-        pct = founder_total / GENESIS_SUPPLY
-        self.assertGreaterEqual(
-            pct, 0.01,
-            f"founder concentration is {pct:.4%} -- below the 1% security "
-            f"floor; seed stake would not dominate bootstrap-era Sybil "
-            f"accumulation by a comfortable margin",
+        from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT
+        from messagechain.config import (
+            BLOCK_REWARD, GENESIS_SUPPLY, TREASURY_ALLOCATION,
         )
+
+        founder_total = RECOMMENDED_GENESIS_PER_SEED
+
+        # Security floor: founder >= 10x the maximum non-seed bootstrap mint.
+        bootstrap_non_seed_mint_ceiling = BOOTSTRAP_END_HEIGHT * BLOCK_REWARD
+        self.assertGreaterEqual(
+            founder_total, 10 * bootstrap_non_seed_mint_ceiling,
+            f"founder allocation {founder_total:,} is below 10x the "
+            f"bootstrap-era non-seed mint ceiling "
+            f"({bootstrap_non_seed_mint_ceiling:,}); seed stake would not "
+            f"dominate bootstrap-era Sybil accumulation by a comfortable "
+            f"margin",
+        )
+
+        # Optics ceiling: founder share of VALIDATOR-DISTRIBUTABLE supply
+        # (supply minus treasury) must not exceed 90%.
+        distributable = GENESIS_SUPPLY - TREASURY_ALLOCATION
+        pct_of_distributable = founder_total / distributable
         self.assertLessEqual(
-            pct, 0.10,
-            f"founder concentration is {pct:.4%} -- above the 10% optics "
+            pct_of_distributable, 0.90,
+            f"founder concentration is {pct_of_distributable:.4%} of "
+            f"validator-distributable supply -- above the 90% optics "
             f"ceiling; hoarding at this level looks extractive",
         )
 
