@@ -6346,14 +6346,22 @@ class Blockchain:
         return True, f"Fork block stored (not best chain, weight={fork_weight})"
 
     def _compute_cumulative_weight(self, block: Block) -> int:
-        """Walk back from block to genesis, summing stake weights."""
+        """Walk back from block to genesis, summing stake weights.
+
+        Genesis is stored with cumulative weight 0 in the additive
+        add_block path (see initialize_genesis's add_tip call), so this
+        walk-based recomputation must stop at genesis WITHOUT adding
+        its weight — otherwise forks computed via this path disagree
+        with the canonical chain's stored cumulative weight and can
+        trigger spurious equal-weight reorgs under the hash tiebreak.
+        """
         weight = 0
         current = block
         depth = 0
         while current and depth < MAX_REORG_DEPTH + 10:
-            weight += compute_block_stake_weight(current, self.supply.staked)
             if current.header.prev_hash == b"\x00" * 32:
                 break
+            weight += compute_block_stake_weight(current, self.supply.staked)
             current = self.get_block_by_hash(current.header.prev_hash)
             depth += 1
         return weight
