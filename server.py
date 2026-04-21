@@ -919,11 +919,15 @@ class Server:
         checkpoints = list(TRUSTED_CHECKPOINTS)
         if data_dir:
             cp_path = _os.path.join(data_dir, "checkpoints.json")
-            file_cps = load_checkpoints_file(cp_path)
-            by_height = {cp.block_number: cp for cp in checkpoints}
-            for cp in file_cps:
-                by_height[cp.block_number] = cp
-            checkpoints = list(by_height.values())
+            # WHY: check existence first so absence falls back to the
+            # embedded TRUSTED_CHECKPOINTS tuple; if the operator did
+            # ship a file, validate it strictly (malformed → raise).
+            if _os.path.exists(cp_path):
+                file_cps = load_checkpoints_file(cp_path, strict=True)
+                by_height = {cp.block_number: cp for cp in checkpoints}
+                for cp in file_cps:
+                    by_height[cp.block_number] = cp
+                checkpoints = list(by_height.values())
         if REQUIRE_CHECKPOINTS and not checkpoints:
             # Auto-waive threshold: previously 1000 blocks (~1 week at 600s).
             # A new community validator cloning the repo after the chain
