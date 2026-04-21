@@ -1246,3 +1246,55 @@ class ChainDB:
             (stripped_bytes, block_hash),
         )
         self._conn.commit()
+
+    def auto_separate_finalized_witnesses(
+        self, finalized_height: int, state=None,
+    ) -> int:
+        """Move witnesses of old finalized blocks to the side table.
+
+        Opt-in via WITNESS_AUTO_SEPARATION_ENABLED.  When disabled
+        (the default) this is a no-op — the current storage shape
+        is preserved byte-for-byte and no existing block-read caller
+        silently loses access to inline signatures.
+
+        When enabled, every block at height <=
+        (finalized_height - WITNESS_RETENTION_BLOCKS) whose witness
+        data is still inline gets re-organized: signatures move from
+        the `blocks.data` BLOB to the `block_witnesses` side table.
+        Nothing is deleted — the message payload, timestamp, and
+        entity_id stay in place forever; only the WOTS sig bytes
+        move.  A caller that needs the full block still passes
+        `include_witnesses=True` to get_block_by_hash.
+
+        Idempotent: skips blocks already separated (identified by a
+        row in block_witnesses).  Safe to call on every finality
+        advance.
+
+        Returns the number of blocks separated in this call.
+        """
+        import messagechain.config as _cfg
+        if not getattr(_cfg, "WITNESS_AUTO_SEPARATION_ENABLED", False):
+            return 0
+
+        retention = _cfg.WITNESS_RETENTION_BLOCKS
+        horizon = finalized_height - retention
+        if horizon < 0:
+            return 0
+
+        # Candidate blocks: finalized depth past the retention window
+        # AND not yet separated.  LEFT JOIN is cheap — the blocks
+        # table is indexed on block_hash and block_witnesses is
+        # keyed on the same hash.
+        cur = self._conn.execute(
+            "SELECT b.block_hash FROM blocks b "
+            "LEFT JOIN block_witnesses w ON b.block_hash = w.block_hash "
+            "WHERE b.block_number <= ? AND w.block_hash IS NULL",
+            (horizon,),
+        )
+        candidates = [bytes(row[0]) for row in cur.fetchall()]
+
+        count = 0
+        for block_hash in candidates:
+            self.strip_finalized_witnesses(block_hash, state=state)
+            count += 1
+        return count

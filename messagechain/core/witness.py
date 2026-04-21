@@ -165,6 +165,66 @@ def get_block_witness_data(block) -> bytes:
     return b"".join(parts)
 
 
+def verify_witness_data(witness_data: bytes, expected_root: bytes) -> bool:
+    """Verify a serialized witness blob matches a committed witness_root.
+
+    This is the integrity anchor for any flow that fetches witnesses
+    from a peer (or reads them from a side-table after separation):
+    the blob is only trusted if re-hashing it reproduces the
+    witness_root already committed in the header (which is itself
+    covered by the block_hash and the proposer signature).
+
+    Recomputes the Merkle tree using the same leaf rule as
+    compute_witness_root — leaf = HASH(signature.canonical_bytes()).
+    The blob format is the one produced by get_block_witness_data.
+
+    Returns True iff the recomputed root equals expected_root.  Any
+    structural error in the blob returns False (not raises) — this
+    function is called on untrusted input from peers and must not
+    crash on malformed data.
+    """
+    try:
+        offset = 0
+        tx_count = struct.unpack_from(">I", witness_data, offset)[0]
+        offset += 4
+
+        if tx_count == 0:
+            return expected_root == hashlib.new(HASH_ALGO, b"").digest()
+
+        leaves = []
+        for _ in range(tx_count):
+            w_len = struct.unpack_from(">I", witness_data, offset)[0]
+            offset += 4
+            w_bytes = witness_data[offset:offset + w_len]
+            if len(w_bytes) != w_len:
+                return False
+            offset += w_len
+
+            # Decode and re-canonicalize.  The blob uses Signature.to_bytes
+            # (compact storage form); witness_root uses canonical_bytes
+            # (deterministic serialization with length prefixes).  They
+            # are not the same byte string, so we must round-trip through
+            # the Signature object to re-derive the canonical form.
+            sig = Signature.from_bytes(w_bytes)
+            leaves.append(_hash(sig.canonical_bytes()))
+
+        if offset != len(witness_data):
+            return False
+
+        layer = list(leaves)
+        while len(layer) > 1:
+            if len(layer) % 2 == 1:
+                layer.append(_hash(b"\x02witness_sentinel"))
+            next_layer = []
+            for i in range(0, len(layer), 2):
+                next_layer.append(_hash(layer[i] + layer[i + 1]))
+            layer = next_layer
+
+        return layer[0] == expected_root
+    except (struct.error, ValueError, IndexError):
+        return False
+
+
 def attach_block_witnesses(stripped_block, witness_data: bytes):
     """Reattach witness data to a stripped block."""
     from messagechain.core.block import Block
