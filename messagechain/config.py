@@ -1305,15 +1305,20 @@ EVIDENCE_MATURITY_BLOCKS = 16
 # the block-signing tree (MERKLE_TREE_HEIGHT) so receipt traffic cannot
 # burn leaves that the proposer needs for block production.
 #
-# Height 16 (65K leaves) matches the block-signing tree.  At realistic
-# receipt rates (tens to hundreds per day early on), this is years of
-# headroom before key rotation is needed.  An earlier h=24 setting was
-# measured on a 2-vCPU VM to take ~36 hours of blocking startup keygen,
-# which is unacceptable as a boot-time operation.  If receipt throughput
-# grows to the point where 65K leaves becomes limiting, either bump this
-# height with async keygen machinery added, or rotate the receipt
-# subtree via SetReceiptSubtreeRootTransaction.  Generated lazily on
-# first startup and cached to disk.
+# Height 16 (65K leaves) matches the block-signing tree.  Receipt-
+# throughput budget: at MAX_TXS_PER_BLOCK=20 and BLOCK_TIME_TARGET=600s,
+# full-capacity throughput is ~2880 admitted txs/day network-wide.
+# A validator issuing one receipt per admitted tx exhausts 65K leaves
+# in ~22 days (65536 / 2880).  At early-phase volume (dozens of txs
+# per day), the same tree lasts years.  Operators MUST plan to rotate
+# the receipt subtree via SetReceiptSubtreeRootTransaction before leaf
+# exhaustion at sustained high throughput; exhaustion-warning logs
+# fire at 80% and 95% usage (see _maybe_warn_exhaustion).  An earlier
+# h=24 setting was measured to take ~36 hours of blocking startup
+# keygen on a 2-vCPU VM, which is unacceptable as a boot-time op.
+# If 65K leaves becomes limiting in steady state, bump this height
+# with async keygen machinery added.  Generated lazily on first
+# startup and cached to disk.
 RECEIPT_SUBTREE_HEIGHT = 16
 
 # Block deserialization size limit — maximum hex-encoded block size
