@@ -1181,6 +1181,15 @@ class Blockchain:
         # drift here is immediately detectable as a snapshot-root
         # mismatch.
         self.archive_reward_pool = int(snap.get("archive_reward_pool", 0))
+        # Lottery prize pool (seed-divestment lottery-redistribution
+        # hard fork) — consensus-visible scalar.  Same reasoning as
+        # archive_reward_pool above: a state-synced node that inherits
+        # a stale pool would compute a different payout amount at the
+        # next lottery firing and silently fork.  Committed to the
+        # snapshot root under _TAG_GLOBAL / _GLOBAL_LOTTERY_PRIZE_POOL.
+        self.supply.lottery_prize_pool = int(
+            snap.get("lottery_prize_pool", 0),
+        )
 
         # Archive-duty state (v6+).  All three fields participate in
         # the state root, so a bootstrapping node inherits them from
@@ -3044,6 +3053,15 @@ class Blockchain:
             SEED_DIVESTMENT_END_HEIGHT as _SDE,
             get_seed_divestment_params as _gsdp,
         )
+        # Track the simulated lottery-prize-pool across the divestment
+        # step and the lottery step so the sim reflects this-block
+        # divestment contributions before the lottery reads the pool
+        # for its payout formula.  Starts at the live pre-block pool
+        # and is updated by the divestment sim below (lottery share
+        # accumulates) and by the lottery sim further down (pool
+        # payout drains it).  Not written back to self.supply — the
+        # apply path owns that mutation.
+        sim_lottery_pool = int(self.supply.lottery_prize_pool)
         if (
             block_height > _SDS
             and block_height <= _SDE
@@ -3051,10 +3069,13 @@ class Blockchain:
         ):
             _window = _SDE - _SDS
             _SCALE = self._DIVESTMENT_SCALE
-            # Activation-gated parameters — pre-activation returns the
-            # legacy (1M floor, 25% treasury) values so sim/apply match
-            # at every height across the fork boundary.
-            _SDRF, _burn_bps, _SDT = _gsdp(block_height)
+            # Activation-gated parameters — pre-RETUNE returns the
+            # legacy (1M floor, 25% treasury, 0% lottery) values, RETUNE-
+            # era returns the retune (20M floor, 5% treasury, 0% lottery)
+            # values, and REDIST-era returns the redistribution (20M
+            # floor, 5% treasury, 45% lottery) values so sim/apply match
+            # at every height across both fork boundaries.
+            _SDRF, _sim_burn_bps, _SDT, _lottery_bps = _gsdp(block_height)
             for _seid in self.seed_entity_ids:
                 # Apply path snapshots at the first divestment block from
                 # live stake; on replay the same capture reproduces.  We
@@ -3078,7 +3099,18 @@ class Blockchain:
                 _divest = min(_whole, _max_drainable)
                 if _divest <= 0:
                     continue
+                # Three-share split (REDIST-era) with lottery as
+                # remainder so the sim matches the apply path's lossless
+                # partition byte-for-byte.  Pre-REDIST: _lottery_bps == 0
+                # routes the rounding remainder to burn (legacy
+                # behavior preserved).
                 _treasury_share = _divest * _SDT // 10_000
+                if _lottery_bps == 0:
+                    _burn_share = _divest - _treasury_share
+                    _lottery_share = 0
+                else:
+                    _burn_share = _divest * _sim_burn_bps // 10_000
+                    _lottery_share = _divest - _burn_share - _treasury_share
                 sim_staked[_seid] = _current - _divest
                 if _treasury_share > 0:
                     sim_balances[TREASURY_ENTITY_ID] = (
@@ -3086,6 +3118,17 @@ class Blockchain:
                     )
                 # Burn portion reduces total_supply — not represented in
                 # the per-entity state tree, so no sim_balances change.
+                # Lottery share accumulates in the sim-side pool mirror
+                # so the lottery sim further below can draw from it at
+                # the same height it might fire.  The consensus-visible
+                # scalar (self.supply.lottery_prize_pool) is mutated by
+                # the apply path; sim reads-through to the live value
+                # plus any this-block divestment contribution tracked
+                # here.  The scalar lives under _TAG_GLOBAL in the
+                # snapshot root (state_snapshot.py) so a state-synced
+                # node inherits the same pool as replaying nodes.
+                if _lottery_share > 0:
+                    sim_lottery_pool += _lottery_share
 
         # Simulate treasury rebase (hard fork): must byte-mirror
         # _apply_treasury_rebase, which runs AFTER seed divestment in
@@ -3219,17 +3262,25 @@ class Blockchain:
             # committee, proposer IS all the work.
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + reward
 
-        # Simulate bootstrap lottery.  Must byte-mirror apply path —
-        # at block_height % LOTTERY_INTERVAL == 0, compute the
-        # progress-faded bounty and, if > 0, credit it to the winner's
-        # balance.  Reputation snapshot used here is the pre-
-        # attestation-of-this-block state (matches apply: lottery runs
-        # before _process_attestations updates self.reputation with the
-        # current block's attestations).
+        # Simulate lottery.  Must byte-mirror apply path — at
+        # block_height % LOTTERY_INTERVAL == 0, compute the progress-
+        # faded bounty AND (REDIST-era, within divestment window) the
+        # pool-funded payout, sum them, and credit to the winner.
+        # Reputation snapshot used here is the pre-attestation-of-this-
+        # block state (matches apply: lottery runs before
+        # _process_attestations updates self.reputation with the
+        # current block's attestations).  Pool payout is drawn from
+        # self.supply.lottery_prize_pool (NOT a sim copy) because the
+        # sim reads the live pre-block value — the apply path hasn't
+        # yet credited the winner, and the divestment apply path runs
+        # BEFORE the lottery apply path so the pool reflects any
+        # divest-this-block contribution.
         from messagechain.config import (
             LOTTERY_INTERVAL as _LI,
             REPUTATION_CAP as _RC,
             get_lottery_bounty as _get_lottery_bounty,
+            SEED_DIVESTMENT_START_HEIGHT as _SIM_SDS,
+            SEED_DIVESTMENT_END_HEIGHT as _SIM_SDE,
         )
         if block_height > 0 and block_height % _LI == 0:
             from messagechain.consensus.reputation_lottery import (
@@ -3240,7 +3291,38 @@ class Blockchain:
                 self.bootstrap_progress,
                 full_bounty=_get_lottery_bounty(block_height),
             )
-            if _bounty > 0:
+            # Sim-side pool-funded payout.  Mirrors apply path exactly:
+            # same divestment-window gate, same remaining_firings
+            # formula, same integer-division drain.  For mid-window
+            # divestment blocks we must account for THIS block's
+            # divestment contribution to the pool — the sim above
+            # updated sim_staked but NOT a sim_pool, so we read
+            # self.supply.lottery_prize_pool directly (live pre-block
+            # value).  At the first divestment block the pool starts
+            # at 0; the divestment contribution for THIS block arrives
+            # inside the apply path's divestment step, but the lottery
+            # at this specific height only ever fires if
+            # block_height % LOTTERY_INTERVAL == 0 — apply runs
+            # divestment BEFORE lottery, so the live pool on apply
+            # already includes this block's contribution.  Sim runs
+            # the same order; here the sim's divestment step above
+            # didn't update a sim_pool, so we must track it for
+            # accuracy.  Simplest: sim reads live pool at block-start,
+            # plus whatever this block just contributed in sim (which
+            # we'd have to track explicitly).  Since the lottery-
+            # funding test does NOT depend on mid-block consistency
+            # (the sim/apply lockstep test exercises this), read the
+            # live pool and trust the apply-path ordering.
+            _pool_payout = 0
+            if (
+                block_height > _SIM_SDS
+                and sim_lottery_pool > 0
+            ):
+                _blocks_until_end = _SIM_SDE - block_height
+                _remaining = max(1, _blocks_until_end // _LI + 1)
+                _pool_payout = sim_lottery_pool // _remaining
+            _total = _bounty + _pool_payout
+            if _total > 0:
                 _winner = select_lottery_winner(
                     candidates=list(self.reputation.items()),
                     seed_entity_ids=self.seed_entity_ids,
@@ -3249,7 +3331,7 @@ class Blockchain:
                 )
                 if _winner is not None:
                     sim_balances[_winner] = (
-                        sim_balances.get(_winner, 0) + _bounty
+                        sim_balances.get(_winner, 0) + _total
                     )
 
         # Apply-path parity for signature-driven watermark bumps.  Order
@@ -5818,15 +5900,23 @@ class Blockchain:
         window = SEED_DIVESTMENT_END_HEIGHT - SEED_DIVESTMENT_START_HEIGHT
         assert window > 0, "divestment window must be positive"
 
-        # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT):
-        # pre-activation the legacy (floor=1M, burn=75%, treasury=25%)
-        # values apply byte-for-byte; post-activation the retune
-        # (floor=20M, burn=95%, treasury=5%) values apply.  The sim
-        # path in compute_post_state_root reads the same helper so sim
-        # and apply stay in lockstep at every height.
-        retain_floor, _burn_bps, treasury_bps = get_seed_divestment_params(
-            block_height,
-        )
+        # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT
+        # and SEED_DIVESTMENT_REDIST_HEIGHT): pre-RETUNE the legacy
+        # (floor=1M, burn=75%, treasury=25%, lottery=0%) values apply
+        # byte-for-byte; RETUNE-era the retune (floor=20M, burn=95%,
+        # treasury=5%, lottery=0%) values apply; REDIST-era the
+        # redistribution (floor=20M, burn=50%, treasury=5%,
+        # lottery=45%) values apply — the lottery share accumulates
+        # in SupplyTracker.lottery_prize_pool for later payout via
+        # the reputation-weighted lottery.  The sim path in
+        # compute_post_state_root reads the same helper so sim and
+        # apply stay in lockstep at every height across both forks.
+        (
+            retain_floor,
+            _burn_bps,
+            treasury_bps,
+            lottery_bps,
+        ) = get_seed_divestment_params(block_height)
 
         SCALE = self._DIVESTMENT_SCALE
 
@@ -5883,13 +5973,31 @@ class Blockchain:
             # slashing.
             self.seed_divestment_debt[eid] = debt - divest * SCALE
 
-            # Split: treasury gets the activation-gated bps share;
-            # burn gets the remainder so any integer-rounding remainder
-            # always favors burn — smaller supply is the cleaner
-            # invariant.
+            # Split: burn + treasury (+ lottery REDIST-era) must sum
+            # EXACTLY to `divest` — no lossy rounding.
+            #
+            # Pre-REDIST (lottery_bps == 0): rounding remainder flows
+            # to BURN so legacy/retune byte-for-byte behavior is
+            # preserved (smaller supply is the cleaner invariant —
+            # matches the pre-redistribution comment in this function).
+            # Treasury takes its bps share, burn takes the rest,
+            # lottery_share is zero.
+            #
+            # REDIST-era (lottery_bps > 0): burn and treasury take
+            # their nominal bps shares, LOTTERY takes the remainder so
+            # the three pieces sum EXACTLY to divest.  Treating
+            # lottery as the catch-all guarantees lossless partition
+            # and routes integer-rounding drift into the pool (which
+            # eventually pays out in full, preserving non-founder-
+            # directed value).
             treasury_share = divest * treasury_bps // 10_000
-            burn_share = divest - treasury_share
-            assert treasury_share + burn_share == divest
+            if lottery_bps == 0:
+                burn_share = divest - treasury_share
+                lottery_share = 0
+            else:
+                burn_share = divest * _burn_bps // 10_000
+                lottery_share = divest - burn_share - treasury_share
+            assert treasury_share + burn_share + lottery_share == divest
 
             self.supply.staked[eid] = current_stake - divest
             if treasury_share > 0:
@@ -5899,6 +6007,16 @@ class Blockchain:
             if burn_share > 0:
                 self.supply.total_supply -= burn_share
                 self.supply.total_burned += burn_share
+            if lottery_share > 0:
+                # Lottery prize pool: accumulates for later payout via
+                # the reputation-weighted lottery.  total_supply is
+                # UNCHANGED here — tokens move from staked to a
+                # consensus-visible scalar pool; total circulating
+                # supply is preserved until the lottery pays out to a
+                # winner's balance.  Pool is snapshotted for reorg
+                # rollback and committed to the state-snapshot root;
+                # see SupplyTracker.lottery_prize_pool.
+                self.supply.lottery_prize_pool += lottery_share
 
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
@@ -6360,18 +6478,36 @@ class Blockchain:
                         earned_at=current_h, unlock_at=unlock_at,
                     )
 
-        # Reputation-weighted bootstrap lottery.  Fires every
-        # LOTTERY_INTERVAL blocks; bounty fades linearly from full at
-        # progress=0 to 0 at progress=1 via lottery_bounty_for_progress
-        # — smooth time-bound handoff to normal PoS, no cliff.
-        # Winner receives the (faded) bounty credited to balance AND
-        # held in escrow for the current escrow window — slashable if
-        # the winner then misbehaves.  Seeds are excluded; reputation
-        # = 0 candidates can still win if nobody else has attested yet.
+        # Reputation-weighted lottery.  Two sources of funding:
+        #
+        #   Bootstrap bounty (pre-BOOTSTRAP_END): fades linearly from
+        #   LOTTERY_BOUNTY at progress=0 to 0 at progress=1 via
+        #   lottery_bounty_for_progress — a smooth time-bound handoff
+        #   to normal PoS with no cliff.  The bounty is MINTED (new
+        #   issuance → total_supply += bounty).
+        #
+        #   Redistribution payout (post-REDIST activation, divestment
+        #   window START+1 <= h <= DIVEST_END): funded from
+        #   lottery_prize_pool (accumulated from divested founder
+        #   stake).  Drains the pool EVENLY over remaining firings so
+        #   the final firing at the last 144-block slot hits pool=0.
+        #   NOT minted — just moved from the pool scalar into the
+        #   winner's balance, preserving total_supply.
+        #
+        # Winners are always non-seed (see select_lottery_winner).
+        # During the divestment window seeds are the funding source
+        # via their divested stake; allowing them to win their own
+        # tokens back would defeat the redistribution purpose.  The
+        # hard exclusion in select_lottery_winner(seed_entity_ids)
+        # handles this by construction — no progress-based ramp
+        # applies here (unlike the attester committee which DOES
+        # ramp seeds back at progress >= 0.5).
         from messagechain.config import (
             LOTTERY_INTERVAL,
             REPUTATION_CAP,
             get_lottery_bounty,
+            SEED_DIVESTMENT_START_HEIGHT,
+            SEED_DIVESTMENT_END_HEIGHT,
         )
         current_h = block.header.block_number
         if current_h > 0 and current_h % LOTTERY_INTERVAL == 0:
@@ -6383,11 +6519,45 @@ class Blockchain:
             # continues to apply the `(1 - bootstrap_progress)` fade on top
             # of the returned base — collapse-to-0 at progress=1.0 is
             # preserved, the raise just scales the non-zero envelope.
+            # The bootstrap-era bounty is NEW mint; pool payout (post-REDIST)
+            # is MOVED from lottery_prize_pool (no mint).
             bounty = lottery_bounty_for_progress(
                 self.bootstrap_progress,
                 full_bounty=get_lottery_bounty(current_h),
             )
-            if bounty > 0:
+            # Redistribution-era bounty: drawn from the accumulated
+            # prize pool, drained evenly across remaining firings so
+            # the pool hits exactly 0 at the final firing.  The window
+            # spans from the first lottery firing after the divestment
+            # START (when the pool first accumulates) onwards — and
+            # continues past SEED_DIVESTMENT_END_HEIGHT if the pool has
+            # residual (post-END firings use remaining_firings = 1 so
+            # any residual drains at the first post-END lottery firing).
+            #
+            # The remaining_firings formula:
+            #     max(1, blocks_until_divest_end // LOTTERY_INTERVAL + 1)
+            # is chosen so the pool drains evenly across the divestment
+            # window — at every firing, the pool is divided by the
+            # COUNT of firings remaining (including this one) so a
+            # final firing with remaining_firings = 1 takes the whole
+            # residue.  Integer-division rounding is absorbed into the
+            # final firing.
+            pool_payout = 0
+            if (
+                current_h > SEED_DIVESTMENT_START_HEIGHT
+                and self.supply.lottery_prize_pool > 0
+            ):
+                blocks_until_divest_end = (
+                    SEED_DIVESTMENT_END_HEIGHT - current_h
+                )
+                remaining_firings = max(
+                    1, blocks_until_divest_end // LOTTERY_INTERVAL + 1,
+                )
+                pool_payout = (
+                    self.supply.lottery_prize_pool // remaining_firings
+                )
+            total_bounty = bounty + pool_payout
+            if total_bounty > 0:
                 candidates = list(self.reputation.items())
                 winner = select_lottery_winner(
                     candidates=candidates,
@@ -6397,27 +6567,31 @@ class Blockchain:
                 )
                 if winner is not None:
                     self.supply.balances[winner] = (
-                        self.supply.balances.get(winner, 0) + bounty
+                        self.supply.balances.get(winner, 0) + total_bounty
                     )
-                    self.supply.total_supply += bounty
-                    # Mint-accounting parity with mint_block_reward /
-                    # slash_validator: every path that mints tokens
-                    # must bump BOTH total_supply AND total_minted,
-                    # otherwise the invariant
-                    # `total_supply == GENESIS_SUPPLY + total_minted
-                    #                  - total_burned`
-                    # drifts by `bounty` every LOTTERY_INTERVAL blocks.
-                    self.supply.total_minted += bounty
+                    # Bootstrap-era `bounty` is NEW mint — bump BOTH
+                    # total_supply and total_minted to preserve the
+                    # invariant `total_supply == GENESIS_SUPPLY
+                    # + total_minted - total_burned` (parity with
+                    # mint_block_reward / slash_validator).
+                    # `pool_payout` is MOVED from lottery_prize_pool
+                    # (not newly minted) — debit the pool only.
+                    if bounty > 0:
+                        self.supply.total_supply += bounty
+                        self.supply.total_minted += bounty
+                    if pool_payout > 0:
+                        self.supply.lottery_prize_pool -= pool_payout
                     if escrow_len > 0:
                         self._escrow.add(
-                            entity_id=winner, amount=bounty,
+                            entity_id=winner, amount=total_bounty,
                             earned_at=current_h,
                             unlock_at=current_h + escrow_len,
                         )
                     logger.info(
                         f"LOTTERY: block #{current_h} — winner "
-                        f"{winner.hex()[:16]} received {bounty} tokens "
-                        f"(reputation={self.reputation.get(winner, 0)}, "
+                        f"{winner.hex()[:16]} received {total_bounty} tokens "
+                        f"(bootstrap_bounty={bounty}, pool_payout={pool_payout}, "
+                        f"reputation={self.reputation.get(winner, 0)}, "
                         f"progress={self.bootstrap_progress:.3f}, "
                         f"escrow_blocks={escrow_len})"
                     )
@@ -7695,6 +7869,16 @@ class Blockchain:
             "treasury_spend_debited_this_epoch": (
                 self.supply._treasury_spend_debited_this_epoch
             ),
+            # Seed-divestment lottery redistribution (hard fork):
+            # pool of lottery-share tokens accumulated from divested
+            # founder stake, awaiting reputation-weighted-lottery
+            # payout.  Consensus-visible scalar; reorg that undoes
+            # divestment blocks or lottery firings must roll this
+            # back in lockstep with the balance/stake rewinds above,
+            # or the canonical replay would accumulate / drain a
+            # diverged amount.  Committed to the state-snapshot root
+            # under _GLOBAL_LOTTERY_PRIZE_POOL for state-sync parity.
+            "lottery_prize_pool": self.supply.lottery_prize_pool,
             "chain_length": len(self.chain),
             "slashed_validators": set(self.slashed_validators),
             "immature_rewards": list(self._immature_rewards),
@@ -7782,6 +7966,13 @@ class Blockchain:
         )
         self.supply._treasury_spend_debited_this_epoch = snapshot.get(
             "treasury_spend_debited_this_epoch", 0,
+        )
+        # Lottery prize pool — reorg rollback restores the pre-reorg
+        # accumulation / drain state so the canonical replay produces
+        # identical payouts.  Default 0 so pre-fork snapshots restore
+        # cleanly (no pool ever accumulated under the old schedule).
+        self.supply.lottery_prize_pool = snapshot.get(
+            "lottery_prize_pool", 0,
         )
         self.base_fee = self.supply.base_fee
         self.nonces = snapshot["nonces"]

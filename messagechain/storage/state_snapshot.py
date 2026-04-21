@@ -133,7 +133,18 @@ from messagechain.config import (
 #     streak-based decay rule.  Decay timing affects withhold_pct on
 #     the next reward block, so two nodes must agree bit-for-bit on
 #     streak state.  Trails the v7 sections.
-STATE_SNAPSHOT_VERSION = 8  # wire format version for encode/decode
+# v9: added lottery_prize_pool — consensus-visible scalar that
+#     accumulates the 45% "lottery" share of divested founder stake
+#     under the seed-divestment lottery-redistribution hard fork
+#     (SEED_DIVESTMENT_REDIST_HEIGHT).  Drained evenly across
+#     remaining lottery firings in the divestment window.  Must
+#     participate in the snapshot root: two state-synced nodes that
+#     disagreed on the pool balance would compute different payout
+#     amounts at the next lottery firing and silently fork.  Placed
+#     under _TAG_GLOBAL alongside other supply-level scalars
+#     (_GLOBAL_LOTTERY_PRIZE_POOL).  Binary layout: single u64
+#     appended after validator_archive_success_streak.
+STATE_SNAPSHOT_VERSION = 9  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -228,6 +239,16 @@ _GLOBAL_NEXT_ENTITY_INDEX = b"next_entity_index"
 # balance silently fork at the next challenge block (different payout
 # amounts flow into different balances).
 _GLOBAL_ARCHIVE_REWARD_POOL = b"archive_reward_pool"
+# Seed-divestment lottery-redistribution hard fork: consensus-visible
+# scalar holding the accumulated "lottery" share of divested founder
+# stake awaiting reputation-weighted-lottery payout.  Single scalar;
+# lives under _TAG_GLOBAL so it shares the root-commitment path with
+# the other supply-level counters.  MUST participate in the snapshot
+# root: two state-synced nodes that disagreed on the pool balance
+# would silently fork at the next lottery firing in the divestment
+# window (different payout amounts flow into different winner
+# balances).  See SupplyTracker.lottery_prize_pool.
+_GLOBAL_LOTTERY_PRIZE_POOL = b"lottery_prize_pool"
 
 
 def _h(data: bytes) -> bytes:
@@ -336,6 +357,14 @@ def serialize_state(blockchain) -> dict:
         # threshold) affects withhold_pct on the next reward block.
         "validator_archive_success_streak": dict(
             getattr(blockchain, "validator_archive_success_streak", {})
+        ),
+        # v9: seed-divestment lottery-redistribution prize pool.
+        # Consensus-visible scalar accumulating the 45% "lottery"
+        # share of divested founder stake (REDIST-era only).  Pool is
+        # drained evenly across remaining lottery firings in the
+        # divestment window, ending at exactly 0 at the final firing.
+        "lottery_prize_pool": int(
+            getattr(blockchain.supply, "lottery_prize_pool", 0)
         ),
     }
 
@@ -496,6 +525,12 @@ def deserialize_state(snapshot: dict) -> dict:
     # from block replay going forward (streak accumulates only after
     # activation, so starting empty is correct, not lossy).
     out.setdefault("validator_archive_success_streak", {})
+    # Pre-v9 snapshots lack the lottery prize pool.  Default to 0 —
+    # the pool only accumulates post-REDIST-activation, and a
+    # migrating chain that activates REDIST after a pre-v9 snapshot
+    # starts with an empty pool, exactly matching a replaying node
+    # that reaches REDIST with no prior accumulation.
+    out.setdefault("lottery_prize_pool", 0)
     return out
 
 
@@ -685,6 +720,13 @@ def compute_state_root(snapshot: dict) -> bytes:
                 # stale pool would compute different payout amounts at
                 # the next challenge block and silently fork.
                 _GLOBAL_ARCHIVE_REWARD_POOL: snap["archive_reward_pool"],
+                # v9: seed-divestment lottery-redistribution prize
+                # pool.  Same consensus criticality as
+                # _GLOBAL_ARCHIVE_REWARD_POOL: a state-synced node
+                # that inherits a stale pool would compute a different
+                # payout at the next lottery firing in the divestment
+                # window and silently fork until END.
+                _GLOBAL_LOTTERY_PRIZE_POOL: snap["lottery_prize_pool"],
             })),
     }
 
@@ -904,6 +946,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes→int  dict>   validator_first_active_block   (v7+)
         <optional struct>   archive_active_snapshot        (v7+)
         <bytes→int  dict>   validator_archive_success_streak (v8+)
+        u64                 lottery_prize_pool              (v9+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -964,6 +1007,11 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_active_snapshot(snap["archive_active_snapshot"])
     # v8: success-streak counter, strictly appended after v7 fields.
     out += _encode_bytes_int_dict(snap["validator_archive_success_streak"])
+    # v9: seed-divestment lottery-redistribution prize pool, a single
+    # u64 scalar.  Strictly appended after the v8 streak dict so a
+    # v8 blob is a strict prefix of a v9 blob through the end of
+    # v8's final field.  Bounded above by total_supply → u64 ample.
+    out += struct.pack(">Q", int(snap["lottery_prize_pool"]))
     return bytes(out)
 
 
@@ -1043,6 +1091,11 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     validator_archive_success_streak, off = _decode_bytes_int_dict(
         blob, off,
     )
+    # v9+: lottery_prize_pool single scalar (u64), always present on
+    # v9+ blobs.  Pre-v9 blobs cannot reach here — the strict version
+    # check above rejects them.
+    (lottery_prize_pool,) = struct.unpack_from(">Q", blob, off)
+    off += 8
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1084,4 +1137,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "validator_archive_success_streak": (
             validator_archive_success_streak
         ),
+        "lottery_prize_pool": lottery_prize_pool,
     }

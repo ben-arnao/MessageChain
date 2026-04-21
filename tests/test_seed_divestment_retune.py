@@ -41,6 +41,23 @@ from messagechain.core.bootstrap import (
 from messagechain.identity.identity import Entity
 
 
+# This file exercises the RETUNE-era divestment schedule (20M floor,
+# 95/5 split, no lottery redistribution).  The REDIST hard fork adds
+# a third era that redirects 45% of divestment to lottery payouts;
+# to preserve RETUNE-era coverage here, push REDIST past the end of
+# this file's simulated range so every test height lives in the
+# RETUNE era without lottery redistribution kicking in.
+_ORIG_REDIST_HEIGHT = config.SEED_DIVESTMENT_REDIST_HEIGHT
+
+
+def setUpModule():
+    config.SEED_DIVESTMENT_REDIST_HEIGHT = 10 ** 9
+
+
+def tearDownModule():
+    config.SEED_DIVESTMENT_REDIST_HEIGHT = _ORIG_REDIST_HEIGHT
+
+
 TREASURY = config.TREASURY_ENTITY_ID
 
 
@@ -117,7 +134,7 @@ class TestParamsSelector(unittest.TestCase):
         self.assertTrue(hasattr(config, "get_seed_divestment_params"))
 
     def test_pre_activation_returns_legacy(self):
-        floor, burn_bps, tres_bps = config.get_seed_divestment_params(
+        floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT - 1,
         )
         self.assertEqual(floor, 1_000_000)
@@ -125,7 +142,7 @@ class TestParamsSelector(unittest.TestCase):
         self.assertEqual(tres_bps, 2500)
 
     def test_at_activation_returns_new(self):
-        floor, burn_bps, tres_bps = config.get_seed_divestment_params(
+        floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT,
         )
         self.assertEqual(floor, 20_000_000)
@@ -133,7 +150,7 @@ class TestParamsSelector(unittest.TestCase):
         self.assertEqual(tres_bps, 500)
 
     def test_post_activation_returns_new(self):
-        floor, burn_bps, tres_bps = config.get_seed_divestment_params(
+        floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT + 10_000,
         )
         self.assertEqual(floor, 20_000_000)
@@ -161,7 +178,7 @@ class TestDivestmentStepsUnderRetune(unittest.TestCase):
         # we can't drive the pre-retune schedule against a real chain
         # without monkeypatching.  Pin the legacy result via the
         # helper instead.
-        floor, burn_bps, tres_bps = config.get_seed_divestment_params(
+        floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT - 1,
         )
         self.assertEqual(floor, config.SEED_DIVESTMENT_RETAIN_FLOOR)
@@ -272,7 +289,7 @@ class TestSimulationPathUsesRetunedParams(unittest.TestCase):
         sim_staked = dict(staked_before)
         sim_balances = dict(balances_before)
         # Re-derive the sim using current config knobs (retune-aware).
-        floor, _burn_bps, tres_bps = config.get_seed_divestment_params(
+        floor, _burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             block_height,
         )
         divestible = staked_before[seed_id] - floor
