@@ -192,18 +192,40 @@ def validate_sig_version(sig_version: int) -> tuple[bool, str]:
 BLOCK_SERIALIZATION_VERSION = 1
 TX_SERIALIZATION_VERSION = 1
 
+# Acceptance sets, mirroring _ACCEPTED_SIG_VERSIONS above.  CLAUDE.md
+# principle #3 (crypto agility) says every versioned object must be
+# migratable by hard fork; a single-value equality check forces every
+# widen-and-accept migration to edit validator logic, whereas a
+# frozenset lets the migration be a one-line data edit.  During a
+# version-bump window, the set contains BOTH the old and the new
+# values; after the migration cutover, the old value can be removed.
+# Both validators below read these sets lazily via globals() so test
+# monkeypatching sees the mutation and import-order is flexible.
+_ACCEPTED_BLOCK_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
+    BLOCK_SERIALIZATION_VERSION,
+})
+_ACCEPTED_TX_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
+    TX_SERIALIZATION_VERSION,
+})
+
 
 def validate_block_serialization_version(version: int) -> tuple[bool, str]:
     """Reject unknown block wire-format versions at the parse boundary.
 
     Called from Block.from_bytes after reading the leading version byte.
-    A future format-bump governance proposal widens this check to accept
-    both the old and new values during a migration window.
+    A future format-bump governance proposal widens this check by
+    adding the new value to _ACCEPTED_BLOCK_SERIALIZATION_VERSIONS — no
+    logic edit required.
     """
-    if version != BLOCK_SERIALIZATION_VERSION:
+    accepted = globals().get(
+        "_ACCEPTED_BLOCK_SERIALIZATION_VERSIONS",
+        frozenset({BLOCK_SERIALIZATION_VERSION}),
+    )
+    if version not in accepted:
         return False, (
             f"Unknown block serialization version {version} "
-            f"(current = {BLOCK_SERIALIZATION_VERSION})"
+            f"(accepted = {sorted(accepted)}, "
+            f"current = {BLOCK_SERIALIZATION_VERSION})"
         )
     return True, "OK"
 
@@ -215,10 +237,15 @@ def validate_tx_serialization_version(version: int) -> tuple[bool, str]:
     version byte.  Same bump-and-widen upgrade shape as
     validate_block_serialization_version.
     """
-    if version != TX_SERIALIZATION_VERSION:
+    accepted = globals().get(
+        "_ACCEPTED_TX_SERIALIZATION_VERSIONS",
+        frozenset({TX_SERIALIZATION_VERSION}),
+    )
+    if version not in accepted:
         return False, (
             f"Unknown transaction serialization version {version} "
-            f"(current = {TX_SERIALIZATION_VERSION})"
+            f"(accepted = {sorted(accepted)}, "
+            f"current = {TX_SERIALIZATION_VERSION})"
         )
     return True, "OK"
 
@@ -236,15 +263,17 @@ def validate_receipt_version(version: int) -> tuple[bool, str]:
     Separated from sig_version because receipts are a separate wire
     object: bumping RECEIPT_VERSION doesn't require a sig-scheme change
     and vice versa.  Reserved: 0 is invalid (traps truncated input that
-    decodes as all-zero bytes).
+    decodes as all-zero bytes).  Widens by adding to
+    _ACCEPTED_RECEIPT_VERSIONS (defined later in this module — read
+    lazily via globals() so test monkeypatching works and import
+    order is flexible).
     """
-    # RECEIPT_VERSION is defined later in this module; reference it
-    # lazily via globals() so the function can be called during
-    # module re-import without NameError on cold init.
     current = globals().get("RECEIPT_VERSION", 1)
-    if version != current:
+    accepted = globals().get("_ACCEPTED_RECEIPT_VERSIONS", frozenset({current}))
+    if version not in accepted:
         return False, (
-            f"Unknown receipt version {version} (current = {current})"
+            f"Unknown receipt version {version} "
+            f"(accepted = {sorted(accepted)}, current = {current})"
         )
     return True, "OK"
 
@@ -1150,6 +1179,11 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 # for BLOCK_TIME_TARGET=600s.  Don't duplicate them here.
 SUBMISSION_FEE = MIN_FEE              # anti-spam; paid to validator regardless of inclusion
 RECEIPT_VERSION = 1                   # on-wire version of SubmissionReceipt
+# Acceptance set for validate_receipt_version above — same
+# widen-by-data-edit shape as _ACCEPTED_SIG_VERSIONS.  During a
+# RECEIPT_VERSION=2 rollout this becomes frozenset({1, 2}); after the
+# migration window the old value is removed.
+_ACCEPTED_RECEIPT_VERSIONS: frozenset[int] = frozenset({RECEIPT_VERSION})
 # NOTE: the actual per-validator receipt-signing tree is
 # RECEIPT_SUBTREE_HEIGHT (defined further down, currently 16).  An
 # earlier RECEIPT_MERKLE_TREE_HEIGHT=24 constant lived here but was
