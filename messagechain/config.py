@@ -120,13 +120,22 @@ SIG_VERSION_WOTS_W16_K64_V2 = 2   # Same parameters, but with the fixed
                                   # security from 128-bit to ~2^56
                                   # grinding.  V2 closes this gap.
 SIG_VERSION_CURRENT = SIG_VERSION_WOTS_W16_K64_V2
-# Accepted sig versions: legacy V1 must still validate (the live
-# mainnet chain up to the V2 cutover has V1 signatures baked into
-# every committed block); V2 is the go-forward scheme for all new
-# signatures.  Either version produces an identical Signature wire
-# format — only the checksum-nibble derivation differs.
+# Accepted sig versions.  V1 was retired at the 2026-04-21 mainnet
+# re-mint (genesis bb010943...): the re-minted chain was produced
+# entirely by current code (SIG_VERSION_CURRENT = V2), so no V1
+# signature exists in the live chain's history, and nothing
+# legitimate would ever produce one.  V1's checksum effectively
+# collapses to zero (see SIG_VERSION_WOTS_W16_K64 comment above —
+# ~2^56 grinding forgery).  Leaving V1 in the accept set after the
+# re-mint is a pure forgery gate with no offsetting benefit, so V1
+# is rejected at the consensus boundary.  The constant itself stays
+# defined for historical reference + a clear rejection error.
+#
+# To re-accept V1 for some future migration, re-add
+# SIG_VERSION_WOTS_W16_K64 here — but only if you genuinely need to
+# validate pre-2026-04-21 sigs (e.g., an archival tool, NOT the
+# live consensus path).
 _ACCEPTED_SIG_VERSIONS: frozenset[int] = frozenset({
-    SIG_VERSION_WOTS_W16_K64,
     SIG_VERSION_WOTS_W16_K64_V2,
 })
 

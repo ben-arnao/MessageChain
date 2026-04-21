@@ -51,11 +51,17 @@ class TestCryptoAgilityConstants(unittest.TestCase):
         verifies, but every NEW signature uses V2."""
         self.assertEqual(SIG_VERSION_CURRENT, SIG_VERSION_WOTS_W16_K64_V2)
 
-    def test_v1_still_accepted_for_legacy_chain(self):
-        """V1 must remain accepted — the live mainnet chain has V1
-        signatures baked into every block committed before the V2
-        cutover; rejecting V1 would halt existing-chain validation."""
-        self.assertIn(SIG_VERSION_WOTS_W16_K64, _ACCEPTED_SIG_VERSIONS)
+    def test_v1_retired_on_post_reset_chain(self):
+        """V1 was retired at the 2026-04-21 mainnet re-mint.  The new
+        chain (genesis bb010943...) was minted entirely by code whose
+        SIG_VERSION_CURRENT = V2, so no V1 signature exists in the
+        live chain's history.  V1's ~2^56-grindable checksum makes
+        continued acceptance a pure forgery gate; dropping it closes
+        that gate without affecting any real chain data.  See the
+        comment beside _ACCEPTED_SIG_VERSIONS in config.py and
+        tests/test_retire_v1_sig_version.py for rationale.
+        """
+        self.assertNotIn(SIG_VERSION_WOTS_W16_K64, _ACCEPTED_SIG_VERSIONS)
         self.assertIn(SIG_VERSION_WOTS_W16_K64_V2, _ACCEPTED_SIG_VERSIONS)
 
 
