@@ -111,6 +111,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
 
+    # --- send-multi ---
+    send_multi = sub.add_parser(
+        "send-multi",
+        help="Send a message via multi-validator HTTPS fan-out",
+        description=(
+            "Censorship-resistant submission: POST the signed tx in "
+            "parallel to N>=3 validator HTTPS endpoints. Receipts are "
+            "persisted under --receipts-dir for later evidence use."
+        ),
+    )
+    send_multi.add_argument("message", type=str, help="Message text (280 chars max)")
+    send_multi.add_argument(
+        "--fee", type=int, required=True, help="Transaction fee (tokens)",
+    )
+    send_multi.add_argument(
+        "--endpoint", dest="endpoints", action="append", default=[],
+        help="Validator endpoint host:port (repeat for each; min 3)",
+    )
+    send_multi.add_argument(
+        "--insecure", action="store_true",
+        help="Accept self-signed validator TLS certs (TOFU mode)",
+    )
+    send_multi.add_argument(
+        "--nonce", type=int, default=0,
+        help="Tx nonce (default 0; useful for fresh accounts)",
+    )
+    send_multi.add_argument(
+        "--leaf-index", dest="leaf_index", type=int, default=None,
+        help=(
+            "WOTS+ signing leaf (defaults to nonce). Override when the "
+            "chain's leaf-watermark for this entity has drifted past nonce."
+        ),
+    )
+    send_multi.add_argument(
+        "--min-successes", dest="min_successes", type=int, default=1,
+        help="Minimum endpoints that must accept (default 1)",
+    )
+    send_multi.add_argument(
+        "--per-endpoint-timeout-s", dest="per_endpoint_timeout_s",
+        type=float, default=10.0,
+        help="Per-endpoint timeout in seconds (default 10)",
+    )
+    send_multi.add_argument(
+        "--receipts-dir", dest="receipts_dir", type=str, default=None,
+        help="Where to persist signed receipts (default ~/.messagechain/receipts)",
+    )
+    send_multi.add_argument(
+        "--no-receipts", dest="no_receipts", action="store_true",
+        help="Don't request signed receipts (skips X-MC-Request-Receipt)",
+    )
+
     # --- transfer ---
     transfer = sub.add_parser(
         "transfer",
@@ -1123,6 +1174,101 @@ def cmd_send(args):
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
+
+
+def cmd_send_multi_submit(args) -> int:
+    """Send a message via multi-validator HTTPS fan-out.
+
+    Censorship-resistant alternative to `send`: instead of trusting one
+    RPC node, POST the signed tx in parallel to N>=3 validator HTTPS
+    submission endpoints.  Single-validator censorship and single-
+    endpoint blocking become useless because the user reaches alternates
+    simultaneously.
+
+    Returns 0 on success (>=min_successes endpoints accepted), non-zero
+    otherwise.  Receipts collected from accepting validators are
+    persisted under args.receipts_dir so the user can later file a
+    CensorshipEvidenceTx if any receipted tx fails to land on-chain.
+    """
+    from messagechain.identity.identity import Entity
+    from messagechain.core.transaction import create_transaction
+    from messagechain.network.submit_client import (
+        SubmitClient, ValidatorEndpoint,
+    )
+
+    raw_endpoints = list(getattr(args, "endpoints", None) or [])
+    if len(raw_endpoints) < 3:
+        print(
+            f"Error: --multi-submit requires at least 3 endpoints "
+            f"(got {len(raw_endpoints)}). Pass --endpoint host:port "
+            f"three or more times, or populate config_local.SUBMIT_ENDPOINTS."
+        )
+        return 1
+    try:
+        endpoints = [ValidatorEndpoint.parse(e) for e in raw_endpoints]
+    except ValueError as e:
+        print(f"Error: invalid endpoint: {e}")
+        return 1
+    if getattr(args, "insecure", False):
+        for ep in endpoints:
+            ep.insecure = True
+
+    keyfile = getattr(args, "keyfile", None)
+    if not keyfile or not os.path.exists(keyfile):
+        print("Error: --keyfile is required and must exist for multi-submit")
+        return 1
+    with open(keyfile, "r", encoding="ascii") as f:
+        hex_key = f.read().strip()
+    try:
+        private_key = bytes.fromhex(hex_key)
+    except ValueError:
+        print("Error: keyfile must contain a 64-char hex private key")
+        return 1
+    entity = Entity.create(private_key)
+
+    nonce = int(getattr(args, "nonce", 0) or 0)
+    leaf_index = getattr(args, "leaf_index", None)
+    if leaf_index is None:
+        leaf_index = nonce
+    entity.keypair.advance_to_leaf(int(leaf_index))
+
+    tx = create_transaction(
+        entity, args.message, fee=int(args.fee), nonce=nonce,
+    )
+
+    client = SubmitClient(
+        endpoints=endpoints,
+        min_successes=int(getattr(args, "min_successes", 1) or 1),
+        per_endpoint_timeout_s=float(
+            getattr(args, "per_endpoint_timeout_s", 10.0) or 10.0
+        ),
+        request_receipts=not bool(getattr(args, "no_receipts", False)),
+    )
+    result = client.submit(tx)
+
+    print(f"tx_hash:   {result.tx_hash.hex()}")
+    print(f"successes: {result.successes}/{len(endpoints)}")
+    print(f"receipts:  {len(result.receipts)}")
+    print(f"elapsed:   {result.elapsed_ms}ms")
+    for ep, reason in result.rejections:
+        print(f"  rejected by {ep.host}:{ep.port}: {reason}")
+
+    receipts_dir = getattr(args, "receipts_dir", None) or os.path.join(
+        os.path.expanduser("~"), ".messagechain", "receipts",
+    )
+    if result.receipts:
+        os.makedirs(receipts_dir, exist_ok=True)
+        # One file per (tx_hash, issuer_id) so multiple validators'
+        # receipts for the same tx don't overwrite each other.
+        for r in result.receipts:
+            fname = f"{r.tx_hash.hex()}_{r.issuer_id.hex()[:16]}.bin"
+            path = os.path.join(receipts_dir, fname)
+            with open(path, "wb") as f:
+                f.write(r.to_bytes())
+
+    if result.successes < client.min_successes:
+        return 1
+    return 0
 
 
 def cmd_transfer(args):
@@ -2403,6 +2549,7 @@ def main():
         "start": cmd_start,
         "account": cmd_account,
         "send": cmd_send,
+        "send-multi": cmd_send_multi_submit,
         "transfer": cmd_transfer,
         "balance": cmd_balance,
         "stake": cmd_stake,
