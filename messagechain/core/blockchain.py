@@ -1993,14 +1993,23 @@ class Blockchain:
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
 
-        # H6: Reject expired evidence. Evidence older than UNBONDING_PERIOD
-        # is stale — the offender may have already unstaked and exited.
-        # This prevents ancient evidence from being weaponized.
-        from messagechain.config import UNBONDING_PERIOD
+        # H6: Reject expired evidence.  Evidence window must cover the
+        # longer of (a) unbonding (stake is slashable until unbonded)
+        # and (b) attester-escrow lock (rewards are slashable until
+        # escrow matures).  Using UNBONDING_PERIOD alone left
+        # ATTESTER_ESCROW_BLOCKS - UNBONDING_PERIOD = 11,952 blocks
+        # (~83 days) of escrow-locked rewards technically slashable in
+        # the comment but unslashable in code - iter 6 H1 finding.
+        # Using max() honors both bonding types.
+        from messagechain.config import UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS
         height = chain_height if chain_height is not None else self.height
         evidence_height = self._evidence_block_number(tx.evidence)
-        if evidence_height is not None and height - evidence_height > UNBONDING_PERIOD:
-            return False, "Evidence expired — older than unbonding period"
+        evidence_ttl = max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)
+        if evidence_height is not None and height - evidence_height > evidence_ttl:
+            return False, (
+                f"Evidence expired - older than {evidence_ttl} blocks "
+                f"(unbonding + escrow window)"
+            )
 
         # Verify the evidence itself (two valid conflicting signatures)
         offender_pk = self.public_keys[tx.evidence.offender_id]

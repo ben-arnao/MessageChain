@@ -1324,11 +1324,20 @@ CENSORSHIP_SLASH_BPS = 1000  # 10% of stake, in basis points (10_000 = 100%)
 EVIDENCE_INCLUSION_WINDOW = 32
 
 # Maximum age (blocks) of a receipt at evidence-submission time.
-# Beyond this, evidence is stale and rejected at mempool admission —
-# prevents weaponizing ancient receipts against a validator who may
-# have already unstaked.  Mirrors the UNBONDING_PERIOD idea from
-# equivocation slashing.
-EVIDENCE_EXPIRY_BLOCKS = 512
+# Beyond this, evidence is stale and rejected at mempool admission.
+#
+# Value must dominate MEMPOOL_TX_TTL so a censoring validator can't
+# simply stall a tx past the evidence window while the user still
+# sees "pending" in their UX for the full mempool TTL.  Previous 512
+# blocks (~3.5d at 600s) was less than MEMPOOL_TX_TTL of 14d: a
+# validator issued a receipt, dropped the tx, waited 4d past the
+# evidence window, and voided all accountability while the user still
+# sat on a "pending" UI for another 10 days (iter 6 M3 finding).
+#
+# 2016 blocks = 14 days at BLOCK_TIME_TARGET=600s - matches the
+# MEMPOOL_TX_TTL window 1:1 so there is no gap where receipts are
+# enforceable but dropped txs aren't.  Raised from 512 (iter 7).
+EVIDENCE_EXPIRY_BLOCKS = 2016
 
 # Maturity delay (blocks) between evidence admission and actual slash
 # application.  During this window, the accused proposer (or any other

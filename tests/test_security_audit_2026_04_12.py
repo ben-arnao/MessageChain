@@ -425,7 +425,11 @@ class TestSlashingEvidenceExpiration(unittest.TestCase):
         self.assertTrue(valid)
         # But the blockchain-level check should reject stale evidence
         # Simulate chain being far ahead
-        from messagechain.config import UNBONDING_PERIOD
+        # Evidence window is now max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)
+        # so stale-evidence rejection only fires past the longer bound
+        # (iter 7 H1 fix).  Test uses the authoritative expiry.
+        from messagechain.config import UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS
+        evidence_ttl = max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)
         # We need a submitter
         submitter = _make_entity()
         bc._install_pubkey_direct(submitter.entity_id, submitter.public_key,
@@ -433,10 +437,10 @@ class TestSlashingEvidenceExpiration(unittest.TestCase):
         bc.supply.balances[submitter.entity_id] = 10_000
         from messagechain.consensus.slashing import create_slash_transaction
         slash_tx = create_slash_transaction(submitter, evidence, fee=MIN_FEE)
-        # Pretend chain is far beyond evidence height
-        # The evidence references block_number=1; chain should reject if too old
+        # Pretend chain is far beyond evidence height.
+        # The evidence references block_number=1; chain should reject if too old.
         valid, reason = bc.validate_slash_transaction(
-            slash_tx, chain_height=1 + UNBONDING_PERIOD + 1,
+            slash_tx, chain_height=1 + evidence_ttl + 1,
         )
         self.assertFalse(valid)
         self.assertIn("expired", reason.lower())
