@@ -41,7 +41,7 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
-from messagechain.config import HASH_ALGO, SIG_VERSION_CURRENT
+from messagechain.config import CHAIN_ID, HASH_ALGO, SIG_VERSION_CURRENT
 from messagechain.crypto.keys import Signature, KeyPair, verify_signature
 
 
@@ -130,8 +130,19 @@ class SubmissionReceipt:
             self.receipt_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # CHAIN_ID binding (read lazily via the module's current
+        # binding so a test can monkeypatch this module's CHAIN_ID
+        # name without editing config).  Pre-fix this was omitted;
+        # receipts therefore verified on any chain that happened to
+        # share the issuer's receipt-subtree root — a cross-chain
+        # replay vector when the founder's hot key is reused across
+        # re-mints (the receipt-subtree root is deterministic in the
+        # private key).  Matches the MessageTransaction pattern.
+        import messagechain.network.submission_receipt as _self_mod
+        chain_id = getattr(_self_mod, "CHAIN_ID", CHAIN_ID)
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return b"".join([
+            chain_id,
             _DOMAIN_TAG,
             struct.pack(">B", sig_version),
             self.tx_hash,
@@ -287,8 +298,14 @@ class SignedRejection:
             self.rejection_hash = self._compute_hash()
 
     def _signable_data(self) -> bytes:
+        # CHAIN_ID binding — same rationale as SubmissionReceipt above.
+        # Rejections are also replay-prone across chains that share
+        # the validator's receipt-subtree root.
+        import messagechain.network.submission_receipt as _self_mod
+        chain_id = getattr(_self_mod, "CHAIN_ID", CHAIN_ID)
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return b"".join([
+            chain_id,
             _REJECTION_DOMAIN_TAG,
             struct.pack(">B", sig_version),
             self.tx_hash,
@@ -360,12 +377,23 @@ class SignedRejection:
 
     @classmethod
     def deserialize(cls, data: dict) -> "SignedRejection":
+        # Fail-fast on unknown reason_code so relay / indexer caches
+        # can't hold a consensus-invalid rejection that verify_rejection
+        # would reject downstream anyway.  Keeps the off-chain view of
+        # rejection state consistent with what the slashing path will
+        # eventually accept.
+        reason_code = int(data["reason_code"])
+        if reason_code not in _VALID_REASON_CODES:
+            raise ValueError(
+                f"SignedRejection has unknown reason_code {reason_code}; "
+                f"valid codes = {sorted(_VALID_REASON_CODES)}"
+            )
         r = cls(
             tx_hash=bytes.fromhex(data["tx_hash"]),
             commit_height=int(data["commit_height"]),
             issuer_id=bytes.fromhex(data["issuer_id"]),
             issuer_root_public_key=bytes.fromhex(data["issuer_root_public_key"]),
-            reason_code=int(data["reason_code"]),
+            reason_code=reason_code,
             signature=Signature.deserialize(data["signature"]),
         )
         expected = r._compute_hash()
