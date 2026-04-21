@@ -148,6 +148,21 @@ def compute_block_sig_cost(block) -> int:
         # Each bogus-rejection-evidence tx carries one submitter
         # signature + one rejection signature — cost both.
         + 2 * len(getattr(block, "bogus_rejection_evidence_txs", []))
+        # Each inclusion-list violation evidence tx carries ONE
+        # submitter signature.  The bundled InclusionList carries
+        # variable-many attester report sigs, but those are amortised
+        # via the inclusion_list field below — counting them again
+        # here would double-charge.
+        + len(getattr(block, "inclusion_list_violation_evidence_txs", []))
+        # Inclusion-list scalar slot: each attester report inside the
+        # quorum_attestation carries one signature.  Cap-bounded by
+        # MAX_INCLUSION_LIST_ENTRIES + the number of staked validators,
+        # so this stays within the existing per-block sig budget.
+        + (
+            len(block.inclusion_list.quorum_attestation)
+            if getattr(block, "inclusion_list", None) is not None
+            else 0
+        )
     )
 
 
@@ -371,6 +386,30 @@ class Blockchain:
         )
         self.bogus_rejection_processor: BogusRejectionProcessor = (
             BogusRejectionProcessor()
+        )
+
+        # Inclusion-list processor.  Tracks active forward windows for
+        # quorum-signed inclusion lists and the (tx_hash, proposer_id)
+        # set of violations already slashed (double-slash defence).
+        # Lifecycle:
+        #   - register(list, height) when a block carrying an
+        #     inclusion_list is applied.
+        #   - observe_block(block) every block apply: records which
+        #     mandated txs landed and which proposer was active at
+        #     each height.
+        #   - expire(height) at end of each apply: drops lists whose
+        #     window has closed; emits InclusionViolation records for
+        #     missed txs.  Caller (Blockchain) handles the slashing
+        #     via process_inclusion_list_violation when an evidence-tx
+        #     arrives in a later block.
+        # Snapshot-serialised so every node reaches identical slashing
+        # outcomes after replay.  See
+        # messagechain.consensus.inclusion_list.
+        from messagechain.consensus.inclusion_list import (
+            InclusionListProcessor,
+        )
+        self.inclusion_list_processor: InclusionListProcessor = (
+            InclusionListProcessor()
         )
 
         # Per-validator receipt-subtree root registry.  Receipts are
@@ -1141,6 +1180,41 @@ class Blockchain:
         self.bogus_rejection_processor.processed = set(
             snap.get("bogus_rejection_processed", set())
         )
+
+        # Inclusion-list processor: install active forward-window
+        # lists + processed_violations from snapshot.  Active lists are
+        # canonical-bytes encoded under publish_height keys; the
+        # processed-violations set is bytes(tx_hash || proposer_id)
+        # concatenations.  Per-list bookkeeping (inclusions_seen +
+        # proposers_by_height) is rebuilt empty — those are derived
+        # from observe_block calls during forward replay and don't
+        # affect any consensus decision once the active window has
+        # closed (only the `expire()` time fires from them).  At the
+        # snapshot height the chain is mid-window and observe_block
+        # will repopulate as new blocks arrive.
+        from messagechain.consensus.inclusion_list import (
+            InclusionList as _InclusionList,
+        )
+        active = {}
+        for ph, blob in snap.get("inclusion_list_active", {}).items():
+            active[int(ph)] = _InclusionList.from_bytes(bytes(blob))
+        self.inclusion_list_processor.active_lists = active
+        self.inclusion_list_processor.proposers_by_height = {
+            lst.list_hash: {} for lst in active.values()
+        }
+        self.inclusion_list_processor.inclusions_seen = {}
+        violations: set[tuple[bytes, bytes]] = set()
+        for compound in snap.get("inclusion_list_processed_violations", set()):
+            # Each entry is bytes(tx_hash || proposer_id) — both 32
+            # bytes.  Strict-shape check guards against a malformed
+            # snapshot from a forked node.
+            if len(compound) != 64:
+                raise ValueError(
+                    "inclusion_list_processed_violations entry must be "
+                    f"64 bytes, got {len(compound)}"
+                )
+            violations.add((bytes(compound[:32]), bytes(compound[32:])))
+        self.inclusion_list_processor.processed_violations = violations
 
         # Rebuild the per-entity sparse Merkle tree from the installed
         # state so compute_current_state_root reflects the snapshot.

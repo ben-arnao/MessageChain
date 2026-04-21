@@ -111,7 +111,14 @@ from messagechain.config import (
 #     Trails the v4 sections in the binary layout; pre-v5 snapshots
 #     decode with an empty processed set under deserialize_state's
 #     setdefault path.
-STATE_SNAPSHOT_VERSION = 5  # wire format version for encode/decode
+# v6: added inclusion-list processor state — active forward-window
+#     lists (int→bytes dict keyed by publish_height with the value
+#     being InclusionList.to_bytes()) and the processed_violations
+#     set (bytes containing tx_hash || proposer_id concatenated).
+#     Trails the v5 section in the binary layout; pre-v6 snapshots
+#     decode with empty active/processed under deserialize_state's
+#     setdefault path.
+STATE_SNAPSHOT_VERSION = 6  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -170,6 +177,15 @@ _TAG_RECEIPT_ROOT = b"rrk"
 # is nothing to age in.  Participates in the snapshot root for the
 # same dedupe-determinism reason as _TAG_CENSORSHIP_PROCESSED.
 _TAG_BOGUS_REJECTION_PROCESSED = b"brproc"
+# Inclusion-list processor — active forward-window lists keyed by
+# publish_height with InclusionList canonical bytes as the value, plus
+# the per-(tx_hash, proposer_id) processed_violations set.  Both
+# sections participate in the state root: two state-synced nodes that
+# disagreed on which lists are active or which violations have already
+# been slashed would silently fork the next time an
+# InclusionListViolationEvidenceTx arrived.
+_TAG_INCLUSION_LIST_ACTIVE = b"ilist_act"
+_TAG_INCLUSION_LIST_VIOLATIONS = b"ilist_vio"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -262,6 +278,20 @@ def serialize_state(blockchain) -> dict:
         "bogus_rejection_processed": _bogus_rejection_processed(
             getattr(blockchain, "bogus_rejection_processor", None),
         ),
+        # Inclusion-list processor — active forward-window lists keyed
+        # by publish_height (int) with the InclusionList canonical
+        # bytes as the value, plus the (tx_hash || proposer_id)
+        # processed_violations set.  See
+        # consensus.inclusion_list.InclusionListProcessor for the
+        # lifecycle that mutates these.
+        "inclusion_list_active": _inclusion_list_active(
+            getattr(blockchain, "inclusion_list_processor", None),
+        ),
+        "inclusion_list_processed_violations": (
+            _inclusion_list_processed_violations(
+                getattr(blockchain, "inclusion_list_processor", None),
+            )
+        ),
     }
 
 
@@ -269,6 +299,25 @@ def _bogus_rejection_processed(processor) -> set:
     if processor is None:
         return set()
     return set(processor.processed)
+
+
+def _inclusion_list_active(processor) -> dict:
+    """Serialise InclusionListProcessor.active_lists into an int→bytes
+    dict (height → InclusionList canonical bytes)."""
+    if processor is None:
+        return {}
+    out: dict[int, bytes] = {}
+    for ph, lst in processor.active_lists.items():
+        out[int(ph)] = lst.to_bytes()
+    return out
+
+
+def _inclusion_list_processed_violations(processor) -> set:
+    """Serialise the (tx_hash, proposer_id) set as bytes
+    concatenations so it can ride the standard bytes_set encoder."""
+    if processor is None:
+        return set()
+    return {tx + pid for (tx, pid) in processor.processed_violations}
 
 
 def _pending_to_bytes_dict(processor) -> dict:
@@ -384,6 +433,12 @@ def deserialize_state(snapshot: dict) -> dict:
     # wire-version bump and no historical block carries
     # BogusRejectionEvidenceTx that needs deduping.
     out.setdefault("bogus_rejection_processed", set())
+    # Pre-v6 snapshots lack the inclusion-list processor sections.  A
+    # migrating chain starts with empty active/processed_violations —
+    # acceptable because the slashing path was introduced at the v6
+    # bump and no historical block carries InclusionList traffic.
+    out.setdefault("inclusion_list_active", {})
+    out.setdefault("inclusion_list_processed_violations", set())
     return out
 
 
@@ -521,6 +576,19 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
             _TAG_BOGUS_REJECTION_PROCESSED,
             snap["bogus_rejection_processed"])),
+        # Inclusion-list processor — active forward-window lists keyed
+        # by publish_height with InclusionList canonical bytes as the
+        # value.  Two state-synced nodes that disagreed on this section
+        # would emit different InclusionViolation records on expiry.
+        _TAG_INCLUSION_LIST_ACTIVE: _merkle(_entries_for_section(
+            _TAG_INCLUSION_LIST_ACTIVE,
+            snap["inclusion_list_active"])),
+        # Inclusion-list processed violations — set of bytes
+        # concatenating tx_hash || proposer_id.  Same dedupe-determinism
+        # criticality as _TAG_CENSORSHIP_PROCESSED.
+        _TAG_INCLUSION_LIST_VIOLATIONS: _merkle(_entries_for_section(
+            _TAG_INCLUSION_LIST_VIOLATIONS,
+            snap["inclusion_list_processed_violations"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -688,6 +756,8 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes set>         censorship_processed   (v4+)
         <bytes→bytes dict>  receipt_subtree_roots  (v4+)
         <bytes set>         bogus_rejection_processed (v5+)
+        <int→bytes dict>    inclusion_list_active     (v6+)
+        <bytes set>         inclusion_list_processed_violations (v6+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -733,6 +803,13 @@ def encode_snapshot(snap: dict) -> bytes:
     # v5: bogus-rejection processed set, trailing the v4 sections.  No
     # pending counterpart — apply-time decision.
     out += _encode_bytes_set(snap["bogus_rejection_processed"])
+    # v6: inclusion-list processor sections.  active_lists is an
+    # int→bytes dict (publish_height → InclusionList canonical bytes);
+    # processed_violations is a bytes-set of (tx_hash || proposer_id)
+    # concatenations.  Trail the v5 section so a v5 blob is a strict
+    # prefix of a v6 blob through the end of v5's final field.
+    out += _encode_int_bytes_dict(snap["inclusion_list_active"])
+    out += _encode_bytes_set(snap["inclusion_list_processed_violations"])
     return bytes(out)
 
 
@@ -796,6 +873,11 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     receipt_subtree_roots, off = _decode_bytes_bytes_dict(blob, off)
     # v5+: bogus-rejection processed set.  Always present on v5+ blobs.
     bogus_rejection_processed, off = _decode_bytes_set(blob, off)
+    # v6+: inclusion-list processor sections.  Always present on v6+
+    # blobs.  active is an int→bytes dict (publish_height → list-bytes);
+    # processed_violations is a bytes-set of (tx || proposer) pairs.
+    inclusion_list_active, off = _decode_int_bytes_dict(blob, off)
+    inclusion_list_processed_violations, off = _decode_bytes_set(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -827,4 +909,8 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "censorship_processed": censorship_processed,
         "receipt_subtree_roots": receipt_subtree_roots,
         "bogus_rejection_processed": bogus_rejection_processed,
+        "inclusion_list_active": inclusion_list_active,
+        "inclusion_list_processed_violations": (
+            inclusion_list_processed_violations
+        ),
     }
