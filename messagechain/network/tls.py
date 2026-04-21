@@ -256,30 +256,71 @@ def _generate_self_signed_cert(cert_path: str, key_path: str):
             .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
             .sign(key, hashes.SHA256())
         )
-        with open(key_path, "wb") as f:
-            f.write(key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL,
-                serialization.NoEncryption(),
-            ))
-        # M14: Restrict private key file permissions
+        pem_bytes = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        )
+        # R5-C: Atomically create the private-key file with mode 0o600
+        # so it NEVER lands on disk world-readable.  The previous
+        # `open("wb") + os.chmod(0o600)` pattern left a TOCTOU window
+        # in which a local unprivileged user on a shared host could
+        # race to read the key before the chmod tightened it.
+        #
+        # Semantics preserved: the old code silently overwrote any
+        # existing key at `key_path` via "wb".  O_EXCL refuses to
+        # reuse an existing file, so unlink first — ignore
+        # FileNotFoundError since the normal first-run case has no
+        # preexisting file.
+        try:
+            os.unlink(key_path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            key_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(pem_bytes)
+        except Exception:
+            # On a write failure, don't leave a half-written (but
+            # correctly-moded) key file behind.
+            try:
+                os.unlink(key_path)
+            except OSError:
+                pass
+            raise
+        # Belt-and-braces on platforms where O_CREAT mode is influenced
+        # by umask (shouldn't be for 0o600, but defend in depth); also
+        # a no-op on Windows where POSIX modes don't fully apply.
         try:
             os.chmod(key_path, 0o600)
         except OSError:
-            pass  # best-effort on platforms that don't support chmod
+            pass
         with open(cert_path, "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
         logger.info(f"Generated self-signed TLS certificate: {cert_path}")
     except ImportError:
         # Fallback: use openssl command if cryptography is not installed
         import subprocess
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:4096",
-            "-keyout", key_path, "-out", cert_path,
-            "-days", "3650", "-nodes",
-            "-subj", "/CN=messagechain-node",
-        ], check=True, capture_output=True)
-        # M14: Restrict private key file permissions
+        # R5-C: Tighten umask around the subprocess so openssl creates
+        # the key file as 0o600 directly — closes the TOCTOU window
+        # between openssl writing the file (previously with default
+        # umask, typically 0o644) and the old trailing chmod.
+        prior_umask = os.umask(0o077)
+        try:
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:4096",
+                "-keyout", key_path, "-out", cert_path,
+                "-days", "3650", "-nodes",
+                "-subj", "/CN=messagechain-node",
+            ], check=True, capture_output=True)
+        finally:
+            os.umask(prior_umask)
+        # Belt-and-braces: ensure the key is 0o600 even if umask
+        # somehow didn't take effect.
         try:
             os.chmod(key_path, 0o600)
         except OSError:
