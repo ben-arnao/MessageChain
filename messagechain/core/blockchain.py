@@ -21,7 +21,7 @@ import time as _time
 from messagechain.config import (
     HASH_ALGO, MAX_TXS_PER_BLOCK, MAX_TXS_PER_ENTITY_PER_BLOCK,
     MAX_BLOCK_MESSAGE_BYTES,
-    VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
+    VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION, GENESIS_SUPPLY,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
@@ -6358,6 +6358,14 @@ class Blockchain:
                         self.supply.balances.get(winner, 0) + bounty
                     )
                     self.supply.total_supply += bounty
+                    # Mint-accounting parity with mint_block_reward /
+                    # slash_validator: every path that mints tokens
+                    # must bump BOTH total_supply AND total_minted,
+                    # otherwise the invariant
+                    # `total_supply == GENESIS_SUPPLY + total_minted
+                    #                  - total_burned`
+                    # drifts by `bounty` every LOTTERY_INTERVAL blocks.
+                    self.supply.total_minted += bounty
                     if escrow_len > 0:
                         self._escrow.add(
                             entity_id=winner, amount=bounty,
@@ -6489,6 +6497,31 @@ class Blockchain:
         # selection and the sim path see a consistent value until the
         # next apply ticks the ratchet forward.
         self._update_bootstrap_ratchet()
+
+        # Supply-invariant gate: every mint must bump total_minted,
+        # every burn must bump total_burned, every movement between
+        # "burned" and "held" must balance.  Asserting this at the end
+        # of EVERY block-apply catches an entire bug class — any mint
+        # or burn site that forgets to update one of the two scalars
+        # trips here instead of silently corrupting the chain's
+        # accounting for centuries.  See R8-#2 (lottery bounty forgot
+        # total_minted) + R8-#3 (no end-of-apply invariant check) for
+        # the motivating instance.  GENESIS_SUPPLY is a protocol
+        # constant so we can read it from config rather than
+        # snapshotting per-chain — the invariant must hold identically
+        # on every node that replays the same history.
+        assert (
+            self.supply.total_supply
+            == GENESIS_SUPPLY
+            + self.supply.total_minted
+            - self.supply.total_burned
+        ), (
+            f"Supply invariant broken at height {self.height}: "
+            f"total_supply={self.supply.total_supply} vs "
+            f"genesis={GENESIS_SUPPLY} + "
+            f"minted={self.supply.total_minted} - "
+            f"burned={self.supply.total_burned}"
+        )
 
     def _apply_archive_rewards(self, block: Block):
         """Redirect fee-burn into archive pool + pay custody-proof rewards.
