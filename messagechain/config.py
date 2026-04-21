@@ -1282,6 +1282,16 @@ FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 # witness data moves to a separate storage tier.
 WITNESS_SEPARATION_ENABLED = True       # feature gate
 WITNESS_RETENTION_BLOCKS = 200          # keep witnesses in main storage for this many blocks beyond finality
+# Opt-in auto-separation: when True, ChainDB.auto_separate_finalized_
+# witnesses moves signatures of old finalized blocks from inline
+# storage to the side-table on every call.  Default False so the
+# existing block-read surface (callers that don't pass
+# include_witnesses=True) is unchanged on upgrade.  Operators enable
+# this once they've verified their block-consumer paths either
+# tolerate stripped blocks or opt into witnesses explicitly.
+# Nothing is deleted in either mode — separation only moves bytes.
+WITNESS_AUTO_SEPARATION_ENABLED = False
+
 
 # Governance — on-chain voting for protocol/codebase changes
 GOVERNANCE_VOTING_WINDOW = 1_008      # blocks (~7 days at 600s/block)
