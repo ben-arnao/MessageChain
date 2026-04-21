@@ -440,13 +440,16 @@ def verify_stake_transaction(
 
     `min_stake_override`: if provided, the caller (typically Blockchain,
     which has access to `bootstrap_progress`) dictates the minimum stake
-    amount.  When None, falls back to the flat VALIDATOR_MIN_STAKE.
+    amount.  When None, the floor is derived from the MIN_STAKE_RAISE
+    hard fork via `get_validator_min_stake(current_height)` — pre-fork
+    100 tokens, post-fork 10_000 tokens.
 
     `current_height` selects the fee rule: at/after
     FEE_INCLUDES_SIGNATURE_HEIGHT the admission floor is the larger of
     MIN_FEE and the signature-aware minimum so an attacker can't bloat
     the chain with large WOTS+ witnesses at MIN_FEE (R5-A).  Legacy
-    callers (None) get the plain MIN_FEE floor.
+    callers (None) get the plain MIN_FEE floor.  Also threads into the
+    MIN_STAKE fork gate when `min_stake_override` is not supplied.
     """
     from messagechain.core.transaction import enforce_signature_aware_min_fee
     if tx.amount <= 0:
@@ -455,8 +458,13 @@ def verify_stake_transaction(
         if tx.amount < min_stake_override:
             return False
     else:
-        from messagechain.config import VALIDATOR_MIN_STAKE
-        if tx.amount < VALIDATOR_MIN_STAKE:
+        from messagechain.config import get_validator_min_stake
+        # Prefer current_height (the block the tx is being admitted
+        # into) so the fork gate fires on the block that'll actually
+        # apply the tx; fall back to block_height when the caller
+        # didn't thread current_height (legacy test fixtures).
+        gate_height = current_height if current_height is not None else block_height
+        if tx.amount < get_validator_min_stake(gate_height):
             return False
     if not enforce_signature_aware_min_fee(
         tx.fee,
