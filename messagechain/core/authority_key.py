@@ -199,11 +199,24 @@ def create_set_authority_key_transaction(
 def verify_set_authority_key_transaction(
     tx: SetAuthorityKeyTransaction,
     signing_public_key: bytes,
+    current_height: int | None = None,
 ) -> bool:
-    """Verify structural fields and the signature (against the signing key)."""
+    """Verify structural fields and the signature (against the signing key).
+
+    `current_height` selects the fee rule: post
+    FEE_INCLUDES_SIGNATURE_HEIGHT the floor becomes max(MIN_FEE,
+    sig-aware min) so large WOTS+ witnesses can't be admitted at
+    MIN_FEE (R5-A).
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if len(tx.new_authority_key) != 32:
         return False
-    if tx.fee < MIN_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False

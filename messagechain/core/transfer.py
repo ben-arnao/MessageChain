@@ -245,11 +245,28 @@ def create_transfer_transaction(
     return tx
 
 
-def verify_transfer_transaction(tx: TransferTransaction, public_key: bytes) -> bool:
-    """Verify a transfer transaction's signature and structural fields."""
+def verify_transfer_transaction(
+    tx: TransferTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
+    """Verify a transfer transaction's signature and structural fields.
+
+    `current_height` selects the fee rule: at/after
+    FEE_INCLUDES_SIGNATURE_HEIGHT the admission floor is
+    max(MIN_FEE, sig-aware min) so witness bloat is priced alongside
+    payload bloat (R5-A).  Legacy callers (current_height=None) get
+    the message-only flat floor, preserving historical-block validity.
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if tx.amount <= 0:
         return False
-    if tx.fee < MIN_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False

@@ -195,7 +195,11 @@ def create_key_rotation(
     return tx
 
 
-def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -> bool:
+def verify_key_rotation(
+    tx: KeyRotationTransaction,
+    current_public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
     """
     Verify a key rotation transaction.
 
@@ -204,7 +208,12 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
     2. The old_public_key matches the entity's current key on chain
     3. The signature is valid under the old key
     4. The new key is different from the old key
+    5. Fee covers KEY_ROTATION_FEE AND (post FEE_INCLUDES_SIGNATURE_HEIGHT)
+       the signature-aware minimum, so an attacker can't churn rotations
+       with large WOTS+ witnesses at the KEY_ROTATION_FEE floor (R5-A).
+       KEY_ROTATION_FEE remains an absolute floor pre- and post-activation.
     """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if tx.timestamp <= 0:
         return False
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
@@ -213,7 +222,12 @@ def verify_key_rotation(tx: KeyRotationTransaction, current_public_key: bytes) -
         return False
     if tx.new_public_key == tx.old_public_key:
         return False
-    if tx.fee < KEY_ROTATION_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=KEY_ROTATION_FEE,
+    ):
         return False
 
     msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()

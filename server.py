@@ -1517,7 +1517,11 @@ class Server(SharedRuntimeMixin):
 
             # Cheap gates passed; now run the expensive WOTS+ verify.
             public_key = self.blockchain.public_keys[entity_id]
-            if not verify_stake_transaction(tx, public_key, block_height=self.blockchain.height):
+            if not verify_stake_transaction(
+                tx, public_key,
+                block_height=self.blockchain.height,
+                current_height=self.blockchain.height + 1,
+            ):
                 return {"ok": False, "error": "Invalid stake transaction signature"}
 
             # Queue for block inclusion — do NOT mutate state directly.
@@ -3222,6 +3226,7 @@ class Server(SharedRuntimeMixin):
                 pk = self.blockchain.public_keys.get(tx.entity_id)
                 if pk is None or not verify_stake_transaction(
                     tx, pk, block_height=self.blockchain.height,
+                    current_height=self.blockchain.height + 1,
                 ):
                     return
                 if not self._check_leaf_across_all_pools(tx):

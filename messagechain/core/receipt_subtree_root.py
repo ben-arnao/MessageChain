@@ -216,17 +216,28 @@ def create_set_receipt_subtree_root_transaction(
 def verify_set_receipt_subtree_root_transaction(
     tx: SetReceiptSubtreeRootTransaction,
     authority_public_key: bytes,
+    current_height: int | None = None,
 ) -> bool:
     """Verify structural fields and the authority-key signature.
 
     Past timestamps are accepted without bound — pre-signable offline.
     Only future timestamps beyond MAX_TIMESTAMP_DRIFT are rejected.
+
+    `current_height` selects the fee rule: post
+    FEE_INCLUDES_SIGNATURE_HEIGHT the floor becomes max(MIN_FEE,
+    sig-aware min) so WOTS+ witnesses can't be admitted at MIN_FEE (R5-A).
     """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
     if len(tx.root_public_key) != 32:
         return False
     if len(tx.entity_id) != 32:
         return False
-    if tx.fee < MIN_FEE:
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=MIN_FEE,
+    ):
         return False
     if tx.timestamp <= 0:
         return False

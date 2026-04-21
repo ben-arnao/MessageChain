@@ -969,9 +969,25 @@ MAX_PROPOSAL_TITLE_BYTES = 400
 MAX_PROPOSAL_DESCRIPTION_BYTES = 20_000
 
 
-def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
-    """Verify a proposal transaction's signature."""
-    if tx.fee < GOVERNANCE_PROPOSAL_FEE:
+def verify_proposal(
+    tx: ProposalTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
+    """Verify a proposal transaction's signature.
+
+    `current_height`: post FEE_INCLUDES_SIGNATURE_HEIGHT the admission
+    floor is max(GOVERNANCE_PROPOSAL_FEE, sig-aware min).  The flat
+    governance floor remains an absolute lower bound pre- and
+    post-activation (R5-A).
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=GOVERNANCE_PROPOSAL_FEE,
+    ):
         return False
     if not tx.title:
         return False
@@ -990,9 +1006,23 @@ def verify_proposal(tx: ProposalTransaction, public_key: bytes) -> bool:
     return verify_signature(msg_hash, tx.signature, public_key)
 
 
-def verify_vote(tx: VoteTransaction, public_key: bytes) -> bool:
-    """Verify a vote transaction's signature."""
-    if tx.fee < GOVERNANCE_VOTE_FEE:
+def verify_vote(
+    tx: VoteTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
+    """Verify a vote transaction's signature.
+
+    Post FEE_INCLUDES_SIGNATURE_HEIGHT the floor is
+    max(GOVERNANCE_VOTE_FEE, sig-aware min) (R5-A).
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=GOVERNANCE_VOTE_FEE,
+    ):
         return False
     if not tx.proposal_id or len(tx.proposal_id) != 32:
         return False
@@ -1000,9 +1030,23 @@ def verify_vote(tx: VoteTransaction, public_key: bytes) -> bool:
     return verify_signature(msg_hash, tx.signature, public_key)
 
 
-def verify_treasury_spend(tx: TreasurySpendTransaction, public_key: bytes) -> bool:
-    """Verify a treasury spend proposal's signature and fields."""
-    if tx.fee < GOVERNANCE_PROPOSAL_FEE:
+def verify_treasury_spend(
+    tx: TreasurySpendTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
+    """Verify a treasury spend proposal's signature and fields.
+
+    Post FEE_INCLUDES_SIGNATURE_HEIGHT the floor is
+    max(GOVERNANCE_PROPOSAL_FEE, sig-aware min) (R5-A).
+    """
+    from messagechain.core.transaction import enforce_signature_aware_min_fee
+    if not enforce_signature_aware_min_fee(
+        tx.fee,
+        signature_bytes=len(tx.signature.to_bytes()),
+        current_height=current_height,
+        flat_floor=GOVERNANCE_PROPOSAL_FEE,
+    ):
         return False
     if not tx.title:
         return False
