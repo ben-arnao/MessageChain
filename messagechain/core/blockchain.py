@@ -24,7 +24,8 @@ from messagechain.config import (
     VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
-    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE, BASE_FEE_INITIAL,
+    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
+    KEY_ROTATION_COOLDOWN_BLOCKS, BASE_FEE_INITIAL,
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
     EVIDENCE_INCLUSION_WINDOW, EVIDENCE_EXPIRY_BLOCKS,
 )
@@ -174,6 +175,9 @@ class Blockchain:
         self.wots_tree_heights: dict[bytes, int] = {}
         self.entity_message_count: dict[bytes, int] = {}
         self.key_rotation_counts: dict[bytes, int] = {}  # entity_id -> rotation number
+        # In-memory rotation cooldown tracking (iter 6 H2).  See comment
+        # at the _reset_state twin-init below for the rationale.
+        self.key_rotation_last_height: dict[bytes, int] = {}
         self.proposer_sig_counts: dict[bytes, int] = {}  # entity_id -> block signatures made
         self.attestation_sig_counts: dict[bytes, int] = {}  # entity_id -> attestation signatures made
         self.slash_sig_counts: dict[bytes, int] = {}  # entity_id -> slash submission signatures made
@@ -1824,6 +1828,20 @@ class Blockchain:
         if tx.fee < KEY_ROTATION_FEE:
             return False, f"Key rotation fee must be at least {KEY_ROTATION_FEE}, got {tx.fee}"
 
+        # Cooldown between successive rotations by the same entity.
+        # Blocks forensic-evasion spam where a funded attacker rotates
+        # every block to erase recent-slashable-behavior associations.
+        # See iter 6 H2 audit finding.  In-memory tracking only (resets
+        # on restart, which is conservatively-safe: restart timing is
+        # operator-controlled, not attacker-triggerable over RPC).
+        last_rot_h = self.key_rotation_last_height.get(tx.entity_id, -KEY_ROTATION_COOLDOWN_BLOCKS)
+        elapsed = self.height - last_rot_h
+        if elapsed < KEY_ROTATION_COOLDOWN_BLOCKS:
+            return False, (
+                f"Key rotation cooldown: {KEY_ROTATION_COOLDOWN_BLOCKS - elapsed} "
+                f"blocks remaining before next rotation allowed"
+            )
+
         if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
             return False, f"Insufficient balance for rotation fee of {tx.fee}"
 
@@ -1858,6 +1876,8 @@ class Blockchain:
         # Update the entity's public key
         self.public_keys[tx.entity_id] = tx.new_public_key
         self.key_rotation_counts[tx.entity_id] = tx.rotation_number + 1
+        # Track rotation block height for cooldown enforcement (iter 6 H2).
+        self.key_rotation_last_height[tx.entity_id] = self.height
 
         # Persist
         if self.db is not None:
@@ -6382,6 +6402,11 @@ class Blockchain:
         self.attestation_sig_counts = {}
         self.slash_sig_counts = {}
         self.key_rotation_counts = {}
+        # Cooldown tracking for KEY_ROTATION_COOLDOWN_BLOCKS enforcement
+        # (iter 6 H2).  In-memory only; resets to empty on restart,
+        # which is a deliberate trade-off: cheap, doesn't require a DB
+        # schema change, and restart timing isn't attacker-controllable.
+        self.key_rotation_last_height = {}
         self.public_keys = {}
         # slashed_validators is deliberately NOT cleared here — it is a
         # security ratchet, like revoked_entities and leaf_watermarks.

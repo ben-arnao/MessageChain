@@ -108,7 +108,10 @@ class TestKeyRotation(unittest.TestCase):
         self.assertIn("rotation number", reason.lower())
 
     def test_sequential_rotations(self):
-        """Can rotate multiple times sequentially."""
+        """Can rotate multiple times sequentially when separated by the
+        KEY_ROTATION_COOLDOWN_BLOCKS window (iter 6 H2)."""
+        from messagechain.config import KEY_ROTATION_COOLDOWN_BLOCKS
+
         # First rotation
         new_kp0 = derive_rotated_keypair(self.alice, rotation_number=0)
         tx0 = create_key_rotation(self.alice, new_kp0, rotation_number=0)
@@ -116,16 +119,41 @@ class TestKeyRotation(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(self.chain.key_rotation_counts[self.alice.entity_id], 1)
 
-        # Second rotation — need to use new keypair to sign
-        # Simulate entity with new keypair
+        # Simulate cooldown expiry by rewinding the tracked height so
+        # `self.height - last >= COOLDOWN`.  In production the chain's
+        # natural height advance does this; the test fixture has a
+        # stationary height so we fast-forward explicitly.
+        self.chain.key_rotation_last_height[self.alice.entity_id] = (
+            self.chain.height - KEY_ROTATION_COOLDOWN_BLOCKS
+        )
+
+        # Second rotation - need to use new keypair to sign
         alice_rotated = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
         alice_rotated.keypair = new_kp0  # swap in the rotated keypair
 
         new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)
         tx1 = create_key_rotation(alice_rotated, new_kp1, rotation_number=1)
-        success, _ = self.chain.apply_key_rotation(tx1, self.bob.entity_id)
-        self.assertTrue(success)
+        success, reason = self.chain.apply_key_rotation(tx1, self.bob.entity_id)
+        self.assertTrue(success, reason)
         self.assertEqual(self.chain.public_keys[self.alice.entity_id], new_kp1.public_key)
+
+    def test_rotation_cooldown_blocks_back_to_back(self):
+        """Back-to-back rotation attempts are rejected by the cooldown."""
+        from messagechain.config import KEY_ROTATION_COOLDOWN_BLOCKS
+
+        new_kp0 = derive_rotated_keypair(self.alice, rotation_number=0)
+        tx0 = create_key_rotation(self.alice, new_kp0, rotation_number=0)
+        success, _ = self.chain.apply_key_rotation(tx0, self.bob.entity_id)
+        self.assertTrue(success)
+
+        # Immediate second attempt — cooldown not elapsed.
+        alice_rotated = Entity.create(b"alice-private-key".ljust(32, b"\x00"))
+        alice_rotated.keypair = new_kp0
+        new_kp1 = derive_rotated_keypair(self.alice, rotation_number=1)
+        tx1 = create_key_rotation(alice_rotated, new_kp1, rotation_number=1)
+        success, reason = self.chain.apply_key_rotation(tx1, self.bob.entity_id)
+        self.assertFalse(success)
+        self.assertIn("cooldown", reason.lower())
 
     def test_rotation_fee_deducted(self):
         """Fee is deducted from entity and paid to proposer."""

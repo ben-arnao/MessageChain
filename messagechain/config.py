@@ -456,7 +456,20 @@ MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
 MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
 MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
-COINBASE_MATURITY = 10    # blocks before block rewards become spendable (BTC uses 100)
+# COINBASE_MATURITY must cover the worst-case un-finalized window or a
+# reorg can double-spend a coinbase that the honest chain never minted.
+# Math: MAX_REORG_DEPTH = 100 caps explicit reorg, but finality lands
+# every FINALITY_INTERVAL = 100 blocks and vote inclusion adds 1-2
+# more blocks - so a coinbase minted just after a checkpoint can sit
+# un-finalized for up to ~100 + 2 blocks.  Mature-at-10 left an 8-90
+# block window where a reorg could vanish the coinbase after Alice
+# already accepted payment from it.  Matching BTC's canonical 100 is
+# necessary but not sufficient here because our reorg cap IS 100;
+# 200 covers reorg_depth + finality_interval with margin.  Raised
+# from 10 (iter 6 of hardening pass).  The chain was young (h<100,
+# no coinbase spends yet) when this changed, so no historical block
+# is retroactively affected.
+COINBASE_MATURITY = 200
 MTP_BLOCK_COUNT = 11      # number of blocks to compute Median Time Past (same as BTC)
 
 # Cryptography (HASH_ALGO defined at top of file)
@@ -600,6 +613,15 @@ HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
                         # 300ms RTT that consumes ~1.2s before any margin.
                         # Honest peers on slow connections should not fail
                         # first-contact for want of a few extra seconds.
+# Key-rotation cooldown: minimum blocks between successive rotations
+# by the same entity.  Without it a funded attacker could rotate every
+# block (cost = KEY_ROTATION_FEE), churning state + erasing forensic
+# traceability of recently-slashable behavior.  At 600s/block, 144
+# blocks ~ 1 day gives legitimate emergency rotations unimpeded and
+# caps spam to 365 rotations/yr/entity — economically irrational at
+# 1000 tokens each.  Consensus constant; changing is a hard fork.
+KEY_ROTATION_COOLDOWN_BLOCKS = 144
+
 PEER_READ_TIMEOUT = 300  # seconds - idle timeout for post-handshake peer
                          # reads.  Previously a magic 300 literal scattered
                          # across server.py + network/node.py (4 sites);
