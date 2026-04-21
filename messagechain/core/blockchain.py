@@ -311,6 +311,44 @@ class Blockchain:
         # docs/proof-of-custody-archive-rewards.md for the design.
         self.archive_reward_pool: int = 0
 
+        # Archive-custody duty state (iteration 3b-ii).  Three pieces:
+        #
+        #   archive_active_snapshot:
+        #     Optional[ActiveValidatorSnapshot].  Materialized at each
+        #     challenge block (height % ARCHIVE_CHALLENGE_INTERVAL == 0)
+        #     carrying the staked-validator set and the K challenge
+        #     heights derived via compute_challenges.  Cleared at epoch
+        #     close (challenge_block + ARCHIVE_SUBMISSION_WINDOW) after
+        #     miss counters are updated.  At most one open epoch at a
+        #     time — windows do not overlap under the current
+        #     interval/window sizing.
+        #
+        #   validator_archive_misses:
+        #     dict[entity_id -> int].  Persistent miss counter; +1 per
+        #     epoch where validator was active-at-C and did not submit
+        #     proofs for all K challenge heights within the window, -1
+        #     (floor 0) per successful epoch, bootstrap-exempt during
+        #     grace.  State-lean: zero entries are omitted.  Drives the
+        #     graduated reward-withhold tier in iteration 3b-iii.
+        #
+        #   validator_first_active_block:
+        #     dict[entity_id -> int].  Block height at which the
+        #     validator was first observed above VALIDATOR_MIN_STAKE.
+        #     Never advanced — a validator that drops below threshold
+        #     and re-enters keeps their original first-active so they
+        #     don't pick up a fresh bootstrap grace on every stake
+        #     cycle.  Seeded lazily from _apply_block_state.
+        #
+        # Snapshot persistence (encode_snapshot / state_root inclusion)
+        # is deferred to iteration 3b-iii alongside reward withholding,
+        # so both consensus-surface changes share one version bump.
+        from messagechain.consensus.archive_duty import (
+            ActiveValidatorSnapshot as _ActiveSnapshot,  # noqa: F401
+        )
+        self.archive_active_snapshot = None  # Optional[ActiveValidatorSnapshot]
+        self.validator_archive_misses: dict[bytes, int] = {}
+        self.validator_first_active_block: dict[bytes, int] = {}
+
         # Attester-reward escrow (stage 3).  Bootstrap-era committee
         # rewards sit here for escrow_blocks_for_progress(progress)
         # blocks before unlocking to spendable balance.  Slashable
@@ -6013,6 +6051,14 @@ class Blockchain:
         # committed.
         self._apply_archive_rewards(block)
 
+        # Archive-custody DUTY layer (iteration 3b-ii): track first-
+        # active blocks, capture challenge-block snapshots, and close
+        # epochs.  Must run AFTER _apply_archive_rewards so the
+        # bundles applied in this block (if any) are visible when we
+        # close an epoch, and AFTER any stake-moving ops so the
+        # active-set snapshot reflects post-stake state.
+        self._apply_archive_duty(block)
+
         # Mature any censorship-evidence whose maturity window has
         # elapsed without the receipted tx landing on-chain.  Runs
         # AFTER tx/evidence application so a same-block evidence
@@ -6126,6 +6172,116 @@ class Blockchain:
                     f"paid {result.total_paid} tokens to "
                     f"{len(result.payouts)} provers "
                     f"(pool remaining: {self.archive_reward_pool})"
+                )
+
+    def _apply_archive_duty(self, block: Block):
+        """Track first-active blocks, capture challenge snapshots, and
+        close epochs.
+
+        Three jobs, in order:
+          1. Track first-active: for every validator currently above
+             VALIDATOR_MIN_STAKE that we haven't seen before, record
+             this block's height as their first-active.  Never advances
+             an existing entry — a validator cycling below threshold
+             and re-entering keeps their original first-active so they
+             don't pick up a fresh bootstrap grace window on every
+             stake cycle.
+          2. Epoch close: if a snapshot is open and this block is at
+             or past its submission-window end, walk bundles from the
+             window, compute miss updates, fold into
+             validator_archive_misses, and clear the snapshot.  Must
+             run BEFORE snapshot capture so a block that is BOTH epoch
+             close and next challenge (possible only if window ==
+             interval) closes the old epoch first.
+          3. Snapshot capture: if this is a challenge block (height %
+             ARCHIVE_CHALLENGE_INTERVAL == 0, height > 0), materialize
+             an ActiveValidatorSnapshot with current staked validators
+             + K derived challenge heights.
+
+        Deliberately ignores the reward-withhold path — that ships in
+        iteration 3b-iii along with state-snapshot persistence.
+        """
+        from messagechain.config import (
+            ARCHIVE_CHALLENGE_K,
+            ARCHIVE_SUBMISSION_WINDOW,
+            VALIDATOR_MIN_STAKE,
+            is_archive_challenge_block,
+        )
+        from messagechain.consensus.archive_challenge import compute_challenges
+        from messagechain.consensus.archive_duty import (
+            ActiveValidatorSnapshot,
+            compute_miss_updates,
+        )
+
+        height = block.header.block_number
+
+        # 1. Track first-active block for any validator we haven't
+        #    seen above threshold yet.
+        for eid, amt in self.supply.staked.items():
+            if amt < VALIDATOR_MIN_STAKE:
+                continue
+            if eid in self.validator_first_active_block:
+                continue
+            self.validator_first_active_block[eid] = height
+
+        # 2. Close an open epoch if the window has elapsed.
+        snap = self.archive_active_snapshot
+        if (
+            snap is not None
+            and height >= snap.challenge_block + ARCHIVE_SUBMISSION_WINDOW
+        ):
+            # Walk the chain for bundles committed in
+            # [challenge_block, challenge_block + window).  Include
+            # the challenge block itself (it may carry bundles too).
+            # self.chain contains every block including this one
+            # (add_block appended it before state apply in some
+            # paths; in others apply runs first).  Guard both.
+            window_start = snap.challenge_block
+            window_end = snap.challenge_block + ARCHIVE_SUBMISSION_WINDOW
+            bundles = []
+            for b in self.chain:
+                bn = b.header.block_number
+                if bn < window_start or bn >= window_end:
+                    continue
+                bundle = getattr(b, "archive_proof_bundle", None)
+                if bundle is not None:
+                    bundles.append(bundle)
+            # Also include the current block's bundle when the window
+            # end lies exactly on this block's height — propose paths
+            # run apply before append, so self.chain[-1] may not yet
+            # include `block`.
+            if self.chain and self.chain[-1] is not block:
+                bundle_here = getattr(block, "archive_proof_bundle", None)
+                if bundle_here is not None and window_start <= height < window_end:
+                    bundles.append(bundle_here)
+
+            new_misses = compute_miss_updates(
+                snapshot=snap,
+                bundles_in_window=bundles,
+                current_misses=self.validator_archive_misses,
+                current_block=height,
+                validator_first_active_block=(
+                    self.validator_first_active_block
+                ),
+            )
+            self.validator_archive_misses = new_misses
+            self.archive_active_snapshot = None
+
+        # 3. Capture a new snapshot at a challenge block.
+        if is_archive_challenge_block(height):
+            active_set = frozenset(
+                eid for eid, amt in self.supply.staked.items()
+                if amt >= VALIDATOR_MIN_STAKE
+            )
+            if active_set:
+                challenges = compute_challenges(
+                    block.block_hash, height, k=ARCHIVE_CHALLENGE_K,
+                )
+                heights = tuple(int(c.target_height) for c in challenges)
+                self.archive_active_snapshot = ActiveValidatorSnapshot(
+                    challenge_block=height,
+                    active_set=active_set,
+                    challenge_heights=heights,
                 )
 
     def _apply_governance_block(self, block: Block):
@@ -6934,6 +7090,16 @@ class Blockchain:
         # _processed_evidence (also not cleared) stays consistent.
         self.reputation = {}
         self._immature_rewards = []
+        # Archive-custody duty state (iteration 3b-ii).  All three
+        # pieces rebuild deterministically from chain replay — miss
+        # counters accumulate via _apply_archive_duty's epoch-close
+        # walks; first-active blocks re-record on the first staked
+        # observation; the open snapshot is freshly captured at the
+        # next challenge block.  Clearing here mirrors every other
+        # replay-deterministic in-memory field above.
+        self.archive_active_snapshot = None
+        self.validator_archive_misses = {}
+        self.validator_first_active_block = {}
         # Reset first-divestment stake reference.  This is NOT a security
         # ratchet — it's the "stake at first observed divestment" anchor
         # used to measure drain debt.  On a reorg that rolls past the
