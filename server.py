@@ -1226,7 +1226,27 @@ class Server:
             except asyncio.TimeoutError:
                 writer.close()
                 return
-            request = safe_json_loads(data.decode("utf-8"), max_depth=16)
+            # Parse the request body with depth-bounded JSON.  Separate
+            # try/except (from the outer handler) so that a malformed
+            # request gets a structured `{"ok": False, "error": ...}`
+            # response instead of a silent socket close — honest clients
+            # with a typo or a misencoded payload see WHY their request
+            # failed.  The error message is bounded (no raw input echo)
+            # so we don't open a reflection vector.  Iter-3 adversarial
+            # probe surfaced this: `echo '{bad json' | socat` got an EOF
+            # with no reason, and a client debugging their integration
+            # had nothing to go on.
+            try:
+                request = safe_json_loads(data.decode("utf-8"), max_depth=16)
+            except (ValueError, UnicodeDecodeError) as e:
+                resp = json.dumps({
+                    "ok": False,
+                    "error": f"Invalid JSON request: {str(e)[:120]}",
+                }).encode("utf-8")
+                writer.write(struct.pack(">I", len(resp)))
+                writer.write(resp)
+                await writer.drain()
+                return
 
             # RPC authentication — only admin methods (ban_peer, unban_peer,
             # etc.) require the token.  Public methods (submit_transaction,
