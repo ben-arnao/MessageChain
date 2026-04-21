@@ -103,6 +103,35 @@ class TestGetPeersRPC(unittest.TestCase):
         result = Server._rpc_get_peers(self.server)
         self.assertEqual(result["result"]["peers"][0]["entity_id"], "")
 
+    def test_transport_defaults_to_plain(self):
+        """A Peer constructed without a transport hint is plain TCP.
+
+        Safe default: the only code paths that can upgrade to TLS are
+        the ones that actually negotiate it.  If an operator wants to
+        assert "my inbound peer X is running TLS" but the Peer was
+        built without setting the field, they see 'plain' — honest and
+        auditable, not a speculative 'tls' that could be wrong.
+        """
+        from server import Server
+        self._add_peer("10.0.0.5", 9333)
+        result = Server._rpc_get_peers(self.server)
+        self.assertEqual(result["result"]["peers"][0]["transport"], "plain")
+
+    def test_transport_tls_surfaces(self):
+        """When a peer is created over TLS the RPC surfaces it.
+
+        This is the observability hook for "is my outbound peer
+        connection actually encrypted, or did TLS silently fall back
+        to plaintext?"  An operator who set P2P_TLS_ENABLED=True
+        wants to VERIFY that — reading the journal is too slow; a
+        single CLI row per peer lets them eyeball the whole fleet.
+        """
+        from server import Server
+        p = self._add_peer("10.0.0.5", 9333)
+        p.transport = "tls"
+        result = Server._rpc_get_peers(self.server)
+        self.assertEqual(result["result"]["peers"][0]["transport"], "tls")
+
 
 if __name__ == "__main__":
     unittest.main()

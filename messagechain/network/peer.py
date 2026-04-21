@@ -42,6 +42,12 @@ class Peer:
     connected_at: float = 0.0        # unix seconds; 0 until socket opens
     peer_height: int = 0             # peer's last-reported chain height
     peer_version: str = ""           # peer's self-reported version string
+    # Transport security: "plain" | "tls".  Set by the connection-
+    # establishment path when it knows whether the socket was wrapped
+    # in an SSLContext.  Default is "plain" — an honest default lets
+    # an operator trust the CLI output when auditing whether
+    # P2P_TLS_ENABLED is actually taking effect across the fleet.
+    transport: str = "plain"
     # inv/getdata: track which tx hashes this peer already knows about
     known_txs: object = field(default_factory=lambda: _LRUSet(SEEN_TX_CACHE_SIZE))
 

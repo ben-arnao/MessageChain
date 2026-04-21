@@ -2357,6 +2357,10 @@ class Server:
                 "height": int(getattr(peer, "peer_height", 0) or 0),
                 "version": str(getattr(peer, "peer_version", "") or ""),
                 "entity_id": getattr(peer, "entity_id", "") or "",
+                # "plain" | "tls".  getattr fallback guards against a
+                # Peer instance that predates the field (unit-test
+                # monkeypatches, forwards-compat).
+                "transport": getattr(peer, "transport", "plain") or "plain",
             })
         return {"ok": True, "result": {"peers": rows, "count": len(rows)}}
 

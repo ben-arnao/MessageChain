@@ -548,7 +548,19 @@ class Node:
                 writer.close()
                 return
 
-        peer = Peer(host=addr[0], port=addr[1], reader=reader, writer=writer, is_connected=True)
+        # "tls" if the asyncio.start_server above was bound with an
+        # SSLContext — writer's extra_info carries the negotiated
+        # session.  Honest observability, not a security boundary:
+        # the TOFU pin check runs separately in _verify_and_pin_peer_tls.
+        transport = "tls" if writer.get_extra_info("ssl_object") else "plain"
+        import time as _time_peer
+        peer = Peer(
+            host=addr[0], port=addr[1], reader=reader, writer=writer,
+            is_connected=True,
+            direction="inbound",
+            connected_at=_time_peer.time(),
+            transport=transport,
+        )
         self.eviction_protector.register_peer(address)
 
         # Long-lived idle timeout for an established peer. Handshake must
@@ -713,9 +725,14 @@ class Node:
             # Decide what kind of outbound peer this is (full-relay vs
             # block-relay-only) based on how many slots are already filled.
             conn_type = self._next_connection_type()
+            transport = "tls" if client_ssl is not None else "plain"
+            import time as _time_peer
             peer = Peer(
                 host=host, port=port, reader=reader, writer=writer,
                 is_connected=True, connection_type=conn_type,
+                direction="outbound",
+                connected_at=_time_peer.time(),
+                transport=transport,
             )
             self.peers[addr] = peer
             peer.touch()

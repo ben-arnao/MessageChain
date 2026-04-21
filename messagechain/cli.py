@@ -2110,7 +2110,7 @@ def cmd_peers(args):
     # pipe this straight to log aggregators.
     print(f"=== Peers ({count}) ===\n")
     print(
-        f"  {'Address':<22} {'Dir':<9} {'Type':<18} {'Height':>8} "
+        f"  {'Address':<22} {'Dir':<9} {'Type':<18} {'TLS':<5} {'Height':>8} "
         f"{'Connected':>11} {'Entity':<20}"
     )
     def _fmt_elapsed(s: int) -> str:
@@ -2122,8 +2122,12 @@ def cmd_peers(args):
     for p in peers:
         eid = (p.get("entity_id") or "")[:16]
         eid_disp = (eid + "...") if eid else "(none)"
+        # Older servers without the field return None -> show "?" so the
+        # operator sees "I should upgrade" rather than a misleading "no".
+        transport = p.get("transport")
+        tls_disp = "yes" if transport == "tls" else ("no" if transport == "plain" else "?")
         print(
-            f"  {p['address']:<22} {p['direction']:<9} {p['connection_type']:<18} "
+            f"  {p['address']:<22} {p['direction']:<9} {p['connection_type']:<18} {tls_disp:<5} "
             f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {eid_disp:<20}"
         )
 
