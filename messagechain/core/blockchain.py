@@ -5248,6 +5248,18 @@ class Blockchain:
             self.key_rotation_counts[atx.entity_id] = atx.rotation_number + 1
             # New Merkle tree = independent leaf namespace, so reset.
             self.leaf_watermarks[atx.entity_id] = 0
+            # WHY: mirrors apply_key_rotation (the RPC path) so the
+            # KEY_ROTATION_COOLDOWN_BLOCKS check fires for rotations
+            # applied via blocks too.  Without this update, the block-
+            # apply path silently forgot the cooldown — meaning any
+            # rotation included in a block (i.e. every rotation on the
+            # live network, since authority txs propagate through blocks)
+            # left last_height empty and `validate_key_rotation` saw
+            # `elapsed = height - (-COOLDOWN) = height + COOLDOWN` and
+            # accepted a follow-up rotation immediately.  Also restores
+            # the cooldown after a reorg: _reset_state clears the map,
+            # and replay through this path rebuilds it (R6-B).
+            self.key_rotation_last_height[atx.entity_id] = self.height
             if self.db is not None:
                 self.db.set_public_key(atx.entity_id, atx.new_public_key)
                 if hasattr(self.db, "set_leaf_watermark"):
@@ -7003,6 +7015,14 @@ class Blockchain:
             "attestation_sig_counts": dict(self.attestation_sig_counts),
             "slash_sig_counts": dict(self.slash_sig_counts),
             "key_rotation_counts": dict(self.key_rotation_counts),
+            # Cooldown tracking (KEY_ROTATION_COOLDOWN_BLOCKS, iter 6 H2).
+            # Snapshotted so a failed-reorg rollback restores the pre-reorg
+            # cooldown state — otherwise the rollback would leave whatever
+            # mid-reorg replay produced, silently letting the attacker
+            # retry the rotation that tripped the rollback.  Paired with
+            # the _apply_authority_tx update (R6-B) that rebuilds this map
+            # during the successful-reorg replay path.
+            "key_rotation_last_height": dict(self.key_rotation_last_height),
             # Cold authority keys are set via a SetAuthorityKey tx that
             # lives inside a block. If that block is rolled back the
             # authority binding must also revert, otherwise a reorged-out
@@ -7100,6 +7120,13 @@ class Blockchain:
         self.attestation_sig_counts = snapshot.get("attestation_sig_counts", {})
         self.slash_sig_counts = snapshot.get("slash_sig_counts", {})
         self.key_rotation_counts = snapshot.get("key_rotation_counts", {})
+        # Cooldown tracking for KEY_ROTATION_COOLDOWN_BLOCKS — default
+        # to empty so pre-field snapshots restore to a pristine map
+        # (matches a freshly-initialised Blockchain).  See the snapshot
+        # comment for the reorg-rollback rationale (R6-B).
+        self.key_rotation_last_height = dict(
+            snapshot.get("key_rotation_last_height", {}),
+        )
         self.slashed_validators = snapshot.get("slashed_validators", set())
         self._immature_rewards = snapshot.get("immature_rewards", [])
         self._processed_evidence = snapshot.get("processed_evidence", set())
