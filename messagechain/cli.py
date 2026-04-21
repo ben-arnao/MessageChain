@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="messagechain",
-        description="MessageChain — decentralized, quantum-resistant messaging",
+        description="MessageChain - decentralized, quantum-resistant messaging",
         usage="messagechain <command> [options]",
     )
     parser.add_argument(
@@ -117,7 +117,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send tokens to another entity",
         description="Transfer tokens to another registered entity.",
     )
-    transfer.add_argument("--to", required=True, help="Recipient address (mc1… checksummed or raw hex)")
+    transfer.add_argument("--to", required=True, help="Recipient address (mc1... checksummed or raw hex)")
     transfer.add_argument("--amount", type=int, required=True, help="Amount to transfer")
     transfer.add_argument("--fee", type=int, default=None, help="Transaction fee (auto-detected if omitted)")
     transfer.add_argument("--server", type=str, default=None, help="Server address host:port")
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     stake = sub.add_parser(
         "stake",
         help="Stake tokens to become a validator",
-        description="Lock tokens for validator staking (minimum graduates 1→10→100 with chain height).",
+        description="Lock tokens for validator staking (minimum graduates 1 -> 10 -> 100 with chain height).",
     )
     stake.add_argument("--amount", type=int, required=True, help="Amount to stake")
     stake.add_argument("--fee", type=int, default=None, help="Transaction fee")
@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Move this entity to a freshly-derived Merkle tree of one-time "
             "keys. Your entity ID (wallet address), balance, stake, and "
-            "authority-key binding all carry over unchanged — only the "
+            "authority-key binding all carry over unchanged - only the "
             "underlying signing public key is replaced. Use when your leaf "
             "watermark approaches the tree capacity, typically at ~80% usage."
         ),
@@ -350,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Show direction (inbound/outbound), connection type, reported "
             "height, duration of the connection, and peer entity_id for "
-            "every currently-tracked peer.  Observability only — "
+            "every currently-tracked peer.  Observability only - "
             "routing decisions are not made from CLI output."
         ),
     )
@@ -430,7 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_tor.add_argument(
         "--rpc-bind", type=str, default="127.0.0.1",
         help="RPC bind address on this validator (default: 127.0.0.1). "
-             "Must be a loopback address — hidden services forwarding to "
+             "Must be a loopback address - hidden services forwarding to "
              "a public interface defeat the point.",
     )
     gen_tor.add_argument(
@@ -500,7 +500,7 @@ def _parse_server(server_str):
 
 
 def _try_tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
-    """Quick liveness probe — returns True if we can open a socket."""
+    """Quick liveness probe - returns True if we can open a socket."""
     import socket as _socket
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
     s.settimeout(timeout)
@@ -618,7 +618,7 @@ def _rpc_call_or_friendly_exit(
     The recovery advice differs by how we got here:
       - explicit --server: the user picked the address; just tell them it
         is unreachable.  Do not lecture them about CLIENT_SEED_ENDPOINTS
-        — they already bypassed it on purpose.
+        - they already bypassed it on purpose.
       - auto-discovery: list all three recovery paths so a newcomer with
         a default config can figure out what to do.
     """
@@ -672,7 +672,7 @@ def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
     every 5% so the output is readable but not spammy. Returns None if
     the tree is small enough that progress is unnecessary.
     """
-    # Skip for small trees (tests, small configs) — the overhead of
+    # Skip for small trees (tests, small configs) - the overhead of
     # printing exceeds the wait time.
     if total_leaves < 4096:
         return None
@@ -711,8 +711,8 @@ def _load_key_from_file(path: str) -> bytes:
     running as the wrong identity.
 
     On POSIX systems, warns if the file is group/world-readable. We do
-    NOT refuse to load — operators may have valid reasons (e.g. container
-    secrets) for wider perms — but we surface the risk.
+    NOT refuse to load - operators may have valid reasons (e.g. container
+    secrets) for wider perms - but we surface the risk.
     """
     from messagechain.identity.key_encoding import (
         decode_private_key,
@@ -741,7 +741,7 @@ def _load_key_from_file(path: str) -> bytes:
     except InvalidKeyFormatError as e:
         raise KeyFileError(f"Key file has invalid format: {path}: {e}")
 
-    # Reject permissive permissions (POSIX only — Windows stat is different).
+    # Reject permissive permissions (POSIX only - Windows stat is different).
     if hasattr(os, "getuid"):
         try:
             mode = os.stat(path).st_mode
@@ -763,7 +763,7 @@ def _resolve_private_key(args=None):
     read the key from that file.  Otherwise fall back to the
     interactive prompt in `_collect_private_key`.
 
-    This is the single entry point for spending commands — putting the
+    This is the single entry point for spending commands - putting the
     branch here means every signing subcommand supports --keyfile for
     free, enabling unattended/scripted operation.
     """
@@ -793,7 +793,7 @@ def _collect_private_key():
     )
 
     print("Authenticate with your recovery phrase or private key.")
-    print("This is your identity — guard it carefully.\n")
+    print("This is your identity - guard it carefully.\n")
 
     entered = getpass.getpass("Recovery phrase or private key (hidden): ")
 
@@ -852,7 +852,7 @@ def cmd_start(args):
         # Let server.py resolve the WOTS+ tree_height from chain state
         # rather than config default.  Avoids multi-hour keygen after a
         # profile flip (matches the --wallet behavior of server.py
-        # directly — see examples/messagechain-validator.service.example).
+        # directly - see examples/messagechain-validator.service.example).
         server.set_wallet(args.wallet)
 
     entity = None
@@ -889,7 +889,7 @@ def cmd_start(args):
         authority_pk = server.blockchain.get_authority_key(entity.entity_id)
         if authority_pk is None or authority_pk == entity.public_key:
             print()
-            print("  ⚠  Single-key model: this server holds the only key that")
+            print("  [!]  Single-key model: this server holds the only key that")
             print("     controls your stake. Compromise = drained funds and")
             print("     stolen governance voting power until slow recovery.")
             print("     Harden by promoting an offline-generated cold key:")
@@ -928,8 +928,8 @@ def cmd_account(args):
 
     With --sigs-remaining, skip the "create" summary and instead print
     the local WOTS+ signature capacity so a user can see how close they
-    are to key exhaustion.  Works entirely off the local key tree — no
-    RPC roundtrip — so a user whose node is down can still check.
+    are to key exhaustion.  Works entirely off the local key tree - no
+    RPC roundtrip - so a user whose node is down can still check.
     """
     from messagechain.identity.identity import Entity
     from messagechain.identity.address import encode_address
@@ -947,7 +947,7 @@ def cmd_account(args):
     print(f"  Entity ID:  {entity.entity_id_hex}")
     print(f"  Address:    {encode_address(entity.entity_id)}")
     print()
-    print("Share the 'Address' form when receiving funds — it has a")
+    print("Share the 'Address' form when receiving funds - it has a")
     print("built-in checksum that catches single-character transcription")
     print("errors. The raw 'Entity ID' is still accepted for compatibility.")
     print()
@@ -960,14 +960,14 @@ def cmd_account(args):
 def _cmd_account_sigs_remaining(args=None):
     """Print WOTS+ one-time-signature capacity for the current wallet.
 
-    Uses ONLY the local keypair — no RPC required.  This is deliberate:
+    Uses ONLY the local keypair - no RPC required.  This is deliberate:
     if the user has run out of leaves, their node may be offline or
     refusing to sign, and they still need a way to see the problem.
 
     The number shown is a local upper bound on the remaining signatures.
     Actual on-chain usage may be slightly ahead (if the node has advanced
     its leaf_index since the last `load_leaf_index`), but can never be
-    behind — so "remaining" is always the safe-to-use floor.
+    behind - so "remaining" is always the safe-to-use floor.
     """
     from messagechain.identity.identity import Entity
 
@@ -979,7 +979,7 @@ def _cmd_account_sigs_remaining(args=None):
     total = entity.keypair.num_leaves
     remaining = entity.keypair.remaining_signatures
     used = total - remaining
-    # Exact to 1 decimal place — large trees (2^20 = 1,048,576) need
+    # Exact to 1 decimal place - large trees (2^20 = 1,048,576) need
     # sub-integer precision to distinguish 79.9% from 80.0%, which is
     # where the rotation warning fires.
     pct_used = (used * 1000) // total / 10 if total else 0.0
@@ -1041,7 +1041,7 @@ def cmd_send(args):
     # submitting a tx the chain will reject.
     from messagechain.core.transaction import calculate_min_fee
     from messagechain.core.compression import encode_payload
-    # Fee is charged on the canonical stored size — compute locally so
+    # Fee is charged on the canonical stored size - compute locally so
     # we never overpay and never underpay relative to what the chain
     # will enforce.
     msg_bytes = args.message.encode("ascii")
@@ -1054,7 +1054,7 @@ def cmd_send(args):
             est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
         )
         fee = max(local_min, server_suggested)
-        note = " (auto — server floor)" if server_suggested >= local_min else " (auto — size floor)"
+        note = " (auto - server floor)" if server_suggested >= local_min else " (auto - size floor)"
         print(f"Fee: {fee} tokens{note}")
     else:
         if fee < local_min:
@@ -1092,7 +1092,7 @@ def cmd_transfer(args):
 
     print("=== Transfer Tokens ===\n")
 
-    # Validate recipient BEFORE prompting for the private key — a typo
+    # Validate recipient BEFORE prompting for the private key - a typo
     # is a permanent loss risk, so we want the user to fix it without
     # having re-entered credentials.
     # Accept either the checksummed "mc1..." display form (preferred,
@@ -1111,14 +1111,14 @@ def cmd_transfer(args):
         print("  Re-check each character with the sender before retrying.")
         sys.exit(1)
     except InvalidAddressError as e:
-        print(f"Error: invalid recipient address — {e}")
+        print(f"Error: invalid recipient address - {e}")
         print(f"  Got: {args.to}")
         sys.exit(1)
 
     host, port = _parse_server(args.server)
     from client import rpc_call
 
-    # Receive-to-exist: the recipient need NOT be pre-registered — a
+    # Receive-to-exist: the recipient need NOT be pre-registered - a
     # Transfer to a brand-new entity_id is fine; the chain creates the
     # balance entry on apply.  Call `estimate_fee` with the recipient_id
     # so the server can tell us (a) whether this is a brand-new recipient
@@ -1135,7 +1135,7 @@ def cmd_transfer(args):
         recipient_is_new = bool(r.get("recipient_is_new", False))
         server_min_fee = int(r.get("min_fee", MIN_FEE))
 
-    # Confirmation step — last chance before the key is handled. Shows
+    # Confirmation step - last chance before the key is handled. Shows
     # both ends of the address so a single-character typo is visible, plus
     # the checksummed display form.
     from messagechain.identity.address import encode_address
@@ -1148,7 +1148,7 @@ def cmd_transfer(args):
     print(f"             (checksummed: {encode_address(recipient_id)})")
     if recipient_is_new:
         print(
-            f"  Note:      Recipient is brand-new on chain — "
+            f"  Note:      Recipient is brand-new on chain - "
             f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)."
         )
     confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
@@ -1208,7 +1208,7 @@ def cmd_transfer(args):
 
     if recipient_is_new:
         print(
-            f"Transferring to a brand-new account — "
+            f"Transferring to a brand-new account - "
             f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)"
         )
     print(f"Transferring {args.amount} tokens (fee: {fee})...")
@@ -1396,7 +1396,7 @@ def cmd_bootstrap_seed(args):
 
     def _fatal(step: str, err: str):
         print(f"\n[{step}] FAILED: {err}")
-        print("Bootstrap aborted.  Chain state may be partially updated — ")
+        print("Bootstrap aborted.  Chain state may be partially updated - ")
         print("re-run `messagechain bootstrap-seed ...` to resume from where you stopped.")
         sys.exit(1)
 
@@ -1421,7 +1421,7 @@ def cmd_bootstrap_seed(args):
         entity.keypair.advance_to_leaf(w)
         return n, w
 
-    # ── Step 1: verify the seed is already known on chain ───────────
+    # -- Step 1: verify the seed is already known on chain -----------
     # Receive-to-exist: seeds are installed at genesis (via the
     # allocation table + bootstrap.bootstrap_seed_local on the
     # validator node itself), not via an RPC call.  An unknown seed
@@ -1439,7 +1439,7 @@ def cmd_bootstrap_seed(args):
         )
     print("      OK: entity is in state")
 
-    # ── Step 2: set authority key (cold) ────────────────────────────
+    # -- Step 2: set authority key (cold) ----------------------------
     print("\n[2/3] Setting cold authority key...")
     current_authority = _fetch_authority()
     if current_authority == authority_pubkey:
@@ -1456,7 +1456,7 @@ def cmd_bootstrap_seed(args):
             _fatal("2/3 set-authority", resp.get("error", "unknown"))
         print(f"      submitted: {resp['result']}")
 
-    # ── Step 3: stake ───────────────────────────────────────────────
+    # -- Step 3: stake -----------------------------------------------
     print(f"\n[3/3] Staking {args.stake_amount} tokens...")
     state = _fetch_state()
     staked = state.get("staked", 0) if state else 0
@@ -1594,7 +1594,7 @@ def cmd_rotate_key(args):
         print(f"  Entity ID:      {result['entity_id']}")
         print(f"  New public key: {result['new_public_key']}")
         print(f"  Rotation #:     {result['rotation_number']}")
-        print(f"\nYour entity ID is unchanged — wallet address and stake all")
+        print(f"\nYour entity ID is unchanged - wallet address and stake all")
         print("carry over. You can now continue signing with the fresh tree.")
         print("Back up any new derivation metadata if needed.")
     else:
@@ -1633,7 +1633,7 @@ def cmd_key_status(args):
     print(f"  Leaves used:     {used} / {capacity} ({pct_used}%)")
     print(f"  Leaves left:     {remaining}")
     if pct_used >= 80:
-        print(f"\n  WARNING: over 80% used — schedule a rotation soon.")
+        print(f"\n  WARNING: over 80% used - schedule a rotation soon.")
         print("  Run: messagechain rotate-key")
 
 
@@ -1643,7 +1643,7 @@ def cmd_emergency_revoke(args):
     from messagechain.core.emergency_revoke import create_revoke_transaction
 
     print("=== Emergency Revoke ===\n")
-    print("Authenticate with your COLD (authority) key — NOT the hot signing")
+    print("Authenticate with your COLD (authority) key - NOT the hot signing")
     print("key that lives on the validator server. The whole point of revoke")
     print("is that an attacker holding only the hot key cannot do this.\n")
 
@@ -1662,7 +1662,7 @@ def cmd_emergency_revoke(args):
     host, port = _parse_server(args.server)
     from client import rpc_call
 
-    # Revoke is nonce-free — no RPC roundtrip required to sign, which is
+    # Revoke is nonce-free - no RPC roundtrip required to sign, which is
     # what makes the "keep a pre-signed revoke tx on paper" workflow
     # practical. The cold key's leaf index is local to its own KeyPair.
     fee = args.fee if args.fee is not None else 500
@@ -1804,7 +1804,7 @@ def cmd_generate_key(_args):
         rows.append("  " + "   ".join(numbered))
 
     print("=== Key Pair Generated ===\n")
-    print("  Recovery phrase (24 words — write these down IN ORDER):\n")
+    print("  Recovery phrase (24 words - write these down IN ORDER):\n")
     for row in rows:
         print(row)
     print(f"\n  Hex form (alternative): {encoded_hex}")
@@ -1813,7 +1813,7 @@ def cmd_generate_key(_args):
     print(f"  Entity ID:   {entity.entity_id_hex}")
     print(f"  Address:     {encode_address(entity.entity_id)}")
     print(f"               ^ share this `mc1...` form to receive funds")
-    print(f"\n  The recovery phrase follows BIP-39 — every word comes from a")
+    print(f"\n  The recovery phrase follows BIP-39 - every word comes from a")
     print("  known 2048-word list, with a built-in checksum that detects")
     print("  single-word transcription errors when you type it back.")
     print(f"\n  IMPORTANT: Verify your backup before deleting this key.")
@@ -1894,9 +1894,9 @@ def cmd_status(args):
     """One-call operator health-check.
 
     Exit codes:
-      0 — all green
-      1 — at least one yellow (warning but functional)
-      2 — at least one red (rotation overdue / chain stalled / unreachable)
+      0 - all green
+      1 - at least one yellow (warning but functional)
+      2 - at least one red (rotation overdue / chain stalled / unreachable)
     """
     host, port = _parse_server(args.server)
 
@@ -1910,7 +1910,7 @@ def cmd_status(args):
         tag = {0: "OK  ", 1: "WARN", 2: "FAIL"}[level]
         msg = f"  [{tag}] {label}: {status}"
         if detail:
-            msg += f" — {detail}"
+            msg += f" - {detail}"
         lines.append(msg)
 
     # 1. Chain reachable + basic info
@@ -1921,7 +1921,7 @@ def cmd_status(args):
         print(f"=== Status check against {host}:{port} ===\n")
         for line in lines:
             print(line)
-        print("\n  Result: RED — chain unreachable")
+        print("\n  Result: RED - chain unreachable")
         sys.exit(2)
 
     info = info_resp["result"]
@@ -1936,18 +1936,18 @@ def cmd_status(args):
     elif state in ("syncing_headers", "syncing_blocks"):
         progress = sync.get("progress", "?")
         mark(1, "sync", f"{state} {progress}",
-             "not yet caught up — catching up to network")
+             "not yet caught up - catching up to network")
     else:
         mark(1, "sync", str(state))
 
-    # 3. Pinned genesis sanity — present and non-empty
+    # 3. Pinned genesis sanity - present and non-empty
     latest_hash = info.get("latest_block_hash", "")
     if latest_hash and len(latest_hash) == 64:
         mark(0, "chain tip", latest_hash[:16] + "...")
     else:
         mark(2, "chain tip", "missing latest_block_hash", "RPC response malformed")
 
-    # 3b. Liveness — warn if no block in 2x block-time, fail at 6x.
+    # 3b. Liveness - warn if no block in 2x block-time, fail at 6x.
     # Stalls are the single most useful thing a cron check can detect;
     # "height=122" alone doesn't distinguish a healthy idle chain from
     # a halted one.
@@ -1998,7 +1998,7 @@ def cmd_status(args):
                 mark(1, "entity state", "not found",
                      ent_resp.get("error", ""))
 
-            # Leaf watermark — rotation urgency
+            # Leaf watermark - rotation urgency
             wm_resp = rpc_call(
                 host, port, "get_leaf_watermark",
                 {"entity_id": entity_hex},
@@ -2023,9 +2023,9 @@ def cmd_status(args):
                 else:
                     mark(2, "leaf usage",
                          f"{wm}/{est_total} ({pct:.1f}%)",
-                         "ROTATE NOW — signatures nearly exhausted")
+                         "ROTATE NOW - signatures nearly exhausted")
 
-    # 5. Liveness — chain height advanced in the last 30s?  Not
+    # 5. Liveness - chain height advanced in the last 30s?  Not
     #    reliable from a single probe, but a block-time of 600s means
     #    "height unchanged over 30s" is uninformative.  Skip.
 
@@ -2103,10 +2103,10 @@ def cmd_peers(args):
     peers = response["result"]["peers"]
     count = response["result"].get("count", len(peers))
     if not peers:
-        print(f"=== Peers (0 — this node has no active P2P connections) ===")
+        print(f"=== Peers (0 - this node has no active P2P connections) ===")
         return
 
-    # Compact, grep-friendly table.  No ANSI color — some operators
+    # Compact, grep-friendly table.  No ANSI color - some operators
     # pipe this straight to log aggregators.
     print(f"=== Peers ({count}) ===\n")
     print(
@@ -2133,7 +2133,7 @@ def cmd_cut_checkpoint(args):
 
     Queries the target node for (block_number, block_hash, state_root)
     at the requested height (tip by default) and emits the result either
-    to stdout (single JSON object) or to a file (JSON array — the shape
+    to stdout (single JSON object) or to a file (JSON array - the shape
     that load_checkpoints_file consumes).
 
     With --append, an existing file is merged in and entries are
@@ -2147,8 +2147,8 @@ def cmd_cut_checkpoint(args):
 
     from client import rpc_call
 
-    # Pick the RPC: tip → get_chain_info (already ubiquitous), explicit
-    # height → get_checkpoint_at_height (narrow, returns only the three
+    # Pick the RPC: tip -> get_chain_info (already ubiquitous), explicit
+    # height -> get_checkpoint_at_height (narrow, returns only the three
     # fields we need).  Doing both saves the --height path from fetching
     # a full block we'd otherwise throw away.
     if args.height is None:
@@ -2161,11 +2161,11 @@ def cmd_cut_checkpoint(args):
             sys.exit(1)
         info = response["result"]
         height = info.get("height")
-        # get_chain_info returns the *count* of blocks as `height` — the
+        # get_chain_info returns the *count* of blocks as `height` - the
         # tip's block_number is height - 1.  An empty chain has nothing
         # to checkpoint.
         if not height or info.get("latest_block_hash") is None:
-            print("Error: chain is empty — nothing to checkpoint", file=sys.stderr)
+            print("Error: chain is empty - nothing to checkpoint", file=sys.stderr)
             sys.exit(1)
         if info.get("state_root") is None:
             print(
@@ -2229,7 +2229,7 @@ def cmd_cut_checkpoint(args):
             print(f"Error: failed to read {args.out}: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # Dedupe by block_number — keep the latest cut for that height so a
+    # Dedupe by block_number - keep the latest cut for that height so a
     # re-run picks up any hash correction.
     entries = [
         e for e in entries
@@ -2306,7 +2306,7 @@ def cmd_gen_tor_config(args):
 
     Censorship-resistance helper: an operator whose users face IP-level
     blocking can expose their RPC over a Tor hidden service.  We don't
-    run Tor — we just print the config fragment.  Operator pipes output
+    run Tor - we just print the config fragment.  Operator pipes output
     into their torrc, restarts tor, then shares the generated .onion
     hostname with users.
 
