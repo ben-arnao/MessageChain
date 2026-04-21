@@ -1302,29 +1302,92 @@ assert (
 # convention used by the three prior forks (50_000).
 SEED_DIVESTMENT_RETUNE_HEIGHT = 50_000
 
+# Seed-divestment lottery-redistribution hard fork.
+#
+# The retune (above) fixed the TREASURY concentration problem but
+# still routed 95% of divested founder stake to BURN — i.e. out of
+# circulation.  Even with deeper burn the founder ends at ~93%
+# consensus weight because non-founder wallets don't grow.
+#
+# The redistribution fork redirects the 95% "burn" share to:
+#   50% burn
+#   5% treasury (unchanged)
+#   45% lottery redistribution — accumulates in SupplyTracker.lottery_prize_pool
+#                                and is paid out to non-founder wallets via
+#                                the existing reputation-weighted lottery.
+#
+# Expected end state (moderate sybil resistance): founder consensus
+# weight drops from ~93% to ~60-75% as real tokens flow into
+# non-founder wallets.
+#
+# Activation-gated at SEED_DIVESTMENT_REDIST_HEIGHT.  Must activate
+# BEFORE BOOTSTRAP_END_HEIGHT = 105_192 or the first divestment block
+# fires under RETUNE-era terms with no lottery share.  Placeholder
+# matches the convention used by prior forks (50_000); operators
+# coordinate REDIST >= RETUNE so the fork schedule is monotonic.
+SEED_DIVESTMENT_BURN_BPS_POST_REDIST = 5000       # 50% burn
+SEED_DIVESTMENT_TREASURY_BPS_POST_REDIST = 500    # 5% treasury (unchanged vs retune)
+SEED_DIVESTMENT_LOTTERY_BPS_POST_REDIST = 4500    # 45% lottery — NEW mechanism
+assert (
+    SEED_DIVESTMENT_BURN_BPS_POST_REDIST
+    + SEED_DIVESTMENT_TREASURY_BPS_POST_REDIST
+    + SEED_DIVESTMENT_LOTTERY_BPS_POST_REDIST
+    == 10_000
+)
 
-def get_seed_divestment_params(block_height: int) -> tuple[int, int, int]:
-    """Return (retain_floor, burn_bps, treasury_bps) at `block_height`.
+SEED_DIVESTMENT_REDIST_HEIGHT = 50_000            # placeholder
 
-    Hard-fork-gated: pre-activation returns the legacy values baked
-    into genesis so historical chain state is reproducible; at/after
-    activation returns the post-retune values sized for a 140M
-    GENESIS_SUPPLY.
+# Operators MUST coordinate REDIST at or after RETUNE — REDIST is a
+# LATER fork that extends the retune policy.  Activating REDIST before
+# RETUNE would leave the divestment mechanism in an undefined
+# intermediate state (post-redist bps against pre-retune floor).  Load-
+# time assertion guards against operator mis-setting.
+assert SEED_DIVESTMENT_REDIST_HEIGHT >= SEED_DIVESTMENT_RETUNE_HEIGHT, (
+    "REDIST fork must land at or after RETUNE fork"
+)
+
+
+def get_seed_divestment_params(
+    block_height: int,
+) -> tuple[int, int, int, int]:
+    """Return (retain_floor, burn_bps, treasury_bps, lottery_bps).
+
+    Hard-fork-gated three-era schedule:
+      * pre-RETUNE: legacy 1M floor, 75% burn, 25% treasury, 0% lottery.
+      * RETUNE-era (RETUNE <= h < REDIST): 20M floor, 95% burn,
+        5% treasury, 0% lottery.
+      * REDIST-era (h >= REDIST): 20M floor, 50% burn, 5% treasury,
+        45% lottery.
+
+    The fourth element (lottery_bps) is the share of each divestment
+    step's divest_amount that accumulates in
+    ``SupplyTracker.lottery_prize_pool`` for later distribution via
+    the reputation-weighted lottery.  Zero in both legacy schedules
+    so byte-for-byte preservation is trivial.
 
     Used by both the apply path (_apply_seed_divestment) and the sim
     path (compute_post_state_root) so the two remain in lockstep
-    across the activation boundary.
+    across the activation boundaries.
     """
+    if block_height >= SEED_DIVESTMENT_REDIST_HEIGHT:
+        return (
+            SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE,
+            SEED_DIVESTMENT_BURN_BPS_POST_REDIST,
+            SEED_DIVESTMENT_TREASURY_BPS_POST_REDIST,
+            SEED_DIVESTMENT_LOTTERY_BPS_POST_REDIST,
+        )
     if block_height >= SEED_DIVESTMENT_RETUNE_HEIGHT:
         return (
             SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE,
             SEED_DIVESTMENT_BURN_BPS_POST_RETUNE,
             SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE,
+            0,
         )
     return (
         SEED_DIVESTMENT_RETAIN_FLOOR,
         SEED_DIVESTMENT_BURN_BPS,
         SEED_DIVESTMENT_TREASURY_BPS,
+        0,
     )
 
 # Staking

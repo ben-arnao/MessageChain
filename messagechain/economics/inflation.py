@@ -80,6 +80,30 @@ class SupplyTracker:
         self._treasury_spend_epoch_start: int = -1
         self._treasury_spend_debited_this_epoch: int = 0
 
+        # Seed-divestment lottery-redistribution hard fork
+        # (SEED_DIVESTMENT_REDIST_HEIGHT): consensus-visible scalar
+        # pool that accumulates the 45% "lottery" share of each
+        # REDIST-era divestment block's divested amount.  Drained
+        # evenly across remaining lottery firings in the divestment
+        # window via Blockchain._apply_block_state's lottery step, so
+        # the pool ends at exactly 0 at the last firing before
+        # SEED_DIVESTMENT_END_HEIGHT.
+        #
+        # Pre-REDIST-activation this scalar remains 0 at all times
+        # — the divestment step's lottery share is zero — so byte-
+        # for-byte preservation of legacy / RETUNE-era behavior is
+        # trivial.
+        #
+        # Lifecycle:
+        #   - accumulated by _apply_seed_divestment (REDIST-era only)
+        #   - drained by _apply_block_state's lottery step
+        #   - snapshotted by _snapshot_memory_state for reorg
+        #     rollback safety
+        #   - committed to the state-snapshot root (state_snapshot.py
+        #     _GLOBAL_LOTTERY_PRIZE_POOL under _TAG_GLOBAL) so state-
+        #     synced nodes inherit the same pool as replaying nodes
+        self.lottery_prize_pool: int = 0
+
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
         return self.balances.get(entity_id, 0)

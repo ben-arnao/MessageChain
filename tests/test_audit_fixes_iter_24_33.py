@@ -20,17 +20,21 @@ from messagechain.core.blockchain import Blockchain
 
 
 # Legacy-schedule coverage: the divestment debt-clamp test in this file
-# simulates the pre-retune schedule.  Push the retune height past its
-# simulated range so pre-retune params apply.
+# simulates the pre-retune schedule.  Push the retune AND
+# redistribution heights past its simulated range so pre-retune params
+# apply throughout (no lottery share of divestment).
 _ORIG_RETUNE_HEIGHT = _config.SEED_DIVESTMENT_RETUNE_HEIGHT
+_ORIG_REDIST_HEIGHT = _config.SEED_DIVESTMENT_REDIST_HEIGHT
 
 
 def setUpModule():
     _config.SEED_DIVESTMENT_RETUNE_HEIGHT = 10 ** 9
+    _config.SEED_DIVESTMENT_REDIST_HEIGHT = 10 ** 9
 
 
 def tearDownModule():
     _config.SEED_DIVESTMENT_RETUNE_HEIGHT = _ORIG_RETUNE_HEIGHT
+    _config.SEED_DIVESTMENT_REDIST_HEIGHT = _ORIG_REDIST_HEIGHT
 
 
 class TestPyprojectHasCLIEntry(unittest.TestCase):
