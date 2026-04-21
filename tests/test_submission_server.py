@@ -310,6 +310,232 @@ class TestMempoolInjectionUnit(unittest.TestCase):
         self.assertFalse(result.ok)
 
 
+class TestRejectionOptIn(unittest.TestCase):
+    """Opt-in SignedRejection on validation failure.
+
+    Default behavior is unchanged: failed validation returns plain 400
+    text (no leaf burned).  When the client sets X-MC-Request-Receipt: 1,
+    the validator additionally issues a SignedRejection committing to
+    the failure reason, returned as a JSON body with a hex blob.
+
+    Tests run against the helper directly so we don't have to spin up
+    a TLS server per test (the helper is the same code path the HTTP
+    handler exercises; the TLS test class above covers the framing).
+    """
+
+    def setUp(self):
+        from messagechain.network.submission_receipt import (
+            ReceiptIssuer, SignedRejection, verify_rejection,
+            REJECT_INVALID_SIG,
+        )
+        from messagechain.crypto.keys import KeyPair
+        self.alice = Entity.create(b"alice-rej-opt".ljust(32, b"\x00"))
+        self.alice.keypair._next_leaf = 0
+        self.chain = Blockchain()
+        self.chain.initialize_genesis(self.alice)
+        self.chain.supply.balances[self.alice.entity_id] = 100_000
+        self.mempool = Mempool(fee_policy=_STATIC_FEE)
+        # Dedicated receipt subtree for alice.
+        self.kp = KeyPair.generate(
+            seed=b"receipt-subtree-rej-opt",
+            height=4,
+        )
+        self.issuer = ReceiptIssuer(
+            self.alice.entity_id, self.kp,
+            height_fn=lambda: self.chain.height,
+        )
+
+    def _make_invalid_sig_tx(self) -> MessageTransaction:
+        """Build a tx with a corrupted-after-the-fact fee — signature
+        no longer covers the modified field, so validate_transaction
+        returns 'Invalid signature'.  This is the canonical input for
+        REJECT_INVALID_SIG."""
+        tx = create_transaction(self.alice, "hi", _TEST_FEE, nonce=0)
+        return MessageTransaction(
+            entity_id=tx.entity_id,
+            message=tx.message,
+            timestamp=tx.timestamp,
+            nonce=tx.nonce,
+            fee=tx.fee + 1,
+            signature=tx.signature,
+            compression_flag=tx.compression_flag,
+        )
+
+    def test_default_failure_returns_no_rejection(self):
+        """Without the opt-in header, a validation failure produces no
+        SignedRejection — the leaf budget is preserved."""
+        bad_tx = self._make_invalid_sig_tx()
+        leaf_before = self.kp._next_leaf
+        result = submit_transaction_to_mempool(
+            bad_tx, self.chain, self.mempool,
+            receipt_issuer=self.issuer,
+            request_rejection=False,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.rejection_hex, "")
+        # Critical: the issuer's leaf cursor is UNCHANGED.  Leaf budget
+        # is the whole reason this is opt-in.
+        self.assertEqual(self.kp._next_leaf, leaf_before)
+
+    def test_opted_in_failure_returns_signed_rejection(self):
+        """With the opt-in flag, the failure carries a verifiable
+        SignedRejection blob.  The blob deserializes, verifies, and
+        binds the right tx_hash + reason_code."""
+        from messagechain.network.submission_receipt import (
+            SignedRejection, verify_rejection, REJECT_INVALID_SIG,
+        )
+        bad_tx = self._make_invalid_sig_tx()
+        leaf_before = self.kp._next_leaf
+        result = submit_transaction_to_mempool(
+            bad_tx, self.chain, self.mempool,
+            receipt_issuer=self.issuer,
+            request_rejection=True,
+        )
+        self.assertFalse(result.ok)
+        self.assertTrue(result.rejection_hex,
+                        "opt-in must produce a non-empty rejection_hex")
+        # Leaf consumed.
+        self.assertEqual(self.kp._next_leaf, leaf_before + 1)
+        # Decode + verify.
+        rej = SignedRejection.from_bytes(bytes.fromhex(result.rejection_hex))
+        self.assertEqual(rej.tx_hash, bad_tx.tx_hash)
+        self.assertEqual(rej.reason_code, REJECT_INVALID_SIG)
+        self.assertEqual(rej.issuer_id, self.alice.entity_id)
+        ok, reason = verify_rejection(rej)
+        self.assertTrue(ok, reason)
+
+    def test_opted_in_success_unchanged(self):
+        """Opt-in header on a SUCCESS path: behavior unchanged — receipt
+        path runs as before, no rejection_hex."""
+        tx = create_transaction(self.alice, "ok", _TEST_FEE, nonce=0)
+        result = submit_transaction_to_mempool(
+            tx, self.chain, self.mempool,
+            receipt_issuer=self.issuer,
+            request_rejection=True,
+        )
+        self.assertTrue(result.ok)
+        self.assertTrue(result.receipt_hex)
+        self.assertEqual(result.rejection_hex, "")
+
+    def test_no_issuer_no_rejection_even_when_opted_in(self):
+        """Even if the client opts in, an issuer-less server cannot
+        produce a rejection (and must not crash trying)."""
+        bad_tx = self._make_invalid_sig_tx()
+        result = submit_transaction_to_mempool(
+            bad_tx, self.chain, self.mempool,
+            receipt_issuer=None,
+            request_rejection=True,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.rejection_hex, "")
+
+
+class TestRejectionOverHTTP(SubmissionServerTestBase):
+    """End-to-end TLS path: opt-in header → 400 JSON with rejection blob.
+
+    The default-path tests above already cover the helper-level logic;
+    this class exists to verify the HTTP handler reads the header,
+    threads the flag through, and serializes the JSON body correctly.
+    """
+
+    def _make_invalid_sig_tx(self) -> MessageTransaction:
+        tx = self._make_tx()
+        return MessageTransaction(
+            entity_id=tx.entity_id,
+            message=tx.message,
+            timestamp=tx.timestamp,
+            nonce=tx.nonce,
+            fee=tx.fee + 1,
+            signature=tx.signature,
+            compression_flag=tx.compression_flag,
+        )
+
+    def _post_with_header(
+        self,
+        path: str,
+        body: bytes,
+        rejection_header: str | None = None,
+    ):
+        """POST with optional X-MC-Request-Receipt header."""
+        conn = http.client.HTTPSConnection(
+            "127.0.0.1", self.port, context=self._tls_context(), timeout=5,
+        )
+        try:
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(body)),
+            }
+            if rejection_header is not None:
+                headers["X-MC-Request-Receipt"] = rejection_header
+            conn.request("POST", path, body=body, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def setUp(self):
+        super().setUp()
+        # Configure an issuer on the running server.  The base setUp
+        # didn't pass one, so we replace the handler context here so a
+        # rejection can actually be issued.
+        from messagechain.network.submission_receipt import ReceiptIssuer
+        from messagechain.crypto.keys import KeyPair
+        self.kp = KeyPair.generate(
+            seed=b"receipt-subtree-http-rej",
+            height=4,
+        )
+        self.issuer = ReceiptIssuer(
+            self.alice.entity_id, self.kp,
+            height_fn=lambda: self.chain.height,
+        )
+        self.server._httpd._submission_context.receipt_issuer = self.issuer
+
+    def test_failure_without_header_plain_text(self):
+        bad_tx = self._make_invalid_sig_tx()
+        status, headers, body = self._post_with_header(
+            "/v1/submit", bad_tx.to_bytes(),
+        )
+        self.assertEqual(status, 400)
+        # Plain text content type — unchanged default behavior.
+        self.assertIn("text/plain", headers.get("Content-Type", ""))
+        self.assertNotIn(b"rejection", body)
+
+    def test_failure_with_header_json_with_rejection(self):
+        from messagechain.network.submission_receipt import (
+            SignedRejection, verify_rejection, REJECT_INVALID_SIG,
+        )
+        bad_tx = self._make_invalid_sig_tx()
+        status, headers, body = self._post_with_header(
+            "/v1/submit", bad_tx.to_bytes(),
+            rejection_header="1",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        self.assertIn(b'"rejection"', body)
+        # Extract the hex blob and verify it.
+        import json
+        payload = json.loads(body)
+        self.assertFalse(payload["ok"])
+        rej = SignedRejection.from_bytes(bytes.fromhex(payload["rejection"]))
+        self.assertEqual(rej.tx_hash, bad_tx.tx_hash)
+        self.assertEqual(rej.reason_code, REJECT_INVALID_SIG)
+        ok, _ = verify_rejection(rej)
+        self.assertTrue(ok)
+
+    def test_success_with_header_unchanged_receipt_behavior(self):
+        """Opt-in header on a successful submission must NOT alter
+        the success path — receipt is returned, no rejection field."""
+        tx = self._make_tx()
+        status, headers, body = self._post_with_header(
+            "/v1/submit", tx.to_bytes(),
+            rejection_header="1",
+        )
+        self.assertEqual(status, 200)
+        # Receipt-bearing JSON body, no rejection field.
+        self.assertIn(b'"receipt"', body)
+        self.assertNotIn(b'"rejection"', body)
+
+
 class TestTLSRequired(SubmissionServerTestBase):
     def test_plaintext_http_fails(self):
         """Plaintext HTTP to a TLS-only endpoint must fail to establish."""

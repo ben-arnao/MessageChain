@@ -106,7 +106,12 @@ from messagechain.config import (
 #     Canonical section order for encode + root-hash: archive_reward_pool
 #     (under _TAG_GLOBAL) first, then pending, processed, and receipt
 #     subtree roots.
-STATE_SNAPSHOT_VERSION = 4  # wire format version for encode/decode
+# v5: added bogus_rejection_processed (one-phase slashing for
+#     SignedRejection — closes the receipt-less censorship gap).
+#     Trails the v4 sections in the binary layout; pre-v5 snapshots
+#     decode with an empty processed set under deserialize_state's
+#     setdefault path.
+STATE_SNAPSHOT_VERSION = 5  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -159,6 +164,12 @@ _TAG_CENSORSHIP_PROCESSED = b"cproc"
 # participate in the state root because two nodes that disagreed on
 # an issuer's root would accept/reject the same evidence differently.
 _TAG_RECEIPT_ROOT = b"rrk"
+# Processed bogus-rejection-evidence set: every evidence_hash that has
+# ever been applied (slashed OR admitted-no-slash).  One-phase, no
+# pending counterpart — bogusness is decided at apply-time so there
+# is nothing to age in.  Participates in the snapshot root for the
+# same dedupe-determinism reason as _TAG_CENSORSHIP_PROCESSED.
+_TAG_BOGUS_REJECTION_PROCESSED = b"brproc"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -245,7 +256,19 @@ def serialize_state(blockchain) -> dict:
         "receipt_subtree_roots": dict(
             getattr(blockchain, "receipt_subtree_roots", {})
         ),
+        # Bogus-rejection processor — set of evidence_hashes that have
+        # ever been applied (slashed OR admitted-no-slash).  No pending
+        # counterpart: bogusness is decided immediately at apply-time.
+        "bogus_rejection_processed": _bogus_rejection_processed(
+            getattr(blockchain, "bogus_rejection_processor", None),
+        ),
     }
+
+
+def _bogus_rejection_processed(processor) -> set:
+    if processor is None:
+        return set()
+    return set(processor.processed)
 
 
 def _pending_to_bytes_dict(processor) -> dict:
@@ -355,6 +378,12 @@ def deserialize_state(snapshot: dict) -> dict:
     out.setdefault("censorship_pending", {})
     out.setdefault("censorship_processed", set())
     out.setdefault("receipt_subtree_roots", {})
+    # Pre-v5 snapshots lack the bogus-rejection processed set.  A
+    # migrating chain starts with an empty processed set — acceptable
+    # because the slashing path was introduced specifically at this
+    # wire-version bump and no historical block carries
+    # BogusRejectionEvidenceTx that needs deduping.
+    out.setdefault("bogus_rejection_processed", set())
     return out
 
 
@@ -487,6 +516,11 @@ def compute_state_root(snapshot: dict) -> bytes:
         # here forks on admission.
         _TAG_RECEIPT_ROOT: _merkle(_entries_for_section(
             _TAG_RECEIPT_ROOT, snap["receipt_subtree_roots"])),
+        # Bogus-rejection processed set — the double-slash defense.
+        # One section, no pending counterpart (apply-time decision).
+        _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
+            _TAG_BOGUS_REJECTION_PROCESSED,
+            snap["bogus_rejection_processed"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -653,6 +687,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes→bytes dict>  censorship_pending     (v4+)
         <bytes set>         censorship_processed   (v4+)
         <bytes→bytes dict>  receipt_subtree_roots  (v4+)
+        <bytes set>         bogus_rejection_processed (v5+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -695,6 +730,9 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_bytes_dict(snap["censorship_pending"])
     out += _encode_bytes_set(snap["censorship_processed"])
     out += _encode_bytes_bytes_dict(snap["receipt_subtree_roots"])
+    # v5: bogus-rejection processed set, trailing the v4 sections.  No
+    # pending counterpart — apply-time decision.
+    out += _encode_bytes_set(snap["bogus_rejection_processed"])
     return bytes(out)
 
 
@@ -756,6 +794,8 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     censorship_pending, off = _decode_bytes_bytes_dict(blob, off)
     censorship_processed, off = _decode_bytes_set(blob, off)
     receipt_subtree_roots, off = _decode_bytes_bytes_dict(blob, off)
+    # v5+: bogus-rejection processed set.  Always present on v5+ blobs.
+    bogus_rejection_processed, off = _decode_bytes_set(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -786,4 +826,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "censorship_pending": censorship_pending,
         "censorship_processed": censorship_processed,
         "receipt_subtree_roots": receipt_subtree_roots,
+        "bogus_rejection_processed": bogus_rejection_processed,
     }

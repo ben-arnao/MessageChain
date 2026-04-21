@@ -47,6 +47,58 @@ from messagechain.crypto.keys import Signature, KeyPair, verify_signature
 
 _DOMAIN_TAG = b"mc-submission-receipt-v1"
 
+# Domain tag for SignedRejection.  Differs from _DOMAIN_TAG so a
+# rejection signature can never be replayed as a receipt signature
+# (and vice versa).  Critical: an honest validator who issues a
+# rejection must not have that signature reusable to forge a "receipt"
+# claiming admission, because admission triggers a different (more
+# severe) chain of accountability.
+_REJECTION_DOMAIN_TAG = b"mc-submission-rejection-v1"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Reason codes for SignedRejection.
+#
+# Plain int constants (NOT an Enum) so the wire format is consensus-
+# stable and the encoding stays stdlib-only.  Each code maps to a
+# concrete validation failure path in submit_transaction_to_mempool.
+#
+# Slashable subset (v1): only REJECT_INVALID_SIG is slashable today —
+# bogusness is immediately provable (re-verify the embedded tx's sig
+# under its on-chain pubkey).  Other codes are accepted as evidence
+# but produce no slash; the framework is extensible to more codes
+# without a hard fork once on-chain commitments to the validator's
+# local state (mempool depth, dynamic fee floor, key revocation set)
+# exist that let an external auditor refute them.
+# ─────────────────────────────────────────────────────────────────────
+
+REJECT_INVALID_SIG = 1
+"""Validator claims the tx signature failed to verify."""
+
+REJECT_INVALID_NONCE = 2
+"""Validator claims the tx nonce did not match the expected next nonce."""
+
+REJECT_FEE_TOO_LOW = 3
+"""Validator claims the tx fee fell below the dynamic minimum relay fee."""
+
+REJECT_MEMPOOL_FULL = 4
+"""Validator claims the mempool is at capacity / per-sender cap reached."""
+
+REJECT_REVOKED_KEY = 5
+"""Validator claims the signer's key was revoked / entity slashed."""
+
+REJECT_MALFORMED = 6
+"""Validator claims the tx structure is invalid (size, encoding, etc.)."""
+
+REJECT_OTHER = 99
+"""Catch-all for validation failures that don't map to a specific code."""
+
+_VALID_REASON_CODES = frozenset({
+    REJECT_INVALID_SIG, REJECT_INVALID_NONCE, REJECT_FEE_TOO_LOW,
+    REJECT_MEMPOOL_FULL, REJECT_REVOKED_KEY, REJECT_MALFORMED,
+    REJECT_OTHER,
+})
+
 
 def _h(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
@@ -196,6 +248,169 @@ def verify_receipt(receipt: SubmissionReceipt) -> tuple[bool, str]:
     return True, "Valid"
 
 
+@dataclass
+class SignedRejection:
+    """A validator's signed commitment that they REJECTED `tx_hash` for
+    `reason_code` at height `commit_height`.
+
+    Mirrors SubmissionReceipt's shape with two changes:
+      * `reason_code` slot — which failure path the validator is
+        claiming the tx hit (REJECT_INVALID_SIG, REJECT_INVALID_NONCE,
+        ...).  Bound by the signature so an attacker cannot mutate
+        the code without forging a fresh signature.
+      * Domain tag is `mc-submission-rejection-v1`, NOT
+        `mc-submission-receipt-v1`.  A rejection signature CANNOT be
+        replayed as a receipt signature and vice versa.
+
+    Signature comes from the SAME WOTS+ subtree as receipts (the
+    validator's receipt-subtree keypair) — sharing the subtree means
+    one root-pubkey commitment on-chain covers both paths.
+
+    Why this matters: `SubmissionReceipt` only catches "admit then
+    drop" censorship.  `SignedRejection` catches "answer with a lie"
+    censorship — the most common nation-state pressure scenario where
+    a validator is coerced to reject specific txs but keep up
+    appearances of liveness.  When the rejection is provably bogus
+    (re-verify the embedded tx's sig), the issuer is slashable.
+    """
+
+    tx_hash: bytes             # 32 B — the rejected tx
+    commit_height: int         # block height at rejection time
+    issuer_id: bytes           # 32 B — validator entity_id
+    issuer_root_public_key: bytes  # 32 B — receipt-subtree root
+    reason_code: int           # one of the REJECT_* constants
+    signature: Signature       # WOTS+ sig from the receipt subtree
+    rejection_hash: bytes = b""
+
+    def __post_init__(self):
+        if not self.rejection_hash:
+            self.rejection_hash = self._compute_hash()
+
+    def _signable_data(self) -> bytes:
+        sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        return b"".join([
+            _REJECTION_DOMAIN_TAG,
+            struct.pack(">B", sig_version),
+            self.tx_hash,
+            struct.pack(">Q", int(self.commit_height)),
+            self.issuer_id,
+            self.issuer_root_public_key,
+            struct.pack(">I", int(self.reason_code)),
+        ])
+
+    def _compute_hash(self) -> bytes:
+        return _h(self._signable_data())
+
+    def serialize(self) -> dict:
+        return {
+            "tx_hash": self.tx_hash.hex(),
+            "commit_height": self.commit_height,
+            "issuer_id": self.issuer_id.hex(),
+            "issuer_root_public_key": self.issuer_root_public_key.hex(),
+            "reason_code": int(self.reason_code),
+            "signature": self.signature.serialize(),
+            "rejection_hash": self.rejection_hash.hex(),
+        }
+
+    def to_bytes(self) -> bytes:
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            self.tx_hash,
+            struct.pack(">Q", int(self.commit_height)),
+            self.issuer_id,
+            self.issuer_root_public_key,
+            struct.pack(">I", int(self.reason_code)),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.rejection_hash,
+        ])
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "SignedRejection":
+        off = 0
+        if len(data) < 32 + 8 + 32 + 32 + 4 + 4 + 32:
+            raise ValueError("SignedRejection blob too short")
+        tx_hash = bytes(data[off:off + 32]); off += 32
+        commit_height = struct.unpack_from(">Q", data, off)[0]; off += 8
+        issuer_id = bytes(data[off:off + 32]); off += 32
+        issuer_root_public_key = bytes(data[off:off + 32]); off += 32
+        reason_code = struct.unpack_from(">I", data, off)[0]; off += 4
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("SignedRejection truncated at signature/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len])); off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("SignedRejection has trailing bytes")
+        r = cls(
+            tx_hash=tx_hash,
+            commit_height=commit_height,
+            issuer_id=issuer_id,
+            issuer_root_public_key=issuer_root_public_key,
+            reason_code=reason_code,
+            signature=sig,
+        )
+        expected = r._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"SignedRejection hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return r
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "SignedRejection":
+        r = cls(
+            tx_hash=bytes.fromhex(data["tx_hash"]),
+            commit_height=int(data["commit_height"]),
+            issuer_id=bytes.fromhex(data["issuer_id"]),
+            issuer_root_public_key=bytes.fromhex(data["issuer_root_public_key"]),
+            reason_code=int(data["reason_code"]),
+            signature=Signature.deserialize(data["signature"]),
+        )
+        expected = r._compute_hash()
+        declared = bytes.fromhex(data["rejection_hash"])
+        if expected != declared:
+            raise ValueError(
+                f"SignedRejection hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return r
+
+
+def verify_rejection(rejection: SignedRejection) -> tuple[bool, str]:
+    """Stateless verification of a SignedRejection.
+
+    Checks (mirrors verify_receipt):
+      * fixed-length fields have correct sizes
+      * reason_code is one of the defined REJECT_* sentinels
+      * rejection_hash matches _compute_hash()
+      * WOTS+ signature is valid under issuer_root_public_key
+
+    Does NOT consult chain state.  Slashing path additionally checks
+    issuer_root_public_key matches the on-chain record for issuer_id.
+    """
+    if len(rejection.tx_hash) != 32:
+        return False, "tx_hash must be 32 bytes"
+    if len(rejection.issuer_id) != 32:
+        return False, "issuer_id must be 32 bytes"
+    if len(rejection.issuer_root_public_key) != 32:
+        return False, "issuer_root_public_key must be 32 bytes"
+    if rejection.commit_height < 0:
+        return False, "commit_height must be non-negative"
+    if rejection.reason_code not in _VALID_REASON_CODES:
+        return False, f"unknown reason_code {rejection.reason_code}"
+    expected = rejection._compute_hash()
+    if expected != rejection.rejection_hash:
+        return False, "rejection_hash mismatch"
+    msg_hash = _h(rejection._signable_data())
+    if not verify_signature(
+        msg_hash, rejection.signature, rejection.issuer_root_public_key,
+    ):
+        return False, "invalid rejection signature"
+    return True, "Valid"
+
+
 class ReceiptIssuer:
     """Wraps a validator's receipt-subtree keypair and issues receipts.
 
@@ -258,5 +473,52 @@ class ReceiptIssuer:
             commit_height=height,
             issuer_id=self.issuer_id,
             issuer_root_public_key=self.subtree_keypair.public_key,
+            signature=sig,
+        )
+
+    def issue_rejection(
+        self, tx_hash: bytes, reason_code: int,
+    ) -> SignedRejection:
+        """Produce a signed REJECTION for `tx_hash` at current chain height.
+
+        Consumes exactly one WOTS+ leaf from the receipt subtree (same
+        subtree as receipts).  reason_code MUST be one of the defined
+        REJECT_* sentinels — unknown codes raise ValueError so a bug in
+        the call site cannot land an unverifiable rejection on the wire.
+
+        Use case: when a validator's HTTPS submission endpoint returns
+        a rejection, an opt-in client can request a SignedRejection
+        binding the validator to that reason.  If the rejection is
+        provably bogus (e.g., REJECT_INVALID_SIG against a tx whose
+        signature actually verifies), the validator is slashable via
+        BogusRejectionEvidenceTx — closing the receipt-less censorship
+        gap where a coerced validator answers honest submissions with
+        a lie.
+        """
+        if len(tx_hash) != 32:
+            raise ValueError("tx_hash must be 32 bytes")
+        if reason_code not in _VALID_REASON_CODES:
+            raise ValueError(
+                f"unknown rejection reason_code {reason_code}; "
+                f"must be one of {sorted(_VALID_REASON_CODES)}"
+            )
+        height = int(self._height_fn())
+        placeholder = Signature([], 0, [], b"", b"")
+        r = SignedRejection(
+            tx_hash=tx_hash,
+            commit_height=height,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            reason_code=reason_code,
+            signature=placeholder,
+        )
+        msg_hash = _h(r._signable_data())
+        sig = self.subtree_keypair.sign(msg_hash)
+        return SignedRejection(
+            tx_hash=tx_hash,
+            commit_height=height,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            reason_code=reason_code,
             signature=sig,
         )
