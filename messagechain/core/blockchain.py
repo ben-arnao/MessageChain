@@ -1175,6 +1175,22 @@ class Blockchain:
         # mismatch.
         self.archive_reward_pool = int(snap.get("archive_reward_pool", 0))
 
+        # Archive-duty state (v6+).  All three fields participate in
+        # the state root, so a bootstrapping node inherits them from
+        # the canonical snapshot; a replaying node would rebuild them
+        # from block history and arrive at the same values.  Absent
+        # entries default to empty maps / no open snapshot (pre-v6
+        # snapshots or fresh chain state).
+        self.validator_archive_misses = dict(
+            snap.get("validator_archive_misses", {})
+        )
+        self.validator_first_active_block = dict(
+            snap.get("validator_first_active_block", {})
+        )
+        self.archive_active_snapshot = snap.get(
+            "archive_active_snapshot", None,
+        )
+
         # Finalized checkpoints (long-range-attack defense — must carry
         # across the bootstrap boundary or the new node would accept a
         # competing chain that contradicts a known-finalized block).
@@ -3328,6 +3344,68 @@ class Blockchain:
                         sim_balances[proposer_id] = (
                             sim_balances.get(proposer_id, 0) + _payout
                         )
+
+        # Simulate archive-duty reward withhold (iter 3b-iii).  Must
+        # mirror the apply path in _apply_block_state immediately
+        # after mint_block_reward.  For every recipient that received
+        # a gross reward this block, read their miss counter and
+        # decrement sim_balances by withhold_pct%.  The pool-credit
+        # side of withhold doesn't affect this SMT root (pool lives
+        # under the snapshot-root global section, not the per-entity
+        # tree), but the balance-debit side does.
+        from messagechain.consensus.archive_duty import (
+            is_bootstrap_exempt as _is_bootstrap_exempt,
+            withhold_pct as _withhold_pct,
+        )
+        # Reconstruct the gross reward each recipient received from
+        # the mint step above.  The sim credited: proposer_share +
+        # (optionally) proposer_att_reward, and per-committee-member
+        # per_slot_reward.  Mirror those exact quantities.
+        _sim_gross: dict[bytes, int] = {}
+        if attester_committee:
+            if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
+                _n = len(attester_committee)
+                _per_slot = (attester_pool // _n) if _n > 0 else 0
+            else:
+                _per_slot = ATTESTER_REWARD_PER_SLOT
+            if _per_slot > 0:
+                for eid in attester_committee:
+                    _sim_gross[eid] = _sim_gross.get(eid, 0) + _per_slot
+            # Proposer may or may not be in the committee; `proposer_share`
+            # above was adjusted in-place if the cap was hit, so we read
+            # back the post-cap value here.
+            _sim_gross[proposer_id] = (
+                _sim_gross.get(proposer_id, 0) + proposer_share
+            )
+        else:
+            # No committee — proposer absorbed the full reward (no cap).
+            _sim_gross[proposer_id] = (
+                _sim_gross.get(proposer_id, 0) + reward
+            )
+        for _eid, _gross in _sim_gross.items():
+            if _gross <= 0:
+                continue
+            # Mirror apply-path's bootstrap-grace defense-in-depth.
+            if _is_bootstrap_exempt(
+                entity_id=_eid,
+                current_block=block_height,
+                validator_first_active_block=(
+                    self.validator_first_active_block
+                ),
+            ):
+                continue
+            _miss = self.validator_archive_misses.get(_eid, 0)
+            _pct = _withhold_pct(_miss)
+            if _pct <= 0:
+                continue
+            _withheld = _gross * _pct // 100
+            if _withheld <= 0:
+                continue
+            sim_balances[_eid] = sim_balances.get(_eid, 0) - _withheld
+            # Pool side doesn't affect the per-entity SMT state root,
+            # but DOES affect the state-snapshot root (via _TAG_GLOBAL
+            # _GLOBAL_ARCHIVE_REWARD_POOL).  That snapshot root is
+            # consumed by a different code path; no action needed here.
 
         # Simulate archive-reward payouts — must mirror
         # _apply_archive_rewards.  Only changes that reach sim_balances
@@ -6034,6 +6112,71 @@ class Blockchain:
             attester_committee=attester_committee,
             bootstrap=is_bootstrap,
         )
+
+        # Archive-duty reward withhold (iteration 3b-iii).  For every
+        # entity that just received a mint credit, read their miss
+        # counter and divert withhold_pct(miss)% of their reward into
+        # the archive_reward_pool.  Bootstrap-exempt validators skip
+        # this (withhold_pct returns 0 via the zero-miss default for
+        # exempt validators — grace is enforced upstream at
+        # _apply_archive_duty; counters never increment inside grace).
+        # This keeps the withhold hot path simple: zero-miss = zero
+        # withhold, no branching on grace here.
+        #
+        # Withheld tokens leave the recipient's balance and enter the
+        # archive_reward_pool scalar.  total_supply is UNCHANGED (just
+        # a reassignment between circulating balance and pool).  The
+        # `result` dict is rewritten so downstream escrow tracking
+        # sees the net amount; otherwise the escrow release later
+        # would try to unlock tokens the recipient never actually
+        # received.
+        from messagechain.consensus.archive_duty import (
+            is_bootstrap_exempt,
+            withhold_pct,
+        )
+        _withhold_adjustments: dict[bytes, int] = {}
+        for _recipient, _gross in (
+            [(proposer_id, result["proposer_reward"])]
+            + list(result["attestor_rewards"].items())
+        ):
+            if _gross <= 0:
+                continue
+            # Defense-in-depth: never withhold from a bootstrap-exempt
+            # validator.  By invariant (compute_miss_updates skips
+            # exempt validators), their miss counter is 0 and the
+            # branch below would pass through anyway — this guard
+            # makes the property explicit at the mutation site.
+            if is_bootstrap_exempt(
+                entity_id=_recipient,
+                current_block=block.header.block_number,
+                validator_first_active_block=(
+                    self.validator_first_active_block
+                ),
+            ):
+                continue
+            _miss = self.validator_archive_misses.get(_recipient, 0)
+            _pct = withhold_pct(_miss)
+            if _pct <= 0:
+                continue
+            _withheld = _gross * _pct // 100
+            if _withheld <= 0:
+                continue
+            # Move tokens from recipient balance → archive pool.
+            self.supply.balances[_recipient] = (
+                self.supply.balances.get(_recipient, 0) - _withheld
+            )
+            self.archive_reward_pool += _withheld
+            # Accumulate per-recipient adjustment so we can patch
+            # `result` with net amounts below.
+            _withhold_adjustments[_recipient] = (
+                _withhold_adjustments.get(_recipient, 0) + _withheld
+            )
+        if _withhold_adjustments:
+            if proposer_id in _withhold_adjustments:
+                result["proposer_reward"] -= _withhold_adjustments[proposer_id]
+            for _eid, _adj in _withhold_adjustments.items():
+                if _eid in result["attestor_rewards"]:
+                    result["attestor_rewards"][_eid] -= _adj
 
         # Track immature rewards for ALL recipients (proposer + attestors)
         self._immature_rewards.append(

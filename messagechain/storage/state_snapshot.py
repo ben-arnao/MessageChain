@@ -118,7 +118,17 @@ from messagechain.config import (
 #     Trails the v5 section in the binary layout; pre-v6 snapshots
 #     decode with empty active/processed under deserialize_state's
 #     setdefault path.
-STATE_SNAPSHOT_VERSION = 6  # wire format version for encode/decode
+# v7: added archive-duty state — three fields committed so bootstrapping
+#     and replaying nodes agree on validator miss counters, first-active
+#     blocks, and (if one is open) the current challenge snapshot.
+#     Reward-path withhold at mint time reads these fields, so they
+#     MUST participate in the state root; otherwise two nodes could
+#     disagree on how much went to the archive pool vs. the proposer.
+#     Canonical binary order (after v6 inclusion-list sections):
+#         validator_archive_misses         (bytes→int dict)
+#         validator_first_active_block     (bytes→int dict)
+#         archive_active_snapshot          (optional struct: flag + body)
+STATE_SNAPSHOT_VERSION = 7  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -186,6 +196,13 @@ _TAG_BOGUS_REJECTION_PROCESSED = b"brproc"
 # InclusionListViolationEvidenceTx arrived.
 _TAG_INCLUSION_LIST_ACTIVE = b"ilist_act"
 _TAG_INCLUSION_LIST_VIOLATIONS = b"ilist_vio"
+# v7: Archive-duty sections.  Three separate tags because each commits
+# a different shape and because new-field additions are always-bump
+# events; keeping them distinct lets a future audit easily locate
+# which field changed which root.
+_TAG_ARCHIVE_MISSES = b"adm"         # bytes→int miss counter
+_TAG_ARCHIVE_FIRST_ACTIVE = b"adfa"  # bytes→int first-active-block
+_TAG_ARCHIVE_OPEN_SNAP = b"adsnap"   # optional open challenge epoch
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -291,6 +308,20 @@ def serialize_state(blockchain) -> dict:
             _inclusion_list_processed_violations(
                 getattr(blockchain, "inclusion_list_processor", None),
             )
+        ),
+        # v7: Archive-custody duty state.  Three pieces — persistent
+        # miss counter, per-validator bootstrap-grace reference, and
+        # (optionally) the currently-open challenge snapshot.  All
+        # three MUST be in the state root because reward-path withhold
+        # reads from them at mint time.
+        "validator_archive_misses": dict(
+            getattr(blockchain, "validator_archive_misses", {})
+        ),
+        "validator_first_active_block": dict(
+            getattr(blockchain, "validator_first_active_block", {})
+        ),
+        "archive_active_snapshot": getattr(
+            blockchain, "archive_active_snapshot", None,
         ),
     }
 
@@ -439,6 +470,13 @@ def deserialize_state(snapshot: dict) -> dict:
     # bump and no historical block carries InclusionList traffic.
     out.setdefault("inclusion_list_active", {})
     out.setdefault("inclusion_list_processed_violations", set())
+    # Pre-v7 snapshots lack the archive-duty sections.  A migrating
+    # chain starts with empty misses / first-active maps and no open
+    # snapshot — acceptable because the duty mechanism only scores
+    # validators going forward from the activation block.
+    out.setdefault("validator_archive_misses", {})
+    out.setdefault("validator_first_active_block", {})
+    out.setdefault("archive_active_snapshot", None)
     return out
 
 
@@ -589,6 +627,26 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_INCLUSION_LIST_VIOLATIONS: _merkle(_entries_for_section(
             _TAG_INCLUSION_LIST_VIOLATIONS,
             snap["inclusion_list_processed_violations"])),
+        # Archive-duty sections (v7).  All three participate because
+        # withhold_pct applied at mint time reads the miss counter,
+        # and the snapshot determines which validators get scored at
+        # the next epoch close — any disagreement on these forks the
+        # next reward block.
+        _TAG_ARCHIVE_MISSES: _merkle(_entries_for_section(
+            _TAG_ARCHIVE_MISSES, snap["validator_archive_misses"])),
+        _TAG_ARCHIVE_FIRST_ACTIVE: _merkle(_entries_for_section(
+            _TAG_ARCHIVE_FIRST_ACTIVE,
+            snap["validator_first_active_block"])),
+        # The open challenge snapshot is a structured record, not a
+        # dict or set.  Encode as a single leaf over its deterministic
+        # canonical form — absent = a sentinel "no-open-snapshot"
+        # marker, present = a full record.  Using _entries_for_section's
+        # dict path with a reserved one-key dict keeps the two-level
+        # Merkle shape consistent with every other tag.
+        _TAG_ARCHIVE_OPEN_SNAP: _merkle(
+            [_h(_TAG_ARCHIVE_OPEN_SNAP
+                + _encode_active_snapshot(snap["archive_active_snapshot"]))],
+        ),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -621,6 +679,66 @@ def compute_state_root(snapshot: dict) -> bytes:
 
 
 # ── Binary encode / decode ───────────────────────────────────────────
+
+def _encode_active_snapshot(snap) -> bytes:
+    """Canonical bytes for an optional ActiveValidatorSnapshot.
+
+    Layout:
+        u8 flag  (0 = absent, 1 = present)
+        if present:
+            u64 challenge_block
+            u32 active_set_count + N × 32-byte entity_id (sorted)
+            u32 heights_count + N × u64 target_height
+    """
+    if snap is None:
+        return b"\x00"
+    out = bytearray(b"\x01")
+    out += struct.pack(">Q", int(snap.challenge_block))
+    sorted_set = sorted(snap.active_set)
+    out += struct.pack(">I", len(sorted_set))
+    for eid in sorted_set:
+        if len(eid) != 32:
+            raise ValueError(
+                f"active_set entity_id must be 32 bytes, got {len(eid)}"
+            )
+        out += eid
+    heights = tuple(snap.challenge_heights)
+    out += struct.pack(">I", len(heights))
+    for h in heights:
+        out += struct.pack(">Q", int(h))
+    return bytes(out)
+
+
+def _decode_active_snapshot(blob: bytes, off: int):
+    """Inverse of _encode_active_snapshot.  Returns (snap_or_None, off)."""
+    if off >= len(blob):
+        raise ValueError("snapshot blob truncated at active_snapshot flag")
+    flag = blob[off]; off += 1
+    if flag == 0:
+        return None, off
+    if flag != 1:
+        raise ValueError(
+            f"active_snapshot flag must be 0 or 1, got {flag}"
+        )
+    (challenge_block,) = struct.unpack_from(">Q", blob, off); off += 8
+    (n_active,) = struct.unpack_from(">I", blob, off); off += 4
+    active_list: list[bytes] = []
+    for _ in range(n_active):
+        active_list.append(bytes(blob[off:off + 32]))
+        off += 32
+    (n_heights,) = struct.unpack_from(">I", blob, off); off += 4
+    heights: list[int] = []
+    for _ in range(n_heights):
+        (h,) = struct.unpack_from(">Q", blob, off); off += 8
+        heights.append(h)
+    from messagechain.consensus.archive_duty import ActiveValidatorSnapshot
+    snap = ActiveValidatorSnapshot(
+        challenge_block=int(challenge_block),
+        active_set=frozenset(active_list),
+        challenge_heights=tuple(heights),
+    )
+    return snap, off
+
 
 def _encode_bytes_int_dict(d: dict) -> bytes:
     out = bytearray()
@@ -758,6 +876,9 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes set>         bogus_rejection_processed (v5+)
         <int→bytes dict>    inclusion_list_active     (v6+)
         <bytes set>         inclusion_list_processed_violations (v6+)
+        <bytes→int  dict>   validator_archive_misses       (v7+)
+        <bytes→int  dict>   validator_first_active_block   (v7+)
+        <optional struct>   archive_active_snapshot        (v7+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -810,6 +931,12 @@ def encode_snapshot(snap: dict) -> bytes:
     # prefix of a v6 blob through the end of v5's final field.
     out += _encode_int_bytes_dict(snap["inclusion_list_active"])
     out += _encode_bytes_set(snap["inclusion_list_processed_violations"])
+    # v7: archive-duty state — misses, first-active, open snapshot.
+    # Strictly appended after the v6 inclusion-list sections so a v6
+    # blob is a strict prefix of a v7 blob.
+    out += _encode_bytes_int_dict(snap["validator_archive_misses"])
+    out += _encode_bytes_int_dict(snap["validator_first_active_block"])
+    out += _encode_active_snapshot(snap["archive_active_snapshot"])
     return bytes(out)
 
 
@@ -878,6 +1005,13 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # processed_violations is a bytes-set of (tx || proposer) pairs.
     inclusion_list_active, off = _decode_int_bytes_dict(blob, off)
     inclusion_list_processed_violations, off = _decode_bytes_set(blob, off)
+    # v7+: archive-duty state.  Three strictly-ordered fields append
+    # at the end of the v6 blob.  Pre-v7 blobs cannot reach here
+    # (version check above rejects them), so truncation here always
+    # means a malformed v7 blob.
+    validator_archive_misses, off = _decode_bytes_int_dict(blob, off)
+    validator_first_active_block, off = _decode_bytes_int_dict(blob, off)
+    archive_active_snapshot, off = _decode_active_snapshot(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -913,4 +1047,7 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "inclusion_list_processed_violations": (
             inclusion_list_processed_violations
         ),
+        "validator_archive_misses": validator_archive_misses,
+        "validator_first_active_block": validator_first_active_block,
+        "archive_active_snapshot": archive_active_snapshot,
     }
