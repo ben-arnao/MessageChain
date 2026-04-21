@@ -1432,6 +1432,17 @@ RECEIPT_SUBTREE_HEIGHT = 16
 # the sender side.
 MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 
+# Activation height for charging fee on (message + signature/witness) bytes.
+# Before this height, fee covers only the canonical message payload — the
+# legacy rule that shipped on mainnet.  At/after this height consensus
+# charges the linear + quadratic formula on (message_bytes + signature_bytes),
+# so an attacker cannot bulk-flood WOTS+ signatures (~2.7 KB each including
+# Merkle auth path) while paying only the payload fee.  Operators MUST
+# replace this placeholder with a concrete coordinated-fork height before
+# deploying to mainnet; the current value is chosen as "current_height +
+# 50_000" headroom so honest nodes have time to upgrade.
+FEE_INCLUDES_SIGNATURE_HEIGHT = 50_000
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.

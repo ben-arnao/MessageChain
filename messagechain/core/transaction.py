@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from messagechain.config import (
     HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
-    SIG_VERSION_CURRENT,
+    SIG_VERSION_CURRENT, FEE_INCLUDES_SIGNATURE_HEIGHT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
 )
 from messagechain.core.compression import (
@@ -301,15 +301,23 @@ class MessageTransaction:
         return tx
 
 
-def calculate_min_fee(message_bytes: bytes) -> int:
+def calculate_min_fee(message_bytes: bytes, signature_bytes: int = 0) -> int:
     """Calculate minimum fee for a message with non-linear size pricing.
 
     Fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
 
     The quadratic term makes larger messages disproportionately more expensive,
     incentivizing conciseness and penalizing bloat-heavy messages.
+
+    `signature_bytes` is the canonical length of the witness (WOTS+ sig +
+    Merkle auth path).  Default 0 preserves the legacy message-only pricing
+    that shipped on mainnet.  Post-FEE_INCLUDES_SIGNATURE_HEIGHT consensus
+    callers pass the real signature length so the same formula is applied
+    to (message_bytes + signature_bytes) — otherwise attackers can flood
+    chain storage with ~2.7 KB of witness per tx while paying only for the
+    message payload.
     """
-    size = len(message_bytes)
+    size = len(message_bytes) + signature_bytes
     linear = size * FEE_PER_BYTE
     quadratic = (size * size * FEE_QUADRATIC_COEFF) // 1000
     return MIN_FEE + linear + quadratic
@@ -378,13 +386,23 @@ def create_transaction(
     return tx
 
 
-def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
+def verify_transaction(
+    tx: MessageTransaction,
+    public_key: bytes,
+    current_height: int | None = None,
+) -> bool:
     """Verify a transaction's quantum-resistant signature and well-formedness.
 
     Size/fee checks apply to the STORED (canonical) form; ASCII and
     char-count checks apply to the decoded plaintext. Canonical-form
     enforcement prevents a sender from wasting chain bytes by submitting
     a compressed payload that's larger than the raw alternative.
+
+    `current_height` selects the fee rule: callers without chain context
+    get the legacy (message-only) rule so historical blocks and isolated
+    unit tests keep validating.  Consensus verification MUST pass the
+    applying block's height so the FEE_INCLUDES_SIGNATURE_HEIGHT gate
+    kicks in — at/after activation, fee covers message + signature bytes.
     """
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
@@ -406,9 +424,19 @@ def verify_transaction(tx: MessageTransaction, public_key: bytes) -> bool:
     canonical_stored, canonical_flag = encode_payload(plaintext)
     if canonical_stored != tx.message or canonical_flag != tx.compression_flag:
         return False
-    # Fee applies to stored size
-    if tx.fee < calculate_min_fee(tx.message):
-        return False
+    # Fee applies to stored size; at/after activation it also covers the
+    # WOTS+ signature + Merkle auth-path bytes so witness bloat is priced
+    # alongside payload bloat (see FEE_INCLUDES_SIGNATURE_HEIGHT).
+    if (
+        current_height is not None
+        and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
+    ):
+        sig_len = len(tx.signature.to_bytes())
+        if tx.fee < calculate_min_fee(tx.message, signature_bytes=sig_len):
+            return False
+    else:
+        if tx.fee < calculate_min_fee(tx.message):
+            return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False

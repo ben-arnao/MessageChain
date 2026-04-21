@@ -2255,7 +2255,10 @@ class Server:
         legacy estimate that assumes an existing recipient.
         """
         from messagechain.core.transaction import calculate_min_fee
-        from messagechain.config import MIN_FEE, NEW_ACCOUNT_FEE, MAX_MESSAGE_CHARS
+        from messagechain.config import (
+            MIN_FEE, NEW_ACCOUNT_FEE, MAX_MESSAGE_CHARS,
+            FEE_INCLUDES_SIGNATURE_HEIGHT,
+        )
         kind = params.get("kind", "message")
         recipient_is_new = False
         if kind == "message":
@@ -2264,7 +2267,22 @@ class Server:
                 return {"ok": False, "error": "message must be a string"}
             if len(msg) > MAX_MESSAGE_CHARS:
                 return {"ok": False, "error": f"Message exceeds {MAX_MESSAGE_CHARS} chars"}
-            min_fee = calculate_min_fee(msg.encode("utf-8"))
+            # Post-activation consensus prices (message + witness) bytes.
+            # The server advertises the same rule clients will face at
+            # submission time so estimates don't under-quote.  Pre-activation
+            # the signature term is zero, preserving legacy estimates.
+            target_height = self.blockchain.height + 1
+            sig_bytes = params.get("signature_bytes")
+            if (
+                target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
+                and isinstance(sig_bytes, int)
+                and sig_bytes > 0
+            ):
+                min_fee = calculate_min_fee(
+                    msg.encode("utf-8"), signature_bytes=sig_bytes,
+                )
+            else:
+                min_fee = calculate_min_fee(msg.encode("utf-8"))
         elif kind == "transfer":
             min_fee = MIN_FEE
             # Optional recipient_id: if provided and the recipient has no

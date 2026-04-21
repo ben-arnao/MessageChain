@@ -1582,7 +1582,11 @@ class Blockchain:
             )
 
         public_key = self.public_keys[tx.entity_id]
-        if not verify_transaction(tx, public_key):
+        # A mempool-admitted tx lands in the next block (height+1), so gate
+        # the fee-includes-signature rule on that target height.
+        if not verify_transaction(
+            tx, public_key, current_height=self.height + 1,
+        ):
             return False, "Invalid signature"
 
         return True, "Valid"
@@ -4303,7 +4307,11 @@ class Blockchain:
             if tx.entity_id not in self.public_keys:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Unknown entity — must register first"
             public_key = self.public_keys[tx.entity_id]
-            if not verify_transaction(tx, public_key):
+            # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
+            # applies to consensus verification.
+            if not verify_transaction(
+                tx, public_key, current_height=block.header.block_number,
+            ):
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
 
             if tx.timestamp <= 0:
@@ -4997,7 +5005,11 @@ class Blockchain:
                 return False, f"Unknown entity in tx {tx.tx_hash.hex()[:16]}"
             pk = self.public_keys[tx.entity_id]
             from messagechain.core.transaction import verify_transaction
-            if not verify_transaction(tx, pk):
+            # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
+            # applies to consensus verification.
+            if not verify_transaction(
+                tx, pk, current_height=block.header.block_number,
+            ):
                 return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
 
         for ttx in block.transfer_transactions:

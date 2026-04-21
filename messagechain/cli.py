@@ -997,6 +997,29 @@ def _cmd_account_sigs_remaining(args=None):
         print("  Schedule a rotation soon: messagechain rotate-key")
 
 
+def _estimate_signature_size(keypair) -> int:
+    """Return the exact to_bytes() length of a fresh signature from `keypair`.
+
+    Signature size is a pure function of the WOTS+ parameters and the
+    Merkle tree height, so we can compute it without burning a one-time
+    leaf to a probe-sign.  Keep in sync with Signature.to_bytes() layout.
+    """
+    from messagechain.config import WOTS_KEY_CHAINS
+    _HASH = 32
+    # Layout (see Signature.to_bytes):
+    #   u16 wots_count + N*32 wots_sig
+    #   u32 leaf_index
+    #   u8  auth_len   + M*32 auth_path   (M = keypair.height)
+    #   32 wots_pub + 32 wots_seed + u8 sig_version
+    return (
+        2 + WOTS_KEY_CHAINS * _HASH
+        + 4
+        + 1 + keypair.height * _HASH
+        + _HASH + _HASH
+        + 1
+    )
+
+
 def cmd_send(args):
     """Send a message to the chain."""
     from messagechain.identity.identity import Entity
@@ -1041,12 +1064,31 @@ def cmd_send(args):
     # submitting a tx the chain will reject.
     from messagechain.core.transaction import calculate_min_fee
     from messagechain.core.compression import encode_payload
+    from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT
     # Fee is charged on the canonical stored size - compute locally so
     # we never overpay and never underpay relative to what the chain
     # will enforce.
     msg_bytes = args.message.encode("ascii")
     stored_bytes, _ = encode_payload(msg_bytes)
-    local_min = calculate_min_fee(stored_bytes)
+    # Post-activation the chain prices (message + signature) bytes; ask
+    # the server for its tip height to decide which rule to apply.  On
+    # RPC failure fall back to legacy pricing -- the node will reject an
+    # under-priced tx and the user can retry with an explicit --fee.
+    info_resp = rpc_call(host, port, "get_chain_info", {})
+    tip_height = 0
+    if info_resp.get("ok"):
+        count = info_resp["result"].get("height", 0) or 0
+        tip_height = max(count - 1, 0)
+    if tip_height + 1 >= FEE_INCLUDES_SIGNATURE_HEIGHT:
+        # Signature size is deterministic for the scheme parameters baked
+        # into the keypair, so compute it without actually signing (a
+        # probe-sign would consume a one-time WOTS+ leaf).
+        sig_bytes_len = _estimate_signature_size(entity.keypair)
+        local_min = calculate_min_fee(
+            stored_bytes, signature_bytes=sig_bytes_len,
+        )
+    else:
+        local_min = calculate_min_fee(stored_bytes)
     fee = args.fee
     if fee is None:
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
