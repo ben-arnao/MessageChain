@@ -3268,6 +3268,48 @@ class Blockchain:
         )
         return compute_snapshot_root(serialize_state(self))
 
+    def _validate_block_list_counts(self, block) -> tuple[bool, str]:
+        """Hard per-block count caps on consensus-path lists.
+
+        Rejects before any cryptographic work — placeholder objects
+        are fine for the count test, which mirrors the pattern used by
+        _validate_finality_votes.  See config.py for the sizing
+        rationale; the short version is that these lists bypass the
+        fee market (proposers insert them directly) so the protocol
+        has to set the ceiling structurally.
+
+        Custody proofs are already capped via ARCHIVE_PROOFS_PER_CHALLENGE
+        in _validate_custody_proofs and are not re-checked here.
+        Finality votes are capped in _validate_finality_votes.
+        """
+        from messagechain.config import (
+            MAX_ATTESTATIONS_PER_BLOCK,
+            MAX_VALIDATOR_SIGNATURES_PER_BLOCK,
+            MAX_GOVERNANCE_TXS_PER_BLOCK,
+            MAX_AUTHORITY_TXS_PER_BLOCK,
+            MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK,
+        )
+        checks = (
+            ("attestations", getattr(block, "attestations", []),
+             MAX_ATTESTATIONS_PER_BLOCK),
+            ("validator_signatures",
+             getattr(block, "validator_signatures", []),
+             MAX_VALIDATOR_SIGNATURES_PER_BLOCK),
+            ("governance_txs", getattr(block, "governance_txs", []),
+             MAX_GOVERNANCE_TXS_PER_BLOCK),
+            ("authority_txs", getattr(block, "authority_txs", []),
+             MAX_AUTHORITY_TXS_PER_BLOCK),
+            ("censorship_evidence_txs",
+             getattr(block, "censorship_evidence_txs", []),
+             MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK),
+        )
+        for name, lst, cap in checks:
+            if len(lst) > cap:
+                return False, (
+                    f"Too many {name}: {len(lst)} > {cap}"
+                )
+        return True, "OK"
+
     def _validate_attestations(self, block: Block) -> tuple[bool, str]:
         """Validate all attestations included in a block.
 
@@ -3684,6 +3726,14 @@ class Blockchain:
         latest = self.get_latest_block()
         if latest is None:
             return False, "No genesis block"
+
+        # Per-block count caps on consensus-path lists (attestations,
+        # validator_signatures, governance/authority/censorship-
+        # evidence txs).  Checked early so a bloated block is rejected
+        # before any signature work.
+        ok, reason = self._validate_block_list_counts(block)
+        if not ok:
+            return False, reason
 
         # Block version must be a known protocol version
         if block.header.version != 1:
@@ -4594,6 +4644,11 @@ class Blockchain:
             return False, "Invalid prev_hash"
         if block.header.block_number != parent.header.block_number + 1:
             return False, "Invalid block number"
+
+        # Per-block count caps — same early rejection as validate_block.
+        ok, reason = self._validate_block_list_counts(block)
+        if not ok:
+            return False, reason
 
         # Block version must be known
         if block.header.version != 1:

@@ -1246,6 +1246,28 @@ INACTIVITY_LEAK_ACTIVATION_THRESHOLD = 4
 INACTIVITY_PENALTY_QUOTIENT = 16_777_216  # ~2^24
 INACTIVITY_BASE_PENALTY = 1
 MAX_FINALITY_VOTES_PER_BLOCK = 200    # DoS guard on block-size expansion via finality votes
+# Per-block count caps on the remaining consensus-path lists.  The fee
+# market only prices mempool-submitted user txs; attestations,
+# validator_signatures, governance_txs, authority_txs, and censorship-
+# evidence txs are inserted by the block proposer directly and have no
+# fee counterparty (the proposer would be paying fees to itself).  Hard
+# count caps are therefore the structural ceiling — permanence-scope
+# data cannot be allowed to grow without bound.
+#
+# Sizing rationale:
+#   * Attestations and validator_signatures scale with the validator
+#     set — mirror MAX_FINALITY_VOTES_PER_BLOCK = 200 as the cap.
+#   * Governance and authority txs are rare administrative events; a
+#     tight cap bounds worst-case block bloat without constraining
+#     normal usage.
+#   * Censorship-evidence txs should not dominate a block — 16 per
+#     block is ample for legitimate evidence traffic given the
+#     submission-receipt maturity window.
+MAX_ATTESTATIONS_PER_BLOCK = 200
+MAX_VALIDATOR_SIGNATURES_PER_BLOCK = 200
+MAX_GOVERNANCE_TXS_PER_BLOCK = 16
+MAX_AUTHORITY_TXS_PER_BLOCK = 16
+MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK = 16
 # A finality vote for a block older than FINALITY_VOTE_MAX_AGE blocks is
 # rejected — prevents spam gossip of votes targeting ancient blocks that
 # are already beyond the rewrite horizon anyway.  10 × FINALITY_INTERVAL
