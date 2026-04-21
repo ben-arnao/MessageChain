@@ -315,13 +315,14 @@ class ChainDB:
             -- validator could time double-signs around their target's
             -- node restarts.
             --
-            -- Rolling 7-day window (UNBONDING_PERIOD = 1008 blocks at
-            -- 600s).  Entries are pruned when
+            -- Rolling window tied to UNBONDING_PERIOD (~15 days at
+            -- 600s post-slash-evasion-fix; ~7 days pre-fix).  Entries
+            -- are pruned when
             --     first_seen_block_height < current_height - UNBONDING_PERIOD
             -- because any older observation is useless — the chain
             -- rejects evidence older than UNBONDING_PERIOD in
             -- Blockchain.validate_slash_transaction.  At ~144 validators
-            -- × 1008 blocks × ~100 B/row the disk ceiling is ~15 MB.
+            -- × 2176 blocks × ~100 B/row the disk ceiling is ~31 MB.
             --
             -- `signed_payload` stores the fully-signed wire form
             -- (BlockHeader.to_bytes() or Attestation.to_bytes()) so the

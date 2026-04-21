@@ -10,7 +10,20 @@ from messagechain.core.blockchain import Blockchain
 from messagechain.core.transaction import create_transaction
 from messagechain.consensus.pos import ProofOfStake
 from messagechain.economics.inflation import SupplyTracker
-from messagechain.config import UNBONDING_PERIOD, VALIDATOR_MIN_STAKE
+from messagechain.config import (
+    UNBONDING_PERIOD,
+    UNBONDING_PERIOD_EXTENSION_HEIGHT,
+    VALIDATOR_MIN_STAKE,
+)
+
+# Pick a synthetic block height safely past the unbonding-period
+# extension fork so ``supply.unstake(current_block=...)`` uses the
+# post-extension period and the release_block arithmetic matches the
+# module-level ``UNBONDING_PERIOD`` imported above.  Pre-activation
+# unstakes release at the legacy 1008-block maturity regardless of
+# what ``UNBONDING_PERIOD`` evaluates to — see
+# ``tests/test_unbonding_evidence_invariant.py`` for that path.
+_POST_FORK = UNBONDING_PERIOD_EXTENSION_HEIGHT + 10
 from tests import register_entity_for_test
 
 
@@ -31,7 +44,7 @@ class TestUnbondingPeriod(unittest.TestCase):
         supply.stake(self.alice.entity_id, 500)
         self.assertEqual(supply.get_staked(self.alice.entity_id), 500)
 
-        result = supply.unstake(self.alice.entity_id, 200, current_block=10)
+        result = supply.unstake(self.alice.entity_id, 200, current_block=_POST_FORK)
         self.assertTrue(result)
         # Staked amount decreases
         self.assertEqual(supply.get_staked(self.alice.entity_id), 300)
@@ -44,14 +57,14 @@ class TestUnbondingPeriod(unittest.TestCase):
         """Pending tokens become spendable after UNBONDING_PERIOD blocks."""
         supply = self.chain.supply
         supply.stake(self.alice.entity_id, 500)
-        supply.unstake(self.alice.entity_id, 200, current_block=10)
+        supply.unstake(self.alice.entity_id, 200, current_block=_POST_FORK)
 
-        # Not released yet at block 10 + UNBONDING_PERIOD - 1
-        supply.process_pending_unstakes(10 + UNBONDING_PERIOD - 1)
+        # Not released yet at block _POST_FORK + UNBONDING_PERIOD - 1
+        supply.process_pending_unstakes(_POST_FORK + UNBONDING_PERIOD - 1)
         self.assertEqual(supply.get_balance(self.alice.entity_id), 9500)
 
-        # Released at block 10 + UNBONDING_PERIOD
-        supply.process_pending_unstakes(10 + UNBONDING_PERIOD)
+        # Released at block _POST_FORK + UNBONDING_PERIOD
+        supply.process_pending_unstakes(_POST_FORK + UNBONDING_PERIOD)
         self.assertEqual(supply.get_balance(self.alice.entity_id), 9700)
         self.assertEqual(supply.get_pending_unstake(self.alice.entity_id), 0)
 
@@ -59,7 +72,7 @@ class TestUnbondingPeriod(unittest.TestCase):
         """Pending unstakes can still be slashed."""
         supply = self.chain.supply
         supply.stake(self.alice.entity_id, 500)
-        supply.unstake(self.alice.entity_id, 500, current_block=10)
+        supply.unstake(self.alice.entity_id, 500, current_block=_POST_FORK)
 
         # Alice has 0 staked, 500 pending — slash should burn pending too
         slashed, reward = supply.slash_validator(self.alice.entity_id, self.bob.entity_id)
@@ -71,15 +84,15 @@ class TestUnbondingPeriod(unittest.TestCase):
         supply = self.chain.supply
         supply.stake(self.alice.entity_id, 500)
 
-        supply.unstake(self.alice.entity_id, 100, current_block=10)
-        supply.unstake(self.alice.entity_id, 100, current_block=20)
+        supply.unstake(self.alice.entity_id, 100, current_block=_POST_FORK)
+        supply.unstake(self.alice.entity_id, 100, current_block=_POST_FORK + 10)
 
-        # First batch releases at 10 + UNBONDING_PERIOD
-        supply.process_pending_unstakes(10 + UNBONDING_PERIOD)
+        # First batch releases at _POST_FORK + UNBONDING_PERIOD
+        supply.process_pending_unstakes(_POST_FORK + UNBONDING_PERIOD)
         self.assertEqual(supply.get_balance(self.alice.entity_id), 9600)  # 9500 + 100
 
-        # Second batch releases at 20 + UNBONDING_PERIOD
-        supply.process_pending_unstakes(20 + UNBONDING_PERIOD)
+        # Second batch releases at _POST_FORK + 10 + UNBONDING_PERIOD
+        supply.process_pending_unstakes(_POST_FORK + 10 + UNBONDING_PERIOD)
         self.assertEqual(supply.get_balance(self.alice.entity_id), 9700)  # 9600 + 100
 
 

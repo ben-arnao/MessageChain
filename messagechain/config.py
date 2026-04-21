@@ -1156,7 +1156,34 @@ SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # tokens the founder always keeps
 # The founder's initial stake is divested DOWN TO this floor, not to zero.
 
 # Staking
-UNBONDING_PERIOD = 1_008      # blocks before unstaked tokens become spendable (~7 days at 600s)
+#
+# Unbonding period — how many blocks a validator's queued unstake
+# sits in the pending queue before the tokens become spendable.  The
+# pending balance is slashable; the spendable balance is not.  Thus
+# the unbonding period MUST be at least as long as the window during
+# which slashing evidence for a past offense is still actionable,
+# otherwise a malicious validator can equivocate, immediately queue
+# an unstake, wait for the unbond to mature, withdraw, and be
+# judgment-proof when slow evidence (finality double-votes,
+# censorship-receipt evidence) finally lands on chain.
+#
+# The original ``UNBONDING_PERIOD = 1_008`` (~7 days at 600 s/block)
+# was SHORTER than ``EVIDENCE_EXPIRY_BLOCKS = 2_016`` (~14 days),
+# opening a ~7-day slash-evasion window.  The post-extension value
+# is derived from the evidence-window constants (see the
+# ``UNBONDING_PERIOD_POST_EXTENSION`` block lower in this file,
+# defined AFTER ``EVIDENCE_EXPIRY_BLOCKS`` and
+# ``EVIDENCE_MATURITY_BLOCKS``) and activated at
+# ``UNBONDING_PERIOD_EXTENSION_HEIGHT``.
+#
+# The module-level name ``UNBONDING_PERIOD`` binds to the
+# post-extension value so callers that read the bare constant
+# without threading block height see the SAFE (longer) window.
+# Consensus-critical call sites thread block height and call
+# ``get_unbonding_period(block_height)`` which returns the legacy
+# value pre-activation so in-flight unstakes and historical replay
+# produce identical release_block arithmetic.
+UNBONDING_PERIOD_LEGACY = 1_008      # pre-fork value; kept for activation gate
 
 # Auto-restake — opt-in, node-local policy.  When AUTO_RESTAKE is True,
 # after a node produces a block it sweeps its own liquid balance above
@@ -1477,6 +1504,80 @@ EVIDENCE_EXPIRY_BLOCKS = 2016
 # slash, because the proposer's good-faith inclusion cancels the
 # pending evidence before maturity.
 EVIDENCE_MATURITY_BLOCKS = 16
+
+# ─────────────────────────────────────────────────────────────────────
+# Unbonding period — derived from the evidence-window invariant.
+# ─────────────────────────────────────────────────────────────────────
+# The pending-unstake queue holds tokens in a slashable-but-locked
+# state.  To close the slash-evasion window (equivocate → unstake →
+# wait-out-unbond → withdraw → evidence arrives too late), the
+# unbonding period must cover the longest window during which slash
+# evidence is still actionable, plus the maturity delay between
+# evidence admission and slash application, plus a small clock-skew
+# margin.
+#
+# Invariant (enforced in tests/test_unbonding_evidence_invariant.py):
+#     UNBONDING_PERIOD_POST_EXTENSION
+#         >= EVIDENCE_EXPIRY_BLOCKS + EVIDENCE_MATURITY_BLOCKS
+#
+# Derivation (defined AFTER EVIDENCE_* so future tweaks stay coherent —
+# bump EVIDENCE_EXPIRY_BLOCKS and the unbonding period follows):
+#     2016 + 16 + 144 = 2176 blocks  (~15.1 days at 600 s/block)
+#
+# The +144 (1 day) margin absorbs block-time jitter and any future
+# slash-evidence window that gets added without remembering to touch
+# this file.  NOTE: ``ATTESTER_ESCROW_BLOCKS = 12_960`` (~90 days) is
+# a SEPARATE bootstrap-era escrow-slash window — the escrow itself
+# burns on slash via ``_escrow.slash_all()`` and does NOT require
+# active stake in the pending queue, so it doesn't raise the
+# unbonding-period floor.
+UNBONDING_PERIOD_POST_EXTENSION = (
+    EVIDENCE_EXPIRY_BLOCKS + EVIDENCE_MATURITY_BLOCKS + 144
+)
+
+# Activation height for the unbonding-period extension (hard fork).
+# Pre-activation, ``get_unbonding_period(h)`` returns the legacy
+# 1008-block value so historical replay is deterministic.  At/after
+# activation, newly initiated unstakes use the post-extension value.
+# In-flight unstakes queued before activation keep their originally
+# scheduled ``release_block`` — we never rewrite pending entries.
+#
+# Operators MUST replace this placeholder with a concrete
+# coordinated-fork height before deploying to mainnet; the current
+# value is chosen as "current_height + 50_000" headroom so honest
+# nodes have time to upgrade (matches the convention used for
+# ``FEE_INCLUDES_SIGNATURE_HEIGHT``).
+UNBONDING_PERIOD_EXTENSION_HEIGHT = 50_000
+
+# Module-level alias: the SAFE value.  Callers that read
+# ``UNBONDING_PERIOD`` without threading block height get the
+# post-extension period — this is the right default for anti-bloat
+# and config-inspection tooling.  Consensus-critical code paths that
+# must match historical chain state at a specific block height MUST
+# call ``get_unbonding_period(block_height)`` instead of this bare
+# constant.
+UNBONDING_PERIOD = UNBONDING_PERIOD_POST_EXTENSION
+
+
+def get_unbonding_period(block_height: int) -> int:
+    """Return the unbonding period in effect at ``block_height``.
+
+    Hard-fork-gated: pre-activation returns the legacy 1008-block
+    value so pre-fork chain state is reproducible; at/after
+    activation returns the post-extension value derived from the
+    evidence-window constants.
+
+    Callers that queue a new unstake MUST pass the CURRENT block
+    height (the height of the block that applies the unstake tx) so
+    the release_block arithmetic uses the period that was in effect
+    at unstake time.  Re-computing with ``self.height`` at a later
+    moment would retroactively extend in-flight unstakes, which is
+    explicitly not what we want.
+    """
+    if block_height >= UNBONDING_PERIOD_EXTENSION_HEIGHT:
+        return UNBONDING_PERIOD_POST_EXTENSION
+    return UNBONDING_PERIOD_LEGACY
+
 
 # Dedicated WOTS+ subtree height for receipt-signing.  Separate from
 # the block-signing tree (MERKLE_TREE_HEIGHT) so receipt traffic cannot

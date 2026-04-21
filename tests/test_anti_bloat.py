@@ -48,11 +48,24 @@ class TestBlockTimeParameters(unittest.TestCase):
         years = HALVING_INTERVAL / blocks_per_year
         self.assertAlmostEqual(years, 4.0, delta=0.1)
 
-    def test_unbonding_period_is_7_days_at_600s(self):
-        """~7 days of blocks at 600s/block."""
+    def test_unbonding_period_covers_evidence_window(self):
+        """Post slash-evasion fix, the unbonding period must cover the
+        evidence window (~14 days) plus maturity delay plus margin —
+        originally 7 days, now ~15 days.  The invariant-style assertion
+        lives in tests/test_unbonding_evidence_invariant.py; this test
+        anchors the at-600s duration for operator-facing tooling."""
+        from messagechain.config import (
+            EVIDENCE_EXPIRY_BLOCKS, EVIDENCE_MATURITY_BLOCKS,
+        )
         blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET
         days = UNBONDING_PERIOD / blocks_per_day
-        self.assertAlmostEqual(days, 7.0, delta=0.1)
+        # ~15.1 days = 2176 blocks at 600 s/block.
+        self.assertAlmostEqual(days, 15.1, delta=0.2)
+        # Structural: the value tracks the evidence-window invariant.
+        self.assertGreaterEqual(
+            UNBONDING_PERIOD,
+            EVIDENCE_EXPIRY_BLOCKS + EVIDENCE_MATURITY_BLOCKS,
+        )
 
     def test_governance_voting_window_is_7_days_at_600s(self):
         """~7 days of blocks at 600s/block."""
