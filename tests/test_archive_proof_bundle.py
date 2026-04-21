@@ -116,7 +116,11 @@ class TestSingleEntityBundle(unittest.TestCase):
         """
         proof = _make_proof(0x11, self.block)
         bundle = ArchiveProofBundle.from_proofs([proof])
-        self.assertEqual(bundle.participants, [proof.prover_id])
+        # Multi-height format: participants is [(entity_id, target_height)].
+        self.assertEqual(
+            bundle.participants,
+            [(proof.prover_id, int(proof.target_height))],
+        )
         self.assertEqual(bundle.participant_count, 1)
 
     def test_single_bundle_root_depends_on_proof_content(self):
@@ -150,14 +154,15 @@ class TestMultiEntityBundle(unittest.TestCase):
         ]
 
     def test_participants_are_sorted(self):
-        """Bundle must expose participants in ascending entity_id order
-        regardless of submission order.  Determinism = every node agrees
-        on the same bundle-root for the same set of proofs.
+        """Bundle must expose participants in ascending
+        (entity_id, target_height) order regardless of submission
+        order.  Determinism = every node agrees on the same bundle-
+        root for the same set of proofs.
         """
         bundle = ArchiveProofBundle.from_proofs(self.proofs)
         self.assertEqual(
             bundle.participants,
-            sorted([p.prover_id for p in self.proofs]),
+            sorted([(p.prover_id, int(p.target_height)) for p in self.proofs]),
         )
 
     def test_root_is_order_invariant(self):
@@ -262,16 +267,20 @@ class TestMembershipVerify(unittest.TestCase):
         self.bundle = ArchiveProofBundle.from_proofs(self.proofs)
 
     def test_contains_identifies_participants(self):
-        """Sanity: every proof's prover_id is a participant."""
+        """Sanity: every proof's (prover_id, target_height) pair is in
+        the bundle.
+        """
         for p in self.proofs:
-            self.assertTrue(self.bundle.contains(p.prover_id))
+            self.assertTrue(
+                self.bundle.contains(p.prover_id, int(p.target_height)),
+            )
 
     def test_contains_rejects_non_participant(self):
         stranger = bytes([0xFE]) * 32
-        self.assertFalse(self.bundle.contains(stranger))
+        self.assertFalse(self.bundle.contains(stranger, target_height=5))
 
     def test_membership_proof_verifies(self):
-        """Given the bundle root + a participant's entity_id + their
+        """Given the bundle root + (entity_id, target_height) + their
         submitted CustodyProof, we can generate a Merkle inclusion proof
         that third parties verify against root alone.  This is the
         primitive a pruned chain uses: the full bundle body is gone, but
@@ -280,10 +289,13 @@ class TestMembershipVerify(unittest.TestCase):
         """
         # Pick the middle prover.
         target = self.proofs[2]
-        membership = self.bundle.build_membership_proof(target.prover_id)
+        membership = self.bundle.build_membership_proof(
+            target.prover_id, int(target.target_height),
+        )
         ok = ArchiveProofBundle.verify_membership(
             root=self.bundle.root,
             entity_id=target.prover_id,
+            target_height=int(target.target_height),
             proof_tx_hash=target.tx_hash,
             membership_proof=membership,
         )
@@ -295,10 +307,13 @@ class TestMembershipVerify(unittest.TestCase):
         """
         target = self.proofs[2]
         imposter = self.proofs[0]
-        membership = self.bundle.build_membership_proof(target.prover_id)
+        membership = self.bundle.build_membership_proof(
+            target.prover_id, int(target.target_height),
+        )
         ok = ArchiveProofBundle.verify_membership(
             root=self.bundle.root,
             entity_id=imposter.prover_id,
+            target_height=int(target.target_height),
             proof_tx_hash=target.tx_hash,
             membership_proof=membership,
         )
@@ -307,7 +322,9 @@ class TestMembershipVerify(unittest.TestCase):
     def test_membership_proof_rejects_forged_path(self):
         """Flipping a sibling hash breaks verification."""
         target = self.proofs[2]
-        membership = self.bundle.build_membership_proof(target.prover_id)
+        membership = self.bundle.build_membership_proof(
+            target.prover_id, int(target.target_height),
+        )
         self.assertGreater(
             len(membership["siblings"]), 0,
             "need >1 participant for a non-trivial path",
@@ -319,6 +336,7 @@ class TestMembershipVerify(unittest.TestCase):
         ok = ArchiveProofBundle.verify_membership(
             root=self.bundle.root,
             entity_id=target.prover_id,
+            target_height=int(target.target_height),
             proof_tx_hash=target.tx_hash,
             membership_proof=forged,
         )
@@ -327,7 +345,7 @@ class TestMembershipVerify(unittest.TestCase):
     def test_build_membership_proof_rejects_non_participant(self):
         stranger = bytes([0xFE]) * 32
         with self.assertRaises(ValueError):
-            self.bundle.build_membership_proof(stranger)
+            self.bundle.build_membership_proof(stranger, target_height=5)
 
     def test_single_participant_membership_verifies(self):
         """Edge: single-leaf tree.  Membership proof is empty-siblings
@@ -335,10 +353,13 @@ class TestMembershipVerify(unittest.TestCase):
         """
         solo = [self.proofs[0]]
         bundle = ArchiveProofBundle.from_proofs(solo)
-        membership = bundle.build_membership_proof(solo[0].prover_id)
+        membership = bundle.build_membership_proof(
+            solo[0].prover_id, int(solo[0].target_height),
+        )
         ok = ArchiveProofBundle.verify_membership(
             root=bundle.root,
             entity_id=solo[0].prover_id,
+            target_height=int(solo[0].target_height),
             proof_tx_hash=solo[0].tx_hash,
             membership_proof=membership,
         )

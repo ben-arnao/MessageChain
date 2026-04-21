@@ -65,6 +65,7 @@ from typing import Iterable, Optional
 from messagechain.config import (
     ARCHIVE_BURN_REDIRECT_PCT,
     ARCHIVE_CHALLENGE_INTERVAL,
+    ARCHIVE_CHALLENGE_K,
     ARCHIVE_PROOFS_PER_CHALLENGE,
     ARCHIVE_REWARD,
     ARCHIVE_SUBMISSION_WINDOW,
@@ -104,7 +105,12 @@ class ArchiveChallenge:
 
 
 def compute_challenge(block_hash: bytes, block_number: int) -> ArchiveChallenge:
-    """Derive the challenge for the given block.
+    """Derive the (single) challenge for the given block.
+
+    Historical single-challenge API preserved for callers that don't
+    yet know about multi-height sampling.  Exactly equivalent to
+    `compute_challenges(block_hash, block_number, k=1)[0]` — the K=1
+    index-0 derivation is the same primitive so no behavior divergence.
 
     `block_number` is B (the block issuing the challenge).  The target
     height is a uniformly-distributed integer in `[0, B)` — i.e., any
@@ -117,6 +123,35 @@ def compute_challenge(block_hash: bytes, block_number: int) -> ArchiveChallenge:
         ValueError: block_number <= 0.  There is no historical block
         to challenge at height 0 — nothing to hold.
     """
+    return compute_challenges(block_hash, block_number, k=1)[0]
+
+
+def compute_challenges(
+    block_hash: bytes,
+    block_number: int,
+    k: int = ARCHIVE_CHALLENGE_K,
+) -> list[ArchiveChallenge]:
+    """Derive K distinct challenges per challenge block.
+
+    Each challenge targets an independently-seeded historical height;
+    seeds are derived as `H(block_hash || "archive-challenge" || i)`
+    for `i` in `[0, K)`, so the per-index domain separation keeps the
+    K seeds pairwise-independent without needing a separate RNG.
+
+    Returned heights are usually K pairwise-distinct values, but the
+    protocol tolerates accidental collisions (probability K^2/(2B) —
+    negligible for K=3 and any meaningful B).  A collision means the
+    same historical height is challenged twice; duty enforcement
+    treats that as one credit, since a second proof for the same
+    (prover, height) is rejected by the bundle.  Accepting the
+    theoretical collision keeps the derivation stateless and
+    byte-identical across nodes.
+
+    Raises:
+        ValueError: k <= 0, block_number <= 0, or block_hash not 32B.
+    """
+    if k <= 0:
+        raise ValueError(f"k must be positive, got {k}")
     if block_number <= 0:
         raise ValueError(
             f"Cannot issue an archive challenge at height {block_number}: "
@@ -126,16 +161,19 @@ def compute_challenge(block_hash: bytes, block_number: int) -> ArchiveChallenge:
         raise ValueError(
             f"block_hash must be 32 bytes, got {len(block_hash)}"
         )
-    seed = _h(bytes(block_hash) + _CHALLENGE_DOMAIN_TAG)
-    # Interpret as uint256 big-endian.  Mod B produces the target
-    # height; mod num_txs is applied by the verifier once they know
-    # num_txs.
-    seed_int = int.from_bytes(seed, "big")
-    target_height = seed_int % block_number
-    return ArchiveChallenge(
-        target_height=target_height,
-        target_leaf_seed=seed_int,
-    )
+
+    challenges: list[ArchiveChallenge] = []
+    for i in range(k):
+        # Per-index domain separation.  u32 suffix lets K scale to ~4B
+        # before encoding collapses — far beyond any plausible tuning.
+        index_tag = struct.pack(">I", i)
+        seed = _h(bytes(block_hash) + _CHALLENGE_DOMAIN_TAG + index_tag)
+        seed_int = int.from_bytes(seed, "big")
+        challenges.append(ArchiveChallenge(
+            target_height=seed_int % block_number,
+            target_leaf_seed=seed_int,
+        ))
+    return challenges
 
 
 def is_within_submission_window(
@@ -728,14 +766,25 @@ def apply_archive_rewards(
 #     consensus cryptographically acknowledge it.
 
 
-def _bundle_leaf_hash(entity_id: bytes, proof_tx_hash: bytes) -> bytes:
-    """Leaf = H(0x10 || entity_id || proof_tx_hash).
+def _bundle_leaf_hash(
+    entity_id: bytes, target_height: int, proof_tx_hash: bytes,
+) -> bytes:
+    """Leaf = H(0x10 || entity_id || u64-BE(target_height) || proof_tx_hash).
 
-    Distinct domain byte from the tx-merkle tree's 0x00 leaf tag so
-    path replay across trees is impossible even when inputs happen to
-    collide.
+    Includes target_height so the same validator's K proofs at K
+    distinct heights produce K distinct leaves — the multi-height
+    sampling property.  A single leaf still binds exactly one proof
+    of custody for one (validator, height) pair; collisions across
+    pairs require a SHA3-256 preimage collision.
+
+    Distinct domain byte (0x10) from the tx-merkle tree's 0x00 leaf
+    tag so path replay across trees is impossible even when inputs
+    happen to collide.
     """
-    return _h(b"\x10" + entity_id + proof_tx_hash)
+    return _h(
+        b"\x10" + entity_id + struct.pack(">Q", int(target_height))
+        + proof_tx_hash
+    )
 
 
 def _bundle_internal_hash(left: bytes, right: bytes) -> bytes:
@@ -862,10 +911,12 @@ class ArchiveProofBundle:
         """Build a bundle from a set of validated CustodyProofs.
 
         Caller must have already verified each proof — bundle commits
-        to whatever it's handed.  Duplicate prover_ids are a hard
-        error (a single validator MUST submit exactly one proof per
-        epoch; two distinct proofs for the same entity_id is a
-        malformed submission, not an accidental dedupe case).
+        to whatever it's handed.  Duplicate (prover_id, target_height)
+        pairs are a hard error: a validator submits exactly one proof
+        per (epoch, challenged height), and two distinct proofs for
+        the same pair means we cannot tell which is canonical.  Same
+        prover at DIFFERENT heights is legal — that's the multi-height
+        sampling path.
         """
         proofs = list(proofs)
         if not proofs:
@@ -875,22 +926,29 @@ class ArchiveProofBundle:
                 root=_bundle_empty_root(),
             )
 
-        # Sort by entity_id so every node computes the same root
-        # regardless of submission / gossip order.
-        proofs_sorted = sorted(proofs, key=lambda p: p.prover_id)
+        # Sort by (prover_id, target_height) so every node computes
+        # the same root regardless of submission / gossip order.
+        proofs_sorted = sorted(
+            proofs, key=lambda p: (p.prover_id, int(p.target_height)),
+        )
 
-        # Reject duplicates — one proof per prover per epoch.
-        seen: set[bytes] = set()
+        # Reject duplicate (prover_id, target_height) pairs.
+        seen: set[tuple[bytes, int]] = set()
         for p in proofs_sorted:
-            if p.prover_id in seen:
+            key = (p.prover_id, int(p.target_height))
+            if key in seen:
                 raise ValueError(
-                    f"duplicate prover_id in bundle: {p.prover_id.hex()}"
+                    f"duplicate (prover_id, target_height) in bundle: "
+                    f"({p.prover_id.hex()}, {p.target_height})"
                 )
-            seen.add(p.prover_id)
+            seen.add(key)
 
-        participants = [p.prover_id for p in proofs_sorted]
+        participants = [
+            (p.prover_id, int(p.target_height)) for p in proofs_sorted
+        ]
         leaf_hashes = [
-            _bundle_leaf_hash(p.prover_id, p.tx_hash) for p in proofs_sorted
+            _bundle_leaf_hash(p.prover_id, int(p.target_height), p.tx_hash)
+            for p in proofs_sorted
         ]
         root = _bundle_build_root(leaf_hashes)
         return cls(
@@ -901,44 +959,48 @@ class ArchiveProofBundle:
 
     # ── membership queries ──────────────────────────────────────────
 
-    def contains(self, entity_id: bytes) -> bool:
-        """Binary-search the sorted participant list."""
+    def contains(self, entity_id: bytes, target_height: int) -> bool:
+        """Binary-search for (entity_id, target_height) in participants.
+
+        The (entity_id, target_height) granularity matches the leaf
+        identity — the duty layer uses this to check each of the K
+        challenged heights for each active validator.
+        """
         if not self.participants:
             return False
-        lo, hi = 0, len(self.participants) - 1
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self.participants[mid] == entity_id:
-                return True
-            if self.participants[mid] < entity_id:
-                lo = mid + 1
-            else:
-                hi = mid - 1
-        return False
+        try:
+            self._index_of(entity_id, target_height)
+            return True
+        except ValueError:
+            return False
 
-    def _index_of(self, entity_id: bytes) -> int:
+    def _index_of(self, entity_id: bytes, target_height: int) -> int:
+        key = (entity_id, int(target_height))
         lo, hi = 0, len(self.participants) - 1
         while lo <= hi:
             mid = (lo + hi) // 2
-            if self.participants[mid] == entity_id:
+            if self.participants[mid] == key:
                 return mid
-            if self.participants[mid] < entity_id:
+            if self.participants[mid] < key:
                 lo = mid + 1
             else:
                 hi = mid - 1
         raise ValueError(
-            f"entity_id {entity_id.hex()} not a participant in this bundle"
+            f"(entity_id={entity_id.hex()}, target_height={target_height}) "
+            "not a participant in this bundle"
         )
 
-    def build_membership_proof(self, entity_id: bytes) -> dict:
-        """Construct a Merkle inclusion proof for the given participant.
+    def build_membership_proof(
+        self, entity_id: bytes, target_height: int,
+    ) -> dict:
+        """Construct a Merkle inclusion proof for (entity_id, target_height).
 
         Returns a dict carrying the leaf index, sibling path, and
         per-layer sizes — the same shape the tx-merkle verifier uses.
         Useful in downstream iterations where a validator disputes an
-        absentee marking.
+        absentee marking at a specific challenge height.
         """
-        idx = self._index_of(entity_id)
+        idx = self._index_of(entity_id, target_height)
         siblings, layer_sizes = _bundle_build_path(self.leaf_hashes, idx)
         return {
             "leaf_index": idx,
@@ -951,33 +1013,39 @@ class ArchiveProofBundle:
         *,
         root: bytes,
         entity_id: bytes,
+        target_height: int,
         proof_tx_hash: bytes,
         membership_proof: dict,
     ) -> bool:
-        """Verify that (entity_id, proof_tx_hash) was committed under `root`.
+        """Verify (entity_id, target_height, proof_tx_hash) was committed
+        under `root`.
 
-        Caller supplies `root` from chain state and the
-        `(entity_id, proof_tx_hash)` they claim was in the bundle; the
-        function recomputes the leaf and replays the path.
+        Caller supplies `root` from chain state and the tuple they
+        claim was in the bundle; the function recomputes the leaf and
+        replays the path.  target_height binds to the leaf so a proof
+        built for height H cannot be replayed at a different height.
         """
         try:
             idx = int(membership_proof["leaf_index"])
             siblings = list(membership_proof["siblings"])
         except (KeyError, TypeError, ValueError):
             return False
-        leaf = _bundle_leaf_hash(entity_id, proof_tx_hash)
+        leaf = _bundle_leaf_hash(entity_id, int(target_height), proof_tx_hash)
         reconstructed = _bundle_replay(leaf, idx, siblings)
         return reconstructed == root
 
     # ── canonical serialization ─────────────────────────────────────
 
     def to_bytes(self) -> bytes:
-        """Stable wire format: count || root || (entity_id || leaf)*.
+        """Stable wire format:
+            count (u32)
+         || root (32B)
+         || count × (entity_id (32B) || target_height (u64 BE) || leaf (32B))
 
-        Carries enough information to reconstruct the entire bundle —
-        participants are the sorted entity_id list, leaves are recorded
-        so membership proofs can be rebuilt by a decoder without
-        access to the original CustodyProofs.
+        target_height is part of each participant record so a decoder
+        can reconstruct the leaf from known inputs and so the duty
+        layer can enumerate the (prover, height) credit set without
+        re-deriving from leaves.
 
         Deliberately does NOT include the full CustodyProof bodies;
         those live in the block body during the submission window and
@@ -989,7 +1057,7 @@ class ArchiveProofBundle:
             _struct.pack(">I", len(self.participants)),
             self.root,
         ]
-        for eid, leaf in zip(self.participants, self.leaf_hashes):
+        for (eid, height), leaf in zip(self.participants, self.leaf_hashes):
             if len(eid) != 32:
                 raise ValueError(
                     f"participant entity_id must be 32 bytes, got {len(eid)}"
@@ -999,6 +1067,7 @@ class ArchiveProofBundle:
                     f"leaf hash must be 32 bytes, got {len(leaf)}"
                 )
             parts.append(eid)
+            parts.append(_struct.pack(">Q", int(height)))
             parts.append(leaf)
         return b"".join(parts)
 
@@ -1009,29 +1078,33 @@ class ArchiveProofBundle:
             raise ValueError("ArchiveProofBundle blob too short for header")
         count = _struct.unpack_from(">I", data, 0)[0]
         root = bytes(data[4:36])
-        expected_len = 4 + 32 + count * (32 + 32)
+        # Per-record size is 32 (entity_id) + 8 (height) + 32 (leaf) = 72.
+        expected_len = 4 + 32 + count * (32 + 8 + 32)
         if len(data) != expected_len:
             raise ValueError(
                 f"ArchiveProofBundle length mismatch: expected {expected_len} "
                 f"bytes for {count} participants, got {len(data)}"
             )
-        participants: list[bytes] = []
+        participants: list[tuple[bytes, int]] = []
         leaf_hashes: list[bytes] = []
         off = 36
-        prev_eid: Optional[bytes] = None
+        prev_key: Optional[tuple[bytes, int]] = None
         for _ in range(count):
             eid = bytes(data[off:off + 32]); off += 32
+            height = _struct.unpack_from(">Q", data, off)[0]; off += 8
             leaf = bytes(data[off:off + 32]); off += 32
-            # Sort invariant: on decode, reject out-of-order participants
-            # so a malicious relayer can't resubmit the same set in a
-            # different order and trick a naive consumer.
-            if prev_eid is not None and eid <= prev_eid:
+            key = (eid, height)
+            # Sort invariant: on decode, reject out-of-order pairs so a
+            # malicious relayer can't resubmit the same set in a
+            # different order and trick a naive consumer.  Order is
+            # (entity_id, target_height) ascending.
+            if prev_key is not None and key <= prev_key:
                 raise ValueError(
                     "ArchiveProofBundle participants not strictly sorted"
                 )
-            participants.append(eid)
+            participants.append(key)
             leaf_hashes.append(leaf)
-            prev_eid = eid
+            prev_key = key
         # Recompute root from leaves and verify it matches the carried
         # root — the carried root is advisory; consensus trusts the
         # recomputation.
