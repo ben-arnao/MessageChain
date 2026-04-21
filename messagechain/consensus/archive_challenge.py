@@ -845,6 +845,16 @@ class ArchiveProofBundle:
     def participant_count(self) -> int:
         return len(self.participants)
 
+    @property
+    def tx_hash(self) -> bytes:
+        """Block-level commitment identity — same pattern every other
+        block-body member uses.  `_h(canonical_bytes)` binds the whole
+        bundle (root, participants, leaves) so folding this into the
+        block's merkle_root prevents a relayer from stripping or
+        mutating the bundle in transit.
+        """
+        return _h(self.to_bytes())
+
     # ── construction ────────────────────────────────────────────────
 
     @classmethod

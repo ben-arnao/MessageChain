@@ -4107,6 +4107,43 @@ class Blockchain:
             + [tx.tx_hash for tx in getattr(block, "censorship_evidence_txs", [])]
             + [tx.tx_hash for tx in getattr(block, "bogus_rejection_evidence_txs", [])]
         )
+        # Archive-proof bundle: commit the aggregated custody blob so
+        # it cannot be stripped in transit.  Derivation-integrity
+        # (bundle matches custody_proofs) is enforced separately below.
+        _cust_proofs_for_bundle = getattr(block, "custody_proofs", [])
+        if _cust_proofs_for_bundle:
+            from messagechain.consensus.archive_challenge import (
+                ArchiveProofBundle as _ArchiveProofBundle,
+            )
+            _expected_bundle = _ArchiveProofBundle.from_proofs(
+                _cust_proofs_for_bundle,
+            )
+            tx_hashes = tx_hashes + [_expected_bundle.tx_hash]
+            # Derivation-integrity check: whatever the proposer placed
+            # in the block-body bundle slot must match what we just
+            # derived from custody_proofs.  A forged bundle fails this
+            # check even before merkle_root comparison — catch it with
+            # a clear reason rather than a cryptic root mismatch.
+            actual_bundle = getattr(block, "archive_proof_bundle", None)
+            if actual_bundle is None:
+                return False, (
+                    "Block has custody_proofs but missing "
+                    "archive_proof_bundle"
+                )
+            if actual_bundle.root != _expected_bundle.root:
+                return False, (
+                    "archive_proof_bundle does not match "
+                    "ArchiveProofBundle.from_proofs(custody_proofs)"
+                )
+        else:
+            # Hygiene: non-challenge blocks MUST NOT carry a bundle —
+            # there's nothing to commit to, and a stray bundle would be
+            # a gossip-layer smuggle attempt.
+            if getattr(block, "archive_proof_bundle", None) is not None:
+                return False, (
+                    "archive_proof_bundle present on block with no "
+                    "custody_proofs"
+                )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"

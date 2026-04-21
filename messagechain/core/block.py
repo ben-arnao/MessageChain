@@ -27,6 +27,45 @@ def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
 
+def _encode_optional_bundle(bundle) -> bytes:
+    """Wire encoding for Block.archive_proof_bundle (optional scalar).
+
+    Absent case is the hot path (non-challenge blocks pay only one
+    byte).  Present case prefixes the canonical-bytes blob with a u32
+    length so the decoder can skip past it without knowing the bundle's
+    internal layout.
+    """
+    import struct as _struct
+    if bundle is None:
+        return b"\x00"
+    blob = bundle.to_bytes()
+    return b"\x01" + _struct.pack(">I", len(blob)) + blob
+
+
+def _decode_optional_bundle(data: bytes, off: int):
+    """Inverse of _encode_optional_bundle.  Returns (bundle, new_off).
+    """
+    import struct as _struct
+    if off >= len(data):
+        raise ValueError("Block blob truncated at archive_proof_bundle flag")
+    flag = data[off]; off += 1
+    if flag == 0:
+        return None, off
+    if flag != 1:
+        raise ValueError(
+            f"archive_proof_bundle flag must be 0 or 1, got {flag}"
+        )
+    if off + 4 > len(data):
+        raise ValueError("Block blob truncated at archive_proof_bundle length")
+    blob_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+    if off + blob_len > len(data):
+        raise ValueError("Block blob truncated at archive_proof_bundle body")
+    from messagechain.consensus.archive_challenge import ArchiveProofBundle
+    bundle = ArchiveProofBundle.from_bytes(bytes(data[off:off + blob_len]))
+    off += blob_len
+    return bundle, off
+
+
 def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     """Compute Merkle root from a list of transaction hashes.
 
@@ -422,9 +461,35 @@ class Block:
     # the issuer if the rejection was bogus.  One-phase, no maturity
     # window — see messagechain.consensus.bogus_rejection_evidence.
     bogus_rejection_evidence_txs: list = field(default_factory=list)
+    # Aggregated commitment to this epoch's archive-custody participants.
+    # Auto-derived from custody_proofs when left as None on construction
+    # (see __post_init__) so proposers and tests that only populate
+    # custody_proofs inherit a consistent bundle for free.  When
+    # custody_proofs is empty this field stays None — nothing to commit
+    # to.  Tx_hash folds into merkle_root (same hygiene as every other
+    # block-body type) so a relayer cannot strip or mutate the bundle
+    # without invalidating the proposer's signature.  Lives apart from
+    # custody_proofs because a future pruning iteration will strip the
+    # full proofs after the submission window closes while keeping the
+    # bundle permanently — the bundle is the post-pruning residue that
+    # late joiners can still use to audit "validator X was credited in
+    # epoch E."
+    archive_proof_bundle: object = None  # Optional[ArchiveProofBundle]
     block_hash: bytes = b""
 
     def __post_init__(self):
+        # Auto-derive the bundle from custody_proofs on the common path
+        # where a proposer only populated custody_proofs.  Explicit
+        # bundles (incl. deliberately wrong ones from adversarial tests)
+        # are left alone; block validation enforces the derivation rule
+        # downstream.
+        if self.archive_proof_bundle is None and self.custody_proofs:
+            from messagechain.consensus.archive_challenge import (
+                ArchiveProofBundle,
+            )
+            self.archive_proof_bundle = ArchiveProofBundle.from_proofs(
+                self.custody_proofs,
+            )
         if not self.block_hash:
             self.block_hash = self._compute_hash()
 
@@ -470,6 +535,13 @@ class Block:
             result["bogus_rejection_evidence_txs"] = [
                 tx.serialize() for tx in self.bogus_rejection_evidence_txs
             ]
+        if self.archive_proof_bundle is not None:
+            # Serialized as hex of canonical bytes — a scalar blob, not
+            # a list; the bundle is a single aggregated commitment per
+            # block rather than a collection.
+            result["archive_proof_bundle"] = (
+                self.archive_proof_bundle.to_bytes().hex()
+            )
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -500,6 +572,7 @@ class Block:
             cproof_count     (u32)  + N x (cproof_len u32 + cproof_blob)
             cev_count        (u32)  + N x (cev_len u32 + cev_blob)
             brev_count       (u32)  + N x (brev_len u32 + brev_blob)
+            bundle_flag      (u8, 0=absent 1=present) + [bundle_len u32 + bundle_blob]
             32               block_hash
 
         (The `reg_count`/registration-tx block slot was removed with
@@ -635,6 +708,13 @@ class Block:
             # consensus-format change; pre-bogus-rejection binaries
             # cannot decode blocks emitted with this slot populated.
             enc_list(self.bogus_rejection_evidence_txs),
+            # archive_proof_bundle is optional — 1 byte presence flag
+            # then u32 length + blob when present.  Absent on blocks
+            # without custody_proofs (the common case) so non-challenge
+            # blocks only pay the single presence byte.  This is a
+            # consensus-format change; pre-bundle binaries cannot
+            # decode blocks from the bundle-aware code path.
+            _encode_optional_bundle(self.archive_proof_bundle),
             self.block_hash,
         ])
 
@@ -802,6 +882,12 @@ class Block:
         )
         bogus_rejection_evidence_txs = dec_list(BogusRejectionEvidenceTx)
 
+        # Archive-proof bundle — optional scalar, hot path on non-
+        # challenge blocks is a single zero byte.  Decoded through the
+        # shared optional-bundle helper so the wire format is
+        # consistent with `to_bytes`.
+        archive_proof_bundle, off = _decode_optional_bundle(data, off)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -820,6 +906,7 @@ class Block:
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+            archive_proof_bundle=archive_proof_bundle,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -894,6 +981,14 @@ class Block:
                 BogusRejectionEvidenceTx.deserialize(e)
                 for e in data["bogus_rejection_evidence_txs"]
             ]
+        archive_proof_bundle = None
+        if data.get("archive_proof_bundle"):
+            from messagechain.consensus.archive_challenge import (
+                ArchiveProofBundle,
+            )
+            archive_proof_bundle = ArchiveProofBundle.from_bytes(
+                bytes.fromhex(data["archive_proof_bundle"]),
+            )
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
@@ -902,7 +997,8 @@ class Block:
                     finality_votes=finality_votes,
                     custody_proofs=custody_proofs,
                     censorship_evidence_txs=censorship_evidence_txs,
-                    bogus_rejection_evidence_txs=bogus_rejection_evidence_txs)
+                    bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+                    archive_proof_bundle=archive_proof_bundle)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])
