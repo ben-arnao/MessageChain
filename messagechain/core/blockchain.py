@@ -2798,6 +2798,10 @@ class Blockchain:
         from messagechain.consensus.attester_committee import (
             ATTESTER_REWARD_PER_SLOT, select_attester_committee,
         )
+        from messagechain.config import (
+            ATTESTER_REWARD_SPLIT_HEIGHT,
+            ATTESTER_COMMITTEE_TARGET_SIZE,
+        )
         reward = self.supply.calculate_block_reward(block_height)
         is_bootstrap = not any(s > 0 for s in sim_staked.values())
         effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
@@ -2827,7 +2831,16 @@ class Blockchain:
             self.chain[-1].header.randao_mix
             if self.chain else b"\x00" * 32
         )
-        committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
+        # Committee-size policy: pre-activation, the committee is
+        # implicitly capped at what the pool can afford at 1 token per
+        # slot (permanently 3 at BLOCK_REWARD_FLOOR — a decentralization
+        # failure).  Post-activation we decouple: the committee is
+        # sized by consensus policy (ATTESTER_COMMITTEE_TARGET_SIZE)
+        # and the pool is divided pro-rata across the full committee.
+        if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
+            committee_size = ATTESTER_COMMITTEE_TARGET_SIZE
+        else:
+            committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
         attester_committee = select_attester_committee(
             candidates=attester_candidates,
             seed_entity_ids=self.seed_entity_ids,
@@ -2837,20 +2850,40 @@ class Blockchain:
         ) if attester_candidates else []
 
         if attester_committee:
-            # Credit 1 ATTESTER_REWARD_PER_SLOT per committee member.
+            # Distribution policy: pre-activation pays
+            # ATTESTER_REWARD_PER_SLOT (1) per slot up to pool capacity;
+            # post-activation divides the pool pro-rata across the full
+            # committee, with integer-division remainder burning.  Must
+            # match mint_block_reward exactly or state_root diverges.
             attester_tokens_paid = 0
-            for eid in attester_committee[:committee_size]:
-                sim_balances[eid] = sim_balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
-                attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
+            if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
+                n = len(attester_committee)
+                per_slot_reward = (attester_pool // n) if n > 0 else 0
+                for eid in attester_committee:
+                    if per_slot_reward > 0:
+                        sim_balances[eid] = (
+                            sim_balances.get(eid, 0) + per_slot_reward
+                        )
+                    attester_tokens_paid += per_slot_reward
+                proposer_att_reward = (
+                    per_slot_reward if proposer_id in attester_committee else 0
+                )
+            else:
+                for eid in attester_committee[:committee_size]:
+                    sim_balances[eid] = (
+                        sim_balances.get(eid, 0) + ATTESTER_REWARD_PER_SLOT
+                    )
+                    attester_tokens_paid += ATTESTER_REWARD_PER_SLOT
+                proposer_att_reward = (
+                    ATTESTER_REWARD_PER_SLOT
+                    if proposer_id in attester_committee else 0
+                )
 
             # Proposer-cap check (matches mint_block_reward).  Cap
             # overflow BURNs now — previously this flowed to treasury
             # which quietly accumulated rewards without a governance
             # vote.  Burn is supply-reduction only; no sim_balances
             # change needed beyond the cap-trim clawback below.
-            proposer_att_reward = (
-                ATTESTER_REWARD_PER_SLOT if proposer_id in attester_committee else 0
-            )
             proposer_total = proposer_share + proposer_att_reward
             if proposer_total > effective_cap:
                 sim_balances[proposer_id] = (
@@ -5637,23 +5670,31 @@ class Blockchain:
         # treasury on a network with no real validators yet.
         is_bootstrap = not any(s > 0 for s in self.supply.staked.values())
 
-        # Select the committee that will actually be paid.  Up to
-        # attester_pool tokens' worth of slots, 1 token each.  Seeds
-        # are excluded during the first half of bootstrap (see
-        # attester_committee.py); selection weight blends uniform and
-        # stake-weighted by bootstrap_progress.
+        # Select the committee that will actually be paid.  Pre-activation:
+        # committee sized implicitly by the pool (at 1 token/slot) — this
+        # caused the BLOCK_REWARD_FLOOR=4 / attester_pool=3 / committee=3
+        # decentralization failure.  Post-activation: committee sized by
+        # consensus policy (ATTESTER_COMMITTEE_TARGET_SIZE), pool divided
+        # pro-rata in mint_block_reward.  Seeds are excluded during the
+        # first half of bootstrap (see attester_committee.py); selection
+        # weight blends uniform and stake-weighted by bootstrap_progress.
         from messagechain.consensus.attester_committee import (
             ATTESTER_REWARD_PER_SLOT,
             select_attester_committee,
         )
         from messagechain.config import (
             PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
+            ATTESTER_REWARD_SPLIT_HEIGHT,
+            ATTESTER_COMMITTEE_TARGET_SIZE,
         )
         block_reward = self.supply.calculate_block_reward(block.header.block_number)
         attester_pool_tokens = block_reward - (
             block_reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         )
-        committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
+        if block.header.block_number >= ATTESTER_REWARD_SPLIT_HEIGHT:
+            committee_size = ATTESTER_COMMITTEE_TARGET_SIZE
+        else:
+            committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
         # Randomness for committee selection: use parent block's
         # randao_mix rather than prev_hash.  Randao accumulates entropy
         # through every proposer's signature over the chain's history,
