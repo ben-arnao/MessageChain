@@ -700,3 +700,338 @@ def apply_archive_rewards(
         result.total_paid += paid
 
     return result
+
+
+# ── ArchiveProofBundle: aggregated per-epoch commitment ──────────────
+#
+# Each challenge epoch collects one CustodyProof per participating
+# validator.  Stored naively that is O(validators × proof_size) on-chain
+# forever — bloat the ledger cannot afford on a 1000-year horizon.  The
+# bundle commits to the set of (entity_id, proof_tx_hash) pairs via a
+# single Merkle root, with participants sorted deterministically so two
+# nodes seeing the same proof set always compute the same root.
+#
+# Tree shape: same binary-Merkle-with-sentinel-padding pattern as the
+# tx-merkle tree, but with a distinct domain byte (0x10/0x11/0x12) so a
+# path built against the tx tree can never be replayed against the
+# bundle tree — defense-in-depth against tag-collision attacks.
+#
+# What this structure enables (downstream iterations, not yet built):
+#   * Duty-coupled rewards: consensus can check `bundle.contains(v)` for
+#     each active validator v; absentees take a reward-withhold.
+#   * Post-finality pruning: the full proof bodies can be stripped once
+#     the submission window closes; the bundle root alone suffices to
+#     answer "was validator v credited in epoch E" for any v that kept
+#     its own submitted CustodyProof.
+#   * Late-joiner audit: a validator that disputes its absentee status
+#     can re-submit its original proof + a membership path and have
+#     consensus cryptographically acknowledge it.
+
+
+def _bundle_leaf_hash(entity_id: bytes, proof_tx_hash: bytes) -> bytes:
+    """Leaf = H(0x10 || entity_id || proof_tx_hash).
+
+    Distinct domain byte from the tx-merkle tree's 0x00 leaf tag so
+    path replay across trees is impossible even when inputs happen to
+    collide.
+    """
+    return _h(b"\x10" + entity_id + proof_tx_hash)
+
+
+def _bundle_internal_hash(left: bytes, right: bytes) -> bytes:
+    return _h(b"\x11" + left + right)
+
+
+def _bundle_sentinel_hash() -> bytes:
+    return _h(b"\x12bundle-sentinel")
+
+
+def _bundle_empty_root() -> bytes:
+    """Sentinel root for an epoch with zero participants.
+
+    Must be deterministic and must not collide with either:
+        * the tx-merkle empty-root (_h(b"empty") in block.py), which
+          would let someone smuggle a tx-tree root into a bundle slot;
+        * the hash of empty bytes, which is the most obvious accidental
+          collision source.
+    """
+    return _h(b"\x13archive-bundle-empty")
+
+
+def _bundle_build_root(leaf_hashes: list[bytes]) -> bytes:
+    """Fold a list of already-hashed leaves into a Merkle root.
+
+    Same odd-layer-pad rule as _build_path above.
+    """
+    if not leaf_hashes:
+        return _bundle_empty_root()
+    layer = list(leaf_hashes)
+    while len(layer) > 1:
+        if len(layer) % 2 == 1:
+            layer.append(_bundle_sentinel_hash())
+        layer = [
+            _bundle_internal_hash(layer[i], layer[i + 1])
+            for i in range(0, len(layer), 2)
+        ]
+    return layer[0]
+
+
+def _bundle_build_path(
+    leaf_hashes: list[bytes], target_index: int,
+) -> tuple[list[bytes], list[int]]:
+    """Siblings + layer sizes for a membership proof in the bundle tree.
+    """
+    if not leaf_hashes:
+        raise ValueError("Cannot build membership path in an empty bundle")
+    if not (0 <= target_index < len(leaf_hashes)):
+        raise ValueError(
+            f"target_index {target_index} out of range for "
+            f"{len(leaf_hashes)} leaves"
+        )
+    layer = list(leaf_hashes)
+    siblings: list[bytes] = []
+    layer_sizes: list[int] = [len(layer)]
+    idx = target_index
+    while len(layer) > 1:
+        padded = list(layer)
+        if len(padded) % 2 == 1:
+            padded.append(_bundle_sentinel_hash())
+        sibling_idx = idx ^ 1
+        siblings.append(padded[sibling_idx])
+        layer = [
+            _bundle_internal_hash(padded[i], padded[i + 1])
+            for i in range(0, len(padded), 2)
+        ]
+        layer_sizes.append(len(layer))
+        idx //= 2
+    return siblings, layer_sizes
+
+
+def _bundle_replay(
+    leaf_hash: bytes,
+    leaf_index: int,
+    siblings: list[bytes],
+) -> bytes:
+    """Reconstruct the bundle root from a leaf + sibling path."""
+    current = leaf_hash
+    idx = leaf_index
+    for sibling in siblings:
+        if idx % 2 == 0:
+            current = _bundle_internal_hash(current, sibling)
+        else:
+            current = _bundle_internal_hash(sibling, current)
+        idx //= 2
+    return current
+
+
+@dataclass
+class ArchiveProofBundle:
+    """Aggregated commitment over a single challenge epoch's proofs.
+
+    Fields are intentionally minimal — everything else is derivable
+    from `participants` + the corresponding leaf hashes.  The root is
+    cached because recomputing it is the hot path for verifiers.
+
+    Construction goes through `from_proofs` (sorts + deduplicates +
+    computes root).  Direct construction is allowed but the caller is
+    then responsible for invariant preservation.
+    """
+
+    participants: list[bytes] = field(default_factory=list)
+    leaf_hashes: list[bytes] = field(default_factory=list)
+    root: bytes = field(default_factory=_bundle_empty_root)
+
+    @property
+    def participant_count(self) -> int:
+        return len(self.participants)
+
+    # ── construction ────────────────────────────────────────────────
+
+    @classmethod
+    def from_proofs(cls, proofs: Iterable[CustodyProof]) -> "ArchiveProofBundle":
+        """Build a bundle from a set of validated CustodyProofs.
+
+        Caller must have already verified each proof — bundle commits
+        to whatever it's handed.  Duplicate prover_ids are a hard
+        error (a single validator MUST submit exactly one proof per
+        epoch; two distinct proofs for the same entity_id is a
+        malformed submission, not an accidental dedupe case).
+        """
+        proofs = list(proofs)
+        if not proofs:
+            return cls(
+                participants=[],
+                leaf_hashes=[],
+                root=_bundle_empty_root(),
+            )
+
+        # Sort by entity_id so every node computes the same root
+        # regardless of submission / gossip order.
+        proofs_sorted = sorted(proofs, key=lambda p: p.prover_id)
+
+        # Reject duplicates — one proof per prover per epoch.
+        seen: set[bytes] = set()
+        for p in proofs_sorted:
+            if p.prover_id in seen:
+                raise ValueError(
+                    f"duplicate prover_id in bundle: {p.prover_id.hex()}"
+                )
+            seen.add(p.prover_id)
+
+        participants = [p.prover_id for p in proofs_sorted]
+        leaf_hashes = [
+            _bundle_leaf_hash(p.prover_id, p.tx_hash) for p in proofs_sorted
+        ]
+        root = _bundle_build_root(leaf_hashes)
+        return cls(
+            participants=participants,
+            leaf_hashes=leaf_hashes,
+            root=root,
+        )
+
+    # ── membership queries ──────────────────────────────────────────
+
+    def contains(self, entity_id: bytes) -> bool:
+        """Binary-search the sorted participant list."""
+        if not self.participants:
+            return False
+        lo, hi = 0, len(self.participants) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self.participants[mid] == entity_id:
+                return True
+            if self.participants[mid] < entity_id:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return False
+
+    def _index_of(self, entity_id: bytes) -> int:
+        lo, hi = 0, len(self.participants) - 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self.participants[mid] == entity_id:
+                return mid
+            if self.participants[mid] < entity_id:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        raise ValueError(
+            f"entity_id {entity_id.hex()} not a participant in this bundle"
+        )
+
+    def build_membership_proof(self, entity_id: bytes) -> dict:
+        """Construct a Merkle inclusion proof for the given participant.
+
+        Returns a dict carrying the leaf index, sibling path, and
+        per-layer sizes — the same shape the tx-merkle verifier uses.
+        Useful in downstream iterations where a validator disputes an
+        absentee marking.
+        """
+        idx = self._index_of(entity_id)
+        siblings, layer_sizes = _bundle_build_path(self.leaf_hashes, idx)
+        return {
+            "leaf_index": idx,
+            "siblings": siblings,
+            "layer_sizes": layer_sizes,
+        }
+
+    @staticmethod
+    def verify_membership(
+        *,
+        root: bytes,
+        entity_id: bytes,
+        proof_tx_hash: bytes,
+        membership_proof: dict,
+    ) -> bool:
+        """Verify that (entity_id, proof_tx_hash) was committed under `root`.
+
+        Caller supplies `root` from chain state and the
+        `(entity_id, proof_tx_hash)` they claim was in the bundle; the
+        function recomputes the leaf and replays the path.
+        """
+        try:
+            idx = int(membership_proof["leaf_index"])
+            siblings = list(membership_proof["siblings"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        leaf = _bundle_leaf_hash(entity_id, proof_tx_hash)
+        reconstructed = _bundle_replay(leaf, idx, siblings)
+        return reconstructed == root
+
+    # ── canonical serialization ─────────────────────────────────────
+
+    def to_bytes(self) -> bytes:
+        """Stable wire format: count || root || (entity_id || leaf)*.
+
+        Carries enough information to reconstruct the entire bundle —
+        participants are the sorted entity_id list, leaves are recorded
+        so membership proofs can be rebuilt by a decoder without
+        access to the original CustodyProofs.
+
+        Deliberately does NOT include the full CustodyProof bodies;
+        those live in the block body during the submission window and
+        may be pruned afterward.  The bundle is the post-pruning
+        residue.
+        """
+        import struct as _struct
+        parts = [
+            _struct.pack(">I", len(self.participants)),
+            self.root,
+        ]
+        for eid, leaf in zip(self.participants, self.leaf_hashes):
+            if len(eid) != 32:
+                raise ValueError(
+                    f"participant entity_id must be 32 bytes, got {len(eid)}"
+                )
+            if len(leaf) != 32:
+                raise ValueError(
+                    f"leaf hash must be 32 bytes, got {len(leaf)}"
+                )
+            parts.append(eid)
+            parts.append(leaf)
+        return b"".join(parts)
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> "ArchiveProofBundle":
+        import struct as _struct
+        if len(data) < 4 + 32:
+            raise ValueError("ArchiveProofBundle blob too short for header")
+        count = _struct.unpack_from(">I", data, 0)[0]
+        root = bytes(data[4:36])
+        expected_len = 4 + 32 + count * (32 + 32)
+        if len(data) != expected_len:
+            raise ValueError(
+                f"ArchiveProofBundle length mismatch: expected {expected_len} "
+                f"bytes for {count} participants, got {len(data)}"
+            )
+        participants: list[bytes] = []
+        leaf_hashes: list[bytes] = []
+        off = 36
+        prev_eid: Optional[bytes] = None
+        for _ in range(count):
+            eid = bytes(data[off:off + 32]); off += 32
+            leaf = bytes(data[off:off + 32]); off += 32
+            # Sort invariant: on decode, reject out-of-order participants
+            # so a malicious relayer can't resubmit the same set in a
+            # different order and trick a naive consumer.
+            if prev_eid is not None and eid <= prev_eid:
+                raise ValueError(
+                    "ArchiveProofBundle participants not strictly sorted"
+                )
+            participants.append(eid)
+            leaf_hashes.append(leaf)
+            prev_eid = eid
+        # Recompute root from leaves and verify it matches the carried
+        # root — the carried root is advisory; consensus trusts the
+        # recomputation.
+        recomputed = _bundle_build_root(leaf_hashes)
+        if recomputed != root:
+            raise ValueError(
+                "ArchiveProofBundle carried root does not match recomputed root"
+            )
+        return cls(
+            participants=participants,
+            leaf_hashes=leaf_hashes,
+            root=root,
+        )
