@@ -55,6 +55,14 @@ from messagechain.network.ratelimit import TokenBucket
 from messagechain.network.submission_receipt import (
     ReceiptIssuer,
     SubmissionReceipt,
+    SignedRejection,
+    REJECT_INVALID_SIG,
+    REJECT_INVALID_NONCE,
+    REJECT_FEE_TOO_LOW,
+    REJECT_MEMPOOL_FULL,
+    REJECT_REVOKED_KEY,
+    REJECT_MALFORMED,
+    REJECT_OTHER,
 )
 
 
@@ -96,6 +104,58 @@ class SubmissionResult:
     # newly admitted (no receipt on duplicate — a retry must not
     # consume a fresh leaf from the receipt subtree).
     receipt_hex: str = ""
+    # Signed-rejection bytes (hex) when issued.  Populated only when:
+    #   * the server-side ReceiptIssuer is configured,
+    #   * the client opted in via the X-MC-Request-Receipt header,
+    #   * validation FAILED (ok == False).
+    # Otherwise empty so the default leaf-budget posture is unchanged
+    # — a misbehaving client cannot drain the issuer's receipt subtree
+    # by spamming garbage txs without setting the opt-in header.
+    rejection_hex: str = ""
+
+
+def _rejection_code_for_validate_reason(reason: str) -> int:
+    """Map a `validate_transaction` failure string to a REJECT_* code.
+
+    String-matching is fragile, but the canonical reasons that
+    validate_transaction returns are stable and documented; the
+    mapping table here is the only place that knows about them.  Any
+    unmatched reason falls through to REJECT_OTHER so a future
+    validation path that emits a new string still lands a verifiable
+    rejection (just with the catch-all code).
+    """
+    r = reason.lower()
+    if "signature" in r or "sig version" in r:
+        return REJECT_INVALID_SIG
+    if "nonce" in r:
+        return REJECT_INVALID_NONCE
+    if "fee" in r or "balance" in r:
+        # "Insufficient spendable balance for fee of N" maps to
+        # REJECT_FEE_TOO_LOW (the user couldn't pay the fee).
+        return REJECT_FEE_TOO_LOW
+    if "leaf" in r:
+        # WOTS+ leaf reuse — there is no perfect REJECT_* for this;
+        # it's a malformed-replay scenario.  REJECT_MALFORMED is the
+        # closest fit until a dedicated code is added.
+        return REJECT_MALFORMED
+    if "unknown entity" in r or "register" in r:
+        # An unknown signer cannot be slashed for REJECT_INVALID_SIG
+        # via this path (no on-chain pubkey to refute), but the
+        # rejection itself is honest under REJECT_OTHER.
+        return REJECT_OTHER
+    if "timestamp" in r or "future" in r:
+        return REJECT_MALFORMED
+    return REJECT_OTHER
+
+
+def _rejection_code_for_mempool_reason(reason: str) -> int:
+    """Map a mempool refusal into a REJECT_* code.  See helper above."""
+    r = reason.lower()
+    if "fee" in r:
+        return REJECT_FEE_TOO_LOW
+    if "cap" in r or "rate" in r or "full" in r:
+        return REJECT_MEMPOOL_FULL
+    return REJECT_OTHER
 
 
 def submit_transaction_to_mempool(
@@ -103,6 +163,7 @@ def submit_transaction_to_mempool(
     blockchain,
     mempool,
     receipt_issuer: Optional[ReceiptIssuer] = None,
+    request_rejection: bool = False,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
@@ -115,8 +176,22 @@ def submit_transaction_to_mempool(
     No receipt is issued on duplicate admission (retries do not
     consume a new leaf from the issuer's subtree).  Content-neutral:
     the issuer has NO discretion to refuse receipts for
-    already-accepted txs.  A receipt is never issued for a rejected
-    tx — a validator must not attest to a tx it refused.
+    already-accepted txs.
+
+    `request_rejection` (default False): when True AND `receipt_issuer`
+    is provided, a SignedRejection is issued for any validation failure
+    and returned via result.rejection_hex.  Default False so the
+    receipt-subtree leaf budget is NOT burned on the default path —
+    a misbehaving client must explicitly opt in (the HTTP handler
+    threads through the X-MC-Request-Receipt header) to make the
+    validator pay a leaf for a failed submission.  This closes the
+    leaf-amplification attack vector.
+
+    A SignedRejection commits the validator to the failure reason; if
+    the rejection is provably bogus (e.g., REJECT_INVALID_SIG against
+    a tx whose signature actually verifies), the validator is slashable
+    via BogusRejectionEvidenceTx — closes the receipt-less censorship
+    gap where a coerced validator answers honest submissions with a lie.
     """
     # Idempotency: if the tx is already in the pool, treat as success.
     # No new receipt is issued — the client already got one on first
@@ -128,13 +203,38 @@ def submit_transaction_to_mempool(
             ok=True, tx_hash=tx.tx_hash, duplicate=True,
         )
 
+    def _maybe_issue_rejection(
+        reason: str,
+        code: int,
+    ) -> str:
+        """Issue a SignedRejection iff opted in + issuer configured.
+
+        Broad-except: a broken issuer must NOT change the failure
+        reason or fail-open the validation; the failure stays a
+        failure with a clear `error` set, the rejection_hex is just
+        empty in that case.
+        """
+        if not request_rejection or receipt_issuer is None:
+            return ""
+        try:
+            rej = receipt_issuer.issue_rejection(tx.tx_hash, code)
+            return rej.to_bytes().hex()
+        except Exception:
+            logger.exception("rejection issuance failed for %s", reason)
+            return ""
+
     on_chain_nonce = blockchain.nonces.get(tx.entity_id, 0)
     pending_nonce = mempool.get_pending_nonce(tx.entity_id, on_chain_nonce)
     valid, reason = blockchain.validate_transaction(
         tx, expected_nonce=pending_nonce,
     )
     if not valid:
-        return SubmissionResult(ok=False, error=reason)
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection(
+                reason, _rejection_code_for_validate_reason(reason),
+            ),
+        )
 
     # Record arrival height so forced-inclusion "tx waited N blocks"
     # logic measures from the moment this node actually saw it.
@@ -149,8 +249,13 @@ def submit_transaction_to_mempool(
             return SubmissionResult(
                 ok=True, tx_hash=tx.tx_hash, duplicate=True,
             )
+        mempool_reason = "Mempool rejected transaction (rate / fee / cap)"
         return SubmissionResult(
-            ok=False, error="Mempool rejected transaction (rate / fee / cap)",
+            ok=False, error=mempool_reason,
+            rejection_hex=_maybe_issue_rejection(
+                mempool_reason,
+                _rejection_code_for_mempool_reason(mempool_reason),
+            ),
         )
 
     # Content-neutral receipt issuance.  No blocklists, no
@@ -431,6 +536,16 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
         # client_address is (host, port); host may be 'localhost'.
         return self.client_address[0]
 
+    def _header_truthy(self, name: str) -> bool:
+        """Treat any non-empty, non-zero header value as opt-in true.
+
+        Accepts "1", "true", "yes" (case-insensitive).  Empty / "0" /
+        "false" / missing all read as False.  Lenient on purpose so a
+        client library that emits any reasonable truthy value works.
+        """
+        v = (self.headers.get(name) or "").strip().lower()
+        return v not in ("", "0", "false", "no")
+
     def _reject(self, status: int, message: str):
         body = message.encode("utf-8") + b"\n"
         self.send_response(status)
@@ -521,7 +636,9 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             self._reject(413, "Payload too large")
             return
 
-        # Decode.
+        # Decode.  A decode failure is NOT eligible for a SignedRejection
+        # — the body wasn't a valid tx, so there is no tx_hash to commit
+        # the rejection to.  Always plain text, regardless of header.
         try:
             tx = MessageTransaction.from_bytes(body)
         except Exception as e:
@@ -529,9 +646,41 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             self._reject(400, "Invalid transaction encoding")
             return
 
+        # Opt-in rejection: clients that want a SignedRejection on
+        # validation failure must set X-MC-Request-Receipt: 1 (any
+        # truthy value).  Default behavior is unchanged — plain 400
+        # text + no leaf burned — so a misbehaving client cannot drain
+        # the receipt-subtree leaf budget by spamming garbage txs.
+        request_rejection = self._header_truthy("X-MC-Request-Receipt")
+
         # Inject via the shared helper (same semantics as RPC ingress).
-        result = ctx.submit(tx)
+        result = ctx.submit(tx, request_rejection=request_rejection)
         if not result.ok:
+            if result.rejection_hex:
+                # JSON 400 with the signed-rejection blob.  Hex-encoded
+                # binary so the client can forward the same bytes into
+                # a BogusRejectionEvidenceTx without re-serialization
+                # risk.  Status stays 400 — the tx was rejected; the
+                # extra payload is for accountability, not success.
+                resp = (
+                    b'{"ok":false,"error":"'
+                    + result.error.replace('"', "'").encode("utf-8")
+                    + b'","rejection":"'
+                    + result.rejection_hex.encode("ascii")
+                    + b'"}'
+                )
+                self.send_response(400)
+                self.send_header(
+                    "Content-Type", "application/json; charset=utf-8",
+                )
+                self.send_header("Content-Length", str(len(resp)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                try:
+                    self.wfile.write(resp)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             self._reject(400, f"Rejected: {result.error}")
             return
 
@@ -720,10 +869,15 @@ class _HandlerContext:
         self._buckets.pop(oldest_ip, None)
         self._last_active.pop(oldest_ip, None)
 
-    def submit(self, tx: MessageTransaction) -> SubmissionResult:
+    def submit(
+        self,
+        tx: MessageTransaction,
+        request_rejection: bool = False,
+    ) -> SubmissionResult:
         return submit_transaction_to_mempool(
             tx, self.blockchain, self.mempool,
             receipt_issuer=self.receipt_issuer,
+            request_rejection=request_rejection,
         )
 
     def submit_proof(self, proof) -> SubmissionResult:

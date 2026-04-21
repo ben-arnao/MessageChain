@@ -414,6 +414,14 @@ class Block:
     # begins a maturity countdown.  See
     # messagechain.consensus.censorship_evidence.
     censorship_evidence_txs: list = field(default_factory=list)
+    # Bogus-rejection evidence txs: first-class block slot, distinct
+    # from censorship_evidence_txs.  An entry carries a SignedRejection
+    # + the rejected MessageTransaction; the chain re-verifies the
+    # tx's signature against its on-chain pubkey and (for the
+    # currently-slashable subset of reason codes) immediately slashes
+    # the issuer if the rejection was bogus.  One-phase, no maturity
+    # window — see messagechain.consensus.bogus_rejection_evidence.
+    bogus_rejection_evidence_txs: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -458,6 +466,10 @@ class Block:
             result["censorship_evidence_txs"] = [
                 tx.serialize() for tx in self.censorship_evidence_txs
             ]
+        if self.bogus_rejection_evidence_txs:
+            result["bogus_rejection_evidence_txs"] = [
+                tx.serialize() for tx in self.bogus_rejection_evidence_txs
+            ]
         return result
 
     def to_bytes(self, state=None) -> bytes:
@@ -487,6 +499,7 @@ class Block:
             fvote_count      (u32)  + N x (fvote_len u32 + fvote_blob)
             cproof_count     (u32)  + N x (cproof_len u32 + cproof_blob)
             cev_count        (u32)  + N x (cev_len u32 + cev_blob)
+            brev_count       (u32)  + N x (brev_len u32 + brev_blob)
             32               block_hash
 
         (The `reg_count`/registration-tx block slot was removed with
@@ -616,6 +629,12 @@ class Block:
             # receipts).  Empty list is a single u32 zero on blocks
             # without evidence traffic.
             enc_list(self.censorship_evidence_txs),
+            # bogus_rejection_evidence_txs trails censorship_evidence_txs
+            # — newest participating tx type.  Empty list is a single u32
+            # zero on blocks without evidence traffic.  This is a
+            # consensus-format change; pre-bogus-rejection binaries
+            # cannot decode blocks emitted with this slot populated.
+            enc_list(self.bogus_rejection_evidence_txs),
             self.block_hash,
         ])
 
@@ -774,6 +793,15 @@ class Block:
         )
         censorship_evidence_txs = dec_list(CensorshipEvidenceTx)
 
+        # Bogus-rejection evidence txs — appended after the censorship
+        # evidence slot.  Same wire-format-breakage caveat: a hard fork
+        # introduces this slot and pre-fork binaries cannot decode
+        # post-fork blobs.
+        from messagechain.consensus.bogus_rejection_evidence import (
+            BogusRejectionEvidenceTx,
+        )
+        bogus_rejection_evidence_txs = dec_list(BogusRejectionEvidenceTx)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -791,6 +819,7 @@ class Block:
             finality_votes=finality_votes,
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
+            bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -856,6 +885,15 @@ class Block:
                 CensorshipEvidenceTx.deserialize(e)
                 for e in data["censorship_evidence_txs"]
             ]
+        bogus_rejection_evidence_txs = []
+        if data.get("bogus_rejection_evidence_txs"):
+            from messagechain.consensus.bogus_rejection_evidence import (
+                BogusRejectionEvidenceTx,
+            )
+            bogus_rejection_evidence_txs = [
+                BogusRejectionEvidenceTx.deserialize(e)
+                for e in data["bogus_rejection_evidence_txs"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
@@ -863,7 +901,8 @@ class Block:
                     unstake_transactions=unstake_txs,
                     finality_votes=finality_votes,
                     custody_proofs=custody_proofs,
-                    censorship_evidence_txs=censorship_evidence_txs)
+                    censorship_evidence_txs=censorship_evidence_txs,
+                    bogus_rejection_evidence_txs=bogus_rejection_evidence_txs)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

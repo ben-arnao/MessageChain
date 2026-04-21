@@ -142,6 +142,9 @@ def compute_block_sig_cost(block) -> int:
         # Each censorship-evidence tx carries one submitter signature +
         # one receipt signature — cost both.
         + 2 * len(getattr(block, "censorship_evidence_txs", []))
+        # Each bogus-rejection-evidence tx carries one submitter
+        # signature + one rejection signature — cost both.
+        + 2 * len(getattr(block, "bogus_rejection_evidence_txs", []))
     )
 
 
@@ -341,6 +344,21 @@ class Blockchain:
         )
         self.censorship_processor: CensorshipEvidenceProcessor = (
             CensorshipEvidenceProcessor()
+        )
+
+        # Bogus-rejection processor.  One-phase: every admitted
+        # BogusRejectionEvidenceTx triggers processor.process(),
+        # which (for the slashable subset of reason codes) re-verifies
+        # the embedded message_tx and slashes the issuer immediately
+        # if the rejection was bogus.  No pending map / no maturity
+        # window — bogusness is decidable at apply-time from the tx
+        # payload + chain state.  See
+        # messagechain.consensus.bogus_rejection_evidence.
+        from messagechain.consensus.bogus_rejection_evidence import (
+            BogusRejectionProcessor,
+        )
+        self.bogus_rejection_processor: BogusRejectionProcessor = (
+            BogusRejectionProcessor()
         )
 
         # Per-validator receipt-subtree root registry.  Receipts are
@@ -1060,6 +1078,12 @@ class Blockchain:
             )
         self.receipt_subtree_roots = dict(
             snap.get("receipt_subtree_roots", {})
+        )
+
+        # Bogus-rejection processor: install processed set from snapshot.
+        # No pending counterpart — apply-time decision.
+        self.bogus_rejection_processor.processed = set(
+            snap.get("bogus_rejection_processed", set())
         )
 
         # Rebuild the per-entity sparse Merkle tree from the installed
@@ -2247,6 +2271,55 @@ class Blockchain:
 
         return True, "Valid"
 
+    def validate_bogus_rejection_evidence_tx(
+        self, tx,
+    ) -> tuple[bool, str]:
+        """Admission-time validation for a BogusRejectionEvidenceTx.
+
+        Cheap-first checks (mirror validate_censorship_evidence_tx):
+          * submitter is registered
+          * offender is registered
+          * offender is NOT already slashed
+          * evidence_hash NOT already in processor.processed (dedupe)
+          * receipt-subtree root matches the registered root for the
+            offender (if any)
+          * submitter can afford fee
+          * stateless verify (rejection sig + submitter sig + tx_hash
+            consistency + fee floor)
+
+        Does NOT check whether the rejection is bogus — that's an
+        apply-time decision (re-verify the message_tx's signature
+        under its on-chain pubkey) so the same evidence_tx admission
+        is content-neutral and predictable.
+        """
+        from messagechain.consensus.bogus_rejection_evidence import (
+            verify_bogus_rejection_evidence_tx,
+        )
+        if tx.submitter_id not in self.public_keys:
+            return False, "Unknown submitter — must register first"
+        if tx.offender_id not in self.public_keys:
+            return False, "Unknown offender"
+        if tx.offender_id in self.slashed_validators:
+            return False, "Offender already slashed"
+        if self.bogus_rejection_processor.has_processed(tx.evidence_hash):
+            return False, "Evidence already processed"
+        registered_root = self.receipt_subtree_roots.get(tx.offender_id)
+        if (
+            registered_root is not None
+            and registered_root != tx.rejection.issuer_root_public_key
+        ):
+            return False, (
+                "Rejection signed with a different subtree root than "
+                "the issuer's registered root"
+            )
+        if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
+            return False, "Submitter cannot afford fee"
+        submitter_pk = self.public_keys[tx.submitter_id]
+        valid, reason = verify_bogus_rejection_evidence_tx(tx, submitter_pk)
+        if not valid:
+            return False, reason
+        return True, "Valid"
+
     def get_median_time_past(self) -> float:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
 
@@ -2408,6 +2481,7 @@ class Blockchain:
         slash_transactions: list | None = None,
         custody_proofs: list | None = None,
         censorship_evidence_txs: list | None = None,
+        bogus_rejection_evidence_txs: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -3129,6 +3203,75 @@ class Blockchain:
                 if slash_amount > 0:
                     sim_staked[entry.offender_id] = current_stake - slash_amount
 
+        # ── Bogus-rejection evidence: simulate the apply path ──
+        # One-phase: each admitted etx pays a fee + bumps watermark; if
+        # the rejection is provably bogus (slashable reason code + the
+        # message_tx's signature actually verifies under its on-chain
+        # pubkey), the issuer is immediately slashed.  An honest
+        # rejection (sig actually fails) means the evidence is rejected
+        # at apply-time and NO fee is charged.  Mirror exactly so the
+        # state_root committed by the proposer matches the apply path.
+        from messagechain.consensus.bogus_rejection_evidence import (
+            _SLASHABLE_REASON_CODES as _BR_SLASHABLE,
+        )
+        from messagechain.core.transaction import (
+            verify_transaction as _verify_msg_tx,
+        )
+        sim_br_processed = set(self.bogus_rejection_processor.processed)
+        for etx in (bogus_rejection_evidence_txs or []):
+            # Cheap unknown-entity gates first.
+            if etx.submitter_id not in sim_public_keys:
+                continue
+            if etx.offender_id not in sim_public_keys:
+                continue
+            # Already-processed gate — sim-local so a same-block
+            # duplicate is rejected.
+            if etx.evidence_hash in sim_br_processed:
+                continue
+            # Registered receipt-subtree root gate (mirrors validation).
+            registered_root = self.receipt_subtree_roots.get(etx.offender_id)
+            if (
+                registered_root is not None
+                and registered_root != etx.rejection.issuer_root_public_key
+            ):
+                continue
+            # Fee affordability.
+            if sim_balances.get(etx.submitter_id, 0) < etx.fee:
+                continue
+            reason_code = etx.rejection.reason_code
+            if reason_code in _BR_SLASHABLE:
+                offender_pk = sim_public_keys.get(
+                    etx.message_tx.entity_id, b"",
+                )
+                if not offender_pk:
+                    # Honest rejection (no key to verify against) —
+                    # evidence rejected at apply-time, no fee.
+                    continue
+                if not _verify_msg_tx(etx.message_tx, offender_pk):
+                    # Honest rejection — evidence rejected, no fee.
+                    continue
+                # Bogus → slash + charge fee + record processed.
+                current_stake = sim_staked.get(etx.offender_id, 0)
+                slash_amount = _cslash(current_stake)
+                if slash_amount > 0:
+                    sim_staked[etx.offender_id] = (
+                        current_stake - slash_amount
+                    )
+            # Charge fee + bump watermark + record processed.  Applies
+            # to both the slash path AND the non-slashable-reason path
+            # (forward-compat — caller pays fee for evidence that's
+            # accepted but doesn't slash).
+            effective_base_fee = min(current_base_fee, etx.fee)
+            tip = etx.fee - effective_base_fee
+            sim_balances[etx.submitter_id] = (
+                sim_balances.get(etx.submitter_id, 0) - etx.fee
+            )
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + tip
+            )
+            _bump_wm(etx.submitter_id, etx.signature.leaf_index)
+            sim_br_processed.add(etx.evidence_hash)
+
         return compute_state_root(
             sim_balances, sim_nonces, sim_staked,
             authority_keys=sim_authority_keys,
@@ -3154,6 +3297,7 @@ class Blockchain:
         finality_votes: list | None = None,
         custody_proofs: list | None = None,
         censorship_evidence_txs: list | None = None,
+        bogus_rejection_evidence_txs: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
@@ -3213,6 +3357,7 @@ class Blockchain:
             slash_transactions=slash_transactions,
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
+            bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -3255,6 +3400,7 @@ class Blockchain:
             finality_votes=finality_votes,
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
+            bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
             state_root_checkpoint=state_root_checkpoint,
@@ -3959,6 +4105,7 @@ class Blockchain:
             + [v.consensus_hash() for v in getattr(block, "finality_votes", [])]
             + [p.tx_hash for p in getattr(block, "custody_proofs", [])]
             + [tx.tx_hash for tx in getattr(block, "censorship_evidence_txs", [])]
+            + [tx.tx_hash for tx in getattr(block, "bogus_rejection_evidence_txs", [])]
         )
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
@@ -5262,6 +5409,50 @@ class Blockchain:
             # Consume submitter's WOTS+ leaf.
             self._bump_watermark(etx.submitter_id, etx.signature.leaf_index)
 
+        # Bogus-rejection evidence — one-phase apply.  For each etx:
+        #   1. Re-run admission gate (validate_bogus_rejection_evidence_tx).
+        #   2. If accepted, hand to processor.process(); processor decides
+        #      slashable/honest/non-slashable-reason and mutates state
+        #      (slash + record processed).
+        #   3. On honest-rejection (apply-time refusal): NO fee, NO
+        #      watermark bump — the evidence_tx is rejected as if it
+        #      never landed.
+        #   4. On every other admitted outcome (slashed OR non-slashable
+        #      reason code): fee paid + watermark bumped + processed.
+        for etx in getattr(block, "bogus_rejection_evidence_txs", []):
+            ok, reason = self.validate_bogus_rejection_evidence_tx(etx)
+            if not ok:
+                logger.warning(
+                    f"BogusRejectionEvidenceTx {etx.tx_hash.hex()[:16]} "
+                    f"rejected at apply-time: {reason}"
+                )
+                continue
+            result = self.bogus_rejection_processor.process(etx, self)
+            if not result.accepted:
+                # Honest rejection or already-processed — no fee, no
+                # watermark bump.  The evidence_tx is rejected entirely.
+                logger.info(
+                    f"BogusRejectionEvidenceTx {etx.tx_hash.hex()[:16]} "
+                    f"refused at apply-time: {result.reason}"
+                )
+                continue
+            if not self.supply.pay_fee_with_burn(
+                etx.submitter_id, proposer_id, etx.fee, current_base_fee,
+            ):
+                logger.error(
+                    f"BogusRejectionEvidenceTx {etx.tx_hash.hex()[:16]} fee "
+                    f"payment failed — skipping (state may drift)"
+                )
+                continue
+            self._bump_watermark(etx.submitter_id, etx.signature.leaf_index)
+            if result.slashed:
+                logger.info(
+                    f"BOGUS-REJECTION-SLASHED validator "
+                    f"{result.offender_id.hex()[:16]}: "
+                    f"stake_burned={result.slash_amount}, "
+                    f"evidence={etx.evidence_hash.hex()[:16]}"
+                )
+
         # Apply authority transactions (SetAuthorityKey / Revoke / KeyRotation).
         # These all carry block-level state changes that previously only
         # applied on the node receiving the RPC — committing them through
@@ -6142,6 +6333,9 @@ class Blockchain:
                     proposer_signature_leaf_index=proposer_sig_leaf,
                     censorship_evidence_txs=getattr(
                         block, "censorship_evidence_txs", [],
+                    ),
+                    bogus_rejection_evidence_txs=getattr(
+                        block, "bogus_rejection_evidence_txs", [],
                     ),
                 )
             except Exception:

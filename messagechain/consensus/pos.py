@@ -227,6 +227,7 @@ class ProofOfStake:
         finality_votes: list | None = None,
         custody_proofs: list | None = None,
         censorship_evidence_txs: list | None = None,
+        bogus_rejection_evidence_txs: list | None = None,
         timestamp: float | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
         state_root_checkpoint: bytes = b"\x00" * 32,
@@ -261,6 +262,7 @@ class ProofOfStake:
         fin_votes = list(finality_votes or [])
         cust_proofs = list(custody_proofs or [])
         censorship_txs = list(censorship_evidence_txs or [])
+        bogus_rej_txs = list(bogus_rejection_evidence_txs or [])
         tx_hashes = (
             [tx.tx_hash for tx in txs]
             + [tx.tx_hash for tx in transfer_txs]
@@ -276,6 +278,11 @@ class ProofOfStake:
             # covers merkle_root).
             + [p.tx_hash for p in cust_proofs]
             + [tx.tx_hash for tx in censorship_txs]
+            # Bogus-rejection evidence binds the same way: the tx_hash
+            # commits to (rejection_hash || message_tx.tx_hash || ...),
+            # so a relay cannot strip or substitute these in flight
+            # without invalidating the merkle root.
+            + [tx.tx_hash for tx in bogus_rej_txs]
         )
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
@@ -343,6 +350,7 @@ class ProofOfStake:
             finality_votes=fin_votes,
             custody_proofs=cust_proofs,
             censorship_evidence_txs=censorship_txs,
+            bogus_rejection_evidence_txs=bogus_rej_txs,
         )
         block.block_hash = block._compute_hash()
         return block
