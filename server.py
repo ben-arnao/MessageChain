@@ -872,6 +872,10 @@ class Server:
         self.rpc_port = rpc_port
         self.rpc_bind = rpc_bind
         self.seed_nodes = seed_nodes
+        # Kept so the P2P listener / outbound connector can place the
+        # self-signed TLS cert under a persistent path (mirrors
+        # messagechain/network/node.py).  None => ephemeral tempdir.
+        self.data_dir = data_dir
 
         # Set up persistent storage if data_dir provided
         self.db = None
@@ -1121,11 +1125,28 @@ class Server:
 
         self._running = True
 
-        # Start P2P server
+        # Start P2P server.  When P2P_TLS_ENABLED is on we wrap the
+        # listener with a server SSL context so the wire is actually
+        # encrypted — previously server.py's listener was plain TCP
+        # despite config.P2P_TLS_ENABLED=True, silently breaking the
+        # config promise.  Mirrors messagechain/network/node.py:443
+        # which already did this correctly.  The cert is lazily
+        # generated under data_dir (or a per-entity tempdir if
+        # data_dir is None) so restarts reuse the same fingerprint
+        # and the eventual TOFU pin stays stable.
+        from messagechain import config as _cfg
+        from messagechain.network.tls import create_node_ssl_context
+        p2p_server_ssl = None
+        if getattr(_cfg, "P2P_TLS_ENABLED", True):
+            p2p_server_ssl = create_node_ssl_context(data_dir=self.data_dir)
         p2p_server = await asyncio.start_server(
-            self._handle_p2p_connection, "0.0.0.0", self.p2p_port
+            self._handle_p2p_connection, "0.0.0.0", self.p2p_port,
+            ssl=p2p_server_ssl,
         )
-        logger.info(f"P2P listening on port {self.p2p_port}")
+        logger.info(
+            f"P2P listening on port {self.p2p_port} "
+            f"({'TLS' if p2p_server_ssl else 'plain'})"
+        )
 
         # Start RPC server (for client commands).  Default bind is
         # 127.0.0.1 so a locally-running CLI is the only reachable client
@@ -2626,12 +2647,17 @@ class Server:
             writer.close()
             return
 
+        # "tls" iff asyncio.start_server was bound with an SSLContext —
+        # writer's extra_info carries the negotiated session.  Honest
+        # observability; matches the pattern in network/node.py.
+        transport = "tls" if writer.get_extra_info("ssl_object") else "plain"
         import time as _time_peer
         peer = Peer(
             host=addr[0], port=addr[1], reader=reader, writer=writer,
             is_connected=True,
             direction="inbound",
             connected_at=_time_peer.time(),
+            transport=transport,
         )
         # C10: timeout on reads to prevent slow-loris DoS
         first_message = True
@@ -2661,18 +2687,31 @@ class Server:
         if self.ban_manager.is_banned(addr):
             logger.debug(f"Skipping banned peer {addr}")
             return
+        # Match the listener's TLS setting on the outbound side.  Both
+        # peers of a TLS-enabled connection must negotiate TLS or the
+        # handshake fails — this is the outbound half of the fix at
+        # start() above.
+        from messagechain import config as _cfg
+        from messagechain.network.tls import create_client_ssl_context
+        client_ssl = (
+            create_client_ssl_context()
+            if getattr(_cfg, "P2P_TLS_ENABLED", True)
+            else None
+        )
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port),
+                asyncio.open_connection(host, port, ssl=client_ssl),
                 timeout=HANDSHAKE_TIMEOUT,
             )
             conn_type = self._next_connection_type()
+            transport = "tls" if client_ssl is not None else "plain"
             import time as _time_peer
             peer = Peer(
                 host=host, port=port, reader=reader, writer=writer,
                 is_connected=True, connection_type=conn_type,
                 direction="outbound",
                 connected_at=_time_peer.time(),
+                transport=transport,
             )
             self.peers[addr] = peer
 
