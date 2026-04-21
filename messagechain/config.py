@@ -561,11 +561,60 @@ MERKLE_TREE_HEIGHT = _profile_int("MESSAGECHAIN_MERKLE_TREE_HEIGHT", "MERKLE_TRE
 # already used.  See KeyPair.persist_leaf_index / load_leaf_index.
 LEAF_INDEX_FILENAME = "leaf_index.json"
 
-# Consensus — flat minimum stake from block 0.
-# 100 tokens required to register as a validator at any block height.
-VALIDATOR_MIN_STAKE = 100
-assert _MAINNET_FOUNDER_STAKE >= VALIDATOR_MIN_STAKE, (
-    "mainnet founder stake must meet VALIDATOR_MIN_STAKE"
+# Consensus — minimum stake to register as a validator.
+#
+# Pre-raise (LEGACY): 100 tokens.  Calibrated against the old 1B
+# GENESIS_SUPPLY — 0.00001% of supply, permissionless but trivially
+# sybil-affordable.  When GENESIS_SUPPLY was rebased from 1B to 140M
+# the legacy floor shrank to 0.00007% of supply: still sybil-trivial,
+# plus the per-validator capital commitment became negligible
+# (~$0.01 under any realistic token price).
+#
+# Post-raise: 10_000 tokens.  At 140M supply that's 0.007% of supply —
+# still permissionless (no whitelist, no gatekeeper) but imposes a
+# meaningful per-validator capital cost that raises the floor on
+# sybil operations.  The `*_POST_RAISE` suffix mirrors the convention
+# used by the prior forks (TREASURY_REBASE_HEIGHT,
+# SEED_DIVESTMENT_RETUNE_HEIGHT, etc).
+#
+# Grandfathering (critical): validators registered pre-fork with
+# stake below the new floor KEEP their stake unchanged — we do not
+# retroactively eject them.  Post-fork new-stake and partial-unstake
+# operations enforce the new floor; full exit (remaining == 0) is
+# always permitted so legacy sub-floor validators can walk away
+# cleanly.  See `get_validator_min_stake` below and the enforcement
+# sites in core/staking.py, core/blockchain.py, economics/inflation.py.
+#
+# Operators MUST replace the MIN_STAKE_RAISE_HEIGHT placeholder
+# (50_000) with a concrete coordinated-fork height before deploying
+# to mainnet; the placeholder follows the "current_height + 50_000"
+# convention shared with the other pending forks.
+VALIDATOR_MIN_STAKE = 100                # LEGACY — see get_validator_min_stake
+VALIDATOR_MIN_STAKE_POST_RAISE = 10_000  # 0.007% of 140M supply
+MIN_STAKE_RAISE_HEIGHT = 50_000
+
+
+def get_validator_min_stake(block_height: int) -> int:
+    """Return the validator minimum stake in effect at ``block_height``.
+
+    Hard-fork-gated: pre-activation returns the legacy 100-token value
+    so pre-fork chain state is reproducible; at/after activation
+    returns the post-raise 10_000-token floor.
+
+    Used by every fresh-stake / partial-unstake enforcement site.
+    The apply-time active-set filter (proposer-selection, validator-
+    set membership for finality/attestation) continues to honor the
+    LEGACY floor: grandfathered sub-floor validators retain their
+    participation rights indefinitely; only NEW stake ops see the
+    raised bar.
+    """
+    if block_height >= MIN_STAKE_RAISE_HEIGHT:
+        return VALIDATOR_MIN_STAKE_POST_RAISE
+    return VALIDATOR_MIN_STAKE
+
+
+assert _MAINNET_FOUNDER_STAKE >= VALIDATOR_MIN_STAKE_POST_RAISE, (
+    "mainnet founder stake must meet VALIDATOR_MIN_STAKE_POST_RAISE"
 )
 CONSENSUS_THRESHOLD_NUMERATOR = 2    # 2/3 of stake must sign off (integer fraction)
 CONSENSUS_THRESHOLD_DENOMINATOR = 3  # Use integer arithmetic: stake * 3 >= total * 2
@@ -614,7 +663,41 @@ ATTESTER_ESCROW_BLOCKS = 12_960
 #   ≈ 105,192 / 144 × 100 ≈ 73K tokens (~0.007% of supply).
 REPUTATION_CAP = 10_000
 LOTTERY_INTERVAL = 144       # blocks (~1 day at 600s)
-LOTTERY_BOUNTY = 100         # tokens paid to lottery winner
+# Bootstrap-lottery bounty, hard-fork-gated.
+#
+# Pre-raise (LEGACY): 100 tokens.  Integrated over the 2-year
+# bootstrap window with the (1 - progress) fade this mints
+# ~73K tokens (~0.05% of 140M supply) across all winners — too small
+# to materially diversify non-founder holdings.
+#
+# Post-raise: 5_000 tokens.  Integrated envelope rises to ~1.83M
+# (~1.3% of supply), feeding meaningful liquidity into non-founder
+# wallets during the bootstrap window while still sized well under
+# every other bootstrap-era mint mechanic.  The `(1 - progress)` fade
+# is preserved — the raise simply scales the base value; collapse-
+# to-0 at progress=1.0 is unchanged.
+#
+# Operators MUST replace the LOTTERY_BOUNTY_RAISE_HEIGHT placeholder
+# (50_000) with a concrete coordinated-fork height before deploying
+# to mainnet.
+LOTTERY_BOUNTY = 100                 # LEGACY — see get_lottery_bounty
+LOTTERY_BOUNTY_POST_RAISE = 5_000
+LOTTERY_BOUNTY_RAISE_HEIGHT = 50_000
+
+
+def get_lottery_bounty(block_height: int) -> int:
+    """Return the lottery base bounty in effect at ``block_height``.
+
+    Hard-fork-gated: pre-activation returns the legacy 100-token value
+    so pre-fork lottery firings replay byte-for-byte; at/after
+    activation returns the post-raise 5_000-token base.  The
+    `(1 - bootstrap_progress)` fade is applied to the returned base
+    by `lottery_bounty_for_progress` at the firing site — semantics
+    preserved across the activation boundary.
+    """
+    if block_height >= LOTTERY_BOUNTY_RAISE_HEIGHT:
+        return LOTTERY_BOUNTY_POST_RAISE
+    return LOTTERY_BOUNTY
 
 # Minimum number of distinct validators required for finality.
 #

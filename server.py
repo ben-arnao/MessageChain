@@ -1849,8 +1849,11 @@ class Server(SharedRuntimeMixin):
             # VALIDATOR_MIN_STAKE applies to the tx amount, not to the
             # delta over existing stake.  If our sweep would be below the
             # min-stake floor, skip — a lower-value sweep would be
-            # rejected at block apply time.
-            if stakeable < _cfg.VALIDATOR_MIN_STAKE:
+            # rejected at block apply time.  Hard-fork-gated via
+            # `get_validator_min_stake` so post-activation we sweep at
+            # the raised 10_000 floor (or skip if liquid is insufficient).
+            apply_height = self.blockchain.height + 1
+            if stakeable < _cfg.get_validator_min_stake(apply_height):
                 return
 
             from messagechain.core.staking import create_stake_transaction

@@ -375,9 +375,16 @@ class SupplyTracker:
 
         # M7: Per-validator minimum stake enforcement.
         # After unstaking, remaining stake must be either 0 (full exit)
-        # or >= VALIDATOR_MIN_STAKE (still a valid validator).
+        # or >= the current VALIDATOR_MIN_STAKE floor (still a valid
+        # validator).  Hard-fork-gated via `get_validator_min_stake`:
+        # pre-fork the legacy 100-token floor applies, post-fork the
+        # raised 10_000-token floor.  Full exit (remaining == 0) is
+        # ALWAYS permitted — legacy sub-floor validators retain the
+        # escape hatch to unwind their grandfathered stake cleanly.
+        from messagechain.config import get_validator_min_stake
+        min_stake_floor = get_validator_min_stake(current_block)
         remaining = current_stake - amount
-        if remaining > 0 and remaining < VALIDATOR_MIN_STAKE:
+        if remaining > 0 and remaining < min_stake_floor:
             return False
 
         # Prevent total stake from dropping below safety floor

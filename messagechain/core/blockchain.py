@@ -3228,15 +3228,17 @@ class Blockchain:
         # current block's attestations).
         from messagechain.config import (
             LOTTERY_INTERVAL as _LI,
-            LOTTERY_BOUNTY as _LB,
             REPUTATION_CAP as _RC,
+            get_lottery_bounty as _get_lottery_bounty,
         )
         if block_height > 0 and block_height % _LI == 0:
             from messagechain.consensus.reputation_lottery import (
                 select_lottery_winner, lottery_bounty_for_progress,
             )
+            # Sim-side mirror of the apply-path hard-fork-gated bounty.
             _bounty = lottery_bounty_for_progress(
-                self.bootstrap_progress, full_bounty=_LB,
+                self.bootstrap_progress,
+                full_bounty=_get_lottery_bounty(block_height),
             )
             if _bounty > 0:
                 _winner = select_lottery_winner(
@@ -5075,13 +5077,23 @@ class Blockchain:
         # the progress-derived min explicitly so the transaction-level
         # signature/structure verification uses the same threshold as the
         # block-level validation below.
+        #
+        # MIN_STAKE_RAISE fork (100 -> 10_000): the `full_min_stake`
+        # anchor switches from the legacy 100-token constant to the
+        # activation-gated `get_validator_min_stake(height)` so every
+        # post-fork fresh-stake operation honors the raised floor.
+        # Grandfathering (existing sub-floor validators retain their
+        # stake) is handled by the top-up check below, not here.
+        from messagechain.config import get_validator_min_stake
+        apply_height = self.height + 1
+        current_floor = get_validator_min_stake(apply_height)
         progress_min = min_stake_for_progress(
-            self.bootstrap_progress, full_min_stake=VALIDATOR_MIN_STAKE,
+            self.bootstrap_progress, full_min_stake=current_floor,
         )
         if not verify_stake_transaction(
             stx, verifying_pubkey, block_height=self.height,
             min_stake_override=progress_min,
-            current_height=self.height + 1,
+            current_height=apply_height,
         ):
             return False, "Invalid signature or fields"
 
@@ -5093,7 +5105,7 @@ class Blockchain:
 
         # Amount must meet the progress-derived minimum so under-bootstrap
         # newcomers can stake any positive amount, while post-bootstrap
-        # new validators must clear VALIDATOR_MIN_STAKE.  The same gate is
+        # new validators must clear the current floor.  The same gate is
         # applied at tx-level verification above; duplicated here so
         # callers that go directly through validate_block still see the
         # check even if verify_stake_transaction was short-circuited.
@@ -5102,6 +5114,29 @@ class Blockchain:
                 f"Stake amount {stx.amount} below bootstrap-progress "
                 f"minimum {progress_min}"
             )
+
+        # MIN_STAKE_RAISE fork: post-activation, a stake operation must
+        # leave the validator at or above the raised floor.  This is the
+        # gate that closes the "stake-a-little-at-a-time-to-stay-below-
+        # floor" sybil vector while preserving grandfathering (existing
+        # sub-floor validators keep their stake; only NEW stake ops are
+        # subject to the floor).  The progress-graduated check above
+        # already excludes fresh validators below the current floor —
+        # this extra check catches the top-up case where `stx.amount`
+        # itself clears `progress_min` but the resulting total stake
+        # would still land below the post-fork floor.
+        from messagechain.config import MIN_STAKE_RAISE_HEIGHT
+        if apply_height >= MIN_STAKE_RAISE_HEIGHT:
+            current_staked = self.supply.get_staked(stx.entity_id)
+            resulting_staked = current_staked + stx.amount
+            if resulting_staked < current_floor:
+                return False, (
+                    f"Post-MIN_STAKE_RAISE: stake would leave "
+                    f"{stx.entity_id.hex()[:16]} at {resulting_staked} "
+                    f"tokens, below the raised floor {current_floor}. "
+                    f"Grandfathered sub-floor validators may fully exit "
+                    f"(unstake to 0) but cannot partially top up."
+                )
 
         spent_so_far = pending_balance_spent.get(stx.entity_id, 0)
         credited_so_far = (
@@ -6334,16 +6369,23 @@ class Blockchain:
         # the winner then misbehaves.  Seeds are excluded; reputation
         # = 0 candidates can still win if nobody else has attested yet.
         from messagechain.config import (
-            LOTTERY_INTERVAL, LOTTERY_BOUNTY,
+            LOTTERY_INTERVAL,
             REPUTATION_CAP,
+            get_lottery_bounty,
         )
         current_h = block.header.block_number
         if current_h > 0 and current_h % LOTTERY_INTERVAL == 0:
             from messagechain.consensus.reputation_lottery import (
                 select_lottery_winner, lottery_bounty_for_progress,
             )
+            # LOTTERY_BOUNTY_RAISE fork (100 -> 5_000): base bounty is
+            # hard-fork-gated by block height.  `lottery_bounty_for_progress`
+            # continues to apply the `(1 - bootstrap_progress)` fade on top
+            # of the returned base — collapse-to-0 at progress=1.0 is
+            # preserved, the raise just scales the non-zero envelope.
             bounty = lottery_bounty_for_progress(
-                self.bootstrap_progress, full_bounty=LOTTERY_BOUNTY,
+                self.bootstrap_progress,
+                full_bounty=get_lottery_bounty(current_h),
             )
             if bounty > 0:
                 candidates = list(self.reputation.items())
