@@ -6597,6 +6597,14 @@ class Blockchain:
         its weight — otherwise forks computed via this path disagree
         with the canonical chain's stored cumulative weight and can
         trigger spurious equal-weight reorgs under the hash tiebreak.
+
+        Each ancestor's weight must be computed against the stake map
+        that was pinned at its height, not the live `supply.staked`
+        dict.  After any stake change (stake tx, unstake, slash) the
+        live dict diverges from the per-block state, so using it here
+        makes the walk-back value disagree with the additive cumulative
+        stored in fork_choice.tips — which under the lex-smaller-hash
+        tiebreak can force a spurious reorg.
         """
         weight = 0
         current = block
@@ -6604,7 +6612,21 @@ class Blockchain:
         while current and depth < MAX_REORG_DEPTH + 10:
             if current.header.prev_hash == b"\x00" * 32:
                 break
-            weight += compute_block_stake_weight(current, self.supply.staked)
+            pinned = self._stake_snapshots.get(current.header.block_number)
+            if pinned is None:
+                # Snapshot unavailable (bootstrap edge, unapplied fork
+                # block, or ancient pruned state) — fall back to live
+                # stake.  Logged at debug because on a healthy chain
+                # this only fires for the fork-head block itself.
+                logger.debug(
+                    "stake snapshot missing for block #%d — falling back "
+                    "to live supply.staked for fork-weight calculation",
+                    current.header.block_number,
+                )
+                stakes = self.supply.staked
+            else:
+                stakes = pinned
+            weight += compute_block_stake_weight(current, stakes)
             current = self.get_block_by_hash(current.header.prev_hash)
             depth += 1
         return weight
