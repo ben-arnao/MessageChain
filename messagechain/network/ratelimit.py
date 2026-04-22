@@ -49,6 +49,17 @@ RATE_RESPONSE = (5, 20)     # 5 responses/sec, burst up to 20
 # process.  2/sec with a burst of 20 accommodates normal bursty usage
 # while making a spam flood economically visible in peer scoring.
 RATE_PENDING_TX = (2, 20)
+# Signed-announce gossip (ANNOUNCE_ATTESTATION, ANNOUNCE_FINALITY_VOTE,
+# ANNOUNCE_SLASH, ANNOUNCE_CUSTODY_PROOF).  Each one triggers a WOTS+-
+# class signature parse and verify — ~2.7 kB of signature material and
+# ~thousand hash invocations per message.  Under the old `general`
+# bucket (30/s, burst 100) a single peer could force 30 WOTS+ verifies
+# per second indefinitely; that is a real CPU DoS vector.  Tight bucket
+# here: legitimate gossip of a finality vote / slash / custody proof is
+# measured in events per epoch, not per second, so 2/sec with a burst
+# of 20 covers normal validator-rotation spikes while making a flood
+# economically visible in ban-score accounting.
+RATE_SIGNED_ANNOUNCE = (2, 20)
 
 
 @dataclass
@@ -102,6 +113,10 @@ class PeerRateLimiter:
                 "response": TokenBucket(rate=RATE_RESPONSE[0], max_tokens=RATE_RESPONSE[1]),
                 "pending_tx": TokenBucket(
                     rate=RATE_PENDING_TX[0], max_tokens=RATE_PENDING_TX[1],
+                ),
+                "signed_announce": TokenBucket(
+                    rate=RATE_SIGNED_ANNOUNCE[0],
+                    max_tokens=RATE_SIGNED_ANNOUNCE[1],
                 ),
                 "mempool_req": TokenBucket(
                     rate=RATE_MEMPOOL_REQ[0], max_tokens=RATE_MEMPOOL_REQ[1],
