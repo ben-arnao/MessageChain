@@ -226,7 +226,14 @@ class ChainDB:
                 offender_id BLOB NOT NULL,
                 tx_hash BLOB NOT NULL,
                 admitted_height INTEGER NOT NULL,
-                evidence_tx_hash BLOB NOT NULL
+                evidence_tx_hash BLOB NOT NULL,
+                -- Offender's staked balance at admission time.  The
+                -- slash amount at maturity is computed from THIS
+                -- value, not current stake, so an unstake during the
+                -- EVIDENCE_MATURITY_BLOCKS window can't shrink the
+                -- realized penalty.  Added 2026-04-21; legacy rows
+                -- migrated via ALTER TABLE below.
+                staked_at_admission INTEGER NOT NULL DEFAULT 0
             );
 
             -- Per-validator receipt-subtree root public keys.  A
@@ -341,6 +348,28 @@ class ChainDB:
                 ON seen_signatures(first_seen_block_height);
         """)
         conn.commit()
+
+        # ── Schema migrations ─────────────────────────────────────
+        # Additive column migrations for running chain.db files that
+        # were created before today's hardening landed.  SQLite has
+        # no IF NOT EXISTS on ALTER TABLE, so we introspect first.
+        # Each migration is idempotent: running on a fresh db (where
+        # CREATE TABLE already included the column) is a no-op.
+        def _has_column(table: str, col: str) -> bool:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == col for row in cur.fetchall())
+
+        if not _has_column("pending_censorship_evidence", "staked_at_admission"):
+            # 2026-04-21 hardening: slash-at-admission fix requires
+            # a per-row snapshot of the offender's `staked` balance
+            # at admission time.  Default 0 for legacy rows (the
+            # pre-fix chain.db may contain them); on the post-reset
+            # mainnet there are no rows to migrate.
+            conn.execute(
+                "ALTER TABLE pending_censorship_evidence "
+                "ADD COLUMN staked_at_admission INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
 
         # Initialize supply meta if not exists
         cur = conn.execute("SELECT COUNT(*) FROM supply_meta")
@@ -863,12 +892,17 @@ class ChainDB:
         tx_hash: bytes,
         admitted_height: int,
         evidence_tx_hash: bytes,
+        staked_at_admission: int = 0,
     ) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO pending_censorship_evidence "
             "(evidence_hash, offender_id, tx_hash, admitted_height, "
-            "evidence_tx_hash) VALUES (?, ?, ?, ?, ?)",
-            (evidence_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash),
+            "evidence_tx_hash, staked_at_admission) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                evidence_hash, offender_id, tx_hash, admitted_height,
+                evidence_tx_hash, int(staked_at_admission),
+            ),
         )
 
     def remove_pending_censorship_evidence(self, evidence_hash: bytes) -> None:
@@ -879,10 +913,11 @@ class ChainDB:
 
     def get_all_pending_censorship_evidence(self) -> dict:
         """Return {evidence_hash -> (offender_id, tx_hash, admitted_height,
-        evidence_tx_hash)}."""
+        evidence_tx_hash, staked_at_admission)}."""
         cur = self._conn.execute(
             "SELECT evidence_hash, offender_id, tx_hash, admitted_height, "
-            "evidence_tx_hash FROM pending_censorship_evidence"
+            "evidence_tx_hash, staked_at_admission "
+            "FROM pending_censorship_evidence"
         )
         out: dict[bytes, tuple] = {}
         for row in cur.fetchall():
@@ -891,6 +926,7 @@ class ChainDB:
                 bytes(row[2]),
                 int(row[3]),
                 bytes(row[4]),
+                int(row[5]) if row[5] is not None else 0,
             )
         return out
 

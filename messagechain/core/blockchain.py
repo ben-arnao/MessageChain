@@ -716,13 +716,22 @@ class Blockchain:
             # are recorded there too on mature/void.
             self.censorship_processor.processed = set(self._processed_evidence)
             for ev_hash, payload in self.db.get_all_pending_censorship_evidence().items():
-                offender_id, tx_hash, admitted_height, evidence_tx_hash = payload
+                # Tolerate both the pre-fix 4-tuple and the post-fix
+                # 5-tuple layout; any live chain.db with pre-fix rows
+                # gets staked_at_admission=0 (the default), matching
+                # the new column default.
+                if len(payload) == 5:
+                    offender_id, tx_hash, admitted_height, evidence_tx_hash, staked_at_admission = payload
+                else:
+                    offender_id, tx_hash, admitted_height, evidence_tx_hash = payload
+                    staked_at_admission = 0
                 self.censorship_processor.pending[ev_hash] = _PendingEvidence(
                     evidence_hash=ev_hash,
                     offender_id=offender_id,
                     tx_hash=tx_hash,
                     admitted_height=admitted_height,
                     evidence_tx_hash=evidence_tx_hash,
+                    staked_at_admission=staked_at_admission,
                 )
         if hasattr(self.db, "get_all_receipt_subtree_roots"):
             self.receipt_subtree_roots = self.db.get_all_receipt_subtree_roots()
@@ -1338,13 +1347,14 @@ class Blockchain:
             snap.get("censorship_processed", set())
         )
         for entry in _bytes_dict_to_pending(snap.get("censorship_pending", {})):
-            ev_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash = entry
+            ev_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash, staked_at_admission = entry
             self.censorship_processor.pending[ev_hash] = _PendingEvidence(
                 evidence_hash=ev_hash,
                 offender_id=offender_id,
                 tx_hash=tx_hash,
                 admitted_height=admitted_height,
                 evidence_tx_hash=evidence_tx_hash,
+                staked_at_admission=staked_at_admission,
             )
         self.receipt_subtree_roots = dict(
             snap.get("receipt_subtree_roots", {})
@@ -2557,15 +2567,32 @@ class Blockchain:
             compute_slash_amount,
         )
         offender_id = matured.offender_id
+        # Slash basis is stake AT ADMISSION, not current stake.  An
+        # accused validator would otherwise unstake during the
+        # EVIDENCE_MATURITY_BLOCKS window (~16 blocks ~2.7h) to drain
+        # `staked` down to VALIDATOR_MIN_STAKE and reduce the realized
+        # slash by ~6 orders of magnitude.  Snapshot lives on the
+        # _PendingEvidence record captured at CensorshipEvidenceTx
+        # admission time — see submit() in censorship_evidence.py.
+        staked_at_admission = getattr(matured, "staked_at_admission", 0)
         current_stake = self.supply.staked.get(offender_id, 0)
-        slash_amount = compute_slash_amount(current_stake)
+        # Cap at current: the unstaked-to-pending portion already
+        # left `staked` for `pending_unstakes`, which this slash path
+        # deliberately does not touch.  Debiting more than current
+        # would underflow the staked balance and break the supply
+        # invariant.  The offender still loses the larger slash amount
+        # effectively, because their `pending_unstakes` is not slashed
+        # by censorship (it still sits for UNBONDING_PERIOD) — only
+        # the maximum we can take from `staked` right now.
+        slash_amount = min(compute_slash_amount(staked_at_admission), current_stake)
         if slash_amount <= 0:
-            # No stake to slash — still record the evidence as
+            # No slash to apply — still record the evidence as
             # processed so it cannot be re-submitted.
             self._processed_evidence.add(matured.evidence_hash)
             logger.info(
                 f"Censorship evidence {matured.evidence_hash.hex()[:16]} "
-                f"matured but offender has no stake — no slash, marked processed"
+                f"matured but offender has no stake — no slash, marked processed "
+                f"(admission_stake={staked_at_admission}, current_stake={current_stake})"
             )
             return
 
@@ -6342,12 +6369,19 @@ class Blockchain:
                     f"failed — skipping"
                 )
                 continue
+            # Snapshot offender's `staked` AT ADMISSION — this is the
+            # basis for the slash computed when the evidence matures.
+            # Reading current stake at mature time would let the
+            # offender unstake during EVIDENCE_MATURITY_BLOCKS to
+            # shrink their realized slash by orders of magnitude.
+            staked_now = self.supply.staked.get(etx.offender_id, 0)
             admitted = self.censorship_processor.submit(
                 evidence_hash=etx.evidence_hash,
                 offender_id=etx.offender_id,
                 tx_hash=etx.message_tx.tx_hash,
                 admitted_height=block.header.block_number,
                 evidence_tx_hash=etx.tx_hash,
+                staked_at_admission=staked_now,
             )
             if not admitted:
                 logger.warning(

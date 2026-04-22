@@ -276,6 +276,14 @@ class _PendingEvidence:
     # Kept for serialization; the processor does not re-verify
     # signatures at mature-time (admission already did).
     evidence_tx_hash: bytes
+    # Offender's `staked` balance at the block that admitted this
+    # evidence.  The slash amount is computed from THIS value, not
+    # current stake, so a validator observing evidence admitted
+    # against them can't unstake during the maturity window to
+    # drop the realized slash by 6 orders of magnitude.  0 is a
+    # valid value (offender already unstaked before admission);
+    # compute_slash_amount returns 0 in that case.
+    staked_at_admission: int = 0
 
     def serialize(self) -> dict:
         return {
@@ -284,6 +292,7 @@ class _PendingEvidence:
             "tx_hash": self.tx_hash.hex(),
             "admitted_height": self.admitted_height,
             "evidence_tx_hash": self.evidence_tx_hash.hex(),
+            "staked_at_admission": int(self.staked_at_admission),
         }
 
     @classmethod
@@ -294,6 +303,12 @@ class _PendingEvidence:
             tx_hash=bytes.fromhex(data["tx_hash"]),
             admitted_height=int(data["admitted_height"]),
             evidence_tx_hash=bytes.fromhex(data["evidence_tx_hash"]),
+            # Default 0 for forward-compat: a snapshot written by
+            # pre-fix code lacks this field and we'd rather slash 0
+            # tokens than crash on startup.  Live chain has no
+            # pre-fix pending evidence (post-reset, height ~68, zero
+            # user submissions) so this default is inert today.
+            staked_at_admission=int(data.get("staked_at_admission", 0)),
         )
 
 
@@ -304,6 +319,10 @@ class MaturedEvidence:
     evidence_hash: bytes
     offender_id: bytes
     tx_hash: bytes
+    # Carried from _PendingEvidence so _apply_censorship_slash never
+    # needs to re-read current stake (which the offender may have
+    # drained during the maturity window).
+    staked_at_admission: int = 0
 
 
 class CensorshipEvidenceProcessor:
@@ -356,8 +375,15 @@ class CensorshipEvidenceProcessor:
         tx_hash: bytes,
         admitted_height: int,
         evidence_tx_hash: bytes,
+        staked_at_admission: int = 0,
     ) -> bool:
         """Admit an evidence into the pending map.
+
+        `staked_at_admission` is the offender's `staked` balance at
+        the block admitting this evidence.  The slash amount is
+        computed from THIS value — reading current stake at mature
+        time would let the offender unstake during the maturity
+        window to drop the realized slash by orders of magnitude.
 
         Returns False if the evidence is already pending or already
         processed (double-submission prevention).  The chain should
@@ -374,6 +400,7 @@ class CensorshipEvidenceProcessor:
             tx_hash=tx_hash,
             admitted_height=admitted_height,
             evidence_tx_hash=evidence_tx_hash,
+            staked_at_admission=int(staked_at_admission),
         )
         return True
 
@@ -414,6 +441,7 @@ class CensorshipEvidenceProcessor:
                     evidence_hash=ev_hash,
                     offender_id=pending.offender_id,
                     tx_hash=pending.tx_hash,
+                    staked_at_admission=pending.staked_at_admission,
                 ))
         for m in matured:
             del self.pending[m.evidence_hash]

@@ -455,7 +455,7 @@ def _pending_to_bytes_dict(processor) -> dict:
     """Serialize processor.pending into a bytes-keyed, bytes-valued
     dict suitable for the standard section encoder.  Value layout:
         32 offender_id || 32 tx_hash || u64 admitted_height ||
-        32 evidence_tx_hash
+        32 evidence_tx_hash || u64 staked_at_admission
     """
     out: dict[bytes, bytes] = {}
     if processor is None:
@@ -466,6 +466,7 @@ def _pending_to_bytes_dict(processor) -> dict:
             + entry.tx_hash
             + struct.pack(">Q", int(entry.admitted_height))
             + entry.evidence_tx_hash
+            + struct.pack(">Q", int(getattr(entry, "staked_at_admission", 0)))
         )
         out[ev_hash] = payload
     return out
@@ -480,20 +481,39 @@ def _processor_processed(processor) -> set:
 def _bytes_dict_to_pending(d: dict):
     """Inverse of _pending_to_bytes_dict.  Returns an iterable of
     (evidence_hash, offender_id, tx_hash, admitted_height,
-    evidence_tx_hash) tuples.  Raises ValueError on a malformed entry.
+    evidence_tx_hash, staked_at_admission) tuples.  Raises ValueError
+    on a malformed entry.
+
+    Accepts both the new 112-byte layout (with trailing u64 stake
+    snapshot) and the legacy 104-byte layout (pre-slash-at-admission
+    fix); legacy rows get staked_at_admission=0.  The live chain
+    today has zero pending entries, so the legacy path is inert
+    post-reset but kept for IBD of any older snapshot that's still
+    in circulation.
     """
     out = []
     for ev_hash, payload in d.items():
-        if len(payload) != 32 + 32 + 8 + 32:
+        if len(payload) == 112:
+            offender_id = payload[0:32]
+            tx_hash = payload[32:64]
+            admitted_height = struct.unpack_from(">Q", payload, 64)[0]
+            evidence_tx_hash = payload[72:104]
+            staked_at_admission = struct.unpack_from(">Q", payload, 104)[0]
+        elif len(payload) == 104:
+            offender_id = payload[0:32]
+            tx_hash = payload[32:64]
+            admitted_height = struct.unpack_from(">Q", payload, 64)[0]
+            evidence_tx_hash = payload[72:104]
+            staked_at_admission = 0
+        else:
             raise ValueError(
                 f"pending censorship entry has wrong length: "
-                f"{len(payload)} (expected 104)"
+                f"{len(payload)} (expected 104 or 112)"
             )
-        offender_id = payload[0:32]
-        tx_hash = payload[32:64]
-        admitted_height = struct.unpack_from(">Q", payload, 64)[0]
-        evidence_tx_hash = payload[72:104]
-        out.append((ev_hash, offender_id, tx_hash, admitted_height, evidence_tx_hash))
+        out.append((
+            ev_hash, offender_id, tx_hash, admitted_height,
+            evidence_tx_hash, staked_at_admission,
+        ))
     return out
 
 
