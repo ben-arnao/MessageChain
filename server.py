@@ -137,6 +137,77 @@ _RPC_METHOD_COST: dict[str, int] = {
 }
 
 
+# ── Release-manifest notification ─────────────────────────────────
+#
+# When the chain accepts a `ReleaseAnnounceTransaction`, the manifest
+# is stored at `blockchain.latest_release_manifest`.  Operators have
+# no visibility into that by default — this helper surfaces it at
+# node startup so an operator sees "UPDATE AVAILABLE" in journald /
+# stdout without having to poll the chain themselves.
+#
+# Severity mapping is documented in release_announce.py:
+#   0 = normal    (routine release, log at WARNING if mismatched)
+#   1 = security  (log at ERROR)
+#   2 = emergency (log at ERROR)
+#
+# This is notification only — no auto-download, no consensus gating,
+# no verification against any local binary.  Keeping the protocol
+# layer free of "run this code" surface is intentional; see
+# CLAUDE.md "No external dependencies in protocol".
+
+_RELEASE_SEVERITY_LABELS = {0: "normal", 1: "security", 2: "emergency"}
+
+
+def log_release_status(logger_, blockchain, current_version: str) -> None:
+    """Log the state of `blockchain.latest_release_manifest`.
+
+    - No manifest on chain: silent (no log line).
+    - Manifest version matches `current_version`: single INFO line
+      confirming the operator is running the latest announced release.
+    - Manifest version differs:
+        severity 0  → WARNING
+        severity ≥ 1 → ERROR
+      Message includes current version, manifest version, severity
+      label, signer count, optional activation height, and the
+      release-notes URI.
+
+    Pure function of its inputs — easy to unit-test via assertLogs.
+    """
+    manifest = getattr(blockchain, "latest_release_manifest", None)
+    if manifest is None:
+        return
+
+    manifest_version = manifest.version
+    if manifest_version == current_version:
+        logger_.info(
+            "Running latest announced release v%s", current_version,
+        )
+        return
+
+    label = _RELEASE_SEVERITY_LABELS.get(
+        int(manifest.severity), f"severity-{int(manifest.severity)}",
+    )
+    num_signers = len(manifest.signer_indices)
+
+    # Build the message in two halves: a fixed prefix, then an
+    # optional activation-height clause inserted before the release-
+    # notes tail.  Using explicit concatenation (not an f-string with
+    # a conditional) keeps the output stable for log-scraping.
+    prefix = (
+        f"UPDATE AVAILABLE: v{manifest_version} "
+        f"(running v{current_version}, severity={label}, "
+        f"signed by {num_signers} release keys)"
+    )
+    if manifest.min_activation_height is not None:
+        prefix += f", activation height {int(manifest.min_activation_height)}"
+    msg = f"{prefix}. Release notes: {manifest.release_notes_uri}"
+
+    if int(manifest.severity) >= 1:
+        logger_.error(msg)
+    else:
+        logger_.warning(msg)
+
+
 def _is_stale_tx_reason(reason: str) -> bool:
     """Classify a validate_transaction rejection as "stale" (peer's
     mempool view lags) vs "invalid" (peer is lying or buggy).
@@ -1189,6 +1260,19 @@ class Server(SharedRuntimeMixin):
             lambda x: self._handle_task_exception("sync_loop", x)
         )
 
+        # Surface any on-chain release manifest to the operator BEFORE
+        # the "Server running" line so "UPDATE AVAILABLE" sits next to
+        # the other startup-identity lines in journald, rather than
+        # buried below the long-running log stream.  Silent when no
+        # manifest is recorded.
+        try:
+            from messagechain import __version__ as _mc_version
+            log_release_status(logger, self.blockchain, _mc_version)
+        except Exception as e:
+            # Never let a notification bug block node startup — the
+            # release helper is non-critical operator UX.
+            logger.warning(f"Release status check failed: {e}")
+
         logger.info(f"Server running. P2P={self.p2p_port} RPC={self.rpc_port}")
         # Log only the first 16 hex chars — full entity_id is sensitive
         # operator metadata (identifies the validator in journald / log
@@ -1361,6 +1445,9 @@ class Server(SharedRuntimeMixin):
             info = self.blockchain.get_chain_info()
             info["sync_status"] = self.syncer.get_sync_status()
             return {"ok": True, "result": info}
+
+        elif method == "get_latest_release":
+            return self._rpc_get_latest_release(request["params"])
 
         elif method == "get_fee_estimate":
             return {"ok": True, "result": {"fee_estimate": self.mempool.get_fee_estimate()}}
@@ -2395,6 +2482,67 @@ class Server(SharedRuntimeMixin):
         if entity_id not in self.blockchain.public_keys:
             return {"ok": False, "error": "Entity not found"}
         return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}
+
+    def _rpc_get_latest_release(self, params: dict) -> dict:
+        """Return the current on-chain release manifest, if any.
+
+        Cheap read: a dict build over a handful of already-deserialized
+        fields.  No signature verify — the manifest was verified when
+        the block containing it was applied.  Classified as
+        RPC_COST_CHEAP at the _RPC_METHOD_COST layer (absent => cheap
+        default), same as `get_chain_info`.
+
+        Shape:
+            {
+              "current_node_version": "<__version__>",
+              "latest_manifest": null | { ... },
+              "update_available": bool,   # True iff the chain has a
+                                          # manifest AND its version
+                                          # string differs from ours.
+            }
+        """
+        from messagechain import __version__ as current_version
+        from messagechain import config as _cfg
+
+        manifest = getattr(self.blockchain, "latest_release_manifest", None)
+        if manifest is None:
+            return {
+                "ok": True,
+                "result": {
+                    "current_node_version": current_version,
+                    "latest_manifest": None,
+                    "update_available": False,
+                },
+            }
+
+        severity_label = _RELEASE_SEVERITY_LABELS.get(
+            int(manifest.severity),
+            f"severity-{int(manifest.severity)}",
+        )
+        latest = {
+            "version": manifest.version,
+            "severity": int(manifest.severity),
+            "severity_label": severity_label,
+            # Lowercase hex — .hex() already returns lowercase, but be
+            # explicit for the contract.
+            "binary_hashes": {
+                k: v.hex().lower() for k, v in manifest.binary_hashes.items()
+            },
+            "min_activation_height": manifest.min_activation_height,
+            "release_notes_uri": manifest.release_notes_uri,
+            "signer_indices": list(manifest.signer_indices),
+            "num_signers": len(manifest.signer_indices),
+            "threshold": int(_cfg.RELEASE_THRESHOLD),
+            "nonce_hex": manifest.nonce.hex().lower(),
+        }
+        return {
+            "ok": True,
+            "result": {
+                "current_node_version": current_version,
+                "latest_manifest": latest,
+                "update_available": manifest.version != current_version,
+            },
+        }
 
     def _rpc_get_network_validators(self) -> dict:
         """Return validators with their client-reachable RPC endpoints.
