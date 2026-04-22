@@ -1095,11 +1095,28 @@ class Server(SharedRuntimeMixin):
 
         # RPC authentication — generate a random token if none configured.
         # Any RPC client must include {"auth": "<token>"} in requests.
+        # Operators can pin a stable token across restarts by setting
+        # MESSAGECHAIN_RPC_AUTH_TOKEN; otherwise a fresh random token is
+        # generated per startup (and must be retrieved from the keyfile).
         from messagechain.config import RPC_AUTH_ENABLED, RPC_AUTH_TOKEN
         self.rpc_auth_enabled = RPC_AUTH_ENABLED
         if RPC_AUTH_ENABLED:
             import os as _rng
-            self.rpc_auth_token = RPC_AUTH_TOKEN or _rng.urandom(32).hex()
+            if RPC_AUTH_TOKEN:
+                self.rpc_auth_token = RPC_AUTH_TOKEN
+                self._rpc_auth_token_source = "env"
+                if len(RPC_AUTH_TOKEN) < 16:
+                    # Short tokens are dangerous — warn but accept
+                    # (operator discretion).  Never log the value itself.
+                    logger.warning(
+                        "RPC auth token from env is shorter than 16 "
+                        "characters (%d); accepting on operator "
+                        "discretion but this is weak.",
+                        len(RPC_AUTH_TOKEN),
+                    )
+            else:
+                self.rpc_auth_token = _rng.urandom(32).hex()
+                self._rpc_auth_token_source = "generated"
             self._log_rpc_auth_status()
 
         # inv/getdata: track recently seen tx hashes
@@ -1108,7 +1125,11 @@ class Server(SharedRuntimeMixin):
     def _log_rpc_auth_status(self):
         # Never log any portion of the token. Operators retrieve it via
         # the configured RPC_AUTH_TOKEN env var or the keyfile, not logs.
-        logger.info("RPC auth enabled")
+        source = getattr(self, "_rpc_auth_token_source", "generated")
+        if source == "env":
+            logger.info("RPC auth enabled (token loaded from env)")
+        else:
+            logger.info("RPC auth enabled (token generated)")
 
     # _track_seen_tx, _get_peer_writer, _on_sync_offense,
     # _handle_task_exception, _current_cumulative_weight,

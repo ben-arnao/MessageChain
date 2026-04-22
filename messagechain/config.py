@@ -77,6 +77,31 @@ def _profile_int(env_name: str, key: str, default: int) -> int:
     return default
 
 
+def _profile_str(
+    env_var: str,
+    profile_var: str | None = None,
+    default: str | None = None,
+) -> str | None:
+    """Return env_var if set and non-empty, else profile-specific fallback, else default.
+
+    Mirrors _profile_bool / _profile_int but for string-typed config.
+    Empty string in the env is treated as unset (falls through to
+    profile/default) — this avoids surprising operators who might
+    ``export MESSAGECHAIN_FOO=`` expecting the default.
+    """
+    raw = _os_profile.environ.get(env_var)
+    if raw is not None and raw != "":
+        return raw
+    if (
+        _PROFILE == "prototype"
+        and profile_var is not None
+        and profile_var in _PROTOTYPE_OVERRIDES
+    ):
+        override = _PROTOTYPE_OVERRIDES[profile_var]
+        return None if override is None else str(override)
+    return default
+
+
 def active_profile() -> str:
     """Return the active profile name ('production' or 'prototype')."""
     return _PROFILE
@@ -1867,7 +1892,16 @@ GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 RPC_AUTH_ENABLED = _profile_bool(
     "MESSAGECHAIN_RPC_AUTH_ENABLED", "RPC_AUTH_ENABLED", True,
 )
-RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
+# RPC_AUTH_TOKEN: operator-pinned token, or None to auto-generate.
+# Without this env-var the server auto-generates a fresh random token on
+# every startup — which rotates the admin token and invalidates all
+# external client / deployment tooling.  Setting
+# MESSAGECHAIN_RPC_AUTH_TOKEN pins the token across restarts so
+# operator tooling keeps working.  The value is treated as a secret and
+# is never logged.
+RPC_AUTH_TOKEN: str | None = _profile_str(
+    "MESSAGECHAIN_RPC_AUTH_TOKEN", default=None,
+)  # auto-generated if None
 
 # TLS encryption for P2P connections — prevents passive eavesdropping
 # and MITM attacks on transaction relay and validator identity.
