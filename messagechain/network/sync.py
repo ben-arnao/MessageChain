@@ -281,11 +281,18 @@ class ChainSyncer:
         self._last_progress_time = time.time()
 
         # Reject oversized batches — prevents memory-exhaustion DoS.
+        # A flooding peer that ships oversized batches burns CPU on parse
+        # + truncation; record an offense so repeat offenders accumulate
+        # ban-score and get disconnected rather than getting a free pass.
         max_allowed = HEADERS_BATCH_SIZE * 2
         if len(headers_data) > max_allowed:
             logger.warning(
                 f"Peer {peer_addr} sent {len(headers_data)} headers "
                 f"(limit {max_allowed}) — truncating"
+            )
+            self._on_peer_offense(
+                peer_addr, OFFENSE_PROTOCOL_VIOLATION,
+                f"header_batch_oversize:{len(headers_data)}>{max_allowed}",
             )
             headers_data = headers_data[:max_allowed]
 
@@ -521,11 +528,18 @@ class ChainSyncer:
         self._last_progress_time = time.time()
 
         # Reject oversized batches — prevents memory-exhaustion DoS.
+        # A flooding peer that ships oversized batches burns CPU on parse
+        # + truncation; record an offense so repeat offenders accumulate
+        # ban-score and get disconnected rather than getting a free pass.
         max_allowed = BLOCKS_BATCH_SIZE * 2
         if len(blocks_data) > max_allowed:
             logger.warning(
                 f"Peer {peer_addr} sent {len(blocks_data)} blocks "
                 f"(limit {max_allowed}) — truncating"
+            )
+            self._on_peer_offense(
+                peer_addr, OFFENSE_PROTOCOL_VIOLATION,
+                f"block_batch_oversize:{len(blocks_data)}>{max_allowed}",
             )
             blocks_data = blocks_data[:max_allowed]
 
