@@ -2460,11 +2460,100 @@ TARGET_CIRCULATING_SUPPLY_FLOOR = 100_000_000
 # out.  Chosen as a round, conservative number — a 4x boost might
 # fix deflation faster but risks overcorrection during data-anomaly
 # scenarios.
+#
+# DEPRECATED at DEFLATION_FLOOR_V2_HEIGHT: the 2× multiplier at floor
+# era produces only ~420K/yr of extra issuance while steady-state burn
+# at moderate traffic is ~13M/yr (31× the boost) — doesn't arrest
+# deflation, barely slows it.  Replaced by a fee-responsive rebate at
+# DEFLATION_FLOOR_V2_HEIGHT; constant is retained as a stub so
+# already-shipped tests that import it don't fail — not referenced by
+# active post-v2 code paths.
 DEFLATION_ISSUANCE_MULTIPLIER = 2
 
 # Activation — operators must replace with a concrete coordinated
 # height before deploy.
 DEFLATION_FLOOR_HEIGHT = 50_000
+
+# ─────────────────────────────────────────────────────────────────────
+# Fee-responsive deflation floor (v2 hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# The v1 anchor (DEFLATION_FLOOR_HEIGHT) doubles BLOCK_REWARD when
+# supply < TARGET.  At BLOCK_REWARD_FLOOR era that produces 4 × 2 = 8
+# tokens/block, ~420K/yr.  Steady-state burn at moderate traffic
+# (~5 tx/block × MIN_FEE=100 × 50% redirected) is ~13M/yr — the 2×
+# boost is ~31× too small to arrest deflation.
+#
+# Fix: replace the fixed multiplier with a fee-responsive rebate.  At/
+# after DEFLATION_FLOOR_V2_HEIGHT, when total_supply < TARGET, issuance
+# becomes
+#     max(base_reward, rolling_burn_rate × DEFLATION_REBATE_BPS // 10_000)
+# where rolling_burn_rate is the trailing window's total burn divided by
+# DEFLATION_REBATE_WINDOW_BLOCKS.  rebate_bps = 7000 (70%) offsets most
+# of the burn without eliminating the deflationary incentive entirely.
+#
+# Pre-activation (block_height < DEFLATION_FLOOR_V2_HEIGHT): v1 2×
+# behavior preserved byte-for-byte.  Between DEFLATION_FLOOR_HEIGHT
+# (50_000) and DEFLATION_FLOOR_V2_HEIGHT (70_000) the legacy 2×
+# multiplier continues to fire so v1-era blocks remain re-validatable.
+#
+# Rolling-window mechanics:
+#   * Every post-activation fee-burn appends (block_height, actual_burn)
+#     to SupplyTracker.rolling_fee_burn.
+#   * Before computing boosted issuance, entries older than the
+#     trailing window are pruned.
+#   * Sum remaining amounts; divide by DEFLATION_REBATE_WINDOW_BLOCKS to
+#     get per-block burn rate.
+#
+# Reorg safety: the rolling list is consensus state.  Snapshotted
+# alongside treasury_spend_rolling_debits; committed to the
+# state-snapshot root (see _TAG_FEE_BURN_ROLLING in state_snapshot.py)
+# so state-synced nodes inherit the same window as replaying nodes.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploy.
+DEFLATION_REBATE_BPS = 7000                 # 70% rebate share
+DEFLATION_REBATE_WINDOW_BLOCKS = 1000       # ~1 week at 600s/block
+DEFLATION_FLOOR_V2_HEIGHT = 70_000          # placeholder — operator sets real height
+
+assert 0 < DEFLATION_REBATE_BPS <= 10_000, (
+    "DEFLATION_REBATE_BPS must be a non-empty fraction <= 100%"
+)
+assert DEFLATION_REBATE_WINDOW_BLOCKS > 0, (
+    "DEFLATION_REBATE_WINDOW_BLOCKS must be positive"
+)
+
+# ─────────────────────────────────────────────────────────────────────
+# Attester-reward cap formula fix (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# The original cap (ATTESTER_REWARD_CAP_HEIGHT = 60_000) was
+#   cap = attester_pool_this_block × PER_VALIDATOR_ATTESTER_REWARD_
+#         CAP_BPS_PER_EPOCH × FINALITY_INTERVAL // 10_000
+# But `attester_pool_this_block` includes the fee-funded portion,
+# which varies per block.  A high-fee block at the first slot of an
+# epoch banks huge rewards under a temporarily-large cap; a low-fee
+# block lowers the cap later in the same epoch — path-dependent.
+#
+# Fix: at/after ATTESTER_CAP_FIX_HEIGHT, the cap uses the issuance-only
+# component:
+#   cap = (reward - proposer_share) × PER_VALIDATOR...
+#         × FINALITY_INTERVAL // 10_000
+# At BLOCK_REWARD=16, proposer_share=4, issuance_pool=12 →
+# cap = 12 × 100 × 100 / 10_000 = 12 tokens/entity/epoch.  Floor era
+# (reward=4): cap = 3 × 100 × 100 / 10_000 = 3.  Stable across fee
+# variation, predictable, path-independent.
+#
+# Dilution impact: naive founder at 42% stake earns ~5 tokens/epoch
+# before cap — cap at 12 barely binds.  Against founder sybils each
+# hitting the cap, the per-validator ceiling bounds aggregate capture.
+# Cap is belt-and-suspenders, not a dominant dilution mechanism;
+# predictability matters more than dilution strength.
+#
+# Pre-activation: cap retains the old (broken) fee-dependent formula
+# byte-for-byte so v1-era mint blocks remain re-validatable.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploy.
+ATTESTER_CAP_FIX_HEIGHT = 70_000            # placeholder — operator sets real height
 
 
 def validate_block_hex_size(block_data) -> bool:
