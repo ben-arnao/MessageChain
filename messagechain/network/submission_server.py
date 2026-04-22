@@ -49,6 +49,8 @@ from messagechain.config import (
     SUBMISSION_BURST,
     SUBMISSION_FEE,
     SUBMISSION_RATE_LIMIT_PER_SEC,
+    SUBMISSION_REJECTION_BURST,
+    SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC,
 )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.network.ratelimit import TokenBucket
@@ -156,6 +158,27 @@ def _rejection_code_for_mempool_reason(reason: str) -> int:
     if "cap" in r or "rate" in r or "full" in r:
         return REJECT_MEMPOOL_FULL
     return REJECT_OTHER
+
+
+def _should_request_rejection(ctx, client_ip: str, header_set: bool) -> bool:
+    """Decide whether this request gets a SignedRejection on failure.
+
+    Silent-downgrade policy: if the client set X-MC-Request-Receipt
+    but the per-IP rejection budget is exhausted, return False.
+    The submission still processes; the client just doesn't get a
+    signed proof of rejection.  Protects the receipt-subtree's
+    finite leaf budget from drain-via-bad-sig-spam while keeping
+    honest slash-evidence issuance flowing at the configured
+    rejection rate.
+
+    Header NOT set → always False regardless of budget.
+    Header set + budget available → True (consumes one token).
+    Header set + budget exhausted → False (no token consumed
+    because rejection_budget_check already returned False).
+    """
+    if not header_set:
+        return False
+    return bool(ctx.rejection_budget_check(client_ip))
 
 
 def submit_transaction_to_mempool(
@@ -527,10 +550,18 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
 
         # Opt-in rejection: clients that want a SignedRejection on
         # validation failure must set X-MC-Request-Receipt: 1 (any
-        # truthy value).  Default behavior is unchanged — plain 400
-        # text + no leaf burned — so a misbehaving client cannot drain
-        # the receipt-subtree leaf budget by spamming garbage txs.
-        request_rejection = self._header_truthy("X-MC-Request-Receipt")
+        # truthy value).  The dedicated rejection budget (see
+        # SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC in config) caps how
+        # often this endpoint will burn a receipt-subtree leaf per IP
+        # — an attacker setting the header and spamming bad sigs to
+        # drain the subtree is now rate-limited to a trickle.  When
+        # the budget is exhausted we silently drop the opt-in: the
+        # submission still processes normally, the client just gets a
+        # plain 400 without a signed-rejection payload.
+        header_set = self._header_truthy("X-MC-Request-Receipt")
+        request_rejection = _should_request_rejection(
+            ctx, self._client_ip(), header_set,
+        )
 
         # Inject via the shared helper (same semantics as RPC ingress).
         result = ctx.submit(tx, request_rejection=request_rejection)
@@ -703,6 +734,14 @@ class _HandlerContext:
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
+        # Dedicated per-IP budget for X-MC-Request-Receipt=1 submissions.
+        # Each exhaustion-via-bad-sig-spam rejection would otherwise
+        # burn a leaf from the RECEIPT_SUBTREE (65k one-time keys at
+        # height 16).  Sharing the base submission bucket means one
+        # attacker IP could drain the subtree in hours.  Dedicated
+        # bucket keeps honest slash-evidence issuance flowing at a
+        # slow rate while closing the leaf-drain vector.
+        self._rejection_buckets: dict[str, TokenBucket] = {}
         # Cap the dict to prevent an attacker rotating IPs from
         # exhausting memory with one-shot buckets.
         self._max_tracked_ips = 4096
@@ -726,6 +765,48 @@ class _HandlerContext:
                     max_tokens=SUBMISSION_BURST,
                 )
                 self._buckets[ip] = bucket
+            self._last_active[ip] = _time.time()
+            return bucket.consume()
+
+    def rejection_budget_check(self, ip: str) -> bool:
+        """Consume one token from `ip`'s REJECTION bucket; True iff allowed.
+
+        Separate from rate_limit_check — exhausting the rejection
+        budget does NOT block the underlying submission, it only
+        prevents a SignedRejection from being issued for that request.
+        See the SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC comment in
+        config.py for the rationale (receipt-subtree leaf drain).
+        """
+        import time as _time
+        with self._buckets_lock:
+            bucket = self._rejection_buckets.get(ip)
+            if bucket is None:
+                if len(self._rejection_buckets) >= self._max_tracked_ips:
+                    # Inactive/LRU eviction on the rejection dict.
+                    # Inline, mirrors the base-bucket logic above but
+                    # scoped to self._rejection_buckets.
+                    to_drop = []
+                    for _ip, _b in self._rejection_buckets.items():
+                        _b._refill()
+                        if _b.tokens >= _b.max_tokens:
+                            to_drop.append(_ip)
+                    for _ip in to_drop:
+                        del self._rejection_buckets[_ip]
+                    if len(self._rejection_buckets) >= self._max_tracked_ips:
+                        # LRU by last_active (shared with the base
+                        # bucket — we reuse the same timestamps).
+                        oldest_ip = min(
+                            self._rejection_buckets,
+                            key=lambda k: self._last_active.get(k, 0.0),
+                        )
+                        del self._rejection_buckets[oldest_ip]
+                    if len(self._rejection_buckets) >= self._max_tracked_ips:
+                        return False
+                bucket = TokenBucket(
+                    rate=SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC,
+                    max_tokens=SUBMISSION_REJECTION_BURST,
+                )
+                self._rejection_buckets[ip] = bucket
             self._last_active[ip] = _time.time()
             return bucket.consume()
 

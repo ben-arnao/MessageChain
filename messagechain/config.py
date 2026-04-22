@@ -1771,6 +1771,27 @@ SUBMISSION_RATE_LIMIT_PER_SEC = 2
 SUBMISSION_BURST = 10
 MAX_SUBMISSION_BODY_BYTES = 16384
 
+# Dedicated per-IP budget for submissions that opt into a
+# SignedRejection response (X-MC-Request-Receipt: 1).  A signed
+# rejection consumes one WOTS+ leaf from the validator's receipt
+# subtree.  At RECEIPT_SUBTREE_HEIGHT=16 (65k leaves) the plain
+# SUBMISSION_RATE_LIMIT cap of 2/sec would let one attacker drain
+# the whole subtree in ~9 hours from a single IPv4, or minutes with
+# cheap IPv6 /64 rotation.  After exhaustion the censorship-
+# evidence framework disables itself until an on-chain subtree
+# rotation lands (+ ~9min keygen on an e2-small).
+#
+# This dedicated budget caps rejection issuance FAR below the base
+# submission rate — honest clients who genuinely need a rejection
+# for slash evidence get one; attackers get a plain 400 and zero
+# leaves burned.  Chosen so that a single /64 can provoke at most
+# SUBMISSION_REJECTION_BURST + sustained_rate * time leaves; burst
+# tokens replenish slowly.  When the budget is exhausted the HTTP
+# handler silently drops the header rather than 429'ing the whole
+# request — the submission still processes.
+SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC = 0.05  # 1 per 20 seconds steady
+SUBMISSION_REJECTION_BURST = 3                   # up to 3 rejection proofs immediately
+
 # ─────────────────────────────────────────────────────────────────────
 # Attestable submission receipts + censorship-evidence slashing
 # ─────────────────────────────────────────────────────────────────────
