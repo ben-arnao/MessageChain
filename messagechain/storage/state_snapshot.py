@@ -222,7 +222,18 @@ from messagechain.config import (
 #      the v14 witnessed-submission sections): u32 count followed by
 #      count × (u32 height, u64 amount) tuples, same encoding as the
 #      pre-existing treasury rolling-debit list.
-STATE_SNAPSHOT_VERSION = 15  # wire format version for encode/decode
+# v16: Validator-registration burn hard fork
+#      (VALIDATOR_REGISTRATION_BURN_HEIGHT).  Adds
+#      ``registered_validators`` — the set of entity_ids that have paid
+#      the one-time validator-registration burn OR were grandfathered in
+#      at activation height.  MUST participate in the snapshot root: a
+#      state-synced node that disagreed on this set would charge the
+#      burn differently at the next StakeTransaction (post-activation,
+#      a first-stake from an unregistered entity burns 10K tokens) and
+#      silently fork at that block.  Section tag
+#      ``_TAG_REGISTERED_VALIDATORS``.  Binary layout (appended strictly
+#      after v15's rolling_fee_burn section): bytes-set.
+STATE_SNAPSHOT_VERSION = 16  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -353,6 +364,16 @@ _TAG_WITNESS_ACK_REGISTRY = b"wack"
 # mis-compute the trailing burn rate and boosted issuance at the next
 # low-supply block, silently forking.
 _TAG_FEE_BURN_ROLLING = b"fbroll"
+# v16: validator-registration burn tracking — set of entity_ids that
+# have paid the one-time validator-registration burn OR were
+# grandfathered in at VALIDATOR_REGISTRATION_BURN_HEIGHT.  Consulted
+# by the stake-tx apply path: post-activation, a StakeTransaction
+# from an entity not in this set burns VALIDATOR_REGISTRATION_BURN
+# tokens and adds the entity.  MUST participate in the snapshot
+# root: two state-synced nodes that disagreed on the set would
+# burn/skip the fee differently at the next first-time stake and
+# silently fork.  Same consensus criticality as _TAG_SLASHED.
+_TAG_REGISTERED_VALIDATORS = b"regval"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -571,6 +592,17 @@ def serialize_state(blockchain) -> dict:
                 blockchain.supply, "rolling_fee_burn", [],
             )
         ],
+        # v16: Registered-validators set — entity_ids that have paid
+        # the one-time validator-registration burn (or were
+        # grandfathered at activation).  Consulted by the stake-tx
+        # apply path post-VALIDATOR_REGISTRATION_BURN_HEIGHT to
+        # decide whether a first stake triggers the burn.  MUST
+        # participate in the state root so state-synced nodes and
+        # replaying nodes compute the same burn amount at the next
+        # first-time stake.
+        "registered_validators": set(
+            getattr(blockchain.supply, "registered_validators", set())
+        ),
     }
 
 
@@ -797,6 +829,12 @@ def deserialize_state(snapshot: dict) -> dict:
     # starts with an empty window, matching a replaying node that
     # reaches activation with no prior spends.
     out.setdefault("rolling_fee_burn", [])
+    # Pre-v16 snapshots lack the registered-validators set.  Migrating
+    # chains start with an empty set — matches a replaying node that
+    # reaches VALIDATOR_REGISTRATION_BURN_HEIGHT with the grandfather
+    # step still pending.  Binary decode populates this strictly so
+    # the default only affects in-memory hand-built snapshot dicts.
+    out.setdefault("registered_validators", set())
     return out
 
 
@@ -1054,6 +1092,16 @@ def compute_state_root(snapshot: dict) -> bytes:
                 snap.get("rolling_fee_burn", []),
             ),
         ),
+        # v16: Registered-validators set — entity_ids that have paid
+        # the one-time validator-registration burn (or were
+        # grandfathered at VALIDATOR_REGISTRATION_BURN_HEIGHT).  Two
+        # state-synced nodes that disagreed on this set would
+        # burn/skip the fee differently at the next first-time stake
+        # and silently fork.  Same dedupe-determinism criticality as
+        # _TAG_SLASHED.
+        _TAG_REGISTERED_VALIDATORS: _merkle(_entries_for_section(
+            _TAG_REGISTERED_VALIDATORS,
+            snap["registered_validators"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -1352,6 +1400,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes set>         non_response_processed         (v14+)
         <bytes→int  dict>   witness_ack_registry           (v14+)
         <rolling-debit list> rolling_fee_burn              (v15+)
+        <bytes set>         registered_validators          (v16+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1451,6 +1500,10 @@ def encode_snapshot(snap: dict) -> bytes:
     # _encode_rolling_debits for the same (height, amount) tuple shape
     # as the treasury rolling-debit list.
     out += _encode_rolling_debits(snap.get("rolling_fee_burn", []))
+    # v16: Registered-validators set, strictly appended after v15's
+    # rolling_fee_burn section so a v15 blob is a strict prefix of a
+    # v16 blob.
+    out += _encode_bytes_set(snap["registered_validators"])
     return bytes(out)
 
 
@@ -1561,6 +1614,8 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # blobs.  Pre-v15 blobs cannot reach here — the strict version
     # check above rejects them.
     rolling_fee_burn, off = _decode_rolling_debits(blob, off)
+    # v16+: Registered-validators set.  Always present on v16+ blobs.
+    registered_validators, off = _decode_bytes_set(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1610,4 +1665,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "non_response_processed": non_response_processed,
         "witness_ack_registry": witness_ack_registry,
         "rolling_fee_burn": rolling_fee_burn,
+        "registered_validators": registered_validators,
     }

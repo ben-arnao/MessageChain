@@ -2609,6 +2609,50 @@ assert DEFLATION_REBATE_WINDOW_BLOCKS > 0, (
 # coordinated-fork height before deploy.
 ATTESTER_CAP_FIX_HEIGHT = 70_000            # placeholder — operator sets real height
 
+# ─────────────────────────────────────────────────────────────────────
+# Validator registration burn (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# The per-entity attester-reward cap (ATTESTER_REWARD_CAP_HEIGHT) is
+# sybil-negative for a large staker: at VALIDATOR_MIN_STAKE = 10_000,
+# a 25M-stake founder can split into ~2,500 sybils, each with its own
+# per-epoch cap allowance — aggregate capture exceeds what the founder's
+# main entity would earn uncapped.  Splitting increases revenue.
+#
+# Fix: raise the real cost of spawning a validator.  Burn
+# VALIDATOR_REGISTRATION_BURN tokens when an entity FIRST registers as
+# a validator (first-ever StakeTransaction).  Sybil cost rises from
+# 10K (recoverable on unstake) to 20K (10K stake + 10K permanently
+# burned).  Infrastructure cost remains the ultimate bound, but the
+# protocol now charges a meaningful entry fee against pure-capital
+# splitting strategies.
+#
+# Policy (Option A from the design doc):
+#   * One-time per entity.  Once registered, always registered.  An
+#     entity that fully unstakes and later re-stakes does NOT pay a
+#     second burn — punishing legitimate operators who cycle stake is
+#     a false-positive we deliberately avoid.
+#   * Grandfathering: entities already staked at activation height
+#     are added to the registered set by a one-shot migration at
+#     VALIDATOR_REGISTRATION_BURN_HEIGHT, without paying.  Guarded
+#     by ``SupplyTracker.grandfather_applied`` for reorg safety
+#     (same pattern as ``treasury_rebase_applied``).
+#   * Pre-activation: the set never populates and no burn fires.
+#     Byte-for-byte legacy behavior preserved.
+#
+# Sized at VALIDATOR_MIN_STAKE_POST_RAISE so first-time registration
+# cost exactly doubles (stake + burn).
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  The height is
+# independent of other *_HEIGHT forks even though it shares the
+# placeholder spacing convention (current_height + 50_000).
+VALIDATOR_REGISTRATION_BURN = 10_000
+VALIDATOR_REGISTRATION_BURN_HEIGHT = 70_000
+
+assert VALIDATOR_REGISTRATION_BURN > 0, (
+    "registration burn must be positive — zero disables sybil defense"
+)
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.

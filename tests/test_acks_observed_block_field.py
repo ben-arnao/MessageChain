@@ -597,7 +597,11 @@ class TestSnapshotVersionsBumped(unittest.TestCase):
     through v11 (treasury rolling debits), v12 (inclusion-list
     processed_violations key widening), and v13 (per-entity
     attester-reward cap epoch earnings), so the actual bump is
-    13→14 / 4→5 — same intent, current numbers."""
+    13→14 / 4→5 — same intent, current numbers.  A subsequent
+    fork (v15: validator-registration burn) has since landed, so
+    this assertion accepts the monotonically-rising snapshot
+    version — what matters is the ``>= 14`` floor that pins the
+    witness-submission wire format, not a freeze at exactly 14."""
 
     def test_state_snapshot_version_is_14(self):
         # Pinned >=14 so the witnessed-submission sections remain
