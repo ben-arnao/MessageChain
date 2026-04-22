@@ -222,12 +222,35 @@ def is_within_submission_window(
 
 @dataclass
 class CustodyProof:
-    """A claim of custody over a historical block.
+    """A signed claim of custody over a historical block.
+
+    Iteration 3f: proof now carries `public_key` + `signature` and
+    requires `prover_id == derive_entity_id(public_key)`.  Closes the
+    swap-prover-id attack where a gossip eavesdropper could intercept
+    Alice's proof, change the prover_id field to their own, and
+    claim the reward — Merkle math verified fine (path is prover-id-
+    independent), but the reward redirected.  A valid signature bound
+    to the embedded pubkey makes that attack impossible without
+    Alice's private key.
 
     Fields:
-        prover_id:           32-byte entity ID claiming the reward.
+        prover_id:           32-byte entity ID = derive_entity_id(
+                             public_key).  Enforced at construction
+                             and verification.
+        public_key:          the prover's WOTS+ Merkle-tree root key.
+                             Embedded so verifiers don't need to
+                             look up chain state — this is what lets
+                             non-validator hobbyist archivists
+                             participate without prior registration.
+        signature:           WOTS+ signature over signing_material()
+                             produced by the prover's KeyPair.  Uses
+                             one WOTS+ leaf per proof.
         target_height:       height the prover claims to hold.
         target_block_hash:   block hash of that height (32 bytes).
+                             Included in signing material so the
+                             proof is bound to a specific target —
+                             cross-epoch replay fails when the
+                             challenge picks a different target.
         header_bytes:        raw header bytes — verifier rehashes to
                              check against target_block_hash.
         merkle_root:         the tx merkle root as stated by the
@@ -245,17 +268,14 @@ class CustodyProof:
                              level.  Mirrors the padding rule from
                              core.block.compute_merkle_root.
 
-    The proof is unsigned in v1.  A signature would bind the claim to
-    the prover and deny front-running, but v1 is open-submission with
-    FCFS payout by block order — the proposer implicitly orders
-    proofs, and a front-runner who copies someone else's valid proof
-    still must commit the real `prover_id` to get paid.  That's a
-    wash economically: the original submitter still must have actually
-    held the data; the front-runner who steals it gets paid, but only
-    because they also held the data (or could reconstruct the path
-    from the stolen proof).  Accepting this trade-off keeps the v1
-    scope tight; signatures can be added in v2 if frontrunning becomes
-    observable.
+    What signing does NOT close:
+        * Sybil via N freshly-generated keypairs.  Each fresh keypair
+          has a distinct prover_id and competes fairly; Sybil cost is
+          O(N × key-gen-cost + N × per-leaf-sign).
+        * Fetch-on-demand: an attacker who reads public block data
+          from gossip can build valid proofs without storing history.
+          This is structurally unclosable without latency-bounded
+          peer-to-peer challenges — out of scope for this iteration.
     """
     prover_id: bytes
     target_height: int
@@ -266,6 +286,12 @@ class CustodyProof:
     tx_bytes: bytes
     merkle_path: list[bytes] = field(default_factory=list)
     merkle_layer_sizes: list[int] = field(default_factory=list)
+    public_key: bytes = b""
+    # Signature is Optional[Signature]; typed loosely here to avoid
+    # circular imports.  A proof with signature=None is STRUCTURALLY
+    # valid (for round-trip decode paths and test helpers that stage
+    # proofs before signing) but will FAIL verify_custody_proof.
+    signature: object = None
 
     def serialize(self) -> dict:
         return {
@@ -279,10 +305,19 @@ class CustodyProof:
             "tx_bytes": self.tx_bytes.hex(),
             "merkle_path": [h.hex() for h in self.merkle_path],
             "merkle_layer_sizes": list(self.merkle_layer_sizes),
+            "public_key": self.public_key.hex(),
+            "signature": (
+                self.signature.serialize() if self.signature is not None else None
+            ),
         }
 
     @classmethod
     def deserialize(cls, data: dict) -> "CustodyProof":
+        sig_data = data.get("signature")
+        signature = None
+        if sig_data is not None:
+            from messagechain.crypto.keys import Signature
+            signature = Signature.deserialize(sig_data)
         return cls(
             prover_id=bytes.fromhex(data["prover_id"]),
             target_height=int(data["target_height"]),
@@ -293,20 +328,25 @@ class CustodyProof:
             tx_bytes=bytes.fromhex(data["tx_bytes"]),
             merkle_path=[bytes.fromhex(x) for x in data.get("merkle_path", [])],
             merkle_layer_sizes=list(data.get("merkle_layer_sizes", [])),
+            public_key=bytes.fromhex(data.get("public_key", "")),
+            signature=signature,
         )
 
-    def canonical_bytes(self) -> bytes:
-        """Stable byte encoding used as the block-layer commitment.
+    def signing_material(self) -> bytes:
+        """Bytes the signature MUST cover — everything except the
+        signature itself.
 
-        Covers every field that binds the proof to its claimed custody
-        act — anyone mutating any of these invalidates the hash,
-        therefore invalidates block.merkle_root, therefore invalidates
-        the proposer's signature.  A MITM that flips `prover_id` alone
-        breaks commitment, so the reward cannot be redirected without
-        re-signing the block.
+        Includes public_key so an attacker can't swap keys without
+        invalidating the signature.  Includes prover_id so the
+        swap-prover-id attack is closed.  Includes target_block_hash
+        so a proof can't be replayed against a different target.
+        Includes the Merkle data so any in-flight tamper of proof
+        fields breaks the signature.
         """
         import struct as _struct
         parts = [
+            _struct.pack(">I", len(self.public_key)),
+            self.public_key,
             self.prover_id,
             _struct.pack(">Q", self.target_height),
             self.target_block_hash,
@@ -325,6 +365,23 @@ class CustodyProof:
         for n in self.merkle_layer_sizes:
             parts.append(_struct.pack(">Q", int(n)))
         return b"".join(parts)
+
+    def canonical_bytes(self) -> bytes:
+        """Full byte encoding including the signature — this is what
+        block.merkle_root commits to so a relayer cannot strip the
+        signature in transit.  tx_hash = H(canonical_bytes).
+        """
+        import struct as _struct
+        base = self.signing_material()
+        if self.signature is None:
+            # Empty-signature sentinel.  Round-trips cleanly; but
+            # verify_custody_proof rejects such proofs, so the only
+            # callers that see this shape are constructors staging a
+            # proof before signing it and test helpers that never
+            # call verify.
+            return base + _struct.pack(">I", 0)
+        sig_blob = self.signature.to_bytes()
+        return base + _struct.pack(">I", len(sig_blob)) + sig_blob
 
     @property
     def tx_hash(self) -> bytes:
@@ -346,11 +403,24 @@ class CustodyProof:
 
     @classmethod
     def from_bytes(cls, data: bytes, state=None) -> "CustodyProof":
-        """Decode a CustodyProof from its canonical_bytes form."""
+        """Decode a CustodyProof from its canonical_bytes form.
+
+        Layout (iter 3f): pubkey_len u32 + pubkey || prover_id(32)
+        || target_height(u64) || target_block_hash(32) || hdr_len(u32)
+        + hdr || merkle_root(32) || tx_index(i64) || tx_len(u32) + tx
+        || path_count(u32) + path_count × 32B || ls_count(u32) +
+        ls_count × u64 || sig_len(u32) + sig_blob.
+        """
         import struct as _struct
         off = 0
-        if len(data) < 32 + 8 + 32 + 4:
-            raise ValueError("CustodyProof blob too short")
+        if len(data) < 4:
+            raise ValueError("CustodyProof blob too short for pubkey_len")
+        pk_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + pk_len > len(data):
+            raise ValueError("CustodyProof truncated at public_key")
+        public_key = bytes(data[off:off + pk_len]); off += pk_len
+        if off + 32 + 8 + 32 + 4 > len(data):
+            raise ValueError("CustodyProof blob too short after pubkey")
         prover_id = bytes(data[off:off + 32]); off += 32
         target_height = _struct.unpack_from(">Q", data, off)[0]; off += 8
         target_block_hash = bytes(data[off:off + 32]); off += 32
@@ -383,6 +453,16 @@ class CustodyProof:
                 raise ValueError("CustodyProof truncated in layer_sizes")
             merkle_layer_sizes.append(_struct.unpack_from(">Q", data, off)[0])
             off += 8
+        if off + 4 > len(data):
+            raise ValueError("CustodyProof truncated at signature length")
+        sig_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+        signature = None
+        if sig_len > 0:
+            if off + sig_len > len(data):
+                raise ValueError("CustodyProof truncated in signature")
+            from messagechain.crypto.keys import Signature
+            signature = Signature.from_bytes(bytes(data[off:off + sig_len]))
+            off += sig_len
         if off != len(data):
             raise ValueError("CustodyProof has trailing bytes")
         return cls(
@@ -395,6 +475,8 @@ class CustodyProof:
             tx_bytes=tx_bytes,
             merkle_path=merkle_path,
             merkle_layer_sizes=merkle_layer_sizes,
+            public_key=public_key,
+            signature=signature,
         )
 
 
@@ -499,7 +581,8 @@ def _replay_merkle(
 
 def build_custody_proof(
     *,
-    prover_id: bytes,
+    entity=None,
+    prover_id: Optional[bytes] = None,
     target_height: int,
     target_block_hash: bytes,
     header_bytes: bytes,
@@ -510,14 +593,44 @@ def build_custody_proof(
 ) -> CustodyProof:
     """Construct a CustodyProof over the given block contents.
 
+    Iteration 3f: takes an `entity` (Entity instance with a KeyPair)
+    and produces a SIGNED proof.  The caller's `entity.keypair` is
+    consumed for one WOTS+ signature.  `prover_id` is derived
+    deterministically from `entity.keypair.public_key`.
+
+    Legacy mode (entity=None, prover_id=<bytes>): produces an UNSIGNED
+    proof with the supplied prover_id and empty public_key.  Retained
+    only for unit tests that exercise the Merkle-path mechanics
+    without needing the signature layer; such proofs FAIL
+    verify_custody_proof (which rejects missing signatures).  Chain
+    code paths MUST pass `entity=` — never `prover_id=`.
+
     Caller supplies the full tx-hash list (so we can compute the
     Merkle path) plus the specific tx the prover is surrendering.  The
     caller is assumed to have the data — this routine doesn't verify
     it came from the claimed block; that's what `verify_custody_proof`
     is for.
     """
-    if not isinstance(prover_id, (bytes, bytearray)) or len(prover_id) != 32:
-        raise ValueError("prover_id must be 32 bytes")
+    # Resolve prover_id + public_key from whichever mode the caller chose.
+    if entity is not None:
+        from messagechain.identity.identity import derive_entity_id
+        public_key = bytes(entity.keypair.public_key)
+        resolved_prover_id = derive_entity_id(public_key)
+        if prover_id is not None and bytes(prover_id) != resolved_prover_id:
+            raise ValueError(
+                "prover_id passed alongside entity must match "
+                "derive_entity_id(entity.keypair.public_key)"
+            )
+    else:
+        if prover_id is None:
+            raise ValueError(
+                "build_custody_proof requires either `entity` (signed mode) "
+                "or `prover_id` (legacy unsigned mode)"
+            )
+        if not isinstance(prover_id, (bytes, bytearray)) or len(prover_id) != 32:
+            raise ValueError("prover_id must be 32 bytes")
+        resolved_prover_id = bytes(prover_id)
+        public_key = b""
 
     # Empty-block case: header-only custody.  No Merkle path, no tx.
     if not all_tx_hashes:
@@ -525,42 +638,50 @@ def build_custody_proof(
             raise ValueError(
                 "Empty block requires tx_index=None and tx_bytes=b''"
             )
-        return CustodyProof(
-            prover_id=bytes(prover_id),
-            target_height=int(target_height),
-            target_block_hash=bytes(target_block_hash),
-            header_bytes=bytes(header_bytes),
-            merkle_root=bytes(merkle_root),
-            tx_index=None,
-            tx_bytes=b"",
-            merkle_path=[],
-            merkle_layer_sizes=[0],
+        merkle_path = []
+        layer_sizes = [0]
+        final_tx_index = None
+        final_tx_bytes = b""
+    else:
+        if tx_index is None:
+            raise ValueError("Non-empty block requires tx_index")
+        if not (0 <= tx_index < len(all_tx_hashes)):
+            raise ValueError(
+                f"tx_index {tx_index} out of range for "
+                f"{len(all_tx_hashes)} txs"
+            )
+        # Sanity check — tx_hash must match hashed tx_bytes
+        if _h(bytes(tx_bytes)) != all_tx_hashes[tx_index]:
+            raise ValueError(
+                "tx_bytes hash does not match all_tx_hashes[tx_index] — "
+                "inconsistent caller input"
+            )
+        siblings, computed_layer_sizes = _build_path(
+            all_tx_hashes, tx_index,
         )
+        merkle_path = [bytes(s) for s in siblings]
+        layer_sizes = list(computed_layer_sizes)
+        final_tx_index = int(tx_index)
+        final_tx_bytes = bytes(tx_bytes)
 
-    if tx_index is None:
-        raise ValueError("Non-empty block requires tx_index")
-    if not (0 <= tx_index < len(all_tx_hashes)):
-        raise ValueError(
-            f"tx_index {tx_index} out of range for {len(all_tx_hashes)} txs"
-        )
-    # Sanity check — tx_hash must match hashed tx_bytes
-    if _h(bytes(tx_bytes)) != all_tx_hashes[tx_index]:
-        raise ValueError(
-            "tx_bytes hash does not match all_tx_hashes[tx_index] — "
-            "inconsistent caller input"
-        )
-    siblings, layer_sizes = _build_path(all_tx_hashes, tx_index)
-    return CustodyProof(
-        prover_id=bytes(prover_id),
+    proof = CustodyProof(
+        prover_id=resolved_prover_id,
         target_height=int(target_height),
         target_block_hash=bytes(target_block_hash),
         header_bytes=bytes(header_bytes),
         merkle_root=bytes(merkle_root),
-        tx_index=int(tx_index),
-        tx_bytes=bytes(tx_bytes),
-        merkle_path=[bytes(s) for s in siblings],
-        merkle_layer_sizes=list(layer_sizes),
+        tx_index=final_tx_index,
+        tx_bytes=final_tx_bytes,
+        merkle_path=merkle_path,
+        merkle_layer_sizes=layer_sizes,
+        public_key=public_key,
+        signature=None,
     )
+    # Signed mode: sign signing_material and attach.
+    if entity is not None:
+        sig_hash = _h(proof.signing_material())
+        proof.signature = entity.keypair.sign(sig_hash)
+    return proof
 
 
 def verify_custody_proof(
@@ -602,6 +723,24 @@ def verify_custody_proof(
         return False, "expected_block_hash must be 32 bytes"
     if proof.target_block_hash != expected_block_hash:
         return False, "proof.target_block_hash does not match chain's block hash"
+
+    # Step 0b — signature + pubkey binding (iter 3f).  Closes the
+    # swap-prover-id attack: an attacker who modifies prover_id
+    # without also re-signing produces a proof whose signature fails
+    # to verify against the declared public_key, OR whose prover_id
+    # no longer matches derive_entity_id(public_key).  Either way,
+    # rejected.
+    from messagechain.identity.identity import derive_entity_id
+    from messagechain.crypto.keys import Signature, verify_signature
+    if not isinstance(proof.public_key, (bytes, bytearray)) or not proof.public_key:
+        return False, "public_key is empty (unsigned legacy proof)"
+    if proof.signature is None or not isinstance(proof.signature, Signature):
+        return False, "signature is missing"
+    if derive_entity_id(proof.public_key) != proof.prover_id:
+        return False, "prover_id does not match derive_entity_id(public_key)"
+    sig_hash = _h(proof.signing_material())
+    if not verify_signature(sig_hash, proof.signature, proof.public_key):
+        return False, "signature does not verify against public_key"
 
     # Step 1 — rehash header bytes
     if _h(proof.header_bytes) != expected_block_hash:

@@ -80,29 +80,28 @@ def _prime_chain(num_blocks: int) -> tuple[Blockchain, Entity, ProofOfStake]:
 
 def _build_proof_for_challenge(
     chain: Blockchain,
-    prover_id: bytes,
+    prover: object,
     challenge_block_number: int,
 ) -> CustodyProof:
     """Construct a valid CustodyProof answering the challenge at height H.
 
+    `prover` may be an Entity (preferred, produces signed proofs) or
+    legacy raw bytes (prover_id, unsigned — will fail verify).  The
+    live chain always produces Entities; the legacy bytes mode is
+    retained for tests exercising hygiene paths that expect rejection
+    regardless of signature.
+
     Resolves the challenge target from the challenge block's parent
     hash (= block at H-1), reads that target block out of the chain,
-    and builds a header-only proof (or tx-indexed if the target has
-    txs).  Uses the block's tx_hashes list; the test chain runs empty
-    blocks so every proof is header-only.
+    and builds a header-only proof (test chain runs empty blocks so
+    every proof is header-only).
     """
     parent = chain.get_block(challenge_block_number - 1)
     ch = compute_challenge(parent.block_hash, challenge_block_number)
     target = chain.get_block(ch.target_height)
     tx_hashes: list[bytes] = []  # test chain runs empty blocks
-    # The CustodyProof primitive verifies header_bytes by SHA3-hashing
-    # them and comparing to target_block_hash.  In MessageChain the
-    # block hash preimage is `header.signable_data() + header.randao_mix`
-    # (see Block._compute_hash), not header.to_bytes() — using the
-    # preimage makes the hash match exactly.
     header_bytes = target.header.signable_data() + target.header.randao_mix
-    return build_custody_proof(
-        prover_id=prover_id,
+    kwargs = dict(
         target_height=target.header.block_number,
         target_block_hash=target.block_hash,
         header_bytes=header_bytes,
@@ -111,6 +110,9 @@ def _build_proof_for_challenge(
         tx_bytes=b"",
         all_tx_hashes=tx_hashes,
     )
+    if isinstance(prover, (bytes, bytearray)):
+        return build_custody_proof(prover_id=bytes(prover), **kwargs)
+    return build_custody_proof(entity=prover, **kwargs)
 
 
 # ── Hygiene on non-challenge blocks ────────────────────────────────────
@@ -149,7 +151,7 @@ class TestProofsFitAndCap(unittest.TestCase):
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
         self.assertTrue(is_archive_challenge_block(next_h))
-        proof = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        proof = _build_proof_for_challenge(chain, alice, next_h)
         block = chain.propose_block(
             consensus, alice, [], custody_proofs=[proof],
         )
@@ -159,7 +161,7 @@ class TestProofsFitAndCap(unittest.TestCase):
     def test_challenge_block_rejects_over_cap(self):
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        template = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        template = _build_proof_for_challenge(chain, alice, next_h)
         proofs = []
         for i in range(ARCHIVE_PROOFS_PER_CHALLENGE + 1):
             proofs.append(CustodyProof(
@@ -188,7 +190,7 @@ class TestBlockSerialization(unittest.TestCase):
     def test_proofs_roundtrip_binary_and_dict(self):
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        proof = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        proof = _build_proof_for_challenge(chain, alice, next_h)
         block = chain.propose_block(
             consensus, alice, [], custody_proofs=[proof],
         )
@@ -208,7 +210,7 @@ class TestValidatorRejectsBadProof(unittest.TestCase):
     def test_wrong_target_height(self):
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        good = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        good = _build_proof_for_challenge(chain, alice, next_h)
         different = chain.get_block((good.target_height + 1) % next_h)
         bad = CustodyProof(
             prover_id=alice.entity_id,
@@ -235,7 +237,7 @@ class TestArchiveProofMempool(unittest.TestCase):
     def test_add_and_dedupe(self):
         chain, alice, _ = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        p = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        p = _build_proof_for_challenge(chain, alice, next_h)
         pool = ArchiveProofMempool()
         self.assertTrue(pool.add_proof(p, challenge_block_number=next_h))
         self.assertFalse(pool.add_proof(p, challenge_block_number=next_h))
@@ -244,7 +246,7 @@ class TestArchiveProofMempool(unittest.TestCase):
     def test_evict_expired(self):
         chain, alice, _ = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        p = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        p = _build_proof_for_challenge(chain, alice, next_h)
         pool = ArchiveProofMempool()
         pool.add_proof(p, challenge_block_number=next_h)
         pool.evict_expired(next_h + ARCHIVE_SUBMISSION_WINDOW + 1)
@@ -253,7 +255,7 @@ class TestArchiveProofMempool(unittest.TestCase):
     def test_non_challenge_block_number_rejected(self):
         chain, alice, _ = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        p = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        p = _build_proof_for_challenge(chain, alice, next_h)
         pool = ArchiveProofMempool()
         self.assertFalse(pool.add_proof(p, challenge_block_number=next_h + 1))
 
@@ -263,29 +265,43 @@ class TestArchiveProofMempool(unittest.TestCase):
 
 class TestPayout(unittest.TestCase):
     def test_fcfs_debits_pool_and_credits_provers(self):
+        """Verifies pool → balance transfers for up-to-cap paid provers.
+        Under iter 3f each proof must be signed, so each prover is a
+        freshly-created Entity.  Uses a bounded count (10) rather than
+        the full cap so this test doesn't spend 100 × Entity.create
+        worth of setup time — the math under test holds for any N."""
+        from messagechain.identity.identity import Entity
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
-        template = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        parent = chain.get_block(next_h - 1)
+        ch = compute_challenge(parent.block_hash, next_h)
+        target = chain.get_block(ch.target_height)
+        header_bytes = target.header.signable_data() + target.header.randao_mix
 
-        seed = ARCHIVE_REWARD * ARCHIVE_PROOFS_PER_CHALLENGE
+        N = 10
+        seed = ARCHIVE_REWARD * N
         chain.archive_reward_pool = seed
 
-        proofs = []
-        provers = []
-        for i in range(ARCHIVE_PROOFS_PER_CHALLENGE):
-            prover = bytes([i + 1]) * 32
-            provers.append(prover)
-            proofs.append(CustodyProof(
-                prover_id=prover,
-                target_height=template.target_height,
-                target_block_hash=template.target_block_hash,
-                header_bytes=template.header_bytes,
-                merkle_root=template.merkle_root,
-                tx_index=template.tx_index,
-                tx_bytes=template.tx_bytes,
-                merkle_path=list(template.merkle_path),
-                merkle_layer_sizes=list(template.merkle_layer_sizes),
-            ))
+        provers_entities = [
+            Entity.create(
+                f"payout-prover-{i}".encode().ljust(32, b"\x00"),
+                tree_height=2,
+            )
+            for i in range(N)
+        ]
+        proofs = [
+            build_custody_proof(
+                entity=e,
+                target_height=target.header.block_number,
+                target_block_hash=target.block_hash,
+                header_bytes=header_bytes,
+                merkle_root=target.header.merkle_root,
+                tx_index=None,
+                tx_bytes=b"",
+                all_tx_hashes=[],
+            )
+            for e in provers_entities
+        ]
 
         block = chain.propose_block(
             consensus, alice, [], custody_proofs=proofs,
@@ -293,17 +309,19 @@ class TestPayout(unittest.TestCase):
         ok, reason = chain.add_block(block)
         self.assertTrue(ok, reason)
 
-        for prover in provers:
+        # All N provers paid.
+        for p in proofs:
             self.assertEqual(
-                chain.supply.balances.get(prover, 0), ARCHIVE_REWARD,
+                chain.supply.balances.get(p.prover_id, 0), ARCHIVE_REWARD,
             )
+        # Pool fully drained.
         self.assertEqual(chain.archive_reward_pool, 0)
 
     def test_empty_pool_is_noop(self):
         chain, alice, consensus = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL - 1)
         next_h = chain.height
         chain.archive_reward_pool = 0
-        proof = _build_proof_for_challenge(chain, alice.entity_id, next_h)
+        proof = _build_proof_for_challenge(chain, alice, next_h)
         block = chain.propose_block(
             consensus, alice, [], custody_proofs=[proof],
         )
@@ -321,7 +339,7 @@ class TestSubmissionHelper(unittest.TestCase):
         )
         chain, alice, _ = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL)
         challenge_h = ARCHIVE_CHALLENGE_INTERVAL
-        proof = _build_proof_for_challenge(chain, alice.entity_id, challenge_h)
+        proof = _build_proof_for_challenge(chain, alice, challenge_h)
         pool = ArchiveProofMempool()
         result = submit_custody_proof_to_pool(proof, chain, pool)
         self.assertTrue(result.ok, result.error)
@@ -333,7 +351,7 @@ class TestSubmissionHelper(unittest.TestCase):
         )
         chain, alice, _ = _prime_chain(ARCHIVE_CHALLENGE_INTERVAL)
         challenge_h = ARCHIVE_CHALLENGE_INTERVAL
-        proof = _build_proof_for_challenge(chain, alice.entity_id, challenge_h)
+        proof = _build_proof_for_challenge(chain, alice, challenge_h)
         pool = ArchiveProofMempool()
         r1 = submit_custody_proof_to_pool(proof, chain, pool)
         r2 = submit_custody_proof_to_pool(proof, chain, pool)
