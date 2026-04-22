@@ -1330,6 +1330,17 @@ class Blockchain:
             (int(h), int(a))
             for (h, a) in snap.get("rolling_fee_burn", [])
         ]
+        # Deflation-floor-v2 activation-seed flag — one-shot guard
+        # that the synthetic window entry has been installed at
+        # DEFLATION_FLOOR_V2_HEIGHT.  Paired with rolling_fee_burn
+        # above: a state-synced node must inherit BOTH the list and
+        # the flag or the next cross-activation replay re-seeds on
+        # top of an already-seeded list (divergent total).  Committed
+        # to the snapshot root under _TAG_GLOBAL /
+        # _GLOBAL_ROLLING_FEE_BURN_SEEDED.
+        self.supply.rolling_fee_burn_seeded = bool(
+            snap.get("rolling_fee_burn_seeded", False),
+        )
 
         # Archive-duty state (v6+).  All three fields participate in
         # the state root, so a bootstrapping node inherits them from
@@ -6748,6 +6759,72 @@ class Blockchain:
         self.supply.registered_validators.add(stx.entity_id)
         return True
 
+    def _apply_deflation_floor_v2_seed(self, block_height: int) -> None:
+        """Seed ``rolling_fee_burn`` at DEFLATION_FLOOR_V2_HEIGHT.
+
+        Fires exactly once per canonical chain history, at the first
+        block at/after activation.  Pre-activation this is a no-op.
+
+        Motivation (fixes a latent gap in the v2 fork shipped at
+        commit 4b3f1ab): the rolling-window rebate formula divides the
+        summed in-window burns by DEFLATION_REBATE_WINDOW_BLOCKS (1000
+        blocks ≈ 1 week).  At activation the window is empty, so the
+        rebate degenerates to 0 and issuance falls back to
+        base_reward.  The fork was designed to fire when
+        total_supply < TARGET — precisely the situation where we
+        cannot afford to wait a week for the rebate to ramp up.  So
+        we seed the window at activation from the lifetime burn rate,
+        making the rebate effective from block 1 of activation.
+
+        Mechanism:
+          * avg_per_block = total_burned // max(1, block_height)
+            — the lifetime burn-per-block average across the chain
+            since genesis.  Total_burned is already tracked globally
+            and available here.
+          * synthetic_total = avg_per_block
+              * DEFLATION_REBATE_WINDOW_BLOCKS
+            — scale up to a full window's worth of burns so the
+            rolling-sum / window arithmetic in calculate_block_reward
+            yields avg_per_block as the rate.
+          * seed_height = max(0, block_height
+              - DEFLATION_REBATE_WINDOW_BLOCKS + 1)
+            — place the synthetic entry at the OLDEST edge of the
+            window so it prunes out naturally after
+            DEFLATION_REBATE_WINDOW_BLOCKS blocks of real accumulation.
+            The rebate ramps down from the bootstrap estimate as real
+            burns fill in, not a discontinuous cliff.
+
+        Cold-start: if total_burned is 0 (genesis-era chain activating
+        the fork with no burn history yet), synthetic_total is 0 and
+        we skip the append — the rolling list stays empty and the
+        rebate is correctly 0 until real burns accumulate.  The flag
+        still flips so the one-shot guard works.
+
+        Idempotent via ``supply.rolling_fee_burn_seeded``.  Reorg-safe:
+        the flag and the synthetic entry both round-trip through
+        _snapshot_memory_state so a reorg past activation cleanly
+        un-fires the seed and the canonical replay re-fires it.
+        """
+        from messagechain.config import (
+            DEFLATION_FLOOR_V2_HEIGHT,
+            DEFLATION_REBATE_WINDOW_BLOCKS,
+        )
+        if block_height < DEFLATION_FLOOR_V2_HEIGHT:
+            return
+        if self.supply.rolling_fee_burn_seeded:
+            return
+        avg_per_block = self.supply.total_burned // max(1, block_height)
+        synthetic_total = avg_per_block * DEFLATION_REBATE_WINDOW_BLOCKS
+        if synthetic_total > 0:
+            seed_height = max(
+                0,
+                block_height - DEFLATION_REBATE_WINDOW_BLOCKS + 1,
+            )
+            self.supply.rolling_fee_burn.append(
+                (int(seed_height), int(synthetic_total)),
+            )
+        self.supply.rolling_fee_burn_seeded = True
+
     def _apply_registration_grandfather(self, block_height: int) -> None:
         """One-shot migration at VALIDATOR_REGISTRATION_BURN_HEIGHT.
 
@@ -6976,6 +7053,16 @@ class Blockchain:
         # block from a grandfathered entity skips the burn cleanly.
         # Idempotent via ``grandfather_applied``.
         self._apply_registration_grandfather(block.header.block_number)
+
+        # Deflation-floor-v2 activation-seed (hard fork, one-shot at
+        # DEFLATION_FLOOR_V2_HEIGHT).  Runs BEFORE any fee processing
+        # / reward computation this block so the rebate floor in
+        # calculate_block_reward sees the seeded window at block 1 of
+        # activation — without this seed the rolling window would be
+        # empty at activation and the rebate would degenerate to 0
+        # for the first DEFLATION_REBATE_WINDOW_BLOCKS blocks.
+        # Idempotent via ``supply.rolling_fee_burn_seeded``.
+        self._apply_deflation_floor_v2_seed(block.header.block_number)
 
         # Count total txs for base fee adjustment
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
@@ -9099,6 +9186,15 @@ class Blockchain:
             "rolling_fee_burn": list(
                 self.supply.rolling_fee_burn,
             ),
+            # Deflation-floor-v2 activation-seed flag — the one-shot
+            # guard for _apply_deflation_floor_v2_seed.  A reorg that
+            # undoes the activation block MUST un-flip this flag AND
+            # revert the appended synthetic entry (captured in
+            # rolling_fee_burn above), or the canonical replay would
+            # skip the seed and the rebate would degenerate to zero
+            # for the first ~1K blocks post-activation.  Same reorg-
+            # rollback pattern as treasury_rebase_applied.
+            "rolling_fee_burn_seeded": self.supply.rolling_fee_burn_seeded,
             # Seed-divestment lottery redistribution (hard fork):
             # pool of lottery-share tokens accumulated from divested
             # founder stake, awaiting reputation-weighted-lottery
@@ -9244,6 +9340,14 @@ class Blockchain:
             (int(h), int(a))
             for (h, a) in snapshot.get("rolling_fee_burn", [])
         ]
+        # Deflation-floor-v2 seed flag — default False so pre-field
+        # snapshots restore to the pristine pre-activation state (no
+        # seed installed yet).  Paired with rolling_fee_burn above so
+        # a reorg rollback rewinds both the flag and the synthetic
+        # entry in lockstep.
+        self.supply.rolling_fee_burn_seeded = snapshot.get(
+            "rolling_fee_burn_seeded", False,
+        )
         # Lottery prize pool — reorg rollback restores the pre-reorg
         # accumulation / drain state so the canonical replay produces
         # identical payouts.  Default 0 so pre-fork snapshots restore

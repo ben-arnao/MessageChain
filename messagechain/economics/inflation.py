@@ -209,6 +209,39 @@ class SupplyTracker:
         # legacy behavior preserved.
         self.rolling_fee_burn: list[tuple[int, int]] = []
 
+        # Deflation-floor-v2 activation-seed flag: one-shot guard that
+        # the synthetic seed entry has been installed at
+        # DEFLATION_FLOOR_V2_HEIGHT.  Without this seed the rolling
+        # window is empty at activation, so the first ~1,000 blocks
+        # post-activation compute rolling_rate=0 and fall back to
+        # base_reward — defeating the fee-responsive rebate at exactly
+        # the moment it is needed (the fork fires when supply < TARGET,
+        # i.e. when deflation is already hurting the chain).
+        #
+        # The seed itself is installed by
+        # ``Blockchain._apply_deflation_floor_v2_seed`` at the start of
+        # _apply_block_state, using the lifetime burn-per-block average
+        # (total_burned / block_height) scaled over
+        # DEFLATION_REBATE_WINDOW_BLOCKS to approximate a full window
+        # of real burns.  The synthetic entry is placed at the oldest
+        # edge of the window (seed_height = block_height
+        # - DEFLATION_REBATE_WINDOW_BLOCKS + 1) so it rotates out over
+        # DEFLATION_REBATE_WINDOW_BLOCKS of real accumulation post-
+        # activation — the rebate ramps UP from the bootstrap estimate
+        # rather than up from zero.
+        #
+        # Consensus-visible state.  Snapshotted alongside
+        # rolling_fee_burn for reorg safety (a reorg past the
+        # activation block MUST un-flip this flag and remove the
+        # synthetic entry, or the canonical replay would skip the
+        # seed).  Committed to the state-snapshot root (_TAG_GLOBAL /
+        # _GLOBAL_ROLLING_FEE_BURN_SEEDED) so state-synced nodes
+        # inherit the same flag — otherwise a cold-booted node that
+        # disagreed on whether the seed had fired would compute a
+        # different boosted reward at the next low-supply block and
+        # silently fork.  Same pattern as ``treasury_rebase_applied``.
+        self.rolling_fee_burn_seeded: bool = False
+
         # Validator-registration-burn hard fork
         # (VALIDATOR_REGISTRATION_BURN_HEIGHT): set of entity_ids that
         # have paid the one-time registration burn OR were grandfathered
