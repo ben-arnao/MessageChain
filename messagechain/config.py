@@ -2072,6 +2072,66 @@ UNBONDING_PERIOD_POST_EXTENSION = (
     EVIDENCE_EXPIRY_BLOCKS + EVIDENCE_MATURITY_BLOCKS + 144
 )
 
+# ═════════════════════════════════════════════════════════════════════
+# FORK SCHEDULE — operator deployment reference
+# ═════════════════════════════════════════════════════════════════════
+#
+# All shipped hard forks and their canonical activation ordering.
+# Every ``*_HEIGHT`` constant below is a placeholder; OPERATORS MUST
+# rewrite these to concrete coordinated values before deploy.  The
+# published schedule preserves all inter-fork dependencies and spaces
+# forks ≥1,000 blocks apart so each is observable and debuggable in
+# isolation.  All heights land before ``BOOTSTRAP_END_HEIGHT = 105,192``
+# so fork activity stays inside the bootstrap window.
+#
+#   Tier 1 — Safety defenses (no dependencies):
+#     50,000  UNBONDING_PERIOD_EXTENSION_HEIGHT
+#     52,000  TREASURY_CAP_TIGHTEN_HEIGHT
+#     54,000  FINALITY_VOTE_CAP_HEIGHT
+#     56,000  SEED_STAKE_CEILING_HEIGHT
+#
+#   Tier 2 — Economic re-sizing:
+#     60,000  MIN_STAKE_RAISE_HEIGHT
+#     62,000  LOTTERY_BOUNTY_RAISE_HEIGHT
+#     64,000  FEE_INCLUDES_SIGNATURE_HEIGHT
+#
+#   Tier 3 — Treasury + divestment (REDIST depends on RETUNE):
+#     68,000  TREASURY_REBASE_HEIGHT
+#     72,000  SEED_DIVESTMENT_RETUNE_HEIGHT
+#     74,000  SEED_DIVESTMENT_REDIST_HEIGHT
+#
+#   Tier 4 — Reward mechanics (depend on MIN_STAKE raise):
+#     78,000  ATTESTER_REWARD_SPLIT_HEIGHT
+#     80,000  ATTESTER_FEE_FUNDING_HEIGHT
+#     82,000  FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
+#     84,000  ATTESTER_REWARD_CAP_HEIGHT
+#     86,000  ATTESTER_CAP_FIX_HEIGHT
+#
+#   Tier 5 — Deflation defense:
+#     90,000  DEFLATION_FLOOR_HEIGHT      (v1: 2× reward, legacy)
+#     92,000  DEFLATION_FLOOR_V2_HEIGHT   (v2: fee-responsive rebate)
+#
+#   Tier 6 — Sybil defense (depends on MIN_STAKE raise):
+#     96,000  VALIDATOR_REGISTRATION_BURN_HEIGHT
+#
+# Dependency invariants (enforced via load-time asserts where
+# declared):
+#   * SEED_DIVESTMENT_REDIST_HEIGHT  >= SEED_DIVESTMENT_RETUNE_HEIGHT
+#   * VALIDATOR_REGISTRATION_BURN_HEIGHT > MIN_STAKE_RAISE_HEIGHT
+#   * All heights < BOOTSTRAP_END_HEIGHT (105,192)
+#   * All heights > current_tip_height + 50,000 at deploy time
+#     (honest-node upgrade runway)
+#
+# DEPLOY CHECKLIST
+#   1. Confirm current tip leaves ≥50,000 blocks of runway before Tier 1.
+#   2. If runway is short, shift the whole schedule upward by a constant
+#      — preserve ordering and spacing.
+#   3. Edit every ``*_HEIGHT`` constant below to match the schedule.
+#   4. Run ``python -m unittest discover tests/`` — must stay fully green.
+#   5. Coordinate binary rollout: all honest validators on the fork-aware
+#      build before the earliest activation height.
+# ═════════════════════════════════════════════════════════════════════
+
 # Activation height for the unbonding-period extension (hard fork).
 # Pre-activation, ``get_unbonding_period(h)`` returns the legacy
 # 1008-block value so historical replay is deterministic.  At/after
@@ -2079,11 +2139,9 @@ UNBONDING_PERIOD_POST_EXTENSION = (
 # In-flight unstakes queued before activation keep their originally
 # scheduled ``release_block`` — we never rewrite pending entries.
 #
-# Operators MUST replace this placeholder with a concrete
-# coordinated-fork height before deploying to mainnet; the current
-# value is chosen as "current_height + 50_000" headroom so honest
-# nodes have time to upgrade (matches the convention used for
-# ``FEE_INCLUDES_SIGNATURE_HEIGHT``).
+# Per the FORK SCHEDULE above: Tier 1, target 50,000.  Current
+# value is a placeholder — operators MUST replace with a concrete
+# coordinated-fork height before deploying to mainnet.
 UNBONDING_PERIOD_EXTENSION_HEIGHT = 50_000
 
 # Module-level alias: the SAFE value.  Callers that read
