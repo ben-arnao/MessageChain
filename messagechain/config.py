@@ -328,19 +328,24 @@ NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
 #
-# Mainnet re-minted 2026-04-22 after the inclusion_list_violation_evidence_txs
-# and signed-custody-proof wire-format additions made bb01094-pinned
-# blocks undecodable by the new Block.from_bytes — the live validator
-# crash-looped on the first block read with "Block blob truncated".
-# Same founder key, same 5M+95M allocation, new hash.  Previous hashes
-# (all abandoned):
+# Mainnet re-minted 2026-04-22 after the witnessed-submission consensus
+# integration (block-level ack aggregation + state-snapshot integration)
+# changed block/state wire format yet again.  The 5c31a346 pin produced
+# under an earlier wire format never matched the genesis hash of any
+# code that actually shipped to the validator.  Same founder key, same
+# 5M+95M allocation, new hash.  Previous hashes (all abandoned):
 #   5e8bc19ccd4449... (2026-04-18 original launch)
 #   53a1ce6217436b... (2026-04-20 post state-root-checkpoint)
 #   5d37dd1c4b2603... (2026-04-20 post archive rewards + censorship)
 #   bb0109432744d1... (2026-04-21 post bogus_rejection_evidence_txs)
+#   5c31a3460698c4... (2026-04-22 stale: minted on ec6ce67, pinned in
+#                      a deploy that never started — code moved past it)
+#   5019f38d570cfe... (2026-04-22 stale: minted on e3431b3, never
+#                      pinned because state_snapshot v11->v12 / new
+#                      witnessed-submission landed before pin commit)
 _TESTNET_GENESIS_HASH: bytes | None = None
 _MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "5c31a3460698c4c3b48df0cd2b64b200617857b93c674ec7b24aac2b5519f67c"
+    "9458c6dbcbc1850fa7320c64a004ee8a17c6418dfa1eed5bbdb16d9eac8b15ec"
 )
 
 
