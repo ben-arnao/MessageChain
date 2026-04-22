@@ -68,9 +68,28 @@ def _mini_block(txs, block_number=1):
     }
 
 
+_ENTITY_POOL: list = []
+
+
+def _entity(i):
+    """Tiny-tree entity factory.  tree_height=2 => 4 WOTS+ leaves
+    per entity, plenty for tests that sign exactly 1 proof per
+    entity.  Keeps test runtime bounded as we need 30+ entities
+    for the lottery-fairness coverage tests."""
+    from messagechain.identity.identity import Entity
+    while len(_ENTITY_POOL) <= i:
+        seed = f"widen-{len(_ENTITY_POOL)}".encode().ljust(32, b"\x00")
+        _ENTITY_POOL.append(Entity.create(seed, tree_height=2))
+    return _ENTITY_POOL[i]
+
+
 def _make_proof(prover_byte, block):
+    """Signed proof bound to entity from module-scoped pool keyed by
+    prover_byte.  Distinct prover_bytes map to distinct Entities
+    (and therefore distinct derived prover_ids) — same uniqueness
+    semantics as the old bytes-prefix identifier."""
     return build_custody_proof(
-        prover_id=bytes([prover_byte]) * 32,
+        entity=_entity(prover_byte),
         target_height=block["block_number"],
         target_block_hash=block["block_hash"],
         header_bytes=block["header_bytes"],
@@ -166,13 +185,13 @@ class TestDeterministicLottery(unittest.TestCase):
 
     def test_selection_is_not_submission_order_fcfs(self):
         """The STRONGEST test: with 30 submitters and cap=10, strict
-        FCFS would always pick provers 1-10 (first 10 in the list).
+        FCFS would always pick the first 10 in submission order.
         Deterministic lottery should almost never pick exactly that
         set.  Run a few different seeds and assert at least one seed
         produces a different winner set than the fast-connection
         bias.
         """
-        fcfs_winners = {bytes([i + 1]) * 32 for i in range(10)}
+        fcfs_winners = {p.prover_id for p in self.proofs[:10]}
         seen_non_fcfs = False
         for i in range(5):
             pool = ArchiveRewardPool(); pool.fund(1_000_000)

@@ -40,6 +40,22 @@ from messagechain.consensus.archive_challenge import (
 )
 
 
+# Iteration 3f: proofs are now signed and require an Entity.  Module-
+# scoped entity pool with small WOTS+ trees (16 leaves per entity)
+# handles multiple tests sharing a single entity slot — test methods
+# in the same class reuse `self.entity = _test_entity(0)` across
+# setUp, each signing consumes one leaf.
+_ENTITY_POOL: list = []
+
+
+def _test_entity(i: int):
+    from messagechain.identity.identity import Entity
+    while len(_ENTITY_POOL) <= i:
+        seed = f"ac-test-{len(_ENTITY_POOL)}".encode().ljust(32, b"\x00")
+        _ENTITY_POOL.append(Entity.create(seed, tree_height=4))
+    return _ENTITY_POOL[i]
+
+
 def _h(b: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, b).digest()
 
@@ -139,12 +155,13 @@ class TestProofVerify(unittest.TestCase):
         # Build a 6-tx block — merkle_root over 6 hashes with padding.
         self.txs = [f"tx-{i}".encode() * 20 for i in range(6)]
         self.block = _mini_block(self.txs, block_number=7)
-        self.prover_id = b"\xaa" * 32
+        self.entity = _test_entity(0)
+        self.prover_id = self.entity.keypair.public_key  # legacy attr
 
     def test_build_and_verify_valid_proof(self):
         """A proof built over a real block position verifies."""
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -162,7 +179,7 @@ class TestProofVerify(unittest.TestCase):
     def test_verify_rejects_wrong_tx_bytes(self):
         """Flipping tx bytes invalidates the leaf hash -> merkle path fails."""
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -178,7 +195,7 @@ class TestProofVerify(unittest.TestCase):
     def test_verify_rejects_wrong_tx_index(self):
         """Claiming tx_index=0 with the bytes from tx_index=3 fails path check."""
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -194,7 +211,7 @@ class TestProofVerify(unittest.TestCase):
     def test_verify_rejects_forged_merkle_path(self):
         """Replacing a sibling in the path invalidates inclusion."""
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -214,7 +231,7 @@ class TestProofVerify(unittest.TestCase):
     def test_verify_rejects_stale_header(self):
         """Header bytes that don't hash to expected_block_hash fail."""
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -231,7 +248,7 @@ class TestProofVerify(unittest.TestCase):
 
     def test_verify_rejects_wrong_target_height(self):
         proof = build_custody_proof(
-            prover_id=self.prover_id,
+            entity=self.entity,
             target_height=self.block["block_number"],
             target_block_hash=self.block["block_hash"],
             header_bytes=self.block["header_bytes"],
@@ -253,7 +270,7 @@ class TestProofEmptyBlock(unittest.TestCase):
     def test_build_and_verify_empty_block(self):
         block = _mini_block([], block_number=3)
         proof = build_custody_proof(
-            prover_id=b"\x01" * 32,
+            entity=_test_entity(1),
             target_height=block["block_number"],
             target_block_hash=block["block_hash"],
             header_bytes=block["header_bytes"],
@@ -347,7 +364,7 @@ class TestArchiveRewardPool(unittest.TestCase):
 class TestFCFSCap(unittest.TestCase):
     def _proof(self, prover_byte: int, block):
         return build_custody_proof(
-            prover_id=bytes([prover_byte]) * 32,
+            entity=_test_entity(prover_byte),
             target_height=block["block_number"],
             target_block_hash=block["block_hash"],
             header_bytes=block["header_bytes"],
@@ -430,7 +447,7 @@ class TestEmptyPoolGraceful(unittest.TestCase):
         block = _mini_block([f"t{i}".encode() * 10 for i in range(3)], 5)
         proofs = [
             build_custody_proof(
-                prover_id=bytes([i + 1]) * 32,
+                entity=_test_entity(i + 1),
                 target_height=block["block_number"],
                 target_block_hash=block["block_hash"],
                 header_bytes=block["header_bytes"],
@@ -457,7 +474,7 @@ class TestEmptyPoolGraceful(unittest.TestCase):
         block = _mini_block([f"t{i}".encode() * 10 for i in range(3)], 5)
         proofs = [
             build_custody_proof(
-                prover_id=bytes([i + 1]) * 32,
+                entity=_test_entity(i + 1),
                 target_height=block["block_number"],
                 target_block_hash=block["block_hash"],
                 header_bytes=block["header_bytes"],

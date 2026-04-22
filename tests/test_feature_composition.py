@@ -172,12 +172,14 @@ def _make_receipt_subtree_keypair(seed_tag: bytes, height: int = 4) -> KeyPair:
 
 
 def _build_proof_for_challenge(
-    chain: Blockchain, prover_id: bytes, challenge_block_number: int,
+    chain: Blockchain, prover, challenge_block_number: int,
 ) -> CustodyProof:
     """Construct a valid CustodyProof answering the challenge at H.
 
-    Caller must ensure `chain.height >= challenge_block_number` so the
-    parent block exists in the chain list.
+    `prover` may be an Entity (signed mode, chain path) or raw bytes
+    (legacy unsigned mode, tests that exercise rejection).  Caller
+    must ensure `chain.height >= challenge_block_number` so the parent
+    block exists in the chain list.
     """
     parent = chain.get_block(challenge_block_number - 1)
     if parent is None:
@@ -194,8 +196,7 @@ def _build_proof_for_challenge(
     header_bytes = (
         target.header.signable_data() + target.header.randao_mix
     )
-    return build_custody_proof(
-        prover_id=prover_id,
+    kwargs = dict(
         target_height=target.header.block_number,
         target_block_hash=target.block_hash,
         header_bytes=header_bytes,
@@ -204,6 +205,9 @@ def _build_proof_for_challenge(
         tx_bytes=b"",
         all_tx_hashes=[],
     )
+    if isinstance(prover, (bytes, bytearray)):
+        return build_custody_proof(prover_id=bytes(prover), **kwargs)
+    return build_custody_proof(entity=prover, **kwargs)
 
 
 def _sign_evidence_tx(
@@ -425,7 +429,7 @@ class TestSameBlockStew(_HarnessMixin, unittest.TestCase):
         )
 
         etx = _sign_evidence_tx(a_sub, receipt, mtx)
-        proof = _build_proof_for_challenge(chain_a, a_off.entity_id, next_h)
+        proof = _build_proof_for_challenge(chain_a, a_off, next_h)
 
         pool_before = chain_a.archive_reward_pool
         staked_before = chain_a.supply.staked.get(a_off.entity_id, 0)
@@ -540,7 +544,7 @@ class TestMaturityAtChallengeHeight(_HarnessMixin, unittest.TestCase):
         while chain_a.height < mature_h:
             self._add_empty_block(chain_a, pos, a_off)
 
-        proof = _build_proof_for_challenge(chain_a, a_off.entity_id, mature_h)
+        proof = _build_proof_for_challenge(chain_a, a_off, mature_h)
         block = chain_a.propose_block(
             pos, a_off, [], custody_proofs=[proof],
         )
@@ -616,7 +620,7 @@ class TestSlashThenPay(_HarnessMixin, unittest.TestCase):
         expected_slash = compute_slash_amount(stake_before)
         self.assertGreater(expected_slash, 0)
 
-        proof = _build_proof_for_challenge(chain, off.entity_id, mature_h)
+        proof = _build_proof_for_challenge(chain, off, mature_h)
         block = chain.propose_block(
             pos, off, [], custody_proofs=[proof],
         )
@@ -919,7 +923,7 @@ class TestInvalidProofPoisonsBlock(_HarnessMixin, unittest.TestCase):
 
         etx = _sign_evidence_tx(sub, receipt, mtx)
 
-        good_proof = _build_proof_for_challenge(chain, off.entity_id, next_h)
+        good_proof = _build_proof_for_challenge(chain, off, next_h)
         bad_proof = CustodyProof(
             prover_id=good_proof.prover_id,
             target_height=good_proof.target_height,
