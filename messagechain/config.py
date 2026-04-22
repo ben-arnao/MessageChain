@@ -2413,6 +2413,55 @@ assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
 FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 50_000
 
 # ─────────────────────────────────────────────────────────────────────
+# Finality-vote apply-path clamp (defense-in-depth, hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# `_validate_finality_votes` already rejects blocks whose
+# finality_votes list exceeds MAX_FINALITY_VOTES_PER_BLOCK, and rejects
+# duplicates on (signer_entity_id, target_block_number) within a single
+# block.  Under the post-FINALITY_REWARD_FROM_ISSUANCE_HEIGHT direct-
+# mint path, however, any validation drift that let an oversize block
+# through would mint one token per vote with NO treasury check — an
+# unbacked-supply failure.
+#
+# This fork adds a SECOND-LAYER hard cap inside `_apply_finality_votes`
+# itself so the mint loop stops at MAX_FINALITY_VOTES_PER_BLOCK even
+# if validation was bypassed or drifted.  Belt-and-suspenders against
+# a single bug class.  At/after FINALITY_VOTE_CAP_HEIGHT the apply-
+# path clamp is authoritative.  Pre-activation the legacy (validation-
+# only) path applies byte-for-byte.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.
+FINALITY_VOTE_CAP_HEIGHT = 70_000
+
+# ─────────────────────────────────────────────────────────────────────
+# Seed-validator stake ceiling (founder re-stake defense, hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# SEED_DIVESTMENT_END_HEIGHT (block 315,576) terminates the forced
+# divestment schedule with the founder's seed entity_id locked at
+# SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE (= 20M) staked tokens.
+# Nothing in the legacy StakeTransaction validation prevents the
+# founder from ACCUMULATING tokens externally (purchases, unstake-
+# then-transfer, OTC) and re-staking them — i.e. the entire dilution
+# the divestment schedule produced can be silently undone by a normal
+# stake tx that pushes the seed back above 20M.
+#
+# Fix: at/after SEED_STAKE_CEILING_HEIGHT, any StakeTransaction whose
+# entity_id is in `seed_entity_ids` is rejected when
+# `current_stake + stake_amount > SEED_MAX_STAKE_CEILING`.  Seeds may
+# still stake UP TO the ceiling (top-up after unstake, re-enter after
+# full exit) and may freely unstake any amount — they simply cannot
+# exceed the post-divestment retention floor.
+#
+# Non-seed validators are unaffected by this gate.  The ceiling is
+# PERMANENT: it does not lift after END — that's the point.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.
+SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 20_000_000
+SEED_STAKE_CEILING_HEIGHT = 70_000
+
+# ─────────────────────────────────────────────────────────────────────
 # Supply-responsive issuance floor (deflation anchor, hard fork)
 # ─────────────────────────────────────────────────────────────────────
 # Steady-state burn math under the shipped fixes is net-deflationary:

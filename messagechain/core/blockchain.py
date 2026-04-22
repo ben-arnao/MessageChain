@@ -4778,11 +4778,29 @@ class Blockchain:
         from messagechain.config import (
             FINALITY_VOTE_INCLUSION_REWARD, TREASURY_ENTITY_ID,
             FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
+            MAX_FINALITY_VOTES_PER_BLOCK, FINALITY_VOTE_CAP_HEIGHT,
         )
         block_height = block.header.block_number
         fork_active = block_height >= FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
+        # Apply-path clamp (defense-in-depth, FINALITY_VOTE_CAP_HEIGHT
+        # fork).  `_validate_finality_votes` is the first line of
+        # defense: it rejects oversize blocks outright.  But under the
+        # post-FINALITY_REWARD_FROM_ISSUANCE fork direct-mint path,
+        # every vote beyond the cap would mint unbacked supply if
+        # validation were bypassed (re-apply with drift, test-harness
+        # skip, future refactor bug).  At/after
+        # FINALITY_VOTE_CAP_HEIGHT the apply loop itself refuses to
+        # process more than MAX_FINALITY_VOTES_PER_BLOCK entries.
+        # Pre-activation the legacy uncapped loop is preserved byte-
+        # for-byte for historical replay.
+        apply_cap_active = block_height >= FINALITY_VOTE_CAP_HEIGHT
         # 1+2: per-vote bounty and watermark
-        for v in votes:
+        for vote_idx, v in enumerate(votes):
+            if apply_cap_active and vote_idx >= MAX_FINALITY_VOTES_PER_BLOCK:
+                # Extras dropped on the apply side.  Honest operators
+                # never reach here — validation rejected the block
+                # first.  This branch only fires on validation drift.
+                break
             self._bump_watermark(v.signer_entity_id, v.signature.leaf_index)
             if FINALITY_VOTE_INCLUSION_REWARD <= 0:
                 continue
@@ -4818,8 +4836,12 @@ class Blockchain:
         # target block so a validator who has since unstaked can
         # still be counted for finalizing a block they voted for.
         # Fall back to live staked map for very old targets whose
-        # snapshot was pruned.
-        for v in votes:
+        # snapshot was pruned.  Apply-path clamp (FINALITY_VOTE_CAP_HEIGHT
+        # fork) also truncates this loop so a block that slipped past
+        # validation cannot inflate the checkpoint-vote tally either.
+        for vote_idx, v in enumerate(votes):
+            if apply_cap_active and vote_idx >= MAX_FINALITY_VOTES_PER_BLOCK:
+                break
             pinned = self._stake_snapshots.get(v.target_block_number)
             stake_map = pinned if pinned is not None else dict(self.supply.staked)
             signer_stake = stake_map.get(v.signer_entity_id, 0)
@@ -5884,6 +5906,38 @@ class Blockchain:
                     f"tokens, below the raised floor {current_floor}. "
                     f"Grandfathered sub-floor validators may fully exit "
                     f"(unstake to 0) but cannot partially top up."
+                )
+
+        # Seed stake ceiling (SEED_STAKE_CEILING_HEIGHT fork).  Without
+        # this gate, after SEED_DIVESTMENT_END_HEIGHT drains the
+        # founder's seed to the 20M retention floor, nothing prevents
+        # the founder from buying / recovering tokens externally and
+        # re-staking them back above 20M — silently undoing the
+        # divestment's dilution effect.  At/after activation, any stake
+        # tx whose entity is in `seed_entity_ids` is rejected when the
+        # resulting stake would exceed SEED_MAX_STAKE_CEILING (= 20M).
+        # Seeds may still stake UP TO 20M and unstake freely; the
+        # ceiling is permanent and does not lift after END.  Non-seed
+        # validators are unaffected.  Pre-activation: no ceiling check
+        # (legacy behavior, byte-for-byte historical replay).
+        from messagechain.config import (
+            SEED_STAKE_CEILING_HEIGHT, SEED_MAX_STAKE_CEILING,
+        )
+        if (
+            apply_height >= SEED_STAKE_CEILING_HEIGHT
+            and stx.entity_id in self.seed_entity_ids
+        ):
+            current_staked = self.supply.get_staked(stx.entity_id)
+            resulting_staked = current_staked + stx.amount
+            if resulting_staked > SEED_MAX_STAKE_CEILING:
+                return False, (
+                    f"Seed stake ceiling: seed entity "
+                    f"{stx.entity_id.hex()[:16]} stake would land at "
+                    f"{resulting_staked} tokens, above the permanent "
+                    f"seed ceiling {SEED_MAX_STAKE_CEILING}. Seeds may "
+                    f"stake up to the ceiling but never exceed it — "
+                    f"prevents founder re-stake from undoing the "
+                    f"divestment dilution."
                 )
 
         spent_so_far = pending_balance_spent.get(stx.entity_id, 0)
