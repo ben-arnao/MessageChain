@@ -2091,12 +2091,81 @@ ATTESTER_COMMITTEE_TARGET_SIZE = 128
 # coordinated-fork height before deploying to mainnet.
 TREASURY_REBASE_HEIGHT = 50_000
 TREASURY_REBASE_BURN_AMOUNT = 33_000_000  # 40M - 33M = 7M ≈ 5% of 140M
-TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # 1% per-epoch cap (basis points)
+TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # LEGACY — see get_treasury_max_spend_bps_per_epoch
 TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
+
+# Treasury spend-rate cap tightening (hard fork).
+#
+# The original per-epoch cap of 100 bps (1%) was introduced in the
+# treasury-rebase fork as a supermajority-proof ceiling on governance
+# spends.  With 525.6 epochs/year (52,560 blocks / 100 blocks per
+# epoch) compounding a max-rate spend drains the treasury to
+# (1 - 0.01)^526 ≈ 0.5% of starting balance in ~1 year — i.e. the cap
+# as written permits a near-total drain inside a year, defeating its
+# purpose as a safeguard against a governance-captured treasury.
+#
+# Post-seed-divestment founder stake is ~14% of supply liquid + ~60%
+# pre-retune stake → founder individually approaches the 2/3
+# supermajority threshold and IS governance.  The spend-rate cap is
+# the last line of defense between founder and treasury, so it must
+# survive a year of uninterrupted max-vote governance.
+#
+# Two-layer cap (both must pass; either binding rejects the spend):
+#   1. Per-epoch cap tightens 100 bps -> 10 bps (0.1%).  Annual
+#      compounded worst case: (1 - 0.001)^526 ≈ 0.59 → 41% drainable
+#      per year on its own.  Still not great; gated by layer 2.
+#   2. Absolute annual ceiling TREASURY_MAX_SPEND_BPS_PER_YEAR = 500
+#      (5% of the current treasury balance) measured over a rolling
+#      52,560-block window (365.25 days at BLOCK_TIME_TARGET=600s).
+#      Max drain: 5%/year compounded → treasury halves in ~14 years
+#      under continuous max-vote governance, not 1 year.
+#
+# At block_height >= TREASURY_CAP_TIGHTEN_HEIGHT:
+#   * Per-epoch cap reads via get_treasury_max_spend_bps_per_epoch
+#     and returns 10 bps instead of 100.
+#   * Annual cap is enforced at every treasury_spend.  Pre-activation
+#     the annual cap is effectively infinity (disabled); post-
+#     activation a spend whose addition to the rolling-window total
+#     would exceed 5% of the current treasury balance is rejected.
+#
+# Operators MUST replace the TREASURY_CAP_TIGHTEN_HEIGHT placeholder
+# (50_000) with a concrete coordinated-fork height before deploying
+# to mainnet; the placeholder follows the "current_height + 50_000"
+# convention shared with the other pending forks.
+TREASURY_MAX_SPEND_BPS_PER_EPOCH_POST_TIGHTEN = 10    # 0.1% per 100-block epoch
+TREASURY_MAX_SPEND_BPS_PER_YEAR = 500                 # 5% per rolling-year window
+TREASURY_SPEND_CAP_YEAR_BLOCKS = 52_560               # 365 days at 600s (≈1yr)
+TREASURY_CAP_TIGHTEN_HEIGHT = 50_000                  # activation placeholder
+
+
+def get_treasury_max_spend_bps_per_epoch(block_height: int) -> int:
+    """Return the per-epoch treasury spend cap in effect at ``block_height``.
+
+    Hard-fork-gated: pre-activation returns the legacy 100 bps (1%)
+    value so pre-fork chain state is reproducible; at/after activation
+    returns the tightened 10 bps (0.1%) value.
+
+    Used by SupplyTracker.treasury_spend at spend time.  Pre-activation
+    callers (or callers that pass current_block < activation) get byte-
+    identical behavior to the pre-fork cap.
+    """
+    if block_height >= TREASURY_CAP_TIGHTEN_HEIGHT:
+        return TREASURY_MAX_SPEND_BPS_PER_EPOCH_POST_TIGHTEN
+    return TREASURY_MAX_SPEND_BPS_PER_EPOCH
+
 
 assert TREASURY_REBASE_BURN_AMOUNT < TREASURY_ALLOCATION, (
     "TREASURY_REBASE_BURN_AMOUNT cannot exceed TREASURY_ALLOCATION — "
     "rebase would underflow the genesis treasury."
+)
+assert TREASURY_MAX_SPEND_BPS_PER_EPOCH_POST_TIGHTEN < TREASURY_MAX_SPEND_BPS_PER_EPOCH, (
+    "post-tighten per-epoch cap must be STRICTLY tighter than legacy"
+)
+assert TREASURY_MAX_SPEND_BPS_PER_YEAR > 0 and TREASURY_MAX_SPEND_BPS_PER_YEAR <= 10_000, (
+    "annual cap must be a positive basis-point value <= 100%"
+)
+assert TREASURY_SPEND_CAP_YEAR_BLOCKS > TREASURY_SPEND_CAP_EPOCH_BLOCKS, (
+    "annual rolling window must cover multiple epochs"
 )
 
 # ─────────────────────────────────────────────────────────────────────

@@ -1217,6 +1217,18 @@ class Blockchain:
         self.supply.lottery_prize_pool = int(
             snap.get("lottery_prize_pool", 0),
         )
+        # Treasury cap-tightening rolling-window debit list
+        # (TREASURY_CAP_TIGHTEN_HEIGHT hard fork).  Consensus-visible
+        # list driving the annual 5%-of-balance ceiling on
+        # treasury_spend.  A state-synced node that inherits a stale
+        # list would mis-compute the rolling-window sum at the next
+        # governance spend and silently diverge; the list is
+        # committed to the snapshot root under _TAG_TREASURY_ROLLING
+        # for state-sync parity.
+        self.supply._treasury_spend_rolling_debits = [
+            (int(h), int(a))
+            for (h, a) in snap.get("treasury_spend_rolling_debits", [])
+        ]
 
         # Archive-duty state (v6+).  All three fields participate in
         # the state root, so a bootstrapping node inherits them from
@@ -8134,6 +8146,15 @@ class Blockchain:
             "treasury_spend_debited_this_epoch": (
                 self.supply._treasury_spend_debited_this_epoch
             ),
+            # Cap-tightening hard fork: rolling-window debit list.
+            # Reorg that undoes a post-cap-tighten spend block MUST
+            # revert the appended entry, or the canonical replay
+            # computes a different annual total and two nodes diverge
+            # at the next spend.  Copy the list (tuples are immutable
+            # so a shallow copy is safe against subsequent mutation).
+            "treasury_spend_rolling_debits": list(
+                self.supply._treasury_spend_rolling_debits,
+            ),
             # Seed-divestment lottery redistribution (hard fork):
             # pool of lottery-share tokens accumulated from divested
             # founder stake, awaiting reputation-weighted-lottery
@@ -8239,6 +8260,17 @@ class Blockchain:
         self.supply._treasury_spend_debited_this_epoch = snapshot.get(
             "treasury_spend_debited_this_epoch", 0,
         )
+        # Cap-tightening rolling-window debit list.  Default to empty
+        # so pre-fork snapshots restore cleanly (no post-tighten
+        # spends ever occurred).  Materialize as tuples (the snapshot
+        # might have list-of-lists from a round-trip) so equality
+        # comparisons with freshly-built lists work uniformly.
+        self.supply._treasury_spend_rolling_debits = [
+            (int(h), int(a))
+            for (h, a) in snapshot.get(
+                "treasury_spend_rolling_debits", [],
+            )
+        ]
         # Lottery prize pool — reorg rollback restores the pre-reorg
         # accumulation / drain state so the canonical replay produces
         # identical payouts.  Default 0 so pre-fork snapshots restore

@@ -152,7 +152,19 @@ from messagechain.config import (
 #      a different amount on the next non-empty inclusion list and
 #      fork silently.  Binary layout: bytes→int dict appended after
 #      lottery_prize_pool.  Tag: _TAG_COVERAGE_MISSES.
-STATE_SNAPSHOT_VERSION = 10  # wire format version for encode/decode
+# v11: added treasury_spend_rolling_debits — rolling-window list of
+#      (block_height, debit_amount) tuples tracking post-cap-tighten
+#      treasury spends.  Drives the annual 5%-of-balance ceiling in
+#      SupplyTracker.treasury_spend (TREASURY_CAP_TIGHTEN_HEIGHT hard
+#      fork).  MUST participate in the snapshot root: a state-synced
+#      node that inherited a stale list would mis-compute the annual
+#      rolling total and accept a spend that a replaying node rejects
+#      (or vice-versa), silently forking at the next governance
+#      treasury spend.  Section tag _TAG_TREASURY_ROLLING — entries
+#      sorted by (height, amount) for deterministic hashing.  Binary
+#      layout: u32 count followed by count × (u32 height, u64 amount)
+#      tuples, appended after attester_coverage_misses.
+STATE_SNAPSHOT_VERSION = 11  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -239,6 +251,14 @@ _TAG_ARCHIVE_STREAK = b"adstreak"    # bytes→int success streak
 # counter would compute different burn amounts at the next
 # inclusion-list cycle and silently fork.  bytes→int dict.
 _TAG_COVERAGE_MISSES = b"covmiss"
+# v11: treasury per-spend rolling-window debit list — drives the
+# annual 5%-ceiling in SupplyTracker.treasury_spend under the
+# TREASURY_CAP_TIGHTEN_HEIGHT hard fork.  Section hashes each
+# (block_height, amount) tuple as a leaf, sorted by (height, amount)
+# for determinism.  MUST participate in the state root: a state-
+# synced node that inherited a stale list would mis-compute the
+# rolling-window total and silently fork at the next treasury spend.
+_TAG_TREASURY_ROLLING = b"trroll"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -390,6 +410,19 @@ def serialize_state(blockchain) -> dict:
         "attester_coverage_misses": dict(
             getattr(blockchain, "attester_coverage_misses", {})
         ),
+        # v11: treasury per-spend rolling-window debit list.  List
+        # of (block_height, debit_amount) tuples tracking every
+        # post-cap-tighten spend within the last
+        # TREASURY_SPEND_CAP_YEAR_BLOCKS.  Drives the annual 5%
+        # ceiling.  Normalize to tuple-of-ints so round-trips from
+        # blob-decoded dicts (which may carry lists of lists) still
+        # compare / serialize the same.
+        "treasury_spend_rolling_debits": [
+            (int(h), int(a))
+            for (h, a) in getattr(
+                blockchain.supply, "_treasury_spend_rolling_debits", [],
+            )
+        ],
     }
 
 
@@ -555,6 +588,12 @@ def deserialize_state(snapshot: dict) -> dict:
     # starts with an empty pool, exactly matching a replaying node
     # that reaches REDIST with no prior accumulation.
     out.setdefault("lottery_prize_pool", 0)
+    # Pre-v10 snapshots lack the treasury rolling-window debit list.
+    # Default to empty: the list only accumulates post-cap-tighten,
+    # and a migrating chain that activates cap-tightening after a
+    # pre-v10 snapshot starts with an empty window, matching a
+    # replaying node that reaches activation with no prior spends.
+    out.setdefault("treasury_spend_rolling_debits", [])
     return out
 
 
@@ -617,6 +656,31 @@ def _merkle(leaves: list[bytes]) -> bytes:
             for i in range(0, len(layer), 2)
         ]
     return layer[0]
+
+
+def _treasury_rolling_leaves(tag: bytes, entries) -> list[bytes]:
+    """Build sorted leaves for the treasury rolling-debit section.
+
+    The section value is a LIST of (height, amount) tuples rather
+    than a dict or set, so it cannot go through _entries_for_section
+    (which only handles keyed containers).  Each tuple hashes as
+        HASH( tag || u64_be(height) || u64_be(amount) )
+    and the leaves are sorted by (height, amount) lexicographic
+    order so two nodes with the same multiset of debits compute the
+    same section root regardless of insertion order.
+
+    Duplicate (height, amount) pairs are permitted in principle (no
+    protocol rule disallows two same-block spends with the same
+    amount to different recipients, though the per-epoch cap makes
+    it unlikely).  Duplicates hash to the same leaf bytes, which is
+    fine — the Merkle shape handles repeats deterministically.
+    """
+    leaves: list[bytes] = []
+    for (h, a) in sorted(entries):
+        leaves.append(
+            _h(tag + struct.pack(">QQ", int(h), int(a))),
+        )
+    return leaves
 
 
 def compute_state_root(snapshot: dict) -> bytes:
@@ -738,6 +802,20 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_COVERAGE_MISSES: _merkle(_entries_for_section(
             _TAG_COVERAGE_MISSES,
             snap.get("attester_coverage_misses", {}))),
+        # v11: treasury per-spend rolling-window debit list.  Each
+        # entry is hashed as a leaf with deterministic encoding
+        # (u64 height || u64 amount); entries sorted by (height,
+        # amount) to stabilize ordering independent of insertion
+        # order.  MUST participate in the root — a state-synced node
+        # that inherited a stale list would mis-compute the annual
+        # rolling total and silently fork at the next governance
+        # treasury spend.
+        _TAG_TREASURY_ROLLING: _merkle(
+            _treasury_rolling_leaves(
+                _TAG_TREASURY_ROLLING,
+                snap["treasury_spend_rolling_debits"],
+            ),
+        ),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -941,6 +1019,47 @@ def _decode_int_bytes_dict(blob: bytes, off: int) -> tuple[dict, int]:
     return out, off
 
 
+def _encode_rolling_debits(entries) -> bytes:
+    """Deterministic binary encoding of a treasury rolling-debit list.
+
+    Wire layout:
+        u32 count
+        count × (u32 height, u64 amount) tuple
+
+    Heights fit in u32: TREASURY_SPEND_CAP_YEAR_BLOCKS = 52,560 is
+    tiny, but the entry's height is an absolute block_height which
+    can go past 2^32 over chain life (≈4.3B blocks × 600s ≈ 82,000
+    years — safe margin but not infinite).  Chosen over u64 purely
+    to keep the per-entry size small (12 bytes vs 16).
+
+    Entries sorted by (height, amount) ascending to match the
+    section-root layout, producing byte-identical blobs for two
+    nodes that agree on the multiset regardless of insertion order.
+    """
+    out = bytearray()
+    sorted_entries = sorted(entries)
+    out += struct.pack(">I", len(sorted_entries))
+    for (h, a) in sorted_entries:
+        # Clamp-check so a malformed list (height overflow) surfaces
+        # as a struct.error at snapshot time rather than silently
+        # wrapping.  Height is defense-in-depth; amount is bounded
+        # by total_supply (< 2^64) so u64 is already ample.
+        out += struct.pack(">IQ", int(h), int(a))
+    return bytes(out)
+
+
+def _decode_rolling_debits(blob: bytes, off: int) -> tuple[list, int]:
+    """Inverse of _encode_rolling_debits.  Returns (list, new_off)."""
+    (n,) = struct.unpack_from(">I", blob, off)
+    off += 4
+    out: list[tuple[int, int]] = []
+    for _ in range(n):
+        (h, a) = struct.unpack_from(">IQ", blob, off)
+        off += 12
+        out.append((int(h), int(a)))
+    return out, off
+
+
 def encode_snapshot(snap: dict) -> bytes:
     """Deterministic binary encoding of a snapshot dict.
 
@@ -979,6 +1098,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <optional struct>   archive_active_snapshot        (v7+)
         <bytes→int  dict>   validator_archive_success_streak (v8+)
         u64                 lottery_prize_pool              (v9+)
+        <rolling-debit list> treasury_spend_rolling_debits  (v10+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1048,6 +1168,14 @@ def encode_snapshot(snap: dict) -> bytes:
     # (bytes→int dict).  Strictly appended after v9's lottery_prize_pool
     # so a v9 blob is a strict prefix of a v10 blob.
     out += _encode_bytes_int_dict(snap.get("attester_coverage_misses", {}))
+    # v11: treasury per-spend rolling-window debit list, a variable-
+    # length list of (block_height, amount) tuples.  Strictly
+    # appended after the v10 dict so a v10 blob is a strict prefix
+    # of a v11 blob.  Bounded entry count: pre-cap-tighten only
+    # RETUNE-era spends accumulate (zero pre-activation);
+    # post-tighten at most ~525 spends/year given the 100-block
+    # epoch × 1-spend-per-epoch worst case.
+    out += _encode_rolling_debits(snap["treasury_spend_rolling_debits"])
     return bytes(out)
 
 
@@ -1135,6 +1263,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # v10+: per-attester coverage-divergence leak miss counter.
     # Always present on v10+ blobs.
     attester_coverage_misses, off = _decode_bytes_int_dict(blob, off)
+    # v11+: treasury per-spend rolling-window debit list.  Always
+    # present on v11+ blobs.  Pre-v11 blobs cannot reach here — the
+    # strict version check above rejects them.
+    treasury_spend_rolling_debits, off = _decode_rolling_debits(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1178,4 +1310,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         ),
         "lottery_prize_pool": lottery_prize_pool,
         "attester_coverage_misses": attester_coverage_misses,
+        "treasury_spend_rolling_debits": treasury_spend_rolling_debits,
     }

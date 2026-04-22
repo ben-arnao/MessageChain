@@ -82,6 +82,25 @@ class SupplyTracker:
         self._treasury_spend_epoch_start: int = -1
         self._treasury_spend_debited_this_epoch: int = 0
 
+        # Treasury cap-tightening hard fork
+        # (TREASURY_CAP_TIGHTEN_HEIGHT): rolling list of
+        # (block_height, debit_amount) tuples recording every
+        # treasury_spend debit observed at/after activation.  At each
+        # post-activation spend the list is pruned to entries whose
+        # block_height is within the trailing
+        # TREASURY_SPEND_CAP_YEAR_BLOCKS window, summed, and checked
+        # against TREASURY_MAX_SPEND_BPS_PER_YEAR of the current
+        # treasury balance.  Bounded size: pre-tighten the per-epoch
+        # cap produces at most ~525 entries/year (one spend per
+        # 100-block epoch × 526 epochs/year window).
+        #
+        # Consensus-visible state: snapshotted alongside the other
+        # treasury-cap bookkeeping and committed to the state root
+        # so state-synced nodes inherit the identical rolling total
+        # — otherwise a cold-booted node would accept a post-sync
+        # spend that a replaying node rejects.
+        self._treasury_spend_rolling_debits: list[tuple[int, int]] = []
+
         # Seed-divestment lottery-redistribution hard fork
         # (SEED_DIVESTMENT_REDIST_HEIGHT): consensus-visible scalar
         # pool that accumulates the 45% "lottery" share of each
@@ -629,13 +648,22 @@ class SupplyTracker:
         **Spend-rate cap (hard fork, active at
         block_height >= TREASURY_REBASE_HEIGHT)**: a single epoch of
         TREASURY_SPEND_CAP_EPOCH_BLOCKS blocks may debit at most
-        TREASURY_MAX_SPEND_BPS_PER_EPOCH / 10_000 of the treasury
-        balance (measured at spend time).  The cap is a hard gate —
-        even a supermajority-approved governance proposal that would
-        exceed it is rejected.  Callers that pass `current_block=None`
-        (legacy tests, off-chain introspection) bypass the cap for
-        back-compat, matching the legacy-rule pattern used by
-        `verify_transaction(current_height=None)`.
+        get_treasury_max_spend_bps_per_epoch(block_height) / 10_000 of
+        the treasury balance (measured at spend time).  The cap is a
+        hard gate — even a supermajority-approved governance proposal
+        that would exceed it is rejected.  Callers that pass
+        `current_block=None` (legacy tests, off-chain introspection)
+        bypass the cap for back-compat, matching the legacy-rule
+        pattern used by `verify_transaction(current_height=None)`.
+
+        **Cap-tightening hard fork (block_height >=
+        TREASURY_CAP_TIGHTEN_HEIGHT)**: in addition to the tightened
+        per-epoch cap (100 bps -> 10 bps), an absolute annual ceiling
+        of TREASURY_MAX_SPEND_BPS_PER_YEAR / 10_000 (5%) of the
+        current treasury balance is enforced over a rolling
+        TREASURY_SPEND_CAP_YEAR_BLOCKS (52,560 blocks ≈ 365.25 days)
+        window.  BOTH caps must pass; either binding rejects the
+        spend.  Pre-tightening the annual cap is effectively infinity.
         """
         if amount <= 0:
             return False
@@ -650,11 +678,15 @@ class SupplyTracker:
         # no-op.  Imports deferred to avoid a config import cycle on
         # module load.
         cap_active = False
+        annual_cap_active = False
         if current_block is not None:
             from messagechain.config import (
                 TREASURY_REBASE_HEIGHT,
-                TREASURY_MAX_SPEND_BPS_PER_EPOCH,
                 TREASURY_SPEND_CAP_EPOCH_BLOCKS,
+                TREASURY_CAP_TIGHTEN_HEIGHT,
+                TREASURY_MAX_SPEND_BPS_PER_YEAR,
+                TREASURY_SPEND_CAP_YEAR_BLOCKS,
+                get_treasury_max_spend_bps_per_epoch,
             )
             if current_block >= TREASURY_REBASE_HEIGHT:
                 cap_active = True
@@ -667,17 +699,50 @@ class SupplyTracker:
                     # New epoch — roll the rolling window forward.
                     self._treasury_spend_epoch_start = epoch_start
                     self._treasury_spend_debited_this_epoch = 0
-                # Cap is 1% of CURRENT treasury balance, so as the
-                # treasury shrinks over time the cap shrinks with it
-                # — no permanent "spend budget" frozen at fork time.
+                # Cap is a bps fraction of CURRENT treasury balance,
+                # so as the treasury shrinks over time the cap shrinks
+                # with it — no permanent "spend budget" frozen at fork
+                # time.  Post-tighten the bps is 10 (0.1%); pre-tighten
+                # it is the legacy 100 (1%).
+                epoch_bps = get_treasury_max_spend_bps_per_epoch(
+                    current_block,
+                )
                 treasury_balance = self.get_balance(TREASURY_ENTITY_ID)
                 epoch_cap = (
                     treasury_balance
-                    * TREASURY_MAX_SPEND_BPS_PER_EPOCH
+                    * epoch_bps
                     // 10_000
                 )
                 already = self._treasury_spend_debited_this_epoch
                 if already + debit_total > epoch_cap:
+                    return False
+
+            # Annual rolling-window cap (cap-tightening hard fork).
+            # Only enforced at/after TREASURY_CAP_TIGHTEN_HEIGHT; pre-
+            # activation the annual ceiling is infinity so legacy
+            # behavior is byte-preserved.  Checked AFTER the per-epoch
+            # cap so the error mode is deterministic — per-epoch
+            # violations fail first.  Prune happens unconditionally
+            # once activated so operator-driven long pauses between
+            # spends don't let an outdated stale entry re-enter the
+            # window.
+            if current_block >= TREASURY_CAP_TIGHTEN_HEIGHT:
+                annual_cap_active = True
+                window_start = current_block - TREASURY_SPEND_CAP_YEAR_BLOCKS
+                self._treasury_spend_rolling_debits = [
+                    (h, a) for (h, a) in self._treasury_spend_rolling_debits
+                    if h >= window_start
+                ]
+                annual_debited = sum(
+                    a for (_, a) in self._treasury_spend_rolling_debits
+                )
+                treasury_balance = self.get_balance(TREASURY_ENTITY_ID)
+                annual_cap = (
+                    treasury_balance
+                    * TREASURY_MAX_SPEND_BPS_PER_YEAR
+                    // 10_000
+                )
+                if annual_debited + debit_total > annual_cap:
                     return False
 
         self.balances[TREASURY_ENTITY_ID] -= debit_total
@@ -687,6 +752,10 @@ class SupplyTracker:
             self.total_burned += new_account_surcharge
         if cap_active:
             self._treasury_spend_debited_this_epoch += debit_total
+        if annual_cap_active:
+            self._treasury_spend_rolling_debits.append(
+                (current_block, debit_total),
+            )
         return True
 
     def burn_from_treasury(self, amount: int) -> bool:

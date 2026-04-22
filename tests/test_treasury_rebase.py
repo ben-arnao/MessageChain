@@ -41,6 +41,25 @@ from messagechain.identity.identity import Entity
 TREASURY = config.TREASURY_ENTITY_ID
 
 
+# The cap-tightening hard fork (TREASURY_CAP_TIGHTEN_HEIGHT) shares
+# the 50_000 placeholder with TREASURY_REBASE_HEIGHT, which would
+# tighten the per-epoch cap from 100 bps -> 10 bps at the same block
+# these legacy tests exercise.  Push the tightening past any height
+# reached here so the legacy 1% cap semantics this file covers
+# remain byte-identical.  Mirrors the setUpModule pattern used by
+# the seed-divestment legacy test files under
+# SEED_DIVESTMENT_RETUNE_HEIGHT.
+_ORIG_CAP_TIGHTEN_HEIGHT = config.TREASURY_CAP_TIGHTEN_HEIGHT
+
+
+def setUpModule():
+    config.TREASURY_CAP_TIGHTEN_HEIGHT = 10 ** 9
+
+
+def tearDownModule():
+    config.TREASURY_CAP_TIGHTEN_HEIGHT = _ORIG_CAP_TIGHTEN_HEIGHT
+
+
 def _entity(tag: bytes) -> Entity:
     return Entity.create(tag.ljust(32, b"\x00"))
 
