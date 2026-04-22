@@ -3314,12 +3314,57 @@ class Blockchain:
         # and the entity isn't yet in sim_public_keys, install it here
         # so the committed state root matches the apply-path mutation
         # (see apply path's "first-spend pubkey install" block above).
+        #
+        # Validator-registration burn hard fork
+        # (VALIDATOR_REGISTRATION_BURN_HEIGHT): a first-time stake post-
+        # activation subtracts an extra VALIDATOR_REGISTRATION_BURN from
+        # the entity's balance BEFORE the stake/fee deduction.  The sim
+        # path must mirror that subtraction or the committed state root
+        # diverges from the apply path at the next first-stake block.
+        # The registered set itself is NOT in the per-block SMT (only
+        # in the snapshot root), so we track it locally just to decide
+        # whether to charge the burn within this sim.  Grandfather
+        # migration at activation height is mirrored by pre-populating
+        # the sim set from self.supply.staked (same logic as
+        # _apply_registration_grandfather).
+        from messagechain.config import (
+            VALIDATOR_REGISTRATION_BURN as _VRB,
+            VALIDATOR_REGISTRATION_BURN_HEIGHT as _VRBH,
+        )
+        _reg_burn_active = block_height >= _VRBH
+        sim_registered = set(self.supply.registered_validators)
+        if (
+            _reg_burn_active
+            and block_height == _VRBH
+            and not self.supply.grandfather_applied
+        ):
+            for _eid, _amt in self.supply.staked.items():
+                if _amt > 0:
+                    sim_registered.add(_eid)
         for stx in (stake_transactions or []):
             if (
                 getattr(stx, "sender_pubkey", b"")
                 and stx.entity_id not in sim_public_keys
             ):
                 sim_public_keys[stx.entity_id] = stx.sender_pubkey
+            # Registration burn mirror.  Aborts the sim for this tx
+            # when the entity lacks balance for stake + burn — matches
+            # _apply_validator_registration_burn's False return in the
+            # apply path, which skips fee + stake + nonce.
+            if (
+                _reg_burn_active
+                and stx.entity_id not in sim_registered
+            ):
+                _required = stx.amount + _VRB
+                if sim_balances.get(stx.entity_id, 0) < _required:
+                    # Apply path skips the tx wholesale — no sim state
+                    # change here either (no balance, nonce, stake, or
+                    # watermark mutation).
+                    continue
+                sim_balances[stx.entity_id] = (
+                    sim_balances.get(stx.entity_id, 0) - _VRB
+                )
+                sim_registered.add(stx.entity_id)
             effective_base_fee = min(current_base_fee, stx.fee)
             tip = stx.fee - effective_base_fee
             new_bal = sim_balances.get(stx.entity_id, 0) - stx.fee - stx.amount
@@ -5886,11 +5931,29 @@ class Blockchain:
             pending_balance_credits.get(stx.entity_id, 0)
             if pending_balance_credits is not None else 0
         )
-        needed = spent_so_far + stx.fee + stx.amount
+        # Validator-registration burn hard fork
+        # (VALIDATOR_REGISTRATION_BURN_HEIGHT): a first-ever stake from
+        # an unregistered entity additionally owes
+        # VALIDATOR_REGISTRATION_BURN at apply-time.  Reject here so a
+        # tx that would drop at apply-time never lands in a validated
+        # block.  Pre-activation: burn=0; grandfathered/re-stake:
+        # already-registered entities pay no burn.
+        from messagechain.config import (
+            VALIDATOR_REGISTRATION_BURN as _VRB_VALIDATE,
+            VALIDATOR_REGISTRATION_BURN_HEIGHT as _VRBH_VALIDATE,
+        )
+        reg_burn = 0
+        if (
+            apply_height >= _VRBH_VALIDATE
+            and stx.entity_id not in self.supply.registered_validators
+        ):
+            reg_burn = _VRB_VALIDATE
+        needed = spent_so_far + stx.fee + stx.amount + reg_burn
         available = self.get_spendable_balance(stx.entity_id) + credited_so_far
         if available < needed:
             return False, (
                 f"Insufficient balance for stake {stx.amount} + fee {stx.fee} "
+                f"(+{reg_burn} registration burn if first-stake) "
                 f"(cumulative with other txs in this block)"
             )
 
@@ -6535,6 +6598,86 @@ class Blockchain:
             return
         self.supply.treasury_rebase_applied = True
 
+    def _apply_validator_registration_burn(
+        self, stx, block_height: int,
+    ) -> bool:
+        """Charge the one-time validator-registration burn on a stake tx.
+
+        Called from the stake-tx apply loop in _apply_block_state BEFORE
+        the fee-payment + stake mutation.  Returns True if the caller
+        should proceed to apply the tx, False if it must abort (the
+        entity lacked balance to cover stake + registration burn).
+
+        Pre-activation: no-op, always returns True.
+
+        Post-activation:
+          * Already-registered entity (or grandfathered): no-op, True.
+          * First-time entity with enough balance: burn
+            VALIDATOR_REGISTRATION_BURN from their balance, decrement
+            total_supply, bump total_burned, add entity to
+            ``registered_validators``.  Returns True.
+          * First-time entity without enough balance (< stake + burn):
+            NO mutation.  Returns False — the caller skips fee payment,
+            nonce bump, and stake application.  The tx is effectively
+            dropped mid-apply the same way a pay_fee_with_burn shortfall
+            drops a tx.
+
+        Option A: a validator that fully unstakes and later re-stakes
+        is still in the registered set and does NOT pay again.  We
+        deliberately do not clear the mark on full unstake.
+        """
+        from messagechain.config import (
+            VALIDATOR_REGISTRATION_BURN,
+            VALIDATOR_REGISTRATION_BURN_HEIGHT,
+        )
+        if block_height < VALIDATOR_REGISTRATION_BURN_HEIGHT:
+            return True
+        if stx.entity_id in self.supply.registered_validators:
+            return True
+        # First registration post-activation: require enough balance for
+        # BOTH stake and the registration burn (validate_stake_tx_in_block
+        # has its own fork-aware pre-check; this is the apply-time
+        # guard that makes the burn safe against a validator that
+        # bypassed validation).
+        required = stx.amount + VALIDATOR_REGISTRATION_BURN
+        if self.supply.get_balance(stx.entity_id) < required:
+            return False
+        # Burn the registration fee from the entity's balance.  This is
+        # a pure burn (not diverted to the attester pool or proposer);
+        # it exists to raise the sybil cost of spawning validators.
+        self.supply.balances[stx.entity_id] = (
+            self.supply.get_balance(stx.entity_id)
+            - VALIDATOR_REGISTRATION_BURN
+        )
+        self.supply.total_supply -= VALIDATOR_REGISTRATION_BURN
+        self.supply.total_burned += VALIDATOR_REGISTRATION_BURN
+        self.supply.registered_validators.add(stx.entity_id)
+        return True
+
+    def _apply_registration_grandfather(self, block_height: int) -> None:
+        """One-shot migration at VALIDATOR_REGISTRATION_BURN_HEIGHT.
+
+        Adds every entity with currently-positive stake to
+        ``registered_validators`` so pre-fork validators are never asked
+        to pay the registration burn post-fork.  Zero-stake entries are
+        skipped — they would have to re-stake from scratch anyway, and
+        a re-stake post-activation correctly triggers the burn.
+
+        Idempotent via ``grandfather_applied``.  Reorg-safe: the flag
+        is snapshotted alongside the set, so a rolled-back migration
+        block rewinds the flag too and the canonical replay re-runs
+        the grandfather cleanly.
+        """
+        from messagechain.config import VALIDATOR_REGISTRATION_BURN_HEIGHT
+        if block_height != VALIDATOR_REGISTRATION_BURN_HEIGHT:
+            return
+        if self.supply.grandfather_applied:
+            return
+        for eid, amt in self.supply.staked.items():
+            if amt > 0:
+                self.supply.registered_validators.add(eid)
+        self.supply.grandfather_applied = True
+
     def _apply_seed_divestment(self, block_height: int) -> None:
         """Forcibly divest the founder's stake DOWN TO the retain floor.
 
@@ -6733,6 +6876,13 @@ class Blockchain:
         # of block below so off-chain callers keep seeing None.
         self.supply._current_block_height = block.header.block_number
 
+        # Validator-registration burn grandfather (hard fork, one-shot
+        # at VALIDATOR_REGISTRATION_BURN_HEIGHT).  Runs BEFORE stake
+        # transactions are processed so a stake tx in the activation
+        # block from a grandfathered entity skips the burn cleanly.
+        # Idempotent via ``grandfather_applied``.
+        self._apply_registration_grandfather(block.header.block_number)
+
         # Count total txs for base fee adjustment
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
 
@@ -6915,6 +7065,21 @@ class Blockchain:
                 self._record_tree_height(stx.entity_id, stx.signature)
                 if self.db is not None:
                     self.db.set_public_key(stx.entity_id, stx.sender_pubkey)
+            # Validator-registration burn hard fork: one-time 10K burn
+            # on a first-ever stake.  Runs BEFORE fee/stake so the
+            # tx aborts cleanly (no fee, no stake, no nonce bump) when
+            # the entity lacks balance to cover stake + burn.  Pre-
+            # activation this is a no-op and returns True
+            # unconditionally.
+            if not self._apply_validator_registration_burn(
+                stx, block.header.block_number,
+            ):
+                logger.error(
+                    f"Stake tx {stx.tx_hash.hex()[:16]} rejected at "
+                    f"apply-time: entity cannot cover stake + "
+                    f"registration burn"
+                )
+                continue
             if not self.supply.pay_fee_with_burn(
                 stx.entity_id, proposer_id, stx.fee, current_base_fee,
             ):
@@ -8782,6 +8947,16 @@ class Blockchain:
             # re-fires the burn.  The accompanying balance/total_supply
             # rewind is already captured above.
             "treasury_rebase_applied": self.supply.treasury_rebase_applied,
+            # Validator-registration burn (hard fork): per-entity set of
+            # entity_ids that have paid the one-time burn, plus the
+            # one-shot grandfather-applied flag.  Reorg-safe rewind —
+            # a rolled-back registration block must un-mark the entity
+            # AND un-apply the grandfather (if the activation block was
+            # in the rewound range), or the canonical replay would mis-
+            # charge or mis-skip the burn.  Same pattern as
+            # treasury_rebase_applied above.
+            "registered_validators": set(self.supply.registered_validators),
+            "grandfather_applied": self.supply.grandfather_applied,
             # Treasury per-epoch spend-rate cap bookkeeping — reorg
             # rollback restores the rolling-window state so a
             # cap-approved spend in the re-orged chain gets the same
@@ -8909,6 +9084,15 @@ class Blockchain:
         # (pre-fork) restore cleanly with the rebase not yet applied.
         self.supply.treasury_rebase_applied = snapshot.get(
             "treasury_rebase_applied", False,
+        )
+        # Validator-registration burn tracking.  Defaults match the
+        # __init__ state so pre-fork snapshots restore to a pristine
+        # set (no entity has paid yet, grandfather has not fired).
+        self.supply.registered_validators = set(
+            snapshot.get("registered_validators", set()),
+        )
+        self.supply.grandfather_applied = snapshot.get(
+            "grandfather_applied", False,
         )
         # Treasury spend-rate cap rolling window.  Defaults match the
         # __init__ sentinels so pre-fork snapshots restore to a

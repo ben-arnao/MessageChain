@@ -210,7 +210,19 @@ from messagechain.config import (
 #      `_TAG_NON_RESPONSE_PROCESSED` and `_TAG_WITNESS_ACK_REGISTRY`.
 #      Binary layout (appended strictly after the v13 attester-epoch
 #      sections): bytes-set then bytes→int dict.
-STATE_SNAPSHOT_VERSION = 14  # wire format version for encode/decode
+#
+# v15: Validator-registration burn hard fork
+# (VALIDATOR_REGISTRATION_BURN_HEIGHT).  Adds
+# ``registered_validators`` — the set of entity_ids that have paid
+# the one-time validator-registration burn OR were grandfathered in
+# at activation height.  MUST participate in the snapshot root: a
+# state-synced node that disagreed on this set would charge the
+# burn differently at the next StakeTransaction (post-activation,
+# a first-stake from an unregistered entity burns 10K tokens) and
+# silently fork at that block.  Section tag
+# ``_TAG_REGISTERED_VALIDATORS``.  Binary layout (appended strictly
+# after the v14 witnessed-submission sections): bytes-set.
+STATE_SNAPSHOT_VERSION = 15  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -333,6 +345,16 @@ _TAG_NON_RESPONSE_PROCESSED = b"nrproc"
 # considered met, and silently fork.  Same consensus criticality as
 # _TAG_CENSORSHIP_PROCESSED.
 _TAG_WITNESS_ACK_REGISTRY = b"wack"
+# v15: validator-registration burn tracking — set of entity_ids that
+# have paid the one-time validator-registration burn OR were
+# grandfathered in at VALIDATOR_REGISTRATION_BURN_HEIGHT.  Consulted
+# by the stake-tx apply path: post-activation, a StakeTransaction
+# from an entity not in this set burns VALIDATOR_REGISTRATION_BURN
+# tokens and adds the entity.  MUST participate in the snapshot
+# root: two state-synced nodes that disagreed on the set would
+# burn/skip the fee differently at the next first-time stake and
+# silently fork.  Same consensus criticality as _TAG_SLASHED.
+_TAG_REGISTERED_VALIDATORS = b"regval"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -537,6 +559,17 @@ def serialize_state(blockchain) -> dict:
         # `validate_non_response_evidence_tx`.
         "witness_ack_registry": dict(
             getattr(blockchain, "witness_ack_registry", {})
+        ),
+        # v15: Registered-validators set — entity_ids that have paid
+        # the one-time validator-registration burn (or were
+        # grandfathered at activation).  Consulted by the stake-tx
+        # apply path post-VALIDATOR_REGISTRATION_BURN_HEIGHT to
+        # decide whether a first stake triggers the burn.  MUST
+        # participate in the state root so state-synced nodes and
+        # replaying nodes compute the same burn amount at the next
+        # first-time stake.
+        "registered_validators": set(
+            getattr(blockchain.supply, "registered_validators", set())
         ),
     }
 
@@ -758,6 +791,12 @@ def deserialize_state(snapshot: dict) -> dict:
     # callers that hand-build snapshot dicts.)
     out.setdefault("non_response_processed", set())
     out.setdefault("witness_ack_registry", {})
+    # Pre-v15 snapshots lack the registered-validators set.  Migrating
+    # chains start with an empty set — matches a replaying node that
+    # reaches VALIDATOR_REGISTRATION_BURN_HEIGHT with the grandfather
+    # step still pending.  Binary decode populates this strictly so
+    # the default only affects in-memory hand-built snapshot dicts.
+    out.setdefault("registered_validators", set())
     return out
 
 
@@ -1003,6 +1042,16 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_WITNESS_ACK_REGISTRY: _merkle(_entries_for_section(
             _TAG_WITNESS_ACK_REGISTRY,
             snap["witness_ack_registry"])),
+        # v15: Registered-validators set — entity_ids that have paid
+        # the one-time validator-registration burn (or were
+        # grandfathered at VALIDATOR_REGISTRATION_BURN_HEIGHT).  Two
+        # state-synced nodes that disagreed on this set would
+        # burn/skip the fee differently at the next first-time stake
+        # and silently fork.  Same dedupe-determinism criticality as
+        # _TAG_SLASHED.
+        _TAG_REGISTERED_VALIDATORS: _merkle(_entries_for_section(
+            _TAG_REGISTERED_VALIDATORS,
+            snap["registered_validators"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -1300,6 +1349,7 @@ def encode_snapshot(snap: dict) -> bytes:
         u64                 attester_epoch_earnings_start +1 (v12+)
         <bytes set>         non_response_processed         (v14+)
         <bytes→int  dict>   witness_ack_registry           (v14+)
+        <bytes set>         registered_validators          (v15+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1393,6 +1443,10 @@ def encode_snapshot(snap: dict) -> bytes:
     # iteration order (sorted tag bytes — `nrproc` < `wack`).
     out += _encode_bytes_set(snap["non_response_processed"])
     out += _encode_bytes_int_dict(snap["witness_ack_registry"])
+    # v15: Registered-validators set, strictly appended after the v14
+    # witness-ack registry so a v14 blob is a strict prefix of a v15
+    # blob through the end of v14's final field.
+    out += _encode_bytes_set(snap["registered_validators"])
     return bytes(out)
 
 
@@ -1499,6 +1553,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # processed-then-registry.
     non_response_processed, off = _decode_bytes_set(blob, off)
     witness_ack_registry, off = _decode_bytes_int_dict(blob, off)
+    # v15+: Registered-validators set.  Always present on v15+ blobs.
+    # Pre-v15 blobs cannot reach here — the strict version check
+    # above rejects them.
+    registered_validators, off = _decode_bytes_set(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1547,4 +1605,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "attester_epoch_earnings_start": attester_epoch_earnings_start,
         "non_response_processed": non_response_processed,
         "witness_ack_registry": witness_ack_registry,
+        "registered_validators": registered_validators,
     }

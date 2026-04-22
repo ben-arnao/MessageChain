@@ -178,6 +178,34 @@ class SupplyTracker:
         self.attester_epoch_earnings: dict[bytes, int] = {}
         self.attester_epoch_earnings_start: int = -1
 
+        # Validator-registration-burn hard fork
+        # (VALIDATOR_REGISTRATION_BURN_HEIGHT): set of entity_ids that
+        # have paid the one-time registration burn OR were grandfathered
+        # in at activation.  Consult this on every stake-tx apply path:
+        #   * post-activation, if stx.entity_id not in this set, charge
+        #     VALIDATOR_REGISTRATION_BURN against the entity's balance
+        #     (reducing total_supply + incrementing total_burned) and
+        #     add the entity to this set.
+        #   * if the entity IS in the set, no burn — Option A: once
+        #     registered, always registered.  A full-unstake / re-stake
+        #     cycle does NOT re-burn.
+        #
+        # Consensus-visible state.  Snapshotted alongside balances /
+        # staked for reorg safety and committed to the state root (see
+        # state_snapshot.py _TAG_REGISTERED_VALIDATORS).  Pre-activation
+        # the set stays empty and the apply-path gate is a no-op, so
+        # legacy chain state is reproducible byte-for-byte.
+        self.registered_validators: set[bytes] = set()
+
+        # One-shot grandfather flag for the registration-burn fork:
+        # flipped True the first time _apply_registration_grandfather
+        # runs at VALIDATOR_REGISTRATION_BURN_HEIGHT.  Same reorg-safety
+        # pattern as ``treasury_rebase_applied`` — snapshotted with the
+        # set so a failed reorg that un-applies the grandfather block
+        # also un-flips the flag, letting the canonical replay re-run
+        # the migration cleanly.
+        self.grandfather_applied: bool = False
+
         # Current-block-height tunnel: set by _apply_block_state at
         # block start so pay_fee_with_burn can gate its split without
         # every call site threading an explicit block_height parameter.
