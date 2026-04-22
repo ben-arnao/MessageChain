@@ -2820,6 +2820,7 @@ class Blockchain:
         from messagechain.config import (
             PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
             PROPOSER_REWARD_CAP, TREASURY_ENTITY_ID,
+            ATTESTER_FEE_FUNDING_HEIGHT, ATTESTER_FEE_SHARE_BPS,
         )
         sim_balances = dict(self.supply.balances)
         sim_nonces = dict(self.nonces)
@@ -2836,6 +2837,33 @@ class Blockchain:
         sim_slashed = set(self.slashed_validators)
         current_base_fee = self.supply.base_fee
 
+        # ATTESTER_FEE_FUNDING_HEIGHT hard-fork mirror: the apply path's
+        # pay_fee_with_burn post-activation diverts
+        # `base_fee * ATTESTER_FEE_SHARE_BPS // 10_000` into the
+        # per-block attester-pool accumulator.  The mint step then
+        # reads that accumulator into attester_pool before dividing
+        # across the committee, which mutates sim_balances via the
+        # pro-rata loop below.  Sim must mirror the same accumulation
+        # off every fee-bearing tx type or the state_root diverges
+        # from the apply path at post-activation heights.
+        #
+        # Starts at 0 at block start (apply path resets in
+        # _apply_block_state) and is consumed when the mint sim runs
+        # — same lifecycle as the live accumulator.
+        _attester_fee_pool_active = block_height >= ATTESTER_FEE_FUNDING_HEIGHT
+        sim_attester_fee_pool = 0
+
+        def _accumulate_attester_fee(effective_base_fee: int) -> None:
+            """Accrue the post-activation attester-pool share from a
+            single fee-bearing tx.  No-op pre-activation.  Matches
+            pay_fee_with_burn's integer-division rounding exactly."""
+            if not _attester_fee_pool_active:
+                return
+            nonlocal sim_attester_fee_pool
+            sim_attester_fee_pool += (
+                effective_base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
+            )
+
         def _bump_wm(eid: bytes, leaf_index: int) -> None:
             """Mirror Blockchain._bump_watermark: monotonic next-leaf cursor."""
             nxt = leaf_index + 1
@@ -2849,7 +2877,12 @@ class Blockchain:
             tip = tx.fee - effective_base_fee
             sim_balances[tx.entity_id] = sim_balances.get(tx.entity_id, 0) - tx.fee
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
-            # base_fee is burned — not added to any balance
+            # base_fee is burned — not added to any balance.  Post-
+            # ATTESTER_FEE_FUNDING_HEIGHT, the attester share of the
+            # base_fee accrues into sim_attester_fee_pool instead of
+            # burning; the mint step below drains it into the
+            # committee's balances (see `attester_pool` merge).
+            _accumulate_attester_fee(effective_base_fee)
             sim_nonces[tx.entity_id] = tx.nonce + 1
             _bump_wm(tx.entity_id, tx.signature.leaf_index)
 
@@ -2908,6 +2941,12 @@ class Blockchain:
             # per-entity balance (it's truly destroyed).  The state_root
             # commits only to per-entity state, so we do not need to
             # reflect the burn itself anywhere in the sim state.
+            # ATTESTER_FEE_FUNDING_HEIGHT: base_fee attester-share
+            # accrues for the mint step.  Surcharge is a separate
+            # one-time burn distinct from base_fee and is NOT
+            # diverted to the attester pool — it stays a pure burn
+            # to match pay_fee_with_burn's split scope.
+            _accumulate_attester_fee(effective_base_fee)
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
             _bump_wm(ttx.entity_id, ttx.signature.leaf_index)
 
@@ -2940,6 +2979,9 @@ class Blockchain:
             tip = atx.fee - effective_base_fee
             sim_balances[atx.entity_id] = sim_balances.get(atx.entity_id, 0) - atx.fee
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
+            # ATTESTER_FEE_FUNDING_HEIGHT: mirror attester-pool share
+            # accrual for authority-class txs as well.
+            _accumulate_attester_fee(effective_base_fee)
             if cls_name == "SetAuthorityKeyTransaction":
                 sim_nonces[atx.entity_id] = atx.nonce + 1
                 sim_authority_keys[atx.entity_id] = atx.new_authority_key
@@ -2995,6 +3037,8 @@ class Blockchain:
             sim_balances[stx.entity_id] = max(new_bal, 0)
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             sim_staked[stx.entity_id] = sim_staked.get(stx.entity_id, 0) + stx.amount
+            # ATTESTER_FEE_FUNDING_HEIGHT: accrue attester share.
+            _accumulate_attester_fee(effective_base_fee)
             sim_nonces[stx.entity_id] = stx.nonce + 1
             _bump_wm(stx.entity_id, stx.signature.leaf_index)
 
@@ -3023,6 +3067,8 @@ class Blockchain:
             sim_balances[proposer_id] = sim_balances.get(proposer_id, 0) + tip
             current_staked = sim_staked.get(utx.entity_id, 0)
             sim_staked[utx.entity_id] = max(current_staked - utx.amount, 0)
+            # ATTESTER_FEE_FUNDING_HEIGHT: accrue attester share.
+            _accumulate_attester_fee(effective_base_fee)
             sim_nonces[utx.entity_id] = utx.nonce + 1
             # Hot watermark bumps when the unstake was signed by the hot
             # key (single-key mode) — mirrors _apply_authority_tx's
@@ -3164,6 +3210,14 @@ class Blockchain:
         effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         attester_pool = reward - proposer_share
+
+        # ATTESTER_FEE_FUNDING_HEIGHT: merge the sim-side per-block
+        # attester-fee accumulator into attester_pool.  Mirrors
+        # mint_block_reward exactly.  Sim runs AFTER every tx-side
+        # accumulate step (including the governance sim merge above)
+        # so this reads the block's full accumulation.
+        if _attester_fee_pool_active:
+            attester_pool += sim_attester_fee_pool
 
         # Candidate pool (who attested) with their current stake.  Zero
         # stake is allowed — early-bootstrap validators register without
@@ -3386,6 +3440,15 @@ class Blockchain:
                 k: list(v) for k, v in self.supply.pending_unstakes.items()
             }
             sim_supply.base_fee = current_base_fee
+            # ATTESTER_FEE_FUNDING_HEIGHT: the sim-local accumulator
+            # (sim_attester_fee_pool) tracks the message/transfer/
+            # auth/stake/unstake/evidence paths via _accumulate_
+            # attester_fee.  sim_supply is a separate copy used for
+            # governance-tx fees; start its accumulator at 0 so the
+            # "already accrued for this block" amount doesn't double-
+            # count when we merge the governance delta back into
+            # sim_attester_fee_pool after phase 1 below.
+            sim_supply.attester_fee_pool_this_block = 0
 
             sim_tracker = _copy.deepcopy(self.governance)
 
@@ -3401,6 +3464,7 @@ class Blockchain:
                     continue
                 sim_supply.pay_fee_with_burn(
                     sender, proposer_id, gtx.fee, sim_supply.base_fee,
+                    block_height=block_height,
                 )
                 _bump_wm(sender, gtx.signature.leaf_index)
                 if isinstance(gtx, (ProposalTransaction,
@@ -3438,21 +3502,48 @@ class Blockchain:
             # Read the post-governance state back into sim_* for state_root
             sim_balances = dict(sim_supply.balances)
             sim_staked = dict(sim_supply.staked)
+            # ATTESTER_FEE_FUNDING_HEIGHT: merge the governance-phase
+            # accumulator back into the sim-local so the mint step
+            # sees the combined across-tx-types total (matches apply
+            # path: every pay_fee_with_burn in _apply_block_state
+            # accrues into the same SupplyTracker.attester_fee_pool_
+            # this_block regardless of which code path it was called
+            # from).
+            if _attester_fee_pool_active:
+                sim_attester_fee_pool += sim_supply.attester_fee_pool_this_block
 
         # Simulate finality votes.  Two side effects touch the state
         # root:
-        #   a) treasury → proposer bounty of FINALITY_VOTE_INCLUSION_REWARD
-        #      per vote (capped at available treasury balance)
+        #   a) pre-FINALITY_REWARD_FROM_ISSUANCE_HEIGHT: treasury →
+        #      proposer bounty of FINALITY_VOTE_INCLUSION_REWARD per
+        #      vote (capped at available treasury balance).
+        #      Post-activation: reward is minted directly and credited
+        #      to the proposer (treasury untouched).  The mint itself
+        #      does not show in the per-entity state tree (total_supply
+        #      / total_minted are global scalars) — only the
+        #      proposer's balance delta is reflected here.
         #   b) signer's leaf watermark bumps to (leaf_index + 1)
         # Must byte-mirror _apply_finality_votes or honest validators
         # will reject otherwise-valid blocks with a state_root mismatch.
         if finality_votes:
             from messagechain.config import (
                 FINALITY_VOTE_INCLUSION_REWARD as _FVR,
+                FINALITY_REWARD_FROM_ISSUANCE_HEIGHT as _FRFIH,
             )
+            _finality_fork_active = block_height >= _FRFIH
             for fv in finality_votes:
                 _bump_wm(fv.signer_entity_id, fv.signature.leaf_index)
-                if _FVR > 0:
+                if _FVR <= 0:
+                    continue
+                if _finality_fork_active:
+                    # Post-fork: mint path — proposer balance grows,
+                    # treasury untouched.  total_supply / total_minted
+                    # live outside the per-entity state tree so no
+                    # additional mutation is modeled here.
+                    sim_balances[proposer_id] = (
+                        sim_balances.get(proposer_id, 0) + _FVR
+                    )
+                else:
                     _tbal = sim_balances.get(TREASURY_ENTITY_ID, 0)
                     _payout = min(_FVR, _tbal)
                     if _payout > 0:
@@ -3679,6 +3770,8 @@ class Blockchain:
             sim_balances[proposer_id] = (
                 sim_balances.get(proposer_id, 0) + tip
             )
+            # ATTESTER_FEE_FUNDING_HEIGHT: accrue attester share.
+            _accumulate_attester_fee(effective_base_fee)
             _bump_wm(etx.submitter_id, etx.signature.leaf_index)
             # Track newly-admitted evidence so a subsequent same-block
             # etx with the same evidence_hash is rejected by the
@@ -3766,6 +3859,8 @@ class Blockchain:
             sim_balances[proposer_id] = (
                 sim_balances.get(proposer_id, 0) + tip
             )
+            # ATTESTER_FEE_FUNDING_HEIGHT: accrue attester share.
+            _accumulate_attester_fee(effective_base_fee)
             _bump_wm(etx.submitter_id, etx.signature.leaf_index)
             sim_br_processed.add(etx.evidence_hash)
 
@@ -4178,10 +4273,15 @@ class Blockchain:
         validated at this point (validate_block already ran); here we
         just:
 
-          1. Credit FINALITY_VOTE_INCLUSION_REWARD from the treasury
-             entity to the proposer for each vote included.  If the
-             treasury is short, we simply pay what the treasury has —
-             keeps this from ever producing negative balances.
+          1. Credit FINALITY_VOTE_INCLUSION_REWARD to the proposer for
+             each vote included.  Post-FINALITY_REWARD_FROM_ISSUANCE_
+             HEIGHT hard fork the reward is MINTED directly (bumps
+             total_supply and total_minted) — no treasury interaction,
+             so a drained or cap-saturated treasury cannot starve
+             finality.  Pre-activation the legacy path persists:
+             debit from the treasury, fall back to paying whatever
+             the treasury has (including 0) so historical replay
+             stays byte-for-byte correct.
           2. Bump the signer's leaf watermark (a finality vote
              consumes a WOTS+ leaf just like any other signed
              artifact; observable on chain).
@@ -4198,11 +4298,33 @@ class Blockchain:
             return
         from messagechain.config import (
             FINALITY_VOTE_INCLUSION_REWARD, TREASURY_ENTITY_ID,
+            FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
         )
+        block_height = block.header.block_number
+        fork_active = block_height >= FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
         # 1+2: per-vote bounty and watermark
         for v in votes:
             self._bump_watermark(v.signer_entity_id, v.signature.leaf_index)
-            if FINALITY_VOTE_INCLUSION_REWARD > 0:
+            if FINALITY_VOTE_INCLUSION_REWARD <= 0:
+                continue
+            if fork_active:
+                # Post-fork: mint the reward directly.  Bumps
+                # total_supply AND total_minted so the end-of-apply
+                # supply-invariant assertion (total_supply ==
+                # GENESIS_SUPPLY + total_minted - total_burned) holds.
+                # Annual cost at FINALITY_INTERVAL=100 and ~100
+                # validators ≈ 52,600 tokens/year ≈ 0.038% of 140M
+                # supply — trivial next to block issuance.
+                self.supply.total_supply += FINALITY_VOTE_INCLUSION_REWARD
+                self.supply.total_minted += FINALITY_VOTE_INCLUSION_REWARD
+                self.supply.balances[proposer_id] = (
+                    self.supply.balances.get(proposer_id, 0)
+                    + FINALITY_VOTE_INCLUSION_REWARD
+                )
+            else:
+                # Pre-fork legacy: treasury-spend with silent
+                # zero-fallback.  Preserved byte-for-byte for
+                # historical replay.
                 treasury_bal = self.supply.balances.get(TREASURY_ENTITY_ID, 0)
                 payout = min(FINALITY_VOTE_INCLUSION_REWARD, treasury_bal)
                 if payout > 0:
@@ -6029,6 +6151,17 @@ class Blockchain:
         # archive reward pool.  See docs/proof-of-custody-archive-
         # rewards.md.
         self.supply.fee_burn_this_block = 0
+        # Same for the attester-pool fee-funding accumulator
+        # (ATTESTER_FEE_FUNDING_HEIGHT hard fork).  Must reset here —
+        # even though mint_block_reward zeroes it on its way out — so
+        # a re-apply of the same block, or a block where mint is
+        # skipped for some reason, can't leak prior accumulation.
+        self.supply.attester_fee_pool_this_block = 0
+        # Expose the current block height to pay_fee_with_burn via the
+        # SupplyTracker tunnel so every existing call site gets the
+        # post-activation split without an API break.  Cleared at end
+        # of block below so off-chain callers keep seeing None.
+        self.supply._current_block_height = block.header.block_number
 
         # Count total txs for base fee adjustment
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
@@ -6738,6 +6871,11 @@ class Blockchain:
             f"minted={self.supply.total_minted} - "
             f"burned={self.supply.total_burned}"
         )
+
+        # Clear the current-block-height tunnel so any off-chain
+        # pay_fee_with_burn call between blocks takes the pre-fork
+        # full-burn path.  Tunnel is only live DURING block-apply.
+        self.supply._current_block_height = None
 
     def _apply_archive_rewards(self, block: Block):
         """Redirect fee-burn into archive pool + pay custody-proof rewards.

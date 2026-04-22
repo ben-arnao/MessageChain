@@ -2012,6 +2012,79 @@ assert TREASURY_REBASE_BURN_AMOUNT < TREASURY_ALLOCATION, (
     "rebase would underflow the genesis treasury."
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Attester pool fee-funding (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Latent economic failure in the shipped code: at BLOCK_REWARD=16 the
+# attester pool is 12 tokens; divided across the 128-member committee
+# post-ATTESTER_REWARD_SPLIT_HEIGHT fork, per-slot reward is 12 // 128
+# == 0.  Every committee member gets exactly zero per block.  At the
+# floor (BLOCK_REWARD=4, pool=3, committee=128) it's still 0.  The
+# consensus-critical attestation work is uncompensated.
+#
+# Fix: redirect half of the base-fee BURN into the attester pool.  At
+# MIN_FEE=100 and TARGET_BLOCK_SIZE=10 txs/block, that's ~500 tokens
+# flowing to the 128-member committee per block = ~4 tokens/slot.
+# Real reward, scales with traffic.
+#
+# At/after block_height == ATTESTER_FEE_FUNDING_HEIGHT:
+#   * Every pay_fee_with_burn call splits base_fee into
+#     attester_share = base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
+#     and actual_burn = base_fee - attester_share.  Only
+#     actual_burn increments total_burned and decrements total_supply;
+#     attester_share accrues into a per-block accumulator
+#     (SupplyTracker.attester_fee_pool_this_block).
+#   * In mint_block_reward the accumulator is added to the existing
+#     attester_pool (= reward - proposer_share) before pro-rata
+#     division across the committee.  Integer-division remainder
+#     still burns — no change to the rounding policy.
+#   * The accumulator is reset at the start of every block apply so
+#     it never leaks between blocks.
+#
+# Pre-activation: accumulator always 0; attester pool comes solely
+# from issuance as before.  Byte-for-byte identical to current
+# behavior.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  The height
+# is independent of other *_HEIGHT forks even though it shares the
+# same placeholder value.
+ATTESTER_FEE_SHARE_BPS = 5000           # 50% of base-fee burn → attester pool
+ATTESTER_FEE_FUNDING_HEIGHT = 50_000
+
+# ─────────────────────────────────────────────────────────────────────
+# Finality-vote reward from issuance (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Latent economic failure in the shipped code: the
+# FINALITY_VOTE_INCLUSION_REWARD (1 token per included vote, paid to
+# the block proposer) is debited from the treasury via
+# treasury_spend.  Three failure modes stack:
+#   1. Treasury eventually empties → finality becomes silently
+#      uneconomic (the legacy code falls back to paying what the
+#      treasury has, all the way down to 0).
+#   2. TREASURY_MAX_SPEND_BPS_PER_EPOCH is saturable by combined
+#      governance-spend + finality-reward draws → finality starves.
+#   3. The same cap is being tightened (separately) from 1%/epoch to
+#      0.1%/epoch, making failure mode #2 worse.
+#
+# Fix: at/after ``FINALITY_REWARD_FROM_ISSUANCE_HEIGHT`` the
+# ``FINALITY_VOTE_INCLUSION_REWARD`` is MINTED directly (bumps
+# total_supply and total_minted) and credited to the proposer.  No
+# treasury interaction.  The numeric reward value is unchanged.
+#
+# Annual cost sanity-check: ~100 validators voting every 100 blocks
+# → 1 token/block → 52,600 tokens/year.  At 140M supply that's
+# 0.038%/year additional inflation.  Acceptable.
+#
+# Pre-activation: treasury-spend path preserved byte-for-byte,
+# including the silent zero-fallback when the treasury is short.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  The height
+# is independent of ATTESTER_FEE_FUNDING_HEIGHT even though it
+# shares the same placeholder value.
+FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 50_000
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
