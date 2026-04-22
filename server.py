@@ -1014,8 +1014,17 @@ class Server(SharedRuntimeMixin):
         self.receipt_issuer = None  # ReceiptIssuer for submission receipts
         self._running = False
 
-        # Network protection — must exist before syncer for the offense callback
-        self.ban_manager = PeerBanManager()
+        # Network protection — must exist before syncer for the offense callback.
+        # Ban state persists under data_dir so bans survive restarts; a peer
+        # banned just before an OOM kill or maintenance reboot used to
+        # reconnect fresh. Alongside anchors.json / peer_pins.json.
+        import os as _os_ban
+        _ban_path = (
+            _os_ban.path.join(data_dir, "ban_scores.json")
+            if data_dir
+            else None
+        )
+        self.ban_manager = PeerBanManager(persistence_path=_ban_path)
         self.rate_limiter = PeerRateLimiter()
 
         # Sybil-resistant address manager (was previously dead code)
