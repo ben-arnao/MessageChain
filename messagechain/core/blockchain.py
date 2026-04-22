@@ -6526,8 +6526,9 @@ class Blockchain:
             # committee pubkeys in config.RELEASE_KEY_ROOTS — NOT by any
             # per-entity account — so there is no entity to debit, no
             # fee to collect, no nonce to bump.  Reject on verify
-            # failure; otherwise record if `version` is lexicographically
-            # greater than the current one (or current is None).
+            # failure; otherwise record if `version` is strictly newer
+            # under semver ordering than the current one (or current is
+            # None).
             if not atx.verify():
                 logger.warning(
                     "release manifest rejected: threshold multi-sig "
@@ -6535,15 +6536,25 @@ class Blockchain:
                     atx.tx_hash.hex()[:16],
                 )
                 return
+            # Lazy import — avoids ordering concerns with other modules
+            # that pull blockchain in during bootstrap.
+            from messagechain.core.release_version import (
+                release_version_is_strictly_newer,
+            )
             current = self.latest_release_manifest
-            if current is not None and atx.version <= current.version:
-                # Older-or-equal version — drop silently.  A monotonic
-                # guard prevents a signer committee that later becomes
-                # compromised from quietly downgrading users to an
-                # older (perhaps vulnerable) build.
-                logger.info(
-                    "release manifest skipped: version=%s not newer than "
-                    "current=%s",
+            if current is not None and not release_version_is_strictly_newer(
+                atx.version, current.version,
+            ):
+                # Not strictly newer under semver — drop, but WARN so
+                # operators see the signal.  The old guard used plain
+                # string `<=`, which silently swallowed the 9->10
+                # boundary (e.g. "0.10.0" after "0.9.0") — that was a
+                # silent-data-loss bug.  Emitting a warning here makes
+                # any future mis-signed or replayed manifest visible
+                # rather than invisible.
+                logger.warning(
+                    "release manifest not adopted (not strictly newer): "
+                    "incoming=v%s current=v%s",
                     atx.version, current.version,
                 )
                 return

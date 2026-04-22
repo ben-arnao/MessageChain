@@ -18,6 +18,7 @@ patches them into config.RELEASE_KEY_ROOTS during setUp — the same
 pattern other config-mutating tests use (see test_authority_key.py).
 """
 
+import logging
 import time
 import unittest
 
@@ -336,6 +337,167 @@ class TestReleaseAnnounceBlockWiring(_Base):
             restored.authority_txs[0], ReleaseAnnounceTransaction,
         )
         self.assertEqual(restored.authority_txs[0].version, "1.0.0")
+
+
+class TestReleaseAnnounceVerifySemver(_Base):
+    """verify() must reject a tx whose `version` field isn't strict semver.
+
+    Rationale: without this gate, any bytes that deserialize
+    successfully would land in `Blockchain.latest_release_manifest`,
+    polluting the RPC surface and every operator's boot log.  The
+    wire-format bound on `version` length already caps DoS potential,
+    but semantic validity is the verify layer's job.
+    """
+
+    def _build(self, version, signer_specs=None):
+        base = dict(
+            version=version,
+            binary_hashes=_make_binary_hashes(),
+            min_activation_height=None,
+            release_notes_uri="",
+            severity=0,
+            nonce=b"\x07" * 16,
+            signers=signer_specs or [
+                (0, _SIGNERS[0]), (1, _SIGNERS[1]), (2, _SIGNERS[2]),
+            ],
+        )
+        return create_release_announce_transaction(**base)
+
+    def test_empty_version_fails_verify(self):
+        tx = self._build(version="")
+        self.assertFalse(tx.verify())
+
+    def test_non_triple_version_fails_verify(self):
+        tx = self._build(version="1.2")
+        self.assertFalse(tx.verify())
+
+    def test_leading_zero_version_fails_verify(self):
+        tx = self._build(version="01.0.0")
+        self.assertFalse(tx.verify())
+
+    def test_nonsense_version_fails_verify(self):
+        tx = self._build(version="zzz")
+        self.assertFalse(tx.verify())
+
+    def test_null_byte_in_version_fails_verify(self):
+        tx = self._build(version="9.9.9\x00evil")
+        self.assertFalse(tx.verify())
+
+    def test_oversize_version_fails(self):
+        """A version string longer than the wire cap must be rejected.
+
+        Asserting the outcome (verify returns False OR construction
+        fails upstream), not the specific location — the outer
+        serialization bound may fire first.
+        """
+        huge = "1." + "2" * 100 + ".3"
+        # Either construction / serialization errors, or verify rejects.
+        try:
+            tx = self._build(version=huge)
+        except Exception:
+            return
+        self.assertFalse(tx.verify())
+
+    def test_valid_nine_to_ten_version_verifies(self):
+        """Regression for the lex-compare bug: "0.10.0" must verify."""
+        tx = self._build(version="0.10.0")
+        self.assertTrue(tx.verify())
+
+    def test_valid_prerelease_verifies(self):
+        tx = self._build(version="1.0.0-rc1")
+        self.assertTrue(tx.verify())
+
+
+class TestReleaseAnnounceMonotonicGuard(_Base):
+    """The `latest_release_manifest` monotonic guard uses semver, not lex.
+
+    This is the headline regression: under the old string compare,
+    applying "0.9.0" then "0.10.0" silently left the state slot at
+    "0.9.0" (because "0.10.0" < "0.9.0" in lex order).  The guard now
+    uses `release_version_is_strictly_newer`, so the 10-minor bump
+    takes effect and non-forward-progressing manifests produce a
+    WARNING log (so operators can spot mis-signed / replayed
+    manifests instead of silent data loss).
+    """
+
+    def _mk(self, version, nonce, signers=None):
+        return create_release_announce_transaction(
+            version=version,
+            binary_hashes=_make_binary_hashes(),
+            min_activation_height=None,
+            release_notes_uri="",
+            severity=0,
+            nonce=nonce,
+            signers=signers or [
+                (0, _SIGNERS[0]), (1, _SIGNERS[1]), (2, _SIGNERS[2]),
+            ],
+        )
+
+    def _apply(self, chain, tx):
+        chain._apply_authority_tx(
+            tx, proposer_id=b"\x00" * 32, base_fee=0,
+        )
+
+    def test_9_to_10_minor_bump_is_applied(self):
+        """THE regression test: "0.9.0" then "0.10.0" must land at "0.10.0"."""
+        chain = Blockchain()
+        self._apply(chain, self._mk("0.9.0", b"\x10" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "0.9.0")
+        self._apply(chain, self._mk("0.10.0", b"\x11" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "0.10.0")
+
+    def test_older_does_not_overwrite_newer_and_logs_warning(self):
+        chain = Blockchain()
+        self._apply(chain, self._mk("0.10.0", b"\x12" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "0.10.0")
+
+        with self.assertLogs(
+            "messagechain.core.blockchain", level="WARNING",
+        ) as cm:
+            self._apply(chain, self._mk("0.9.0", b"\x13" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "0.10.0")
+        joined = "\n".join(cm.output)
+        self.assertIn("not adopted", joined.lower())
+        self.assertIn("0.9.0", joined)
+        self.assertIn("0.10.0", joined)
+
+    def test_equal_version_does_not_overwrite_and_logs_warning(self):
+        chain = Blockchain()
+        first = self._mk("1.0.0", b"\x14" * 16)
+        self._apply(chain, first)
+        self.assertIs(chain.latest_release_manifest, first)
+
+        with self.assertLogs(
+            "messagechain.core.blockchain", level="WARNING",
+        ) as cm:
+            self._apply(chain, self._mk("1.0.0", b"\x15" * 16))
+        # Same-version replay: stays pointing at the first tx object.
+        self.assertIs(chain.latest_release_manifest, first)
+        self.assertTrue(
+            any("not adopted" in line.lower() for line in cm.output),
+        )
+
+    def test_release_supersedes_prerelease(self):
+        chain = Blockchain()
+        self._apply(chain, self._mk("1.0.0-rc1", b"\x16" * 16))
+        self.assertEqual(
+            chain.latest_release_manifest.version, "1.0.0-rc1",
+        )
+        self._apply(chain, self._mk("1.0.0", b"\x17" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "1.0.0")
+
+    def test_prerelease_does_not_supersede_release_and_logs(self):
+        chain = Blockchain()
+        self._apply(chain, self._mk("1.0.0", b"\x18" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "1.0.0")
+        with self.assertLogs(
+            "messagechain.core.blockchain", level="WARNING",
+        ) as cm:
+            self._apply(chain, self._mk("1.0.0-rc2", b"\x19" * 16))
+        self.assertEqual(chain.latest_release_manifest.version, "1.0.0")
+        self.assertTrue(
+            any("not adopted" in line.lower() for line in cm.output),
+        )
 
 
 if __name__ == "__main__":

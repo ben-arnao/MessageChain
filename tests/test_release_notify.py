@@ -190,6 +190,58 @@ class TestLogReleaseStatus(unittest.TestCase):
         # No 'activation' wording when None.
         self.assertNotIn("activation", msg.lower())
 
+    # ── Semver-aware update detection ───────────────────────────
+    def test_nine_to_ten_minor_bump_warns_update_available(self):
+        """Regression for the lex-compare bug: node v0.9.0, manifest v0.10.0
+        MUST surface as an update — under the old lex compare
+        "0.10.0" < "0.9.0", so the helper would have said "running
+        latest" and hidden a real update."""
+        chain = _StubChain(manifest=_manifest(version="0.10.0", severity=0))
+        records = self._get_records(chain, "0.9.0")
+        self.assertEqual(len(records), 1, [r.getMessage() for r in records])
+        self.assertEqual(records[0].levelno, logging.WARNING)
+        msg = records[0].getMessage()
+        self.assertIn("UPDATE AVAILABLE", msg)
+        self.assertIn("v0.10.0", msg)
+        self.assertIn("v0.9.0", msg)
+
+    def test_node_ahead_of_manifest_logs_info(self):
+        """Node v0.10.0 running, manifest announces v0.9.0 — this is a
+        dev build newer than the last announced release.  Should NOT
+        fire UPDATE AVAILABLE; should emit a friendly "ahead" info line."""
+        chain = _StubChain(manifest=_manifest(version="0.9.0", severity=0))
+        records = self._get_records(chain, "0.10.0")
+        self.assertEqual(len(records), 1, [r.getMessage() for r in records])
+        self.assertEqual(records[0].levelno, logging.INFO)
+        msg = records[0].getMessage()
+        self.assertNotIn("UPDATE AVAILABLE", msg)
+        self.assertIn("ahead", msg.lower())
+        self.assertIn("v0.10.0", msg)
+        self.assertIn("v0.9.0", msg)
+
+    def test_equal_versions_log_running_latest(self):
+        """Semver-equal → still "running latest", same as before."""
+        chain = _StubChain(manifest=_manifest(version="0.2.0", severity=0))
+        records = self._get_records(chain, "0.2.0")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].levelno, logging.INFO)
+        self.assertIn("latest announced release", records[0].getMessage().lower())
+
+    def test_unparseable_node_version_falls_back_to_strict_string(self):
+        """If the node's own version string doesn't parse (e.g. a
+        developer build tag), the helper must still surface a real
+        update — fall back to the old string-inequality behavior.
+
+        This is the safety net: we never want a parser edge case to
+        silence an UPDATE AVAILABLE signal.
+        """
+        chain = _StubChain(manifest=_manifest(version="0.2.0", severity=0))
+        records = self._get_records(chain, "weird-local-build")
+        # Falls back: they aren't equal, so UPDATE AVAILABLE.
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].levelno, logging.WARNING)
+        self.assertIn("UPDATE AVAILABLE", records[0].getMessage())
+
 
 # ──────────────────────────────────────────────────────────────
 # 2. RPC handler — get_latest_release
@@ -286,6 +338,56 @@ class TestGetLatestReleaseRPC(unittest.TestCase):
                 resp["result"]["latest_manifest"]["min_activation_height"],
                 value,
             )
+
+    # ── Semver-aware update_available flag ──────────────────────
+    def _call_with_node_version(self, manifest, node_version):
+        """Same as _call() but pin __version__ so we can exercise the
+        update_available semantics without rebuilding the package."""
+        from server import Server
+        import messagechain
+        srv = Server.__new__(Server)
+        srv.blockchain = _StubChain(manifest=manifest)
+        orig = messagechain.__version__
+        try:
+            messagechain.__version__ = node_version
+            return srv._rpc_get_latest_release({})
+        finally:
+            messagechain.__version__ = orig
+
+    def test_update_available_9_to_10_boundary(self):
+        """Node v0.9.0, manifest v0.10.0 → update_available True.
+
+        Regression: under the old `manifest.version != current_version`
+        compare, this returned True only by luck — the inequality
+        happened to hold.  Now we use the semver comparator, and this
+        should stay True (and be True for the *right* reason).
+        """
+        m = _manifest(version="0.10.0", severity=0)
+        resp = self._call_with_node_version(m, "0.9.0")
+        self.assertTrue(resp["result"]["update_available"])
+
+    def test_update_available_false_when_node_ahead(self):
+        """Node v0.10.0, manifest v0.9.0 → update_available False.
+
+        Under the old inequality compare this was True, which is a
+        bug: the operator isn't missing an update, they're a dev
+        build ahead of the last announced release.
+        """
+        m = _manifest(version="0.9.0", severity=0)
+        resp = self._call_with_node_version(m, "0.10.0")
+        self.assertFalse(resp["result"]["update_available"])
+
+    def test_update_available_false_on_equal(self):
+        m = _manifest(version="0.2.0", severity=0)
+        resp = self._call_with_node_version(m, "0.2.0")
+        self.assertFalse(resp["result"]["update_available"])
+
+    def test_update_available_falls_back_when_unparseable(self):
+        """Unparseable node version → fall back to string inequality
+        so a real update signal is never silenced."""
+        m = _manifest(version="0.2.0", severity=0)
+        resp = self._call_with_node_version(m, "weird-local-build")
+        self.assertTrue(resp["result"]["update_available"])
 
 
 # ──────────────────────────────────────────────────────────────

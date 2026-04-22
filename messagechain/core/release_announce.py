@@ -61,6 +61,7 @@ from messagechain.config import (
     validate_sig_version,
     validate_tx_serialization_version,
 )
+from messagechain.core.release_version import parse_release_version
 from messagechain.crypto.keys import Signature, verify_signature
 
 # Domain-separation tag — bound into `_signable_data` so a signature
@@ -236,7 +237,22 @@ class ReleaseAnnounceTransaction:
         # Structural bounds — keep verify O(1) on obvious garbage.
         if len(self.nonce) != _NONCE_SIZE:
             return False
+        # Outer size gate (primary): the wire format itself caps the
+        # version string at RELEASE_ANNOUNCE_VERSION_MAX_LEN.  Re-check
+        # here for objects that bypassed the decoder (tampering tests,
+        # in-memory construction).  An additional inner 64-char cap
+        # inside parse_release_version() is belt-and-suspenders.
         if len(self.version.encode("utf-8")) > RELEASE_ANNOUNCE_VERSION_MAX_LEN:
+            return False
+        # Strict-semver gate: the `version` field must parse as
+        # MAJOR.MINOR.PATCH[-PRERELEASE].  Without this, any bytes
+        # that deserialize successfully would pollute the state slot
+        # (e.g. "zzz" or "9.9.9\x00evil"), and the semver monotonic
+        # guard in blockchain.py would silently skip them — which
+        # would be the old lex-compare bug wearing a disguise.
+        try:
+            parse_release_version(self.version)
+        except ValueError:
             return False
         if len(self.release_notes_uri.encode("utf-8")) > RELEASE_ANNOUNCE_MAX_URI_LEN:
             return False
