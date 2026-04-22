@@ -153,6 +153,31 @@ class SupplyTracker:
         # mint_block_reward).  Byte-for-byte legacy behavior.
         self.attester_fee_pool_this_block: int = 0
 
+        # Per-entity attester-reward cap per epoch hard fork
+        # (ATTESTER_REWARD_CAP_HEIGHT): rolling-epoch bookkeeping for
+        # the PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH limit.
+        # ``attester_epoch_earnings`` tracks per-entity earnings
+        # (bytes→int) inside the current FINALITY_INTERVAL window; it
+        # resets to empty when ``attester_epoch_earnings_start`` no
+        # longer matches the current block's epoch-start.  Rewards
+        # exceeding the per-entity cap BURN rather than crediting
+        # the entity.
+        #
+        # Consensus-visible state: snapshotted alongside the treasury
+        # cap bookkeeping and committed to the state root (see
+        # _TAG_ATTESTER_EPOCH under messagechain/storage/state_snapshot.py)
+        # so a state-synced node computes the identical cap-overflow
+        # burn at the next reward block — otherwise a cold-booted
+        # node that disagreed on per-entity earnings would silently
+        # fork the next mint.
+        #
+        # Sentinel -1 for the start marker sidesteps a real epoch-0
+        # collision; pre-activation the dict stays empty and the
+        # sentinel never changes, giving byte-for-byte legacy
+        # behavior.
+        self.attester_epoch_earnings: dict[bytes, int] = {}
+        self.attester_epoch_earnings_start: int = -1
+
         # Current-block-height tunnel: set by _apply_block_state at
         # block start so pay_fee_with_burn can gate its split without
         # every call site threading an explicit block_height parameter.
@@ -335,15 +360,63 @@ class SupplyTracker:
             # defensive so a future refactor can't silently divide by
             # zero.
             per_slot_reward = (attester_pool // n) if n > 0 else 0
-            for eid in paid_committee:
-                attestor_rewards[eid] = (
-                    attestor_rewards.get(eid, 0) + per_slot_reward
+
+            # ATTESTER_REWARD_CAP_HEIGHT hard fork: enforce a per-
+            # entity cap on epoch-cumulative attester earnings.  Reset
+            # the rolling tracker if the block's epoch boundary differs
+            # from what's recorded.  Cap is computed from THIS block's
+            # attester_pool (a conservative per-block upper bound on
+            # the epoch pool) — at attester_pool=512 and bps=100,
+            # epoch=100, the cap is 512 tokens/entity/epoch.  Overflow
+            # burns.
+            from messagechain.config import (
+                ATTESTER_REWARD_CAP_HEIGHT,
+                PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH,
+                FINALITY_INTERVAL,
+            )
+            cap_active = block_height >= ATTESTER_REWARD_CAP_HEIGHT
+            cap_per_entity = 0
+            if cap_active:
+                epoch_start = (
+                    (block_height // FINALITY_INTERVAL) * FINALITY_INTERVAL
                 )
-                if per_slot_reward > 0:
+                if self.attester_epoch_earnings_start != epoch_start:
+                    self.attester_epoch_earnings_start = epoch_start
+                    self.attester_epoch_earnings = {}
+                # Per-entity cap, in TOKENS, for the full epoch.  Uses
+                # this block's pool as the epoch-pool snapshot —
+                # conservative: every block in the epoch is assumed
+                # to match the current block's pool size.  Real
+                # epochs with varying traffic will over- or under-cap
+                # by a fraction; the cap's purpose is deterrent and
+                # order-of-magnitude correct, not precision-exact.
+                cap_per_entity = (
+                    attester_pool
+                    * PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+                    * FINALITY_INTERVAL
+                    // 10_000
+                )
+
+            for eid in paid_committee:
+                reward_amount = per_slot_reward
+                if cap_active and per_slot_reward > 0:
+                    earned = self.attester_epoch_earnings.get(eid, 0)
+                    available = cap_per_entity - earned
+                    if available < 0:
+                        available = 0
+                    reward_amount = min(per_slot_reward, available)
+                    # Bookkeeping: track credited amount (pre-cap
+                    # overflow) so the tracker reflects ACTUAL
+                    # earnings, not paid-intent.
+                    self.attester_epoch_earnings[eid] = earned + reward_amount
+                attestor_rewards[eid] = (
+                    attestor_rewards.get(eid, 0) + reward_amount
+                )
+                if reward_amount > 0:
                     self.balances[eid] = (
-                        self.balances.get(eid, 0) + per_slot_reward
+                        self.balances.get(eid, 0) + reward_amount
                     )
-                attester_tokens_paid += per_slot_reward
+                attester_tokens_paid += reward_amount
         else:
             # Legacy path: first `max_slots` committee members paid 1
             # token each, rest truncated.  Preserved byte-for-byte for
@@ -386,6 +459,21 @@ class SupplyTracker:
             )
             attestor_rewards[proposer_id] = 0
             burned += proposer_att_reward
+            # ATTESTER_REWARD_CAP_HEIGHT: a PROPOSER_REWARD_CAP
+            # clawback of the proposer's committee slot must ALSO
+            # reverse the epoch-earnings tracker entry — the
+            # proposer never actually retained those tokens, so
+            # they should not count against the per-entity cap in
+            # subsequent blocks.  Pre-cap-activation the tracker is
+            # empty so this is a no-op.
+            if proposer_att_reward > 0 and (
+                self.attester_epoch_earnings.get(proposer_id, 0) > 0
+            ):
+                self.attester_epoch_earnings[proposer_id] = max(
+                    0,
+                    self.attester_epoch_earnings[proposer_id]
+                    - proposer_att_reward,
+                )
             proposer_att_reward = 0
             if proposer_share > effective_cap:
                 burned += proposer_share - effective_cap

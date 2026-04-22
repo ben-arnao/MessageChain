@@ -2315,6 +2315,54 @@ ATTESTER_FEE_SHARE_BPS = 5000           # 50% of base-fee burn → attester pool
 ATTESTER_FEE_FUNDING_HEIGHT = 50_000
 
 # ─────────────────────────────────────────────────────────────────────
+# Per-entity attester-reward cap per epoch (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Belt-and-suspenders defense limiting any single entity's capture of
+# the attester fee+issuance pool.  Attester-fee-funding redirects 50%
+# of base-fee burn to the 128-member committee, distributed pro-rata
+# across committee seats.  Committee selection is stake-weighted, so
+# the largest staker naturally earns a share of the pool proportional
+# to their stake; a 42%-stake founder captures ~42% of per-block
+# attester revenue.  Concentration drift is slow (rewards flow in
+# proportion to existing stake) but external fee-payer outflow still
+# favors large stakers, and a raw cap limits naive large-staker
+# advantage.
+#
+# At block_height >= ATTESTER_REWARD_CAP_HEIGHT:
+#   * Each FINALITY_INTERVAL-block window is a rolling "epoch" for the
+#     purposes of this cap.  SupplyTracker tracks per-entity earnings
+#     from the attester pool in a dict reset at every epoch boundary.
+#   * A per-entity cap of (attester_pool_this_block *
+#     PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH / 10_000 *
+#     FINALITY_INTERVAL) tokens/epoch is enforced at credit time.
+#     (At attester_pool=500, cap ≈ 500 tokens/entity/epoch.  At pool=50
+#     it's ~50; the cap scales with pool volume, not fixed.)
+#   * Rewards beyond the cap BURN — no treasury credit, no carryover.
+#
+# Sybil evasion: to beat the cap a mega-staker must split their stake
+# into sybils, each individually stake-gated by VALIDATOR_MIN_STAKE
+# (10_000 tokens).  A founder with 25M stake can operationally run
+# up to ~100-500 sybils; beyond that, collective capture saturates
+# the pool regardless (25M / 10K = 2500 sybils → cap * 2500 = 25x
+# pool size → pool fully drained via burn).  So the cap either limits
+# direct capture (few sybils) or forces large-staker burn (many
+# sybils) — either way defends decentralization.
+#
+# Pre-activation: cap_active=False; legacy mint path byte-for-byte.
+# Operators MUST replace the placeholder with a coordinated-fork height.
+# Height chosen independently of ATTESTER_FEE_FUNDING_HEIGHT even
+# though they share the placeholder value.
+PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH = 100  # 1% of epoch pool
+# Placeholder above ATTESTER_REWARD_SPLIT_HEIGHT + ATTESTER_FEE_FUNDING_HEIGHT
+# so the cap activates only after pro-rata distribution + fee-funding are
+# live.  Operators MUST replace with a coordinated-fork height.
+ATTESTER_REWARD_CAP_HEIGHT = 60_000
+
+assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
+    "cap must be a positive basis-point fraction <= 100%"
+)
+
+# ─────────────────────────────────────────────────────────────────────
 # Finality-vote reward from issuance (hard fork)
 # ─────────────────────────────────────────────────────────────────────
 # Latent economic failure in the shipped code: the

@@ -740,10 +740,12 @@ class TestSnapshotWireRoundTrip(unittest.TestCase):
     def test_wire_version_at_least_11(self):
         # Originally bumped to v10, but the concurrent coverage-misses
         # fork also claimed v10 — this fork was promoted to v11 at
-        # merge time.  Subsequent forks may have bumped further
-        # (e.g. v12 widened inclusion_list_processed_violations
-        # entries to 96 bytes), so the treasury-cap-tightening fork
-        # only requires the floor is still v11 or higher.
+        # merge time.  Subsequent forks have bumped further
+        # (v12 widened inclusion_list_processed_violations entries
+        # to 96 bytes; v13 added attester_epoch_earnings strict-append
+        # for the PER_VALIDATOR_ATTESTER_REWARD_CAP fork), so the
+        # treasury-cap-tightening fork only requires the floor is
+        # still v11 or higher.
         self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 11)
 
 
