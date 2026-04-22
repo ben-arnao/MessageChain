@@ -1179,8 +1179,18 @@ def is_state_root_checkpoint_block(block_number: int) -> bool:
 # of the fee-burn stream — preserves most of the deflationary pressure
 # while giving archives a meaningful paycheck.
 ARCHIVE_CHALLENGE_INTERVAL = 100
-ARCHIVE_PROOFS_PER_CHALLENGE = 10
-ARCHIVE_REWARD = 1_000
+# Iteration 3e (recommendation 1 from the post-3d audit): widen the
+# paid-archivist surface from ~10 industrial operators per epoch to
+# ~100 distributed ones.  Per-payout reward simultaneously dropped
+# so total per-epoch pool drain (cap × reward = 10,000 tokens) is
+# unchanged — 10× more winners each earning 1/10 as much.
+# Economic-model margins remain wide (~500× storage cost at year
+# 100 for a 1-slot-per-epoch winner).  Pairs with the selection
+# change in apply_archive_rewards: deterministic uniform shuffle
+# replaces strict FCFS, so fast-connection advantage is neutralized
+# among valid submitters.
+ARCHIVE_PROOFS_PER_CHALLENGE = 100
+ARCHIVE_REWARD = 100
 ARCHIVE_SUBMISSION_WINDOW = 100
 ARCHIVE_BURN_REDIRECT_PCT = 25
 # Multi-height sampling: K distinct historical heights challenged per
