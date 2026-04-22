@@ -727,7 +727,9 @@ class TestCheckpointIntervalConst(unittest.TestCase):
         # snapshot Merkle root (partial-divestment-to-floor schedule).
         # v3: bumped when archive_reward_pool was added (proof-of-custody
         # archive rewards).
-        self.assertEqual(STATE_ROOT_VERSION, 3)
+        # v4: bumped when attester_coverage_misses was added (defense
+        # against 1/3-stake AttesterMempoolReport withholding).
+        self.assertEqual(STATE_ROOT_VERSION, 4)
 
 
 class TestMeasureSnapshotSize(unittest.TestCase):

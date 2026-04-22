@@ -1100,7 +1100,13 @@ MAX_STATE_SNAPSHOT_BYTES = 500_000_000
 # v3: added archive_reward_pool (proof-of-custody archive rewards —
 # the pool balance scalar must participate in the root so bootstrapping
 # nodes see the same value as replaying nodes).
-STATE_ROOT_VERSION = 3
+# v4: added attester_coverage_misses section (per-attester
+# consecutive-miss counter for the coverage-divergence inactivity
+# leak — defense against 1/3 AttesterMempoolReport withholding
+# cartels).  Two state-synced nodes that disagreed on the counter
+# would burn different amounts at the next non-empty inclusion list
+# and silently fork.
+STATE_ROOT_VERSION = 4
 
 # ── On-chain state-root checkpoints ──────────────────────────────────
 # Periodic commitments of the full snapshot root into the block header
@@ -1647,6 +1653,56 @@ FINALITY_INACTIVITY_PENALTY = 0       # placeholder — reward-loss, not slashin
 INACTIVITY_LEAK_ACTIVATION_THRESHOLD = 4
 INACTIVITY_PENALTY_QUOTIENT = 16_777_216  # ~2^24
 INACTIVITY_BASE_PENALTY = 1
+
+# ─────────────────────────────────────────────────────────────────────
+# Coverage-divergence inactivity leak — defense against 1/3-cartel
+# selective withholding of AttesterMempoolReports for inclusion lists.
+#
+# Threat: a coordinated minority of validators can defeat the
+# inclusion-list censorship-resistance lever by silently NOT reporting
+# specific tx_hashes from their gossiped AttesterMempoolReports.
+# Because the chain still finalizes (the cartel attests to BLOCKS
+# normally), the existing finalization-based inactivity leak doesn't
+# trigger.  No inclusion list ever forms for the censored txs; the
+# proposer-side slashing-bearing path never engages.
+#
+# Defense: when an inclusion list DOES form (proving 2/3+ of stake saw
+# the listed txs), every active-set attester whose mempool reports
+# lacked any listed tx has their per-attester "coverage_misses"
+# counter incremented.  An attester whose reports covered all listed
+# txs resets to zero.  Penalties are quadratic-in-misses, mirroring
+# the existing finalization-based inactivity leak's shape.
+#
+# Calibration (against a default validator stake of 10**12 tokens —
+# the test-suite default; production stake distributions are
+# heterogeneous, so these are policy values not invariants):
+#
+#   * COVERAGE_LEAK_BASE_PENALTY = 4 + COVERAGE_LEAK_QUOTIENT = 2*10**6
+#     produce per-cycle penalty = stake * 4 * misses^2 / 2_000_000
+#     once misses > COVERAGE_LEAK_ACTIVATION_MISSES.
+#   * Activation = 4 → at most 4 consecutive honest mempool divergences
+#     are free.  False-positive defense rests primarily on the 2/3-
+#     quorum threshold (the inclusion-list mechanism itself), but the
+#     buffer guards against transient gossip disruption.
+#   * 32-cycle persistent withholding drains roughly 2.3% of stake
+#     (target: "~5%"; the calibration favours the 128-cycle target
+#     because the 32- and 128-cycle "ideal" rates conflict for any
+#     pure quadratic — see [tests/test_coverage_leak.py] for the
+#     loose-bound assertions).
+#   * 128-cycle persistent withholding drains roughly 76% of stake.
+#     The cartel falls below the 1/3 threshold needed to make their
+#     withholding matter long before the stake hits zero.
+#
+# COVERAGE_LEAK_WINDOW_BLOCKS is a defensive observation cap rather
+# than a hard cycle bound — counter values larger than this would
+# imply a withholder with stake far above the calibration target,
+# which is fine; the cap exists to keep the per-attester counter from
+# growing unboundedly across pathological forks.
+COVERAGE_LEAK_BASE_PENALTY = 4
+COVERAGE_LEAK_QUOTIENT = 2_000_000
+COVERAGE_LEAK_ACTIVATION_MISSES = 4
+COVERAGE_LEAK_WINDOW_BLOCKS = 32
+
 MAX_FINALITY_VOTES_PER_BLOCK = 200    # DoS guard on block-size expansion via finality votes
 # Per-block count caps on the remaining consensus-path lists.  The fee
 # market only prices mempool-submitted user txs; attestations,
