@@ -3,17 +3,9 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live since 2026-04-20 (2nd re-mint after adding
-proof-of-custody archive rewards + attestable censorship-evidence
-slashing — both are consensus-level changes that required another
-fresh chain). Chain ID `messagechain-v1`, genesis block 0
+**Status:** mainnet live since 2026-04-20. Chain ID `messagechain-v1`,
+genesis block 0
 `5d37dd1c4b2603a2414300a3e33578119702dba968efde1c5bb2aa0abb974f20`.
-Seed peers are baked into `messagechain/config.py:CLIENT_SEED_ENDPOINTS`
-and the current tip is one command away:
-
-```bash
-messagechain status    # or `info` for full chain stats
-```
 
 ## Why
 
@@ -111,6 +103,7 @@ messagechain estimate-fee --message "hi"        # fee preview
 ```bash
 messagechain info                               # chain height, supply, sync
 messagechain validators                         # validator set, stakes, shares
+messagechain peers                              # P2P peers of the target node
 messagechain status --server HOST:9334          # one-call health check
 messagechain status --server HOST:9334 --entity YOUR_ID
                                                 # validator-specific leaf usage
