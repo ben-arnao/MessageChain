@@ -50,6 +50,50 @@ from messagechain.config import (
 from tests import register_entity_for_test, pick_selected_proposer
 
 
+# ─────────────────────────────────────────────────────────────────────
+# FINALITY_REWARD_FROM_ISSUANCE_HEIGHT test-time override
+# ─────────────────────────────────────────────────────────────────────
+# This file tests the legacy treasury-debit semantics for finality-vote
+# inclusion rewards.  The hard fork
+# (FINALITY_REWARD_FROM_ISSUANCE_HEIGHT) switches that reward to be
+# minted directly on/after the activation height.  To keep THIS file
+# pinning legacy behavior byte-for-byte — as a protection against
+# accidental changes to the pre-fork path — push the activation height
+# to 10**9 during this module's test run.  Restored on tearDown.
+#
+# A dedicated test file (test_finality_reward_from_issuance.py) covers
+# the post-fork mint path explicitly.
+import messagechain.config as _mcfg
+import messagechain.core.blockchain as _bc_mod_finality
+
+_ORIG_FINALITY_REWARD_ISSUANCE_HEIGHT = None
+_ORIG_BC_FINALITY_REWARD_ISSUANCE_HEIGHT = None
+
+
+def setUpModule():
+    global _ORIG_FINALITY_REWARD_ISSUANCE_HEIGHT
+    global _ORIG_BC_FINALITY_REWARD_ISSUANCE_HEIGHT
+    _ORIG_FINALITY_REWARD_ISSUANCE_HEIGHT = (
+        _mcfg.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
+    )
+    _mcfg.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 10**9
+    if hasattr(_bc_mod_finality, "FINALITY_REWARD_FROM_ISSUANCE_HEIGHT"):
+        _ORIG_BC_FINALITY_REWARD_ISSUANCE_HEIGHT = (
+            _bc_mod_finality.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
+        )
+        _bc_mod_finality.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 10**9
+
+
+def tearDownModule():
+    _mcfg.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = (
+        _ORIG_FINALITY_REWARD_ISSUANCE_HEIGHT
+    )
+    if _ORIG_BC_FINALITY_REWARD_ISSUANCE_HEIGHT is not None:
+        _bc_mod_finality.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = (
+            _ORIG_BC_FINALITY_REWARD_ISSUANCE_HEIGHT
+        )
+
+
 class TestFinalityVoteBasic(unittest.TestCase):
     """FinalityVote object: sign, verify, and round-trip encodings."""
 

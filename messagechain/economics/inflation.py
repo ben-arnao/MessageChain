@@ -32,6 +32,8 @@ from messagechain.config import (
     TARGET_BLOCK_SIZE, MIN_TIP,
     get_unbonding_period,
     ATTESTER_REWARD_SPLIT_HEIGHT,
+    ATTESTER_FEE_FUNDING_HEIGHT,
+    ATTESTER_FEE_SHARE_BPS,
 )
 
 
@@ -104,6 +106,48 @@ class SupplyTracker:
         #     synced nodes inherit the same pool as replaying nodes
         self.lottery_prize_pool: int = 0
 
+        # Attester-pool fee-funding hard fork
+        # (ATTESTER_FEE_FUNDING_HEIGHT): per-block accumulator of the
+        # base-fee share that redirects into the attester committee
+        # reward pool instead of burning.  Every pay_fee_with_burn
+        # call post-activation splits base_fee into
+        #   attester_share = base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
+        #   actual_burn    = base_fee - attester_share
+        # and accrues attester_share here.  mint_block_reward adds
+        # this accumulator to the issuance-side attester_pool before
+        # dividing pro-rata across the committee, then zeroes it so
+        # the next block starts clean.
+        #
+        # EPHEMERAL: reset at the start of every _apply_block_state
+        # (mirrors fee_burn_this_block) and consumed at mint-time
+        # within the same block.  Not snapshotted — a reorg replay
+        # produces the same value deterministically because the fees
+        # that fed it are themselves in the block.  Re-apply of the
+        # same block sees the same fee set, accrues the same amount,
+        # and mints the same per-slot reward.
+        #
+        # Pre-activation: never accrues (the gate lives in
+        # pay_fee_with_burn) and never consumed (the gate lives in
+        # mint_block_reward).  Byte-for-byte legacy behavior.
+        self.attester_fee_pool_this_block: int = 0
+
+        # Current-block-height tunnel: set by _apply_block_state at
+        # block start so pay_fee_with_burn can gate its split without
+        # every call site threading an explicit block_height parameter.
+        # Reset to None after the block applies — any stray call
+        # outside a block-apply window (off-chain audit, legacy test)
+        # sees None and takes the pre-fork full-burn path.
+        #
+        # Consensus-visibility: this field is NEVER the authoritative
+        # source of a block's height — compute_post_state_root and
+        # _apply_block_state read the block header directly when they
+        # need the height.  The tunnel is only a convenience channel
+        # for the many pay_fee_with_burn call sites so we don't have
+        # to plumb block_height through every validation helper.
+        # Explicit block_height= kwargs on pay_fee_with_burn still
+        # win; the tunnel is a fallback only.
+        self._current_block_height: int | None = None
+
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
         return self.balances.get(entity_id, 0)
@@ -165,6 +209,27 @@ class SupplyTracker:
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         attester_pool = reward - proposer_share
 
+        # ATTESTER_FEE_FUNDING_HEIGHT hard fork: merge the per-block
+        # fee-funded accumulator into the attester_pool BEFORE pro-rata
+        # division.  The accumulated share is neither minted here nor
+        # in pay_fee_with_burn — it's a redirect (tokens that would
+        # have burned, now accrue to the committee).  Supply totals
+        # are therefore NOT adjusted at this step; consumption simply
+        # drains the accumulator into the committee's balances via
+        # the pro-rata loop below.  The accumulator is zeroed AFTER
+        # consumption so a re-apply of the same block (reorg replay)
+        # sees the same freshly-computed value.
+        #
+        # Gate is strictly on block_height — pre-activation the
+        # accumulator is always 0 (guarded in pay_fee_with_burn) but
+        # we defend-in-depth by skipping the merge too, so a
+        # hypothetical nonzero accumulator at a pre-fork height can't
+        # leak into legacy-mode mint results.
+        fee_funded_attester_bonus = 0
+        if block_height >= ATTESTER_FEE_FUNDING_HEIGHT:
+            fee_funded_attester_bonus = self.attester_fee_pool_this_block
+            attester_pool += fee_funded_attester_bonus
+
         # No committee: proposer absorbs the whole reward.  Previously
         # the cap fired here and siphoned the difference into the
         # treasury, which was surprising (treasury accumulated purely
@@ -173,18 +238,35 @@ class SupplyTracker:
         # staker capturing disproportionate reward in a MULTI-validator
         # committee; with no committee the proposer IS all the work,
         # so no cap applies.
+        #
+        # Post-ATTESTER_FEE_FUNDING_HEIGHT note: the fee-funded
+        # accumulator (if any) has been merged into attester_pool
+        # above but there is no committee to pay.  The accumulator
+        # tokens are in total_supply (pay_fee_with_burn redirected
+        # them away from burn) but unassigned.  Burn them here to
+        # match the no-committee case's "no attester tokens accrue"
+        # semantics and to avoid unassigned inflation.  In practice
+        # this path is genesis / bootstrap-only and fees at those
+        # heights are effectively zero, so the burn is a defensive
+        # no-op in all realistic deployments.
         if not attester_committee:
             proposer_reward = reward
             self.balances[proposer_id] = (
                 self.balances.get(proposer_id, 0) + proposer_reward
             )
+            leaked_burn = 0
+            if fee_funded_attester_bonus > 0:
+                self.total_supply -= fee_funded_attester_bonus
+                self.total_burned += fee_funded_attester_bonus
+                leaked_burn = fee_funded_attester_bonus
+                self.attester_fee_pool_this_block = 0
             return {
                 "total_reward": reward,
                 "proposer_reward": proposer_reward,
                 "total_attestor_reward": 0,
                 "attestor_rewards": {},
                 "treasury_excess": 0,
-                "burned": 0,
+                "burned": leaked_burn,
             }
 
         # Reward-distribution policy gate.  Pre-activation (legacy):
@@ -274,6 +356,18 @@ class SupplyTracker:
             self.total_supply -= burned
             self.total_burned += burned
 
+        # ATTESTER_FEE_FUNDING_HEIGHT: drain the accumulator now that
+        # its contents have been credited (pro-rata) or burned
+        # (remainder / cap-overflow).  Zeroing here — not at block
+        # start — means the mint step is idempotent within a single
+        # block apply: consuming the accumulator leaves nothing for
+        # a following code path to double-spend.  _apply_block_state
+        # also resets fee_burn_this_block and attester_fee_pool_this_
+        # block to 0 at block-start so a re-apply of the same block
+        # produces the same consumption amount deterministically.
+        if fee_funded_attester_bonus > 0:
+            self.attester_fee_pool_this_block = 0
+
         return {
             "total_reward": reward,
             "proposer_reward": proposer_share,
@@ -295,29 +389,74 @@ class SupplyTracker:
         return True
 
     def pay_fee_with_burn(
-        self, from_id: bytes, to_proposer_id: bytes, fee: int, base_fee: int,
+        self,
+        from_id: bytes,
+        to_proposer_id: bytes,
+        fee: int,
+        base_fee: int,
+        block_height: int | None = None,
     ) -> bool:
         """Pay a transaction fee with EIP-1559-style base fee burning.
 
         The base_fee portion is burned (permanently removed from supply).
         The remainder (tip = fee - base_fee) goes to the block proposer.
         Returns False if fee < base_fee or sender can't afford it.
+
+        ``block_height`` activates the ATTESTER_FEE_FUNDING_HEIGHT hard
+        fork: post-activation, `ATTESTER_FEE_SHARE_BPS / 10_000` of the
+        base_fee is diverted into `attester_fee_pool_this_block` (a
+        per-block accumulator consumed by `mint_block_reward`) instead
+        of being burned.  The remainder still burns.  Pre-activation,
+        or when ``block_height is None`` (off-chain audit / legacy test
+        paths that pre-date the fork), 100% of base_fee burns as
+        before — byte-for-byte-identical to the pre-fork code path.
         """
         if fee < base_fee:
             return False
         if self.get_balance(from_id) < fee:
             return False
 
+        # Hard-fork split: post-ATTESTER_FEE_FUNDING_HEIGHT the base_fee
+        # is split into an attester-pool share (accrued into the per-
+        # block accumulator, consumed by mint_block_reward below) and
+        # a burn share (destroyed as before).  block_height=None falls
+        # back to the self._current_block_height tunnel that
+        # Blockchain._apply_block_state sets at block start; when that
+        # too is None the full-burn legacy path is used (mirror of
+        # verify_transaction(current_height=None)).
+        effective_height = (
+            block_height
+            if block_height is not None
+            else self._current_block_height
+        )
+        attester_share = 0
+        if (
+            effective_height is not None
+            and effective_height >= ATTESTER_FEE_FUNDING_HEIGHT
+        ):
+            attester_share = base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
+        actual_burn = base_fee - attester_share
+
         tip = fee - base_fee
         self.balances[from_id] -= fee
         self.balances[to_proposer_id] = self.balances.get(to_proposer_id, 0) + tip
-        self.total_supply -= base_fee  # burn
-        self.total_burned += base_fee
+        # Only the non-diverted portion reduces total_supply / bumps
+        # total_burned.  The attester share stays in circulation (it
+        # will be credited to committee members when mint_block_reward
+        # runs).
+        if actual_burn > 0:
+            self.total_supply -= actual_burn
+            self.total_burned += actual_burn
+        if attester_share > 0:
+            self.attester_fee_pool_this_block += attester_share
         # Fee-burn-only ticker: tracks the CURRENT block's fee-burn so
         # Blockchain._apply_block_state can redirect the configured
-        # fraction into the archive-reward pool.  Not double-counted —
-        # the redirect step subtracts from total_burned to compensate.
-        self.fee_burn_this_block += base_fee
+        # fraction into the archive-reward pool.  Post-fork this
+        # reflects the POST-SPLIT burn amount (attester_share is not
+        # burned and so is not a redirect candidate).  Not double-
+        # counted — the redirect step subtracts from total_burned to
+        # compensate.
+        self.fee_burn_this_block += actual_burn
         self.total_fees_collected += fee
         return True
 
