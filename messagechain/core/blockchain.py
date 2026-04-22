@@ -4033,11 +4033,16 @@ class Blockchain:
             # FCFS.  Same seed the apply path uses (see
             # _apply_archive_rewards), kept consistent so sim and
             # apply reach identical per-entity balance mutations.
+            # Iter 3h: registration gate.  Proofs from unregistered
+            # prover_ids are rejected before payout — raises the
+            # Sybil attack bar to the cost of a real on-chain
+            # registration.  Must mirror the apply path exactly.
             sim_result = apply_archive_rewards(
                 proofs=custody_proofs,
                 pool=sim_pool,
                 expected_block_hash=sim_expected_hash,
                 selection_seed=parent_randao,
+                registered_provers=set(sim_public_keys.keys()),
             )
             for payout in sim_result.payouts:
                 sim_balances[payout.prover_id] = (
@@ -7624,11 +7629,16 @@ class Blockchain:
             # Selection seed (iter 3e): parent block's randao_mix.
             # Same seed the sim path in compute_post_state_root uses;
             # shuffle-then-pay replaces strict FCFS.
+            # Iter 3h: registered_provers gates payout on pre-
+            # existing on-chain identity — raises Sybil cost from
+            # keygen-only to keygen+fee-per-identity.  Same filter as
+            # sim path; both use the current public_keys dict.
             result = apply_archive_rewards(
                 proofs=proofs,
                 pool=wrapper,
                 expected_block_hash=expected_block_hash,
                 selection_seed=parent.header.randao_mix,
+                registered_provers=set(self.public_keys.keys()),
             )
             # Credit every paid prover.  Tokens move from the pool
             # into circulating balances — pool was already counted in

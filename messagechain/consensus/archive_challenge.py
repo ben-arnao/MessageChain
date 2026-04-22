@@ -858,23 +858,26 @@ def apply_archive_rewards(
     pool: ArchiveRewardPool,
     expected_block_hash: bytes,
     selection_seed: Optional[bytes] = None,
+    registered_provers: Optional[set] = None,
     reward_amount: int = ARCHIVE_REWARD,
     max_payouts: int = ARCHIVE_PROOFS_PER_CHALLENGE,
 ) -> ArchiveRewardResult:
     """Pay up to `max_payouts` rewards from `pool`.
 
-    Iteration 3e change: selection is a DETERMINISTIC UNIFORM SHUFFLE
-    over the valid, deduplicated proofs — not strict FCFS as before.
-    This neutralizes the fast-connection advantage that made paid
-    archival a winner-take-all race for industrial operators.  Every
-    valid submitter has equal odds of making the cap, regardless of
-    where they appear in the proposer's listed order.
+    Iteration 3e: selection is a DETERMINISTIC UNIFORM SHUFFLE over
+    the valid, deduplicated proofs — not strict FCFS as before.  Every
+    valid submitter has equal odds of making the cap regardless of
+    where they appear in the proposer's listed order.  `selection_seed`
+    (typically parent block's randao) drives the shuffle; None falls
+    back to submission-order for test helpers.
 
-    `selection_seed` (32 bytes) drives the shuffle; callers pass the
-    parent block's randao mix or an equivalent consensus-deterministic
-    value.  If None, falls back to submission-order (backward-compat
-    for tests + modules that hand a list directly without a seed;
-    live-chain callers in blockchain.py always pass a seed).
+    Iteration 3h: `registered_provers` — when provided, a proof whose
+    prover_id is NOT in this set is rejected before payout.  Binds
+    Sybil attack cost to the fee required to register a new pubkey
+    on-chain (via any transfer).  Keygen is free; a funded
+    registration transaction is not.  None = skip the check (legacy
+    mode for unit tests that don't care about registration); live-
+    chain callers always pass `set(self.public_keys.keys())`.
 
     Rules retained from prior iteration:
       * One payout per unique prover_id per challenge (Sybil cap).
@@ -884,9 +887,10 @@ def apply_archive_rewards(
     import hashlib as _hashlib
     import struct as _struct
 
-    # First pass: filter to valid, unique proofs (consistent with the
-    # old FCFS semantics for dedup — first occurrence of a prover_id
-    # wins the de-dup).  Collect as a list so we can shuffle.
+    # First pass: filter to valid, unique, registered proofs
+    # (consistent with the old FCFS semantics for dedup — first
+    # occurrence of a prover_id wins the de-dup).  Collect as a list
+    # so we can shuffle.
     result = ArchiveRewardResult()
     valid_proofs: list[CustodyProof] = []
     seen_provers: set[bytes] = set()
@@ -899,6 +903,16 @@ def apply_archive_rewards(
             continue
         if proof.prover_id in seen_provers:
             result.rejected.append("duplicate prover")
+            continue
+        # iter 3h — registration gate.  Proofs from unregistered
+        # prover_ids cost the attacker nothing to submit, but earn
+        # nothing either; the cap is effectively denied to Sybils
+        # that haven't paid to register on-chain.
+        if (
+            registered_provers is not None
+            and proof.prover_id not in registered_provers
+        ):
+            result.rejected.append("prover not registered")
             continue
         seen_provers.add(proof.prover_id)
         valid_proofs.append(proof)
