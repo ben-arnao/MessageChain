@@ -233,7 +233,21 @@ from messagechain.config import (
 #      silently fork at that block.  Section tag
 #      ``_TAG_REGISTERED_VALIDATORS``.  Binary layout (appended strictly
 #      after v15's rolling_fee_burn section): bytes-set.
-STATE_SNAPSHOT_VERSION = 16  # wire format version for encode/decode
+# v17: Deflation-floor-v2 activation-seed flag
+#      (rolling_fee_burn_seeded) — the one-shot guard that the
+#      synthetic seed entry has been installed in rolling_fee_burn at
+#      DEFLATION_FLOOR_V2_HEIGHT.  Without this flag a cold-booted
+#      node that agreed on rolling_fee_burn but disagreed on whether
+#      the seed had already fired would re-seed at the next canonical
+#      replay across the activation block, producing a different
+#      rolling-window total than peers.  MUST participate in the
+#      snapshot root.  Placed under ``_TAG_GLOBAL`` alongside
+#      supply-level scalars (key ``_GLOBAL_ROLLING_FEE_BURN_SEEDED``),
+#      encoded as a u64 with 0 = False and 1 = True.  Binary wire
+#      layout: appended strictly after v16's registered_validators
+#      set as a single u8 flag (0 = False, 1 = True) for a compact
+#      encoding — simpler than widening the _TAG_GLOBAL scheme.
+STATE_SNAPSHOT_VERSION = 17  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -411,6 +425,17 @@ _GLOBAL_LOTTERY_PRIZE_POOL = b"lottery_prize_pool"
 # different block and silently fork.  Encoded via an unsigned-shift
 # (value + 1) so the sentinel -1 serializes as 0 in a u64.
 _GLOBAL_ATTESTER_EPOCH_START = b"attester_epoch_earnings_start"
+# v17: Deflation-floor-v2 activation-seed flag.  Guards the one-shot
+# synthetic-entry install at DEFLATION_FLOOR_V2_HEIGHT in
+# SupplyTracker.rolling_fee_burn (see Blockchain._apply_deflation_
+# floor_v2_seed).  Must participate in the snapshot root so a
+# state-synced node inherits the same seeded/unseeded state as a
+# replaying node — without this, two nodes that disagreed on whether
+# the seed had fired would re-seed (or skip re-seeding) differently
+# on the next cross-activation replay and compute different rolling-
+# window totals.  Encoded as a u64 under _TAG_GLOBAL: 0 = False, 1 =
+# True.
+_GLOBAL_ROLLING_FEE_BURN_SEEDED = b"rolling_fee_burn_seeded"
 
 
 def _h(data: bytes) -> bytes:
@@ -602,6 +627,16 @@ def serialize_state(blockchain) -> dict:
         # first-time stake.
         "registered_validators": set(
             getattr(blockchain.supply, "registered_validators", set())
+        ),
+        # v17: Deflation-floor-v2 activation-seed flag.  One-shot
+        # guard that the synthetic rolling_fee_burn entry has been
+        # installed at DEFLATION_FLOOR_V2_HEIGHT.  Default False on
+        # pre-activation chains — flipped True exactly once by
+        # Blockchain._apply_deflation_floor_v2_seed.  Consensus-
+        # visible: state-synced nodes must inherit the same value or
+        # they diverge at the next cross-activation replay.
+        "rolling_fee_burn_seeded": bool(
+            getattr(blockchain.supply, "rolling_fee_burn_seeded", False)
         ),
     }
 
@@ -835,6 +870,14 @@ def deserialize_state(snapshot: dict) -> dict:
     # step still pending.  Binary decode populates this strictly so
     # the default only affects in-memory hand-built snapshot dicts.
     out.setdefault("registered_validators", set())
+    # Pre-v17 snapshots lack the deflation-floor-v2 activation-seed
+    # flag.  Default False: a migrating chain that pre-dates v17
+    # either has not reached DEFLATION_FLOOR_V2_HEIGHT yet (flag
+    # correctly False) OR was built against a pre-v17 codebase where
+    # the seed never fired (also False) — so the default is safe on
+    # both sides.  Binary decode populates this strictly so the
+    # default only affects hand-built snapshot dicts.
+    out.setdefault("rolling_fee_burn_seeded", False)
     return out
 
 
@@ -1133,6 +1176,16 @@ def compute_state_root(snapshot: dict) -> bytes:
                 _GLOBAL_ATTESTER_EPOCH_START: (
                     int(snap.get("attester_epoch_earnings_start", -1)) + 1
                 ),
+                # v17: Deflation-floor-v2 activation-seed flag.  Must
+                # participate in the root: a state-synced node that
+                # disagreed on whether the seed had fired would re-seed
+                # (or skip re-seeding) differently on the next
+                # cross-activation replay and compute a different
+                # rolling-window total.  Encoded as a u64 (0/1) to
+                # ride the existing _TAG_GLOBAL int-value path.
+                _GLOBAL_ROLLING_FEE_BURN_SEEDED: (
+                    1 if bool(snap.get("rolling_fee_burn_seeded", False)) else 0
+                ),
             })),
     }
 
@@ -1401,6 +1454,7 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes→int  dict>   witness_ack_registry           (v14+)
         <rolling-debit list> rolling_fee_burn              (v15+)
         <bytes set>         registered_validators          (v16+)
+        u8                  rolling_fee_burn_seeded        (v17+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1504,6 +1558,14 @@ def encode_snapshot(snap: dict) -> bytes:
     # rolling_fee_burn section so a v15 blob is a strict prefix of a
     # v16 blob.
     out += _encode_bytes_set(snap["registered_validators"])
+    # v17: Deflation-floor-v2 activation-seed flag.  Single u8
+    # (0 = False, 1 = True) strictly appended after the v16
+    # registered_validators set, so a v16 blob is a strict prefix of
+    # a v17 blob through the end of v16's final field.
+    out += struct.pack(
+        ">B",
+        1 if bool(snap.get("rolling_fee_burn_seeded", False)) else 0,
+    )
     return bytes(out)
 
 
@@ -1616,6 +1678,16 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     rolling_fee_burn, off = _decode_rolling_debits(blob, off)
     # v16+: Registered-validators set.  Always present on v16+ blobs.
     registered_validators, off = _decode_bytes_set(blob, off)
+    # v17+: Deflation-floor-v2 activation-seed flag (single u8).  Always
+    # present on v17+ blobs — the strict version check above rejects
+    # earlier versions.
+    (_seed_flag,) = struct.unpack_from(">B", blob, off)
+    off += 1
+    if _seed_flag not in (0, 1):
+        raise ValueError(
+            f"rolling_fee_burn_seeded flag must be 0 or 1, got {_seed_flag}"
+        )
+    rolling_fee_burn_seeded = bool(_seed_flag)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1666,4 +1738,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "witness_ack_registry": witness_ack_registry,
         "rolling_fee_burn": rolling_fee_burn,
         "registered_validators": registered_validators,
+        "rolling_fee_burn_seeded": rolling_fee_burn_seeded,
     }
