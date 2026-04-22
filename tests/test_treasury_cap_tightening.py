@@ -740,8 +740,13 @@ class TestSnapshotWireRoundTrip(unittest.TestCase):
     def test_wire_version_bumped_to_11(self):
         # Originally bumped to v10, but the concurrent coverage-misses
         # fork also claimed v10 — this fork was promoted to v11 at
-        # merge time.
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 11)
+        # merge time.  The per-entity attester-reward cap fork later
+        # bumped the wire version again to v12 (strict-append); the
+        # floor assertion here stays at >=11 because the treasury
+        # rolling-debit section must still be present in any blob
+        # that encodes a post-TREASURY_CAP_TIGHTEN_HEIGHT snapshot,
+        # regardless of subsequent fork bumps.
+        self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 11)
 
 
 if __name__ == "__main__":

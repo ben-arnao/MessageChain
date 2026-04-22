@@ -1305,6 +1305,20 @@ class Blockchain:
             (int(h), int(a))
             for (h, a) in snap.get("treasury_spend_rolling_debits", [])
         ]
+        # Per-entity attester-reward cap epoch-earnings tracker
+        # (ATTESTER_REWARD_CAP_HEIGHT hard fork).  Consensus-visible
+        # dict + scalar that drive the per-entity cap on cumulative
+        # epoch earnings.  A state-synced node that inherits a stale
+        # dict / start marker would compute a different cap-overflow
+        # burn at the next mint than a replaying node and silently
+        # fork.  Committed to the snapshot root under _TAG_ATTESTER_EPOCH
+        # (dict) + _GLOBAL_ATTESTER_EPOCH_START (scalar).
+        self.supply.attester_epoch_earnings = dict(
+            snap.get("attester_epoch_earnings", {}),
+        )
+        self.supply.attester_epoch_earnings_start = int(
+            snap.get("attester_epoch_earnings_start", -1),
+        )
 
         # Archive-duty state (v6+).  All three fields participate in
         # the state root, so a bootstrapping node inherits them from
@@ -3418,15 +3432,81 @@ class Blockchain:
             if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
                 n = len(attester_committee)
                 per_slot_reward = (attester_pool // n) if n > 0 else 0
-                for eid in attester_committee:
-                    if per_slot_reward > 0:
-                        sim_balances[eid] = (
-                            sim_balances.get(eid, 0) + per_slot_reward
+                # ATTESTER_REWARD_CAP_HEIGHT hard fork: mirror mint-
+                # side per-entity cap logic.  Read the live pre-block
+                # earnings tracker; any block that crosses an epoch
+                # boundary resets it in-sim.  Cap is computed from
+                # this block's attester_pool (matching mint-side).
+                # Overflow tokens do NOT credit sim_balances but
+                # DO reduce total_supply (not tracked here — the
+                # per-entity SMT only covers balances).  The cap
+                # effectively CLAMPS per-entity credits; the sim
+                # state-root commits only to the clamped amounts.
+                from messagechain.config import (
+                    ATTESTER_REWARD_CAP_HEIGHT as _ARCH,
+                    PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+                    as _ARCB,
+                    FINALITY_INTERVAL as _FI,
+                )
+                _cap_active = block_height >= _ARCH
+                _sim_epoch_earnings: dict[bytes, int] = {}
+                _cap_per_entity = 0
+                if _cap_active:
+                    _epoch_start = (
+                        (block_height // _FI) * _FI
+                    )
+                    if (
+                        self.supply.attester_epoch_earnings_start
+                        == _epoch_start
+                    ):
+                        _sim_epoch_earnings = dict(
+                            self.supply.attester_epoch_earnings,
                         )
-                    attester_tokens_paid += per_slot_reward
+                    # else: new epoch, sim starts from empty mirror.
+                    _cap_per_entity = (
+                        attester_pool * _ARCB * _FI // 10_000
+                    )
+                for eid in attester_committee:
+                    _reward_amount = per_slot_reward
+                    if _cap_active and per_slot_reward > 0:
+                        _earned = _sim_epoch_earnings.get(eid, 0)
+                        _available = max(0, _cap_per_entity - _earned)
+                        _reward_amount = min(per_slot_reward, _available)
+                        _sim_epoch_earnings[eid] = (
+                            _earned + _reward_amount
+                        )
+                    if _reward_amount > 0:
+                        sim_balances[eid] = (
+                            sim_balances.get(eid, 0) + _reward_amount
+                        )
+                    attester_tokens_paid += _reward_amount
+                # Proposer's committee-slot share — apply path reads
+                # this BEFORE the PROPOSER_REWARD_CAP clawback, so
+                # match: the proposer's actual post-cap credit for
+                # their attester slot.
                 proposer_att_reward = (
+                    _sim_epoch_earnings.get(proposer_id, 0)
+                    - (
+                        self.supply.attester_epoch_earnings.get(
+                            proposer_id, 0,
+                        )
+                        if (
+                            _cap_active
+                            and self.supply.attester_epoch_earnings_start
+                            == (block_height // _FI) * _FI
+                        ) else 0
+                    )
+                ) if _cap_active else (
                     per_slot_reward if proposer_id in attester_committee else 0
                 )
+                # Sanity: post-cap proposer_att_reward is what the
+                # proposer actually received (0 if not in committee).
+                if not _cap_active:
+                    proposer_att_reward = (
+                        per_slot_reward
+                        if proposer_id in attester_committee
+                        else 0
+                    )
             else:
                 for eid in attester_committee[:committee_size]:
                     sim_balances[eid] = (
@@ -3724,8 +3804,48 @@ class Blockchain:
             else:
                 _per_slot = ATTESTER_REWARD_PER_SLOT
             if _per_slot > 0:
+                # ATTESTER_REWARD_CAP_HEIGHT: the withhold apply path
+                # runs on the POST-cap actual credit amount, not the
+                # pre-cap per-slot value, because withhold is a
+                # percentage of what landed in balances.  Mirror the
+                # mint-side clamp so the sim withhold deduction
+                # matches the apply-side deduction.
+                from messagechain.config import (
+                    ATTESTER_REWARD_CAP_HEIGHT as _ARCH2,
+                    PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+                    as _ARCB2,
+                    FINALITY_INTERVAL as _FI2,
+                )
+                _cap_active2 = block_height >= _ARCH2
+                _gross_cap_per_entity = (
+                    attester_pool * _ARCB2 * _FI2 // 10_000
+                    if _cap_active2 else 0
+                )
+                _gross_live_earnings: dict[bytes, int] = {}
+                if (
+                    _cap_active2
+                    and self.supply.attester_epoch_earnings_start
+                    == (block_height // _FI2) * _FI2
+                ):
+                    _gross_live_earnings = dict(
+                        self.supply.attester_epoch_earnings,
+                    )
                 for eid in attester_committee:
-                    _sim_gross[eid] = _sim_gross.get(eid, 0) + _per_slot
+                    if _cap_active2:
+                        _earned_gross = _gross_live_earnings.get(eid, 0)
+                        _avail_gross = max(
+                            0, _gross_cap_per_entity - _earned_gross,
+                        )
+                        _credit = min(_per_slot, _avail_gross)
+                        _gross_live_earnings[eid] = (
+                            _earned_gross + _credit
+                        )
+                    else:
+                        _credit = _per_slot
+                    if _credit > 0:
+                        _sim_gross[eid] = (
+                            _sim_gross.get(eid, 0) + _credit
+                        )
             # Proposer may or may not be in the committee; `proposer_share`
             # above was adjusted in-place if the cap was hit, so we read
             # back the post-cap value here.
@@ -8410,6 +8530,19 @@ class Blockchain:
             "treasury_spend_rolling_debits": list(
                 self.supply._treasury_spend_rolling_debits,
             ),
+            # Per-entity attester-reward cap epoch-earnings tracker
+            # (ATTESTER_REWARD_CAP_HEIGHT hard fork): reorg that
+            # undoes a post-cap-activation mint block MUST roll back
+            # the earnings increments, or the canonical replay sees
+            # a different cap-overflow burn amount than peer nodes
+            # that never saw the orphaned block.  Shallow dict copy
+            # + scalar int.
+            "attester_epoch_earnings": dict(
+                self.supply.attester_epoch_earnings,
+            ),
+            "attester_epoch_earnings_start": (
+                self.supply.attester_epoch_earnings_start
+            ),
             # Seed-divestment lottery redistribution (hard fork):
             # pool of lottery-share tokens accumulated from divested
             # founder stake, awaiting reputation-weighted-lottery
@@ -8526,6 +8659,16 @@ class Blockchain:
                 "treasury_spend_rolling_debits", [],
             )
         ]
+        # Per-entity attester-reward cap epoch-earnings tracker
+        # (ATTESTER_REWARD_CAP_HEIGHT hard fork).  Defaults match
+        # __init__ sentinels so pre-fork snapshots restore to a
+        # pristine tracker state.
+        self.supply.attester_epoch_earnings = dict(
+            snapshot.get("attester_epoch_earnings", {}),
+        )
+        self.supply.attester_epoch_earnings_start = snapshot.get(
+            "attester_epoch_earnings_start", -1,
+        )
         # Lottery prize pool — reorg rollback restores the pre-reorg
         # accumulation / drain state so the canonical replay produces
         # identical payouts.  Default 0 so pre-fork snapshots restore

@@ -164,7 +164,21 @@ from messagechain.config import (
 #      sorted by (height, amount) for deterministic hashing.  Binary
 #      layout: u32 count followed by count × (u32 height, u64 amount)
 #      tuples, appended after attester_coverage_misses.
-STATE_SNAPSHOT_VERSION = 11  # wire format version for encode/decode
+# v12: added attester_epoch_earnings + attester_epoch_earnings_start —
+#      per-entity cumulative attester earnings tracker for the
+#      PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH cap
+#      (ATTESTER_REWARD_CAP_HEIGHT hard fork).  Reset every
+#      FINALITY_INTERVAL block.  MUST participate in the snapshot
+#      root: two state-synced nodes that disagreed on this tracker
+#      would compute different cap-overflow burn amounts at the next
+#      mint and silently fork.  Section tag _TAG_ATTESTER_EPOCH for
+#      the bytes→int dict; the scalar start marker rides under
+#      _TAG_GLOBAL (_GLOBAL_ATTESTER_EPOCH_START) alongside other
+#      supply-level scalars.  Binary layout: bytes→int dict
+#      (attester_epoch_earnings) followed by i64
+#      (attester_epoch_earnings_start — i64 because the sentinel
+#      value -1 requires a signed type, encoded via an offset shift).
+STATE_SNAPSHOT_VERSION = 12  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -259,6 +273,15 @@ _TAG_COVERAGE_MISSES = b"covmiss"
 # synced node that inherited a stale list would mis-compute the
 # rolling-window total and silently fork at the next treasury spend.
 _TAG_TREASURY_ROLLING = b"trroll"
+# v12: per-entity attester-reward-cap epoch earnings tracker
+# (bytes→int dict).  Drives the PER_VALIDATOR_ATTESTER_REWARD_CAP
+# _BPS_PER_EPOCH cap under the ATTESTER_REWARD_CAP_HEIGHT hard fork.
+# Must participate in the state root: two state-synced nodes that
+# disagreed on this tracker would compute different cap-overflow
+# burn amounts at the next mint and silently fork.  Paired with
+# _GLOBAL_ATTESTER_EPOCH_START (below) so both the earnings dict
+# and the scalar epoch-start marker are committed.
+_TAG_ATTESTER_EPOCH = b"attepoch"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -286,6 +309,16 @@ _GLOBAL_ARCHIVE_REWARD_POOL = b"archive_reward_pool"
 # window (different payout amounts flow into different winner
 # balances).  See SupplyTracker.lottery_prize_pool.
 _GLOBAL_LOTTERY_PRIZE_POOL = b"lottery_prize_pool"
+# v12: rolling-epoch start marker for the per-entity attester-reward
+# cap tracker.  Sentinel value -1 means "no epoch recorded yet";
+# otherwise holds the epoch-start block number of the current
+# window.  Committed alongside the attester_epoch_earnings dict so a
+# state-synced node inherits both the tracker values and the epoch
+# pinning — otherwise a cold-booted node that agreed on earnings
+# but disagreed on the epoch pin would reset its tracker at a
+# different block and silently fork.  Encoded via an unsigned-shift
+# (value + 1) so the sentinel -1 serializes as 0 in a u64.
+_GLOBAL_ATTESTER_EPOCH_START = b"attester_epoch_earnings_start"
 
 
 def _h(data: bytes) -> bytes:
@@ -423,6 +456,23 @@ def serialize_state(blockchain) -> dict:
                 blockchain.supply, "_treasury_spend_rolling_debits", [],
             )
         ],
+        # v12: per-entity attester-reward cap epoch-earnings tracker
+        # and its accompanying epoch-start marker.  Both MUST be in
+        # the snapshot root so state-synced nodes compute the same
+        # cap-overflow burn at the next mint; otherwise two nodes
+        # silently fork at the next reward block.  See
+        # ATTESTER_REWARD_CAP_HEIGHT / _TAG_ATTESTER_EPOCH /
+        # _GLOBAL_ATTESTER_EPOCH_START docstrings above.
+        "attester_epoch_earnings": dict(
+            getattr(blockchain.supply, "attester_epoch_earnings", {})
+        ),
+        "attester_epoch_earnings_start": int(
+            getattr(
+                blockchain.supply,
+                "attester_epoch_earnings_start",
+                -1,
+            ),
+        ),
     }
 
 
@@ -614,6 +664,14 @@ def deserialize_state(snapshot: dict) -> dict:
     # pre-v10 snapshot starts with an empty window, matching a
     # replaying node that reaches activation with no prior spends.
     out.setdefault("treasury_spend_rolling_debits", [])
+    # Pre-v12 snapshots lack the per-entity attester-reward cap
+    # tracker.  Default to empty dict + sentinel start; the cap only
+    # activates post-ATTESTER_REWARD_CAP_HEIGHT and a migrating
+    # chain crossing that fork after a pre-v12 snapshot begins with
+    # an empty tracker, exactly matching a replaying node that
+    # reaches activation with no prior mint.
+    out.setdefault("attester_epoch_earnings", {})
+    out.setdefault("attester_epoch_earnings_start", -1)
     return out
 
 
@@ -836,6 +894,14 @@ def compute_state_root(snapshot: dict) -> bytes:
                 snap["treasury_spend_rolling_debits"],
             ),
         ),
+        # v12: per-entity attester-reward cap earnings tracker.  Same
+        # consensus criticality as _TAG_COVERAGE_MISSES — disagreement
+        # here forks the next reward mint.  Default to empty so test
+        # fixtures that pre-date the field still hash to a stable
+        # value.
+        _TAG_ATTESTER_EPOCH: _merkle(_entries_for_section(
+            _TAG_ATTESTER_EPOCH,
+            snap.get("attester_epoch_earnings", {}))),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -857,6 +923,16 @@ def compute_state_root(snapshot: dict) -> bytes:
                 # payout at the next lottery firing in the divestment
                 # window and silently fork until END.
                 _GLOBAL_LOTTERY_PRIZE_POOL: snap["lottery_prize_pool"],
+                # v12: per-entity attester-reward cap epoch-start
+                # marker.  Sentinel -1 shift-encoded to fit in u64
+                # (stored as start + 1).  Same consensus criticality
+                # as _GLOBAL_LOTTERY_PRIZE_POOL: a state-synced node
+                # that inherits a stale pin would reset its earnings
+                # tracker at a different block than a replaying node
+                # and silently fork at the next mint.
+                _GLOBAL_ATTESTER_EPOCH_START: (
+                    int(snap.get("attester_epoch_earnings_start", -1)) + 1
+                ),
             })),
     }
 
@@ -1119,6 +1195,8 @@ def encode_snapshot(snap: dict) -> bytes:
         <bytes→int  dict>   validator_archive_success_streak (v8+)
         u64                 lottery_prize_pool              (v9+)
         <rolling-debit list> treasury_spend_rolling_debits  (v10+)
+        <bytes→int  dict>   attester_epoch_earnings        (v12+)
+        u64                 attester_epoch_earnings_start +1 (v12+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1196,6 +1274,14 @@ def encode_snapshot(snap: dict) -> bytes:
     # post-tighten at most ~525 spends/year given the 100-block
     # epoch × 1-spend-per-epoch worst case.
     out += _encode_rolling_debits(snap["treasury_spend_rolling_debits"])
+    # v12: per-entity attester-reward cap epoch-earnings tracker
+    # (bytes→int dict) + scalar start marker.  Strictly appended
+    # after the v11 rolling-debit section so a v11 blob is a strict
+    # prefix of a v12 blob.  Start is shift-encoded (value + 1) so
+    # the sentinel -1 rides in a u64 unsigned field as 0.
+    out += _encode_bytes_int_dict(snap.get("attester_epoch_earnings", {}))
+    _epoch_start = int(snap.get("attester_epoch_earnings_start", -1))
+    out += struct.pack(">Q", _epoch_start + 1)
     return bytes(out)
 
 
@@ -1287,6 +1373,14 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # present on v11+ blobs.  Pre-v11 blobs cannot reach here — the
     # strict version check above rejects them.
     treasury_spend_rolling_debits, off = _decode_rolling_debits(blob, off)
+    # v12+: per-entity attester-reward cap epoch-earnings tracker +
+    # scalar start marker.  Always present on v12+ blobs.  Shift-
+    # decode the start marker (stored as value + 1 so the sentinel
+    # -1 rides as 0 in the u64).
+    attester_epoch_earnings, off = _decode_bytes_int_dict(blob, off)
+    (_epoch_start_encoded,) = struct.unpack_from(">Q", blob, off)
+    off += 8
+    attester_epoch_earnings_start = int(_epoch_start_encoded) - 1
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1331,4 +1425,6 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "lottery_prize_pool": lottery_prize_pool,
         "attester_coverage_misses": attester_coverage_misses,
         "treasury_spend_rolling_debits": treasury_spend_rolling_debits,
+        "attester_epoch_earnings": attester_epoch_earnings,
+        "attester_epoch_earnings_start": attester_epoch_earnings_start,
     }
