@@ -65,9 +65,12 @@ Processor
     "active" while the current block height is within its forward
     window.  Block validation reads this map to decide whether the
     current block carries a valid excuse or has committed censorship.
-  * `processed_violations`: set[(tx_hash, proposer_id)].  Every
-    violation slash applied is recorded here so a second evidence
-    against the same (tx, proposer) pair cannot re-slash.
+  * `processed_violations`: set[(list_hash, tx_hash, proposer_id)].
+    Every violation slash applied is recorded here so a second
+    evidence against the same (list, tx, proposer) triple cannot
+    re-slash.  list_hash is part of the key because two overlapping
+    inclusion lists can both mandate the same tx: omitting that tx
+    while BOTH lists are active is two violations, not one.
 
 Both fields participate in the state-snapshot root so every node
 reaches identical slashing outcomes after replay.
@@ -645,11 +648,11 @@ class InclusionViolation:
     """Result of processor.expire(): one tx_hash that a proposer failed
     to include during an active window, with the accused proposers.
 
-    The (tx_hash, proposer_id) pair is the dedup key for
+    The (list_hash, tx_hash, proposer_id) triple is the dedup key for
     `processed_violations` — a single violation-evidence tx slashes
     exactly one proposer, so the same missed-tx can in principle ground
-    multiple evidences (one per accused proposer), each limited once by
-    the dedupe.
+    multiple evidences (one per accused proposer, one per list that
+    mandated it), each limited once by the dedupe.
     """
     list_hash: bytes
     tx_hash: bytes
@@ -677,9 +680,12 @@ class InclusionListProcessor:
         # height.  Filled by observe_block().  Keyed by list_hash for
         # expiry accounting.
         self.proposers_by_height: dict[bytes, dict[int, bytes]] = {}
-        # Double-slash defence.  One (tx_hash, proposer_id) may be
-        # slashed at most once across the chain's whole history.
-        self.processed_violations: set[tuple[bytes, bytes]] = set()
+        # Double-slash defence.  One (list_hash, tx_hash, proposer_id)
+        # triple may be slashed at most once across the chain's whole
+        # history.  list_hash participates so a proposer who omitted
+        # the same tx from two overlapping lists is slashed once per
+        # list, not once total.
+        self.processed_violations: set[tuple[bytes, bytes, bytes]] = set()
 
     # ── Active-window queries ──────────────────────────────────────────
 
@@ -824,8 +830,10 @@ class InclusionListProcessor:
 
     # ── Double-slash defence ──────────────────────────────────────────
 
-    def has_processed(self, tx_hash: bytes, proposer_id: bytes) -> bool:
-        return (tx_hash, proposer_id) in self.processed_violations
+    def has_processed(
+        self, list_hash: bytes, tx_hash: bytes, proposer_id: bytes,
+    ) -> bool:
+        return (list_hash, tx_hash, proposer_id) in self.processed_violations
 
     # ── Snapshot serialisation ────────────────────────────────────────
 
@@ -851,8 +859,8 @@ class InclusionListProcessor:
                 for lst_hash, m in self.proposers_by_height.items()
             },
             "processed_violations": sorted(
-                [tx.hex() + "|" + pid.hex()
-                 for (tx, pid) in self.processed_violations]
+                [lh.hex() + "|" + tx.hex() + "|" + pid.hex()
+                 for (lh, tx, pid) in self.processed_violations]
             ),
         }
 
@@ -874,10 +882,21 @@ class InclusionListProcessor:
                 int(h): bytes.fromhex(pid) for h, pid in m.items()
             }
         self.proposers_by_height = pbh
-        pv: set[tuple[bytes, bytes]] = set()
+        pv: set[tuple[bytes, bytes, bytes]] = set()
         for compound in data.get("processed_violations", []):
-            tx_hex, pid_hex = compound.split("|", 1)
-            pv.add((bytes.fromhex(tx_hex), bytes.fromhex(pid_hex)))
+            parts = compound.split("|")
+            if len(parts) != 3:
+                raise ValueError(
+                    "processed_violations entry must be "
+                    "'list_hash|tx_hash|proposer_id' hex triple, "
+                    f"got {len(parts)} parts"
+                )
+            lh_hex, tx_hex, pid_hex = parts
+            pv.add((
+                bytes.fromhex(lh_hex),
+                bytes.fromhex(tx_hex),
+                bytes.fromhex(pid_hex),
+            ))
         self.processed_violations = pv
 
 
@@ -1098,8 +1117,8 @@ class InclusionViolationResult:
     """Three terminal states mirror BogusRejectionResult:
 
       * accepted=True, slashed=True   — violation confirmed; offender's
-        stake burned by `slash_amount`; (tx_hash, proposer_id) recorded
-        in processor.processed_violations.
+        stake burned by `slash_amount`; (list_hash, tx_hash, proposer_id)
+        recorded in processor.processed_violations.
       * accepted=False, slashed=False — evidence already processed OR
         violation refuted (tx actually landed, list expired earlier
         and was already reconciled).  Caller MUST NOT charge fee.
@@ -1122,14 +1141,26 @@ def process_inclusion_list_violation(
     decision from chain state.
 
     Decision rules:
-      * If (omitted_tx_hash, accused_proposer_id) is already in
-        `processed_violations` → reject (double-slash defence).
+      * If (list_hash, omitted_tx_hash, accused_proposer_id) is already
+        in `processed_violations` → reject (double-slash defence).
       * Slash the offender's stake by compute_violation_slash_amount;
         burn the tokens.
-      * Record the (tx_hash, proposer_id) in processed_violations.
+      * Record the (list_hash, tx_hash, proposer_id) in
+        processed_violations.
+
+    The dedupe key includes list_hash because two overlapping lists
+    can mandate the same tx; omitting that tx while both are active
+    is two violations, not one.  Keyed at 3-tuple (not 4-tuple with
+    accused_height) because the height range is implied by the list's
+    window — two evidences for the same (list, tx, proposer) at
+    different heights are true duplicates.
     """
     proc = blockchain.inclusion_list_processor
-    key = (etx.omitted_tx_hash, etx.accused_proposer_id)
+    key = (
+        etx.inclusion_list.list_hash,
+        etx.omitted_tx_hash,
+        etx.accused_proposer_id,
+    )
     if key in proc.processed_violations:
         return InclusionViolationResult(
             accepted=False, slashed=False,

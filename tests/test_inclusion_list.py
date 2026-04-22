@@ -751,7 +751,12 @@ class TestInclusionListProcessor(unittest.TestCase):
 
         proc = InclusionListProcessor()
         proc.register(lst, current_height=11)
-        proc.processed_violations.add((tx_h, b"\xff" * 32))
+        # Dedup key is (list_hash, tx_hash, proposer_id) — list_hash
+        # participates so two overlapping lists mandating the same tx
+        # each get their own slash.
+        proc.processed_violations.add(
+            (lst.list_hash, tx_h, b"\xff" * 32),
+        )
 
         snap = proc.snapshot_dict()
         proc2 = InclusionListProcessor()

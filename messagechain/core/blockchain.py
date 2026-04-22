@@ -1389,14 +1389,17 @@ class Blockchain:
         # Inclusion-list processor: install active forward-window
         # lists + processed_violations from snapshot.  Active lists are
         # canonical-bytes encoded under publish_height keys; the
-        # processed-violations set is bytes(tx_hash || proposer_id)
-        # concatenations.  Per-list bookkeeping (inclusions_seen +
-        # proposers_by_height) is rebuilt empty — those are derived
-        # from observe_block calls during forward replay and don't
-        # affect any consensus decision once the active window has
-        # closed (only the `expire()` time fires from them).  At the
-        # snapshot height the chain is mid-window and observe_block
-        # will repopulate as new blocks arrive.
+        # processed-violations set is bytes(list_hash || tx_hash ||
+        # proposer_id) concatenations (96 bytes per entry from v12
+        # onwards — list_hash was added to the dedup key so a proposer
+        # who omitted the same tx from two overlapping lists is
+        # slashed once per list, not once total).  Per-list bookkeeping
+        # (inclusions_seen + proposers_by_height) is rebuilt empty —
+        # those are derived from observe_block calls during forward
+        # replay and don't affect any consensus decision once the
+        # active window has closed (only the `expire()` time fires
+        # from them).  At the snapshot height the chain is mid-window
+        # and observe_block will repopulate as new blocks arrive.
         from messagechain.consensus.inclusion_list import (
             InclusionList as _InclusionList,
         )
@@ -1408,17 +1411,22 @@ class Blockchain:
             lst.list_hash: {} for lst in active.values()
         }
         self.inclusion_list_processor.inclusions_seen = {}
-        violations: set[tuple[bytes, bytes]] = set()
+        violations: set[tuple[bytes, bytes, bytes]] = set()
         for compound in snap.get("inclusion_list_processed_violations", set()):
-            # Each entry is bytes(tx_hash || proposer_id) — both 32
-            # bytes.  Strict-shape check guards against a malformed
-            # snapshot from a forked node.
-            if len(compound) != 64:
+            # Each entry is bytes(list_hash || tx_hash || proposer_id)
+            # — all three 32 bytes, total 96.  Strict-shape check
+            # guards against a malformed snapshot from a forked node.
+            if len(compound) != 96:
                 raise ValueError(
                     "inclusion_list_processed_violations entry must be "
-                    f"64 bytes, got {len(compound)}"
+                    f"96 bytes (list_hash||tx_hash||proposer_id), "
+                    f"got {len(compound)}"
                 )
-            violations.add((bytes(compound[:32]), bytes(compound[32:])))
+            violations.add((
+                bytes(compound[:32]),
+                bytes(compound[32:64]),
+                bytes(compound[64:]),
+            ))
         self.inclusion_list_processor.processed_violations = violations
 
         # Coverage-divergence leak per-attester miss counter — install

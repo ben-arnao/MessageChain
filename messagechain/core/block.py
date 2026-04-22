@@ -600,7 +600,10 @@ class Block:
     # admission, the chain slashes the proposer
     # INCLUSION_VIOLATION_SLASH_BPS of stake (burned, no finder reward)
     # via process_inclusion_list_violation.  Double-slash defence via
-    # InclusionListProcessor.processed_violations.
+    # InclusionListProcessor.processed_violations (keyed by
+    # (list_hash, tx_hash, proposer_id) — list_hash participates so
+    # two overlapping lists that both mandated a tx each get their
+    # own slash on omission).
     # See messagechain.consensus.inclusion_list.
     inclusion_list_violation_evidence_txs: list = field(default_factory=list)
     # The InclusionList PUBLISHED at this height, applying forward to

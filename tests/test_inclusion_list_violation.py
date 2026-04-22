@@ -8,9 +8,11 @@ can submit an InclusionListViolationEvidenceTx naming the omitted tx
 proposer INCLUSION_VIOLATION_SLASH_BPS of stake (burned — no finder
 reward, matches the existing evidence types).
 
-Double-slash defense: once a (tx_hash, proposer_id) pair is in the
-processor's processed_violations set, no second evidence can be
-admitted against it.
+Double-slash defense: once a (list_hash, tx_hash, proposer_id) triple
+is in the processor's processed_violations set, no second evidence can
+be admitted against it.  list_hash is part of the key because two
+overlapping inclusion lists can both mandate the same tx — omitting
+that tx while both are active is two violations, not one.
 """
 
 import hashlib
@@ -239,11 +241,12 @@ class TestInclusionViolationSlashing(unittest.TestCase):
             self.accused.entity_id, accused_height=12,
         )
         # Register the violation directly via the processor as a
-        # reference point: the (tx_hash, proposer_id) hasn't been
-        # processed yet.
+        # reference point: the (list_hash, tx_hash, proposer_id)
+        # triple hasn't been processed yet.
         proc = self.chain.inclusion_list_processor
         self.assertNotIn(
-            (tx_h, self.accused.entity_id), proc.processed_violations,
+            (lst.list_hash, tx_h, self.accused.entity_id),
+            proc.processed_violations,
         )
 
         stake_before = self.chain.supply.staked[self.accused.entity_id]
@@ -264,7 +267,8 @@ class TestInclusionViolationSlashing(unittest.TestCase):
         self.assertEqual(stake_before - stake_after, expected)
         self.assertGreaterEqual(burned_after - burned_before, expected)
         self.assertIn(
-            (tx_h, self.accused.entity_id), proc.processed_violations,
+            (lst.list_hash, tx_h, self.accused.entity_id),
+            proc.processed_violations,
         )
 
     def test_double_slash_prevented(self):
@@ -315,10 +319,11 @@ class TestInclusionViolationSlashing(unittest.TestCase):
         self.assertIn("inclusion_list_processed_violations", restored)
         self.assertIn("inclusion_list_active", restored)
         # processed_violations is encoded as a bytes set whose entries
-        # are (tx_hash || proposer_id) concatenations — a single
-        # 64-byte blob per violation.
+        # are (list_hash || tx_hash || proposer_id) concatenations —
+        # a single 96-byte blob per violation (v12+; pre-v12 used
+        # 64-byte entries without list_hash).
         self.assertIn(
-            tx_h + self.accused.entity_id,
+            lst.list_hash + tx_h + self.accused.entity_id,
             restored["inclusion_list_processed_violations"],
         )
         self.assertIn(
@@ -332,7 +337,7 @@ class TestInclusionViolationSlashing(unittest.TestCase):
         chain2 = Blockchain()
         chain2._install_state_snapshot(restored)
         self.assertIn(
-            (tx_h, self.accused.entity_id),
+            (lst.list_hash, tx_h, self.accused.entity_id),
             chain2.inclusion_list_processor.processed_violations,
         )
         self.assertIn(

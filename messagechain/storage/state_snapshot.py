@@ -114,7 +114,8 @@ from messagechain.config import (
 # v6: added inclusion-list processor state — active forward-window
 #     lists (int→bytes dict keyed by publish_height with the value
 #     being InclusionList.to_bytes()) and the processed_violations
-#     set (bytes containing tx_hash || proposer_id concatenated).
+#     set (bytes containing tx_hash || proposer_id concatenated — 64
+#     bytes per entry until v12 widened to 96 bytes with list_hash).
 #     Trails the v5 section in the binary layout; pre-v6 snapshots
 #     decode with empty active/processed under deserialize_state's
 #     setdefault path.
@@ -164,7 +165,20 @@ from messagechain.config import (
 #      sorted by (height, amount) for deterministic hashing.  Binary
 #      layout: u32 count followed by count × (u32 height, u64 amount)
 #      tuples, appended after attester_coverage_misses.
-STATE_SNAPSHOT_VERSION = 11  # wire format version for encode/decode
+# v12: inclusion-list processed_violations entries widen from 64 bytes
+#      (tx_hash || proposer_id) to 96 bytes
+#      (list_hash || tx_hash || proposer_id).  Two overlapping inclusion
+#      lists can mandate the same tx; under the old key a proposer who
+#      omitted that tx from both was slashed once total instead of
+#      once per list.  list_hash is now part of the dedup key
+#      (InclusionListProcessor.processed_violations).  Pure
+#      key-widening — no new section is added, same section tag
+#      (_TAG_INCLUSION_LIST_VIOLATIONS).  The binary layout is
+#      otherwise unchanged from v11; the version bump is required
+#      because the per-entry byte length changed and the strict
+#      installer-side width check in blockchain._install_state_snapshot
+#      was widened from 64 to 96 accordingly.
+STATE_SNAPSHOT_VERSION = 12  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -225,7 +239,8 @@ _TAG_RECEIPT_ROOT = b"rrk"
 _TAG_BOGUS_REJECTION_PROCESSED = b"brproc"
 # Inclusion-list processor — active forward-window lists keyed by
 # publish_height with InclusionList canonical bytes as the value, plus
-# the per-(tx_hash, proposer_id) processed_violations set.  Both
+# the per-(list_hash, tx_hash, proposer_id) processed_violations set
+# (v12 key-widening — see STATE_SNAPSHOT_VERSION header).  Both
 # sections participate in the state root: two state-synced nodes that
 # disagreed on which lists are active or which violations have already
 # been slashed would silently fork the next time an
@@ -363,8 +378,9 @@ def serialize_state(blockchain) -> dict:
         ),
         # Inclusion-list processor — active forward-window lists keyed
         # by publish_height (int) with the InclusionList canonical
-        # bytes as the value, plus the (tx_hash || proposer_id)
-        # processed_violations set.  See
+        # bytes as the value, plus the (list_hash || tx_hash ||
+        # proposer_id) processed_violations set (96-byte entries from
+        # v12 onwards — see STATE_SNAPSHOT_VERSION header).  See
         # consensus.inclusion_list.InclusionListProcessor for the
         # lifecycle that mutates these.
         "inclusion_list_active": _inclusion_list_active(
@@ -444,11 +460,14 @@ def _inclusion_list_active(processor) -> dict:
 
 
 def _inclusion_list_processed_violations(processor) -> set:
-    """Serialise the (tx_hash, proposer_id) set as bytes
-    concatenations so it can ride the standard bytes_set encoder."""
+    """Serialise the (list_hash, tx_hash, proposer_id) set as 96-byte
+    concatenations (list_hash || tx_hash || proposer_id) so it can
+    ride the standard bytes_set encoder.  list_hash is part of the
+    key because two overlapping inclusion lists can mandate the same
+    tx — see InclusionListProcessor.processed_violations."""
     if processor is None:
         return set()
-    return {tx + pid for (tx, pid) in processor.processed_violations}
+    return {lh + tx + pid for (lh, tx, pid) in processor.processed_violations}
 
 
 def _pending_to_bytes_dict(processor) -> dict:
@@ -784,8 +803,9 @@ def compute_state_root(snapshot: dict) -> bytes:
             _TAG_INCLUSION_LIST_ACTIVE,
             snap["inclusion_list_active"])),
         # Inclusion-list processed violations — set of bytes
-        # concatenating tx_hash || proposer_id.  Same dedupe-determinism
-        # criticality as _TAG_CENSORSHIP_PROCESSED.
+        # concatenating list_hash || tx_hash || proposer_id (96 bytes
+        # per entry, v12+).  Same dedupe-determinism criticality as
+        # _TAG_CENSORSHIP_PROCESSED.
         _TAG_INCLUSION_LIST_VIOLATIONS: _merkle(_entries_for_section(
             _TAG_INCLUSION_LIST_VIOLATIONS,
             snap["inclusion_list_processed_violations"])),
@@ -1166,9 +1186,11 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_set(snap["bogus_rejection_processed"])
     # v6: inclusion-list processor sections.  active_lists is an
     # int→bytes dict (publish_height → InclusionList canonical bytes);
-    # processed_violations is a bytes-set of (tx_hash || proposer_id)
-    # concatenations.  Trail the v5 section so a v5 blob is a strict
-    # prefix of a v6 blob through the end of v5's final field.
+    # processed_violations is a bytes-set of (list_hash || tx_hash ||
+    # proposer_id) concatenations (96 bytes per entry, v12+ — v6
+    # through v11 used 64-byte entries without list_hash).  Trail the
+    # v5 section so a v5 blob is a strict prefix of a v6 blob through
+    # the end of v5's final field.
     out += _encode_int_bytes_dict(snap["inclusion_list_active"])
     out += _encode_bytes_set(snap["inclusion_list_processed_violations"])
     # v7: archive-duty state — misses, first-active, open snapshot.
@@ -1261,7 +1283,9 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     bogus_rejection_processed, off = _decode_bytes_set(blob, off)
     # v6+: inclusion-list processor sections.  Always present on v6+
     # blobs.  active is an int→bytes dict (publish_height → list-bytes);
-    # processed_violations is a bytes-set of (tx || proposer) pairs.
+    # processed_violations is a bytes-set of (list_hash || tx || proposer)
+    # triples (96 bytes per entry, v12+; was 64-byte (tx || proposer)
+    # pairs in v6-v11 before the list_hash widening).
     inclusion_list_active, off = _decode_int_bytes_dict(blob, off)
     inclusion_list_processed_violations, off = _decode_bytes_set(blob, off)
     # v7+: archive-duty state.  Three strictly-ordered fields append
