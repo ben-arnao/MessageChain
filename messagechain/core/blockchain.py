@@ -3542,10 +3542,16 @@ class Blockchain:
             # second compute_challenge call here — validator has
             # already bound the list to the correct challenge.
             sim_expected_hash = custody_proofs[0].target_block_hash
+            # Selection seed (iter 3e): parent block's randao mix
+            # drives the deterministic-shuffle that replaces strict
+            # FCFS.  Same seed the apply path uses (see
+            # _apply_archive_rewards), kept consistent so sim and
+            # apply reach identical per-entity balance mutations.
             sim_result = apply_archive_rewards(
                 proofs=custody_proofs,
                 pool=sim_pool,
                 expected_block_hash=sim_expected_hash,
+                selection_seed=parent_randao,
             )
             for payout in sim_result.payouts:
                 sim_balances[payout.prover_id] = (
@@ -6805,10 +6811,14 @@ class Blockchain:
             # the first proof rather than re-resolving the challenge,
             # so a pool caller that applies an already-validated block
             # doesn't redundantly recompute compute_challenge here.
+            # Selection seed (iter 3e): parent block's randao_mix.
+            # Same seed the sim path in compute_post_state_root uses;
+            # shuffle-then-pay replaces strict FCFS.
             result = apply_archive_rewards(
                 proofs=proofs,
                 pool=wrapper,
                 expected_block_hash=expected_block_hash,
+                selection_seed=parent.header.randao_mix,
             )
             # Credit every paid prover.  Tokens move from the pool
             # into circulating balances — pool was already counted in

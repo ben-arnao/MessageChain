@@ -718,31 +718,40 @@ def apply_archive_rewards(
     proofs: Iterable[CustodyProof],
     pool: ArchiveRewardPool,
     expected_block_hash: bytes,
+    selection_seed: Optional[bytes] = None,
     reward_amount: int = ARCHIVE_REWARD,
     max_payouts: int = ARCHIVE_PROOFS_PER_CHALLENGE,
 ) -> ArchiveRewardResult:
-    """Pay up to `max_payouts` FCFS rewards from `pool`.
+    """Pay up to `max_payouts` rewards from `pool`.
 
-    - Iterates `proofs` in supplied order (the proposer's listed
-      order in the block).
-    - Validates each against `expected_block_hash`.
-    - Pays up to `reward_amount` per valid, unique prover.
-    - Duplicates (same prover_id submitting twice) are silently
-      dropped — one reward per prover per challenge caps Sybil
-      amplification to zero.
-    - Stops once `max_payouts` valid proofs have been paid OR the
-      pool empties (returns 0 from try_pay).
+    Iteration 3e change: selection is a DETERMINISTIC UNIFORM SHUFFLE
+    over the valid, deduplicated proofs — not strict FCFS as before.
+    This neutralizes the fast-connection advantage that made paid
+    archival a winner-take-all race for industrial operators.  Every
+    valid submitter has equal odds of making the cap, regardless of
+    where they appear in the proposer's listed order.
 
-    Does not mutate any balance other than the pool's — the caller
-    splices `result.payouts` into its own supply ledger.  This keeps
-    the module testable without a live Blockchain.
+    `selection_seed` (32 bytes) drives the shuffle; callers pass the
+    parent block's randao mix or an equivalent consensus-deterministic
+    value.  If None, falls back to submission-order (backward-compat
+    for tests + modules that hand a list directly without a seed;
+    live-chain callers in blockchain.py always pass a seed).
+
+    Rules retained from prior iteration:
+      * One payout per unique prover_id per challenge (Sybil cap).
+      * Pool-exhaustion is graceful: remaining proofs marked rejected.
+      * No mutation outside the pool scalar — caller splices payouts.
     """
-    result = ArchiveRewardResult()
-    seen_provers: set[bytes] = set()
+    import hashlib as _hashlib
+    import struct as _struct
 
+    # First pass: filter to valid, unique proofs (consistent with the
+    # old FCFS semantics for dedup — first occurrence of a prover_id
+    # wins the de-dup).  Collect as a list so we can shuffle.
+    result = ArchiveRewardResult()
+    valid_proofs: list[CustodyProof] = []
+    seen_provers: set[bytes] = set()
     for proof in proofs:
-        if len(result.payouts) >= max_payouts:
-            break
         ok, reason = verify_custody_proof(
             proof, expected_block_hash=expected_block_hash,
         )
@@ -752,13 +761,27 @@ def apply_archive_rewards(
         if proof.prover_id in seen_provers:
             result.rejected.append("duplicate prover")
             continue
+        seen_provers.add(proof.prover_id)
+        valid_proofs.append(proof)
+
+    # Deterministic shuffle.  Seed-keyed sort by
+    # H(seed || prover_id) — every node with the same seed + input
+    # set produces the same ordering.  This is the Fisher-Yates
+    # equivalent for a small list without needing per-element
+    # randomness bytes.
+    if selection_seed is not None and valid_proofs:
+        def _shuffle_key(p: CustodyProof) -> bytes:
+            return _hashlib.new(HASH_ALGO, selection_seed + p.prover_id).digest()
+        valid_proofs = sorted(valid_proofs, key=_shuffle_key)
+
+    # Pay out up to cap; stop on pool exhaustion.
+    for proof in valid_proofs:
+        if len(result.payouts) >= max_payouts:
+            break
         paid = pool.try_pay(reward_amount)
         if paid <= 0:
-            # Pool exhausted — no point continuing, future proofs
-            # will also get 0.  Record each as a skip for audit.
             result.rejected.append("pool exhausted")
             break
-        seen_provers.add(proof.prover_id)
         result.payouts.append(_Payout(prover_id=proof.prover_id, amount=paid))
         result.total_paid += paid
 

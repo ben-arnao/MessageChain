@@ -358,10 +358,18 @@ class TestFCFSCap(unittest.TestCase):
         )
 
     def test_first_N_valid_proofs_paid(self):
+        """With more valid proofs than the cap, exactly
+        ARCHIVE_PROOFS_PER_CHALLENGE are paid.  Uses cap + 10 proofs
+        so the test stays meaningful as the cap scales across
+        iterations (was 10 pre-3e, now 100).
+        """
         pool = ArchiveRewardPool()
-        pool.fund(ARCHIVE_REWARD * 100)  # plenty
+        pool.fund(ARCHIVE_REWARD * (ARCHIVE_PROOFS_PER_CHALLENGE + 20))
         block = _mini_block([f"t{i}".encode() * 10 for i in range(3)], 5)
-        proofs = [self._proof(i + 1, block) for i in range(15)]
+        proofs = [
+            self._proof(i + 1, block)
+            for i in range(ARCHIVE_PROOFS_PER_CHALLENGE + 10)
+        ]
         result = apply_archive_rewards(
             proofs=proofs,
             pool=pool,
