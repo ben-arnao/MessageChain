@@ -737,8 +737,11 @@ class TestSnapshotWireRoundTrip(unittest.TestCase):
             sorted(entries),
         )
 
-    def test_wire_version_bumped_to_10(self):
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 10)
+    def test_wire_version_bumped_to_11(self):
+        # Originally bumped to v10, but the concurrent coverage-misses
+        # fork also claimed v10 — this fork was promoted to v11 at
+        # merge time.
+        self.assertEqual(STATE_SNAPSHOT_VERSION, 11)
 
 
 if __name__ == "__main__":
