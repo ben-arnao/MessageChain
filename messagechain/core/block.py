@@ -238,6 +238,9 @@ def _deserialize_authority_tx(data: dict):
     from messagechain.core.receipt_subtree_root import (
         SetReceiptSubtreeRootTransaction,
     )
+    from messagechain.core.release_announce import (
+        ReleaseAnnounceTransaction,
+    )
     tag = data.get("type")
     if tag == "set_authority_key":
         return SetAuthorityKeyTransaction.deserialize(data)
@@ -247,6 +250,8 @@ def _deserialize_authority_tx(data: dict):
         return KeyRotationTransaction.deserialize(data)
     if tag == "set_receipt_subtree_root":
         return SetReceiptSubtreeRootTransaction.deserialize(data)
+    if tag == "release_announce":
+        return ReleaseAnnounceTransaction.deserialize(data)
     raise ValueError(f"Unknown authority tx type: {tag!r}")
 
 
@@ -749,6 +754,9 @@ class Block:
         from messagechain.core.receipt_subtree_root import (
             SetReceiptSubtreeRootTransaction,
         )
+        from messagechain.core.release_announce import (
+            ReleaseAnnounceTransaction,
+        )
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
@@ -797,6 +805,11 @@ class Block:
                     # bootstrap binaries; that is flagged as a
                     # consensus-format change in the commit message.
                     kind = 3
+                elif isinstance(t, ReleaseAnnounceTransaction):
+                    # kind=4: threshold multi-sig release manifest.
+                    # Append-only union extension — same hard-fork
+                    # caveat as kind=3.
+                    kind = 4
                 else:
                     raise ValueError(f"Unknown authority tx: {type(t).__name__}")
                 b = _tx_bytes(t)
@@ -895,6 +908,9 @@ class Block:
         from messagechain.core.receipt_subtree_root import (
             SetReceiptSubtreeRootTransaction,
         )
+        from messagechain.core.release_announce import (
+            ReleaseAnnounceTransaction,
+        )
         from messagechain.governance.governance import (
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
@@ -992,10 +1008,14 @@ class Block:
         # kind 0: SetAuthorityKey, kind 1: Revoke, kind 2: KeyRotation,
         # kind 3: SetReceiptSubtreeRoot (appended — older binaries reject
         # kind=3 with a clear "Unknown authority tx kind" error).
+        # kind 4: ReleaseAnnounce (threshold multi-sig manifest; same
+        # hard-fork caveat as kind=3 — pre-release-announce binaries
+        # cannot decode blocks with this slot populated).
         auth_count = take_u32()
         auth_classes = (
             SetAuthorityKeyTransaction, RevokeTransaction,
             KeyRotationTransaction, SetReceiptSubtreeRootTransaction,
+            ReleaseAnnounceTransaction,
         )
         authority_txs = []
         for _ in range(auth_count):
