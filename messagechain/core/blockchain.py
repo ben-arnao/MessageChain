@@ -23,7 +23,8 @@ from messagechain.config import (
     MAX_BLOCK_MESSAGE_BYTES,
     VALIDATOR_MIN_STAKE, GENESIS_ALLOCATION, GENESIS_SUPPLY,
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
-    DUST_LIMIT, MAX_ORPHAN_BLOCKS, ASSUME_VALID_BLOCK_HASH,
+    DUST_LIMIT, MAX_ORPHAN_BLOCKS, MAX_ORPHAN_BLOCKS_PER_PEER,
+    ORPHAN_MAX_AGE_BLOCKS, ASSUME_VALID_BLOCK_HASH,
     MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
     KEY_ROTATION_COOLDOWN_BLOCKS, BASE_FEE_INITIAL,
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
@@ -281,6 +282,21 @@ class Blockchain:
         self._immature_rewards: list[tuple[int, bytes, int]] = []
         # Orphan block pool: blocks whose parent is not yet known (bounded)
         self.orphan_pool: dict[bytes, Block] = {}  # block_hash -> Block
+        # Per-orphan arrival metadata: (arrival_height, source_peer | None).
+        # Used for both age-based TTL eviction (ORPHAN_MAX_AGE_BLOCKS) and
+        # per-peer quota enforcement (MAX_ORPHAN_BLOCKS_PER_PEER).  Entries
+        # are inserted on orphan-store, removed on drain (_process_orphans)
+        # or TTL eviction — kept in lockstep with orphan_pool.
+        self.orphan_arrival: dict[bytes, tuple[int, str | None]] = {}
+        # Running per-peer count of currently-pooled orphans, keyed by
+        # source_peer address string.  Derivable from orphan_arrival but
+        # maintained incrementally so the quota check is O(1).
+        self.orphan_peer_counts: dict[str, int] = {}
+        # Peers caught exceeding per-peer quota or flooding a full pool —
+        # the network layer drains this into ban_manager.record_offense
+        # (OFFENSE_PROTOCOL_VIOLATION).  Blockchain itself stays peer-agnostic;
+        # it just accumulates counts for the caller to honor.
+        self.orphan_flood_peers: dict[str, int] = {}
         # Signature verification cache (invalidated on reorg)
         self.sig_cache = get_global_cache()
         # AssumeValid: skip signature verification for blocks at or below this hash
@@ -7464,8 +7480,32 @@ class Blockchain:
 
         return True, "Genesis block reconstructed from block 0 alone"
 
-    def add_block(self, block: Block) -> tuple[bool, str]:
-        """Validate and append a block, updating state (fees + inflation)."""
+    def add_block(
+        self, block: Block, source_peer: str | None = None,
+    ) -> tuple[bool, str]:
+        """Validate and append a block, updating state (fees + inflation).
+
+        Args:
+            block: the Block to validate and attempt to append.
+            source_peer: optional peer-address string identifying who sent
+                us this block.  Threaded through so the orphan pool can
+                enforce MAX_ORPHAN_BLOCKS_PER_PEER and record flood
+                offenses.  None for internally-produced blocks (e.g., own
+                proposals) and legacy / test callers — no per-peer
+                accounting happens in that case.
+        """
+        # Age-based TTL cleanup: drop orphans that have gone
+        # ORPHAN_MAX_AGE_BLOCKS without their parent arriving.  Cheap O(n)
+        # scan on every add_block, guaranteed small (n ≤ MAX_ORPHAN_BLOCKS).
+        # Runs first so stale entries free quota slots the new arrival may need.
+        if self.orphan_arrival:
+            cutoff = self.height - ORPHAN_MAX_AGE_BLOCKS
+            expired = [
+                h for h, (arrived_h, _peer) in self.orphan_arrival.items()
+                if arrived_h < cutoff
+            ]
+            for h in expired:
+                self._evict_orphan(h)
         # ── Weak-subjectivity checkpoint gate ───────────────────────────
         # Universal long-range-attack defense: if this block's height is
         # checkpointed and its hash doesn't match, reject.  Lives here
@@ -7495,8 +7535,7 @@ class Blockchain:
                 # "I'm behind" signal rather than invalid-block-ban.
                 # IBD triggered elsewhere will fetch block 0 and drain
                 # the orphan pool.
-                if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
-                    self.orphan_pool[block.block_hash] = block
+                self._store_orphan(block, source_peer)
                 return False, (
                     f"Orphan block — chain empty, received block "
                     f"{block.header.block_number}; need IBD to block 0"
@@ -7579,11 +7618,7 @@ class Blockchain:
             if _orphan_entity_counts[tx.entity_id] > MAX_TXS_PER_ENTITY_PER_BLOCK:
                 return False, "Orphan rejected — per-entity message tx cap exceeded"
 
-        if len(self.orphan_pool) < MAX_ORPHAN_BLOCKS:
-            self.orphan_pool[block.block_hash] = block
-            logger.debug(f"Stored orphan block #{block.header.block_number} (pool: {len(self.orphan_pool)})")
-        else:
-            logger.warning(f"Orphan pool full ({MAX_ORPHAN_BLOCKS}), dropping block #{block.header.block_number}")
+        self._store_orphan(block, source_peer)
         return False, "Orphan block — parent not found"
 
     def _append_block(self, block: Block) -> tuple[bool, str]:
@@ -7722,6 +7757,82 @@ class Blockchain:
 
         return True, f"Block added (reward: {reward}, fees: {total_fees})"
 
+    def _store_orphan(self, block: Block, source_peer: str | None) -> None:
+        """Insert an orphan into the pool, honoring global + per-peer quotas.
+
+        Silently drops the orphan when either cap is hit.  If source_peer is
+        known and the drop is due to a quota violation, records a flood
+        offense against that peer (the network layer drains
+        self.orphan_flood_peers into its ban manager).
+
+        Kept in lockstep with orphan_arrival and orphan_peer_counts —
+        callers must never poke orphan_pool directly.
+        """
+        block_hash = block.block_hash
+        # Already present — idempotent no-op, don't double-count the peer.
+        if block_hash in self.orphan_pool:
+            return
+
+        # Per-peer quota: a single sybil can hold at most
+        # MAX_ORPHAN_BLOCKS_PER_PEER slots, so it cannot evict honest IBD-gap
+        # orphans submitted by other peers.  Only enforced when we know the
+        # sender (source_peer != None); internal / legacy callers bypass.
+        if source_peer is not None:
+            cur = self.orphan_peer_counts.get(source_peer, 0)
+            if cur >= MAX_ORPHAN_BLOCKS_PER_PEER:
+                self.orphan_flood_peers[source_peer] = (
+                    self.orphan_flood_peers.get(source_peer, 0) + 1
+                )
+                logger.warning(
+                    f"Orphan quota exceeded for peer {source_peer} "
+                    f"(cap={MAX_ORPHAN_BLOCKS_PER_PEER}); dropping block "
+                    f"#{block.header.block_number}"
+                )
+                return
+
+        # Global pool cap: prevents unbounded memory use when many distinct
+        # peers each fill a fraction of their quota.  If full and sender is
+        # known, log flood; Bitcoin-style silent drop for unknown senders.
+        if len(self.orphan_pool) >= MAX_ORPHAN_BLOCKS:
+            if source_peer is not None:
+                self.orphan_flood_peers[source_peer] = (
+                    self.orphan_flood_peers.get(source_peer, 0) + 1
+                )
+            logger.warning(
+                f"Orphan pool full ({MAX_ORPHAN_BLOCKS}), dropping block "
+                f"#{block.header.block_number}"
+                + (f" from {source_peer}" if source_peer else "")
+            )
+            return
+
+        self.orphan_pool[block_hash] = block
+        self.orphan_arrival[block_hash] = (self.height, source_peer)
+        if source_peer is not None:
+            self.orphan_peer_counts[source_peer] = (
+                self.orphan_peer_counts.get(source_peer, 0) + 1
+            )
+        logger.debug(
+            f"Stored orphan block #{block.header.block_number} "
+            f"(pool: {len(self.orphan_pool)})"
+        )
+
+    def _evict_orphan(self, block_hash: bytes) -> None:
+        """Remove a single orphan + its arrival/peer-count metadata.
+
+        Single choke point for every orphan-remove path (TTL, drain, quota
+        eviction) so the three tracking dicts stay consistent.
+        """
+        self.orphan_pool.pop(block_hash, None)
+        meta = self.orphan_arrival.pop(block_hash, None)
+        if meta is not None:
+            _arrived_h, peer = meta
+            if peer is not None:
+                new_count = self.orphan_peer_counts.get(peer, 0) - 1
+                if new_count <= 0:
+                    self.orphan_peer_counts.pop(peer, None)
+                else:
+                    self.orphan_peer_counts[peer] = new_count
+
     def _process_orphans(self, parent_hash: bytes):
         """Check if any orphan blocks depend on the given parent and try to add them."""
         dependents = [
@@ -7729,7 +7840,9 @@ class Blockchain:
             if orphan.header.prev_hash == parent_hash
         ]
         for orphan in dependents:
-            del self.orphan_pool[orphan.block_hash]
+            # Use _evict_orphan so arrival-height and per-peer counters stay
+            # in lockstep with orphan_pool (previously del'd dict entry only).
+            self._evict_orphan(orphan.block_hash)
             logger.debug(f"Processing orphan block #{orphan.header.block_number}")
             self.add_block(orphan)
 

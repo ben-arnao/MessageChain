@@ -2892,7 +2892,8 @@ class Server(SharedRuntimeMixin):
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_block_data"
                 )
                 return
-            success, reason = self.blockchain.add_block(block)
+            success, reason = self.blockchain.add_block(block, source_peer=address)
+            self._drain_orphan_flood_offenses()
             if success:
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
                 # Attester duty: vote on the accepted block, but only if
@@ -3361,6 +3362,25 @@ class Server(SharedRuntimeMixin):
     async def _broadcast_block(self, block: Block):
         msg = NetworkMessage(MessageType.ANNOUNCE_BLOCK, block.serialize())
         await self._broadcast(msg)
+
+    def _drain_orphan_flood_offenses(self) -> None:
+        """Turn Blockchain's accumulated orphan-flood counts into ban offenses.
+
+        Mirrors messagechain.network.node._drain_orphan_flood_offenses.
+        Blockchain is peer-agnostic and just increments a counter when a
+        peer exceeds MAX_ORPHAN_BLOCKS_PER_PEER or hits a full pool; the
+        network layer owns the ban manager and converts those events into
+        OFFENSE_PROTOCOL_VIOLATION hits here.
+        """
+        flood_map = getattr(self.blockchain, "orphan_flood_peers", None)
+        if not flood_map:
+            return
+        for addr, count in list(flood_map.items()):
+            for _ in range(count):
+                self.ban_manager.record_offense(
+                    addr, OFFENSE_PROTOCOL_VIOLATION, "orphan_pool_flood",
+                )
+        flood_map.clear()
 
     def _schedule_pending_tx_gossip(self, kind: str, tx) -> None:
         """Fire-and-forget gossip of a newly-admitted non-message tx.
