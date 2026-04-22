@@ -2147,8 +2147,16 @@ MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 # Merkle auth path) while paying only the payload fee.  Operators MUST
 # replace this placeholder with a concrete coordinated-fork height before
 # deploying to mainnet; the current value is chosen as "current_height +
-# 50_000" headroom so honest nodes have time to upgrade.
-FEE_INCLUDES_SIGNATURE_HEIGHT = 50_000
+# 50_000" headroom so honest nodes have time to upgrade.  Set
+# ``MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT`` in systemd/k8s env to pin
+# the coordinated-fork height without editing this file — avoids the
+# edit-and-redeploy slip that otherwise risks validators diverging on
+# consensus at activation.
+FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
+    "MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT",
+    "FEE_INCLUDES_SIGNATURE_HEIGHT",
+    50_000,
+)
 
 # Activation height for decoupling attester committee size from the
 # reward-pool token budget.  Pre-activation the committee was implicitly
