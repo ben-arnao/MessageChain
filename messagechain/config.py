@@ -1920,6 +1920,60 @@ EVIDENCE_EXPIRY_BLOCKS = 2016
 EVIDENCE_MATURITY_BLOCKS = 16
 
 # ─────────────────────────────────────────────────────────────────────
+# Witnessed submission — closes the silent-TCP-drop censorship gap.
+# ─────────────────────────────────────────────────────────────────────
+# Today's signed-rejection slashing catches validators who answer an
+# HTTPS submission with a bogus rejection reason.  It does NOT catch
+# validators who simply hang up the TCP connection silently — the
+# client has no proof the validator received the submission, so no
+# on-chain evidence can be filed.
+#
+# Witnessed submission closes this: the client opts in (paying a small
+# fee surcharge), signs a SubmissionRequest blob and sends it to the
+# target validator AND gossips the digest to a witness topic.  The
+# target validator MUST publish a signed SubmissionAck within
+# WITNESS_RESPONSE_DEADLINE_BLOCKS.  If they don't, peers who saw the
+# witness gossip submit a NonResponseEvidenceTx and the validator gets
+# slashed WITNESS_NON_RESPONSE_SLASH_BPS of stake.
+
+# Surcharge above MIN_FEE that an opt-in client pays to use the
+# witnessed-submission path.  Small enough that legitimate users in
+# coercion contexts can afford it; large enough that the witness
+# topic's bandwidth is paid for and not griefable.
+WITNESS_SURCHARGE = MIN_FEE * 2
+
+# Number of blocks after a witness gossip's observed_height by which
+# the target validator MUST publish a SubmissionAck.  Beyond this,
+# peers can file NonResponseEvidenceTx.  Generous enough to absorb
+# block-time jitter, short enough that silent censorship is not
+# economic.
+WITNESS_RESPONSE_DEADLINE_BLOCKS = 8
+
+# Minimum number of distinct witness signatures required to admit a
+# NonResponseEvidenceTx.  Q-of-N witness model — a few honest peers
+# seeing the gossip is enough to slash, no consensus-grade BFT
+# reliability required from the witness path.
+WITNESS_QUORUM = 3
+
+# Per-validator slash percentage applied when a NonResponseEvidenceTx
+# is admitted.  Set smaller than CENSORSHIP_SLASH_BPS (10%) because a
+# silent drop is less aggressive censorship than admit-then-drop —
+# 5% still hurts but leaves room to escalate via repeated evidence.
+WITNESS_NON_RESPONSE_SLASH_BPS = 500  # 5% of stake
+
+# Maximum number of (request_hash) entries a proposer may embed in
+# their block as the "acks_observed_this_block" list.  Caps block
+# size so the witness ack registry cannot bloat block bandwidth.
+MAX_ACKS_PER_BLOCK = 256
+
+# How long the in-memory WitnessObservationStore keeps observations
+# before pruning.  Bound on memory at the cost of forgetting older
+# obligations — anything older than this is past the
+# WITNESS_RESPONSE_DEADLINE_BLOCKS window anyway, so evidence cannot
+# be assembled from it.
+WITNESS_OBSERVATION_RETENTION_BLOCKS = 64
+
+# ─────────────────────────────────────────────────────────────────────
 # Unbonding period — derived from the evidence-window invariant.
 # ─────────────────────────────────────────────────────────────────────
 # The pending-unstake queue holds tokens in a slashable-but-locked

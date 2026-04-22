@@ -114,6 +114,20 @@ class SubmissionResult:
     # — a misbehaving client cannot drain the issuer's receipt subtree
     # by spamming garbage txs without setting the opt-in header.
     rejection_hex: str = ""
+    # SubmissionAck bytes (hex) when issued.  Populated only when the
+    # client opts in via X-MC-Witnessed-Submission: <hex(request_hash)>
+    # AND the server-side ReceiptIssuer is configured.  The ack
+    # commits the validator to having received and processed the
+    # request_hash; if the validator silently dropped the request
+    # instead, peers who saw the witness gossip can submit a
+    # NonResponseEvidenceTx and slash the validator.
+    #
+    # Issued for BOTH success (ACK_ADMITTED) AND failure (ACK_REJECTED)
+    # paths because the threat being closed is the silent-drop, not
+    # the lie — a validator that returns ACK_REJECTED honestly
+    # commits to having seen the request, which is what the witness
+    # path needs.
+    ack_hex: str = ""
 
 
 def _rejection_code_for_validate_reason(reason: str) -> int:
@@ -187,6 +201,7 @@ def submit_transaction_to_mempool(
     mempool,
     receipt_issuer: Optional[ReceiptIssuer] = None,
     request_rejection: bool = False,
+    witnessed_request_hash: Optional[bytes] = None,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
@@ -216,14 +231,44 @@ def submit_transaction_to_mempool(
     via BogusRejectionEvidenceTx — closes the receipt-less censorship
     gap where a coerced validator answers honest submissions with a lie.
     """
+    # Helper — issue a SubmissionAck iff the caller passed a
+    # witnessed_request_hash AND the server has a ReceiptIssuer.
+    # Best-effort: a broken issuer must NOT change the validation
+    # outcome.  See witness_submission.SubmissionAck for semantics.
+    def _maybe_issue_ack(action_code_int: int) -> str:
+        if witnessed_request_hash is None or receipt_issuer is None:
+            return ""
+        if len(witnessed_request_hash) != 32:
+            return ""
+        try:
+            from messagechain.consensus.witness_submission import (
+                ACK_ADMITTED, ACK_REJECTED,
+            )
+            ack = receipt_issuer.issue_ack(
+                witnessed_request_hash, action_code_int,
+            )
+            return ack.to_bytes().hex()
+        except Exception:
+            logger.exception("ack issuance failed")
+            return ""
+
     # Idempotency: if the tx is already in the pool, treat as success.
     # No new receipt is issued — the client already got one on first
     # submission, and re-issuing would burn a fresh subtree leaf per
     # retry, giving a network retry loop an amplification path against
     # the issuer's leaf budget.
+    #
+    # Acks ARE issued on duplicate witnessed submissions: the client's
+    # opt-in ack request is independent of the receipt-leaf budget
+    # (it's already paying WITNESS_SURCHARGE on top of the normal
+    # fee, and the witness path explicitly requires a fresh ack per
+    # request_hash).  Without this, a re-tried witnessed submission
+    # would silently fail to discharge the witness obligation.
     if tx.tx_hash in mempool.pending:
+        from messagechain.consensus.witness_submission import ACK_ADMITTED
         return SubmissionResult(
             ok=True, tx_hash=tx.tx_hash, duplicate=True,
+            ack_hex=_maybe_issue_ack(ACK_ADMITTED),
         )
 
     def _maybe_issue_rejection(
@@ -252,11 +297,13 @@ def submit_transaction_to_mempool(
         tx, expected_nonce=pending_nonce,
     )
     if not valid:
+        from messagechain.consensus.witness_submission import ACK_REJECTED
         return SubmissionResult(
             ok=False, error=reason,
             rejection_hex=_maybe_issue_rejection(
                 reason, _rejection_code_for_validate_reason(reason),
             ),
+            ack_hex=_maybe_issue_ack(ACK_REJECTED),
         )
 
     # Record arrival height so forced-inclusion "tx waited N blocks"
@@ -269,16 +316,20 @@ def submit_transaction_to_mempool(
         # under dynamic minimum).  If the tx still ended up pending
         # this call, treat as duplicate success; otherwise reject.
         if tx.tx_hash in mempool.pending:
+            from messagechain.consensus.witness_submission import ACK_ADMITTED
             return SubmissionResult(
                 ok=True, tx_hash=tx.tx_hash, duplicate=True,
+                ack_hex=_maybe_issue_ack(ACK_ADMITTED),
             )
         mempool_reason = "Mempool rejected transaction (rate / fee / cap)"
+        from messagechain.consensus.witness_submission import ACK_REJECTED
         return SubmissionResult(
             ok=False, error=mempool_reason,
             rejection_hex=_maybe_issue_rejection(
                 mempool_reason,
                 _rejection_code_for_mempool_reason(mempool_reason),
             ),
+            ack_hex=_maybe_issue_ack(ACK_REJECTED),
         )
 
     # Content-neutral receipt issuance.  No blocklists, no
@@ -297,8 +348,10 @@ def submit_transaction_to_mempool(
             # best response is to proceed without a receipt.
             logger.exception("receipt issuance failed")
 
+    from messagechain.consensus.witness_submission import ACK_ADMITTED
     return SubmissionResult(
         ok=True, tx_hash=tx.tx_hash, receipt_hex=receipt_hex,
+        ack_hex=_maybe_issue_ack(ACK_ADMITTED),
     )
 
 
@@ -563,22 +616,73 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             ctx, self._client_ip(), header_set,
         )
 
+        # Opt-in WITNESSED submission: if the client passes
+        # `X-MC-Witnessed-Submission: <hex(request_hash)>`, the server
+        # MUST issue a SubmissionAck (admitted or rejected) that
+        # commits the validator to having received the request.
+        # Without this, a coerced validator could simply hang up the
+        # TCP connection and leave no on-chain evidence; with it, the
+        # client (and any witnesses who saw the gossip) holds a
+        # signed proof of receipt that's slashable if it's ever
+        # contradicted by a NonResponseEvidenceTx.
+        #
+        # The header value is the hex-encoded 32-byte request_hash
+        # bound by the client's separately-gossiped SubmissionRequest.
+        # Malformed values are silently ignored (the submission still
+        # processes; the client just doesn't get an ack).  Witnessed
+        # submission costs WITNESS_SURCHARGE on top of the normal fee
+        # — the fee floor is enforced by validate_submission_request
+        # at the gossip layer, not here.
+        witnessed_request_hash: Optional[bytes] = None
+        raw_hdr = (self.headers.get("X-MC-Witnessed-Submission") or "").strip()
+        if raw_hdr:
+            try:
+                candidate = bytes.fromhex(raw_hdr)
+                if len(candidate) == 32:
+                    witnessed_request_hash = candidate
+            except ValueError:
+                witnessed_request_hash = None
+
         # Inject via the shared helper (same semantics as RPC ingress).
-        result = ctx.submit(tx, request_rejection=request_rejection)
+        result = ctx.submit(
+            tx, request_rejection=request_rejection,
+            witnessed_request_hash=witnessed_request_hash,
+        )
+
+        # Defense-in-depth: if an ack was issued, fan it out to peers
+        # via the ack_relay_callback.  Client already has the bytes
+        # over HTTPS, but gossiping them ensures honest witnesses
+        # learn of the discharge even if the validator silently drops
+        # the HTTPS response.  Best-effort; never blocks the response.
+        if result.ack_hex and ctx.ack_relay_callback is not None:
+            try:
+                ctx.ack_relay_callback(bytes.fromhex(result.ack_hex))
+            except Exception:  # noqa: BLE001 — relay is best-effort
+                logger.exception("ack relay hook raised")
         if not result.ok:
-            if result.rejection_hex:
-                # JSON 400 with the signed-rejection blob.  Hex-encoded
-                # binary so the client can forward the same bytes into
-                # a BogusRejectionEvidenceTx without re-serialization
-                # risk.  Status stays 400 — the tx was rejected; the
-                # extra payload is for accountability, not success.
-                resp = (
-                    b'{"ok":false,"error":"'
-                    + result.error.replace('"', "'").encode("utf-8")
-                    + b'","rejection":"'
-                    + result.rejection_hex.encode("ascii")
-                    + b'"}'
-                )
+            if result.rejection_hex or result.ack_hex:
+                # JSON 400 with optional signed-rejection and/or ack
+                # blobs.  Hex-encoded binary so the client can forward
+                # the same bytes into a BogusRejectionEvidenceTx
+                # (rejection) or treat as proof of receipt (ack)
+                # without any re-serialization risk.  Status stays
+                # 400 — the tx was rejected; the extra payloads are
+                # for accountability, not success.
+                parts: list[bytes] = [
+                    b'{"ok":false,"error":"',
+                    result.error.replace('"', "'").encode("utf-8"),
+                    b'"',
+                ]
+                if result.rejection_hex:
+                    parts.append(b',"rejection":"')
+                    parts.append(result.rejection_hex.encode("ascii"))
+                    parts.append(b'"')
+                if result.ack_hex:
+                    parts.append(b',"ack":"')
+                    parts.append(result.ack_hex.encode("ascii"))
+                    parts.append(b'"')
+                parts.append(b'}')
+                resp = b"".join(parts)
                 self.send_response(400)
                 self.send_header(
                     "Content-Type", "application/json; charset=utf-8",
@@ -609,19 +713,23 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
         # hex-encoded binary blob (not a dict) because it's the
         # authoritative wire format that CensorshipEvidenceTx expects
         # — the client can forward the same bytes later without any
-        # re-serialization risk.
+        # re-serialization risk.  Same shape used for the witnessed-
+        # submission ack blob (NonResponseEvidenceTx consumes it).
+        parts: list[bytes] = [
+            b'{"ok":true,"tx_hash":"',
+            tx.tx_hash.hex().encode("ascii"),
+            b'"',
+        ]
         if result.receipt_hex:
-            resp = (
-                b'{"ok":true,"tx_hash":"'
-                + tx.tx_hash.hex().encode("ascii")
-                + b'","receipt":"'
-                + result.receipt_hex.encode("ascii")
-                + b'"}'
-            )
-        else:
-            resp = (
-                b'{"ok":true,"tx_hash":"' + tx.tx_hash.hex().encode("ascii") + b'"}'
-            )
+            parts.append(b',"receipt":"')
+            parts.append(result.receipt_hex.encode("ascii"))
+            parts.append(b'"')
+        if result.ack_hex:
+            parts.append(b',"ack":"')
+            parts.append(result.ack_hex.encode("ascii"))
+            parts.append(b'"')
+        parts.append(b'}')
+        resp = b"".join(parts)
         self._ok(resp)
 
     def _handle_custody_proof_submit(self, ctx):
@@ -717,10 +825,27 @@ class _HandlerContext:
         receipt_issuer: Optional[ReceiptIssuer] = None,
         proof_pool=None,
         proof_relay_callback=None,
+        ack_relay_callback=None,
+        witness_observation_store=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
         self.relay_callback = relay_callback
+        # Optional ack-gossip hook.  When the server issues a
+        # SubmissionAck, this callback is invoked with the raw ack
+        # bytes so peers can mark the witness obligation discharged
+        # via the witness gossip topic.  Defense in depth: the
+        # client has the ack over HTTPS already, but a censoring
+        # validator could silently drop the response — gossiping the
+        # ack to peers means honest witnesses learn of the discharge
+        # even when the response is dropped.
+        self.ack_relay_callback = ack_relay_callback
+        # Optional WitnessObservationStore.  When the server receives
+        # a SubmissionRequest gossip blob (NOT addressed to itself),
+        # it records the (request_hash, observed_height) so the local
+        # node can later sign a WitnessObservation if the deadline
+        # passes without a corresponding ack.
+        self.witness_observation_store = witness_observation_store
         # Optional ReceiptIssuer — see submission_receipt.ReceiptIssuer.
         # When set, every fresh admission returns a signed receipt the
         # client can later weaponize as CensorshipEvidenceTx if the
@@ -833,11 +958,13 @@ class _HandlerContext:
         self,
         tx: MessageTransaction,
         request_rejection: bool = False,
+        witnessed_request_hash: Optional[bytes] = None,
     ) -> SubmissionResult:
         return submit_transaction_to_mempool(
             tx, self.blockchain, self.mempool,
             receipt_issuer=self.receipt_issuer,
             request_rejection=request_rejection,
+            witnessed_request_hash=witnessed_request_hash,
         )
 
     def submit_proof(self, proof) -> SubmissionResult:
@@ -888,6 +1015,8 @@ class SubmissionServer:
         receipt_issuer: Optional[ReceiptIssuer] = None,
         proof_pool=None,
         proof_relay_callback=None,
+        ack_relay_callback: Optional[Callable[[bytes], None]] = None,
+        witness_observation_store=None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -906,6 +1035,14 @@ class SubmissionServer:
         # /v1/submit-custody-proof endpoint is disabled in that case.
         self.proof_pool = proof_pool
         self.proof_relay_callback = proof_relay_callback
+        # Optional ack-gossip hook + witness observation store — see
+        # _HandlerContext for semantics.  Operators who do NOT want to
+        # participate in witnessed submission leave these None; the
+        # X-MC-Witnessed-Submission header is silently no-op'd in that
+        # case (the submission still processes; the client just gets
+        # no ack).
+        self.ack_relay_callback = ack_relay_callback
+        self.witness_observation_store = witness_observation_store
         self._httpd: Optional[_ThreadingHTTPSServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -943,6 +1080,8 @@ class SubmissionServer:
             receipt_issuer=self.receipt_issuer,
             proof_pool=self.proof_pool,
             proof_relay_callback=self.proof_relay_callback,
+            ack_relay_callback=self.ack_relay_callback,
+            witness_observation_store=self.witness_observation_store,
         )
         ssl_context = self._build_ssl_context()
         self._httpd.socket = ssl_context.wrap_socket(
