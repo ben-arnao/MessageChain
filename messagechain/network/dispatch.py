@@ -19,11 +19,15 @@ def message_category(msg_type: MessageType) -> str:
     """Map a network message type to its rate-limit bucket category.
 
     Buckets (see messagechain.network.ratelimit):
-        tx          — transaction gossip, block announce-by-inv
-        block_req   — explicit block/block-batch requests
-        headers_req — header download requests
-        addr        — ADDR-equivalent peer-list gossip (strictly throttled)
-        general     — handshakes, chain-height probes, everything else
+        tx              — transaction gossip, block announce-by-inv
+        block_req       — explicit block/block-batch requests
+        headers_req     — header download requests
+        addr            — ADDR-equivalent peer-list gossip (strictly throttled)
+        signed_announce — attestation / finality-vote / slash / custody-proof
+                          gossip (each carries a WOTS+-class signature —
+                          tight bucket so a flood can't force unbounded
+                          signature-verify CPU spend)
+        general         — handshakes, chain-height probes, everything else
 
     Any message type that isn't explicitly mapped falls into `general`.
     """
@@ -49,4 +53,15 @@ def message_category(msg_type: MessageType) -> str:
         # Digest arrivals — additionally throttled per-peer by interval
         # (see Node._mempool_digest_last_seen / MEMPOOL_DIGEST_MIN_INTERVAL_SEC).
         return "mempool_digest"
+    if msg_type in (
+        MessageType.ANNOUNCE_ATTESTATION,
+        MessageType.ANNOUNCE_FINALITY_VOTE,
+        MessageType.ANNOUNCE_SLASH,
+        MessageType.ANNOUNCE_CUSTODY_PROOF,
+    ):
+        # Each of these carries a WOTS+-class signature that the receiver
+        # must parse and verify — expensive enough that the wider
+        # `general` bucket (30/s, burst 100) is a DoS vector.  See
+        # ratelimit.RATE_SIGNED_ANNOUNCE for sizing rationale.
+        return "signed_announce"
     return "general"
