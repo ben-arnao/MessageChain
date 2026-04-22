@@ -880,7 +880,13 @@ class Node(SharedRuntimeMixin):
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_block_data"
                 )
                 return
-            success, reason = self.blockchain.add_block(block)
+            success, reason = self.blockchain.add_block(block, source_peer=address)
+            # Drain any orphan-flood offenses recorded against this peer.
+            # Blockchain is peer-agnostic — it just accumulates counts; we
+            # honor them here (OFFENSE_PROTOCOL_VIOLATION, reason
+            # "orphan_pool_flood") so a peer repeatedly filling the pool
+            # with unreachable-parent orphans gets banned.
+            self._drain_orphan_flood_offenses()
             if success:
                 # Remove included txs from mempool (all transaction types)
                 all_tx_hashes = (
@@ -1017,7 +1023,8 @@ class Node(SharedRuntimeMixin):
                         address, OFFENSE_PROTOCOL_VIOLATION, "invalid_response_block"
                     )
                     return
-                success, reason = self.blockchain.add_block(block)
+                success, reason = self.blockchain.add_block(block, source_peer=address)
+                self._drain_orphan_flood_offenses()
                 if not success and reason.lower().startswith("checkpoint violation"):
                     # Same gate as ANNOUNCE_BLOCK: a peer serving a
                     # mismatched block at a checkpointed height earns an
@@ -1765,6 +1772,25 @@ class Node(SharedRuntimeMixin):
         )
         if peer.writer:
             await write_message(peer.writer, response)
+
+    def _drain_orphan_flood_offenses(self) -> None:
+        """Convert accumulated orphan-pool flood events into ban offenses.
+
+        Blockchain stays peer-agnostic and just increments
+        orphan_flood_peers[addr] when a peer exceeds its per-peer quota or
+        hits the pool when it's full.  Network layer owns the ban manager,
+        so it drains the counter here into OFFENSE_PROTOCOL_VIOLATION per
+        event.  Repeated flooding naturally crosses the ban threshold.
+        """
+        flood_map = getattr(self.blockchain, "orphan_flood_peers", None)
+        if not flood_map:
+            return
+        for addr, count in list(flood_map.items()):
+            for _ in range(count):
+                self.ban_manager.record_offense(
+                    addr, OFFENSE_PROTOCOL_VIOLATION, "orphan_pool_flood",
+                )
+        flood_map.clear()
 
     async def _broadcast(self, msg: NetworkMessage, exclude: str = ""):
         """Broadcast a message to all connected peers."""

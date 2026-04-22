@@ -1029,6 +1029,15 @@ MAX_NEW_ACCOUNTS_PER_BLOCK = 10
 
 # Orphan block pool
 MAX_ORPHAN_BLOCKS = 100   # max orphan blocks stored (bounded to prevent memory exhaustion)
+# Per-peer orphan quota: one sybil can no longer fill all MAX_ORPHAN_BLOCKS slots.
+# A single honest peer filling its cap during an IBD gap still fits comfortably
+# below MAX_ORPHAN_BLOCKS; 10 peers filling it simultaneously fills the pool.
+MAX_ORPHAN_BLOCKS_PER_PEER = 10
+# Age-based TTL for orphan blocks (in number of block-heights since arrival).
+# 100 blocks at a 6-second target ~= 10 minutes — long enough for any honest
+# parent to arrive via normal gossip / IBD, short enough that a peer feeding us
+# unreachable orphans cannot pin them in memory indefinitely.
+ORPHAN_MAX_AGE_BLOCKS = 100
 
 # Header spam protection — bound pending headers during IBD to prevent OOM
 MAX_PENDING_HEADERS = 50_000  # max headers held in memory during sync
