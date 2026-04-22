@@ -103,6 +103,47 @@ def _decode_optional_inclusion_list(data: bytes, off: int):
     return lst, off
 
 
+def _encode_acks_observed(acks: list[bytes]) -> bytes:
+    """Wire encoding for Block.acks_observed_this_block.
+
+    Layout: u32 count followed by N × 32-byte raw `request_hash`.  The
+    encoder writes whatever order it receives; canonical-form
+    enforcement (sorted ascending + no duplicates + length cap) lives in
+    `validate_block` so a dishonest proposer's malformed list is caught
+    at consensus time, not silently re-canonicalized.
+    """
+    import struct as _struct
+    out = bytearray(_struct.pack(">I", len(acks)))
+    for rh in acks:
+        if not isinstance(rh, (bytes, bytearray)):
+            raise TypeError(
+                f"ack entry must be bytes, got {type(rh).__name__}"
+            )
+        out += bytes(rh)
+    return bytes(out)
+
+
+def _decode_acks_observed(data: bytes, off: int):
+    """Inverse of _encode_acks_observed.  Returns (acks, new_off).
+
+    Strict 32-byte-per-entry decode — a malformed entry surfaces here
+    rather than letting the validator's shape check carry the load.
+    """
+    import struct as _struct
+    if off + 4 > len(data):
+        raise ValueError("Block blob truncated at acks_observed count")
+    n = _struct.unpack_from(">I", data, off)[0]; off += 4
+    acks: list[bytes] = []
+    for _ in range(n):
+        if off + 32 > len(data):
+            raise ValueError(
+                "Block blob truncated mid-acks_observed entry"
+            )
+        acks.append(bytes(data[off:off + 32]))
+        off += 32
+    return acks, off
+
+
 def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     """Compute Merkle root from a list of transaction hashes.
 
@@ -177,6 +218,9 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
         getattr(block, "inclusion_list_violation_evidence_txs", []) or []
     )
     inclusion_list_obj = getattr(block, "inclusion_list", None)
+    acks_observed = list(
+        getattr(block, "acks_observed_this_block", []) or []
+    )
 
     out: list[bytes] = []
     out.extend(tx.tx_hash for tx in msg_txs)
@@ -207,6 +251,14 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     # block-body type.
     if inclusion_list_obj is not None:
         out.append(inclusion_list_obj.list_hash)
+
+    # acks_observed_this_block: every observed `request_hash` is folded
+    # in directly so a relayer cannot strip or mutate the list without
+    # invalidating the proposer's signature (same hygiene as every
+    # other block-body type).  Append in the on-wire canonical order
+    # (sorted ascending) so two nodes building the same merkle root
+    # from the same multiset of acks land on the same value.
+    out.extend(sorted(acks_observed))
 
     # Archive-proof bundle (aggregated custody commitment) — derived,
     # not read from the block's optional bundle slot, so the proposer
@@ -628,6 +680,28 @@ class Block:
     # late joiners can still use to audit "validator X was credited in
     # epoch E."
     archive_proof_bundle: object = None  # Optional[ArchiveProofBundle]
+    # Witness-ack aggregation: list of 32-byte `request_hash`es whose
+    # corresponding SubmissionAck the proposer observed in their local
+    # WitnessObservationStore.  Validators apply each entry by writing
+    # `(request_hash, block.height)` into `Blockchain.witness_ack_registry`
+    # so a later NonResponseEvidenceTx for the same request_hash is
+    # rejected (the obligation was met).
+    #
+    # Soft-vote semantics: the receiving validator is NOT required to
+    # have observed the same ack locally — proposer mempool views are
+    # subjective, and a mismatch would otherwise fork the chain.  A
+    # request_hash with no corresponding outstanding obligation is also
+    # acceptable (could be a stale ack a witness saw but the chain
+    # already aged out).
+    #
+    # Wire format: u32 count followed by N × 32-byte request_hash.
+    # Canonical ordering: sorted by raw bytes ascending; duplicates
+    # rejected by `validate_block` so the on-wire form is unambiguous.
+    # Cap at MAX_ACKS_PER_BLOCK to keep block bandwidth bounded.
+    # Folded into `merkle_root` via `canonical_block_tx_hashes` so a
+    # relayer cannot strip or mutate the list in transit without
+    # invalidating the proposer's signature.
+    acks_observed_this_block: list = field(default_factory=list)
     block_hash: bytes = b""
 
     def __post_init__(self):
@@ -695,6 +769,14 @@ class Block:
             ]
         if self.inclusion_list is not None:
             result["inclusion_list"] = self.inclusion_list.serialize()
+        if self.acks_observed_this_block:
+            # Hex-encoded for JSON-friendliness; the on-wire binary
+            # encoder uses raw 32-byte form.  Empty list omitted entirely
+            # so blocks without witness-ack traffic stay byte-identical
+            # to the pre-feature serialization.
+            result["acks_observed_this_block"] = [
+                rh.hex() for rh in self.acks_observed_this_block
+            ]
         if self.archive_proof_bundle is not None:
             # Serialized as hex of canonical bytes — a scalar blob, not
             # a list; the bundle is a single aggregated commitment per
@@ -894,6 +976,15 @@ class Block:
             # consensus-format change; pre-bundle binaries cannot
             # decode blocks from the bundle-aware code path.
             _encode_optional_bundle(self.archive_proof_bundle),
+            # acks_observed_this_block — strictly appended after
+            # archive_proof_bundle so a pre-witnessed-submission blob
+            # is a strict prefix of a post-feature blob (modulo the
+            # block_hash trailer).  Empty list pays exactly 4 bytes
+            # (a u32 zero count) on the hot path, since the vast
+            # majority of blocks carry no observed acks.  Consensus-
+            # format change: pre-feature binaries cannot decode blocks
+            # with this slot populated.
+            _encode_acks_observed(self.acks_observed_this_block),
             self.block_hash,
         ])
 
@@ -1090,6 +1181,12 @@ class Block:
         # consistent with `to_bytes`.
         archive_proof_bundle, off = _decode_optional_bundle(data, off)
 
+        # acks_observed_this_block — appended after archive_proof_bundle.
+        # Strict 32-bytes-per-entry shape; canonical-form rules
+        # (sorted, no duplicates, count <= MAX_ACKS_PER_BLOCK) are
+        # enforced at validate_block time, not here.
+        acks_observed_this_block, off = _decode_acks_observed(data, off)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -1113,6 +1210,7 @@ class Block:
             ),
             inclusion_list=inclusion_list_obj,
             archive_proof_bundle=archive_proof_bundle,
+            acks_observed_this_block=acks_observed_this_block,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -1208,6 +1306,11 @@ class Block:
             archive_proof_bundle = ArchiveProofBundle.from_bytes(
                 bytes.fromhex(data["archive_proof_bundle"]),
             )
+        acks_observed_this_block = []
+        if data.get("acks_observed_this_block"):
+            acks_observed_this_block = [
+                bytes.fromhex(rh) for rh in data["acks_observed_this_block"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
@@ -1221,7 +1324,8 @@ class Block:
                         inclusion_list_violation_evidence_txs
                     ),
                     inclusion_list=inclusion_list_obj,
-                    archive_proof_bundle=archive_proof_bundle)
+                    archive_proof_bundle=archive_proof_bundle,
+                    acks_observed_this_block=acks_observed_this_block)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])

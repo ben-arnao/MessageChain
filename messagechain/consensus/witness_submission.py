@@ -784,3 +784,18 @@ class WitnessObservationStore:
         """(observations, acks) — for observability."""
         with self._lock:
             return (len(self._observations), len(self._acks))
+
+    def list_acks(self) -> list[tuple[bytes, int]]:
+        """Snapshot the (request_hash, ack_height) entries currently
+        in the ack table.
+
+        Returned entries are sorted by ack_height ascending so a
+        block-proposer can take the OLDEST unrecorded acks first when
+        deciding what to embed in `Block.acks_observed_this_block`.
+        Pure read; the lock is released before returning.
+        """
+        with self._lock:
+            entries = sorted(
+                self._acks.items(), key=lambda kv: (kv[1], kv[0]),
+            )
+        return [(rh, h) for rh, h in entries]

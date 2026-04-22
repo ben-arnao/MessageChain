@@ -1450,6 +1450,22 @@ class Blockchain:
             snap.get("attester_coverage_misses", {})
         )
 
+        # Witnessed-submission state (v12+).  Two consensus-critical
+        # sections: NonResponseEvidenceProcessor.processed (the
+        # double-slash defense) + the witness_ack_registry consulted
+        # by `validate_non_response_evidence_tx`.  A bootstrapping
+        # node that inherited an empty processed set could re-apply
+        # already-processed evidence; an empty registry could admit
+        # evidence the chain has already discharged.  Both are
+        # committed to the snapshot root under
+        # _TAG_NON_RESPONSE_PROCESSED + _TAG_WITNESS_ACK_REGISTRY.
+        self.non_response_processor.processed = set(
+            snap.get("non_response_processed", set())
+        )
+        self.witness_ack_registry = dict(
+            snap.get("witness_ack_registry", {})
+        )
+
         # Rebuild the per-entity sparse Merkle tree from the installed
         # state so compute_current_state_root reflects the snapshot.
         self._rebuild_state_tree()
@@ -2787,6 +2803,109 @@ class Blockchain:
         if not valid:
             return False, reason
         return True, "Valid"
+
+    def validate_non_response_evidence_tx(
+        self, tx,
+    ) -> tuple[bool, str]:
+        """Admission-time validation for a NonResponseEvidenceTx.
+
+        Cheap-first checks (mirror the other evidence validators):
+          * submitter is registered
+          * offender is registered
+          * offender is NOT already slashed
+          * evidence_hash NOT already in processor.processed (dedupe)
+          * request_hash NOT in witness_ack_registry — the chain has
+            recorded the obligation as met.  This is the close of
+            Gap B in the witnessed-submission iteration: without
+            this consultation, the registry was populated only by
+            in-process test assignment and the admission gate could
+            not see consensus-derived ack state.
+          * submitter can afford fee
+          * stateless verify (request sig + observation sigs +
+            quorum + submitter sig)
+
+        The full deadline + active-set + chain-pubkey gate runs at
+        apply-time inside `NonResponseEvidenceProcessor.process` —
+        keeping that there means slashes are computed against the
+        live stake snapshot at apply, not at admission.
+        """
+        from messagechain.consensus.non_response_evidence import (
+            verify_non_response_evidence_tx,
+        )
+        if tx.submitter_id not in self.public_keys:
+            return False, "Unknown submitter — must register first"
+        if tx.offender_id not in self.public_keys:
+            return False, "Unknown offender"
+        if tx.offender_id in self.slashed_validators:
+            return False, "Offender already slashed"
+        if self.non_response_processor.has_processed(tx.evidence_hash):
+            return False, "Evidence already processed"
+        if tx.request.request_hash in self.witness_ack_registry:
+            return False, (
+                "ack present in chain state: obligation was met for "
+                f"request_hash {tx.request.request_hash.hex()[:16]}"
+            )
+        if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
+            return False, "Submitter cannot afford fee"
+        # Re-derive the witness public-key map from chain state for the
+        # observations bound into the evidence.  An observation whose
+        # witness has no chain pubkey yet will surface here as a clear
+        # admission rejection rather than a silent drop.
+        witness_pks: dict[bytes, bytes] = {}
+        for o in tx.witness_observations:
+            wpk = self.public_keys.get(o.witness_id)
+            if wpk is None:
+                return False, (
+                    f"witness {o.witness_id.hex()[:16]} has no public "
+                    "key on chain"
+                )
+            witness_pks[o.witness_id] = wpk
+        client_pk = self.public_keys.get(tx.request.submitter_id)
+        if client_pk is None:
+            return False, (
+                f"client {tx.request.submitter_id.hex()[:16]} has no "
+                "public key on chain"
+            )
+        submitter_pk = self.public_keys[tx.submitter_id]
+        ok, reason = verify_non_response_evidence_tx(
+            tx, submitter_pk,
+            witness_public_keys=witness_pks,
+            client_public_key=client_pk,
+        )
+        if not ok:
+            return False, reason
+        return True, "Valid"
+
+    def _prune_witness_ack_registry(self, current_height: int) -> int:
+        """Drop witness_ack_registry entries older than
+        WITNESS_OBSERVATION_RETENTION_BLOCKS + WITNESS_RESPONSE_DEADLINE_BLOCKS.
+
+        Anything beyond that combined window is past the reach of
+        evidence assembly: an honest witness peer's local store has
+        already dropped the observation, so no NonResponseEvidenceTx
+        can be assembled to test against the registry entry.  Pruning
+        keeps the registry footprint bounded.
+
+        Returns the number of entries dropped (0 in the steady-state
+        case where every registry entry is fresh).
+        """
+        from messagechain.config import (
+            WITNESS_OBSERVATION_RETENTION_BLOCKS,
+            WITNESS_RESPONSE_DEADLINE_BLOCKS,
+        )
+        cutoff = (
+            int(current_height)
+            - int(WITNESS_OBSERVATION_RETENTION_BLOCKS)
+            - int(WITNESS_RESPONSE_DEADLINE_BLOCKS)
+        )
+        if cutoff <= 0:
+            return 0
+        dropped = 0
+        for rh, h in list(self.witness_ack_registry.items()):
+            if h < cutoff:
+                del self.witness_ack_registry[rh]
+                dropped += 1
+        return dropped
 
     def get_median_time_past(self) -> float:
         """Compute Median Time Past from the last MTP_BLOCK_COUNT blocks.
@@ -4173,6 +4292,7 @@ class Blockchain:
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
+        acks_observed_this_block: list[bytes] | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -4262,6 +4382,31 @@ class Blockchain:
         # bits has no consensus effect — the dual-encoding is cosmetic.
         now = _time.time()
         timestamp = now if now > mtp else mtp + 1e-6
+        # Witness-ack aggregation: derive the block-level acks list when
+        # the caller didn't supply one explicitly.  Default behaviour:
+        # consult the local WitnessObservationStore (if attached), pick
+        # up to MAX_ACKS_PER_BLOCK request_hashes whose acks the
+        # proposer has observed but the chain hasn't recorded yet,
+        # ordered by ack_height ascending (oldest first), and emit them
+        # in canonical sort order.
+        if acks_observed_this_block is None:
+            acks_observed_this_block = self._derive_observed_acks_for_block()
+        else:
+            # Caller-supplied list — apply the same canonical-form rules
+            # (sort + dedupe + cap) so a wired-in list stays valid even
+            # if the caller didn't pre-sort.  Length validation and
+            # 32-byte shape are enforced at validate_block; we still
+            # truncate here so a benign over-long list doesn't get the
+            # block rejected on the proposer's own side.
+            from messagechain.config import MAX_ACKS_PER_BLOCK as _MAX_ACK
+            seen: set[bytes] = set()
+            filtered: list[bytes] = []
+            for rh in acks_observed_this_block:
+                if rh in seen:
+                    continue
+                seen.add(rh)
+                filtered.append(bytes(rh))
+            acks_observed_this_block = sorted(filtered)[:_MAX_ACK]
         return consensus.create_block(
             proposer_entity, transactions, prev,
             state_root=state_root, attestations=attestations,
@@ -4278,7 +4423,42 @@ class Blockchain:
             timestamp=timestamp,
             mempool_tx_hashes=mempool_tx_hashes,
             state_root_checkpoint=state_root_checkpoint,
+            acks_observed_this_block=acks_observed_this_block,
         )
+
+    def _derive_observed_acks_for_block(self) -> list[bytes]:
+        """Read the local witness_observation_store (if attached) and
+        return up to MAX_ACKS_PER_BLOCK request_hashes whose acks the
+        proposer has observed but the chain has not yet recorded.
+
+        Sort key: oldest ack_height first (so a long-running proposer
+        catches up on backlog before fresh acks).  The returned list
+        is then re-sorted into canonical wire order (raw-bytes
+        ascending) so the on-chain commitment is deterministic
+        regardless of the underlying observation order.
+
+        Returns an empty list when the proposer has no store attached
+        — typical for tests that don't wire one in.
+        """
+        from messagechain.config import MAX_ACKS_PER_BLOCK as _MAX_ACK
+        store = getattr(self, "witness_observation_store", None)
+        if store is None:
+            return []
+        try:
+            entries = store.list_acks()
+        except AttributeError:
+            # Older store implementation without list_acks — degrade
+            # gracefully to "no acks this block".
+            return []
+        candidates: list[bytes] = []
+        for rh, _ack_h in entries:
+            if rh in self.witness_ack_registry:
+                continue  # chain already knows; don't re-embed
+            candidates.append(bytes(rh))
+            if len(candidates) >= _MAX_ACK:
+                break
+        # Canonical wire order: raw-bytes ascending.
+        return sorted(candidates)
 
     def _compute_snapshot_root_live(self) -> bytes:
         """Snapshot-root commitment over the current live chain state.
@@ -4810,6 +4990,55 @@ class Blockchain:
                 return False, f"Invalid custody proof: {reason}"
         return True, "ok"
 
+    def _validate_acks_observed_this_block(
+        self, block: Block,
+    ) -> tuple[bool, str]:
+        """Validate `block.acks_observed_this_block` against the
+        canonical-form rules.
+
+        Soft-vote semantics: the validator does NOT need to have
+        observed the same acks locally — proposer mempool views are
+        subjective.  The block remains VALID even if a request_hash
+        appears here that has no corresponding outstanding
+        obligation in chain state.  We only enforce the wire-format
+        rules: shape (32 bytes), order (sorted ascending), no
+        duplicates, and the per-block count cap.
+        """
+        from messagechain.config import MAX_ACKS_PER_BLOCK
+        acks = getattr(block, "acks_observed_this_block", None) or []
+        if not acks:
+            return True, "no acks observed"
+        if len(acks) > MAX_ACKS_PER_BLOCK:
+            return False, (
+                f"Too many acks_observed_this_block entries: "
+                f"{len(acks)} > MAX_ACKS_PER_BLOCK={MAX_ACKS_PER_BLOCK}"
+            )
+        prev: bytes | None = None
+        for rh in acks:
+            if not isinstance(rh, (bytes, bytearray)):
+                return False, (
+                    "acks_observed_this_block entry must be bytes, "
+                    f"got {type(rh).__name__}"
+                )
+            if len(rh) != 32:
+                return False, (
+                    "acks_observed_this_block entry must be 32 bytes, "
+                    f"got {len(rh)}"
+                )
+            if prev is not None:
+                if rh == prev:
+                    return False, (
+                        "duplicate request_hash in "
+                        f"acks_observed_this_block: {rh.hex()[:16]}"
+                    )
+                if rh < prev:
+                    return False, (
+                        "acks_observed_this_block must be sorted "
+                        "ascending by raw bytes"
+                    )
+            prev = bytes(rh)
+        return True, "ok"
+
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
         latest = self.get_latest_block()
@@ -4821,6 +5050,16 @@ class Blockchain:
         # evidence txs).  Checked early so a bloated block is rejected
         # before any signature work.
         ok, reason = self._validate_block_list_counts(block)
+        if not ok:
+            return False, reason
+
+        # acks_observed_this_block — wire-format / canonical-form
+        # rules only (sort, dedupe, shape, count cap).  Soft-vote
+        # semantics: a block referencing request_hashes the local
+        # node has never observed is still VALID — proposer
+        # mempool views are subjective.  See
+        # `_validate_acks_observed_this_block` for the rule set.
+        ok, reason = self._validate_acks_observed_this_block(block)
         if not ok:
             return False, reason
 
@@ -7185,6 +7424,30 @@ class Blockchain:
         )
         for m in matured:
             self._apply_censorship_slash(m)
+
+        # Witness-ack registry: every entry in
+        # `block.acks_observed_this_block` is a soft-vote signal from
+        # the proposer that they observed a SubmissionAck for that
+        # request_hash via the witness gossip topic.  Recording the
+        # ack at this block's height makes the discharge consensus-
+        # visible so a NonResponseEvidenceTx for the same request_hash
+        # is rejected at admission time (see
+        # `validate_non_response_evidence_tx`).  First-write wins —
+        # an earlier block's ack_height stays authoritative.
+        block_acks = getattr(block, "acks_observed_this_block", None) or []
+        for rh in block_acks:
+            if rh not in self.witness_ack_registry:
+                self.witness_ack_registry[rh] = block.header.block_number
+        # Prune entries older than
+        # WITNESS_OBSERVATION_RETENTION_BLOCKS + WITNESS_RESPONSE_DEADLINE_BLOCKS
+        # — anything beyond that window is past evidence-assembly
+        # reach anyway (witness peers have already pruned their
+        # observation stores) and the registry's footprint stays
+        # bounded.  Runs every block since the cost is O(deleted
+        # entries) and steady-state churn is small.
+        self._prune_witness_ack_registry(
+            current_height=block.header.block_number,
+        )
 
         # Update base fee for next block based on this block's fullness
         self.supply.update_base_fee(total_tx_count)
