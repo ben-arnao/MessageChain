@@ -37,6 +37,9 @@ from messagechain.config import (
     TARGET_CIRCULATING_SUPPLY_FLOOR,
     DEFLATION_ISSUANCE_MULTIPLIER,
     DEFLATION_FLOOR_HEIGHT,
+    DEFLATION_FLOOR_V2_HEIGHT,
+    DEFLATION_REBATE_BPS,
+    DEFLATION_REBATE_WINDOW_BLOCKS,
 )
 
 
@@ -178,6 +181,34 @@ class SupplyTracker:
         self.attester_epoch_earnings: dict[bytes, int] = {}
         self.attester_epoch_earnings_start: int = -1
 
+        # Fee-responsive deflation floor hard fork
+        # (DEFLATION_FLOOR_V2_HEIGHT): rolling window of
+        # (block_height, fee_burn_amount) entries used to compute the
+        # trailing burn rate that drives the new rebate-style boosted
+        # issuance.  At/after DEFLATION_FLOOR_V2_HEIGHT, every fee-burn
+        # appends an entry here; calculate_block_reward prunes entries
+        # older than DEFLATION_REBATE_WINDOW_BLOCKS, sums the rest, and
+        # uses (sum / window) × DEFLATION_REBATE_BPS / 10_000 as a
+        # rebate floor on issuance when supply < TARGET.
+        #
+        # Consensus-visible state: snapshotted alongside
+        # _treasury_spend_rolling_debits (same pattern) and committed
+        # to the state-snapshot root (_TAG_FEE_BURN_ROLLING) so
+        # state-synced nodes inherit the identical rolling total —
+        # otherwise a cold-booted node would compute a different
+        # boosted reward at the next block under the floor regime
+        # and silently fork.
+        #
+        # Bounded size: at most DEFLATION_REBATE_WINDOW_BLOCKS entries
+        # survive the prune per block (the prune runs before each
+        # reward computation).  Intra-block we can transiently hold
+        # more if multiple fees burn in the same block, but the next
+        # calculate_block_reward call prunes back down.
+        #
+        # Pre-activation: never appended and never read; byte-for-byte
+        # legacy behavior preserved.
+        self.rolling_fee_burn: list[tuple[int, int]] = []
+
         # Current-block-height tunnel: set by _apply_block_state at
         # block start so pay_fee_with_burn can gate its split without
         # every call site threading an explicit block_height parameter.
@@ -210,15 +241,29 @@ class SupplyTracker:
         BLOCK_REWARD_FLOOR (not 1), keeping validation lucrative
         even after all halvings complete.
 
-        Supply-responsive issuance floor (hard fork at
-        DEFLATION_FLOOR_HEIGHT): when total_supply drops below
-        TARGET_CIRCULATING_SUPPLY_FLOOR, multiply the halvings-adjusted
-        reward by DEFLATION_ISSUANCE_MULTIPLIER (2x).  Applied AFTER
-        the BLOCK_REWARD_FLOOR clamp so the floor-era boost is
-        FLOOR * multiplier (= 8 at the current tuning).  Strictly-
-        less-than: supply == floor exactly means "recovered, no
-        boost".  Self-correcting — once supply recovers above the
-        floor the next block returns to the unboosted schedule.
+        Supply-responsive issuance floor evolution — two hard forks:
+
+        v1 (DEFLATION_FLOOR_HEIGHT): when total_supply < TARGET, reward
+        doubles.  Retained byte-for-byte below DEFLATION_FLOOR_V2_HEIGHT
+        so v1-era blocks remain re-validatable.
+
+        v2 (DEFLATION_FLOOR_V2_HEIGHT, fee-responsive rebate): the
+        fixed 2× multiplier was ~31× too small to arrest real burn
+        rates.  Replaced with
+            reward = max(base_reward,
+                         rolling_burn_rate
+                         * DEFLATION_REBATE_BPS // 10_000)
+        where rolling_burn_rate = (sum of fee burns in the trailing
+        DEFLATION_REBATE_WINDOW_BLOCKS window) / window.  At 70% rebate
+        the new issuance offsets most of the burn without eliminating
+        the deflationary incentive entirely.  Prune of expired entries
+        is inline so the rolling list stays bounded.
+
+        Strictly-less-than on the floor: supply == floor exactly means
+        "recovered, no boost".  Self-correcting — once supply recovers
+        above the floor the next block returns to the unboosted
+        schedule.
+
         Pre-activation: boost never applies; byte-for-byte identical
         to the legacy reward curve.
 
@@ -230,10 +275,36 @@ class SupplyTracker:
         halvings = block_height // HALVING_INTERVAL
         reward = BLOCK_REWARD >> halvings  # integer division by 2^halvings
         reward = max(BLOCK_REWARD_FLOOR, reward)
+        supply_below_floor = (
+            self.total_supply < TARGET_CIRCULATING_SUPPLY_FLOOR
+        )
         if (
-            block_height >= DEFLATION_FLOOR_HEIGHT
-            and self.total_supply < TARGET_CIRCULATING_SUPPLY_FLOOR
+            block_height >= DEFLATION_FLOOR_V2_HEIGHT
+            and supply_below_floor
         ):
+            # v2 fee-responsive rebate.  Prune rolling window in-place,
+            # then compute burn_rate = sum / window.  The prune is
+            # defensive; pay_fee_with_burn already keeps the list
+            # bounded, but a cold-booted node whose snapshot carried a
+            # not-yet-pruned window should still converge to the same
+            # burn rate.
+            window_start = block_height - DEFLATION_REBATE_WINDOW_BLOCKS
+            self.rolling_fee_burn = [
+                (h, a) for (h, a) in self.rolling_fee_burn
+                if h >= window_start
+            ]
+            rolling_sum = sum(a for (_, a) in self.rolling_fee_burn)
+            rolling_rate = rolling_sum // DEFLATION_REBATE_WINDOW_BLOCKS
+            rebate_floor = (
+                rolling_rate * DEFLATION_REBATE_BPS // 10_000
+            )
+            reward = max(reward, rebate_floor)
+        elif (
+            block_height >= DEFLATION_FLOOR_HEIGHT
+            and supply_below_floor
+        ):
+            # v1 legacy 2× multiplier — applies only at heights in
+            # [DEFLATION_FLOOR_HEIGHT, DEFLATION_FLOOR_V2_HEIGHT).
             reward *= DEFLATION_ISSUANCE_MULTIPLIER
         return reward
 
@@ -371,10 +442,12 @@ class SupplyTracker:
             # burns.
             from messagechain.config import (
                 ATTESTER_REWARD_CAP_HEIGHT,
+                ATTESTER_CAP_FIX_HEIGHT,
                 PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH,
                 FINALITY_INTERVAL,
             )
             cap_active = block_height >= ATTESTER_REWARD_CAP_HEIGHT
+            cap_fix_active = block_height >= ATTESTER_CAP_FIX_HEIGHT
             cap_per_entity = 0
             if cap_active:
                 epoch_start = (
@@ -383,15 +456,30 @@ class SupplyTracker:
                 if self.attester_epoch_earnings_start != epoch_start:
                     self.attester_epoch_earnings_start = epoch_start
                     self.attester_epoch_earnings = {}
-                # Per-entity cap, in TOKENS, for the full epoch.  Uses
-                # this block's pool as the epoch-pool snapshot —
-                # conservative: every block in the epoch is assumed
-                # to match the current block's pool size.  Real
-                # epochs with varying traffic will over- or under-cap
-                # by a fraction; the cap's purpose is deterrent and
-                # order-of-magnitude correct, not precision-exact.
+                # Per-entity cap, in TOKENS, for the full epoch.
+                #
+                # Pre-ATTESTER_CAP_FIX_HEIGHT (broken): uses
+                # attester_pool post-fee-merge, which includes the
+                # fee-funded component and flips 500× between high-
+                # fee and low-fee blocks in the same epoch.  Path-
+                # dependent.  Preserved byte-for-byte for heights
+                # strictly below the fix activation.
+                #
+                # Post-ATTESTER_CAP_FIX_HEIGHT (fix): uses the
+                # issuance-only component (reward - proposer_share),
+                # which is a deterministic function of block_height
+                # via calculate_block_reward.  Stable across fee
+                # variation, predictable, path-independent.  At
+                # BLOCK_REWARD=16 the cap is 12 tokens/entity/epoch;
+                # at floor era (reward=4) it's 3 — both small but
+                # predictable.
+                cap_pool_basis = (
+                    (reward - proposer_share)
+                    if cap_fix_active
+                    else attester_pool
+                )
                 cap_per_entity = (
-                    attester_pool
+                    cap_pool_basis
                     * PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
                     * FINALITY_INTERVAL
                     // 10_000
@@ -580,6 +668,20 @@ class SupplyTracker:
         if actual_burn > 0:
             self.total_supply -= actual_burn
             self.total_burned += actual_burn
+            # DEFLATION_FLOOR_V2_HEIGHT hard fork: accrue every
+            # post-activation fee-burn into the rolling window that
+            # drives the fee-responsive issuance rebate.  Pre-activation
+            # the list stays empty (byte-for-byte legacy behavior).
+            # Effective height for the gate mirrors the attester-fee
+            # split above so an explicit block_height= kwarg still
+            # wins over the tunnel.
+            if (
+                effective_height is not None
+                and effective_height >= DEFLATION_FLOOR_V2_HEIGHT
+            ):
+                self.rolling_fee_burn.append(
+                    (int(effective_height), int(actual_burn)),
+                )
         if attester_share > 0:
             self.attester_fee_pool_this_block += attester_share
         # Fee-burn-only ticker: tracks the CURRENT block's fee-burn so

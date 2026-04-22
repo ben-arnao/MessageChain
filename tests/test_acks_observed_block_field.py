@@ -600,8 +600,12 @@ class TestSnapshotVersionsBumped(unittest.TestCase):
     13→14 / 4→5 — same intent, current numbers."""
 
     def test_state_snapshot_version_is_14(self):
+        # Pinned >=14 so the witnessed-submission sections remain
+        # committed.  Follow-on forks bump further (v15 added the
+        # fee-burn rolling window); strict equality would break every
+        # time a new hard fork lands, so we pin the lower bound.
         from messagechain.storage.state_snapshot import STATE_SNAPSHOT_VERSION
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 14)
+        self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 14)
 
     def test_state_root_version_is_5(self):
         from messagechain.storage.state_snapshot import STATE_ROOT_VERSION

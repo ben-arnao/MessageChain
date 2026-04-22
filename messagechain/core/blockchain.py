@@ -1319,6 +1319,17 @@ class Blockchain:
         self.supply.attester_epoch_earnings_start = int(
             snap.get("attester_epoch_earnings_start", -1),
         )
+        # Fee-burn rolling-window list (DEFLATION_FLOOR_V2_HEIGHT
+        # hard fork).  Consensus-visible list driving the fee-
+        # responsive rebate.  A state-synced node that inherits a
+        # stale list would mis-compute the trailing burn rate and
+        # silently diverge at the next low-supply block; the list
+        # is committed to the snapshot root under _TAG_FEE_BURN_ROLLING
+        # for state-sync parity.
+        self.supply.rolling_fee_burn = [
+            (int(h), int(a))
+            for (h, a) in snap.get("rolling_fee_burn", [])
+        ]
 
         # Archive-duty state (v6+).  All three fields participate in
         # the state root, so a bootstrapping node inherits them from
@@ -3571,11 +3582,13 @@ class Blockchain:
                 # state-root commits only to the clamped amounts.
                 from messagechain.config import (
                     ATTESTER_REWARD_CAP_HEIGHT as _ARCH,
+                    ATTESTER_CAP_FIX_HEIGHT as _ACFH,
                     PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
                     as _ARCB,
                     FINALITY_INTERVAL as _FI,
                 )
                 _cap_active = block_height >= _ARCH
+                _cap_fix_active = block_height >= _ACFH
                 _sim_epoch_earnings: dict[bytes, int] = {}
                 _cap_per_entity = 0
                 if _cap_active:
@@ -3590,8 +3603,19 @@ class Blockchain:
                             self.supply.attester_epoch_earnings,
                         )
                     # else: new epoch, sim starts from empty mirror.
+                    # ATTESTER_CAP_FIX_HEIGHT: post-fix use issuance-
+                    # only pool (reward - proposer_share) as the basis
+                    # — fee-funded component excluded so the cap is
+                    # stable across varying fee blocks within an
+                    # epoch.  Pre-fix retain the old fee-dependent
+                    # basis byte-for-byte.
+                    _cap_pool_basis = (
+                        (reward - proposer_share)
+                        if _cap_fix_active
+                        else attester_pool
+                    )
                     _cap_per_entity = (
-                        attester_pool * _ARCB * _FI // 10_000
+                        _cap_pool_basis * _ARCB * _FI // 10_000
                     )
                 for eid in attester_committee:
                     _reward_amount = per_slot_reward
@@ -3939,13 +3963,24 @@ class Blockchain:
                 # matches the apply-side deduction.
                 from messagechain.config import (
                     ATTESTER_REWARD_CAP_HEIGHT as _ARCH2,
+                    ATTESTER_CAP_FIX_HEIGHT as _ACFH2,
                     PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
                     as _ARCB2,
                     FINALITY_INTERVAL as _FI2,
                 )
                 _cap_active2 = block_height >= _ARCH2
+                _cap_fix_active2 = block_height >= _ACFH2
+                # ATTESTER_CAP_FIX_HEIGHT: post-fix, cap basis is
+                # issuance-only (reward - proposer_share); pre-fix
+                # retains the old fee-dependent basis.  Mirrors the
+                # apply-path in SupplyTracker.mint_block_reward.
+                _gross_cap_pool_basis = (
+                    (reward - proposer_share)
+                    if _cap_fix_active2
+                    else attester_pool
+                )
                 _gross_cap_per_entity = (
-                    attester_pool * _ARCB2 * _FI2 // 10_000
+                    _gross_cap_pool_basis * _ARCB2 * _FI2 // 10_000
                     if _cap_active2 else 0
                 )
                 _gross_live_earnings: dict[bytes, int] = {}
@@ -8878,6 +8913,17 @@ class Blockchain:
             "attester_epoch_earnings_start": (
                 self.supply.attester_epoch_earnings_start
             ),
+            # Fee-burn rolling-window list
+            # (DEFLATION_FLOOR_V2_HEIGHT hard fork): reorg that
+            # undoes a post-v2 fee-burn block MUST revert the
+            # appended entries, or the canonical replay computes a
+            # different trailing burn rate and boosted issuance at
+            # the next low-supply block, forking silently.  Copy
+            # the list — tuples are immutable so a shallow copy is
+            # safe against subsequent mutation.
+            "rolling_fee_burn": list(
+                self.supply.rolling_fee_burn,
+            ),
             # Seed-divestment lottery redistribution (hard fork):
             # pool of lottery-share tokens accumulated from divested
             # founder stake, awaiting reputation-weighted-lottery
@@ -9004,6 +9050,16 @@ class Blockchain:
         self.supply.attester_epoch_earnings_start = snapshot.get(
             "attester_epoch_earnings_start", -1,
         )
+        # Fee-burn rolling-window list (DEFLATION_FLOOR_V2_HEIGHT
+        # hard fork).  Default to empty so pre-fork snapshots restore
+        # cleanly (no post-v2 fee-burns ever occurred).  Materialize
+        # as tuples (the snapshot might have list-of-lists from a
+        # round-trip) so equality comparisons with freshly-built
+        # lists work uniformly.
+        self.supply.rolling_fee_burn = [
+            (int(h), int(a))
+            for (h, a) in snapshot.get("rolling_fee_burn", [])
+        ]
         # Lottery prize pool — reorg rollback restores the pre-reorg
         # accumulation / drain state so the canonical replay produces
         # identical payouts.  Default 0 so pre-fork snapshots restore
