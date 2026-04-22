@@ -10,6 +10,7 @@ so even large trees (height=40 → ~1 trillion signatures) have near-instant
 creation time and constant memory overhead.
 """
 
+import errno
 import hashlib
 import hmac
 import json
@@ -24,6 +25,77 @@ from messagechain.config import (
 from messagechain.crypto.hash_sig import wots_keygen, wots_sign, wots_verify, _hash
 
 logger = logging.getLogger(__name__)
+
+
+class LeafIndexPersistError(RuntimeError):
+    """Raised when durable persistence of the WOTS+ leaf counter fails.
+
+    Specifically raised when the parent-directory fsync that guarantees
+    the tmp+rename atomic write survives a power loss returns an errno
+    other than EINVAL.  EINVAL is the known-benign tmpfs/overlayfs case
+    (the filesystem genuinely doesn't support dir fsync); any other
+    errno (EIO, ENOSPC, EACCES, ...) is a real durability failure.
+
+    sign() catches `Exception` from persist_leaf_index(), rolls back
+    _next_leaf, and re-raises.  This class is a RuntimeError subclass
+    so existing broad handlers keep catching it — the only behavioral
+    change is that a signature is NO LONGER produced when durability
+    is uncertain.  Burning a leaf under a spurious abort is cheap;
+    reusing one is unrecoverable (WOTS+ leaf reuse leaks the private
+    key for that leaf).
+    """
+
+
+def _fsync_parent_dir(dir_path: str) -> None:
+    """Fsync a directory so its recent rename entries are durable.
+
+    On POSIX, `os.replace()` is inode-atomic but the directory entry
+    update can still be lost on a power cut unless the directory
+    itself is fsynced.  We open the directory O_RDONLY and fsync the
+    fd.
+
+    Errno classification (CRITICAL for WOTS+ safety):
+      - EINVAL: tmpfs / some overlay filesystems genuinely don't
+        support directory fsync.  Volatile by design; not a durability
+        bug.  Logged at DEBUG and ignored.
+      - anything else (EIO, ENOSPC, EACCES, EPERM, ...): a real
+        durability failure.  If swallowed, a subsequent power loss
+        could revert the on-disk leaf counter; the next sign() would
+        then reuse a leaf that was already broadcast, and the WOTS+
+        private key for that leaf would be recoverable from the two
+        signatures.  Surface loudly as LeafIndexPersistError so
+        sign() refuses to produce bytes.
+
+    Platforms without O_DIRECTORY (notably Windows) fall through as a
+    no-op — Windows is not a production validator target and its FS
+    semantics for rename durability differ.  The no-op is acceptable
+    for dev but operators running on Windows have been warned.
+    """
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        dir_fd = os.open(dir_path, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as e:
+        if e.errno == errno.EINVAL:
+            logger.debug(
+                "directory fsync not supported on %r: %s "
+                "(treating as tmpfs/overlay; not a durability bug)",
+                dir_path, e,
+            )
+            return
+        logger.error(
+            "directory fsync FAILED on %r: %s; "
+            "leaf-index durability is NOT guaranteed — "
+            "refusing to sign rather than risk WOTS+ leaf reuse",
+            dir_path, e,
+        )
+        raise LeafIndexPersistError(
+            f"leaf-index directory fsync failed on {dir_path!r}: {e}"
+        ) from e
 
 # WOTS+ leaf-usage thresholds (percent of capacity) at which sign() emits
 # an operator-visible WARNING.  The footgun these guard against: a
@@ -582,6 +654,12 @@ class KeyPair:
 
         The file is a small JSON object so it is human-inspectable and
         trivially portable across platforms.
+
+        Raises LeafIndexPersistError if the parent-directory fsync (the
+        step that makes the rename survive a power loss) fails with a
+        real I/O error.  The known-benign tmpfs case (EINVAL) is logged
+        at DEBUG and treated as success.  See _fsync_parent_dir below
+        for the errno classification rationale.
         """
         # Symlink traversal guard: refuse to write through symlinks.
         real_path = os.path.realpath(path)
@@ -604,24 +682,7 @@ class KeyPair:
         # defaults to _next_leaf=0, and the next sign() reuses leaves
         # that were already published.  WOTS+ leaf reuse = private
         # key recovery on that leaf.
-        # Windows has no directory fsync primitive and os.open of a
-        # directory is not supported — skip there.  Windows is not a
-        # production validator target.
-        if hasattr(os, "O_DIRECTORY"):
-            try:
-                dir_fd = os.open(
-                    os.path.dirname(os.path.abspath(path)) or ".",
-                    os.O_RDONLY,
-                )
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                # Some filesystems (tmpfs) don't support dir fsync —
-                # best-effort is acceptable there because they're
-                # volatile by design and not production targets.
-                pass
+        _fsync_parent_dir(os.path.dirname(os.path.abspath(path)) or ".")
 
     def load_leaf_index(self, path: str) -> None:
         """Restore _next_leaf from a previously-persisted file.
