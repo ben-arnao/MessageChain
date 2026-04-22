@@ -192,7 +192,25 @@ from messagechain.config import (
 #      (attester_epoch_earnings) followed by i64
 #      (attester_epoch_earnings_start — i64 because the sentinel
 #      value -1 requires a signed type, encoded via an offset shift).
-STATE_SNAPSHOT_VERSION = 13  # wire format version for encode/decode
+# v14: added two witnessed-submission sections —
+#        non_response_processed   (set of NonResponseEvidence
+#                                  evidence_hashes already applied;
+#                                  the double-slash defense)
+#        witness_ack_registry     (request_hash → observed_height;
+#                                  consulted by
+#                                  `validate_non_response_evidence_tx`
+#                                  so an evidence whose request_hash
+#                                  is already ack'd in chain state is
+#                                  rejected at admission).
+#      Both MUST participate in the snapshot root: a state-synced node
+#      that inherited an empty `processed` set would re-apply
+#      already-processed evidence (double-slash); a node that
+#      inherited an empty registry would admit evidence that the
+#      chain has already discharged.  Section tags
+#      `_TAG_NON_RESPONSE_PROCESSED` and `_TAG_WITNESS_ACK_REGISTRY`.
+#      Binary layout (appended strictly after the v13 attester-epoch
+#      sections): bytes-set then bytes→int dict.
+STATE_SNAPSHOT_VERSION = 14  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -297,6 +315,24 @@ _TAG_TREASURY_ROLLING = b"trroll"
 # _GLOBAL_ATTESTER_EPOCH_START (below) so both the earnings dict
 # and the scalar epoch-start marker are committed.
 _TAG_ATTESTER_EPOCH = b"attepoch"
+# v14: NonResponseEvidenceProcessor.processed — set of evidence_hashes
+# that have ever been admitted (slashed OR rejected after admission
+# gates).  No pending counterpart — apply-time decision.  MUST
+# participate in the snapshot root: a state-synced node that
+# inherited an empty processed set would re-apply already-applied
+# evidence and double-slash the same offender.  Same dedupe-
+# determinism criticality as _TAG_BOGUS_REJECTION_PROCESSED.
+_TAG_NON_RESPONSE_PROCESSED = b"nrproc"
+# v14: Witness-ack registry — request_hash → observed_height.
+# Populated when a block's `acks_observed_this_block` lands; consulted
+# by `validate_non_response_evidence_tx` so an evidence whose
+# request_hash is already discharged in chain state is rejected at
+# admission.  MUST participate in the snapshot root: a state-synced
+# node that inherited an empty registry would admit
+# NonResponseEvidence for request_hashes the chain has already
+# considered met, and silently fork.  Same consensus criticality as
+# _TAG_CENSORSHIP_PROCESSED.
+_TAG_WITNESS_ACK_REGISTRY = b"wack"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -489,7 +525,29 @@ def serialize_state(blockchain) -> dict:
                 -1,
             ),
         ),
+        # v14: NonResponseEvidenceProcessor.processed (set of
+        # evidence_hashes already applied) — the double-slash defense.
+        # Apply-time decision, no pending counterpart.
+        "non_response_processed": _non_response_processed(
+            getattr(blockchain, "non_response_processor", None),
+        ),
+        # v14: Witness-ack registry — request_hash → observed_height.
+        # Populated by `_apply_block_state` from each block's
+        # `acks_observed_this_block` list; consulted by
+        # `validate_non_response_evidence_tx`.
+        "witness_ack_registry": dict(
+            getattr(blockchain, "witness_ack_registry", {})
+        ),
     }
+
+
+def _non_response_processed(processor) -> set:
+    """Extract the set form of NonResponseEvidenceProcessor.processed
+    so it can ride the standard bytes-set encoder.  Absent processor
+    (cold-load path) returns an empty set."""
+    if processor is None:
+        return set()
+    return set(processor.processed)
 
 
 def _bogus_rejection_processed(processor) -> set:
@@ -691,6 +749,15 @@ def deserialize_state(snapshot: dict) -> dict:
     # reaches activation with no prior mint.
     out.setdefault("attester_epoch_earnings", {})
     out.setdefault("attester_epoch_earnings_start", -1)
+    # Pre-v14 snapshots lack the witnessed-submission sections.
+    # Migrating chains start with empty processed/registry — matches
+    # a replaying node that reaches witnessed-submission activation
+    # with no prior NonResponseEvidence applied and no acks
+    # discharged.  (The strict binary-decode path enforces the
+    # version byte separately, so this default only matters for
+    # callers that hand-build snapshot dicts.)
+    out.setdefault("non_response_processed", set())
+    out.setdefault("witness_ack_registry", {})
     return out
 
 
@@ -922,6 +989,20 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_ATTESTER_EPOCH: _merkle(_entries_for_section(
             _TAG_ATTESTER_EPOCH,
             snap.get("attester_epoch_earnings", {}))),
+        # v14: NonResponseEvidenceProcessor processed set — the
+        # double-slash defense.  Same dedupe-determinism criticality
+        # as _TAG_BOGUS_REJECTION_PROCESSED.
+        _TAG_NON_RESPONSE_PROCESSED: _merkle(_entries_for_section(
+            _TAG_NON_RESPONSE_PROCESSED,
+            snap["non_response_processed"])),
+        # v14: Witness-ack registry — request_hash → observed_height.
+        # Two state-synced nodes that disagreed on this dict would
+        # accept/reject the same NonResponseEvidenceTx differently
+        # at admission and silently fork at the first contested
+        # request_hash.
+        _TAG_WITNESS_ACK_REGISTRY: _merkle(_entries_for_section(
+            _TAG_WITNESS_ACK_REGISTRY,
+            snap["witness_ack_registry"])),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -1217,6 +1298,8 @@ def encode_snapshot(snap: dict) -> bytes:
         <rolling-debit list> treasury_spend_rolling_debits  (v10+)
         <bytes→int  dict>   attester_epoch_earnings        (v12+)
         u64                 attester_epoch_earnings_start +1 (v12+)
+        <bytes set>         non_response_processed         (v14+)
+        <bytes→int  dict>   witness_ack_registry           (v14+)
     """
     snap = deserialize_state(snap)
     out = bytearray()
@@ -1304,6 +1387,12 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_int_dict(snap.get("attester_epoch_earnings", {}))
     _epoch_start = int(snap.get("attester_epoch_earnings_start", -1))
     out += struct.pack(">Q", _epoch_start + 1)
+    # v14: NonResponseEvidence processed set + witness-ack registry,
+    # strictly appended after the v13 attester-epoch-earnings section.
+    # Order is processed-then-registry to match compute_state_root's
+    # iteration order (sorted tag bytes — `nrproc` < `wack`).
+    out += _encode_bytes_set(snap["non_response_processed"])
+    out += _encode_bytes_int_dict(snap["witness_ack_registry"])
     return bytes(out)
 
 
@@ -1405,6 +1494,11 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     (_epoch_start_encoded,) = struct.unpack_from(">Q", blob, off)
     off += 8
     attester_epoch_earnings_start = int(_epoch_start_encoded) - 1
+    # v14+: NonResponseEvidence processed set + witness-ack registry.
+    # Always present on v14+ blobs.  Order matches encode_snapshot:
+    # processed-then-registry.
+    non_response_processed, off = _decode_bytes_set(blob, off)
+    witness_ack_registry, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1451,4 +1545,6 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "treasury_spend_rolling_debits": treasury_spend_rolling_debits,
         "attester_epoch_earnings": attester_epoch_earnings,
         "attester_epoch_earnings_start": attester_epoch_earnings_start,
+        "non_response_processed": non_response_processed,
+        "witness_ack_registry": witness_ack_registry,
     }

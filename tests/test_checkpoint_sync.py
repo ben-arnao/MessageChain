@@ -729,7 +729,13 @@ class TestCheckpointIntervalConst(unittest.TestCase):
         # archive rewards).
         # v4: bumped when attester_coverage_misses was added (defense
         # against 1/3-stake AttesterMempoolReport withholding).
-        self.assertEqual(STATE_ROOT_VERSION, 4)
+        # v5: bumped when non_response_processed + witness_ack_registry
+        # were added together — closes Gap A (state-snapshot integration)
+        # and Gap B (block-level ack aggregation) for witnessed-submission
+        # evidence (closes the silent-TCP-drop slash-evasion path that
+        # would otherwise let a state-synced node re-apply already-
+        # processed evidence or miss the registry's discharge signal).
+        self.assertEqual(STATE_ROOT_VERSION, 5)
 
 
 class TestMeasureSnapshotSize(unittest.TestCase):

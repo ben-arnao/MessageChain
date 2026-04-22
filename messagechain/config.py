@@ -328,17 +328,19 @@ NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
 #
-# Mainnet re-minted 2026-04-21 after the bogus_rejection_evidence_txs
-# wire-format addition (and subsequent block-body field additions)
-# made older blocks undecodable by new deserializers.  Same founder
-# key, same 5M+95M allocation, new hash.  Previous hashes (all
-# abandoned):
+# Mainnet re-minted 2026-04-22 after the inclusion_list_violation_evidence_txs
+# and signed-custody-proof wire-format additions made bb01094-pinned
+# blocks undecodable by the new Block.from_bytes — the live validator
+# crash-looped on the first block read with "Block blob truncated".
+# Same founder key, same 5M+95M allocation, new hash.  Previous hashes
+# (all abandoned):
 #   5e8bc19ccd4449... (2026-04-18 original launch)
 #   53a1ce6217436b... (2026-04-20 post state-root-checkpoint)
 #   5d37dd1c4b2603... (2026-04-20 post archive rewards + censorship)
+#   bb0109432744d1... (2026-04-21 post bogus_rejection_evidence_txs)
 _TESTNET_GENESIS_HASH: bytes | None = None
 _MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "bb0109432744d143108389bd90a81c060b6dca55779d029c3f02fec092660a03"
+    "5c31a3460698c4c3b48df0cd2b64b200617857b93c674ec7b24aac2b5519f67c"
 )
 
 
@@ -1115,7 +1117,17 @@ MAX_STATE_SNAPSHOT_BYTES = 500_000_000
 # cartels).  Two state-synced nodes that disagreed on the counter
 # would burn different amounts at the next non-empty inclusion list
 # and silently fork.
-STATE_ROOT_VERSION = 4
+# v5: added two new sections — non_response_processed (set of
+# evidence_hashes that have been admitted by NonResponseEvidence-
+# Processor; double-slash defense) and witness_ack_registry
+# (request_hash → observed_height; consulted by
+# `validate_non_response_evidence_tx` so an evidence whose
+# request_hash is already ack'd in chain state is rejected).  Both
+# MUST participate in the state root: a state-synced node that
+# inherited empty processed/registry would re-apply already-
+# processed evidence (double-slash) or admit evidence the chain
+# considers met.  See storage.state_snapshot for the section tags.
+STATE_ROOT_VERSION = 5
 
 # ── On-chain state-root checkpoints ──────────────────────────────────
 # Periodic commitments of the full snapshot root into the block header
