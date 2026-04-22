@@ -3976,6 +3976,18 @@ def main():
     else:
         logger.info("Active profile: production (strict defaults)")
 
+    # Log the fee-includes-signature activation height so operators can
+    # confirm at boot which coordinated-fork height this node is running.
+    # Silent divergence at activation is a consensus-forking bug; a boot-
+    # time log line is a cheap way to catch a mis-set
+    # MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT before it matters.
+    from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT
+    logger.info(
+        "FEE_INCLUDES_SIGNATURE_HEIGHT activation: %d "
+        "(override via MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT)",
+        FEE_INCLUDES_SIGNATURE_HEIGHT,
+    )
+
     asyncio.run(run(args))
 
 
