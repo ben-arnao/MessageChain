@@ -132,12 +132,25 @@ def compute_block_sig_cost(block) -> int:
     attestation sig costs 1 verification. This budget prevents DoS via
     blocks stuffed with expensive WOTS+ signature verifications.
     """
+    # Each authority tx costs one sig verification except
+    # ReleaseAnnounceTransaction, which carries a threshold multi-sig
+    # and costs one verification per signer.  Without this adjustment,
+    # a release tx would under-count its real verify cost and a block
+    # stuffed with release txs could exceed the sig-verification budget.
+    auth_txs = getattr(block, "authority_txs", []) or []
+    authority_sig_cost = 0
+    for atx in auth_txs:
+        if atx.__class__.__name__ == "ReleaseAnnounceTransaction":
+            authority_sig_cost += len(getattr(atx, "signatures", []) or [])
+        else:
+            authority_sig_cost += 1
+
     return (
         len(block.transactions)
         + len(block.transfer_transactions)
         + len(block.slash_transactions)
         + len(block.governance_txs)
-        + len(getattr(block, "authority_txs", []))
+        + authority_sig_cost
         + len(getattr(block, "stake_transactions", []))
         + len(getattr(block, "unstake_transactions", []))
         + 1  # proposer signature
@@ -242,6 +255,13 @@ class Blockchain:
         # pushed into pending_unstakes at revoke time, so the cold-key
         # holder recovers funds through the normal unbonding path.
         self.revoked_entities: set[bytes] = set()
+        # Latest ReleaseAnnounceTransaction observed on-chain.  None until
+        # the first valid threshold-signed manifest lands.  Monotonic
+        # guard in _apply_authority_tx ensures an older version cannot
+        # overwrite a newer one.  Advisory only — nodes surface the
+        # manifest to operators out of band; the protocol NEVER
+        # auto-downloads or auto-applies the announced binaries.
+        self.latest_release_manifest = None
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
         self.fork_choice = ForkChoice()
@@ -3083,6 +3103,14 @@ class Blockchain:
         # iteration order and every such block would be rejected.
         for atx in _canonicalize_authority_txs(authority_txs or []):
             cls_name = atx.__class__.__name__
+            # ReleaseAnnounceTransaction has no entity_id / fee and does
+            # NOT mutate any per-entity state committed by the state
+            # root (it writes only to blockchain.latest_release_manifest,
+            # which is not in compute_state_root's input set).  Skip
+            # the sim entirely for this class — no balance / nonce /
+            # stake move to mirror.
+            if cls_name == "ReleaseAnnounceTransaction":
+                continue
             # M4: mirror _apply_authority_tx's validation-gated skip.  If
             # a Revoke for this entity ran earlier in the SAME block
             # (canonical ordering guarantees it would), the subsequent
@@ -4187,20 +4215,32 @@ class Blockchain:
         """Per-tx byte ceiling on authority txs.
 
         Safety rail that complements the per-block COUNT cap
-        (MAX_AUTHORITY_TXS_PER_BLOCK).  A real authority tx is
-        dominated by its ~2.8 KB WOTS+ signature and can't
-        meaningfully grow beyond that; the cap is here to reject
-        malformed or future-incompatible variants on size alone
+        (MAX_AUTHORITY_TXS_PER_BLOCK).  Most authority txs are
+        dominated by a single ~2.8 KB WOTS+ signature and can't
+        meaningfully grow beyond that; the default cap is here to
+        reject malformed or future-incompatible variants on size alone
         before any signature verification.
+
+        ReleaseAnnounceTransaction is an exception: it carries a
+        threshold multi-sig (up to N WOTS+ signatures) plus the
+        manifest body, so it uses the larger MAX_RELEASE_ANNOUNCE_TX_BYTES
+        cap.
         """
-        from messagechain.config import MAX_AUTHORITY_TX_BYTES
+        from messagechain.config import (
+            MAX_AUTHORITY_TX_BYTES,
+            MAX_RELEASE_ANNOUNCE_TX_BYTES,
+        )
         for atx in authority_txs:
             size = len(atx.to_bytes())
-            if size > MAX_AUTHORITY_TX_BYTES:
+            if atx.__class__.__name__ == "ReleaseAnnounceTransaction":
+                cap = MAX_RELEASE_ANNOUNCE_TX_BYTES
+            else:
+                cap = MAX_AUTHORITY_TX_BYTES
+            if size > cap:
                 tx_hash_hex = getattr(atx, "tx_hash", b"").hex()[:16]
                 return False, (
                     f"Authority tx {tx_hash_hex} exceeds size cap: "
-                    f"{size} > {MAX_AUTHORITY_TX_BYTES} bytes"
+                    f"{size} > {cap} bytes"
                 )
         return True, "OK"
 
@@ -5015,6 +5055,12 @@ class Blockchain:
                     f"fee {gtx.fee} below current base_fee {current_base_fee}"
                 )
         for atx in getattr(block, "authority_txs", []):
+            # ReleaseAnnounceTransaction has no fee (not a per-entity
+            # tx — it's a threshold multi-sig'd manifest from a
+            # hardcoded committee).  Skip the fee gate for it; verify()
+            # on the tx itself gates inclusion.
+            if atx.__class__.__name__ == "ReleaseAnnounceTransaction":
+                continue
             if atx.fee < current_base_fee:
                 return False, (
                     f"Invalid authority tx {atx.tx_hash.hex()[:16]}: "
@@ -5951,6 +5997,37 @@ class Blockchain:
             # Nonce-free; signature consumed a leaf in the COLD tree —
             # deliberately do NOT bump the hot-key watermark, matching
             # Revoke.
+        elif cls_name == "ReleaseAnnounceTransaction":
+            # Threshold multi-sig'd release manifest.  Signed by hardcoded
+            # committee pubkeys in config.RELEASE_KEY_ROOTS — NOT by any
+            # per-entity account — so there is no entity to debit, no
+            # fee to collect, no nonce to bump.  Reject on verify
+            # failure; otherwise record if `version` is lexicographically
+            # greater than the current one (or current is None).
+            if not atx.verify():
+                logger.warning(
+                    "release manifest rejected: threshold multi-sig "
+                    "verify failed (tx_hash=%s)",
+                    atx.tx_hash.hex()[:16],
+                )
+                return
+            current = self.latest_release_manifest
+            if current is not None and atx.version <= current.version:
+                # Older-or-equal version — drop silently.  A monotonic
+                # guard prevents a signer committee that later becomes
+                # compromised from quietly downgrading users to an
+                # older (perhaps vulnerable) build.
+                logger.info(
+                    "release manifest skipped: version=%s not newer than "
+                    "current=%s",
+                    atx.version, current.version,
+                )
+                return
+            self.latest_release_manifest = atx
+            logger.info(
+                "release manifest accepted: version=%s severity=%d",
+                atx.version, atx.severity,
+            )
         # Unknown class: silently skip. deserialize() would have rejected
         # an unknown type before reaching here, so this branch is defensive.
 

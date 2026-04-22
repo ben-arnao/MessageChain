@@ -1752,6 +1752,49 @@ MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK = 16
 # unpriced permanent data.  Headroom above the real ~2.8 KB size
 # keeps legitimate txs safe while closing the oversize escape hatch.
 MAX_AUTHORITY_TX_BYTES = 3_200
+
+# ─────────────────────────────────────────────────────────────────────
+# Release-announce transaction (ReleaseAnnounceTransaction)
+# ─────────────────────────────────────────────────────────────────────
+# Threshold multi-sig'd "new release available" manifest committed on-
+# chain so operators learn about upgrades through the same gossip path
+# as blocks themselves, rather than via a centralized update server
+# that a state actor could compel, block, or poison.  The tx records a
+# version tag, per-platform binary hashes, and an optional release
+# notes URI — nodes surface it to operators but NEVER auto-download or
+# auto-apply.  Rotation of the signing set is a hard fork (consistent
+# with "no permissioned validators" plus "crypto agility" — signers
+# are protocol-defined, not governance-elected).
+#
+# RELEASE_KEY_ROOTS: Tuple of 32-byte WOTS+ Merkle-tree public keys
+# for the authorized release signers.  Default is an empty tuple —
+# the real keys are seeded via a hard fork once the multi-party key
+# ceremony completes.  Until then, `verify()` on any ReleaseAnnounce
+# tx returns False (no signer index is in range of an empty tuple),
+# so the tx type is inert on mainnet without coordination.
+#
+# RELEASE_THRESHOLD: M-of-N unique signers required.  Default 3-of-5
+# when seeded.  Picked so a single compromised or lost key cannot
+# issue a release (threshold > 1) and the ceremony survives two
+# offline signers (threshold <= N - 2).
+RELEASE_KEY_ROOTS: tuple[bytes, ...] = ()
+RELEASE_THRESHOLD: int = 3
+
+# Per-field DoS bounds.  A release tx is broadcast through the same
+# authority-tx slot as SetAuthorityKey/Revoke/KeyRotation, so loose
+# string/map lengths would translate directly into unpriced permanent
+# storage growth.  Caps are generous for real content but cheap to
+# enforce at deserialize time.
+RELEASE_ANNOUNCE_MAX_URI_LEN = 256
+RELEASE_ANNOUNCE_MAX_PLATFORMS = 16
+RELEASE_ANNOUNCE_VERSION_MAX_LEN = 32
+
+# Per-tx byte ceiling specifically for ReleaseAnnounceTransaction.
+# A valid tx carries up to RELEASE_THRESHOLD..N signatures (each
+# ~2.8 KB WOTS+), plus the manifest body.  5 signatures * ~3 KB +
+# headroom = 20 KB.  This is larger than MAX_AUTHORITY_TX_BYTES
+# (3.2 KB) because release txs carry multi-sig, not single-sig.
+MAX_RELEASE_ANNOUNCE_TX_BYTES = 20_480
 # A finality vote for a block older than FINALITY_VOTE_MAX_AGE blocks is
 # rejected — prevents spam gossip of votes targeting ancient blocks that
 # are already beyond the rewrite horizon anyway.  10 × FINALITY_INTERVAL
