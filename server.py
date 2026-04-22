@@ -161,15 +161,21 @@ _RELEASE_SEVERITY_LABELS = {0: "normal", 1: "security", 2: "emergency"}
 def log_release_status(logger_, blockchain, current_version: str) -> None:
     """Log the state of `blockchain.latest_release_manifest`.
 
+    Semver-aware since the fix to the lex-compare silent-data-loss bug
+    (see messagechain.core.release_version):
+
     - No manifest on chain: silent (no log line).
-    - Manifest version matches `current_version`: single INFO line
+    - Both versions parse AND manifest is strictly newer: UPDATE
+      AVAILABLE at WARNING (severity 0) or ERROR (severity >= 1).
+    - Both versions parse AND they're equal: single INFO line
       confirming the operator is running the latest announced release.
-    - Manifest version differs:
-        severity 0  → WARNING
-        severity ≥ 1 → ERROR
-      Message includes current version, manifest version, severity
-      label, signer count, optional activation height, and the
-      release-notes URI.
+    - Both versions parse AND the node is ahead of the manifest:
+      INFO "ahead of the latest announced release" line (the typical
+      "dev build newer than last release" case).
+    - Either version fails to parse: fall back to strict string
+      inequality and emit the original UPDATE AVAILABLE log.  This is
+      the safety net — a parser edge case must never silence a real
+      update signal.
 
     Pure function of its inputs — easy to unit-test via assertLogs.
     """
@@ -178,11 +184,51 @@ def log_release_status(logger_, blockchain, current_version: str) -> None:
         return
 
     manifest_version = manifest.version
-    if manifest_version == current_version:
-        logger_.info(
-            "Running latest announced release v%s", current_version,
+
+    # Try the semver-aware path first.  If either side fails to parse,
+    # `parse_release_version` raises ValueError and we drop into the
+    # legacy string-inequality fallback below.
+    from messagechain.core.release_version import parse_release_version
+    both_parse = True
+    try:
+        parse_release_version(manifest_version)
+        parse_release_version(current_version)
+    except (ValueError, TypeError):
+        both_parse = False
+
+    if both_parse:
+        from messagechain.core.release_version import (
+            release_version_is_strictly_newer,
         )
-        return
+        if manifest_version == current_version:
+            logger_.info(
+                "Running latest announced release v%s", current_version,
+            )
+            return
+        if release_version_is_strictly_newer(
+            current_version, manifest_version,
+        ):
+            # Dev build ahead of the last announced release.
+            logger_.info(
+                "Node v%s is ahead of the latest announced release v%s "
+                "(no action needed)",
+                current_version, manifest_version,
+            )
+            return
+        # Else: manifest is strictly newer — fall through to emit the
+        # UPDATE AVAILABLE line.
+    else:
+        # Unparseable version on at least one side — fall back to
+        # strict string inequality.  If they happen to match as
+        # strings, treat that as "running latest"; otherwise emit the
+        # legacy UPDATE AVAILABLE line so the operator isn't left in
+        # the dark.
+        if manifest_version == current_version:
+            logger_.info(
+                "Running latest announced release v%s", current_version,
+            )
+            return
+        # Fall through to emit the legacy UPDATE AVAILABLE line.
 
     label = _RELEASE_SEVERITY_LABELS.get(
         int(manifest.severity), f"severity-{int(manifest.severity)}",
@@ -2535,12 +2581,28 @@ class Server(SharedRuntimeMixin):
             "threshold": int(_cfg.RELEASE_THRESHOLD),
             "nonce_hex": manifest.nonce.hex().lower(),
         }
+        # Semver-aware update_available — consistent with
+        # log_release_status().  If either side fails to parse, fall
+        # back to strict string inequality so a parser edge case
+        # never silences a real update signal.
+        from messagechain.core.release_version import (
+            parse_release_version,
+            release_version_is_strictly_newer,
+        )
+        try:
+            parse_release_version(manifest.version)
+            parse_release_version(current_version)
+            update_available = release_version_is_strictly_newer(
+                manifest.version, current_version,
+            )
+        except (ValueError, TypeError):
+            update_available = manifest.version != current_version
         return {
             "ok": True,
             "result": {
                 "current_node_version": current_version,
                 "latest_manifest": latest,
-                "update_available": manifest.version != current_version,
+                "update_available": update_available,
             },
         }
 
