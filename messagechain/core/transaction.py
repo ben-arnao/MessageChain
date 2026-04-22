@@ -14,7 +14,8 @@ import struct
 import time
 from dataclasses import dataclass
 from messagechain.config import (
-    HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE, FEE_PER_BYTE,
+    HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE,
+    MIN_FEE_POST_FLAT, FLAT_FEE_HEIGHT, FEE_PER_BYTE,
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
     SIG_VERSION_CURRENT, FEE_INCLUDES_SIGNATURE_HEIGHT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
@@ -301,22 +302,34 @@ class MessageTransaction:
         return tx
 
 
-def calculate_min_fee(message_bytes: bytes, signature_bytes: int = 0) -> int:
-    """Calculate minimum fee for a message with non-linear size pricing.
+def calculate_min_fee(
+    message_bytes: bytes,
+    signature_bytes: int = 0,
+    current_height: int | None = None,
+) -> int:
+    """Calculate the minimum fee floor a tx must pay to be admitted.
 
-    Fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
+    At/after FLAT_FEE_HEIGHT: flat ``MIN_FEE_POST_FLAT`` regardless of
+    message or signature size.  Multi-part messages pay N × floor by
+    virtue of being N separate txs.
 
-    The quadratic term makes larger messages disproportionately more expensive,
-    incentivizing conciseness and penalizing bloat-heavy messages.
+    Before FLAT_FEE_HEIGHT (and when ``current_height`` is None — the
+    legacy default for isolated tests and non-consensus call sites):
+    the legacy quadratic formula applies so historical blocks replay
+    deterministically:
 
-    `signature_bytes` is the canonical length of the witness (WOTS+ sig +
-    Merkle auth path).  Default 0 preserves the legacy message-only pricing
-    that shipped on mainnet.  Post-FEE_INCLUDES_SIGNATURE_HEIGHT consensus
-    callers pass the real signature length so the same formula is applied
-    to (message_bytes + signature_bytes) — otherwise attackers can flood
-    chain storage with ~2.7 KB of witness per tx while paying only for the
-    message payload.
+        Fee = MIN_FEE
+            + (bytes * FEE_PER_BYTE)
+            + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
+
+    where ``bytes = len(message_bytes) + signature_bytes``.  The
+    ``signature_bytes`` knob matches the pre-flat-fee
+    FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
+    payload).  Post-flat-fee the witness size is moot — the flat floor
+    is uniform for every tx type — so ``signature_bytes`` is ignored.
     """
+    if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
+        return MIN_FEE_POST_FLAT
     size = len(message_bytes) + signature_bytes
     linear = size * FEE_PER_BYTE
     quadratic = (size * size * FEE_QUADRATIC_COEFF) // 1000
@@ -337,20 +350,31 @@ def enforce_signature_aware_min_fee(
     payload and only needs to cover the signature witness above the
     existing flat floor.
 
-    Pre-activation (`current_height is None` or < activation height):
-      * Accept iff `tx_fee >= flat_floor` (unchanged legacy rule).
+    Pre-FEE_INCLUDES_SIGNATURE_HEIGHT (``current_height`` is None or
+    below activation):
+      * Accept iff ``tx_fee >= flat_floor``.
 
-    Post-activation (`current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT`):
-      * Accept iff `tx_fee >= max(flat_floor, calculate_min_fee(b"",
-        signature_bytes=signature_bytes))`.
+    FEE_INCLUDES_SIGNATURE_HEIGHT ≤ ``current_height`` < FLAT_FEE_HEIGHT:
+      * Accept iff ``tx_fee >= max(flat_floor, calculate_min_fee(b"",
+        signature_bytes=signature_bytes))``.  Pricing the WOTS+ witness
+        plugs the R5-A hole where a small-flat-fee tx type (transfer,
+        stake, vote, revoke, etc.) could carry a ~2.7 KB signature at
+        MIN_FEE and bloat permanent chain state at nearly zero cost.
 
-    Pricing witnesses uniformly plugs the R5-A hole where a small-flat-
-    fee tx type (transfer, stake, unstake, vote, revoke, authority,
-    receipt-root, slash) could carry a ~2.7 KB WOTS+ signature at
-    MIN_FEE and bloat permanent chain state at nearly zero cost.
+    ``current_height`` ≥ FLAT_FEE_HEIGHT:
+      * Accept iff ``tx_fee >= max(flat_floor, MIN_FEE_POST_FLAT)``.
+        Size-indexed pricing is gone — the flat floor subsumes both the
+        byte and witness surcharges.  The ``flat_floor`` argument
+        (e.g. GOVERNANCE_PROPOSAL_FEE, KEY_ROTATION_FEE) still applies
+        for tx types whose own hardcoded minimum exceeds the protocol
+        floor.
     """
     if tx_fee < flat_floor:
         return False
+    if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
+        if tx_fee < MIN_FEE_POST_FLAT:
+            return False
+        return True
     if (
         current_height is not None
         and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
@@ -462,10 +486,16 @@ def verify_transaction(
     canonical_stored, canonical_flag = encode_payload(plaintext)
     if canonical_stored != tx.message or canonical_flag != tx.compression_flag:
         return False
-    # Fee applies to stored size; at/after activation it also covers the
-    # WOTS+ signature + Merkle auth-path bytes so witness bloat is priced
-    # alongside payload bloat (see FEE_INCLUDES_SIGNATURE_HEIGHT).
-    if (
+    # Fee rule depends on block height:
+    #   * At/after FLAT_FEE_HEIGHT — flat per-tx floor (MIN_FEE_POST_FLAT).
+    #   * FEE_INCLUDES_SIGNATURE_HEIGHT..FLAT_FEE_HEIGHT-1 — legacy
+    #     quadratic priced on (message + signature) bytes.
+    #   * Pre-FEE_INCLUDES_SIGNATURE_HEIGHT (or no height context) —
+    #     legacy quadratic on message bytes only.
+    if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
+        if tx.fee < calculate_min_fee(tx.message, current_height=current_height):
+            return False
+    elif (
         current_height is not None
         and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
     ):
