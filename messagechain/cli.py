@@ -353,6 +353,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
 
+    # --- release-status ---
+    # Surface the on-chain release manifest (ReleaseAnnounceTransaction)
+    # to the operator - human-readable counterpart to the
+    # `get_latest_release` RPC.  Does not download, verify, or apply
+    # any binary; notification-only by design.
+    release_status = sub.add_parser(
+        "release-status",
+        help="Show the latest on-chain release manifest",
+        description=(
+            "Query a running node for the latest on-chain release "
+            "manifest (version, severity, signers, binary hashes). "
+            "Notification-only - no auto-apply."
+        ),
+    )
+    release_status.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+
     # --- status (operator health-check) ---
     status = sub.add_parser(
         "status",
@@ -2078,6 +2097,73 @@ def cmd_info(args):
         sys.exit(1)
 
 
+def cmd_release_status(args):
+    """Show the latest on-chain release manifest.
+
+    Calls the `get_latest_release` RPC and formats the result for a
+    human reader.  If the node has seen no manifest (new chain, or
+    the release committee hasn't published yet), prints a one-line
+    "No release manifest seen" note with the current node version.
+
+    Notification surface only - no binary download, no signature
+    verification against local files.  See
+    messagechain/core/release_announce.py for the tx-layer details.
+    """
+    host, port = _parse_server(args.server)
+
+    from client import rpc_call
+    response = rpc_call(host, port, "get_latest_release", {})
+
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    result = response["result"]
+    current = result.get("current_node_version", "?")
+    manifest = result.get("latest_manifest")
+
+    if manifest is None:
+        print(f"No release manifest seen. Node version: {current}")
+        return
+
+    version = manifest.get("version", "?")
+    label = manifest.get("severity_label", "?")
+    update_available = result.get("update_available", False)
+
+    print("=== Release Status ===\n")
+    print(f"  Node version:       {current}")
+    print(f"  Latest manifest:    v{version} ({label})")
+    print(f"  Update available:   {'YES' if update_available else 'NO'}")
+
+    signer_indices = manifest.get("signer_indices", [])
+    num_signers = manifest.get("num_signers", len(signer_indices))
+    threshold = manifest.get("threshold", "?")
+    idx_str = ", ".join(str(i) for i in signer_indices)
+    print(f"  Signers:            {num_signers} of {threshold} "
+          f"(indices: {idx_str})")
+
+    # Activation height is optional - manifest may have been issued
+    # without one (routine release).  Skip the line entirely in that
+    # case, same as the boot-log helper.
+    mah = manifest.get("min_activation_height")
+    if mah is not None:
+        print(f"  Min activation:     height {mah}")
+
+    binary_hashes = manifest.get("binary_hashes", {})
+    if binary_hashes:
+        print("  Binary hashes:")
+        # Align hashes under a fixed-width platform column so the
+        # output scans at a glance, even when platform names differ
+        # in length.
+        max_name = max(len(k) for k in binary_hashes)
+        for platform in sorted(binary_hashes):
+            h = binary_hashes[platform]
+            print(f"    {platform:<{max_name}}  {h}")
+
+    uri = manifest.get("release_notes_uri", "")
+    print(f"  Release notes:  {uri}")
+
+
 def cmd_status(args):
     """One-call operator health-check.
 
@@ -2565,6 +2651,7 @@ def main():
         "verify-key": cmd_verify_key,
         "read": cmd_read,
         "info": cmd_info,
+        "release-status": cmd_release_status,
         "status": cmd_status,
         "proposals": cmd_proposals,
         "validators": cmd_validators,
