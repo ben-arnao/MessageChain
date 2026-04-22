@@ -116,8 +116,14 @@ class Node(SharedRuntimeMixin):
         self._running = False
 
         # Network protection — must exist before syncer so the offense
-        # callback can reference ban_manager.
-        self.ban_manager = PeerBanManager()
+        # callback can reference ban_manager.  The ban manager persists
+        # its score table under data_dir so a peer banned just before an
+        # OOM kill or scheduled reboot stays banned on restart — without
+        # this, the banned peer reconnects fresh on boot.
+        _ban_path = (
+            os.path.join(data_dir, "ban_scores.json") if data_dir else None
+        )
+        self.ban_manager = PeerBanManager(persistence_path=_ban_path)
         self.rate_limiter = PeerRateLimiter()
         self.eviction_protector = PeerEvictionProtector()
 
