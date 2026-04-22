@@ -512,6 +512,37 @@ class Blockchain:
         # forward-replaying blocks past the snapshot height.
         self.attester_coverage_misses: dict[bytes, int] = {}
 
+        # Witness-ack registry: request_hash → ack_height.  Populated
+        # when a block's `acks_observed_this_block` list lands —
+        # proposers who saw a SubmissionAck via the witness gossip
+        # topic embed the request_hash in the next block's ack list,
+        # and other validators verify by checking their own
+        # WitnessObservationStore.  The registry is consulted by
+        # NonResponseEvidenceProcessor: a request_hash present here
+        # with ack_height inside the deadline window means the
+        # obligation was met → no slash.
+        #
+        # Bounded growth: ack-registry entries are pruned with the
+        # rest of the witness state once they fall outside the
+        # WITNESS_RESPONSE_DEADLINE_BLOCKS window.  See
+        # _prune_witness_ack_registry.
+        self.witness_ack_registry: dict[bytes, int] = {}
+
+        # Non-response-evidence processor (silent-TCP-drop slashing).
+        # One-phase: every admitted NonResponseEvidenceTx triggers
+        # processor.process(), which checks deadline + ack-registry +
+        # active-set witness quorum and (if all gates pass) slashes
+        # the silent-drop offender by WITNESS_NON_RESPONSE_SLASH_BPS.
+        # Snapshot-serialised so every node reaches identical
+        # outcomes after replay.  See
+        # messagechain.consensus.non_response_evidence.
+        from messagechain.consensus.non_response_evidence import (
+            NonResponseEvidenceProcessor,
+        )
+        self.non_response_processor: NonResponseEvidenceProcessor = (
+            NonResponseEvidenceProcessor()
+        )
+
         # Per-validator receipt-subtree root registry.  Receipts are
         # signed with a DIFFERENT WOTS+ subtree than block-signing;
         # every validator that wants to issue receipts registers the

@@ -504,6 +504,64 @@ class ReceiptIssuer:
             signature=sig,
         )
 
+    def issue_ack(
+        self, request_hash: bytes, action_code: int,
+    ):
+        """Produce a signed SubmissionAck for `request_hash` at current
+        chain height.
+
+        Consumes exactly one WOTS+ leaf from the receipt subtree (same
+        subtree as receipts and rejections).  `action_code` MUST be one
+        of the defined ACK_* sentinels — unknown codes raise ValueError
+        so a bug in the call site cannot land an unverifiable ack on
+        the wire.
+
+        Use case: when a validator's HTTPS submission endpoint is hit
+        with the X-MC-Witnessed-Submission opt-in header, the validator
+        publishes a SubmissionAck (admitted or rejected) so that
+        peers who saw the witness gossip can mark the obligation
+        discharged.  If the validator silently drops the request
+        instead of issuing an ack, peers can submit a
+        NonResponseEvidenceTx after WITNESS_RESPONSE_DEADLINE_BLOCKS
+        and the validator gets slashed — closing the silent-TCP-drop
+        censorship gap left by SignedRejection (which only catches
+        validators who answer with a lie, not those who hang up).
+
+        Lazy import of witness_submission to avoid a top-level cycle:
+        witness_submission imports from this module's domain (signature
+        primitives) but the wire types live in the consensus package.
+        """
+        from messagechain.consensus.witness_submission import (
+            SubmissionAck, _VALID_ACK_CODES,
+        )
+        if len(request_hash) != 32:
+            raise ValueError("request_hash must be 32 bytes")
+        if action_code not in _VALID_ACK_CODES:
+            raise ValueError(
+                f"unknown SubmissionAck action_code {action_code}; "
+                f"must be one of {sorted(_VALID_ACK_CODES)}"
+            )
+        height = int(self._height_fn())
+        placeholder = Signature([], 0, [], b"", b"")
+        a = SubmissionAck(
+            request_hash=request_hash,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            action_code=action_code,
+            commit_height=height,
+            signature=placeholder,
+        )
+        msg_hash = _h(a._signable_data())
+        sig = self.subtree_keypair.sign(msg_hash)
+        return SubmissionAck(
+            request_hash=request_hash,
+            issuer_id=self.issuer_id,
+            issuer_root_public_key=self.subtree_keypair.public_key,
+            action_code=action_code,
+            commit_height=height,
+            signature=sig,
+        )
+
     def issue_rejection(
         self, tx_hash: bytes, reason_code: int,
     ) -> SignedRejection:
