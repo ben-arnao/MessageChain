@@ -328,12 +328,11 @@ NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 # Per-network canonical block-0 hashes.  Read these via PINNED_GENESIS_HASH
 # below; do not reference them directly from other modules.
 #
-# Mainnet re-minted 2026-04-22 after the witnessed-submission consensus
-# integration (block-level ack aggregation + state-snapshot integration)
-# changed block/state wire format yet again.  The 5c31a346 pin produced
-# under an earlier wire format never matched the genesis hash of any
-# code that actually shipped to the validator.  Same founder key, same
-# 5M+95M allocation, new hash.  Previous hashes (all abandoned):
+# Mainnet re-minted 2026-04-22 after the safety-gaps + sybil-bind +
+# state_snapshot v12->v14 merge train invalidated the 9458c6db pin
+# (state-snapshot version bump alone changes block-0 state root).
+# Same founder key, same 5M+95M allocation, new hash.  Previous
+# hashes (all abandoned):
 #   5e8bc19ccd4449... (2026-04-18 original launch)
 #   53a1ce6217436b... (2026-04-20 post state-root-checkpoint)
 #   5d37dd1c4b2603... (2026-04-20 post archive rewards + censorship)
@@ -343,9 +342,11 @@ NETWORK_NAME = "mainnet"  # "mainnet" | "testnet" | "devnet"
 #   5019f38d570cfe... (2026-04-22 stale: minted on e3431b3, never
 #                      pinned because state_snapshot v11->v12 / new
 #                      witnessed-submission landed before pin commit)
+#   9458c6dbcbc185... (2026-04-22 stale: minted on 93c11e3, pinned but
+#                      state_snapshot v12->v14 landed during test cycle)
 _TESTNET_GENESIS_HASH: bytes | None = None
 _MAINNET_GENESIS_HASH: bytes | None = bytes.fromhex(
-    "9458c6dbcbc1850fa7320c64a004ee8a17c6418dfa1eed5bbdb16d9eac8b15ec"
+    "4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6"
 )
 
 

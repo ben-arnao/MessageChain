@@ -5,7 +5,7 @@ built to last centuries.
 
 **Status:** mainnet live since 2026-04-20. Chain ID `messagechain-v1`,
 genesis block 0
-`9458c6dbcbc1850fa7320c64a004ee8a17c6418dfa1eed5bbdb16d9eac8b15ec`.
+`4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
 
 ## Why
 
