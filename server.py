@@ -94,6 +94,49 @@ _ADMIN_RPC_METHODS = frozenset({
 })
 
 
+# ── RPC cost schedule ───────────────────────────────────────────────
+#
+# The rate limiter is a shared 300-token/min-per-IP budget
+# (max_requests=300, window=60s).  Before this wiring, EVERY method
+# charged 1 token: `submit_transaction` (WOTS+ verify, ~50ms CPU)
+# cost the same as `get_chain_info` (dict lookup, microseconds).
+# An attacker flooding submit_transaction burned real CPU at
+# negligible rate-limit cost.
+#
+# Two tiers (cheap, expensive) intentionally — three tiers adds
+# operator-facing tunable surface without a correspondingly clear
+# attack model.  Add RPC_COST_MEDIUM later if a specific handler
+# proves to need it, rather than pre-allocating knobs.
+#
+# With max_requests=300 and RPC_COST_EXPENSIVE=20, an attacker
+# flooding submit_transaction is rate-limited at 15 reqs/min
+# (300/20) instead of 300 — a 20x reduction in CPU burn before
+# the limiter kicks in.  Legitimate validator operations (stake,
+# rotate_key, etc.) are rare enough that 15/min per IP is plenty.
+RPC_COST_CHEAP = 1      # dict lookups, status queries, list endpoints
+RPC_COST_EXPENSIVE = 20  # WOTS+ verify, tx deserialize + validate
+
+# Method → cost.  Absent keys default to RPC_COST_CHEAP at dispatch
+# time (keeps the table focused on what's actually expensive).  Every
+# method whose body runs a WOTS+ signature verify — directly or via
+# a helper like `_queue_authority_tx` that calls `validate_*` under
+# the hood — belongs here.
+_RPC_METHOD_COST: dict[str, int] = {
+    # Direct WOTS+ verify + deserialize.
+    "submit_transaction": RPC_COST_EXPENSIVE,
+    "submit_transfer": RPC_COST_EXPENSIVE,
+    # Authority/stake/governance paths — all run WOTS+ verify.
+    "stake": RPC_COST_EXPENSIVE,
+    "unstake": RPC_COST_EXPENSIVE,
+    "submit_proposal": RPC_COST_EXPENSIVE,
+    "submit_vote": RPC_COST_EXPENSIVE,
+    "rotate_key": RPC_COST_EXPENSIVE,
+    "set_authority_key": RPC_COST_EXPENSIVE,
+    "emergency_revoke": RPC_COST_EXPENSIVE,
+    "set_receipt_subtree_root": RPC_COST_EXPENSIVE,
+}
+
+
 def _is_stale_tx_reason(reason: str) -> bool:
     """Classify a validate_transaction rejection as "stale" (peer's
     mempool view lags) vs "invalid" (peer is lying or buggy).
@@ -1182,7 +1225,14 @@ class Server(SharedRuntimeMixin):
             # Rate limit by client IP
             addr = writer.get_extra_info("peername")
             client_ip = addr[0] if addr else "unknown"
-            if not self.rpc_rate_limiter.check(client_ip):
+            # Outer connection-level check — explicit cost=1 so this
+            # gate catches cheap-request floods (300/min).  A second,
+            # method-specific cost is charged inside `_process_rpc`
+            # after the method name is known; expensive methods like
+            # submit_transaction charge RPC_COST_EXPENSIVE there so
+            # an attacker burning CPU on WOTS+ verify is rate-limited
+            # at ~15 reqs/min instead of ~300.
+            if not self.rpc_rate_limiter.check(client_ip, cost=RPC_COST_CHEAP):
                 resp = json.dumps({"ok": False, "error": "Rate limited"}).encode("utf-8")
                 writer.write(struct.pack(">I", len(resp)))
                 writer.write(resp)
@@ -1249,7 +1299,7 @@ class Server(SharedRuntimeMixin):
                     await writer.drain()
                     return
 
-            response = await self._process_rpc(request)
+            response = await self._process_rpc(request, client_ip=client_ip)
 
             resp_bytes = json.dumps(response).encode("utf-8")
             writer.write(struct.pack(">I", len(resp_bytes)))
@@ -1260,8 +1310,19 @@ class Server(SharedRuntimeMixin):
         finally:
             writer.close()
 
-    async def _process_rpc(self, request: dict) -> dict:
-        """Process a single RPC request from a client."""
+    async def _process_rpc(self, request: dict, client_ip: str = "") -> dict:
+        """Process a single RPC request from a client.
+
+        `client_ip` is the peer IP from the TCP connection.  When
+        present, we charge a method-specific cost against the rate
+        limiter (`_RPC_METHOD_COST`) BEFORE dispatching — so expensive
+        methods (WOTS+ verify) consume more of the per-IP budget than
+        cheap ones (dict lookups).  When empty (unit-test harnesses
+        that call `_process_rpc` directly without a socket), the
+        per-method charge is skipped — the outer `_handle_rpc_connection`
+        has no test coverage in those cases so there's nothing to
+        defend against.
+        """
         method = request.get("method", "")
         # Any method that reaches a `request["params"]`-style access below
         # would KeyError if `params` is missing, bubbling up to the outer
@@ -1270,6 +1331,25 @@ class Server(SharedRuntimeMixin):
         # clean structured error instead of a reset.
         if "params" not in request or not isinstance(request.get("params"), dict):
             request["params"] = {}
+
+        # Method-cost rate-limit gate.  Only applies when we have a
+        # real `client_ip` (production path).  The outer handler
+        # already charged RPC_COST_CHEAP=1; this adds `cost - 1` more
+        # tokens for expensive methods so a submit_transaction flood
+        # burns ~20 tokens/call instead of ~1.  We charge the FULL
+        # method cost here (not a delta) because each charge is an
+        # independent allow/deny decision — if the budget is at 299
+        # and the method costs 20, we want to reject cleanly rather
+        # than let the first token through and then get short.
+        if client_ip:
+            method_cost = _RPC_METHOD_COST.get(method, RPC_COST_CHEAP)
+            if method_cost > RPC_COST_CHEAP and not self.rpc_rate_limiter.check(
+                client_ip, cost=method_cost,
+            ):
+                return {
+                    "ok": False,
+                    "error": f"Rate limited: method '{method}' exceeds budget",
+                }
 
         if method == "submit_transaction":
             return self._rpc_submit_transaction(request["params"])
