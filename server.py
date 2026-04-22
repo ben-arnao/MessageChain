@@ -1040,11 +1040,27 @@ class Server(SharedRuntimeMixin):
         # messagechain/network/node.py).  None => ephemeral tempdir.
         self.data_dir = data_dir
 
+        # R12-#1: acquire an exclusive OS-level lock on data_dir BEFORE
+        # opening any keyfile / DB.  Two processes sharing a data_dir
+        # would both load the same WOTS+ keypair cache and sign
+        # different payloads at identical leaf indices — leaf reuse in
+        # a one-time-signature scheme leaks the private key outright
+        # (and for a validator, forks consensus).  The lock is held for
+        # the process lifetime; clean shutdown releases it in stop().
+        # Tests that legitimately spin up multiple servers on the same
+        # tempdir set MESSAGECHAIN_SKIP_DATA_DIR_LOCK=1.
+        self._data_dir_lock = None
+        if data_dir:
+            import os
+            os.makedirs(data_dir, exist_ok=True)
+            from messagechain.storage.data_dir_lock import DataDirLock
+            self._data_dir_lock = DataDirLock(data_dir)
+            self._data_dir_lock.__enter__()
+
         # Set up persistent storage if data_dir provided
         self.db = None
         if data_dir:
             import os
-            os.makedirs(data_dir, exist_ok=True)
             from messagechain.storage.chaindb import ChainDB
             db_path = os.path.join(data_dir, "chain.db")
             self.db = ChainDB(db_path)
@@ -1346,6 +1362,13 @@ class Server(SharedRuntimeMixin):
             self.anchor_store.save_anchors(anchors)
         if self.db:
             self.db.close()
+        # Release the data_dir lock LAST — after chaindb is closed and
+        # all keyfile writes have flushed.  Releasing earlier would
+        # open a window where a second starter could acquire the lock
+        # while our shutdown is still persisting state.
+        if self._data_dir_lock is not None:
+            self._data_dir_lock.__exit__(None, None, None)
+            self._data_dir_lock = None
 
     # ── RPC Handler (client interface) ──────────────────────────────
 

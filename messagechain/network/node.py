@@ -100,6 +100,21 @@ class Node(SharedRuntimeMixin):
         self.port = port
         self.seed_nodes = seed_nodes or SEED_NODES
         self.data_dir = data_dir
+
+        # R12-#1: acquire an exclusive OS-level lock on data_dir BEFORE
+        # any keyfile/DB access.  Two Node processes sharing a data_dir
+        # would both load the same WOTS+ keypair cache and sign at the
+        # same leaf index — one-time-signature leaf reuse leaks the
+        # private key outright and (for a validator) forks consensus.
+        # Held for process lifetime; released in stop().  Tests that
+        # share data_dirs set MESSAGECHAIN_SKIP_DATA_DIR_LOCK=1.
+        self._data_dir_lock = None
+        if data_dir is not None:
+            os.makedirs(data_dir, exist_ok=True)
+            from messagechain.storage.data_dir_lock import DataDirLock
+            self._data_dir_lock = DataDirLock(data_dir)
+            self._data_dir_lock.__enter__()
+
         self.blockchain = Blockchain(db=db)
         self.mempool = Mempool()
         # Dedicated mempool for archive-reward custody proofs — their
@@ -462,6 +477,12 @@ class Node(SharedRuntimeMixin):
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Release the data_dir lock LAST — after listeners close and
+        # anchor/keyfile writes flush.  Releasing earlier would open a
+        # window where a second starter could race our shutdown.
+        if self._data_dir_lock is not None:
+            self._data_dir_lock.__exit__(None, None, None)
+            self._data_dir_lock = None
 
     async def _handle_connection(self, reader, writer):
         """Handle an incoming peer connection.
