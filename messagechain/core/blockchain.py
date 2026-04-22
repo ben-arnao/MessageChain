@@ -469,6 +469,33 @@ class Blockchain:
             InclusionListProcessor()
         )
 
+        # Coverage-divergence inactivity-leak counter.  Per-attester
+        # consecutive count of inclusion-list cycles in which the
+        # attester's AttesterMempoolReports failed to cover at least
+        # one tx_hash that 2/3+ of stake reported.  Reset to 0 on any
+        # cycle in which the attester adequately reports.
+        #
+        # This is the per-attester equivalent of the chain-wide
+        # `blocks_since_last_finalization` counter that drives the
+        # finalization-based inactivity leak.  Defends against the
+        # 1/3-cartel selective-withholding attack: cartel attests to
+        # blocks normally (so the chain finalizes and the
+        # finalization-based leak doesn't trigger) but stays silent on
+        # AttesterMempoolReports for the censored txs, preventing any
+        # inclusion list from forming.  When ANY inclusion list does
+        # form (proving 2/3+ of stake saw the listed txs), validators
+        # whose reports lacked any listed tx accumulate misses here.
+        # Quadratic-in-misses penalty bleeds withholding stake until
+        # the cartel falls below the 1/3 threshold where their
+        # withholding matters.  See
+        # messagechain.consensus.inactivity.compute_coverage_penalty.
+        # Mutated only by `_apply_inclusion_list_coverage_leak` (which
+        # runs from `_apply_block_state` when a block carries a
+        # non-empty inclusion list).  Snapshot-serialised so two
+        # state-synced nodes reach identical burn outcomes when
+        # forward-replaying blocks past the snapshot height.
+        self.attester_coverage_misses: dict[bytes, int] = {}
+
         # Per-validator receipt-subtree root registry.  Receipts are
         # signed with a DIFFERENT WOTS+ subtree than block-signing;
         # every validator that wants to issue receipts registers the
@@ -1304,6 +1331,13 @@ class Blockchain:
                 )
             violations.add((bytes(compound[:32]), bytes(compound[32:])))
         self.inclusion_list_processor.processed_violations = violations
+
+        # Coverage-divergence leak per-attester miss counter — install
+        # the snapshot value verbatim.  Pre-v10 snapshots default to
+        # an empty dict (matches a fresh chain).
+        self.attester_coverage_misses = dict(
+            snap.get("attester_coverage_misses", {})
+        )
 
         # Rebuild the per-entity sparse Merkle tree from the installed
         # state so compute_current_state_root reflects the snapshot.
@@ -6676,6 +6710,20 @@ class Blockchain:
                         f"(stall={self.blocks_since_last_finalization} blocks)"
                     )
 
+        # Coverage-divergence leak — companion to the finalization-based
+        # leak above, defending the inclusion-list censorship lever
+        # against a 1/3-stake cartel that selectively withholds its
+        # AttesterMempoolReports.  Fires only when the block carries a
+        # non-empty inclusion list (an empty list provides no consensus
+        # signal about who saw what).  See
+        # `_apply_inclusion_list_coverage_leak` for the per-attester
+        # counter + quadratic-burn semantics.
+        block_lst = getattr(block, "inclusion_list", None)
+        if block_lst is not None and block_lst.entries:
+            self._apply_inclusion_list_coverage_leak(
+                block_lst, block_number=block.header.block_number,
+            )
+
         # Proof-of-custody archive rewards — redirect a fraction of
         # this block's fee-burn into the archive reward pool, and pay
         # rewards to any valid custody proofs against the challenge
@@ -6744,6 +6792,69 @@ class Blockchain:
             f"minted={self.supply.total_minted} - "
             f"burned={self.supply.total_burned}"
         )
+
+    def _apply_inclusion_list_coverage_leak(
+        self, inclusion_list, block_number: int | None = None,
+    ):
+        """Apply the coverage-divergence leak for one inclusion-list cycle.
+
+        Called from `_apply_block_state` when a block carries a
+        non-empty `inclusion_list`.  For every active-set attester:
+
+          * If their reports inside `inclusion_list.quorum_attestation`
+            cover ALL listed tx_hashes → their
+            `attester_coverage_misses` counter resets to 0.
+          * If their reports lack any listed tx_hash (or they did not
+            gossip a report at all) → their counter increments by 1.
+          * Once the counter exceeds COVERAGE_LEAK_ACTIVATION_MISSES,
+            burn `compute_coverage_penalty(stake, misses)` from their
+            stake (capped at current stake, never below 0).
+
+        The active set is "validators with stake > 0", mirroring the
+        finalization-based inactivity leak's `expected` set.
+        Validators outside the active set are ignored — they aren't
+        expected to attest.
+
+        Mutates: `self.attester_coverage_misses`, `self.supply.staked`,
+        `self.supply.total_supply`, `self.supply.total_burned`.
+
+        Block consensus invariant: any node replaying the same block
+        sequence MUST reach the same set of stake values.  The mutation
+        is deterministic (sorted iteration in
+        `apply_coverage_leak`) and the inputs (active set + list
+        contents) come from chain state + block payload, so two nodes
+        observing the same chain see identical leak outcomes.
+        """
+        from messagechain.consensus.inactivity import apply_coverage_leak
+
+        active = {
+            eid for eid, amt in self.supply.staked.items()
+            if amt > 0
+        }
+        # No active validators → nothing to update.  Edge case during
+        # genesis / pre-stake bootstrap when no one is staked yet.
+        if not active:
+            return
+
+        total_burned, deactivated = apply_coverage_leak(
+            staked=self.supply.staked,
+            misses_counter=self.attester_coverage_misses,
+            active_attesters=active,
+            inclusion_list=inclusion_list,
+            min_stake=VALIDATOR_MIN_STAKE,
+        )
+        if total_burned > 0:
+            self.supply.total_supply -= total_burned
+            self.supply.total_burned += total_burned
+            blk = (
+                f" block #{block_number}" if block_number is not None
+                else ""
+            )
+            logger.info(
+                f"COVERAGE LEAK:{blk} burned {total_burned} tokens "
+                f"from coverage-divergent attesters "
+                f"({len(deactivated)} deactivated)"
+            )
 
     def _apply_archive_rewards(self, block: Block):
         """Redirect fee-burn into archive pool + pay custody-proof rewards.
@@ -7798,6 +7909,12 @@ class Blockchain:
         # honest validators take a SECOND quadratic inactivity-leak
         # penalty for the same outage.
         self.blocks_since_last_finalization = 0
+        # Coverage-divergence leak counter — fully derived from forward
+        # block replay (each block with an inclusion_list invokes
+        # _apply_inclusion_list_coverage_leak which writes here).  Reset
+        # to empty so a reorg replay rebuilds from scratch instead of
+        # carrying over miss counts from an orphaned fork.
+        self.attester_coverage_misses = {}
 
         # Restore public keys with zero balances — balances rebuild from block replay
         for eid, pk in old_pks.items():
@@ -7904,6 +8021,13 @@ class Blockchain:
             # and re-applies blocks.
             "bootstrap_ratchet_max": self._bootstrap_ratchet.max_progress,
             "blocks_since_last_finalization": self.blocks_since_last_finalization,
+            # Coverage-divergence leak per-attester miss counter.  Reorg-
+            # safe: a rolled-back block whose inclusion list incremented
+            # or reset a counter must have its mutation reverted, or the
+            # canonical replay would compute different burn amounts at
+            # later inclusion-list cycles than peer nodes that never saw
+            # the orphaned block.
+            "attester_coverage_misses": dict(self.attester_coverage_misses),
             # Seed divestment snapshot: reorg-safe so the once-per-seed
             # initial-stake reference is not silently rebuilt from a
             # post-reorg stake value on replay.  Also persisted in the
@@ -8023,6 +8147,11 @@ class Blockchain:
             self._bootstrap_ratchet.observe(ratchet_value)
         self.blocks_since_last_finalization = snapshot.get(
             "blocks_since_last_finalization", 0,
+        )
+        # Coverage-divergence leak counter — default empty for pre-field
+        # snapshots (matches a freshly-built Blockchain).
+        self.attester_coverage_misses = dict(
+            snapshot.get("attester_coverage_misses", {}),
         )
         self.seed_initial_stakes = dict(
             snapshot.get("seed_initial_stakes", {})

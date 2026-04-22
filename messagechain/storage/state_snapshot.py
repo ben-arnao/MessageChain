@@ -144,7 +144,15 @@ from messagechain.config import (
 #     under _TAG_GLOBAL alongside other supply-level scalars
 #     (_GLOBAL_LOTTERY_PRIZE_POOL).  Binary layout: single u64
 #     appended after validator_archive_success_streak.
-STATE_SNAPSHOT_VERSION = 9  # wire format version for encode/decode
+# v10: added attester_coverage_misses — per-attester consecutive
+#      inclusion-list-cycle miss counter for the coverage-divergence
+#      leak (defense against 1/3-stake AttesterMempoolReport
+#      withholding cartels).  MUST participate in the snapshot root:
+#      a state-synced node that disagreed on the counter would burn
+#      a different amount on the next non-empty inclusion list and
+#      fork silently.  Binary layout: bytes→int dict appended after
+#      lottery_prize_pool.  Tag: _TAG_COVERAGE_MISSES.
+STATE_SNAPSHOT_VERSION = 10  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -222,6 +230,15 @@ _TAG_ARCHIVE_OPEN_SNAP = b"adsnap"   # optional open challenge epoch
 # v8: success-streak counter — per-validator count of consecutive
 # successful epochs, used by streak-based decay (iter 3c).
 _TAG_ARCHIVE_STREAK = b"adstreak"    # bytes→int success streak
+# v10: coverage-divergence leak miss counter — per-attester
+# consecutive count of inclusion-list cycles in which the attester's
+# AttesterMempoolReports failed to cover at least one tx_hash that
+# 2/3+ of stake reported.  Drives the quadratic stake leak in
+# `_apply_inclusion_list_coverage_leak`.  Must participate in the
+# snapshot root: two state-synced nodes that disagreed on the
+# counter would compute different burn amounts at the next
+# inclusion-list cycle and silently fork.  bytes→int dict.
+_TAG_COVERAGE_MISSES = b"covmiss"
 
 # Global-field keys — stable strings under _TAG_GLOBAL.
 _GLOBAL_TOTAL_SUPPLY = b"total_supply"
@@ -365,6 +382,13 @@ def serialize_state(blockchain) -> dict:
         # divestment window, ending at exactly 0 at the final firing.
         "lottery_prize_pool": int(
             getattr(blockchain.supply, "lottery_prize_pool", 0)
+        ),
+        # v10: per-attester coverage-divergence inactivity-leak miss
+        # counter.  bytes(entity_id) → int(consecutive_misses).  See
+        # Blockchain.attester_coverage_misses + the
+        # _apply_inclusion_list_coverage_leak hook for the lifecycle.
+        "attester_coverage_misses": dict(
+            getattr(blockchain, "attester_coverage_misses", {})
         ),
     }
 
@@ -706,6 +730,14 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_ARCHIVE_STREAK: _merkle(_entries_for_section(
             _TAG_ARCHIVE_STREAK,
             snap["validator_archive_success_streak"])),
+        # v10: coverage-divergence leak per-attester miss counter.
+        # Same consensus criticality as the streak counter above —
+        # disagreement here forks the next inclusion-list cycle.
+        # Default to empty so test fixtures that pre-date the field
+        # still hash to a stable value.
+        _TAG_COVERAGE_MISSES: _merkle(_entries_for_section(
+            _TAG_COVERAGE_MISSES,
+            snap.get("attester_coverage_misses", {}))),
         _TAG_GLOBAL: _merkle(_entries_for_section(
             _TAG_GLOBAL, {
                 _GLOBAL_TOTAL_SUPPLY: snap["total_supply"],
@@ -1012,6 +1044,10 @@ def encode_snapshot(snap: dict) -> bytes:
     # v8 blob is a strict prefix of a v9 blob through the end of
     # v8's final field.  Bounded above by total_supply → u64 ample.
     out += struct.pack(">Q", int(snap["lottery_prize_pool"]))
+    # v10: per-attester coverage-divergence leak miss counter
+    # (bytes→int dict).  Strictly appended after v9's lottery_prize_pool
+    # so a v9 blob is a strict prefix of a v10 blob.
+    out += _encode_bytes_int_dict(snap.get("attester_coverage_misses", {}))
     return bytes(out)
 
 
@@ -1096,6 +1132,9 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # check above rejects them.
     (lottery_prize_pool,) = struct.unpack_from(">Q", blob, off)
     off += 8
+    # v10+: per-attester coverage-divergence leak miss counter.
+    # Always present on v10+ blobs.
+    attester_coverage_misses, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1138,4 +1177,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
             validator_archive_success_streak
         ),
         "lottery_prize_pool": lottery_prize_pool,
+        "attester_coverage_misses": attester_coverage_misses,
     }
