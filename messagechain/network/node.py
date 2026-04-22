@@ -1864,7 +1864,21 @@ class Node(SharedRuntimeMixin):
         cust_proofs = []
         next_height = self.blockchain.height
         if is_archive_challenge_block(next_height):
-            cust_proofs = self.proof_pool.top_for_challenge(next_height)
+            # Iter 3g: fair proposer-side selection keyed by parent
+            # block's randao mix.  Replaces strict-FCFS ordering so a
+            # single proposer cannot systematically prefer their own
+            # cartel's proofs when the mempool has more proofs than
+            # the cap.  Deterministic across nodes with the same
+            # mempool + same parent randao.  Pairs with the payout-
+            # side shuffle from iter 3e.
+            parent_randao = (
+                self.blockchain.chain[-1].header.randao_mix
+                if self.blockchain.chain else b"\x00" * 32
+            )
+            cust_proofs = self.proof_pool.select_for_inclusion(
+                next_height,
+                selection_seed=parent_randao,
+            )
         block = self.blockchain.propose_block(
             self.consensus, self.entity, txs,
             slash_transactions=slash_txs,

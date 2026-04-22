@@ -177,10 +177,55 @@ class ArchiveProofMempool:
     ) -> list[CustodyProof]:
         """First `cap` FCFS proofs for a specific challenge.
 
-        Convenience wrapper around proofs_for_challenge that bakes in
-        the consensus cap.  Proposer integration calls this.
+        Legacy FCFS helper — kept for backward compat with callers
+        that haven't switched to `select_for_inclusion`.  Live-chain
+        proposers SHOULD use select_for_inclusion with the parent
+        block's randao_mix as seed to get the iter-3g fairness
+        guarantee.
         """
         return self.proofs_for_challenge(challenge_block_number)[:cap]
+
+    def select_for_inclusion(
+        self,
+        challenge_block_number: int,
+        *,
+        cap: int = ARCHIVE_PROOFS_PER_CHALLENGE,
+        selection_seed: "bytes | None" = None,
+    ) -> list[CustodyProof]:
+        """Select up to `cap` proofs for inclusion in a challenge block
+        via a DETERMINISTIC UNIFORM SHUFFLE keyed by `selection_seed`.
+
+        Iteration 3g: replaces FCFS-at-proposer-side with a fair
+        shuffle so a single proposer cannot systematically prefer
+        their own cartel's proofs over outsiders in the mempool.
+        Pairs with the 3e payout-side shuffle — the whole pipeline
+        is randomness-driven end-to-end.
+
+        Seed should be parent block's `randao_mix` (consensus-
+        deterministic, tamper-resistant, available to all nodes).
+        When `selection_seed` is None this function degrades to the
+        legacy FCFS order — retained for test helpers and startup
+        paths that run before any parent-block randao exists.
+        """
+        proofs = self.proofs_for_challenge(challenge_block_number)
+        if not proofs or cap <= 0:
+            return []
+        if selection_seed is None:
+            return proofs[:cap]
+
+        # Deterministic shuffle via seed-keyed sort over prover_id.
+        # Same primitive as apply_archive_rewards (iter 3e); every
+        # node reproduces the same ordering from the same seed.
+        import hashlib as _hashlib
+        from messagechain.config import HASH_ALGO as _HASH_ALGO
+
+        def _shuffle_key(p: CustodyProof) -> bytes:
+            return _hashlib.new(
+                _HASH_ALGO, bytes(selection_seed) + p.prover_id,
+            ).digest()
+
+        shuffled = sorted(proofs, key=_shuffle_key)
+        return shuffled[:cap]
 
     def __contains__(self, key: tuple[int, bytes]) -> bool:
         return key in self._entries
