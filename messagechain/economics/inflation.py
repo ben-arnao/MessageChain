@@ -34,6 +34,9 @@ from messagechain.config import (
     ATTESTER_REWARD_SPLIT_HEIGHT,
     ATTESTER_FEE_FUNDING_HEIGHT,
     ATTESTER_FEE_SHARE_BPS,
+    TARGET_CIRCULATING_SUPPLY_FLOOR,
+    DEFLATION_ISSUANCE_MULTIPLIER,
+    DEFLATION_FLOOR_HEIGHT,
 )
 
 
@@ -181,10 +184,33 @@ class SupplyTracker:
         Reward halves every HALVING_INTERVAL blocks. The floor is
         BLOCK_REWARD_FLOOR (not 1), keeping validation lucrative
         even after all halvings complete.
+
+        Supply-responsive issuance floor (hard fork at
+        DEFLATION_FLOOR_HEIGHT): when total_supply drops below
+        TARGET_CIRCULATING_SUPPLY_FLOOR, multiply the halvings-adjusted
+        reward by DEFLATION_ISSUANCE_MULTIPLIER (2x).  Applied AFTER
+        the BLOCK_REWARD_FLOOR clamp so the floor-era boost is
+        FLOOR * multiplier (= 8 at the current tuning).  Strictly-
+        less-than: supply == floor exactly means "recovered, no
+        boost".  Self-correcting — once supply recovers above the
+        floor the next block returns to the unboosted schedule.
+        Pre-activation: boost never applies; byte-for-byte identical
+        to the legacy reward curve.
+
+        Consensus-critical: this helper is the single source of
+        truth called by both the sim path (compute_post_state_root)
+        and the apply path (_apply_block_state / mint_block_reward),
+        so sim/apply stay in lockstep automatically.
         """
         halvings = block_height // HALVING_INTERVAL
         reward = BLOCK_REWARD >> halvings  # integer division by 2^halvings
-        return max(BLOCK_REWARD_FLOOR, reward)
+        reward = max(BLOCK_REWARD_FLOOR, reward)
+        if (
+            block_height >= DEFLATION_FLOOR_HEIGHT
+            and self.total_supply < TARGET_CIRCULATING_SUPPLY_FLOOR
+        ):
+            reward *= DEFLATION_ISSUANCE_MULTIPLIER
+        return reward
 
     def mint_block_reward(
         self,

@@ -2347,6 +2347,65 @@ ATTESTER_FEE_FUNDING_HEIGHT = 50_000
 # shares the same placeholder value.
 FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 50_000
 
+# ─────────────────────────────────────────────────────────────────────
+# Supply-responsive issuance floor (deflation anchor, hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Steady-state burn math under the shipped fixes is net-deflationary:
+# issuance at the BLOCK_REWARD_FLOOR era (~210K/yr) plus the finality
+# mint (~52K/yr) totals ~262K tokens/yr, while base-fee burn at
+# moderate traffic (~5 tx/block after the ATTESTER_FEE_FUNDING_HEIGHT
+# redirect) burns an order of magnitude more.  Net of other minor
+# burns (new-account, slashing, seed divestment residuals) the chain
+# loses roughly 10–15M tokens/year.  Over decades this drives
+# circulating supply toward dangerously thin totals — at <~50M the
+# per-token impact of every economic event becomes unwieldy and the
+# security-incentive surface thins out.
+#
+# Fix (anchor, not cure): when `total_supply` drops below
+# TARGET_CIRCULATING_SUPPLY_FLOOR, double the issuance-side block
+# reward until supply recovers.  Self-correcting — above the floor
+# the multiplier snaps back to 1x.  Bounded — capped at 2x even if
+# burn pathology continues, so an implementation bug cannot produce
+# runaway inflation.  This does NOT prevent deflation (burn can
+# still exceed boosted issuance), but meaningfully slows it at low
+# supply.  A full deflation fix would require fee-responsive
+# issuance, which is deliberately deferred — the anchor is the
+# simple, auditable long-term guard.
+#
+# At/after block_height == DEFLATION_FLOOR_HEIGHT:
+#   * If supply < TARGET_CIRCULATING_SUPPLY_FLOOR at reward-compute
+#     time, the halvings-adjusted reward is multiplied by
+#     DEFLATION_ISSUANCE_MULTIPLIER (2x) AFTER the BLOCK_REWARD_FLOOR
+#     clamp.  Post-floor era that's 4 × 2 = 8 tokens/block.
+#   * If supply >= floor, no boost.  Strictly-less-than: the boundary
+#     value (supply == floor exactly) is "recovered, don't boost".
+#
+# Pre-activation: boost never applies regardless of supply.
+# Byte-for-byte legacy reward behavior preserved.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  The height
+# is independent of other *_HEIGHT forks even though it shares the
+# same placeholder value.
+
+# Deflation floor: when circulating supply drops below this, issuance
+# doubles until supply recovers.  Conservative target (71% of genesis)
+# preserves deflationary dynamics while capping the worst-case
+# extinction trajectory.  Not a full deflation fix — that would
+# require fee-responsive issuance — but a meaningful long-term anchor.
+TARGET_CIRCULATING_SUPPLY_FLOOR = 100_000_000
+
+# When supply is below the floor, multiply BLOCK_REWARD by this.
+# Capped at 2x to prevent runaway inflation if burn pathology bugs
+# out.  Chosen as a round, conservative number — a 4x boost might
+# fix deflation faster but risks overcorrection during data-anomaly
+# scenarios.
+DEFLATION_ISSUANCE_MULTIPLIER = 2
+
+# Activation — operators must replace with a concrete coordinated
+# height before deploy.
+DEFLATION_FLOOR_HEIGHT = 50_000
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
