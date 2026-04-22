@@ -737,11 +737,14 @@ class TestSnapshotWireRoundTrip(unittest.TestCase):
             sorted(entries),
         )
 
-    def test_wire_version_bumped_to_11(self):
+    def test_wire_version_at_least_11(self):
         # Originally bumped to v10, but the concurrent coverage-misses
         # fork also claimed v10 — this fork was promoted to v11 at
-        # merge time.
-        self.assertEqual(STATE_SNAPSHOT_VERSION, 11)
+        # merge time.  Subsequent forks may have bumped further
+        # (e.g. v12 widened inclusion_list_processed_violations
+        # entries to 96 bytes), so the treasury-cap-tightening fork
+        # only requires the floor is still v11 or higher.
+        self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 11)
 
 
 if __name__ == "__main__":

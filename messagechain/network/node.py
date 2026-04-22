@@ -1429,9 +1429,18 @@ class Node(SharedRuntimeMixin):
             )
             return
 
-        # Validate the slash transaction
+        # Validate the slash transaction.  Parity with the attestation
+        # handler's on-invalid-sig branch: a semantically-invalid slash
+        # from a relayer is a protocol violation — without scoring,
+        # a flooding peer can pay zero ban score by sending well-formed
+        # but invalid slashes indefinitely (the deserialize path above
+        # already scores, so dropping here left an asymmetry).
         valid, reason = self.blockchain.validate_slash_transaction(slash_tx)
         if not valid:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION,
+                f"invalid_slash_evidence:{reason}",
+            )
             logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
             return
 
