@@ -289,6 +289,12 @@ class TestPayout(unittest.TestCase):
             )
             for i in range(N)
         ]
+        # Iter 3h: provers must be registered on-chain before they
+        # can collect archive rewards.  The test stages this directly
+        # by inserting pubkeys; production callers would register via
+        # a normal transfer.
+        for e in provers_entities:
+            chain.public_keys[e.entity_id] = e.keypair.public_key
         proofs = [
             build_custody_proof(
                 entity=e,
