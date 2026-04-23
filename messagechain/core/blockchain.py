@@ -25,7 +25,7 @@ from messagechain.config import (
     MAX_BLOCK_SIG_COST, COINBASE_MATURITY, MTP_BLOCK_COUNT,
     DUST_LIMIT, MAX_ORPHAN_BLOCKS, MAX_ORPHAN_BLOCKS_PER_PEER,
     ORPHAN_MAX_AGE_BLOCKS, ASSUME_VALID_BLOCK_HASH,
-    MIN_FEE, MAX_TIMESTAMP_DRIFT, KEY_ROTATION_FEE,
+    MIN_FEE, MAX_TIMESTAMP_DRIFT, MAX_BLOCK_FUTURE_DRIFT, KEY_ROTATION_FEE,
     KEY_ROTATION_COOLDOWN_BLOCKS, BASE_FEE_INITIAL,
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
     EVIDENCE_INCLUSION_WINDOW, EVIDENCE_EXPIRY_BLOCKS,
@@ -5399,8 +5399,14 @@ class Blockchain:
         if block.header.timestamp <= mtp:
             return False, f"Block timestamp {block.header.timestamp} must exceed median time past {mtp}"
 
-        # L1: Reject blocks with timestamps too far in the future (BTC: 2 hours)
-        max_future = _time.time() + 7200
+        # Reject blocks with timestamps too far in the future.  Bitcoin
+        # uses 2 hours to absorb PoW's bursty inter-block gaps; PoS with
+        # deterministic ~10-minute slots doesn't need that slack, and
+        # the wider the window the more slots a colluding proposer can
+        # lock honest validators out of via future-dated parents (every
+        # subsequent block must have timestamp > parent.timestamp).
+        # See config.MAX_BLOCK_FUTURE_DRIFT for the rationale.
+        max_future = _time.time() + MAX_BLOCK_FUTURE_DRIFT
         if block.header.timestamp > max_future:
             return False, f"Block timestamp {block.header.timestamp} too far in the future"
 
@@ -6419,10 +6425,12 @@ class Blockchain:
                     f"(max {MAX_TXS_PER_ENTITY_PER_BLOCK})"
                 )
 
-        # Timestamp checks
+        # Timestamp checks.  Future-drift bound mirrors the validate_block
+        # path; see config.MAX_BLOCK_FUTURE_DRIFT for why we tightened
+        # from Bitcoin's 2-hour window to a slot-proportional bound.
         if block.header.timestamp <= parent.header.timestamp:
             return False, "Block timestamp must exceed parent timestamp"
-        max_future = _time.time() + 7200
+        max_future = _time.time() + MAX_BLOCK_FUTURE_DRIFT
         if block.header.timestamp > max_future:
             return False, "Block timestamp too far in the future"
 

@@ -299,12 +299,26 @@ class ProofOfStake:
         else:
             snapshot_root = b"\x00" * 32
 
+        # Clamp against parent.timestamp so an honest proposer with a
+        # wall clock that trails the parent's header (e.g., the previous
+        # proposer's clock ran ahead, or the NTP sync on this host is
+        # late) still emits a block that passes
+        # `block.header.timestamp > parent.header.timestamp`.  Without
+        # this floor, a single future-dated parent can deny every
+        # subsequent honest slot until wall clock catches up.  Callers
+        # passing an explicit timestamp (tests / special harnesses) keep
+        # their exact value so negative-path tests can still construct
+        # invalid blocks on purpose.
+        if timestamp is None:
+            chosen_ts = max(time.time(), prev_block.header.timestamp + 1)
+        else:
+            chosen_ts = timestamp
         header = BlockHeader(
             version=1,
             block_number=prev_block.header.block_number + 1,
             prev_hash=prev_block.block_hash,
             merkle_root=merkle_root,
-            timestamp=time.time() if timestamp is None else timestamp,
+            timestamp=chosen_ts,
             proposer_id=proposer_entity.entity_id,
             state_root=state_root,
             mempool_snapshot_root=snapshot_root,

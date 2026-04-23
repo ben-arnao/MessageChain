@@ -528,6 +528,19 @@ MIN_TIP = 1                          # minimum priority tip to proposer
 # Timestamp tolerance
 MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current time
 
+# Max seconds a BLOCK header's timestamp may be ahead of wall clock.
+# Bitcoin's 7200 s (2 hours) is calibrated for PoW's bursty inter-block
+# gaps; MessageChain is deterministic PoS with ~10-minute slots, so the
+# window can be much tighter.  At a 2-hour bound a colluding proposer
+# can stamp `time.time() + 7200` and — because every subsequent block
+# must have `timestamp > parent.timestamp` (see validate_block /
+# validate_block_standalone) — lock every honest proposer out of their
+# slot until wall clock catches up, systematically denying honest blocks
+# to propagate.  120 s is twice the tx drift bound and a small multiple
+# of a reasonable NTP error; anything beyond is either a broken clock
+# or an adversary abusing the window.
+MAX_BLOCK_FUTURE_DRIFT = 120
+
 # Block parameters
 #
 # BLOCK_TIME_TARGET: seconds between blocks (10 min, same as BTC — speed is
@@ -537,11 +550,13 @@ MAX_TIMESTAMP_DRIFT = 60  # max seconds a tx timestamp can be ahead of current t
 BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_TARGET", 600)
 # Cap on how many fallback rounds a block's claimed timestamp can imply
 # past the parent.  Block round is computed as
-# int((block.ts - parent.ts - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET),
-# and at our 2-hour future-drift bound a malicious proposer could otherwise
-# claim round 11 to skip the honest round-0 proposer.  Five fallback rounds
-# covers legitimate missed-slot scenarios with margin; anything beyond is
-# network pathology or abuse.
+# int((block.ts - parent.ts - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET).
+# Even after tightening MAX_BLOCK_FUTURE_DRIFT to 120 s, a malicious
+# proposer can still inflate the implied round count by picking a
+# parent.ts well below current wall clock; the explicit round cap keeps
+# slot-rotation grinding bounded regardless of future-drift tolerance.
+# Five fallback rounds covers legitimate missed-slot scenarios with
+# margin; anything beyond is network pathology or abuse.
 MAX_PROPOSER_FALLBACK_ROUNDS = 5
 # Cap on concurrently-active governance proposals.  Without this, an
 # attacker willing to pay PROPOSAL_FEE per proposal can spin up enough

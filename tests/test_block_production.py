@@ -363,6 +363,7 @@ class TestStrictProposerValidation(unittest.TestCase):
 
     def test_on_time_timestamp_accepted_with_enforcement_on(self):
         """Block timestamped at parent + BLOCK_TIME_TARGET must be accepted."""
+        from unittest.mock import patch
         original = messagechain.config.ENFORCE_SLOT_TIMING
         try:
             messagechain.config.ENFORCE_SLOT_TIMING = True
@@ -370,13 +371,24 @@ class TestStrictProposerValidation(unittest.TestCase):
             latest = chain.get_latest_block()
             proposer = entities[0]
 
-            block = consensus.create_block(
-                proposer, [], latest,
-                state_root=chain.compute_post_state_root([], proposer.entity_id, 1),
-                timestamp=latest.header.timestamp + BLOCK_TIME_TARGET + 1,
-            )
-            ok, reason = chain.add_block(block)
-            self.assertTrue(ok, reason)
+            # Simulate wall clock advancing past the slot boundary.  With
+            # the tightened MAX_BLOCK_FUTURE_DRIFT (120s), a block that
+            # claims ts = parent + BLOCK_TIME_TARGET + 1 is only valid if
+            # real wall clock has also advanced — mirrors live-node
+            # behavior where the proposer waits for its slot to open.
+            simulated_now = latest.header.timestamp + BLOCK_TIME_TARGET + 1
+            with patch("time.time", return_value=simulated_now), \
+                 patch(
+                     "messagechain.core.blockchain._time.time",
+                     return_value=simulated_now,
+                 ):
+                block = consensus.create_block(
+                    proposer, [], latest,
+                    state_root=chain.compute_post_state_root([], proposer.entity_id, 1),
+                    timestamp=simulated_now,
+                )
+                ok, reason = chain.add_block(block)
+                self.assertTrue(ok, reason)
         finally:
             messagechain.config.ENFORCE_SLOT_TIMING = original
 
