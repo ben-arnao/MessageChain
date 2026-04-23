@@ -174,6 +174,32 @@ class ChainDB:
                 public_key BLOB NOT NULL
             );
 
+            -- Per-entity public-key rotation history.  Append-only log
+            -- of (installed_at, public_key) tuples: one entry per
+            -- first-spend install + one per key rotation.  Used by
+            -- `validate_slash_transaction` to look up the
+            -- PRE-rotation pubkey an equivocation was signed under, so
+            -- a validator that equivocates at height M and then
+            -- rotates at height N > M can still be slashed with
+            -- evidence signed by the old key.  Consensus-critical:
+            -- without persistence, cold-restart empties the history,
+            -- `_public_key_at_height` falls back to the CURRENT
+            -- (post-rotation) pubkey, WOTS+ verify against old-key-
+            -- signed evidence fails, and the restarted node rejects
+            -- a slash block uprestarted peers accept — state_root
+            -- divergence + silent slash evasion.  Composite PK allows
+            -- multiple rotations for the same entity at distinct
+            -- heights; repeated installs at the exact same height are
+            -- a no-op under INSERT OR REPLACE (replay fidelity with
+            -- the in-memory list, where duplicates at the same height
+            -- are tolerated but not deduped).
+            CREATE TABLE IF NOT EXISTS key_history (
+                entity_id BLOB NOT NULL,
+                installed_at INTEGER NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (entity_id, installed_at)
+            );
+
             CREATE TABLE IF NOT EXISTS message_counts (
                 entity_id BLOB PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
@@ -682,6 +708,71 @@ class ChainDB:
     def get_all_public_keys(self) -> dict[bytes, bytes]:
         cur = self._conn.execute("SELECT entity_id, public_key FROM public_keys")
         return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
+
+    # ── State: Key Rotation History ──────────────────────────────
+    # Append-only audit log of every public-key install for every
+    # entity.  Must stay in lockstep with
+    # `Blockchain.key_history` — every `_record_key_history` call on
+    # the Blockchain side must mirror into `add_key_history_entry`
+    # here, and the full dict is rehydrated on cold start via
+    # `get_all_key_history()`.  See the `key_history` table comment
+    # in the schema block for the slash-evasion / consensus-divergence
+    # rationale.
+
+    def add_key_history_entry(
+        self, entity_id: bytes, installed_at: int, public_key: bytes,
+    ) -> None:
+        """Persist one (entity_id, installed_at) → public_key entry.
+
+        INSERT OR REPLACE mirrors the in-memory list's behaviour:
+        the Blockchain side deliberately does not guard against
+        duplicate inserts at the same height (replay fidelity is
+        more important than deduplication), so repeated calls at the
+        same height overwrite rather than error.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO key_history "
+            "(entity_id, installed_at, public_key) VALUES (?, ?, ?)",
+            (entity_id, int(installed_at), public_key),
+        )
+        self._maybe_commit()
+
+    def clear_key_history(self, entity_id: bytes) -> None:
+        """Delete every key_history row for an entity.
+
+        Used by the reorg-rollback path: when a replay re-applies
+        installs from genesis forward, the DB rows from the old
+        history must be cleared first so the replay doesn't leave
+        stale (height, pubkey) pairs that a later
+        `_public_key_at_height` lookup could incorrectly resolve to.
+        """
+        self._conn.execute(
+            "DELETE FROM key_history WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_key_history(
+        self,
+    ) -> dict[bytes, list[tuple[int, bytes]]]:
+        """Rehydrate the full key_history map on cold start.
+
+        Returns ``{entity_id: [(installed_at, public_key), ...]}``
+        with entries ordered ascending by ``installed_at`` so
+        `_public_key_at_height` can walk them in forward-order (the
+        same shape the in-memory list holds after a linear replay).
+        """
+        cur = self._conn.execute(
+            "SELECT entity_id, installed_at, public_key "
+            "FROM key_history "
+            "ORDER BY entity_id, installed_at",
+        )
+        out: dict[bytes, list[tuple[int, bytes]]] = {}
+        for eid, installed_at, public_key in cur.fetchall():
+            out.setdefault(bytes(eid), []).append(
+                (int(installed_at), bytes(public_key)),
+            )
+        return out
 
     # ── State: Entity Index Registry (bloat reduction) ──────────
 
@@ -1245,6 +1336,13 @@ class ChainDB:
             # reorg-and-restore silently clears the queue and diverges
             # consensus at the next `process_pending_unstakes`.
             "pending_unstakes": self.get_all_pending_unstakes(),
+            # key_history must round-trip with public_keys: a reorg
+            # that rolls past a key-rotation block has to restore
+            # the pre-rotation entry so post-reorg slash-evidence
+            # lookups at pre-rotation heights still resolve to the
+            # correct pubkey.  See the `key_history` table comment
+            # in the schema block for the full consensus rationale.
+            "key_history": self.get_all_key_history(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1272,6 +1370,13 @@ class ChainDB:
             # that we just wiped — restore them alongside so the
             # validator unbonding queue reflects the ancestor state.
             conn.execute("DELETE FROM pending_unstakes")
+            # key_history must roll back with public_keys: a
+            # SetAuthorityKey / KeyRotation / first-spend install
+            # on the losing fork must have its history entry
+            # reverted, or post-reorg `_public_key_at_height`
+            # lookups would resolve to a key the canonical chain
+            # never installed.
+            conn.execute("DELETE FROM key_history")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -1299,6 +1404,14 @@ class ChainDB:
                         "(entity_id, release_block, amount) "
                         "VALUES (?, ?, ?)",
                         (eid, int(release_block), int(amount)),
+                    )
+            for eid, entries in snapshot.get("key_history", {}).items():
+                for installed_at, public_key in entries:
+                    conn.execute(
+                        "INSERT INTO key_history "
+                        "(entity_id, installed_at, public_key) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(installed_at), public_key),
                     )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))

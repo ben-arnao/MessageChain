@@ -683,6 +683,18 @@ class Blockchain:
         self.public_keys = self.db.get_all_public_keys()
         self.nonces = self.db.get_all_nonces()
         self.entity_message_count = self.db.get_all_message_counts()
+        # Rehydrate the per-entity key-rotation history.  Slash-
+        # evidence verification at validate_slash_transaction uses
+        # ``_public_key_at_height(evidence_height)`` to fetch the
+        # pubkey active at the evidence height; without the history
+        # the cold-booted node falls back to the CURRENT pubkey and
+        # pre-rotation evidence fails WOTS+ verify, letting a
+        # rotate-then-restart offender escape slashing on any peer
+        # that has cold-booted since the rotation.  ``hasattr`` gate
+        # keeps legacy chain.db files (pre-key_history-table) loadable
+        # under the new binary.
+        if hasattr(self.db, "get_all_key_history"):
+            self.key_history = self.db.get_all_key_history()
 
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
@@ -2515,10 +2527,26 @@ class Blockchain:
         height forward.  We do not guard against duplicate entries at
         the same height — replay fidelity is more important than
         deduplication.
+
+        Mirrored into the `key_history` chaindb table so a cold
+        restart (which does NOT replay blocks — ``_load_from_db``
+        reads persisted tables directly) still has the pre-rotation
+        pubkey available for ``_public_key_at_height`` lookups during
+        slash-evidence verification.  Without the mirror, a validator
+        that rotates keys after equivocating can escape slashing on
+        any peer that has restarted since the rotation, because the
+        cold-booted peer falls back to the CURRENT pubkey and the
+        pre-rotation evidence signature fails to verify — plus the
+        restarted peer would reject the slash block an uprestarted
+        peer accepts, producing a state_root divergence.
         """
         self.key_history.setdefault(entity_id, []).append(
             (self.height, public_key),
         )
+        if self.db is not None and hasattr(self.db, "add_key_history_entry"):
+            self.db.add_key_history_entry(
+                entity_id, self.height, public_key,
+            )
 
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
@@ -9215,8 +9243,14 @@ class Blockchain:
         # which is a deliberate trade-off: cheap, doesn't require a DB
         # schema change, and restart timing isn't attacker-controllable.
         self.key_rotation_last_height = {}
-        # R6-A: key_history is in-memory state that replay rebuilds
-        # via _record_key_history at every install / rotation site.
+        # R6-A: key_history is state that the REORG replay rebuilds
+        # via _record_key_history at every install / rotation site
+        # (this _reset_state is followed by `for blk in self.chain:
+        # _apply_block_state(blk)` forward-walking every install).
+        # For the COLD-START path, replay does NOT run — rehydration
+        # comes from the `key_history` chaindb table via
+        # `_load_from_db`; every `_record_key_history` call mirrors
+        # into that table when a db handle is attached.
         self.key_history = {}
         self.public_keys = {}
         # slashed_validators is deliberately NOT cleared here — it is a
