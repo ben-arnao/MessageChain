@@ -28,9 +28,11 @@ L2 protocols can layer identity verification, reputation, and trust on top.
 
 import hashlib
 from dataclasses import dataclass
-from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
+from messagechain.config import (
+    HASH_ALGO, MERKLE_TREE_HEIGHT, IDENTITY_HASH_VERSION,
+)
 from messagechain.crypto.keys import KeyPair
-from messagechain.crypto.hashing import default_hash
+from messagechain.crypto.hashing import default_hash, hash_v
 
 # Minimum private key length in bytes. Matches 256-bit security expected for
 # a 32-byte SHA3-256 seed. Private keys with less entropy than this are
@@ -53,9 +55,16 @@ def derive_entity_id(public_key: bytes) -> bytes:
 
     Domain-separated from the signing seed so that knowing the entity ID
     reveals nothing about the signing key.
+
+    Hash is PINNED to ``IDENTITY_HASH_VERSION`` (never ``default_hash``)
+    so a future governance-driven bump of ``HASH_VERSION_CURRENT`` does
+    NOT silently reassign every existing account's entity_id.  Identity
+    is the one namespace that must stay byte-stable across every hash
+    rotation for the full 100–1000 year chain lifetime.  See
+    ``config.IDENTITY_HASH_VERSION`` for the migration-policy rationale.
     """
     combined = _DOMAIN_ENTITY_ID + public_key
-    return default_hash(combined)
+    return hash_v(combined, IDENTITY_HASH_VERSION)
 
 
 def _derive_signing_seed(private_key: bytes) -> bytes:
@@ -67,9 +76,16 @@ def _derive_signing_seed(private_key: bytes) -> bytes:
 
     Domain-separated from the entity ID so that knowing the public entity ID
     reveals nothing about this seed.
+
+    Hash is PINNED to ``IDENTITY_HASH_VERSION`` (never ``default_hash``).
+    If a bumped ``HASH_VERSION_CURRENT`` changed this output, the same
+    private key would produce a DIFFERENT signing seed, which would
+    produce a different keypair, and the user would no longer sign for
+    their own on-chain identity — a silent full-account wipe on every
+    hash rotation.  See ``derive_entity_id`` + ``IDENTITY_HASH_VERSION``.
     """
     combined = _DOMAIN_SIGNING_SEED + private_key
-    return default_hash(combined)
+    return hash_v(combined, IDENTITY_HASH_VERSION)
 
 
 @dataclass

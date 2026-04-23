@@ -137,6 +137,39 @@ HASH_ALGO = "sha3_256"
 HASH_VERSION_SHA256 = 1
 HASH_VERSION_CURRENT = HASH_VERSION_SHA256
 
+# Identity-derivation hash version — frozen at genesis and NEVER rotated.
+#
+# `derive_entity_id(pubkey)` and `_derive_signing_seed(privkey)` in
+# messagechain.identity.identity both need to return the exact same
+# bytes every time they are called over the ENTIRE lifetime of the
+# chain, because:
+#
+#   * A user's on-chain balance is keyed by the entity_id that
+#     `derive_entity_id` produced the first time they transferred.  If
+#     the function ever returns a different hash for the same public
+#     key, the user's wallet address silently changes and their funds
+#     are orphaned at an unreproducible address.
+#   * A user's keypair is re-derived from their private key every time
+#     they sign.  If `_derive_signing_seed` ever returns a different
+#     seed for the same private key, the recomputed WOTS+ keypair has
+#     a different public key than the one recorded on chain, so the
+#     user can no longer sign for their own account.
+#
+# Binding those derivations to `HASH_VERSION_CURRENT` (the ACTIVE hash
+# version, which governance is designed to rotate over the 100–1000
+# year horizon) would guarantee a full account wipe on the first
+# rotation — the exact failure mode the crypto-agility story exists to
+# prevent.  Pin a SEPARATE "identity hash version" register here that
+# NEVER rotates, so the on-chain identity namespace is immortal.
+#
+# If SHA3-256 is ever broken, we do NOT change this constant.  We ship
+# a migration tx type that lets a user SIGN (under the still-valid
+# signing primitive of the day) a "rebind from old_entity_id to
+# new_entity_id" instruction, moving their balance to the new
+# identity namespace under the new hash.  That keeps the namespace
+# change user-consented, not silent.
+IDENTITY_HASH_VERSION = HASH_VERSION_SHA256
+
 SIG_VERSION_WOTS_W16_K64 = 1      # WOTS W=16 chains=64 merkle h=20.
                                   # NOTE: checksum encoding in this version
                                   # truncates to always-zero — see V2 below.
@@ -434,7 +467,16 @@ import hashlib as _hashlib
 # genesis ID the live chain has already committed to; a future hash
 # migration cannot change it even in principle.  See
 # tests/test_hash_dispatch.py ALLOWED_DIRECT_USES.
-TREASURY_ENTITY_ID = _hashlib.new(HASH_ALGO, b"messagechain-treasury-v1").digest()
+#
+# HASH LITERAL pinning: the hash family is spelled out as a bare
+# string ("sha3_256"), NOT the ``HASH_ALGO`` constant, so a future PR
+# that updates ``HASH_ALGO`` to track a rotated hash family cannot
+# silently move TREASURY_ENTITY_ID to a different 32-byte address.
+# Any relocation of the treasury address MUST be an explicit edit to
+# this line accompanied by an explicit governance migration — the
+# treasury holds 40M tokens and a silent address change orphans all
+# of them.
+TREASURY_ENTITY_ID = _hashlib.new("sha3_256", b"messagechain-treasury-v1").digest()
 TREASURY_ALLOCATION = 40_000_000  # ~28.6% of genesis supply (40M / 140M)
 
 # Default genesis allocation table: genesis validator + treasury.
