@@ -190,6 +190,10 @@ def build_parser() -> argparse.ArgumentParser:
     stake.add_argument("--amount", type=int, required=True, help="Amount to stake")
     stake.add_argument("--fee", type=int, default=None, help="Transaction fee")
     stake.add_argument("--server", type=str, default=None, help="Server address host:port")
+    stake.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- unstake ---
     unstake = sub.add_parser(
@@ -200,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     unstake.add_argument("--amount", type=int, required=True, help="Amount to unstake")
     unstake.add_argument("--fee", type=int, default=None, help="Transaction fee")
     unstake.add_argument("--server", type=str, default=None, help="Server address host:port")
+    unstake.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- bootstrap-seed ---
     bootstrap = sub.add_parser(
@@ -251,6 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     set_auth.add_argument("--fee", type=int, default=None, help="Transaction fee")
     set_auth.add_argument("--server", type=str, default=None, help="Server address host:port")
+    set_auth.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- rotate-key ---
     rotate = sub.add_parser(
@@ -266,6 +278,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rotate.add_argument("--fee", type=int, default=None, help="Rotation fee")
     rotate.add_argument("--server", type=str, default=None, help="Server address host:port")
+    rotate.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- key-status ---
     key_status = sub.add_parser(
@@ -294,6 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     revoke.add_argument("--fee", type=int, default=None, help="Transaction fee")
     revoke.add_argument("--server", type=str, default=None, help="Server address host:port")
+    revoke.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- propose ---
     propose = sub.add_parser(
@@ -877,9 +897,6 @@ def _collect_private_key():
         print("\nError: Checksum failed.")
         print("This usually means you mistyped a word or character from your backup.")
         print("Double-check each word/character and try again.")
-        sys.exit(1)
-    except InvalidKeyFormatError as e:
-        print(f"\nError: {e}")
         sys.exit(1)
     except InvalidKeyFormatError as e:
         print(f"\nError: {e}")
@@ -1491,10 +1508,25 @@ def cmd_stake(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 1
+    # Default fee: post-flat floor is the safe choice pre- and post-
+    # activation (MIN_FEE=100 pre, MIN_FEE_POST_FLAT=1000 post).  The
+    # previous default of 1 was below BOTH floors and got on-chain-
+    # rejected for underpriced whenever --fee was omitted.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
+
+    if not getattr(args, "yes", False):
+        print(f"\nAbout to stake:")
+        print(f"  Amount:  {args.amount} tokens")
+        print(f"  Fee:     {fee} tokens")
+        print(f"  Entity:  {entity.entity_id_hex[:16]}...{entity.entity_id_hex[-8:]} (self)")
+        confirm = input("\nConfirm stake (type 'yes' to proceed): ").strip().lower()
+        if confirm != "yes":
+            print("Stake cancelled.")
+            sys.exit(0)
 
     response = rpc_call(host, port, "stake", {
         "transaction": tx.serialize(),
@@ -1537,10 +1569,27 @@ def cmd_unstake(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 1
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    # See cmd_stake for rationale — 1 was below both MIN_FEE floors.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")
+
+    if not getattr(args, "yes", False):
+        print(f"\nAbout to unstake:")
+        print(f"  Amount:  {args.amount} tokens")
+        print(f"  Fee:     {fee} tokens")
+        print(f"  Entity:  {entity.entity_id_hex[:16]}...{entity.entity_id_hex[-8:]} (self)")
+        print(
+            "  Warning: unstaked funds enter a 7-day UNBONDING_PERIOD "
+            "before they return to your balance."
+        )
+        confirm = input("\nConfirm unstake (type 'yes' to proceed): ").strip().lower()
+        if confirm != "yes":
+            print("Unstake cancelled.")
+            sys.exit(0)
 
     response = rpc_call(host, port, "unstake", {
         "transaction": tx.serialize(),
@@ -1728,10 +1777,30 @@ def cmd_set_authority_key(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 500
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_set_authority_key_transaction(
         entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee,
     )
+
+    if not getattr(args, "yes", False):
+        ak_hex = authority_pubkey.hex()
+        ak_short = f"{ak_hex[:16]}...{ak_hex[-8:]}"
+        print(f"\nAbout to set authority key:")
+        print(f"  New authority pubkey: {ak_short}")
+        print(f"  (full: {ak_hex})")
+        print(f"  Fee:                  {fee} tokens")
+        print(
+            "  This will lock future revoke/unstake authority to the new "
+            "key; irreversible."
+        )
+        confirm = input(
+            "\nConfirm set-authority-key (type 'yes' to proceed): "
+        ).strip().lower()
+        if confirm != "yes":
+            print("Set-authority-key cancelled.")
+            sys.exit(0)
 
     response = rpc_call(host, port, "set_authority_key", {
         "transaction": tx.serialize(),
@@ -1791,6 +1860,25 @@ def cmd_rotate_key(args):
     rot_tx = create_key_rotation(
         entity, new_kp, rotation_number=current_rotation, fee=fee,
     )
+
+    if not getattr(args, "yes", False):
+        new_pk_hex = new_kp.public_key.hex()
+        new_pk_short = f"{new_pk_hex[:16]}...{new_pk_hex[-8:]}"
+        print(f"\nAbout to rotate key:")
+        print(f"  New public key: {new_pk_short}")
+        print(f"  (full: {new_pk_hex})")
+        print(f"  Rotation #:     {current_rotation}")
+        print(f"  Fee:            {fee} tokens")
+        print(
+            "  The OLD Merkle tree is retired after this runs - keep "
+            "signing with the fresh tree from now on."
+        )
+        confirm = input(
+            "\nConfirm rotate-key (type 'yes' to proceed): "
+        ).strip().lower()
+        if confirm != "yes":
+            print("Rotate-key cancelled.")
+            sys.exit(0)
 
     response = rpc_call(host, port, "rotate_key", {
         "transaction": rot_tx.serialize(),
@@ -1872,10 +1960,32 @@ def cmd_emergency_revoke(args):
     # Revoke is nonce-free - no RPC roundtrip required to sign, which is
     # what makes the "keep a pre-signed revoke tx on paper" workflow
     # practical. The cold key's leaf index is local to its own KeyPair.
-    fee = args.fee if args.fee is not None else 500
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_revoke_transaction(
         cold, fee=fee, entity_id=target_entity_id,
     )
+
+    if not getattr(args, "yes", False):
+        tid_hex = target_entity_id.hex()
+        tid_short = f"{tid_hex[:16]}...{tid_hex[-8:]}"
+        print(f"\nAbout to emergency-revoke:")
+        print(f"  Target entity: {tid_short}")
+        print(f"  (full: {tid_hex})")
+        print(f"  Fee:           {fee} tokens")
+        print(
+            "  This disables the validator PERMANENTLY.  Staked funds "
+            "release to the operator's balance after the 7-day "
+            "unbonding period, but block production is stopped "
+            "immediately and cannot be undone."
+        )
+        confirm = input(
+            "\nConfirm emergency-revoke (type 'yes' to proceed): "
+        ).strip().lower()
+        if confirm != "yes":
+            print("Emergency-revoke cancelled.")
+            sys.exit(0)
 
     print(f"Broadcasting revoke for {target_entity_id.hex()[:16]}...")
     response = rpc_call(host, port, "emergency_revoke", {

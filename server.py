@@ -1040,11 +1040,27 @@ class Server(SharedRuntimeMixin):
         # messagechain/network/node.py).  None => ephemeral tempdir.
         self.data_dir = data_dir
 
+        # R12-#1: acquire an exclusive OS-level lock on data_dir BEFORE
+        # opening any keyfile / DB.  Two processes sharing a data_dir
+        # would both load the same WOTS+ keypair cache and sign
+        # different payloads at identical leaf indices — leaf reuse in
+        # a one-time-signature scheme leaks the private key outright
+        # (and for a validator, forks consensus).  The lock is held for
+        # the process lifetime; clean shutdown releases it in stop().
+        # Tests that legitimately spin up multiple servers on the same
+        # tempdir set MESSAGECHAIN_SKIP_DATA_DIR_LOCK=1.
+        self._data_dir_lock = None
+        if data_dir:
+            import os
+            os.makedirs(data_dir, exist_ok=True)
+            from messagechain.storage.data_dir_lock import DataDirLock
+            self._data_dir_lock = DataDirLock(data_dir)
+            self._data_dir_lock.__enter__()
+
         # Set up persistent storage if data_dir provided
         self.db = None
         if data_dir:
             import os
-            os.makedirs(data_dir, exist_ok=True)
             from messagechain.storage.chaindb import ChainDB
             db_path = os.path.join(data_dir, "chain.db")
             self.db = ChainDB(db_path)
@@ -1060,8 +1076,17 @@ class Server(SharedRuntimeMixin):
         self.receipt_issuer = None  # ReceiptIssuer for submission receipts
         self._running = False
 
-        # Network protection — must exist before syncer for the offense callback
-        self.ban_manager = PeerBanManager()
+        # Network protection — must exist before syncer for the offense callback.
+        # Ban state persists under data_dir so bans survive restarts; a peer
+        # banned just before an OOM kill or maintenance reboot used to
+        # reconnect fresh. Alongside anchors.json / peer_pins.json.
+        import os as _os_ban
+        _ban_path = (
+            _os_ban.path.join(data_dir, "ban_scores.json")
+            if data_dir
+            else None
+        )
+        self.ban_manager = PeerBanManager(persistence_path=_ban_path)
         self.rate_limiter = PeerRateLimiter()
 
         # Sybil-resistant address manager (was previously dead code)
@@ -1141,11 +1166,28 @@ class Server(SharedRuntimeMixin):
 
         # RPC authentication — generate a random token if none configured.
         # Any RPC client must include {"auth": "<token>"} in requests.
+        # Operators can pin a stable token across restarts by setting
+        # MESSAGECHAIN_RPC_AUTH_TOKEN; otherwise a fresh random token is
+        # generated per startup (and must be retrieved from the keyfile).
         from messagechain.config import RPC_AUTH_ENABLED, RPC_AUTH_TOKEN
         self.rpc_auth_enabled = RPC_AUTH_ENABLED
         if RPC_AUTH_ENABLED:
             import os as _rng
-            self.rpc_auth_token = RPC_AUTH_TOKEN or _rng.urandom(32).hex()
+            if RPC_AUTH_TOKEN:
+                self.rpc_auth_token = RPC_AUTH_TOKEN
+                self._rpc_auth_token_source = "env"
+                if len(RPC_AUTH_TOKEN) < 16:
+                    # Short tokens are dangerous — warn but accept
+                    # (operator discretion).  Never log the value itself.
+                    logger.warning(
+                        "RPC auth token from env is shorter than 16 "
+                        "characters (%d); accepting on operator "
+                        "discretion but this is weak.",
+                        len(RPC_AUTH_TOKEN),
+                    )
+            else:
+                self.rpc_auth_token = _rng.urandom(32).hex()
+                self._rpc_auth_token_source = "generated"
             self._log_rpc_auth_status()
 
         # inv/getdata: track recently seen tx hashes
@@ -1154,7 +1196,11 @@ class Server(SharedRuntimeMixin):
     def _log_rpc_auth_status(self):
         # Never log any portion of the token. Operators retrieve it via
         # the configured RPC_AUTH_TOKEN env var or the keyfile, not logs.
-        logger.info("RPC auth enabled")
+        source = getattr(self, "_rpc_auth_token_source", "generated")
+        if source == "env":
+            logger.info("RPC auth enabled (token loaded from env)")
+        else:
+            logger.info("RPC auth enabled (token generated)")
 
     # _track_seen_tx, _get_peer_writer, _on_sync_offense,
     # _handle_task_exception, _current_cumulative_weight,
@@ -1346,6 +1392,13 @@ class Server(SharedRuntimeMixin):
             self.anchor_store.save_anchors(anchors)
         if self.db:
             self.db.close()
+        # Release the data_dir lock LAST — after chaindb is closed and
+        # all keyfile writes have flushed.  Releasing earlier would
+        # open a window where a second starter could acquire the lock
+        # while our shutdown is still persisting state.
+        if self._data_dir_lock is not None:
+            self._data_dir_lock.__exit__(None, None, None)
+            self._data_dir_lock = None
 
     # ── RPC Handler (client interface) ──────────────────────────────
 
@@ -2871,8 +2924,17 @@ class Server(SharedRuntimeMixin):
                                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
                             )
                             await write_message(peer.writer, msg)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Write failures usually mean the peer went
+                            # away.  Mark disconnected so the next
+                            # maintenance sweep prunes them; logged at
+                            # debug for operator diagnosability without
+                            # spamming on routine peer churn.
+                            logger.debug(
+                                f"height-request write to {addr} "
+                                f"failed: {e}"
+                            )
+                            peer.is_connected = False
 
                 if self.syncer.needs_sync():
                     await self.syncer.start_sync()
@@ -2923,8 +2985,14 @@ class Server(SharedRuntimeMixin):
                     break
                 first_message = False
                 await self._handle_p2p_message(msg, peer)
-        except Exception:
-            pass
+        except Exception as e:
+            # Any exception in the P2P handler loop is either a protocol
+            # violation by the peer or an internal bug.  Log at debug so
+            # operators debugging flaky peers can trace it; the finally
+            # block below handles the connection cleanup.
+            logger.debug(
+                f"P2P handler loop for {address} exited with exception: {e}"
+            )
         finally:
             peer.is_connected = False
             self.rate_limiter.remove_peer(address)
@@ -3626,7 +3694,13 @@ class Server(SharedRuntimeMixin):
             if peer.is_connected and peer.writer:
                 try:
                     await write_message(peer.writer, msg)
-                except Exception:
+                except Exception as e:
+                    # Broadcast write failure means the peer went away.
+                    # Mark disconnected for maintenance-sweep cleanup; log
+                    # at debug for diagnosability without spam.
+                    logger.debug(
+                        f"broadcast write to {addr} failed: {e}"
+                    )
                     peer.is_connected = False
 
 
@@ -3945,6 +4019,18 @@ def main():
         )
     else:
         logger.info("Active profile: production (strict defaults)")
+
+    # Log the fee-includes-signature activation height so operators can
+    # confirm at boot which coordinated-fork height this node is running.
+    # Silent divergence at activation is a consensus-forking bug; a boot-
+    # time log line is a cheap way to catch a mis-set
+    # MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT before it matters.
+    from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT
+    logger.info(
+        "FEE_INCLUDES_SIGNATURE_HEIGHT activation: %d "
+        "(override via MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT)",
+        FEE_INCLUDES_SIGNATURE_HEIGHT,
+    )
 
     asyncio.run(run(args))
 

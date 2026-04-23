@@ -77,6 +77,31 @@ def _profile_int(env_name: str, key: str, default: int) -> int:
     return default
 
 
+def _profile_str(
+    env_var: str,
+    profile_var: str | None = None,
+    default: str | None = None,
+) -> str | None:
+    """Return env_var if set and non-empty, else profile-specific fallback, else default.
+
+    Mirrors _profile_bool / _profile_int but for string-typed config.
+    Empty string in the env is treated as unset (falls through to
+    profile/default) — this avoids surprising operators who might
+    ``export MESSAGECHAIN_FOO=`` expecting the default.
+    """
+    raw = _os_profile.environ.get(env_var)
+    if raw is not None and raw != "":
+        return raw
+    if (
+        _PROFILE == "prototype"
+        and profile_var is not None
+        and profile_var in _PROTOTYPE_OVERRIDES
+    ):
+        override = _PROTOTYPE_OVERRIDES[profile_var]
+        return None if override is None else str(override)
+    return default
+
+
 def active_profile() -> str:
     """Return the active profile name ('production' or 'prototype')."""
     return _PROFILE
@@ -1884,7 +1909,16 @@ GOVERNANCE_VOTE_FEE = 100             # fee to cast a vote
 RPC_AUTH_ENABLED = _profile_bool(
     "MESSAGECHAIN_RPC_AUTH_ENABLED", "RPC_AUTH_ENABLED", True,
 )
-RPC_AUTH_TOKEN: str | None = None  # auto-generated if None
+# RPC_AUTH_TOKEN: operator-pinned token, or None to auto-generate.
+# Without this env-var the server auto-generates a fresh random token on
+# every startup — which rotates the admin token and invalidates all
+# external client / deployment tooling.  Setting
+# MESSAGECHAIN_RPC_AUTH_TOKEN pins the token across restarts so
+# operator tooling keeps working.  The value is treated as a secret and
+# is never logged.
+RPC_AUTH_TOKEN: str | None = _profile_str(
+    "MESSAGECHAIN_RPC_AUTH_TOKEN", default=None,
+)  # auto-generated if None
 
 # TLS encryption for P2P connections — prevents passive eavesdropping
 # and MITM attacks on transaction relay and validator identity.
@@ -2225,8 +2259,16 @@ MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 # Merkle auth path) while paying only the payload fee.  Operators MUST
 # replace this placeholder with a concrete coordinated-fork height before
 # deploying to mainnet; the current value is chosen as "current_height +
-# 50_000" headroom so honest nodes have time to upgrade.
-FEE_INCLUDES_SIGNATURE_HEIGHT = 64_000  # Tier 2
+# 50_000" headroom so honest nodes have time to upgrade.  Set
+# ``MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT`` in systemd/k8s env to pin
+# the coordinated-fork height without editing this file — avoids the
+# edit-and-redeploy slip that otherwise risks validators diverging on
+# consensus at activation.
+FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
+    "MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT",
+    "FEE_INCLUDES_SIGNATURE_HEIGHT",
+    64_000,  # Tier 2 of canonical fork schedule (see CLAUDE.md)
+)
 
 # Activation height for decoupling attester committee size from the
 # reward-pool token budget.  Pre-activation the committee was implicitly

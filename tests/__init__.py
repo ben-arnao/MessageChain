@@ -1,7 +1,21 @@
 """Test package — patches config for fast test execution."""
 import hashlib
+import os
 import messagechain.config
 from messagechain.config import HASH_ALGO
+
+# R12-#1: bypass the data_dir exclusive-lock enforcement for the whole
+# test suite.  Production-path Server/Node startup acquires an OS-level
+# lock on <data_dir>/.node.lock to prevent two processes from sharing
+# a data_dir (which would cause WOTS+ leaf reuse and full private-key
+# leakage).  Many integration tests legitimately construct multiple
+# Server/Node objects pointing at the SAME tempdir within a single test
+# process (cert-reuse, restart semantics, etc.).  The suite-wide bypass
+# is only safe because those in-process tests don't actually concurrently
+# sign at the same leaf.  Tests that exercise the lock directly
+# (test_data_dir_lock.py) clear this var in their own setUp.
+# See messagechain.storage.data_dir_lock for the threat model.
+os.environ.setdefault("MESSAGECHAIN_SKIP_DATA_DIR_LOCK", "1")
 
 messagechain.config.MERKLE_TREE_HEIGHT = 4  # 16 leaves instead of 1M (production=20)
 # Tests historically use 1-validator chains. The production threshold would

@@ -858,7 +858,7 @@ class ChainDB:
         add_slashed_validator that auto-commits for callers that don't batch.
         """
         self.add_slashed_validator(entity_id, block_number, evidence_hash or b"\x00" * 32)
-        self._conn.commit()
+        self._maybe_commit()
 
     # ── Processed Slashing Evidence ─────────────────────────────────
 
@@ -870,7 +870,7 @@ class ChainDB:
             "INSERT OR IGNORE INTO processed_evidence (evidence_hash, processed_at_block) VALUES (?, ?)",
             (evidence_hash, block_number),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def is_evidence_processed(self, evidence_hash: bytes) -> bool:
         cur = self._conn.execute(
@@ -997,7 +997,7 @@ class ChainDB:
                 signed_payload, signature_bytes, first_seen_block_height,
             ),
         )
-        self._conn.commit()
+        self._maybe_commit()
         return cur.rowcount > 0
 
     def prune_seen_signatures_before(self, cutoff_block_height: int) -> int:
@@ -1011,7 +1011,7 @@ class ChainDB:
             "DELETE FROM seen_signatures WHERE first_seen_block_height < ?",
             (cutoff_block_height,),
         )
-        self._conn.commit()
+        self._maybe_commit()
         return cur.rowcount
 
     def count_seen_signatures(self) -> int:
@@ -1034,7 +1034,7 @@ class ChainDB:
             "(block_number, block_hash) VALUES (?, ?)",
             (block_number, block_hash),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def is_block_finalized(self, block_hash: bytes) -> bool:
         cur = self._conn.execute(
@@ -1087,7 +1087,7 @@ class ChainDB:
             "(block_number, checkpoint_blob, signatures_blob) VALUES (?, ?, ?)",
             (checkpoint.block_number, cp_blob, sigs_blob),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_verified_state_checkpoint(self, block_number: int):
         """Return (StateCheckpoint, [StateCheckpointSignature, ...]) or None."""
@@ -1221,7 +1221,15 @@ class ChainDB:
         return self._txn_depth() > 0
 
     def _maybe_commit(self):
-        """Commit iff no wrapping begin_transaction is active."""
+        """Commit iff no wrapping begin_transaction is active.
+
+        Every state-mutating helper in this class must route its commit
+        through here rather than calling self._conn.commit() directly —
+        otherwise a helper invoked inside an outer begin_transaction
+        scope (e.g. Blockchain._persist_state) prematurely commits the
+        outer transaction mid-flight, silently breaking the atomicity
+        guarantee the scope exists to provide.
+        """
         if not self._in_txn():
             self._conn.commit()
 
@@ -1268,7 +1276,7 @@ class ChainDB:
             "(block_hash, witness_data) VALUES (?, ?)",
             (block_hash, witness_data),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def get_witness_data(self, block_hash: bytes) -> bytes | None:
         """Get stored witness data for a block, or None."""
@@ -1328,7 +1336,7 @@ class ChainDB:
             "UPDATE blocks SET data = ? WHERE block_hash = ?",
             (stripped_bytes, block_hash),
         )
-        self._conn.commit()
+        self._maybe_commit()
 
     def auto_separate_finalized_witnesses(
         self, finalized_height: int, state=None,

@@ -100,6 +100,21 @@ class Node(SharedRuntimeMixin):
         self.port = port
         self.seed_nodes = seed_nodes or SEED_NODES
         self.data_dir = data_dir
+
+        # R12-#1: acquire an exclusive OS-level lock on data_dir BEFORE
+        # any keyfile/DB access.  Two Node processes sharing a data_dir
+        # would both load the same WOTS+ keypair cache and sign at the
+        # same leaf index — one-time-signature leaf reuse leaks the
+        # private key outright and (for a validator) forks consensus.
+        # Held for process lifetime; released in stop().  Tests that
+        # share data_dirs set MESSAGECHAIN_SKIP_DATA_DIR_LOCK=1.
+        self._data_dir_lock = None
+        if data_dir is not None:
+            os.makedirs(data_dir, exist_ok=True)
+            from messagechain.storage.data_dir_lock import DataDirLock
+            self._data_dir_lock = DataDirLock(data_dir)
+            self._data_dir_lock.__enter__()
+
         self.blockchain = Blockchain(db=db)
         self.mempool = Mempool()
         # Dedicated mempool for archive-reward custody proofs — their
@@ -116,8 +131,14 @@ class Node(SharedRuntimeMixin):
         self._running = False
 
         # Network protection — must exist before syncer so the offense
-        # callback can reference ban_manager.
-        self.ban_manager = PeerBanManager()
+        # callback can reference ban_manager.  The ban manager persists
+        # its score table under data_dir so a peer banned just before an
+        # OOM kill or scheduled reboot stays banned on restart — without
+        # this, the banned peer reconnects fresh on boot.
+        _ban_path = (
+            os.path.join(data_dir, "ban_scores.json") if data_dir else None
+        )
+        self.ban_manager = PeerBanManager(persistence_path=_ban_path)
         self.rate_limiter = PeerRateLimiter()
         self.eviction_protector = PeerEvictionProtector()
 
@@ -462,6 +483,12 @@ class Node(SharedRuntimeMixin):
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Release the data_dir lock LAST — after listeners close and
+        # anchor/keyfile writes flush.  Releasing earlier would open a
+        # window where a second starter could race our shutdown.
+        if self._data_dir_lock is not None:
+            self._data_dir_lock.__exit__(None, None, None)
+            self._data_dir_lock = None
 
     async def _handle_connection(self, reader, writer):
         """Handle an incoming peer connection.
@@ -692,7 +719,19 @@ class Node(SharedRuntimeMixin):
             # Cumulative weight is the PoS analog of Bitcoin's chainwork and is
             # what ChainSyncer uses (via MIN_CUMULATIVE_STAKE_WEIGHT) to pick
             # a sync peer.
+            #
+            # B-1: genesis_hash binds the handshake to a specific chain.  A
+            # mainnet node and a testnet node previously passed every other
+            # field validation, then silently failed tx-signature verify
+            # (CHAIN_ID is committed in _signable_data) — a quiet operational
+            # partition instead of a loud early reject.  Empty string means
+            # "I'm still in IBD, no genesis yet"; receivers tolerate it.
             latest = self.blockchain.get_latest_block()
+            our_genesis_hex = (
+                self.blockchain.chain[0].block_hash.hex()
+                if self.blockchain.chain
+                else ""
+            )
             handshake = NetworkMessage(
                 msg_type=MessageType.HANDSHAKE,
                 payload={
@@ -700,6 +739,7 @@ class Node(SharedRuntimeMixin):
                     "chain_height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
                     "cumulative_weight": self._current_cumulative_weight(),
+                    "genesis_hash": our_genesis_hex,
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -772,6 +812,40 @@ class Node(SharedRuntimeMixin):
                 return
             # Sanity-cap the claim — see _accept_peer_weight.
             peer_weight = self._accept_peer_weight(peer_weight_raw)
+
+            # B-1: genesis_hash cross-chain guard.  Missing field = legacy
+            # peer (pre-B-1 binary) → treat as empty for backward compat.
+            # Empty on either side = IBD (no genesis yet) → tolerate; the
+            # syncing node will fetch block 0 and reconcile.  Both sides
+            # non-empty AND different = different chains; record a protocol
+            # violation and close the connection so tx-signature CHAIN_ID
+            # mismatches don't silently partition the peering.
+            peer_genesis = msg.payload.get("genesis_hash", "")
+            if not isinstance(peer_genesis, str):
+                self.ban_manager.record_offense(
+                    address, OFFENSE_PROTOCOL_VIOLATION, "invalid_genesis_hash"
+                )
+                peer.is_connected = False
+                return
+            our_genesis = (
+                self.blockchain.chain[0].block_hash.hex()
+                if self.blockchain.chain
+                else ""
+            )
+            if our_genesis and peer_genesis and our_genesis != peer_genesis:
+                peer_short = peer_genesis[:16]
+                ours_short = our_genesis[:16]
+                logger.warning(
+                    f"Genesis mismatch from {peer.address}: peer={peer_short} "
+                    f"ours={ours_short} — closing (cross-chain peer)."
+                )
+                self.ban_manager.record_offense(
+                    address,
+                    OFFENSE_PROTOCOL_VIOLATION,
+                    f"genesis_mismatch:{peer_short}:{ours_short}",
+                )
+                peer.is_connected = False
+                return
 
             # M1: Bind the TOFU TLS pin to the declared entity_id.
             # A peer that pinned a legitimate cert on first sight cannot

@@ -252,8 +252,14 @@ def _generate_self_signed_cert(cert_path: str, key_path: str):
             .issuer_name(issuer)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=3650))
+            # datetime.utcnow() is deprecated — use timezone-aware
+            # datetime.now(UTC) so certs still generate on Python
+            # versions that remove the naive utcnow helper.
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=3650)
+            )
             .sign(key, hashes.SHA256())
         )
         pem_bytes = key.private_bytes(
