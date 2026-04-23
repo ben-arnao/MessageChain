@@ -4,6 +4,36 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-04-23
+
+Patch release — operator ergonomics + gossip correctness. No consensus
+or chain-state changes; no hard fork needed. Safe to roll in-place on
+a running validator via a systemd restart.
+
+### Added
+
+- `reserve_leaf` RPC on `server.py`. Atomic WOTS+ leaf reservation for
+  CLI signers co-resident with the validator daemon: eliminates the
+  window in which an operator `messagechain transfer` and a
+  block-producer `sign()` pick the same leaf and leak the private key.
+- Global `--data-dir` flag on the CLI. When set, `transfer`, `stake`,
+  and `send` load the daemon's on-disk keypair cache (skipping the
+  multi-minute WOTS+ keygen) and call `reserve_leaf` for the signing
+  leaf (collision-free with block production).
+- `_load_key_from_file(..., accept_raw_hex=True)` opt-in parser. The
+  CLI now accepts the daemon-side 64-char raw-hex keyfile when
+  `--data-dir` is present, so the operator keyfile the validator unit
+  consumes is directly usable for CLI signing.
+
+### Fixed
+
+- ANNOUNCE_TX gossip for `TransferTransaction` payloads. The handler
+  previously only deserialized `MessageTransaction`, so a transfer
+  gossiped from a peer was rejected as `invalid_tx_data` and never
+  reached the block producer. Dispatch now reads the `type`
+  discriminator in the serialized dict and routes to the matching
+  validator.
+
 ## [1.0.0] — 2026-04-22
 
 Initial mainnet release. Current chain minted 2026-04-22 after several
