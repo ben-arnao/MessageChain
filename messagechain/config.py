@@ -793,11 +793,15 @@ ENFORCE_SLOT_TIMING = True
 # Network
 DEFAULT_PORT = 9333      # P2P listen port
 RPC_DEFAULT_PORT = 9334  # RPC listen port (clients speak JSON-RPC here)
-# The genesis validator IS the seed — it doesn't peer with itself.
-# Other nodes either use CLIENT_SEED_ENDPOINTS (for CLI RPC discovery),
-# pass --seed on startup (for P2P peering), or populate this via
-# config_local.py.
-SEED_NODES: list[tuple[str, int]] = []
+# Default P2P seed list shipped with the release.  A fresh node with no
+# --seed flag connects to these to join the network.  Operators override
+# via --seed on startup or by setting SEED_NODES in config_local.py.
+# The genesis validator does not peer with itself; it reads this list
+# only on non-genesis nodes.  As the validator set grows, shipped
+# defaults should expand and eventually give way to proper peer-exchange.
+SEED_NODES: list[tuple[str, int]] = [
+    ("35.237.211.12", DEFAULT_PORT),  # genesis validator — bootstrap phase
+]
 
 # Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
 # to make its initial RPC connection.  Once connected, the CLI calls

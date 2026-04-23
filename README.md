@@ -1,5 +1,9 @@
 # MessageChain
 
+[![tests](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml/badge.svg)](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml)
+[![release](https://img.shields.io/github/v/release/ben-arnao/MessageChain)](https://github.com/ben-arnao/MessageChain/releases)
+[![license](https://img.shields.io/github/license/ben-arnao/MessageChain)](./LICENSE)
+
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
@@ -128,3 +132,31 @@ messagechain set-authority-key --authority-pubkey <cold_hex>
 messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
 
+## Running a validator
+
+Minimum to participate in consensus:
+
+- **Stake:** 10,000 tokens locked via `messagechain stake`. Unbonding
+  takes ~15 days (2176 blocks) so you can be slashed for misbehavior
+  discovered after you leave.
+- **Host:** any always-on Linux box with Python 3.10+, ~2 GB RAM,
+  and outbound+inbound TCP 9333 (P2P) and 9334 (RPC). Validator-1
+  currently runs on a GCP `e2-small`.
+- **Keys:** generate a hot key with `messagechain generate-key` and
+  store the printed hex on paper. Optionally set a cold authority
+  key with `set-authority-key` so key rotations require the cold key.
+- **Run:** `messagechain start --mine --rpc-bind 0.0.0.0 --data-dir
+  /var/lib/messagechain --keyfile /etc/messagechain/keyfile`. A
+  systemd unit example lives under `deploy/systemd/` in the repo.
+- **Upkeep:** run `key-status` periodically (WOTS+ leaves deplete
+  with use) and `rotate-key` before exhaustion.
+
+Rewards are a mix of block reward + transaction fees + attester
+pool share, split pro-rata by stake. Expect economics to tighten as
+the validator set grows.
+
+## Security & changelog
+
+- Vulnerabilities: see [SECURITY.md](./SECURITY.md) — private email
+  disclosure, 72h ack, 7d triage. Do not open a public issue.
+- Release notes: see [CHANGELOG.md](./CHANGELOG.md).
