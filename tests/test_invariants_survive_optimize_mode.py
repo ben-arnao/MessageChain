@@ -57,17 +57,7 @@ import unittest
 #
 # Consensus-critical asserts MUST NOT be allowlisted — they must be
 # converted to ``raise ChainIntegrityError(...)`` (or equivalent).
-_ASSERT_ALLOWLIST: set[tuple[str, int]] = {
-    # messagechain/storage/state_snapshot.py — isinstance type-narrowing
-    # inside canonical-encoding helpers.  struct.pack will fail loudly
-    # on a wrong-type key even without the assert, so stripping under
-    # -O cannot silently corrupt state — worst case the encoder raises
-    # a TypeError, which is equally fatal.
-    ("messagechain/storage/state_snapshot.py", 1272),
-    ("messagechain/storage/state_snapshot.py", 1297),
-    ("messagechain/storage/state_snapshot.py", 1327),
-    ("messagechain/storage/state_snapshot.py", 1349),
-}
+_ASSERT_ALLOWLIST: set[tuple[str, int]] = set()
 
 
 def _repo_root() -> pathlib.Path:

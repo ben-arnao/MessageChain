@@ -1570,7 +1570,7 @@ def cmd_unstake(args):
     entity.keypair.advance_to_leaf(watermark)
 
     # Default fee: post-flat floor is safe pre- and post-activation.
-    # See cmd_stake for rationale — 1 was below both MIN_FEE floors.
+    # See cmd_stake for rationale: 1 was below both MIN_FEE floors.
     from messagechain.config import MIN_FEE_POST_FLAT
     fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
