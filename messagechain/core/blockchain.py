@@ -317,6 +317,17 @@ class Blockchain:
         # doing, so block proposal / validation is independent of total
         # account count.
         self.state_tree: SparseMerkleTree = SparseMerkleTree()
+        # Per-entity dirty set for scoped ``_persist_state``.
+        #   None  — next persist is a FULL flush (cold start, post-reset,
+        #           post-reorg, freshly-loaded-from-db).  Every per-entity
+        #           row on disk is rewritten.
+        #   set() — clean; next persist has no per-entity work to do.
+        #   set of entity_ids — only these rows need flushing.
+        # Populated piggybacked on ``_touch_state`` (the canonical choke
+        # point for every consensus-relevant mutation); cleared at the end
+        # of ``_persist_state``.  Replaces the pre-dirty-tracker O(N) scan
+        # that rewrote every account on every block.
+        self._dirty_entities: set[bytes] | None = None
         # Immature block rewards: list of (block_height, proposer_id, reward_amount)
         self._immature_rewards: list[tuple[int, bytes, int]] = []
         # Orphan block pool: blocks whose parent is not yet known (bounded)
@@ -844,39 +855,78 @@ class Blockchain:
 
         All writes are wrapped in a single SQL transaction so a crash
         mid-persist cannot leave the database in a partially-updated state.
+
+        Scoping: when ``self._dirty_entities`` is a set, the per-entity
+        loops iterate only those entity_ids — the single optimisation
+        that keeps steady-state block apply O(K_touched) instead of
+        O(N_accounts) on every block.  When it is None (cold-start,
+        post-reset, post-reorg), every live entity is flushed so the
+        disk picks up whatever the replay produced.  See ``__init__``
+        docstring on ``_dirty_entities`` for the full state machine.
         """
         if self.db is None:
             return
+        # Snapshot the dirty set and determine the iteration domain up
+        # front.  Holding the snapshot — and immediately clearing the
+        # live tracker — means any mutation that happens mid-persist
+        # (none should, but belt-and-suspenders) lands in a fresh set
+        # for the NEXT flush rather than silently disappearing.
+        dirty = self._dirty_entities
+        self._dirty_entities = set()
+        full_flush = dirty is None
+
+        def _scoped(source: dict) -> list:
+            """Pick (eid, value) pairs from `source` to flush this call."""
+            if full_flush:
+                return list(source.items())
+            # Dirty-only: fetch current value (or default) for each
+            # touched entity.  Missing-from-source means the entity
+            # has no row in that field (e.g. no public_key yet); the
+            # individual loops below skip such entries where the
+            # value is semantically absent.
+            return [(eid, source.get(eid)) for eid in dirty if eid in source]
+
         self.db.begin_transaction()
         try:
-            for eid, bal in self.supply.balances.items():
+            for eid, bal in _scoped(self.supply.balances):
                 self.db.set_balance(eid, bal)
-            for eid, stk in self.supply.staked.items():
+            for eid, stk in _scoped(self.supply.staked):
                 self.db.set_staked(eid, stk)
-            for eid, nonce in self.nonces.items():
+            for eid, nonce in _scoped(self.nonces):
                 self.db.set_nonce(eid, nonce)
-            for eid, pk in self.public_keys.items():
+            for eid, pk in _scoped(self.public_keys):
                 self.db.set_public_key(eid, pk)
-            for eid, cnt in self.entity_message_count.items():
+            for eid, cnt in _scoped(self.entity_message_count):
                 self.db.set_message_count(eid, cnt)
-            for eid, cnt in self.proposer_sig_counts.items():
+            for eid, cnt in _scoped(self.proposer_sig_counts):
                 self.db.set_proposer_sig_count(eid, cnt)
             if hasattr(self.db, 'set_leaf_watermark'):
-                for eid, nxt in self.leaf_watermarks.items():
+                for eid, nxt in _scoped(self.leaf_watermarks):
                     self.db.set_leaf_watermark(eid, nxt)
             if hasattr(self.db, 'set_authority_key'):
-                for eid, ak in self.authority_keys.items():
+                for eid, ak in _scoped(self.authority_keys):
                     self.db.set_authority_key(eid, ak)
             if hasattr(self.db, 'set_revoked'):
-                for eid in self.revoked_entities:
+                # revoked_entities is a set, not a dict — iterate the
+                # union of (live revocations) restricted to the flush
+                # domain.  Revocation is set-once (security ratchet),
+                # so re-writing a row that's already present is a cheap
+                # INSERT OR IGNORE no-op.
+                if full_flush:
+                    revoked_iter = self.revoked_entities
+                else:
+                    revoked_iter = dirty & self.revoked_entities
+                for eid in revoked_iter:
                     self.db.set_revoked(eid)
             if hasattr(self.db, 'set_key_rotation_count'):
-                for eid, rn in self.key_rotation_counts.items():
+                for eid, rn in _scoped(self.key_rotation_counts):
                     self.db.set_key_rotation_count(eid, rn)
             if hasattr(self.db, 'set_wots_tree_height'):
                 # Set-once at the storage layer (INSERT OR IGNORE), so
                 # re-persisting unchanged entries is a cheap no-op.
-                for eid, th in self.wots_tree_heights.items():
+                # Scoped alongside the other per-entity dicts; the
+                # full-flush path still covers every row.
+                for eid, th in _scoped(self.wots_tree_heights):
                     self.db.set_wots_tree_height(eid, th)
             self.db.set_supply_meta("total_supply", self.supply.total_supply)
             self.db.set_supply_meta("total_minted", self.supply.total_minted)
@@ -3008,7 +3058,16 @@ class Blockchain:
         are inside the leaf commitment, so any mutation must end in a
         _touch_state call or the block's state_root will not match what
         validators reconstruct.  Cheap — O(len(entity_ids) * TREE_DEPTH).
+
+        Piggybacks the dirty-set tracker for ``_persist_state`` scoping:
+        when ``self._dirty_entities`` is not None (i.e. we're past the
+        initial cold-start full flush), every touched entity_id is
+        added to the dirty set so the next persist writes only those
+        rows.  When it IS None, tracking is skipped — the next persist
+        will rewrite everything anyway.
         """
+        if self._dirty_entities is not None:
+            self._dirty_entities.update(entity_ids)
         for eid in entity_ids:
             self.state_tree.set(
                 eid,
@@ -9035,6 +9094,13 @@ class Blockchain:
         but all balance/nonce state is rebuilt from block replay.
         """
         old_pks = dict(self.public_keys)
+        # Dirty-set tracker: reset to the None sentinel so the next
+        # _persist_state after the replay does a FULL flush.  The
+        # alternative — inheriting whatever dirty set existed before the
+        # reset — would silently skip rows that the replay mutated back
+        # to their pre-reset values (equal but stored as stale) and leave
+        # the on-disk copy desynced from memory.
+        self._dirty_entities = None
         self.supply = SupplyTracker()
         self.nonces = {}
         self.entity_message_count = {}
