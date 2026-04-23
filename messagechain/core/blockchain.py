@@ -410,7 +410,7 @@ class Blockchain:
         # Persists forever across blocks — unused rewards never expire
         # (permanence aligns with CLAUDE.md principle #2: the pool is
         # on-chain state like any balance).  See
-        # docs/proof-of-custody-archive-rewards.md for the design.
+        # `messagechain/consensus/archive_challenge.py` for the design.
         self.archive_reward_pool: int = 0
 
         # Archive-custody duty state (iteration 3b-ii).  Three pieces:
@@ -7229,8 +7229,9 @@ class Blockchain:
         # Reset the per-block fee-burn ticker so this block's
         # pay_fee_with_burn calls accumulate cleanly.  Read back at
         # end-of-block to redirect ARCHIVE_BURN_REDIRECT_PCT into the
-        # archive reward pool.  See docs/proof-of-custody-archive-
-        # rewards.md.
+        # archive reward pool.  See
+        # `messagechain/consensus/archive_challenge.py` (module
+        # docstring) for the design.
         self.supply.fee_burn_this_block = 0
         # Same for the attester-pool fee-funding accumulator
         # (ATTESTER_FEE_FUNDING_HEIGHT hard fork).  Must reset here —

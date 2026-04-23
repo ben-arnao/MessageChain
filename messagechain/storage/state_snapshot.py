@@ -399,8 +399,8 @@ _GLOBAL_TOTAL_BURNED = b"total_burned"
 _GLOBAL_BASE_FEE = b"base_fee"
 _GLOBAL_NEXT_ENTITY_INDEX = b"next_entity_index"
 # Proof-of-custody archive reward pool balance.  See
-# docs/proof-of-custody-archive-rewards.md and
-# messagechain/consensus/archive_challenge.py.  Single scalar; lives
+# `messagechain/consensus/archive_challenge.py` (module docstring)
+# for the authoritative design.  Single scalar; lives
 # under _TAG_GLOBAL so it shares the root-commitment path with other
 # supply-level counters.  MUST participate in the snapshot root for
 # consensus reasons: two state-synced nodes that disagree on the pool

@@ -1,6 +1,6 @@
 """Tests for proof-of-custody archive rewards.
 
-Spec: docs/proof-of-custody-archive-rewards.md
+Spec: `messagechain/consensus/archive_challenge.py` (module docstring).
 
 Covers the eight TDD requirements:
     1. Challenge determinism & uniformity.

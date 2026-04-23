@@ -1299,7 +1299,9 @@ def is_state_root_checkpoint_block(block_number: int) -> bool:
 # Consensus-enforced reward stream that pays nodes for provably holding
 # historical block data, defending the 1000-year permanence principle
 # against archive-operator attrition.  See
-# docs/proof-of-custody-archive-rewards.md for the full design.
+# `messagechain/consensus/archive_challenge.py` (module docstring +
+# `CustodyProof`, `ArchiveProofBundle`) and
+# `messagechain/consensus/archive_duty.py` for the full design.
 #
 # Each challenge block, the chain selects a random past height via
 # VRF-over-block-hash.  Any operator holding that block may submit a
@@ -1710,8 +1712,10 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 # it so someone else does) within the grace window, the user can
 # publish the receipt as slashable evidence on-chain.
 #
-# Two-phase slashing (critical — see docs/attestable-submission-receipts.md
-# "Security Analysis"):
+# Two-phase slashing (critical — see
+# `messagechain/network/submission_receipt.py` +
+# `messagechain/consensus/censorship_evidence.py` for the authoritative
+# design + security analysis):
 #   1. Accuser posts CensorshipEvidenceTx (pays MIN_FEE).
 #   2. Evidence is recorded in pending state, NOT yet applied.
 #   3. Accused validator has EVIDENCE_MATURITY_BLOCKS (defined below) to

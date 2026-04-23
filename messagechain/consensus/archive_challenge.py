@@ -1,7 +1,8 @@
 """Proof-of-custody archive rewards — consensus module.
 
-See `docs/proof-of-custody-archive-rewards.md` for the authoritative
-design.  Summary:
+This module docstring + the `CustodyProof` / `ArchiveProofBundle`
+class docstrings below are the authoritative design reference for
+the feature (there is no separate public-facing spec file).  Summary:
 
     * Every ARCHIVE_CHALLENGE_INTERVAL blocks the chain seeds a VRF-
       style challenge over its own block hash, selecting a random
