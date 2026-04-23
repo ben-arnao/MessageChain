@@ -65,12 +65,6 @@ messagechain send "hello world" --fee 500       # pay a specific amount
 messagechain estimate-fee --message "hello world"   # preview cost
 ```
 
-Default: `send` picks `max(size-floor, network-suggested)` so your
-tx is never rejected for underpayment. Fee grows quadratically with
-size (`100 + 3·bytes + 2·bytes²/1000`); brevity is rewarded because
-storage is permanent. Base fee is burned; any tip above base fee
-goes to the proposer.
-
 Your first outgoing transaction reveals your public key on-chain
 (the "first-spend pubkey install" path). After that, every
 subsequent transaction is verified against the installed key.

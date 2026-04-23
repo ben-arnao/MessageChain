@@ -492,12 +492,23 @@ PROPOSER_REWARD_DENOMINATOR = 4
 # Excess is redirected to the treasury. Set to proposer's normal 1/4 share.
 PROPOSER_REWARD_CAP = BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR  # 4 tokens
 
-# Fee economics — EIP-1559-style base fee + tip
-# Non-linear size pricing: fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
-# This makes larger messages disproportionately expensive, incentivizing conciseness.
-MIN_FEE = 100  # absolute floor for base fee (spam deterrent)
-FEE_PER_BYTE = 3  # per-byte fee component (3x higher than original — storage is expensive)
-FEE_QUADRATIC_COEFF = 2  # quadratic surcharge coefficient: (bytes^2 * 2) // 1000
+# Fee economics — EIP-1559-style base fee + tip.
+#
+# LEGACY (pre-FLAT_FEE_HEIGHT) non-linear size pricing — retained so
+# historical blocks before the flat-fee fork replay deterministically:
+#     fee = MIN_FEE + (bytes * FEE_PER_BYTE) + (bytes^2 * FEE_QUADRATIC_COEFF) // 1000
+#
+# POST-FLAT_FEE_HEIGHT the formula collapses to a flat per-tx floor
+# (``MIN_FEE_POST_FLAT``).  Messages are already hard-capped at tweet
+# scale, users are expected to fill that capacity, and multi-part
+# messages are a first-class pattern — so charging per byte on top of
+# per-tx is redundant.  Bloat defense becomes: (a) the hard size cap
+# and (b) a flat fee set high enough that bulk spam is uneconomical.
+# Above the floor, the market (EIP-1559 base fee + tip) does the rest.
+MIN_FEE = 100  # legacy floor (pre-FLAT_FEE_HEIGHT)
+MIN_FEE_POST_FLAT = 1000  # flat per-tx floor post-FLAT_FEE_HEIGHT
+FEE_PER_BYTE = 3  # legacy per-byte component (pre-FLAT_FEE_HEIGHT only)
+FEE_QUADRATIC_COEFF = 2  # legacy quadratic coeff (pre-FLAT_FEE_HEIGHT only)
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
 BASE_FEE_MAX_CHANGE_DENOMINATOR = 8  # max 12.5% change per block
 TARGET_BLOCK_SIZE = 10                # target txs per block (50% of MAX_TXS_PER_BLOCK)
@@ -2149,6 +2160,9 @@ UNBONDING_PERIOD_POST_EXTENSION = (
 #   Tier 6 — Sybil defense (depends on MIN_STAKE raise):
 #     96,000  VALIDATOR_REGISTRATION_BURN_HEIGHT
 #
+#   Tier 7 — Fee-model simplification:
+#     98,000  FLAT_FEE_HEIGHT  (flat per-tx floor; retires quadratic)
+#
 # Dependency invariants (enforced via load-time asserts where
 # declared):
 #   * SEED_DIVESTMENT_REDIST_HEIGHT  >= SEED_DIVESTMENT_RETUNE_HEIGHT
@@ -2752,6 +2766,43 @@ VALIDATOR_REGISTRATION_BURN_HEIGHT = 70_000
 
 assert VALIDATOR_REGISTRATION_BURN > 0, (
     "registration burn must be positive — zero disables sybil defense"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Flat per-tx fee floor — retires the legacy quadratic formula
+# ─────────────────────────────────────────────────────────────────────
+# At/after FLAT_FEE_HEIGHT the fee floor collapses to ``MIN_FEE_POST_FLAT``
+# regardless of message or signature size.  Rationale:
+#
+#   * Messages are hard-capped at tweet scale (MAX_MESSAGE_CHARS /
+#     MAX_MESSAGE_BYTES), so size-indexed pricing inside a single tx
+#     buys little real protection — rational users fill the cap.
+#   * Multi-part messages are a first-class pattern; charging per-byte
+#     on top of per-tx double-counts the cost a user already pays by
+#     splitting.  Flat per-tx → N-part message pays exactly N × floor.
+#   * Bloat defense stays intact: (1) the hard size cap, (2) a floor
+#     high enough that bulk spam is uneconomical, (3) market-driven
+#     fees above the floor during congestion.
+#
+# Legacy constants (MIN_FEE, FEE_PER_BYTE, FEE_QUADRATIC_COEFF) are
+# retained so pre-fork blocks replay deterministically.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  Per the FORK
+# SCHEDULE: Tier 7, target 98,000 — after the last Tier 6 fork
+# (VALIDATOR_REGISTRATION_BURN_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
+FLAT_FEE_HEIGHT = 98_000
+
+assert MIN_FEE_POST_FLAT > MIN_FEE, (
+    "MIN_FEE_POST_FLAT must exceed the legacy floor — otherwise the fork "
+    "silently lowers fees and weakens anti-spam pressure"
+)
+assert FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT, (
+    "FLAT_FEE_HEIGHT must follow FEE_INCLUDES_SIGNATURE_HEIGHT — the flat "
+    "fee supersedes the sig-aware quadratic rule, so blocks in the "
+    "[FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT) window still apply "
+    "the witness-aware formula during replay"
 )
 
 
