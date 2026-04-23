@@ -65,13 +65,8 @@ messagechain send "hello world" --fee 500       # pay a specific amount
 messagechain estimate-fee --message "hello world"   # preview cost
 ```
 
-Default: `send` picks `max(protocol-floor, network-suggested)` so your
-tx is never rejected for underpayment. The protocol floor is a flat
-per-tx minimum — a one-character message and a full 280-character
-message cost the same. Multi-part messages pay the floor per tx, so
-a 10-tx thread costs exactly twice a 5-tx thread. Above the floor,
-the market sets the price: base fee is burned; any tip above base
-fee goes to the proposer.
+By default the fee is auto-picked. Pass `--fee N` only if you want to
+override it.
 
 Your first outgoing transaction reveals your public key on-chain
 (the "first-spend pubkey install" path). After that, every
