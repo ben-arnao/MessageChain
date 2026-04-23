@@ -842,7 +842,8 @@ RPC_DEFAULT_PORT = 9334  # RPC listen port (clients speak JSON-RPC here)
 # only on non-genesis nodes.  As the validator set grows, shipped
 # defaults should expand and eventually give way to proper peer-exchange.
 SEED_NODES: list[tuple[str, int]] = [
-    ("35.237.211.12", DEFAULT_PORT),  # genesis validator — bootstrap phase
+    ("35.237.211.12", DEFAULT_PORT),  # validator-1 (founder / genesis) — us-east1-b
+    ("35.231.82.12", DEFAULT_PORT),   # validator-2 — us-east1-c (added v1.0.1)
 ]
 
 # Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
@@ -855,7 +856,8 @@ SEED_NODES: list[tuple[str, int]] = [
 #
 # These must point at RPC ports (RPC_DEFAULT_PORT), not P2P ports.
 CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
-    ("35.237.211.12", RPC_DEFAULT_PORT),
+    ("35.237.211.12", RPC_DEFAULT_PORT),  # validator-1 — us-east1-b
+    ("35.231.82.12", RPC_DEFAULT_PORT),   # validator-2 — us-east1-c (added v1.0.1)
 ]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
