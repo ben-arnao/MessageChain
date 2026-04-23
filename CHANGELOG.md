@@ -4,6 +4,20 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] — 2026-04-23
+
+Patch release — ship validator-2 in the default seed list so fresh
+clients bootstrap against both validators instead of one.
+
+### Changed
+
+- `SEED_NODES` and `CLIENT_SEED_ENDPOINTS` in `messagechain/config.py`
+  now include both validator-1 (35.237.211.12) and validator-2
+  (35.231.82.12). A fresh install — `messagechain send "hi"` or
+  `python server.py --mine` with no flags — connects to either
+  validator automatically. Users keep full `--seed` / `--server`
+  override.
+
 ## [1.0.1] — 2026-04-23
 
 Patch release — operator ergonomics + gossip correctness. No consensus
