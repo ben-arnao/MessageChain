@@ -19,10 +19,11 @@ from dataclasses import dataclass
 
 from messagechain.config import HASH_ALGO
 from messagechain.core.block import Block
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # GCS parameters (simplified)
@@ -32,7 +33,7 @@ GCS_M_FACTOR = (1 << GCS_P)  # M = N * 2^P, where N = number of elements
 
 def _siphash_mod(key: bytes, item: bytes, m: int) -> int:
     """Map an item to [0, m) using a keyed hash. Deterministic per block."""
-    h = hashlib.new(HASH_ALGO, key + item).digest()
+    h = default_hash(key + item)
     val = int.from_bytes(h[:8], "big")
     return val % m
 

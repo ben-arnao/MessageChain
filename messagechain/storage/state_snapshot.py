@@ -95,6 +95,7 @@ from messagechain.config import (
     MAX_STATE_SNAPSHOT_BYTES as _MAX_DEFAULT,
     STATE_ROOT_VERSION as _STATE_ROOT_VERSION,
 )
+from messagechain.crypto.hashing import default_hash
 
 # Re-exported so callers don't need to import from both places.
 # v2: added seed_divestment_debt (partial-divestment-to-floor schedule).
@@ -439,7 +440,7 @@ _GLOBAL_ROLLING_FEE_BURN_SEEDED = b"rolling_fee_burn_seeded"
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def serialize_state(blockchain) -> dict:

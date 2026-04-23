@@ -30,6 +30,7 @@ import hashlib
 from dataclasses import dataclass
 from messagechain.config import HASH_ALGO, MERKLE_TREE_HEIGHT
 from messagechain.crypto.keys import KeyPair
+from messagechain.crypto.hashing import default_hash
 
 # Minimum private key length in bytes. Matches 256-bit security expected for
 # a 32-byte SHA3-256 seed. Private keys with less entropy than this are
@@ -54,7 +55,7 @@ def derive_entity_id(public_key: bytes) -> bytes:
     reveals nothing about the signing key.
     """
     combined = _DOMAIN_ENTITY_ID + public_key
-    return hashlib.new(HASH_ALGO, combined).digest()
+    return default_hash(combined)
 
 
 def _derive_signing_seed(private_key: bytes) -> bytes:
@@ -68,7 +69,7 @@ def _derive_signing_seed(private_key: bytes) -> bytes:
     reveals nothing about this seed.
     """
     combined = _DOMAIN_SIGNING_SEED + private_key
-    return hashlib.new(HASH_ALGO, combined).digest()
+    return default_hash(combined)
 
 
 @dataclass

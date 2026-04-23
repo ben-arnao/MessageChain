@@ -24,10 +24,11 @@ from __future__ import annotations
 import hashlib
 from messagechain.config import HASH_ALGO, MIN_FEE, NEW_ACCOUNT_FEE
 from messagechain.core.authority_key import create_set_authority_key_transaction
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def bootstrap_seed_local(

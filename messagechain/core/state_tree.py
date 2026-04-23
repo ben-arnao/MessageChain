@@ -57,6 +57,7 @@ those roots re-verified. Treat the upgrade as a hard consensus change.
 import hashlib
 import struct
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 # Every account's leaf address is hash-of-entity-id, so the tree depth
 # matches the hash output in bits. 256 bits → 256 levels.
@@ -64,7 +65,7 @@ TREE_DEPTH = 256
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # Precomputed empty-subtree hashes. _EMPTY[level] is the hash of a

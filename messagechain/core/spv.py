@@ -17,10 +17,11 @@ import hashlib
 from dataclasses import dataclass, field
 from messagechain.config import HASH_ALGO
 from messagechain.core.block import Block, canonical_block_tx_hashes
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # Cap on siblings.  A path for a tree with N leaves is at most

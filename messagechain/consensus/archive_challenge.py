@@ -73,6 +73,7 @@ from messagechain.config import (
     ARCHIVE_CHALLENGE_VERSION,
     HASH_ALGO,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 # Domain tag for the challenge seed — prevents cross-protocol preimage
@@ -82,7 +83,7 @@ _CHALLENGE_DOMAIN_TAG = b"archive-challenge"
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # ── Challenge derivation ──────────────────────────────────────────────
@@ -924,7 +925,7 @@ def apply_archive_rewards(
     # randomness bytes.
     if selection_seed is not None and valid_proofs:
         def _shuffle_key(p: CustodyProof) -> bytes:
-            return _hashlib.new(HASH_ALGO, selection_seed + p.prover_id).digest()
+            return default_hash(selection_seed + p.prover_id)
         valid_proofs = sorted(valid_proofs, key=_shuffle_key)
 
     # Pay out up to cap; stop on pool exhaustion.

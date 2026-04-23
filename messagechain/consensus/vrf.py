@@ -28,10 +28,11 @@ Seed management:
 import hashlib
 import struct
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def compute_randao_commitment(seed: bytes) -> bytes:

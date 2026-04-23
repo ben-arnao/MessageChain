@@ -63,6 +63,7 @@ from messagechain.config import (
 )
 from messagechain.core.release_version import parse_release_version
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 # Domain-separation tag — bound into `_signable_data` so a signature
 # over a ReleaseAnnounce manifest cannot be replayed against any other
@@ -80,7 +81,7 @@ _NONCE_SIZE = 16
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _canonical_binary_hashes_blob(binary_hashes: Dict[str, bytes]) -> bytes:

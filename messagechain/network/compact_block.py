@@ -17,10 +17,11 @@ from dataclasses import dataclass, field
 from messagechain.config import HASH_ALGO
 from messagechain.core.block import Block, BlockHeader
 from messagechain.core.transaction import MessageTransaction
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _short_tx_id(tx_hash: bytes, nonce: bytes = b"") -> bytes:

@@ -24,6 +24,7 @@ from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
 from messagechain.identity.identity import Entity
+from messagechain.crypto.hashing import default_hash
 from messagechain.crypto.keys import Signature, verify_signature
 
 
@@ -88,7 +89,7 @@ class MessageTransaction:
         return decode_payload(self.message, self.compression_flag)
 
     def _compute_hash(self) -> bytes:
-        return hashlib.new(HASH_ALGO, self._signable_data()).digest()
+        return default_hash(self._signable_data())
 
     def _compute_witness_hash(self) -> bytes:
         """Hash covering both transaction data AND signature.
@@ -440,7 +441,7 @@ def create_transaction(
     )
 
     # Sign the transaction data with quantum-resistant signature
-    msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
+    msg_hash = default_hash(tx._signable_data())
     tx.signature = entity.keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
     tx.witness_hash = tx._compute_witness_hash()
@@ -508,5 +509,5 @@ def verify_transaction(
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
-    msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
+    msg_hash = default_hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

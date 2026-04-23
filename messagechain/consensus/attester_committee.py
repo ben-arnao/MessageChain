@@ -31,6 +31,7 @@ import hashlib
 from decimal import Decimal, localcontext
 
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 
 # Each committee slot pays exactly this many tokens.  Must be integer.
@@ -141,7 +142,7 @@ def _deterministic_weighted_sample(
     with localcontext() as ctx:
         ctx.prec = 40
         for item, w in zip(items, weights):
-            h = hashlib.new(HASH_ALGO, randomness + item).digest()
+            h = default_hash(randomness + item)
             # Convert hash to a value in (0, 1] — avoid 0 for log-domain safety.
             hash_int = int.from_bytes(h[:8], "big") + 1
             if w <= 0:

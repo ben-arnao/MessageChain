@@ -58,6 +58,7 @@ from messagechain.config import (
     CHAIN_ID, HASH_ALGO, MIN_FEE, SIG_VERSION_CURRENT, WITNESS_SURCHARGE,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -88,7 +89,7 @@ _VALID_ACK_CODES: frozenset = frozenset({ACK_ADMITTED, ACK_REJECTED})
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # ─────────────────────────────────────────────────────────────────────

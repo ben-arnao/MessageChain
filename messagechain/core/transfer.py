@@ -25,10 +25,11 @@ from messagechain.config import (
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

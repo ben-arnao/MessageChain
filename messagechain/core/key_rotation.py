@@ -21,6 +21,7 @@ from messagechain.config import (
     HASH_ALGO, KEY_ROTATION_FEE, CHAIN_ID, MAX_TIMESTAMP_DRIFT,
     SIG_VERSION_CURRENT,
 )
+from messagechain.crypto.hashing import default_hash
 from messagechain.crypto.keys import Signature, verify_signature, KeyPair
 from messagechain.identity.identity import Entity
 
@@ -62,7 +63,7 @@ class KeyRotationTransaction:
         )
 
     def _compute_hash(self) -> bytes:
-        return hashlib.new(HASH_ALGO, self._signable_data()).digest()
+        return default_hash(self._signable_data())
 
     def serialize(self) -> dict:
         return {
@@ -188,7 +189,7 @@ def create_key_rotation(
     )
 
     # Sign with the OLD key to prove current ownership
-    msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
+    msg_hash = default_hash(tx._signable_data())
     tx.signature = entity.keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
 
@@ -230,7 +231,7 @@ def verify_key_rotation(
     ):
         return False
 
-    msg_hash = hashlib.new(HASH_ALGO, tx._signable_data()).digest()
+    msg_hash = default_hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, current_public_key)
 
 

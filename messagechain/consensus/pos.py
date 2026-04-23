@@ -22,10 +22,11 @@ from messagechain.core.block import Block, BlockHeader, compute_merkle_root
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import verify_signature
 from messagechain.consensus.attestation import Attestation, create_attestation, verify_attestation
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 class ProofOfStake:

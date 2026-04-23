@@ -40,13 +40,14 @@ from messagechain.config import (
     STATE_CHECKPOINT_THRESHOLD_DENOMINATOR,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 _STATE_CKPT_DOMAIN_TAG = b"STATE_CKPT_V1"
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

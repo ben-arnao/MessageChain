@@ -23,10 +23,11 @@ from messagechain.config import (
     HASH_ALGO,
     MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def compute_mempool_snapshot_root(tx_hashes: list[bytes]) -> bytes:

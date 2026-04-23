@@ -44,10 +44,11 @@ from messagechain.config import (
     validate_tx_serialization_version,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _decode_unstake_like(cls, data: bytes, label: str, state=None):
