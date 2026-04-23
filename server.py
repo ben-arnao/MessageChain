@@ -3224,8 +3224,23 @@ class Server(SharedRuntimeMixin):
             await self._handle_getdata(msg.payload, peer)
 
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
+            # ANNOUNCE_TX carries either a MessageTransaction payload or
+            # a TransferTransaction payload — both land in the shared
+            # mempool and both are legitimate gossip targets.  Pre-fix,
+            # this handler only deserialized MessageTransaction, so a
+            # transfer announced by an off-host submitter (CLI on a peer
+            # node) failed to parse, got scored as invalid_tx_data, and
+            # never reached the block producer's mempool.  Dispatch on
+            # the `type` discriminator that TransferTransaction.serialize
+            # writes into the dict.
+            payload = msg.payload
+            tx_type = payload.get("type") if isinstance(payload, dict) else None
+            is_transfer = tx_type == "transfer"
             try:
-                tx = MessageTransaction.deserialize(msg.payload)
+                if is_transfer:
+                    tx = TransferTransaction.deserialize(payload)
+                else:
+                    tx = MessageTransaction.deserialize(payload)
             except Exception:
                 self.ban_manager.record_offense(
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_tx_data"
@@ -3235,9 +3250,18 @@ class Server(SharedRuntimeMixin):
             if tx_hash_hex in self._seen_txs:
                 return
             pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
-            valid, reason = self.blockchain.validate_transaction(
-                tx, expected_nonce=pending_nonce,
-            )
+            # Route validation through the type-specific validator —
+            # validate_transaction only understands MessageTransaction
+            # and will reject transfers for structural reasons that
+            # would look like malice (missing fields, etc.).
+            if is_transfer:
+                valid, reason = self.blockchain.validate_transfer_transaction(
+                    tx, expected_nonce=pending_nonce,
+                )
+            else:
+                valid, reason = self.blockchain.validate_transaction(
+                    tx, expected_nonce=pending_nonce,
+                )
             if valid:
                 self._track_seen_tx(tx_hash_hex)
                 # Record arrival height - see _rpc_submit_transaction for rationale.
