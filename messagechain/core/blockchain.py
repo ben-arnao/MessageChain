@@ -4380,15 +4380,84 @@ class Blockchain:
             _bump_wm(etx.submitter_id, etx.signature.leaf_index)
             sim_br_processed.add(etx.evidence_hash)
 
-        return compute_state_root(
-            sim_balances, sim_nonces, sim_staked,
-            authority_keys=sim_authority_keys,
-            public_keys=sim_public_keys,
-            leaf_watermarks=sim_leaf_watermarks,
-            key_rotation_counts=sim_rotation_counts,
-            revoked_entities=sim_revoked,
-            slashed_validators=sim_slashed,
+        # Incremental state-root commitment via the live state_tree.
+        # The old path called ``compute_state_root(sim_*)`` which built a
+        # fresh SparseMerkleTree from scratch: O(N_accounts * TREE_DEPTH)
+        # hash operations per propose AND per validate, independent of
+        # how many entities the block actually touched.  That contradicts
+        # the property the state_tree is supposed to provide (see
+        # __init__'s docstring on ``state_tree``: "block proposal /
+        # validation is independent of total account count").
+        #
+        # Here instead we open a journal on the LIVE tree, apply only the
+        # leaves whose committed tuple actually differs from the sim's
+        # post-apply value, read the root, then roll back.  Journal
+        # rollback is O(changes) (see SparseMerkleTree.rollback), so the
+        # live tree emerges bit-identical to its pre-call state — the
+        # test suite pins this via the "side effects" tests in
+        # tests/test_compute_post_state_root_incremental.py.
+        #
+        # The diff scan over the union of sim dicts is O(N_accounts)
+        # cheap comparisons (integers / bytes equality), no hashing.
+        # Tree mutation + path rehash only fires for entities where the
+        # sim genuinely diverges from the live committed leaf, bounding
+        # the hash work to O(K_touched * TREE_DEPTH).
+        #
+        # The ``compute_state_root`` full-rebuild helper stays in the
+        # tree (and is re-exported from block.py) for the test/fallback
+        # callers that only have dicts in hand — e.g., a light-client
+        # one-shot commitment or the snapshot-sync path.  It MUST NOT
+        # be called from propose/validate.
+        touched_keys: set[bytes] = (
+            set(sim_balances)
+            | set(sim_nonces)
+            | set(sim_staked)
+            | set(sim_authority_keys)
+            | set(sim_public_keys)
+            | set(sim_leaf_watermarks)
+            | set(sim_rotation_counts)
+            | set(sim_revoked)
+            | set(sim_slashed)
         )
+        self.state_tree.begin()
+        try:
+            for eid in touched_keys:
+                # Build the full committed-tuple shape the SMT leaf uses
+                # (see SparseMerkleTree._DEFAULT_AUTH for field order).
+                new_tuple = (
+                    sim_balances.get(eid, 0),
+                    sim_nonces.get(eid, 0),
+                    sim_staked.get(eid, 0),
+                    sim_authority_keys.get(eid, b""),
+                    sim_public_keys.get(eid, b""),
+                    sim_leaf_watermarks.get(eid, 0),
+                    sim_rotation_counts.get(eid, 0),
+                    eid in sim_revoked,
+                    eid in sim_slashed,
+                )
+                # Fast path: if the committed leaf already matches the
+                # sim value, the set() would be a no-op anyway — skip
+                # it to avoid even the journal overhead.  O(1) dict
+                # lookup + tuple compare.
+                if self.state_tree.get(eid) == new_tuple:
+                    continue
+                self.state_tree.set(
+                    eid,
+                    new_tuple[0], new_tuple[1], new_tuple[2],
+                    authority_key=new_tuple[3],
+                    public_key=new_tuple[4],
+                    leaf_watermark=new_tuple[5],
+                    rotation_count=new_tuple[6],
+                    is_revoked=new_tuple[7],
+                    is_slashed=new_tuple[8],
+                )
+            return self.state_tree.root()
+        finally:
+            # Unconditional rollback: the sim must never leak mutations
+            # into the live tree, even on an exception path.  Rollback
+            # is O(changes) and doesn't snapshot the tree, so it's
+            # cheap regardless of K.
+            self.state_tree.rollback()
 
     def propose_block(
         self,
