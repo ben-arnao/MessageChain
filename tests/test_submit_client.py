@@ -565,25 +565,25 @@ class TestParallelFanout(SubmitClientTestBase):
         from messagechain.network.submit_client import (
             SubmitClient, ValidatorEndpoint,
         )
-        slow = self._spawn(delay_s=2.0)
-        fast = self._spawn(delay_s=0.1)
+        slow = self._spawn(delay_s=1.0)
+        fast = self._spawn(delay_s=0.05)
         endpoints = [
             ValidatorEndpoint(host="127.0.0.1", port=slow, insecure=True),
             ValidatorEndpoint(host="127.0.0.1", port=fast, insecure=True),
         ]
         client = SubmitClient(
             endpoints, min_successes=2,
-            per_endpoint_timeout_s=5.0,
+            per_endpoint_timeout_s=3.0,
             request_receipts=False,
         )
         tx = self._make_tx()
         t0 = time.time()
         result = client.submit(tx)
         elapsed = time.time() - t0
-        # Sequential would be > 2.1s; parallel ≈ 2.0s + small overhead.
-        # Allow generous slack for slow CI.
-        self.assertLess(elapsed, 3.0,
-                        f"fan-out took {elapsed:.2f}s — should be <3s")
+        # Sequential would be ≥ 1.05s; parallel ≈ 1.0s + small overhead.
+        # 1.5s threshold catches parallelism with 0.5s CI slack.
+        self.assertLess(elapsed, 1.5,
+                        f"fan-out took {elapsed:.2f}s — should be <1.5s")
         self.assertEqual(result.successes, 2)
 
 
