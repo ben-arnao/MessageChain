@@ -65,9 +65,6 @@ messagechain send "hello world" --fee 500       # pay a specific amount
 messagechain estimate-fee --message "hello world"   # preview cost
 ```
 
-By default the fee is auto-picked. Pass `--fee N` only if you want to
-override it.
-
 Your first outgoing transaction reveals your public key on-chain
 (the "first-spend pubkey install" path). After that, every
 subsequent transaction is verified against the installed key.
