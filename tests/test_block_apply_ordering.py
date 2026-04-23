@@ -244,43 +244,62 @@ class TestAttesterFeePoolResetBetweenBlocks(unittest.TestCase):
         self.assertEqual(s.attester_fee_pool_this_block, 0)
 
 
-class TestActivationHeightParity(unittest.TestCase):
-    """At the shipped shared activation height (50_000), the three
-    forks that interact with each other (FINALITY_REWARD_FROM_ISSUANCE,
-    TREASURY_REBASE, ATTESTER_FEE_FUNDING) all fire together.
+class TestActivationHeightOrdering(unittest.TestCase):
+    """Canonical fork-schedule ordering (see CLAUDE.md fork table).
 
-    When they fire together, ordering between finality-mint and
-    treasury-rebase is moot because finality no longer draws from
-    treasury.  This test locks that invariant explicitly — any
-    future refactor that re-introduces a treasury dependency at
-    the activation height must break this assertion.
+    Every inter-fork dependency must hold; a drift here means the
+    deployed schedule breaks an economic invariant the code relies on.
     """
 
-    def test_shared_activation_height(self):
-        self.assertEqual(
-            config.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
-            config.TREASURY_REBASE_HEIGHT,
-            "shipped forks share activation height — the rebase/mint "
-            "ordering is intentionally moot at this height",
-        )
-        self.assertEqual(
-            config.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
-            config.ATTESTER_FEE_FUNDING_HEIGHT,
-        )
-
-    def test_seed_ceiling_and_finality_cap_post_shared_activation(self):
-        """The two new forks from this worktree (seed stake ceiling +
-        finality-vote apply cap) must activate AT or AFTER the
-        shared 50_000 height — they are defense-in-depth gates
-        layered on top of the existing forks, never before them.
+    def test_finality_cap_activates_before_direct_mint(self):
+        """The defensive per-block finality-vote mint cap MUST activate
+        BEFORE the direct-mint path goes live — any window where mint
+        runs without the cap is an uncapped-issuance failure under
+        validation drift (exactly the hazard the cap was created for).
         """
-        self.assertGreaterEqual(
-            config.SEED_STAKE_CEILING_HEIGHT,
-            config.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
-        )
-        self.assertGreaterEqual(
+        self.assertLess(
             config.FINALITY_VOTE_CAP_HEIGHT,
             config.FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
+        )
+
+    def test_attester_reward_ordering(self):
+        """Cap-fix follows cap; cap follows pro-rata split + fee-funding."""
+        self.assertLess(
+            config.ATTESTER_REWARD_SPLIT_HEIGHT,
+            config.ATTESTER_REWARD_CAP_HEIGHT,
+        )
+        self.assertLess(
+            config.ATTESTER_FEE_FUNDING_HEIGHT,
+            config.ATTESTER_REWARD_CAP_HEIGHT,
+        )
+        self.assertLess(
+            config.ATTESTER_REWARD_CAP_HEIGHT,
+            config.ATTESTER_CAP_FIX_HEIGHT,
+        )
+
+    def test_divestment_ordering(self):
+        """REDIST extends RETUNE; ordering is monotonic."""
+        self.assertLessEqual(
+            config.SEED_DIVESTMENT_RETUNE_HEIGHT,
+            config.SEED_DIVESTMENT_REDIST_HEIGHT,
+        )
+
+    def test_deflation_floor_v2_supersedes_v1(self):
+        self.assertLess(
+            config.DEFLATION_FLOOR_HEIGHT,
+            config.DEFLATION_FLOOR_V2_HEIGHT,
+        )
+
+    def test_registration_burn_follows_min_stake_raise(self):
+        self.assertLess(
+            config.MIN_STAKE_RAISE_HEIGHT,
+            config.VALIDATOR_REGISTRATION_BURN_HEIGHT,
+        )
+
+    def test_flat_fee_follows_sig_aware_fee(self):
+        self.assertLess(
+            config.FEE_INCLUDES_SIGNATURE_HEIGHT,
+            config.FLAT_FEE_HEIGHT,
         )
 
 

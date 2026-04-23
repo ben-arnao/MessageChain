@@ -62,11 +62,11 @@ class TestFeeIncludesSigHeightEnvSet(unittest.TestCase):
 
 
 class TestFeeIncludesSigHeightDefault(unittest.TestCase):
-    """Test B: env-var unset → hardcoded placeholder default (50_000)."""
+    """Test B: env-var unset → hardcoded canonical default (64_000, Tier 2)."""
 
     def test_default_when_unset(self):
         out = _run_config_probe({}, _PROBE)
-        self.assertEqual(out, "50000")
+        self.assertEqual(out, "64000")
 
 
 class TestFeeIncludesSigHeightInvalidInt(unittest.TestCase):

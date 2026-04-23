@@ -103,9 +103,10 @@ class TestCapTighteningConstants(unittest.TestCase):
             365 * 86_400,
         )
 
-    def test_activation_height_constant(self):
+    def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "TREASURY_CAP_TIGHTEN_HEIGHT"))
-        self.assertEqual(config.TREASURY_CAP_TIGHTEN_HEIGHT, 50_000)
+        # Tier 1 of the canonical fork schedule (see CLAUDE.md).
+        self.assertEqual(config.TREASURY_CAP_TIGHTEN_HEIGHT, 52_000)
 
     def test_helper_returns_legacy_bps_pre_activation(self):
         self.assertEqual(
@@ -230,10 +231,13 @@ class TestPostActivationPerEpochTighter(unittest.TestCase):
 
     def test_spend_over_post_tighten_cap_rejected(self):
         supply = _fresh_supply(7_000_000)
-        # 0.11% = 7,700 — above the 0.1% cap.
+        # 0.11% = 7,700 — above the 0.1% cap.  Use a block at/after
+        # TREASURY_REBASE_HEIGHT so the per-epoch cap block is active
+        # (the tighten height is strictly earlier in the canonical
+        # schedule, so the cap is already tightened by then).
         ok = supply.treasury_spend(
             _recipient(), 7_700,
-            current_block=config.TREASURY_CAP_TIGHTEN_HEIGHT,
+            current_block=config.TREASURY_REBASE_HEIGHT,
         )
         self.assertFalse(ok)
         # Treasury untouched on reject.
@@ -245,7 +249,7 @@ class TestPostActivationPerEpochTighter(unittest.TestCase):
         supply = _fresh_supply(7_000_000)
         ok = supply.treasury_spend(
             _recipient(), 70_000,
-            current_block=config.TREASURY_CAP_TIGHTEN_HEIGHT,
+            current_block=config.TREASURY_REBASE_HEIGHT,
         )
         self.assertFalse(ok)
 
@@ -462,10 +466,13 @@ class TestCapInteraction(unittest.TestCase):
     def test_satisfies_annual_but_violates_per_epoch_rejects(self):
         supply = _fresh_supply(7_000_000)
         # 2% of 7M = 140,000 — well over the 0.1% per-epoch cap
-        # (7,000) but inside the 5% annual cap (350,000).
+        # (7,000) but inside the 5% annual cap (350,000).  Use
+        # TREASURY_REBASE_HEIGHT so the per-epoch cap block is active
+        # (tighten height is earlier in the canonical schedule, so
+        # by REBASE the cap is already tightened).
         ok = supply.treasury_spend(
             _recipient(), 140_000,
-            current_block=config.TREASURY_CAP_TIGHTEN_HEIGHT,
+            current_block=config.TREASURY_REBASE_HEIGHT,
         )
         self.assertFalse(ok)
 

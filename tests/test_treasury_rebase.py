@@ -86,12 +86,10 @@ class TestRebaseConstants(unittest.TestCase):
         self.assertTrue(hasattr(config, "TREASURY_REBASE_BURN_AMOUNT"))
         self.assertEqual(config.TREASURY_REBASE_BURN_AMOUNT, 33_000_000)
 
-    def test_activation_height_is_placeholder(self):
+    def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "TREASURY_REBASE_HEIGHT"))
-        # Matches the convention used by the three prior forks
-        # (FEE_INCLUDES_SIGNATURE_HEIGHT, ATTESTER_REWARD_SPLIT_HEIGHT,
-        # UNBONDING_PERIOD_EXTENSION_HEIGHT).
-        self.assertEqual(config.TREASURY_REBASE_HEIGHT, 50_000)
+        # Tier 3 of the canonical fork schedule (see CLAUDE.md).
+        self.assertEqual(config.TREASURY_REBASE_HEIGHT, 68_000)
 
     def test_spend_cap_constant(self):
         self.assertTrue(hasattr(config, "TREASURY_MAX_SPEND_BPS_PER_EPOCH"))
