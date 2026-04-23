@@ -199,7 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     unstake = sub.add_parser(
         "unstake",
         help="Unstake tokens",
-        description="Unlock staked tokens (7-day unbonding period).",
+        description=(
+            "Unlock staked tokens. Unbonding period is ~7 days before "
+            "block 50,000 and ~15 days after (UNBONDING_PERIOD_EXTENSION_HEIGHT); "
+            "the window covers the evidence slashing lookback."
+        ),
     )
     unstake.add_argument("--amount", type=int, required=True, help="Amount to unstake")
     unstake.add_argument("--fee", type=int, default=None, help="Transaction fee")
@@ -299,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
             "suspected compromised. Signed by the cold authority key (NOT "
             "the hot signing key). After this runs: the validator can no "
             "longer propose blocks or attest, and all active stake enters "
-            "the normal 7-day unbonding queue so the legitimate operator "
+            "the normal unbonding queue so the legitimate operator "
             "recovers the funds. Keep a pre-signed revoke tx on paper for "
             "rapid response."
         ),
@@ -552,6 +556,36 @@ def resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
         args.data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
 
     return args
+
+
+def _describe_unbonding_period(tip_height: int | None) -> str:
+    """Human-readable unbonding window for the active fork state.
+
+    Callers pass the observed tip height (from an RPC probe) so the
+    message matches what the chain will actually enforce when the
+    unstake lands.  Tip unknown -> describe both regimes so the user
+    isn't misled into planning on the wrong window.
+    """
+    from messagechain.config import (
+        BLOCK_TIME_TARGET,
+        UNBONDING_PERIOD_EXTENSION_HEIGHT,
+        UNBONDING_PERIOD_LEGACY,
+        UNBONDING_PERIOD_POST_EXTENSION,
+    )
+    legacy_days = round(UNBONDING_PERIOD_LEGACY * BLOCK_TIME_TARGET / 86400)
+    post_days = round(UNBONDING_PERIOD_POST_EXTENSION * BLOCK_TIME_TARGET / 86400)
+    if tip_height is None:
+        return (
+            f"~{legacy_days}-day unbonding pre block "
+            f"{UNBONDING_PERIOD_EXTENSION_HEIGHT:,}, "
+            f"~{post_days}-day after"
+        )
+    if tip_height >= UNBONDING_PERIOD_EXTENSION_HEIGHT:
+        return f"~{post_days}-day unbonding"
+    return (
+        f"~{legacy_days}-day unbonding (extends to ~{post_days}-day "
+        f"at block {UNBONDING_PERIOD_EXTENSION_HEIGHT:,})"
+    )
 
 
 def _parse_server(server_str):
@@ -1570,7 +1604,7 @@ def cmd_unstake(args):
     entity.keypair.advance_to_leaf(watermark)
 
     # Default fee: post-flat floor is safe pre- and post-activation.
-    # See cmd_stake for rationale — 1 was below both MIN_FEE floors.
+    # See cmd_stake for rationale -- 1 was below both MIN_FEE floors.
     from messagechain.config import MIN_FEE_POST_FLAT
     fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
@@ -1578,13 +1612,21 @@ def cmd_unstake(args):
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")
 
     if not getattr(args, "yes", False):
+        # Probe tip height so the warning reflects the CURRENTLY active
+        # unbonding fork, not a stale constant baked into the help text.
+        tip_resp = rpc_call(host, port, "get_chain_info", {})
+        tip_height: int | None = None
+        if tip_resp.get("ok"):
+            count = tip_resp["result"].get("height", 0) or 0
+            tip_height = max(count - 1, 0)
         print(f"\nAbout to unstake:")
         print(f"  Amount:  {args.amount} tokens")
         print(f"  Fee:     {fee} tokens")
         print(f"  Entity:  {entity.entity_id_hex[:16]}...{entity.entity_id_hex[-8:]} (self)")
         print(
-            "  Warning: unstaked funds enter a 7-day UNBONDING_PERIOD "
-            "before they return to your balance."
+            f"  Warning: unstaked funds enter UNBONDING_PERIOD "
+            f"({_describe_unbonding_period(tip_height)}) before they "
+            f"return to your balance."
         )
         confirm = input("\nConfirm unstake (type 'yes' to proceed): ").strip().lower()
         if confirm != "yes":
@@ -1967,6 +2009,14 @@ def cmd_emergency_revoke(args):
         cold, fee=fee, entity_id=target_entity_id,
     )
 
+    # Probe tip height so the warning reflects the CURRENTLY active
+    # unbonding fork.
+    tip_resp = rpc_call(host, port, "get_chain_info", {})
+    revoke_tip: int | None = None
+    if tip_resp.get("ok"):
+        count = tip_resp["result"].get("height", 0) or 0
+        revoke_tip = max(count - 1, 0)
+
     if not getattr(args, "yes", False):
         tid_hex = target_entity_id.hex()
         tid_short = f"{tid_hex[:16]}...{tid_hex[-8:]}"
@@ -1975,10 +2025,11 @@ def cmd_emergency_revoke(args):
         print(f"  (full: {tid_hex})")
         print(f"  Fee:           {fee} tokens")
         print(
-            "  This disables the validator PERMANENTLY.  Staked funds "
-            "release to the operator's balance after the 7-day "
-            "unbonding period, but block production is stopped "
-            "immediately and cannot be undone."
+            f"  This disables the validator PERMANENTLY.  Staked funds "
+            f"release to the operator's balance after the unbonding "
+            f"period ({_describe_unbonding_period(revoke_tip)}), but "
+            f"block production is stopped immediately and cannot be "
+            f"undone."
         )
         confirm = input(
             "\nConfirm emergency-revoke (type 'yes' to proceed): "
@@ -1997,7 +2048,10 @@ def cmd_emergency_revoke(args):
         print(f"  Entity ID: {result['entity_id']}")
         print(f"  TX hash:   {result['tx_hash']}")
         print(f"\nThe validator can no longer propose blocks. Staked funds")
-        print("will release to your balance after the 7-day unbonding period.")
+        print(
+            f"will release to your balance after the unbonding period "
+            f"({_describe_unbonding_period(revoke_tip)})."
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)

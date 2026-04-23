@@ -121,7 +121,7 @@ WOTS+ signing key before it exhausts.
 ```bash
 messagechain start --mine                       # run a validator
 messagechain stake --amount 10000               # lock as validator stake
-messagechain unstake --amount 5000              # 7-day unbonding
+messagechain unstake --amount 5000              # ~15-day unbonding (was 7d pre block 50,000)
 messagechain key-status                         # WOTS+ leaf usage; when to rotate
 messagechain rotate-key                         # fresh keypair, old key retired
 messagechain set-authority-key --authority-pubkey <cold_hex>
