@@ -2924,8 +2924,17 @@ class Server(SharedRuntimeMixin):
                                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
                             )
                             await write_message(peer.writer, msg)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            # Write failures usually mean the peer went
+                            # away.  Mark disconnected so the next
+                            # maintenance sweep prunes them; logged at
+                            # debug for operator diagnosability without
+                            # spamming on routine peer churn.
+                            logger.debug(
+                                f"height-request write to {addr} "
+                                f"failed: {e}"
+                            )
+                            peer.is_connected = False
 
                 if self.syncer.needs_sync():
                     await self.syncer.start_sync()
@@ -2976,8 +2985,14 @@ class Server(SharedRuntimeMixin):
                     break
                 first_message = False
                 await self._handle_p2p_message(msg, peer)
-        except Exception:
-            pass
+        except Exception as e:
+            # Any exception in the P2P handler loop is either a protocol
+            # violation by the peer or an internal bug.  Log at debug so
+            # operators debugging flaky peers can trace it; the finally
+            # block below handles the connection cleanup.
+            logger.debug(
+                f"P2P handler loop for {address} exited with exception: {e}"
+            )
         finally:
             peer.is_connected = False
             self.rate_limiter.remove_peer(address)
@@ -3679,7 +3694,13 @@ class Server(SharedRuntimeMixin):
             if peer.is_connected and peer.writer:
                 try:
                     await write_message(peer.writer, msg)
-                except Exception:
+                except Exception as e:
+                    # Broadcast write failure means the peer went away.
+                    # Mark disconnected for maintenance-sweep cleanup; log
+                    # at debug for diagnosability without spam.
+                    logger.debug(
+                        f"broadcast write to {addr} failed: {e}"
+                    )
                     peer.is_connected = False
 
 

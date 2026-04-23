@@ -1508,7 +1508,12 @@ def cmd_stake(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 1
+    # Default fee: post-flat floor is the safe choice pre- and post-
+    # activation (MIN_FEE=100 pre, MIN_FEE_POST_FLAT=1000 post).  The
+    # previous default of 1 was below BOTH floors and got on-chain-
+    # rejected for underpriced whenever --fee was omitted.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
@@ -1564,7 +1569,10 @@ def cmd_unstake(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 1
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    # See cmd_stake for rationale — 1 was below both MIN_FEE floors.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")
@@ -1769,7 +1777,9 @@ def cmd_set_authority_key(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else 500
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_set_authority_key_transaction(
         entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee,
     )
@@ -1950,7 +1960,9 @@ def cmd_emergency_revoke(args):
     # Revoke is nonce-free - no RPC roundtrip required to sign, which is
     # what makes the "keep a pre-signed revoke tx on paper" workflow
     # practical. The cold key's leaf index is local to its own KeyPair.
-    fee = args.fee if args.fee is not None else 500
+    # Default fee: post-flat floor is safe pre- and post-activation.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
     tx = create_revoke_transaction(
         cold, fee=fee, entity_id=target_entity_id,
     )
