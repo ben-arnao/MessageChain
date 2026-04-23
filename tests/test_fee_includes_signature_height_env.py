@@ -53,10 +53,12 @@ class TestFeeIncludesSigHeightEnvSet(unittest.TestCase):
 
     def test_env_var_override_applied(self):
         out = _run_config_probe(
-            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "123456"},
+            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "75000"},
             _PROBE,
         )
-        self.assertEqual(out, "123456")
+        # Must be < FLAT_FEE_HEIGHT (98000) per config.py's invariant
+        # assertion that the signature-gate precedes the flat-fee fork.
+        self.assertEqual(out, "75000")
 
 
 class TestFeeIncludesSigHeightDefault(unittest.TestCase):
