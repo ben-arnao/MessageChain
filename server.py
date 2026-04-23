@@ -1073,6 +1073,16 @@ class Server(SharedRuntimeMixin):
 
         self.wallet_id: bytes | None = None  # the entity_id that earns fees
         self.wallet_entity: Entity | None = None  # full entity for block signing
+        # Serializes read-and-advance of wallet_entity.keypair._next_leaf
+        # across (a) block-production sign() calls running in the thread
+        # pool via asyncio.to_thread and (b) reserve_leaf RPC handlers
+        # running on the event loop thread.  Without this lock, an
+        # operator CLI transfer could read the same _next_leaf value
+        # that the block producer is about to consume — two WOTS+
+        # signatures at the same leaf mathematically reveal the private
+        # key, so the lock is a correctness guard, not an optimization.
+        import threading as _threading_wl
+        self._wallet_leaf_lock = _threading_wl.Lock()
         self.receipt_issuer = None  # ReceiptIssuer for submission receipts
         self._running = False
 
@@ -1640,6 +1650,9 @@ class Server(SharedRuntimeMixin):
 
         elif method == "submit_transfer":
             return self._rpc_submit_transfer(request["params"])
+
+        elif method == "reserve_leaf":
+            return self._rpc_reserve_leaf(request["params"])
 
         elif method == "submit_proposal":
             return self._rpc_submit_proposal(request["params"])
@@ -2538,6 +2551,88 @@ class Server(SharedRuntimeMixin):
         }
         return {"ok": True, "result": result}
 
+    def _rpc_reserve_leaf(self, params: dict) -> dict:
+        """Atomically reserve the next WOTS+ leaf for a co-resident signer.
+
+        Co-resident operator flow:
+          1. CLI (cmd_transfer / cmd_stake) runs on the same host as the
+             validator daemon and signs with the same entity the daemon
+             block-signs with.
+          2. CLI calls reserve_leaf before signing.
+          3. Server picks `leaf = max(in-memory _next_leaf, chain watermark)`,
+             advances its in-memory _next_leaf to leaf+1 (and persists the
+             leaf index if a path is wired), returns leaf.
+          4. CLI signs at leaf; submits tx via the usual RPC path.
+          5. The daemon's next block sign will NOT collide — its own
+             _next_leaf was already bumped past `leaf` in step 3.
+
+        If the caller's entity_id doesn't match this daemon's wallet,
+        no reservation is possible — we return the current chain
+        watermark as a hint so the caller can still use the legacy
+        watermark-only path (off-host signers never had coordination
+        and this RPC doesn't regress them).
+
+        Returns {'leaf_index': int, 'reserved': bool} where `reserved`
+        is True iff the daemon actually advanced its counter.
+        """
+        entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
+        if entity_id is None:
+            return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
+
+        chain_watermark = self.blockchain.get_leaf_watermark(entity_id)
+
+        # Off-host / third-party signer case: we don't hold their keypair,
+        # so we cannot burn a leaf on their behalf.  Return the watermark
+        # as a hint and let the caller fall back to legacy semantics.
+        if (
+            self.wallet_entity is None
+            or self.wallet_id is None
+            or entity_id != self.wallet_id
+        ):
+            return {
+                "ok": True,
+                "result": {
+                    "leaf_index": chain_watermark,
+                    "reserved": False,
+                },
+            }
+
+        # Co-resident signer: serialize with block production via the
+        # shared lock.  max() takes the later of (our in-memory counter,
+        # chain-visible watermark) so a CLI tx signed at leaf L that is
+        # still in the mempool — not yet folded into the chain watermark
+        # but already persisted to _next_leaf via this RPC — won't be
+        # handed out again to a second concurrent reserve_leaf caller.
+        with self._wallet_leaf_lock:
+            kp = self.wallet_entity.keypair
+            leaf = max(kp._next_leaf, chain_watermark)
+            if leaf >= kp.num_leaves:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"WOTS+ tree exhausted (leaf {leaf} >= "
+                        f"{kp.num_leaves}).  Rotate the key before signing."
+                    ),
+                }
+            try:
+                kp.advance_to_leaf(leaf + 1)
+                # Persist the advance so a crash-reboot skips the reserved
+                # leaf even if the caller never submits the tx.  Burning a
+                # leaf without a corresponding sign is cheap; reusing one
+                # is catastrophic.
+                if kp.leaf_index_path is not None:
+                    kp.persist_leaf_index(kp.leaf_index_path)
+            except Exception as e:
+                return {"ok": False, "error": sanitize_error(str(e))}
+
+        return {
+            "ok": True,
+            "result": {
+                "leaf_index": leaf,
+                "reserved": True,
+            },
+        }
+
     def _rpc_submit_transfer(self, params: dict) -> dict:
         """Accept a signed transfer transaction from a client."""
         try:
@@ -2831,15 +2926,20 @@ class Server(SharedRuntimeMixin):
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
 
-        block = self.blockchain.propose_block(
-            self.consensus, self.wallet_entity, txs,
-            transfer_transactions=transfer_txs,
-            slash_transactions=slash_txs,
-            authority_txs=authority_txs,
-            stake_transactions=stake_txs,
-            unstake_transactions=unstake_txs,
-            governance_txs=governance_txs,
-        )
+        # Serialize block sign with reserve_leaf RPC via the same lock
+        # — see _rpc_reserve_leaf / self._wallet_leaf_lock for the full
+        # rationale.  Without this, an operator CLI running on the same
+        # host can race the block producer for the same _next_leaf.
+        with self._wallet_leaf_lock:
+            block = self.blockchain.propose_block(
+                self.consensus, self.wallet_entity, txs,
+                transfer_transactions=transfer_txs,
+                slash_transactions=slash_txs,
+                authority_txs=authority_txs,
+                stake_transactions=stake_txs,
+                unstake_transactions=unstake_txs,
+                governance_txs=governance_txs,
+            )
 
         success, reason = self.blockchain.add_block(block)
         if success:

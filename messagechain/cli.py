@@ -43,6 +43,21 @@ def build_parser() -> argparse.ArgumentParser:
              "mnemonic, one line).  Allows unattended signing.  Ensure "
              "file permissions are 0400 or 0600.",
     )
+    # Global --data-dir.  When a signing command runs on the SAME host as
+    # the validator daemon (operator convenience case), passing --data-dir
+    # lets the CLI (a) reuse the daemon's cached WOTS+ keypair instead of
+    # regenerating a multi-minute tree, and (b) coordinate leaf reservation
+    # with the running server via the `reserve_leaf` RPC.  Without this
+    # flag, cmd_transfer / cmd_stake / etc. work the way they always did
+    # (fresh keygen, no daemon coordination) for off-host signers.
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Chain data directory (hot-validator co-host optimization).  "
+             "When set, signing subcommands load the keypair from the "
+             "daemon's on-disk cache and reserve leaves via the server's "
+             "reserve_leaf RPC — eliminating the multi-minute CLI keygen "
+             "and preventing WOTS+ leaf collisions with the running daemon.",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -827,7 +842,7 @@ class KeyFileError(Exception):
     """Raised when a --keyfile cannot be loaded (missing, empty, bad checksum)."""
 
 
-def _load_key_from_file(path: str) -> bytes:
+def _load_key_from_file(path: str, *, accept_raw_hex: bool = False) -> bytes:
     """Load and verify a checksummed private key from a file.
 
     Returns the raw 32-byte private key. Raises KeyFileError on any
@@ -837,6 +852,12 @@ def _load_key_from_file(path: str) -> bytes:
     On POSIX systems, warns if the file is group/world-readable. We do
     NOT refuse to load - operators may have valid reasons (e.g. container
     secrets) for wider perms - but we surface the risk.
+
+    When *accept_raw_hex* is True, also accept the daemon-side 64-char
+    raw-hex format (what server.py --keyfile consumes).  Off by default
+    so paper-backup users still get the checksum check — the CLI only
+    lowers the bar when it already knows it's running alongside a
+    daemon on the same host (operator path, via global --data-dir).
     """
     from messagechain.identity.key_encoding import (
         decode_private_key,
@@ -863,7 +884,23 @@ def _load_key_from_file(path: str) -> bytes:
             "The file may be corrupted or truncated."
         )
     except InvalidKeyFormatError as e:
-        raise KeyFileError(f"Key file has invalid format: {path}: {e}")
+        # Daemon-format keyfiles are plain 64-char hex (no 8-char
+        # checksum suffix).  When the caller explicitly opts in, fall
+        # back to that format so `--data-dir --keyfile /etc/messagechain/
+        # mainnet-keyfile` works without hand-reformatting the operator
+        # key just to satisfy the CLI's paper-backup checksum path.
+        stripped = contents.strip()
+        if accept_raw_hex and len(stripped) == 64:
+            try:
+                key = bytes.fromhex(stripped)
+                if len(key) != 32:
+                    raise ValueError("expected 32 bytes")
+            except ValueError as exc:
+                raise KeyFileError(
+                    f"Key file has invalid format: {path}: {exc}"
+                )
+        else:
+            raise KeyFileError(f"Key file has invalid format: {path}: {e}")
 
     # Reject permissive permissions (POSIX only - Windows stat is different).
     if hasattr(os, "getuid"):
@@ -880,6 +917,96 @@ def _load_key_from_file(path: str) -> bytes:
     return key
 
 
+def _load_cached_entity(private_key, data_dir):
+    """Load an Entity from the daemon's on-disk keypair cache, or None.
+
+    Used when a signing CLI runs co-resident with a validator daemon on
+    the same host: the daemon's cache (~30 min to regenerate from scratch
+    for a production tree_height=20 wallet) is reused, so `cli transfer`
+    / `cli stake` complete in seconds instead of forcing a fresh keygen.
+
+    Returns None if the cache is absent, stale, or the daemon was never
+    started from *data_dir* — the caller falls back to the slow path.
+    Cache authenticity is HMAC-verified by the daemon's loader, so a
+    corrupted or tampered cache file can't leak a wrong public key.
+
+    The on-disk tree_height must match the chain's stored height for
+    this entity, which for existing wallets is tracked via the
+    `--wallet` mechanism on the daemon.  We try 16 (prototype / the
+    operator-chosen height on mainnet bootstrap) then the config
+    default — both are cheap misses since _load_or_create_entity falls
+    straight through on a bad cache path without touching keygen.
+    """
+    try:
+        import importlib.util
+        import os as _os
+        spec = importlib.util.spec_from_file_location(
+            "_mc_server", _os.path.join(
+                _os.path.dirname(_os.path.dirname(__file__)), "server.py",
+            ),
+        )
+        if spec is None or spec.loader is None:
+            return None
+        srv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+    except Exception:
+        return None
+
+    from messagechain.config import MERKLE_TREE_HEIGHT, LEAF_INDEX_FILENAME
+    import os as _os
+    # Try the two most plausible heights in priority order: operator
+    # override (16) then the compiled-in default.  _load_or_create_entity
+    # falls straight through to fresh keygen on cache miss, so speculating
+    # costs only a short file-stat / HMAC-verify per attempt.
+    candidate_heights = []
+    for h in (16, MERKLE_TREE_HEIGHT):
+        if h not in candidate_heights:
+            candidate_heights.append(h)
+    for height in candidate_heights:
+        cache_path = srv._keypair_cache_path(private_key, height, data_dir)
+        if not _os.path.exists(cache_path):
+            continue
+        try:
+            entity = srv._load_or_create_entity(
+                private_key, height, data_dir, no_cache=False,
+            )
+        except Exception:
+            continue
+        # Bind leaf-index persistence so sign() durably burns the leaf
+        # before the signature can escape the process — same invariant
+        # the daemon relies on.  load_leaf_index silently tolerates a
+        # missing file (fresh wallet, never signed).
+        leaf_path = _os.path.join(data_dir, LEAF_INDEX_FILENAME)
+        try:
+            entity.keypair.leaf_index_path = leaf_path
+            entity.keypair.load_leaf_index(leaf_path)
+        except Exception:
+            entity.keypair.leaf_index_path = None
+        return entity
+    return None
+
+
+def _reserve_leaf_via_rpc(host, port, entity_id_hex):
+    """Ask the server to atomically reserve a leaf for the given entity.
+
+    Returns the reserved leaf index, or None if the server doesn't
+    implement the RPC (older daemons) — in which case the caller should
+    fall back to the chain-watermark path.  Reserving bumps the server's
+    in-memory _next_leaf so a subsequent block sign by the same wallet
+    will skip this leaf, preventing the CLI-vs-daemon collision that
+    would otherwise surface as two WOTS+ signatures at the same leaf.
+    """
+    from client import rpc_call
+    r = rpc_call(host, port, "reserve_leaf", {"entity_id": entity_id_hex})
+    if not r.get("ok"):
+        return None
+    result = r.get("result", {})
+    leaf = result.get("leaf_index")
+    if not isinstance(leaf, int):
+        return None
+    return leaf
+
+
 def _resolve_private_key(args=None):
     """Resolve the private key for a signing command.
 
@@ -892,8 +1019,14 @@ def _resolve_private_key(args=None):
     free, enabling unattended/scripted operation.
     """
     if args is not None and getattr(args, "keyfile", None):
+        # When --data-dir is set, the caller is co-resident with a
+        # daemon and the keyfile is almost certainly in daemon raw-hex
+        # format.  Opt into the 64-char parser so the CLI can sign
+        # with the SAME keyfile the validator unit is using, without
+        # needing a parallel checksummed copy of the operator key.
+        accept_raw = bool(getattr(args, "data_dir", None))
         try:
-            return _load_key_from_file(args.keyfile)
+            return _load_key_from_file(args.keyfile, accept_raw_hex=accept_raw)
         except KeyFileError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -1415,7 +1548,14 @@ def cmd_transfer(args):
         sys.exit(0)
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
 
     nonce_resp = rpc_call(host, port, "get_nonce", {
@@ -1425,8 +1565,16 @@ def cmd_transfer(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer an atomic server-side leaf reservation when the signer
+    # shares a wallet with a running daemon: reserve_leaf bumps the
+    # daemon's in-memory _next_leaf so its next block sign won't
+    # collide with this transfer.  Falls back to the chain-watermark
+    # path when the server doesn't implement reserve_leaf (older
+    # daemons) or when the signer's entity isn't this daemon's wallet.
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Receive-to-exist: determine whether this is a first-spend tx
     # (server has no pubkey for this entity yet).  If so we include
@@ -1524,7 +1672,14 @@ def cmd_stake(args):
     print("=== Stake Tokens ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nStaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -1539,8 +1694,11 @@ def cmd_stake(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer server-side atomic leaf reservation (see cmd_transfer).
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Default fee: post-flat floor is the safe choice pre- and post-
     # activation (MIN_FEE=100 pre, MIN_FEE_POST_FLAT=1000 post).  The
