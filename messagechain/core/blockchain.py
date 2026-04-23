@@ -221,6 +221,14 @@ class Blockchain:
             self.set_trusted_checkpoints(trusted_checkpoints)
         self.chain: list[Block] = []
         self.supply = SupplyTracker()
+        # Thread the persistence handle into SupplyTracker so the
+        # pending_unstakes mutation paths (unstake / process / slash)
+        # mirror each change into the `pending_unstakes` SQL table.
+        # Without this, a cold process restart loses the queue and
+        # process_pending_unstakes releases mismatched tokens vs. a
+        # peer that never restarted — forking consensus at the next
+        # state_root check.  None-safe: in-memory tests leave db=None.
+        self.supply.db = self.db
         self.base_fee: int = self.supply.base_fee  # mirror for easy access
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
@@ -694,6 +702,17 @@ class Blockchain:
         # Restore supply tracker
         self.supply.balances = self.db.get_all_balances()
         self.supply.staked = self.db.get_all_staked()
+        # Rehydrate the validator unbonding queue.  Without this, a
+        # cold-booted node starts with an empty pending_unstakes dict
+        # while `staked` already reflects the debit, so process_
+        # pending_unstakes releases nothing at maturity while
+        # uprestarted peers release the real tokens — the resulting
+        # balance drift diverges state_root and forks the restarted
+        # node off the honest chain.  `hasattr` gate keeps legacy
+        # chain.db files (pre-pending-unstakes-table) loadable under
+        # the new binary.
+        if hasattr(self.db, "get_all_pending_unstakes"):
+            self.supply.pending_unstakes = self.db.get_all_pending_unstakes()
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
@@ -9180,6 +9199,10 @@ class Blockchain:
         # the on-disk copy desynced from memory.
         self._dirty_entities = None
         self.supply = SupplyTracker()
+        # Re-thread the persistence handle — the fresh SupplyTracker
+        # has db=None by default, but restored state needs DB-mirrored
+        # pending_unstakes mutations during the replay loop.
+        self.supply.db = self.db
         self.nonces = {}
         self.entity_message_count = {}
         self.proposer_sig_counts = {}

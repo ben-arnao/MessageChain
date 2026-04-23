@@ -55,6 +55,16 @@ class SupplyTracker:
         self.staked: dict[bytes, int] = {}
         # Pending unstakes: entity_id -> list of (amount, release_block)
         self.pending_unstakes: dict[bytes, list[tuple[int, int]]] = {}
+        # Optional ChainDB handle.  When set by Blockchain.__init__ the
+        # pending_unstakes mutation paths (unstake / process / slash)
+        # mirror each change into the `pending_unstakes` SQL table so a
+        # cold process restart rehydrates the identical queue — without
+        # this mirror the in-memory queue is lost on restart and the
+        # next process_pending_unstakes call releases different tokens
+        # on restarted vs. un-restarted nodes, forking consensus at the
+        # next state_root check.  None-safe: tests and non-persisted
+        # contexts don't set it and the mirror calls are skipped.
+        self.db = None
         # EIP-1559 dynamic base fee
         self.base_fee: int = BASE_FEE_INITIAL
         # Per-block fee-burn ticker.  Incremented by every
@@ -865,11 +875,14 @@ class SupplyTracker:
         if entity_id not in self.pending_unstakes:
             self.pending_unstakes[entity_id] = []
         self.pending_unstakes[entity_id].append((amount, release_block))
+        if self.db is not None and hasattr(self.db, "add_pending_unstake"):
+            self.db.add_pending_unstake(entity_id, amount, release_block)
         return True
 
     def process_pending_unstakes(self, current_block: int) -> int:
         """Release matured unstakes. Returns total tokens released."""
         total_released = 0
+        db = self.db if hasattr(self, "db") else None
         for entity_id in list(self.pending_unstakes.keys()):
             pending = self.pending_unstakes[entity_id]
             still_pending = []
@@ -877,6 +890,11 @@ class SupplyTracker:
                 if current_block >= release_block:
                     self.balances[entity_id] = self.balances.get(entity_id, 0) + amount
                     total_released += amount
+                    # Mirror the matured ticket's removal into the DB
+                    # so a cold-booted node rehydrates a queue that
+                    # matches what the running node just released.
+                    if db is not None and hasattr(db, "clear_pending_unstake"):
+                        db.clear_pending_unstake(entity_id, release_block)
                 else:
                     still_pending.append((amount, release_block))
             if still_pending:
@@ -1079,6 +1097,13 @@ class SupplyTracker:
         self.staked[offender_id] = 0
         if offender_id in self.pending_unstakes:
             del self.pending_unstakes[offender_id]
+        # Mirror the slash into the DB so restarted peers see the same
+        # empty queue — without this, a cold-booted node would rehydrate
+        # a ghost queue for a slashed offender and release tokens that
+        # the canonical chain burned.
+        db = self.db if hasattr(self, "db") else None
+        if db is not None and hasattr(db, "clear_all_pending_unstakes"):
+            db.clear_all_pending_unstakes(offender_id)
 
         # Pay finder
         self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward
