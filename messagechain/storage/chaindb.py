@@ -146,6 +146,24 @@ class ChainDB:
                 amount INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Pending unbonding tickets for every validator that has
+            -- called unstake() but whose UNBONDING_PERIOD hasn't elapsed.
+            -- Tokens have been debited from `staked` but not yet
+            -- credited back to `balances` — they live here in the
+            -- meantime.  Consensus-critical: without persistence,
+            -- process_pending_unstakes(block_height) runs on a cold-
+            -- booted node with an empty queue while uprestarted peers
+            -- release the real tokens, producing a state_root mismatch
+            -- and forking the restarted node off the honest chain.
+            -- Composite key (entity_id, release_block) lets a single
+            -- entity stack multiple concurrent unstakes.
+            CREATE TABLE IF NOT EXISTS pending_unstakes (
+                entity_id BLOB NOT NULL,
+                release_block INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, release_block)
+            );
+
             CREATE TABLE IF NOT EXISTS nonces (
                 entity_id BLOB PRIMARY KEY,
                 nonce INTEGER NOT NULL DEFAULT 0
@@ -561,6 +579,75 @@ class ChainDB:
     def get_all_staked(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, amount FROM staked WHERE amount > 0")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Pending Unstakes ──────────────────────────────────
+    # Unbonding queue per validator.  Tokens here have been debited
+    # from `staked` but are not yet in `balances`; they sit for
+    # UNBONDING_PERIOD blocks before process_pending_unstakes releases
+    # them.  The table must be kept in lockstep with
+    # SupplyTracker.pending_unstakes — every queue insert in
+    # SupplyTracker.unstake() must mirror into add_pending_unstake(),
+    # and every matured release in process_pending_unstakes() must
+    # call clear_pending_unstake() for the (entity_id, release_block)
+    # composite key.
+
+    def add_pending_unstake(
+        self, entity_id: bytes, amount: int, release_block: int,
+    ) -> None:
+        """Persist one pending unstake ticket.
+
+        Uses INSERT OR REPLACE so a re-apply of the same (entity,
+        release_block) pair overwrites rather than duplicating —
+        matches the in-memory list semantics where a second append at
+        the exact same release_block is unreachable in normal flow but
+        deterministic under reorg replay.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_unstakes "
+            "(entity_id, release_block, amount) VALUES (?, ?, ?)",
+            (entity_id, int(release_block), int(amount)),
+        )
+        self._maybe_commit()
+
+    def clear_pending_unstake(
+        self, entity_id: bytes, release_block: int,
+    ) -> None:
+        """Delete one matured or slashed pending-unstake ticket."""
+        self._conn.execute(
+            "DELETE FROM pending_unstakes "
+            "WHERE entity_id = ? AND release_block = ?",
+            (entity_id, int(release_block)),
+        )
+        self._maybe_commit()
+
+    def clear_all_pending_unstakes(self, entity_id: bytes) -> None:
+        """Delete every pending-unstake ticket for an entity (slash path)."""
+        self._conn.execute(
+            "DELETE FROM pending_unstakes WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_pending_unstakes(
+        self,
+    ) -> dict[bytes, list[tuple[int, int]]]:
+        """Rehydrate the full pending-unstakes map on cold start.
+
+        Returns `{entity_id: [(amount, release_block), ...]}` with
+        release_block ordering preserved (ascending), matching the
+        in-memory list shape SupplyTracker expects.
+        """
+        cur = self._conn.execute(
+            "SELECT entity_id, amount, release_block "
+            "FROM pending_unstakes "
+            "ORDER BY entity_id, release_block",
+        )
+        out: dict[bytes, list[tuple[int, int]]] = {}
+        for eid, amount, release_block in cur.fetchall():
+            out.setdefault(bytes(eid), []).append(
+                (int(amount), int(release_block)),
+            )
+        return out
 
     # ── State: Nonces ────────────────────────────────────────────
 
@@ -1150,6 +1237,14 @@ class ChainDB:
             "proposer_sig_counts": self.get_all_proposer_sig_counts(),
             "leaf_watermarks": self.get_all_leaf_watermarks(),
             "authority_keys": self.get_all_authority_keys(),
+            # pending_unstakes must round-trip with the other supply
+            # state: a reorg that rolls past an unstake tx (but not past
+            # its maturity block) has to restore the ticket so the
+            # re-applied chain releases the same tokens at the same
+            # height a peer who never forked would.  Without this, a
+            # reorg-and-restore silently clears the queue and diverges
+            # consensus at the next `process_pending_unstakes`.
+            "pending_unstakes": self.get_all_pending_unstakes(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1173,6 +1268,10 @@ class ChainDB:
             # Authority keys revert with the block that set them. Keys set
             # on a fork that lost the reorg must not persist silently.
             conn.execute("DELETE FROM authority_keys")
+            # Pending-unstakes mirror the supply-state balances/staked
+            # that we just wiped — restore them alongside so the
+            # validator unbonding queue reflects the ancestor state.
+            conn.execute("DELETE FROM pending_unstakes")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -1193,6 +1292,14 @@ class ChainDB:
                     "INSERT INTO authority_keys (entity_id, authority_public_key) VALUES (?, ?)",
                     (eid, ak),
                 )
+            for eid, tickets in snapshot.get("pending_unstakes", {}).items():
+                for amount, release_block in tickets:
+                    conn.execute(
+                        "INSERT INTO pending_unstakes "
+                        "(entity_id, release_block, amount) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(release_block), int(amount)),
+                    )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
