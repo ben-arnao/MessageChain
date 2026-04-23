@@ -881,9 +881,6 @@ def _collect_private_key():
     except InvalidKeyFormatError as e:
         print(f"\nError: {e}")
         sys.exit(1)
-    except InvalidKeyFormatError as e:
-        print(f"\nError: {e}")
-        sys.exit(1)
 
 
 def cmd_start(args):
