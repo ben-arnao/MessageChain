@@ -16,10 +16,11 @@ This is the same approach used by Ethereum's Beacon Chain.
 
 import hashlib
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 class RANDAOMix:

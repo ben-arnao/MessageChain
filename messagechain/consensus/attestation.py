@@ -29,10 +29,11 @@ from messagechain.config import (
     CHAIN_ID, SIG_VERSION_CURRENT,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

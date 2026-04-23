@@ -30,6 +30,7 @@ import hashlib
 import math
 
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 
 def effective_reputation(rep: int, cap: int) -> int:
@@ -126,7 +127,7 @@ def select_lottery_winner(
     for eid, w in eligible:
         if w <= 0:
             continue
-        h = hashlib.new(HASH_ALGO, randomness + eid).digest()
+        h = default_hash(randomness + eid)
         u = (int.from_bytes(h[:8], "big") + 1) / (2**64)
         # Same log-space A-Res key as the attester committee sampler.
         key = math.log(u) / w

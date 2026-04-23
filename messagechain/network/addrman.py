@@ -26,10 +26,11 @@ from messagechain.config import (
     ADDRMAN_MAX_PER_SOURCE,
     ADDRMAN_HORIZON_DAYS,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _is_public_ip(ip: str) -> bool:

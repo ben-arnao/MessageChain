@@ -36,11 +36,12 @@ from messagechain.config import (
     MIN_FEE,
     SIG_VERSION_CURRENT,
 )
+from messagechain.crypto.hashing import default_hash
 from messagechain.crypto.keys import Signature, verify_signature
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

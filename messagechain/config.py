@@ -113,14 +113,18 @@ HASH_ALGO = "sha3_256"
 # Crypto agility — version bytes allow future algorithm upgrades via governance
 # without a chain reset. Validators MUST reject unknown versions.
 #
-# These are carry-only registers today (no dispatch table). When a future hash
-# or signature scheme ships, it is activated by a governance proposal that
-# bumps HASH_VERSION_CURRENT / SIG_VERSION_CURRENT — the existing gate simply
-# starts accepting the new value in addition to the old one for a migration
-# window. That's the upgrade path this field saves us from ever having to
-# hard-fork-and-reset over. SHA-256 will break someday (50 years? 200?); the
-# 1-byte-per-block + 1-byte-per-signature cost of carrying these now is a
-# trivial price for a chain designed to last 100-1000+ years.
+# HASH_VERSION_CURRENT / SIG_VERSION_CURRENT are active dispatch keys:
+# every hash in the codebase flows through
+# messagechain.crypto.hashing.default_hash (which consults
+# HASH_VERSION_CURRENT) and every signature verify dispatches on the
+# signature's own sig_version.  A future governance proposal activates
+# a new scheme by adding a row to hashing._ALGO_BY_VERSION (for hashes)
+# or widening _ACCEPTED_SIG_VERSIONS (for signatures), then bumping the
+# _CURRENT constant.  No logic edits are required at call sites — the
+# dispatcher is the single point of change.  SHA-256 will break someday
+# (50 years? 200?); the 1-byte-per-block + 1-byte-per-signature cost
+# of carrying these now is a trivial price for a chain designed to last
+# 100-1000+ years.
 #
 # Reserved: 0 is invalid (traps uninitialized). Concrete current values pin
 # the scheme-in-use:
@@ -423,6 +427,13 @@ DEVNET = NETWORK_NAME == "devnet"
 # The treasury entity has a well-known deterministic ID (no private key exists).
 # Funds can only leave the treasury via approved governance proposals.
 import hashlib as _hashlib
+# Carve-out: this is the ONE place config.py hashes at import time.
+# Routing it through messagechain.crypto.hashing.default_hash would
+# require importing the dispatcher before config.HASH_VERSION_CURRENT
+# is bound, which is a circular-import hazard.  The value is a frozen
+# genesis ID the live chain has already committed to; a future hash
+# migration cannot change it even in principle.  See
+# tests/test_hash_dispatch.py ALLOWED_DIRECT_USES.
 TREASURY_ENTITY_ID = _hashlib.new(HASH_ALGO, b"messagechain-treasury-v1").digest()
 TREASURY_ALLOCATION = 40_000_000  # ~28.6% of genesis supply (40M / 140M)
 

@@ -18,10 +18,11 @@ import struct
 from messagechain.config import HASH_ALGO
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.keys import Signature
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # Sentinel signature for witness-stripped transactions.  Empty lists +
@@ -46,7 +47,7 @@ def compute_witness_root(transactions: list) -> bytes:
     block_hash commits to witnesses even when they are stored separately.
     """
     if not transactions:
-        return hashlib.new(HASH_ALGO, b"").digest()
+        return default_hash(b"")
 
     leaves = []
     for tx in transactions:
@@ -189,7 +190,7 @@ def verify_witness_data(witness_data: bytes, expected_root: bytes) -> bool:
         offset += 4
 
         if tx_count == 0:
-            return expected_root == hashlib.new(HASH_ALGO, b"").digest()
+            return expected_root == default_hash(b"")
 
         leaves = []
         for _ in range(tx_count):

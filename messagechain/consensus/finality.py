@@ -61,6 +61,7 @@ from messagechain.config import (
     FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 # Distinct domain tag.  A finality vote must NEVER collide with any
@@ -72,7 +73,7 @@ _FINALITY_VOTE_DOMAIN_TAG = b"FINALITY_VOTE_V1"
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

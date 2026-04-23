@@ -64,6 +64,7 @@ from messagechain.consensus.finality import (
     FinalityDoubleVoteEvidence,
 )
 from messagechain.economics.inflation import SupplyTracker
+from messagechain.crypto.hashing import default_hash
 from messagechain.crypto.keys import (
     compute_root_from_signature,
     verify_signature,
@@ -96,7 +97,7 @@ class ChainIntegrityError(RuntimeError):
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _canonicalize_authority_txs(authority_txs):

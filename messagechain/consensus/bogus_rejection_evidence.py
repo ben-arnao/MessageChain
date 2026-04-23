@@ -64,6 +64,7 @@ from messagechain.network.submission_receipt import (
     SignedRejection, verify_rejection,
     REJECT_INVALID_SIG,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 _DOMAIN_TAG = b"bogus-rejection-evidence"
@@ -76,7 +77,7 @@ _SLASHABLE_REASON_CODES = frozenset({REJECT_INVALID_SIG})
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

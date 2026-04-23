@@ -21,6 +21,7 @@ import logging
 
 from messagechain.config import HASH_ALGO
 from messagechain.core.block import Block
+from messagechain.crypto.hashing import default_hash
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ MAX_REORG_DEPTH = 100  # reject reorgs deeper than this (long-range attack prote
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def compute_block_stake_weight(block: Block, stakes: dict[bytes, int]) -> int:

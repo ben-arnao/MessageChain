@@ -95,6 +95,7 @@ from messagechain.config import (
     validate_inclusion_list_version,
 )
 from messagechain.crypto.keys import Signature, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 # Domain tags — MUST differ so a signature over one type can never be
@@ -107,7 +108,7 @@ INCLUSION_LIST_VIOLATION_DOMAIN_TAG = b"mc-inclusion-list-violation-v1"
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 # ─────────────────────────────────────────────────────────────────────

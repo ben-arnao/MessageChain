@@ -61,6 +61,7 @@ from messagechain.consensus.witness_submission import (
     verify_submission_request,
     verify_witness_observation,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 # Domain tag — distinct from receipt, rejection, request, ack, and
@@ -69,7 +70,7 @@ _DOMAIN_TAG = b"mc-non-response-evidence-v1"
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def compute_non_response_slash_amount(stake: int) -> int:

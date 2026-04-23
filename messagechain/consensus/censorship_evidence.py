@@ -57,10 +57,11 @@ from messagechain.core.transaction import MessageTransaction
 from messagechain.network.submission_receipt import (
     SubmissionReceipt, verify_receipt,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

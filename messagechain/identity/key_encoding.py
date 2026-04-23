@@ -36,6 +36,7 @@ from messagechain.identity.mnemonic import (
     encode_to_mnemonic,
     looks_like_mnemonic,
 )
+from messagechain.crypto.hashing import default_hash
 
 _CHECKSUM_BYTES = 4
 CHECKSUM_HEX_CHARS = _CHECKSUM_BYTES * 2
@@ -53,7 +54,7 @@ class InvalidKeyChecksumError(ValueError):
 
 
 def _compute_checksum(private_key: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, _DOMAIN + private_key).digest()[:_CHECKSUM_BYTES]
+    return default_hash(_DOMAIN + private_key)[:_CHECKSUM_BYTES]
 
 
 def encode_private_key(private_key: bytes) -> str:

@@ -16,6 +16,7 @@ from messagechain.config import (
     BLOCK_SERIALIZATION_VERSION, validate_block_serialization_version,
 )
 from messagechain.core.transaction import MessageTransaction
+from messagechain.crypto.hashing import default_hash
 from messagechain.crypto.keys import Signature
 
 # Account count at which compute_state_root starts logging a scaling
@@ -24,7 +25,7 @@ STATE_ROOT_WARN_THRESHOLD = 100_000
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _encode_optional_bundle(bundle) -> bytes:

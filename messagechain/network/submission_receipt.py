@@ -43,6 +43,7 @@ from typing import Optional
 
 from messagechain.config import CHAIN_ID, HASH_ALGO, SIG_VERSION_CURRENT
 from messagechain.crypto.keys import Signature, KeyPair, verify_signature
+from messagechain.crypto.hashing import default_hash
 
 
 _DOMAIN_TAG = b"mc-submission-receipt-v1"
@@ -101,7 +102,7 @@ _VALID_REASON_CODES = frozenset({
 
 
 def _h(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 @dataclass

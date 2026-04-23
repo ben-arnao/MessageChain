@@ -26,6 +26,7 @@ hex form without the prefix remains accepted for backward compatibility.
 import hashlib
 
 from messagechain.config import HASH_ALGO
+from messagechain.crypto.hashing import default_hash
 
 _PREFIX = "mc1"
 _DOMAIN = b"mc-addr-v1"
@@ -44,7 +45,7 @@ class InvalidAddressChecksumError(ValueError):
 
 
 def _compute_checksum(entity_id: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, _DOMAIN + entity_id).digest()[:_CHECKSUM_BYTES]
+    return default_hash(_DOMAIN + entity_id)[:_CHECKSUM_BYTES]
 
 
 def encode_address(entity_id: bytes) -> str:

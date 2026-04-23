@@ -15,10 +15,11 @@ from messagechain.config import (
     SIG_VERSION_WOTS_W16_K64, SIG_VERSION_WOTS_W16_K64_V2,
     SIG_VERSION_CURRENT,
 )
+from messagechain.crypto.hashing import default_hash
 
 
 def _hash(data: bytes) -> bytes:
-    return hashlib.new(HASH_ALGO, data).digest()
+    return default_hash(data)
 
 
 def _prf(seed: bytes, index: int) -> bytes:
