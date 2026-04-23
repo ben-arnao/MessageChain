@@ -18,9 +18,11 @@ Tests:
   * ``Test A`` (lottery reproducer): run the chain long enough to fire
     the lottery.  Invariant must hold afterwards.  Pre-fix this
     FAILS (drift == bounty).
-  * ``Test B`` (assertion catches drift): monkey-patch a balance
+  * ``Test B`` (invariant catches drift): monkey-patch a balance
     mutation that bumps ``total_supply`` without touching
-    ``total_minted``, then apply a block.  Must raise ``AssertionError``.
+    ``total_minted``, then apply a block.  Must raise
+    ``ChainIntegrityError`` (previously ``AssertionError``, but that
+    class of raise is stripped under ``python -O``).
   * ``Test C`` (baseline): run many blocks and assert the invariant
     at every height.
 """
@@ -194,6 +196,7 @@ class TestInvariantAssertionCatchesDrift(unittest.TestCase):
 
     def test_silent_mint_without_total_minted_raises(self):
         from tests import pick_selected_proposer
+        from messagechain.core.blockchain import ChainIntegrityError
 
         chain, seeds, consensus = _make_chain_with_seeds()
         # Inject a drift: bump total_supply without total_minted, as
@@ -203,9 +206,11 @@ class TestInvariantAssertionCatchesDrift(unittest.TestCase):
 
         proposer = pick_selected_proposer(chain, seeds)
         blk = chain.propose_block(consensus, proposer, [])
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(ChainIntegrityError):
             # _apply_block_state is the guarded path; add_block funnels
-            # through it.  Either call site must trip.
+            # through it.  Either call site must trip.  Must be
+            # ChainIntegrityError (not AssertionError) so the check
+            # survives ``python -O`` / PYTHONOPTIMIZE=1.
             chain._apply_block_state(blk)
 
 

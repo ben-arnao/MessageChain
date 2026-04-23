@@ -698,12 +698,16 @@ class InclusionListProcessor:
 
         Idempotent: re-registering the same list is a no-op.
         `current_height` MUST equal inclusion_list.publish_height — the
-        assertion is defensive only (callers already know this).
+        check is defensive only (callers already know this) but must
+        survive ``python -O`` (which strips ``assert``), so we raise
+        ``ChainIntegrityError`` instead.
         """
-        assert current_height == inclusion_list.publish_height, (
-            f"register height mismatch: {current_height} vs "
-            f"{inclusion_list.publish_height}"
-        )
+        from messagechain.core.blockchain import ChainIntegrityError
+        if current_height != inclusion_list.publish_height:
+            raise ChainIntegrityError(
+                f"register height mismatch: {current_height} vs "
+                f"{inclusion_list.publish_height}"
+            )
         self.active_lists.setdefault(
             inclusion_list.publish_height, inclusion_list,
         )

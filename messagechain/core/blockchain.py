@@ -76,6 +76,25 @@ from messagechain.consensus.fork_choice import (
 logger = logging.getLogger(__name__)
 
 
+class ChainIntegrityError(RuntimeError):
+    """Consensus invariant violation — chain state is internally inconsistent.
+
+    Used in place of ``assert`` for consensus-critical checks (supply
+    conservation, canonical encoding, state-tree invariants, etc.).
+
+    Rationale: Python strips ``assert`` statements when run with ``-O``
+    or ``PYTHONOPTIMIZE=1``.  The same flag strips ``AssertionError``
+    raisers as well.  An operator running the node in optimized mode
+    would silently skip every invariant check — the exact class of bug
+    the invariant was added to catch.  Subclassing ``RuntimeError``
+    (not ``AssertionError``) guarantees these raises survive ``-O``.
+
+    If this is raised, the chain is in an impossible state — halt block
+    apply and let the caller decide (abort, reorg, snapshot-restore).
+    Never catch-and-swallow at a site that would mask corruption.
+    """
+
+
 def _hash(data: bytes) -> bytes:
     return hashlib.new(HASH_ALGO, data).digest()
 
@@ -6915,7 +6934,12 @@ class Blockchain:
         if not self.seed_entity_ids:
             return
         window = SEED_DIVESTMENT_END_HEIGHT - SEED_DIVESTMENT_START_HEIGHT
-        assert window > 0, "divestment window must be positive"
+        if window <= 0:
+            raise ChainIntegrityError(
+                f"divestment window must be positive, got {window} "
+                f"(start={SEED_DIVESTMENT_START_HEIGHT}, "
+                f"end={SEED_DIVESTMENT_END_HEIGHT})"
+            )
 
         # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT
         # and SEED_DIVESTMENT_REDIST_HEIGHT): pre-RETUNE the legacy
@@ -7014,7 +7038,13 @@ class Blockchain:
             else:
                 burn_share = divest * _burn_bps // 10_000
                 lottery_share = divest - burn_share - treasury_share
-            assert treasury_share + burn_share + lottery_share == divest
+            if treasury_share + burn_share + lottery_share != divest:
+                raise ChainIntegrityError(
+                    f"seed-divestment split broken at height "
+                    f"{block_height} for eid={eid!r}: "
+                    f"treasury={treasury_share} + burn={burn_share} + "
+                    f"lottery={lottery_share} != divest={divest}"
+                )
 
             self.supply.staked[eid] = current_stake - divest
             if treasury_share > 0:
@@ -7831,18 +7861,18 @@ class Blockchain:
         # constant so we can read it from config rather than
         # snapshotting per-chain — the invariant must hold identically
         # on every node that replays the same history.
-        assert (
-            self.supply.total_supply
-            == GENESIS_SUPPLY
+        if self.supply.total_supply != (
+            GENESIS_SUPPLY
             + self.supply.total_minted
             - self.supply.total_burned
-        ), (
-            f"Supply invariant broken at height {self.height}: "
-            f"total_supply={self.supply.total_supply} vs "
-            f"genesis={GENESIS_SUPPLY} + "
-            f"minted={self.supply.total_minted} - "
-            f"burned={self.supply.total_burned}"
-        )
+        ):
+            raise ChainIntegrityError(
+                f"Supply invariant broken at height {self.height}: "
+                f"total_supply={self.supply.total_supply} vs "
+                f"genesis={GENESIS_SUPPLY} + "
+                f"minted={self.supply.total_minted} - "
+                f"burned={self.supply.total_burned}"
+            )
 
         # Clear the current-block-height tunnel so any off-chain
         # pay_fee_with_burn call between blocks takes the pre-fork
