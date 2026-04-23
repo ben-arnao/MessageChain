@@ -127,9 +127,9 @@ class TestRedistributionConstants(unittest.TestCase):
             10_000,
         )
 
-    def test_redist_height_placeholder(self):
+    def test_redist_height_canonical(self):
         self.assertTrue(hasattr(config, "SEED_DIVESTMENT_REDIST_HEIGHT"))
-        self.assertEqual(config.SEED_DIVESTMENT_REDIST_HEIGHT, 50_000)
+        self.assertEqual(config.SEED_DIVESTMENT_REDIST_HEIGHT, 74_000)
 
     def test_redist_at_or_after_retune(self):
         """REDIST must land at or after RETUNE (monotonic fork schedule)."""

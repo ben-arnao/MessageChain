@@ -35,9 +35,9 @@ class TestLotteryBountyRaiseConstants(unittest.TestCase):
         self.assertTrue(hasattr(config, "LOTTERY_BOUNTY_POST_RAISE"))
         self.assertEqual(config.LOTTERY_BOUNTY_POST_RAISE, 5_000)
 
-    def test_activation_height_placeholder(self):
+    def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "LOTTERY_BOUNTY_RAISE_HEIGHT"))
-        self.assertEqual(config.LOTTERY_BOUNTY_RAISE_HEIGHT, 50_000)
+        self.assertEqual(config.LOTTERY_BOUNTY_RAISE_HEIGHT, 62_000)
 
     def test_helper_exists(self):
         self.assertTrue(hasattr(config, "get_lottery_bounty"))
