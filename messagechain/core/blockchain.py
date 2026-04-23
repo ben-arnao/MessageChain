@@ -475,9 +475,19 @@ class Blockchain:
         #   * _process_attestations: +1 per attestation in an applied
         #     block (every node sees the same chain, so every node
         #     agrees on the count).
-        #   * apply_slash_transaction: reset offender to 0.
-        # Deterministic from chain replay — not persisted to db,
-        # rebuilt from history on load.
+        #   * apply_slash_transaction + finality-double-vote slash:
+        #     reset offender to 0.
+        # Consensus-visible (the lottery bounty credits
+        # `supply.balances[winner]` and mints new supply) so the map
+        # MUST survive cold restart.  On the REORG path, replay
+        # rebuilds it via `_process_attestations` + `_reset_state`.
+        # On the COLD-START path, `_load_from_db` does NOT replay;
+        # instead we rehydrate from the `reputation` chaindb table
+        # and every mutation is mirrored into that table via
+        # `_bump_reputation` / `_clear_reputation` helpers below.
+        # Direct writes to `self.reputation` would skip the mirror
+        # and silently reintroduce the cold-restart divergence this
+        # table closes, so ALL mutations go through the helpers.
         self.reputation: dict[bytes, int] = {}
 
         # Inactivity leak — Casper-style finalization-stall counter.
@@ -695,6 +705,16 @@ class Blockchain:
         # under the new binary.
         if hasattr(self.db, "get_all_key_history"):
             self.key_history = self.db.get_all_key_history()
+        # Rehydrate the per-validator reputation (accepted-attestation)
+        # counter.  Consensus-visible: drives `select_lottery_winner`
+        # at every LOTTERY_INTERVAL block during bootstrap; the
+        # winner's balance + total_supply change.  Without this, a
+        # cold-booted node starts with an empty map, selects no
+        # winner, pays no bounty, and diverges from uprestarted
+        # peers at the next lottery firing.  `hasattr` gate keeps
+        # legacy chain.db files (pre-reputation-table) loadable.
+        if hasattr(self.db, "get_all_reputation"):
+            self.reputation = self.db.get_all_reputation()
 
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
@@ -2548,6 +2568,31 @@ class Blockchain:
                 entity_id, self.height, public_key,
             )
 
+    def _bump_reputation(self, entity_id: bytes, delta: int = 1) -> None:
+        """Increment an entity's reputation counter, DB-mirrored.
+
+        Single chokepoint for every attestation-accepted +1 so the
+        in-memory dict and the chaindb `reputation` table never drift.
+        A direct `self.reputation[eid] += 1` would bypass the mirror
+        and silently reintroduce the cold-restart divergence the
+        table closes.
+        """
+        new = self.reputation.get(entity_id, 0) + delta
+        self.reputation[entity_id] = new
+        if self.db is not None and hasattr(self.db, "set_reputation"):
+            self.db.set_reputation(entity_id, new)
+
+    def _clear_reputation(self, entity_id: bytes) -> None:
+        """Reset an entity's reputation to 0, DB-mirrored.
+
+        Called from the slash path — a validator caught equivocating
+        forfeits accumulated reputation and re-enters the lottery at
+        zero.
+        """
+        self.reputation.pop(entity_id, None)
+        if self.db is not None and hasattr(self.db, "clear_reputation"):
+            self.db.clear_reputation(entity_id)
+
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
     ) -> bytes | None:
@@ -2730,7 +2775,7 @@ class Blockchain:
         # reputation and re-enters the lottery pool (if at all) as a
         # zero-reputation newcomer.  Prevents the "misbehave once, earn
         # back your reputation from cached history" attack.
-        self.reputation.pop(tx.evidence.offender_id, None)
+        self._clear_reputation(tx.evidence.offender_id)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -4999,10 +5044,10 @@ class Blockchain:
             # block.  Deterministic (same chain → same counts on every
             # node).  Read by the bootstrap lottery to pick a winner
             # every LOTTERY_INTERVAL blocks; drives "honest behavior =
-            # real-time influence" during bootstrap.
-            self.reputation[att.validator_id] = (
-                self.reputation.get(att.validator_id, 0) + 1
-            )
+            # real-time influence" during bootstrap.  Routed through
+            # `_bump_reputation` so the in-memory dict and the
+            # chaindb `reputation` table stay in lockstep.
+            self._bump_reputation(att.validator_id)
             target_block = att.block_number
             pinned = self._stake_snapshots.get(target_block)
             if pinned is not None:
@@ -7333,7 +7378,7 @@ class Blockchain:
             self.slashed_validators.add(stx.evidence.offender_id)
             # Reputation reset: same policy as apply_slash_transaction;
             # a slashed validator forfeits accumulated reputation.
-            self.reputation.pop(stx.evidence.offender_id, None)
+            self._clear_reputation(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )

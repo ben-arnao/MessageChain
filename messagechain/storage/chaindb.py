@@ -200,6 +200,25 @@ class ChainDB:
                 PRIMARY KEY (entity_id, installed_at)
             );
 
+            -- Per-entity accepted-attestation counter that drives the
+            -- bootstrap-era reputation-weighted lottery.  Every
+            -- LOTTERY_INTERVAL block, `select_lottery_winner` reads
+            -- the current reputation map and picks a winner who
+            -- receives a `bounty + pool_payout` mint/redirect -- the
+            -- winner's balance changes, total_supply / total_minted
+            -- bump, so the reputation input is fully consensus-
+            -- visible.  Consensus-critical: without persistence, a
+            -- cold-booted peer starts with an empty map,
+            -- `select_lottery_winner(candidates=[], ...)` returns
+            -- None, no bounty is paid, balances diverge from
+            -- uprestarted peers, and the restarted peer forks off at
+            -- the next lottery firing.  Same structural shape as the
+            -- `pending_unstakes` / `key_history` cold-restart fixes.
+            CREATE TABLE IF NOT EXISTS reputation (
+                entity_id BLOB PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS message_counts (
                 entity_id BLOB PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
@@ -774,6 +793,42 @@ class ChainDB:
             )
         return out
 
+    # ── State: Reputation ────────────────────────────────────────
+    # Per-entity accepted-attestation count driving the bootstrap
+    # reputation-weighted lottery.  Must mirror
+    # `Blockchain.reputation` in lockstep: every increment in
+    # `_process_attestations` and every reset in
+    # `apply_slash_transaction` routes through here when a db handle
+    # is attached.  On cold start `_load_from_db` rehydrates the full
+    # dict via `get_all_reputation()` — without this the restarted
+    # peer starts empty, `select_lottery_winner` returns None, no
+    # bounty is paid, and the balance diverges from uprestarted peers
+    # at the next lottery firing.
+
+    def set_reputation(self, entity_id: bytes, count: int) -> None:
+        """Upsert the reputation counter for an entity."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO reputation (entity_id, count) "
+            "VALUES (?, ?)",
+            (entity_id, int(count)),
+        )
+        self._maybe_commit()
+
+    def clear_reputation(self, entity_id: bytes) -> None:
+        """Delete the reputation row for an entity (slash path)."""
+        self._conn.execute(
+            "DELETE FROM reputation WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_reputation(self) -> dict[bytes, int]:
+        """Rehydrate the full reputation map on cold start."""
+        cur = self._conn.execute(
+            "SELECT entity_id, count FROM reputation",
+        )
+        return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
+
     # ── State: Entity Index Registry (bloat reduction) ──────────
 
     def set_entity_index(self, entity_id: bytes, entity_index: int):
@@ -1343,6 +1398,12 @@ class ChainDB:
             # correct pubkey.  See the `key_history` table comment
             # in the schema block for the full consensus rationale.
             "key_history": self.get_all_key_history(),
+            # reputation must round-trip with supply state because
+            # lottery payouts debit/credit supply.balances and the
+            # winner is a function of this map; a reorg that rolls
+            # past attestations must restore the pre-reorg counts
+            # so the post-reorg replay converges on the same winner.
+            "reputation": self.get_all_reputation(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1377,6 +1438,10 @@ class ChainDB:
             # lookups would resolve to a key the canonical chain
             # never installed.
             conn.execute("DELETE FROM key_history")
+            # reputation mirrors attestation counts -- must roll
+            # back with them so the post-reorg replay rebuilds from
+            # the ancestor's state, not the losing fork's.
+            conn.execute("DELETE FROM reputation")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -1413,6 +1478,12 @@ class ChainDB:
                         "VALUES (?, ?, ?)",
                         (eid, int(installed_at), public_key),
                     )
+            for eid, count in snapshot.get("reputation", {}).items():
+                conn.execute(
+                    "INSERT INTO reputation (entity_id, count) "
+                    "VALUES (?, ?)",
+                    (eid, int(count)),
+                )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
