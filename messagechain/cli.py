@@ -1291,7 +1291,14 @@ def cmd_send(args):
 
     # Authenticate
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -1308,9 +1315,13 @@ def cmd_send(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    # Advance keypair past used leaves
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer server-mediated leaf reservation (see cmd_transfer for full
+    # rationale) so a co-resident daemon's next block sign skips the
+    # leaf this message is signed at.
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
