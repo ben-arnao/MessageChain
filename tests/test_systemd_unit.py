@@ -13,17 +13,29 @@ import unittest
 
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROD_UNIT = REPO_ROOT / "deploy" / "systemd" / "messagechain-validator.service"
+# PROD_UNIT points at the PUBLIC shipped template, not the operator-
+# local `deploy/systemd/...` copy.  The public template is the one a
+# new operator will copy into their own /etc/systemd/system/ path;
+# any regression that weakens its hardening contract (strips
+# MemoryDenyWriteExecute, bakes in MESSAGECHAIN_PROFILE=prototype,
+# etc.) must fail CI on every PR, not only on the operator's local
+# machine where `deploy/` happens to exist.  Gating this contract
+# behind _DEPLOY_PRESENT previously skipped the regression gate on
+# every public CI run — exactly the silent drift the tests were
+# written to catch.
+PROD_UNIT = REPO_ROOT / "examples" / "messagechain-validator.service.example"
 PROTOTYPE_DROPIN = (
     REPO_ROOT / "deploy" / "systemd" / "messagechain-validator-prototype.conf.example"
 )
 
 # deploy/ is gitignored per CLAUDE.md (operator/founder-local content).
-# Skip the whole module when the artifact isn't present.
+# Only the prototype drop-in test uses this skip — the prototype
+# drop-in is operator-specific config that doesn't belong in the
+# public examples/ tree.  The prod-unit hardening contract ran above
+# is always active on CI.
 _DEPLOY_PRESENT = (REPO_ROOT / "deploy").is_dir()
 
 
-@unittest.skipUnless(_DEPLOY_PRESENT, "deploy/ gitignored; operator-only test")
 class TestProductionUnitIsSafe(unittest.TestCase):
     """The default unit file must be production-safe out of the box."""
 

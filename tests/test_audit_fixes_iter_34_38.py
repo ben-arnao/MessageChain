@@ -85,14 +85,23 @@ class TestGenerateVerifyKeyPrintsAddress(unittest.TestCase):
         self.assertIn("Address:", body)
 
 
-@unittest.skipUnless(_DEPLOY_PRESENT, "deploy/ gitignored; operator-only test")
 class TestSystemdHardening(unittest.TestCase):
     """Production validator unit file must carry baseline hardening.
     Adding a new required directive here serves as a regression gate if
-    the unit file is ever regenerated from a template."""
+    the unit file is ever regenerated from a template.
+
+    Runs against the PUBLIC shipped template
+    (``examples/messagechain-validator.service.example``) so any PR
+    that weakens the hardening surface fails CI immediately — the
+    previous ``deploy/``-gated form skipped on every public CI run
+    and the hardening contract was enforced only on the operator's
+    local machine.
+    """
 
     def test_unit_has_memory_deny_write_execute(self):
-        unit = (ROOT / "deploy" / "systemd" / "messagechain-validator.service").read_text(encoding="utf-8")
+        unit = (
+            ROOT / "examples" / "messagechain-validator.service.example"
+        ).read_text(encoding="utf-8")
         required = [
             "NoNewPrivileges=true",
             "PrivateTmp=true",
