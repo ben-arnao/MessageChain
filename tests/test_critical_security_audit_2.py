@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 
+from messagechain import config
 from messagechain.config import HASH_ALGO, MIN_FEE, VALIDATOR_MIN_STAKE
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -153,8 +154,17 @@ class TestConsensusStakeSyncOnRestart(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test_stake_sync.db")
+        # These tests mint a local genesis from an arbitrary entity seed,
+        # which only works when the pinned-hash guard is off and devnet
+        # mode is on.
+        self._orig_pinned = getattr(config, "PINNED_GENESIS_HASH", None)
+        self._orig_devnet = getattr(config, "DEVNET", False)
+        config.PINNED_GENESIS_HASH = None
+        config.DEVNET = True
 
     def tearDown(self):
+        config.PINNED_GENESIS_HASH = self._orig_pinned
+        config.DEVNET = self._orig_devnet
         try:
             os.unlink(self.db_path)
         except OSError:
@@ -172,6 +182,10 @@ class TestConsensusStakeSyncOnRestart(unittest.TestCase):
         # Simulate staking
         chain1.supply.balances[entity.entity_id] = 10000
         chain1.supply.stake(entity.entity_id, 500)
+        # The test bypasses the normal transaction path, so mark the
+        # entity dirty manually; _persist_state scopes writes to
+        # _dirty_entities when it's a set.
+        chain1._touch_state({entity.entity_id})
         chain1._persist_state()
         db1.close()
 
@@ -200,6 +214,7 @@ class TestConsensusStakeSyncOnRestart(unittest.TestCase):
         chain1.initialize_genesis(entity)
         chain1.supply.balances[entity.entity_id] = 10000
         chain1.supply.stake(entity.entity_id, VALIDATOR_MIN_STAKE)
+        chain1._touch_state({entity.entity_id})
         chain1._persist_state()
         db1.close()
 
@@ -221,8 +236,14 @@ class TestAtomicStatePersistence(unittest.TestCase):
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
         self.db_path = os.path.join(self.tmpdir, "test_atomic.db")
+        self._orig_pinned = getattr(config, "PINNED_GENESIS_HASH", None)
+        self._orig_devnet = getattr(config, "DEVNET", False)
+        config.PINNED_GENESIS_HASH = None
+        config.DEVNET = True
 
     def tearDown(self):
+        config.PINNED_GENESIS_HASH = self._orig_pinned
+        config.DEVNET = self._orig_devnet
         try:
             os.unlink(self.db_path)
         except OSError:
@@ -274,6 +295,10 @@ class TestAtomicStatePersistence(unittest.TestCase):
 
         # Add a balance that will be persisted
         chain.supply.balances[entity.entity_id] = 9999
+        # Force a full flush on the next persist so set_nonce is actually
+        # called (otherwise the dirty-entity scope skips our sabotaged
+        # write and no exception ever fires).
+        chain._touch_state({entity.entity_id})
 
         # Sabotage one write to simulate a crash
         original_set_nonce = db.set_nonce

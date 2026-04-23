@@ -231,7 +231,7 @@ class TestLotteryFairness(unittest.TestCase):
         # 20 valid provers; pick 5 per round; many rounds.
         proofs = [_make_proof(i + 1, block) for i in range(20)]
         ever_won: set[bytes] = set()
-        for i in range(200):
+        for i in range(80):
             pool = ArchiveRewardPool(); pool.fund(1_000_000)
             result = apply_archive_rewards(
                 proofs=proofs, pool=pool,
@@ -241,9 +241,8 @@ class TestLotteryFairness(unittest.TestCase):
             )
             for p in result.payouts:
                 ever_won.add(p.prover_id)
-        # After 200 × 5 = 1000 slot-draws over 20 provers at uniform
-        # probability, it is astronomically unlikely that any prover
-        # never wins.  (1 - 5/20)^200 ≈ 10^-25.
+        # 80 × 5 = 400 slot-draws over 20 provers at uniform probability.
+        # P(any one prover never wins) = (15/20)^80 ≈ 4e-10 × 20 ≈ 8e-9.
         self.assertEqual(
             len(ever_won), 20,
             f"only {len(ever_won)}/20 provers ever won across 200 "

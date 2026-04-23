@@ -18,7 +18,12 @@ PROTOTYPE_DROPIN = (
     REPO_ROOT / "deploy" / "systemd" / "messagechain-validator-prototype.conf.example"
 )
 
+# deploy/ is gitignored per CLAUDE.md (operator/founder-local content).
+# Skip the whole module when the artifact isn't present.
+_DEPLOY_PRESENT = (REPO_ROOT / "deploy").is_dir()
 
+
+@unittest.skipUnless(_DEPLOY_PRESENT, "deploy/ gitignored; operator-only test")
 class TestProductionUnitIsSafe(unittest.TestCase):
     """The default unit file must be production-safe out of the box."""
 
@@ -85,6 +90,7 @@ class TestProductionUnitIsSafe(unittest.TestCase):
         self.assertIn("StartLimitIntervalSec", self.text)
 
 
+@unittest.skipUnless(_DEPLOY_PRESENT, "deploy/ gitignored; operator-only test")
 class TestPrototypeDropinExists(unittest.TestCase):
     """The prototype-phase drop-in is shipped as a separate, opt-in file."""
 

@@ -3,9 +3,9 @@
 import pytest
 
 # ---------------------------------------------------------------------------
-# Reduce MERKLE_TREE_HEIGHT for tests (height=4 -> 16 leaves instead of 1024).
-# This cuts entity creation time by ~64x while still exercising the full
-# WOTS+ / Merkle-tree code path.
+# Reduce MERKLE_TREE_HEIGHT for tests (height=4 -> 16 leaves instead of 1M).
+# This cuts entity creation time by ~64k× vs the production default of 20,
+# while still exercising the full WOTS+ / Merkle-tree code path.
 # ---------------------------------------------------------------------------
 import messagechain.config
 
