@@ -7,8 +7,8 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live since 2026-04-20. Chain ID `messagechain-v1`,
-genesis block 0
+**Status:** mainnet live; current chain minted 2026-04-22 during
+bootstrap. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
 
 ## Why
@@ -147,7 +147,11 @@ Minimum to participate in consensus:
   key with `set-authority-key` so key rotations require the cold key.
 - **Run:** `messagechain start --mine --rpc-bind 0.0.0.0 --data-dir
   /var/lib/messagechain --keyfile /etc/messagechain/keyfile`. A
-  systemd unit example lives under `deploy/systemd/` in the repo.
+  systemd unit example ships as
+  [`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example)
+  — copy to `/etc/systemd/system/messagechain-validator.service`,
+  edit the paths, then `systemctl daemon-reload && systemctl enable
+  --now messagechain-validator`.
 - **Upkeep:** run `key-status` periodically (WOTS+ leaves deplete
   with use) and `rotate-key` before exhaustion.
 
