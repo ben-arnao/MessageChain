@@ -48,6 +48,11 @@ class Peer:
     # an operator trust the CLI output when auditing whether
     # P2P_TLS_ENABLED is actually taking effect across the fleet.
     transport: str = "plain"
+    # True once this side has written its HANDSHAKE to the peer. Outbound
+    # sets it when dialing; inbound sets it after echoing the peer's
+    # HANDSHAKE back. Prevents the observability-only echo from re-firing
+    # on every inbound HANDSHAKE a reconnecting peer might send.
+    handshake_sent: bool = False
     # inv/getdata: track which tx hashes this peer already knows about
     known_txs: object = field(default_factory=lambda: _LRUSet(SEEN_TX_CACHE_SIZE))
 

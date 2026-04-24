@@ -746,6 +746,7 @@ class Node(SharedRuntimeMixin):
                 sender_id=self.entity.entity_id_hex,
             )
             await write_message(writer, handshake)
+            peer.handshake_sent = True
 
             # Listen for messages with a bounded idle timeout
             first_message = True
@@ -896,6 +897,45 @@ class Node(SharedRuntimeMixin):
                 t.add_done_callback(
                     lambda x: self._handle_task_exception("syncer.start_sync", x)
                 )
+
+            # Inbound peer just introduced itself; return the favor so
+            # their Peer record can populate entity/height/version. The
+            # sync subsystem only needs the one-way handshake (we already
+            # called update_peer_height above), but the CLI observability
+            # fields on the DIALER side stay empty without this echo.
+            # handshake_sent guards against re-echo on reconnect.
+            if (
+                getattr(peer, "direction", "inbound") == "inbound"
+                and not getattr(peer, "handshake_sent", False)
+            ):
+                latest_local = self.blockchain.get_latest_block()
+                reply = NetworkMessage(
+                    msg_type=MessageType.HANDSHAKE,
+                    payload={
+                        "port": self.port,
+                        "chain_height": self.blockchain.height,
+                        "best_block_hash": (
+                            latest_local.block_hash.hex() if latest_local else ""
+                        ),
+                        "cumulative_weight": self._current_cumulative_weight(),
+                        "genesis_hash": our_genesis,
+                        "version": __version__,
+                    },
+                    sender_id=self.entity.entity_id_hex,
+                )
+                try:
+                    await write_message(peer.writer, reply)
+                    try:
+                        peer.handshake_sent = True
+                    except AttributeError:
+                        # Test fixtures (e.g. slotted mocks) may reject
+                        # attribute assignment; the echo itself is the
+                        # side-effect that matters for production.
+                        pass
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to echo handshake to {peer.address}: {e}"
+                    )
 
         elif msg.msg_type == MessageType.INV:
             await self._handle_inv(msg.payload, peer)
