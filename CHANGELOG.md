@@ -4,6 +4,60 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] — 2026-04-24
+
+Minor release. Ships the **Tier 10 `prev` pointer** feature and pulls
+the remaining bootstrap-era fork schedule forward so the feature can
+be exercised end-to-end on the live chain within hours rather than
+months. Consensus-breaking: requires all validators to upgrade before
+the earliest activation height.
+
+### Added
+
+- **`prev` pointer on message transactions.** Optional single 32-byte
+  `tx_hash` reference to a prior on-chain message, forming a
+  protocol-agnostic single-linked list — apps can render the
+  relationship as a reply, a chained long-form document, a citation,
+  etc. The field is opt-in via tx `version=2`; `version=1` remains
+  valid for prev-less messages.
+- **Strict-prev validation.** When set, `prev` must resolve to a
+  `MessageTransaction` already included in a strictly earlier
+  persisted block. Self-reference, forward reference, and dangling
+  reference are all rejected at the validation boundary.
+- **ChainDB `tx_locations` index (schema v3).** Maps every message
+  `tx_hash` to its `(block_height, tx_index)` for O(1) strict-prev
+  resolution. One-shot migration `migrate_schema_v2_to_v3` walks
+  persisted blocks to backfill; non-destructive, idempotent. The
+  `messagechain migrate-chain-db` CLI now cascades v1 → v2 → v3 in a
+  single invocation. `messagechain upgrade` runs migrations
+  automatically.
+- **`messagechain send --prev <tx_hash>`** CLI flag. Adds 33 stored
+  bytes (1B presence flag + 32B hash) to the fee basis, priced at
+  the live per-stored-byte rate. Pointer bytes do NOT count against
+  `MAX_MESSAGE_CHARS` — the full 1024-char text budget stays intact.
+- **Public feed (messagechain.org) surfaces `prev`.** `/v1/latest`
+  JSON includes a `prev` hex field when a message carries a pointer;
+  `feed.html` renders a `↳ refs <tx_hash_short>` row above the
+  message text. Absent pre-fork and for prev-less post-fork messages.
+
+### Changed (consensus)
+
+- **Fork schedule pulled forward** so live operator testing is
+  viable within the current bootstrap-era chain height:
+  `LINEAR_FEE_HEIGHT` 4_300 → 300, `BLOCK_BYTES_RAISE_HEIGHT`
+  4_500 → 350, `PREV_POINTER_HEIGHT` 6_000 → 400. All three forks
+  activate in sequence within ~24 hours at the current block cadence.
+  Validators MUST run 1.6.0 before the earliest activation height
+  (300); an older binary at height ≥ 300 diverges consensus.
+
+### Security
+
+- No new security findings. Field-level tamper resistance on `prev`
+  is covered by the standard signature commitment: the field is
+  part of `_signable_data` at `version >= 2`, so flipping "no prev
+  ↔ prev set" or swapping a `prev` value after signing invalidates
+  the signature.
+
 ## [1.5.2] — 2026-04-24
 
 Patch release. Bundles a security audit rollup with a P2P

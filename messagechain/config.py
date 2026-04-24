@@ -3039,7 +3039,7 @@ FEE_PER_STORED_BYTE = 1          # per-byte component (charged on STORED, not pl
 # height (98_000) the linear rule is already in force, so the flat floor
 # never applies in production.  Pre-linear heights still replay under
 # their original legacy-quadratic rules unchanged.
-LINEAR_FEE_HEIGHT = 4_300
+LINEAR_FEE_HEIGHT = 300  # Tier 8 (bootstrap-compressed: pulled forward from 4_300 so a live operator test of the Tier 10 prev-pointer feature is viable within bootstrap — see CLAUDE.md fork schedule for runway notes)
 
 assert BASE_TX_FEE >= 0, "BASE_TX_FEE cannot be negative"
 assert FEE_PER_STORED_BYTE >= 1, (
@@ -3084,7 +3084,7 @@ assert FEE_PER_STORED_BYTE >= 1, (
 #     formula must be active when the per-byte rate multiplies, since
 #     the post-raise branch reads BASE_TX_FEE and the post-raise
 #     per-byte rate.
-BLOCK_BYTES_RAISE_HEIGHT = 4_500         # Tier 9 (pulled forward alongside Tier 8)
+BLOCK_BYTES_RAISE_HEIGHT = 350           # Tier 9 (bootstrap-compressed: pulled forward from 4_500; rides on top of LINEAR_FEE_HEIGHT)
 FEE_PER_STORED_BYTE_POST_RAISE = 3       # 3× Tier 8 floor — preserves bloat discipline under wider cap
 TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (was 10, 50% of 20)
 
@@ -3098,7 +3098,7 @@ TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (w
 # a human-content constraint, the pointer is structural metadata.
 # Pre-activation: tx version must be 1 (no prev field).  Post-activation:
 # version=2 is accepted; version=1 remains valid for prev-less txs.
-PREV_POINTER_HEIGHT = 6_000              # Tier 10
+PREV_POINTER_HEIGHT = 400                # Tier 10 (bootstrap-compressed: pulled forward from 6_000 for live operator testing)
 
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
