@@ -19,14 +19,12 @@ import unittest
 from messagechain.config import (
     BASE_TX_FEE,
     FEE_PER_STORED_BYTE,
-    FLAT_FEE_HEIGHT,
     LINEAR_FEE_HEIGHT,
     MAX_BLOCK_MESSAGE_BYTES,
     MAX_MESSAGE_BYTES,
     MAX_MESSAGE_CHARS,
     MAX_TXS_PER_BLOCK,
     MIN_FEE,
-    MIN_FEE_POST_FLAT,
 )
 from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT
 from messagechain.core.compression import encode_payload
@@ -58,9 +56,6 @@ class TestLinearFeeConstants(unittest.TestCase):
 
     def test_fee_per_stored_byte_default(self):
         self.assertEqual(FEE_PER_STORED_BYTE, 1)
-
-    def test_linear_fee_height_after_flat_fee_height(self):
-        self.assertGreater(LINEAR_FEE_HEIGHT, FLAT_FEE_HEIGHT)
 
     def test_linear_fee_height_inside_bootstrap_window(self):
         self.assertLess(LINEAR_FEE_HEIGHT, BOOTSTRAP_END_HEIGHT)
@@ -129,26 +124,17 @@ class TestLinearFeeFormula(unittest.TestCase):
 
 
 class TestLegacyFeeRulesUnchanged(unittest.TestCase):
-    """Pre-LINEAR_FEE_HEIGHT heights replay under their original rules."""
+    """Pre-LINEAR_FEE_HEIGHT heights replay under their original rules.
 
-    def test_flat_window_still_returns_flat_floor(self):
-        """[FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT) keeps the flat per-tx floor."""
-        height = FLAT_FEE_HEIGHT  # exactly at activation of flat fee
-        self.assertEqual(
-            calculate_min_fee(b"x" * 280, current_height=height),
-            MIN_FEE_POST_FLAT,
-        )
-        self.assertEqual(
-            calculate_min_fee(b"x", current_height=height),
-            MIN_FEE_POST_FLAT,
-        )
+    With the bootstrap-compressed schedule, LINEAR_FEE_HEIGHT (4,300)
+    precedes FLAT_FEE_HEIGHT (98,000), so there is no live flat-fee
+    window in production — Tier 7 is retired in favor of Tier 8.  These
+    tests therefore only cover the pre-linear legacy-quadratic path.
+    """
 
-    def test_pre_flat_height_uses_legacy_quadratic(self):
-        """Heights before FLAT_FEE_HEIGHT keep the legacy quadratic floor."""
-        height = FLAT_FEE_HEIGHT - 1
-        # Legacy formula: MIN_FEE + bytes*FEE_PER_BYTE + bytes^2 * coeff // 1000.
-        # We don't recompute it here — just assert the floor exceeds MIN_FEE
-        # and is independent of the linear-fee rule.
+    def test_pre_linear_height_uses_legacy_quadratic(self):
+        """Heights before LINEAR_FEE_HEIGHT keep the legacy quadratic floor."""
+        height = LINEAR_FEE_HEIGHT - 1
         floor = calculate_min_fee(b"x" * 100, current_height=height)
         self.assertGreater(floor, MIN_FEE)
         self.assertNotEqual(

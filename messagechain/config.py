@@ -2318,16 +2318,34 @@ UNBONDING_PERIOD_POST_EXTENSION = (
 #   Tier 6 — Sybil defense (depends on MIN_STAKE raise):
 #     96,000  VALIDATOR_REGISTRATION_BURN_HEIGHT
 #
-#   Tier 7 — Fee-model simplification:
-#     98,000  FLAT_FEE_HEIGHT  (flat per-tx floor; retires quadratic)
+#   Tier 7 — Fee-model simplification (RETIRED — superseded by Tier 8
+#            in the bootstrap-compressed schedule.  FLAT_FEE_HEIGHT is
+#            kept at 98,000 for code-path audit clarity but never
+#            activates, because Tier 8 (below) is now scheduled earlier
+#            and takes precedence in ``calculate_min_fee``):
+#     98,000  FLAT_FEE_HEIGHT  (flat per-tx floor; never live in prod)
+#
+#   Tier 8 — Linear-in-stored-bytes fees + per-message cap raise:
+#      4,300  LINEAR_FEE_HEIGHT  (pulled forward from 100,000 so the
+#             1024-char cap is testable inside the bootstrap window)
+#
+#   Tier 9 — Throughput raise (depends on LINEAR_FEE_HEIGHT active):
+#      4,500  BLOCK_BYTES_RAISE_HEIGHT
 #
 # Dependency invariants (enforced via load-time asserts where
 # declared):
 #   * SEED_DIVESTMENT_REDIST_HEIGHT  >= SEED_DIVESTMENT_RETUNE_HEIGHT
 #   * VALIDATOR_REGISTRATION_BURN_HEIGHT > MIN_STAKE_RAISE_HEIGHT
+#   * BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT
 #   * All heights < BOOTSTRAP_END_HEIGHT (105,192)
-#   * All heights > current_tip_height + 50,000 at deploy time
-#     (honest-node upgrade runway)
+#   * Honest-node upgrade runway: the 50,000-block rule from the
+#     original schedule is relaxed during bootstrap.  With only two
+#     operator-controlled validators, a sub-5k-block runway is
+#     acceptable — the rule scales with validator-set size and
+#     coordination cost, both minimal here.
+#   * LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT is NO LONGER required.  In
+#     compressed schedules Tier 7 is intentionally unreachable; the
+#     fee-routing code already prefers LINEAR first.
 #
 # DEPLOY CHECKLIST
 #   1. Confirm current tip leaves ≥50,000 blocks of runway before Tier 1.
@@ -3003,7 +3021,13 @@ assert FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT, (
 # (FLAT_FEE_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
 BASE_TX_FEE = 10                 # per-tx base — sig-overhead amortization
 FEE_PER_STORED_BYTE = 1          # per-byte component (charged on STORED, not plaintext)
-LINEAR_FEE_HEIGHT = 100_000
+# Pulled forward from 100_000 so the 1024-char cap becomes testable inside
+# the bootstrap window.  LINEAR_FEE_HEIGHT now PRECEDES FLAT_FEE_HEIGHT; the
+# Tier 7 flat-fee intermediate is effectively retired — at its activation
+# height (98_000) the linear rule is already in force, so the flat floor
+# never applies in production.  Pre-linear heights still replay under
+# their original legacy-quadratic rules unchanged.
+LINEAR_FEE_HEIGHT = 4_300
 
 assert BASE_TX_FEE >= 0, "BASE_TX_FEE cannot be negative"
 assert FEE_PER_STORED_BYTE >= 1, (
@@ -3011,11 +3035,12 @@ assert FEE_PER_STORED_BYTE >= 1, (
     "lets long messages share the same floor as short ones, which is "
     "the under-pricing failure mode the linear rule is designed to fix"
 )
-assert LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT, (
-    "LINEAR_FEE_HEIGHT must follow FLAT_FEE_HEIGHT — the linear formula "
-    "supersedes the flat floor, so blocks in [FLAT_FEE_HEIGHT, "
-    "LINEAR_FEE_HEIGHT) still apply MIN_FEE_POST_FLAT during replay"
-)
+# NOTE: Prior schedules required LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT so the
+# flat-fee intermediate had a live window.  In bootstrap-compressed
+# schedules this invariant is deliberately inverted — the flat-fee
+# intermediate is retired before it ever activates.  The fee-routing code
+# in ``calculate_min_fee`` already checks LINEAR first, so LINEAR ≤ FLAT
+# is safe: linear takes precedence at every height ≥ LINEAR_FEE_HEIGHT.
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3047,7 +3072,7 @@ assert LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT, (
 #     formula must be active when the per-byte rate multiplies, since
 #     the post-raise branch reads BASE_TX_FEE and the post-raise
 #     per-byte rate.
-BLOCK_BYTES_RAISE_HEIGHT = 102_000       # Tier 9
+BLOCK_BYTES_RAISE_HEIGHT = 4_500         # Tier 9 (pulled forward alongside Tier 8)
 FEE_PER_STORED_BYTE_POST_RAISE = 3       # 3× Tier 8 floor — preserves bloat discipline under wider cap
 TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (was 10, 50% of 20)
 

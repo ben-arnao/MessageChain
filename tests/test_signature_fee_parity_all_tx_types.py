@@ -97,16 +97,17 @@ class TestMessageTxRegression(unittest.TestCase):
         tx = create_transaction(self.alice, "hi", fee=calculate_min_fee(b"hi"), nonce=0)
         self.assertTrue(verify_transaction(tx, self.pk, current_height=PRE))
 
-    def test_post_activation_sig_aware_fee_passes(self):
-        tx = create_transaction(self.alice, "hi", fee=calculate_min_fee(b"hi"), nonce=0)
-        sig_len = len(tx.signature.to_bytes())
-        # message-only fee is insufficient post-activation
-        self.assertFalse(verify_transaction(tx, self.pk, current_height=POST))
-        tx2 = create_transaction(
-            self.alice, "hi",
-            fee=calculate_min_fee(b"hi", signature_bytes=sig_len), nonce=0,
-        )
-        self.assertTrue(verify_transaction(tx2, self.pk, current_height=POST))
+    # test_post_activation_sig_aware_fee_passes retired: previously
+    # asserted that MessageTx at POST=FEE_INCLUDES_SIGNATURE_HEIGHT
+    # rejects a message-only fee under sig-aware-quadratic.  In the
+    # bootstrap-compressed schedule, LINEAR_FEE_HEIGHT (4,300) precedes
+    # FEE_INCLUDES_SIGNATURE_HEIGHT (64,000), so linear pricing is
+    # already active at POST and ignores signature bytes.  The
+    # sig-aware-quadratic window is unreachable in the production
+    # schedule for MessageTx.  Non-MessageTx tx types (transfer, stake,
+    # etc.) still exercise the sig-aware path via
+    # ``enforce_signature_aware_min_fee`` — those regressions live in
+    # the classes below this one.
 
 
 class TestTransferFeeParity(unittest.TestCase):

@@ -520,27 +520,30 @@ def verify_transaction(
     canonical_stored, canonical_flag = encode_payload(plaintext)
     if canonical_stored != tx.message or canonical_flag != tx.compression_flag:
         return False
-    # Fee rule depends on block height (calculate_min_fee dispatches):
-    #   * At/after LINEAR_FEE_HEIGHT — linear in stored bytes
-    #     (BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message)).
-    #   * [FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT) — flat per-tx floor.
-    #   * [FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT) — legacy
-    #     quadratic priced on (message + signature) bytes.
-    #   * Pre-FEE_INCLUDES_SIGNATURE_HEIGHT (or no height context) —
-    #     legacy quadratic on message bytes only.
-    if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
-        if tx.fee < calculate_min_fee(tx.message, current_height=current_height):
-            return False
-    elif (
+    # Fee rule depends on block height.  Delegate the full dispatch to
+    # ``calculate_min_fee`` (single source of truth) instead of branching
+    # on each gate locally — this keeps verify in lockstep with the fee
+    # routing and is robust to schedule compressions where one fork
+    # supersedes another (e.g. bootstrap-compressed LINEAR < FLAT, where
+    # Tier 7 is retired in favor of Tier 8).
+    #
+    # Signature bytes feed the floor only in the legacy-quadratic window
+    # (``[FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT)``).  At/after
+    # FLAT or LINEAR the witness is amortized into the per-tx base and
+    # ``calculate_min_fee`` ignores the ``signature_bytes`` argument.
+    if (
         current_height is not None
         and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
     ):
         sig_len = len(tx.signature.to_bytes())
-        if tx.fee < calculate_min_fee(tx.message, signature_bytes=sig_len):
-            return False
     else:
-        if tx.fee < calculate_min_fee(tx.message):
-            return False
+        sig_len = 0
+    if tx.fee < calculate_min_fee(
+        tx.message,
+        signature_bytes=sig_len,
+        current_height=current_height,
+    ):
+        return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
