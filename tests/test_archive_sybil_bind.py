@@ -48,12 +48,13 @@ _ENTITY_POOL: list = []
 
 
 def _entity(i: int):
-    """Tree_height=4 for test speed; 16 leaves per entity plenty for
-    per-test signing."""
+    """Tree_height=1 — tests build one proof per entity, so 2 leaves is
+    ample.  This keeps WOTS+ keygen to a single keypair per entity,
+    which dominates runtime when the Sybil test builds 60 entities."""
     from messagechain.identity.identity import Entity
     while len(_ENTITY_POOL) <= i:
         seed = f"sybil-{len(_ENTITY_POOL)}".encode().ljust(32, b"\x00")
-        _ENTITY_POOL.append(Entity.create(seed, tree_height=4))
+        _ENTITY_POOL.append(Entity.create(seed, tree_height=1))
     return _ENTITY_POOL[i]
 
 

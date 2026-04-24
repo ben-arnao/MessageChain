@@ -96,6 +96,28 @@ class ChainIntegrityError(RuntimeError):
     """
 
 
+class BinaryOutOfDateError(RuntimeError):
+    """Block header advertises a protocol version newer than this binary.
+
+    Semantically distinct from ``ChainIntegrityError`` (which means *chain
+    state is broken*) and from a plain invalid-block rejection (which means
+    *the block is malformed or malicious*).  This one means *the network has
+    moved past my binary* — I am running an old release; the blocks I'm
+    seeing are valid under newer consensus rules I don't understand.
+
+    The correct response is NOT to reject the block as invalid (which on a
+    cascade makes every new block look adversarial and spams peer-ban state),
+    and it is NOT to apply it blindly (I can't — I don't know the new rules).
+    It is to HALT with a clear, actionable operator message pointing at the
+    upgrade path.  Systemd will restart the unit a few times and then hit its
+    StartLimitBurst; the operator sees a failed unit and runs
+    ``messagechain upgrade``.
+
+    Distinct from ChainIntegrityError so post-mortem / on-call can tell
+    "my node is broken" from "my binary is stale" at a glance.
+    """
+
+
 def _hash(data: bytes) -> bytes:
     return default_hash(data)
 
@@ -221,6 +243,14 @@ class Blockchain:
             self.set_trusted_checkpoints(trusted_checkpoints)
         self.chain: list[Block] = []
         self.supply = SupplyTracker()
+        # Thread the persistence handle into SupplyTracker so the
+        # pending_unstakes mutation paths (unstake / process / slash)
+        # mirror each change into the `pending_unstakes` SQL table.
+        # Without this, a cold process restart loses the queue and
+        # process_pending_unstakes releases mismatched tokens vs. a
+        # peer that never restarted — forking consensus at the next
+        # state_root check.  None-safe: in-memory tests leave db=None.
+        self.supply.db = self.db
         self.base_fee: int = self.supply.base_fee  # mirror for easy access
         self.nonces: dict[bytes, int] = {}  # entity_id -> next expected nonce
         self.public_keys: dict[bytes, bytes] = {}  # entity_id -> public_key
@@ -402,7 +432,7 @@ class Blockchain:
         # Persists forever across blocks — unused rewards never expire
         # (permanence aligns with CLAUDE.md principle #2: the pool is
         # on-chain state like any balance).  See
-        # docs/proof-of-custody-archive-rewards.md for the design.
+        # `messagechain/consensus/archive_challenge.py` for the design.
         self.archive_reward_pool: int = 0
 
         # Archive-custody duty state (iteration 3b-ii).  Three pieces:
@@ -467,9 +497,19 @@ class Blockchain:
         #   * _process_attestations: +1 per attestation in an applied
         #     block (every node sees the same chain, so every node
         #     agrees on the count).
-        #   * apply_slash_transaction: reset offender to 0.
-        # Deterministic from chain replay — not persisted to db,
-        # rebuilt from history on load.
+        #   * apply_slash_transaction + finality-double-vote slash:
+        #     reset offender to 0.
+        # Consensus-visible (the lottery bounty credits
+        # `supply.balances[winner]` and mints new supply) so the map
+        # MUST survive cold restart.  On the REORG path, replay
+        # rebuilds it via `_process_attestations` + `_reset_state`.
+        # On the COLD-START path, `_load_from_db` does NOT replay;
+        # instead we rehydrate from the `reputation` chaindb table
+        # and every mutation is mirrored into that table via
+        # `_bump_reputation` / `_clear_reputation` helpers below.
+        # Direct writes to `self.reputation` would skip the mirror
+        # and silently reintroduce the cold-restart divergence this
+        # table closes, so ALL mutations go through the helpers.
         self.reputation: dict[bytes, int] = {}
 
         # Inactivity leak — Casper-style finalization-stall counter.
@@ -675,6 +715,51 @@ class Blockchain:
         self.public_keys = self.db.get_all_public_keys()
         self.nonces = self.db.get_all_nonces()
         self.entity_message_count = self.db.get_all_message_counts()
+        # Rehydrate the per-entity key-rotation history.  Slash-
+        # evidence verification at validate_slash_transaction uses
+        # ``_public_key_at_height(evidence_height)`` to fetch the
+        # pubkey active at the evidence height; without the history
+        # the cold-booted node falls back to the CURRENT pubkey and
+        # pre-rotation evidence fails WOTS+ verify, letting a
+        # rotate-then-restart offender escape slashing on any peer
+        # that has cold-booted since the rotation.  ``hasattr`` gate
+        # keeps legacy chain.db files (pre-key_history-table) loadable
+        # under the new binary.
+        if hasattr(self.db, "get_all_key_history"):
+            self.key_history = self.db.get_all_key_history()
+        # Rehydrate the per-validator reputation (accepted-attestation)
+        # counter.  Consensus-visible: drives `select_lottery_winner`
+        # at every LOTTERY_INTERVAL block during bootstrap; the
+        # winner's balance + total_supply change.  Without this, a
+        # cold-booted node starts with an empty map, selects no
+        # winner, pays no bounty, and diverges from uprestarted
+        # peers at the next lottery firing.  `hasattr` gate keeps
+        # legacy chain.db files (pre-reputation-table) loadable.
+        if hasattr(self.db, "get_all_reputation"):
+            self.reputation = self.db.get_all_reputation()
+        # Rehydrate the finalization-stall counter.  Consensus-visible:
+        # `_apply_block_state` reads it to decide whether to fire the
+        # inactivity leak AND scales the per-validator burn
+        # quadratically with its value -- so a cold-restart that
+        # resets the counter to 0 while uprestarted peers hold N>0
+        # stops burning on the restarted peer while peers continue,
+        # diverging supply.staked + supply.total_supply at the next
+        # block.  `hasattr` gate keeps legacy chain.db files loadable.
+        if hasattr(self.db, "get_finalization_stall_counter"):
+            self.blocks_since_last_finalization = (
+                self.db.get_finalization_stall_counter()
+            )
+        # Rehydrate the lottery prize pool.  Consensus-visible: the
+        # `pool_payout` paid to the lottery winner at every
+        # LOTTERY_INTERVAL firing is computed from this pool -- cold
+        # restart that zeros the pool while uprestarted peers retain
+        # the accumulated value pays a different bounty and diverges
+        # `supply.balances[winner]` at the next firing.  `hasattr`
+        # gate keeps legacy chain.db files loadable.
+        if hasattr(self.db, "get_lottery_prize_pool"):
+            self.supply.lottery_prize_pool = (
+                self.db.get_lottery_prize_pool()
+            )
 
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
@@ -694,6 +779,17 @@ class Blockchain:
         # Restore supply tracker
         self.supply.balances = self.db.get_all_balances()
         self.supply.staked = self.db.get_all_staked()
+        # Rehydrate the validator unbonding queue.  Without this, a
+        # cold-booted node starts with an empty pending_unstakes dict
+        # while `staked` already reflects the debit, so process_
+        # pending_unstakes releases nothing at maturity while
+        # uprestarted peers release the real tokens — the resulting
+        # balance drift diverges state_root and forks the restarted
+        # node off the honest chain.  `hasattr` gate keeps legacy
+        # chain.db files (pre-pending-unstakes-table) loadable under
+        # the new binary.
+        if hasattr(self.db, "get_all_pending_unstakes"):
+            self.supply.pending_unstakes = self.db.get_all_pending_unstakes()
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
@@ -822,12 +918,32 @@ class Blockchain:
         for tip_hash_db, tip_num, tip_w in self.db.get_all_tips():
             self.fork_choice.add_tip(tip_hash_db, tip_num, tip_w)
 
-        # Pin a single stake snapshot at the loaded tip so ongoing
-        # finality processing after load has a correct denominator for
-        # the next block's attestations. We can't reconstruct full
-        # historical snapshots from a cold load, but the tip's snapshot
-        # is all the next block needs.
-        if self.chain:
+        # Rehydrate the per-block stake snapshots from the chaindb
+        # `stake_snapshots` table if it's present -- this carries
+        # the trailing FINALITY_VOTE_MAX_AGE_BLOCKS window of pins
+        # so `_process_finality_votes` can look up the correct 2/3
+        # denominator for any in-flight finality vote without
+        # falling through to the live-stakes branch that diverges
+        # consensus across restarted vs. uprestarted peers.
+        # Legacy chain.db files (pre-stake_snapshots-table) fall
+        # through the hasattr gate and land on the single-tip pin
+        # below, which is the old cold-start behaviour.
+        rehydrated = False
+        if hasattr(self.db, "get_all_stake_snapshots"):
+            persisted = self.db.get_all_stake_snapshots()
+            if persisted:
+                self._stake_snapshots = persisted
+                rehydrated = True
+        if not rehydrated and self.chain:
+            # Fallback: pin a single stake snapshot at the loaded
+            # tip so ongoing finality processing after load has a
+            # correct denominator for the next block's
+            # attestations.  Finality votes targeting older blocks
+            # still hit the live-stakes fallback on this path --
+            # that's the pre-persistence behaviour and is the best
+            # we can do for legacy chain.db files.  New chain.db
+            # files built under this binary always take the
+            # rehydrated path above and never land here.
             self._record_stake_snapshot(self.chain[-1].header.block_number)
 
         # Rehydrate seed_entity_ids from block 0.  This set is consensus-
@@ -1360,9 +1476,11 @@ class Blockchain:
         # a stale pool would compute a different payout amount at the
         # next lottery firing and silently fork.  Committed to the
         # snapshot root under _TAG_GLOBAL / _GLOBAL_LOTTERY_PRIZE_POOL.
-        self.supply.lottery_prize_pool = int(
-            snap.get("lottery_prize_pool", 0),
-        )
+        # Routed through `_set_lottery_prize_pool` so the chaindb
+        # mirror is populated at checkpoint-sync install time --
+        # subsequent cold restarts on this node then rehydrate from
+        # the DB row the install wrote.
+        self._set_lottery_prize_pool(int(snap.get("lottery_prize_pool", 0)))
         # Treasury cap-tightening rolling-window debit list
         # (TREASURY_CAP_TIGHTEN_HEIGHT hard fork).  Consensus-visible
         # list driving the annual 5%-of-balance ceiling on
@@ -2496,10 +2614,94 @@ class Blockchain:
         height forward.  We do not guard against duplicate entries at
         the same height — replay fidelity is more important than
         deduplication.
+
+        Mirrored into the `key_history` chaindb table so a cold
+        restart (which does NOT replay blocks — ``_load_from_db``
+        reads persisted tables directly) still has the pre-rotation
+        pubkey available for ``_public_key_at_height`` lookups during
+        slash-evidence verification.  Without the mirror, a validator
+        that rotates keys after equivocating can escape slashing on
+        any peer that has restarted since the rotation, because the
+        cold-booted peer falls back to the CURRENT pubkey and the
+        pre-rotation evidence signature fails to verify — plus the
+        restarted peer would reject the slash block an uprestarted
+        peer accepts, producing a state_root divergence.
         """
         self.key_history.setdefault(entity_id, []).append(
             (self.height, public_key),
         )
+        if self.db is not None and hasattr(self.db, "add_key_history_entry"):
+            self.db.add_key_history_entry(
+                entity_id, self.height, public_key,
+            )
+
+    def _bump_reputation(self, entity_id: bytes, delta: int = 1) -> None:
+        """Increment an entity's reputation counter, DB-mirrored.
+
+        Single chokepoint for every attestation-accepted +1 so the
+        in-memory dict and the chaindb `reputation` table never drift.
+        A direct `self.reputation[eid] += 1` would bypass the mirror
+        and silently reintroduce the cold-restart divergence the
+        table closes.
+        """
+        new = self.reputation.get(entity_id, 0) + delta
+        self.reputation[entity_id] = new
+        if self.db is not None and hasattr(self.db, "set_reputation"):
+            self.db.set_reputation(entity_id, new)
+
+    def _clear_reputation(self, entity_id: bytes) -> None:
+        """Reset an entity's reputation to 0, DB-mirrored.
+
+        Called from the slash path — a validator caught equivocating
+        forfeits accumulated reputation and re-enters the lottery at
+        zero.
+        """
+        self.reputation.pop(entity_id, None)
+        if self.db is not None and hasattr(self.db, "clear_reputation"):
+            self.db.clear_reputation(entity_id)
+
+    def _set_finalization_stall_counter(self, value: int) -> None:
+        """Set `self.blocks_since_last_finalization`, DB-mirrored.
+
+        Single chokepoint for every mutation of the finalization-stall
+        counter so the in-memory int and the chaindb `supply_meta` row
+        stay in lockstep.  The counter gates the quadratic inactivity-
+        leak burn in `_apply_block_state` — a cold-booted peer that
+        reads a stale 0 while uprestarted peers hold N>0 would stop
+        burning inactive-validator stake while peers continue,
+        diverging `supply.staked` + state_root at the next block.
+        Direct writes to `self.blocks_since_last_finalization` would
+        bypass the DB mirror and silently reopen the cold-restart
+        divergence the persistence closes, so ALL mutations go
+        through this helper.
+        """
+        self.blocks_since_last_finalization = int(value)
+        if self.db is not None and hasattr(
+            self.db, "set_finalization_stall_counter",
+        ):
+            self.db.set_finalization_stall_counter(int(value))
+
+    def _set_lottery_prize_pool(self, value: int) -> None:
+        """Set `self.supply.lottery_prize_pool`, DB-mirrored.
+
+        Single chokepoint for every mutation of the lottery prize
+        pool so the in-memory scalar and the chaindb `supply_meta`
+        row stay in lockstep.  The pool drives `select_lottery_
+        winner`'s `pool_payout` amount at every LOTTERY_INTERVAL
+        firing post-`SEED_DIVESTMENT_REDIST_HEIGHT` -- a cold-booted
+        peer that reads a stale 0 while uprestarted peers hold N>0
+        would pay the winner 0 tokens while peers continue paying
+        N/remaining, diverging `supply.balances` and state_root at
+        the next lottery firing.  Direct `+=` / `-=` writes on
+        `self.supply.lottery_prize_pool` would bypass the DB mirror
+        and silently reopen the cold-restart divergence the
+        persistence closes, so ALL mutations go through this helper.
+        """
+        self.supply.lottery_prize_pool = int(value)
+        if self.db is not None and hasattr(
+            self.db, "set_lottery_prize_pool",
+        ):
+            self.db.set_lottery_prize_pool(int(value))
 
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
@@ -2683,7 +2885,7 @@ class Blockchain:
         # reputation and re-enters the lottery pool (if at all) as a
         # zero-reputation newcomer.  Prevents the "misbehave once, earn
         # back your reputation from cached history" attack.
-        self.reputation.pop(tx.evidence.offender_id, None)
+        self._clear_reputation(tx.evidence.offender_id)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -4952,10 +5154,10 @@ class Blockchain:
             # block.  Deterministic (same chain → same counts on every
             # node).  Read by the bootstrap lottery to pick a winner
             # every LOTTERY_INTERVAL blocks; drives "honest behavior =
-            # real-time influence" during bootstrap.
-            self.reputation[att.validator_id] = (
-                self.reputation.get(att.validator_id, 0) + 1
-            )
+            # real-time influence" during bootstrap.  Routed through
+            # `_bump_reputation` so the in-memory dict and the
+            # chaindb `reputation` table stay in lockstep.
+            self._bump_reputation(att.validator_id)
             target_block = att.block_number
             pinned = self._stake_snapshots.get(target_block)
             if pinned is not None:
@@ -4978,7 +5180,7 @@ class Blockchain:
             if justified:
                 # Reset inactivity leak counter: finalization resumed.
                 # Penalties stop immediately on the next block.
-                self.blocks_since_last_finalization = 0
+                self._set_finalization_stall_counter(0)
                 logger.info(
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
@@ -5120,36 +5322,47 @@ class Blockchain:
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
 
-        Snapshots are permanent.  CLAUDE.md principle #2 (message
-        permanence & censorship resistance) applies equally to
-        consensus-critical state: a finality proof or attestation-
-        validity check that works today must still work in 100+
-        years, and that requires the stake map at every block to
-        remain reconstructible from chain state.
+        In-memory map (`self._stake_snapshots`) retains every
+        snapshot since chain start for replay fidelity; the chaindb
+        mirror (`stake_snapshots` table) is pruned to a trailing
+        ``FINALITY_VOTE_MAX_AGE_BLOCKS`` window because:
 
-        Snapshots are small — dict[entity_id_32B, int] — so the
-        per-block footprint scales with live validator-set size,
-        not chain length.  At ~500 validators with 40-byte entries
-        (32B id + 8B int + dict overhead) a snapshot is ~20 KB.
-        One block per ~12 s gives ~2.6M blocks/year, so an upper-
-        bound annual cost is ~50 GB even if the validator set is
-        saturated every single block — and in practice the set
-        churns slowly and most snapshots share structure, so this
-        is a comfortable ceiling, not a typical cost.  Relative to
-        message payloads (every on-chain message lives forever too),
-        stake snapshots are negligible.
+        * Attestations target the immediate parent (N → N-1), so
+          only the most recent pin is needed there.
+        * FinalityVotes may target a block up to
+          ``FINALITY_VOTE_MAX_AGE_BLOCKS`` slots back; anything
+          older is rejected at validation time before the consumer
+          sees it, so persisting older pins would never be read.
+        * Without the mirror, a cold-restart loses every pin
+          except the one `_load_from_db` installs at the loaded
+          tip -- FinalityVotes targeting older-than-tip blocks
+          then fall through to the `dict(self.supply.staked)`
+          live-state branch in `_process_finality_votes`, which
+          corrupts the 2/3 denominator (post-restart stake churn
+          vs. the pinned-correct pre-churn distribution) and
+          diverges the `crossed` decision vs. uprestarted peers.
 
         See `_process_attestations`: attestations in block N vote
         for block N-1, so the 2/3 denominator must be pinned to
         the stake set that existed at the attestation's target
         block, not the post-churn live set.  Finality votes
         (`_apply_finality_votes`) consult the same map for the
-        long-range-defense threshold — both callers used to have
-        "snapshot may have been pruned" fallbacks, but with
-        unbounded retention those fallbacks only fire during cold-
-        load bootstrap, never for organic traffic.
+        long-range-defense threshold.
         """
-        self._stake_snapshots[block_number] = dict(self.supply.staked)
+        stakes = dict(self.supply.staked)
+        self._stake_snapshots[block_number] = stakes
+        if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
+            self.db.add_stake_snapshot(block_number, stakes)
+            # Prune persisted rows older than the oldest block any
+            # finality vote could legally target.  In-memory map
+            # stays untouched -- callers that still hold a
+            # Blockchain instance across the activation window may
+            # want the older pins for analytics; the consensus
+            # consumers never look that far back.
+            from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
+            cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
+            if cutoff > 0:
+                self.db.prune_stake_snapshots_before(cutoff)
 
     def _validate_custody_proofs(
         self, block: Block, parent: Block,
@@ -5329,8 +5542,32 @@ class Blockchain:
         if not ok:
             return False, reason
 
-        # Block version must be a known protocol version
-        if block.header.version != 1:
+        # Block version gate.
+        #
+        # A block header whose `version` exceeds `MAX_SUPPORTED_BLOCK_VERSION`
+        # isn't a malicious or malformed block -- it means the network is
+        # running a consensus ruleset this binary doesn't know.  Treating it
+        # as "invalid block" would (a) never-endingly spam the peer-ban
+        # machinery as every post-fork block looks adversarial, and
+        # (b) silently keep the validator stuck at an old tip while its
+        # stake drifts to inactivity slashing.  Instead, raise
+        # ``BinaryOutOfDateError`` so the caller can halt with a clear
+        # "run `messagechain upgrade`" message.
+        #
+        # A version BELOW the minimum (or == 0) is still a real malformation
+        # -- that stays a normal rejection.
+        from messagechain.config import MAX_SUPPORTED_BLOCK_VERSION
+        if block.header.version > MAX_SUPPORTED_BLOCK_VERSION:
+            raise BinaryOutOfDateError(
+                f"Block at height {block.header.block_number} has version "
+                f"{block.header.version}, but this binary supports up to "
+                f"{MAX_SUPPORTED_BLOCK_VERSION}. The network has activated "
+                f"a consensus ruleset newer than your binary. Run "
+                f"`messagechain upgrade` (or `messagechain upgrade --tag "
+                f"vX.Y.Z-mainnet`) to install the release that implements "
+                f"this version, then restart the validator."
+            )
+        if block.header.version < 1:
             return False, f"Unknown block version {block.header.version}"
 
         # Crypto-agility gate: reject any block whose header advertises an
@@ -7198,9 +7435,14 @@ class Blockchain:
                 # consensus-visible scalar pool; total circulating
                 # supply is preserved until the lottery pays out to a
                 # winner's balance.  Pool is snapshotted for reorg
-                # rollback and committed to the state-snapshot root;
-                # see SupplyTracker.lottery_prize_pool.
-                self.supply.lottery_prize_pool += lottery_share
+                # rollback, committed to the state-snapshot root, AND
+                # mirrored into chaindb via `_set_lottery_prize_pool`
+                # so cold restart doesn't zero the pool while
+                # uprestarted peers retain it.
+                # See SupplyTracker.lottery_prize_pool.
+                self._set_lottery_prize_pool(
+                    self.supply.lottery_prize_pool + lottery_share,
+                )
 
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
@@ -7210,8 +7452,9 @@ class Blockchain:
         # Reset the per-block fee-burn ticker so this block's
         # pay_fee_with_burn calls accumulate cleanly.  Read back at
         # end-of-block to redirect ARCHIVE_BURN_REDIRECT_PCT into the
-        # archive reward pool.  See docs/proof-of-custody-archive-
-        # rewards.md.
+        # archive reward pool.  See
+        # `messagechain/consensus/archive_challenge.py` (module
+        # docstring) for the design.
         self.supply.fee_burn_this_block = 0
         # Same for the attester-pool fee-funding accumulator
         # (ATTESTER_FEE_FUNDING_HEIGHT hard fork).  Must reset here —
@@ -7285,7 +7528,7 @@ class Blockchain:
             self.slashed_validators.add(stx.evidence.offender_id)
             # Reputation reset: same policy as apply_slash_transaction;
             # a slashed validator forfeits accumulated reputation.
-            self.reputation.pop(stx.evidence.offender_id, None)
+            self._clear_reputation(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
@@ -7814,7 +8057,14 @@ class Blockchain:
                         self.supply.total_supply += bounty
                         self.supply.total_minted += bounty
                     if pool_payout > 0:
-                        self.supply.lottery_prize_pool -= pool_payout
+                        # Route through the helper so the chaindb
+                        # mirror of lottery_prize_pool tracks this
+                        # drain -- direct `-=` would bypass the DB
+                        # write and diverge from uprestarted peers
+                        # at the NEXT lottery firing.
+                        self._set_lottery_prize_pool(
+                            self.supply.lottery_prize_pool - pool_payout,
+                        )
                     if escrow_len > 0:
                         self._escrow.add(
                             entity_id=winner, amount=total_bounty,
@@ -7871,7 +8121,13 @@ class Blockchain:
         # this block, _process_attestations (called after us from add_block)
         # will reset it to 0.  The counter drives quadratic penalties on
         # non-attesting validators during prolonged finalization stalls.
-        self.blocks_since_last_finalization += 1
+        # Routed through `_set_finalization_stall_counter` so the
+        # chaindb `supply_meta` row stays in lockstep with the in-
+        # memory int — without the DB mirror, a cold-restart during a
+        # stall would silently diverge the burn from uprestarted peers.
+        self._set_finalization_stall_counter(
+            self.blocks_since_last_finalization + 1,
+        )
 
         from messagechain.consensus.inactivity import (
             is_leak_active,
@@ -7973,8 +8229,10 @@ class Blockchain:
             current_height=block.header.block_number,
         )
 
-        # Update base fee for next block based on this block's fullness
-        self.supply.update_base_fee(total_tx_count)
+        # Update base fee for next block based on this block's fullness.
+        # Pass the block's height so the EIP-1559 target tracks the
+        # post-Tier-9 raised target (22) at/after BLOCK_BYTES_RAISE_HEIGHT.
+        self.supply.update_base_fee(total_tx_count, block.header.block_number)
         self.base_fee = self.supply.base_fee
 
         # Update bootstrap_progress ratchet.  Deliberately the LAST step
@@ -9180,6 +9438,10 @@ class Blockchain:
         # the on-disk copy desynced from memory.
         self._dirty_entities = None
         self.supply = SupplyTracker()
+        # Re-thread the persistence handle — the fresh SupplyTracker
+        # has db=None by default, but restored state needs DB-mirrored
+        # pending_unstakes mutations during the replay loop.
+        self.supply.db = self.db
         self.nonces = {}
         self.entity_message_count = {}
         self.proposer_sig_counts = {}
@@ -9191,8 +9453,14 @@ class Blockchain:
         # which is a deliberate trade-off: cheap, doesn't require a DB
         # schema change, and restart timing isn't attacker-controllable.
         self.key_rotation_last_height = {}
-        # R6-A: key_history is in-memory state that replay rebuilds
-        # via _record_key_history at every install / rotation site.
+        # R6-A: key_history is state that the REORG replay rebuilds
+        # via _record_key_history at every install / rotation site
+        # (this _reset_state is followed by `for blk in self.chain:
+        # _apply_block_state(blk)` forward-walking every install).
+        # For the COLD-START path, replay does NOT run — rehydration
+        # comes from the `key_history` chaindb table via
+        # `_load_from_db`; every `_record_key_history` call mirrors
+        # into that table when a db handle is attached.
         self.key_history = {}
         self.public_keys = {}
         # slashed_validators is deliberately NOT cleared here — it is a
@@ -9239,8 +9507,9 @@ class Blockchain:
         # Leaving it stale lets replay stack a fresh leak window on top
         # of the old one — if finality stalls again after the merge,
         # honest validators take a SECOND quadratic inactivity-leak
-        # penalty for the same outage.
-        self.blocks_since_last_finalization = 0
+        # penalty for the same outage.  Routed through the helper so
+        # the chaindb row clears alongside the in-memory int.
+        self._set_finalization_stall_counter(0)
         # Coverage-divergence leak counter — fully derived from forward
         # block replay (each block with an inclusion_list invokes
         # _apply_inclusion_list_coverage_leak which writes here).  Reset

@@ -32,10 +32,23 @@ _TREE_HEIGHT = 5
 _SEED = b"\x42" * 32
 
 
+_KEYPAIR_CACHE: dict[tuple[int, bytes], KeyPair] = {}
+
+
 def _fresh_keypair(height: int = _TREE_HEIGHT, seed: bytes = _SEED) -> KeyPair:
-    """Build a small tree and reset the module-level warned state."""
+    """Return a keypair reset to leaf 0, reusing a cached tree per
+    (height, seed).  WOTS+ keygen is the dominant cost here; signing
+    leaves 0..N does not mutate tree structure, only the next-leaf
+    counter, so a cached keypair with _next_leaf=0 is equivalent to a
+    fresh one for every test in this file."""
     keys_module._warned_thresholds.clear()
-    return KeyPair.generate(seed, height=height)
+    ck = (height, seed)
+    kp = _KEYPAIR_CACHE.get(ck)
+    if kp is None:
+        kp = KeyPair.generate(seed, height=height)
+        _KEYPAIR_CACHE[ck] = kp
+    kp._next_leaf = 0
+    return kp
 
 
 class TestSignatureExhaustionWarnings(unittest.TestCase):
@@ -114,7 +127,7 @@ class TestSignatureExhaustionWarnings(unittest.TestCase):
         """Two different keypairs warn independently (different entities)."""
         # Different seeds → different Merkle roots → independent counters.
         kp_a = _fresh_keypair(seed=b"\x01" * 32)
-        kp_b = KeyPair.generate(b"\x02" * 32, height=_TREE_HEIGHT)
+        kp_b = _fresh_keypair(seed=b"\x02" * 32)
 
         # Sign kp_a past 80% — fires once for kp_a.
         with self.assertLogs(keys_module.__name__, level="WARNING") as cm1:

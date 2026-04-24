@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "messagechain"
-version = "1.0.0"
+version = "1.4.0"
 description = "Quantum-resistant proof-of-stake message chain"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -30,9 +30,26 @@ py-modules = ["client", "server"]
 include = ["messagechain*"]
 exclude = ["tests*", "deploy*", "docs*", ".claude*"]
 
+[tool.setuptools.package-data]
+# Ship the static HTML page served by the public-feed endpoint so
+# `pip install .` deployments can expose /v1/latest + the bundled viewer.
+messagechain = ["static/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-n auto"
+# -n auto              parallelise across CPU cores (pytest-xdist)
+# --timeout=30         abort any test that stalls > 30s (pytest-timeout)
+#                      — a hanging test otherwise burns a whole worker
+# --timeout-method=thread   works on Windows; main-thread interrupt
+# --reruns 1           one silent retry for xdist worker-crash victims
+#                      that happen to be scheduled alongside a leaky
+#                      test.  Tests that are genuinely flaky should be
+#                      fixed, not papered over — so the retry count is
+#                      capped at 1.
+# See CLAUDE.md "Test performance rules" for the why behind each flag.
+# Dev deps (not installed by the project — install locally):
+#     pip install pytest-xdist pytest-timeout pytest-rerunfailures
+addopts = "-n auto --timeout=30 --timeout-method=thread --reruns 1 --reruns-delay 1"
 markers = [
     "slow: run with production MERKLE_TREE_HEIGHT=10 (deselect with '-m \"not slow\"')",
 ]

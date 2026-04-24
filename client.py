@@ -16,6 +16,7 @@ import struct
 import sys
 import getpass
 
+from messagechain.config import MAX_MESSAGE_CHARS
 from messagechain.identity.identity import Entity
 from messagechain.core.transaction import create_transaction
 from messagechain.validation import safe_json_loads
@@ -106,15 +107,15 @@ def cmd_send_message(args):
     # Get message
     message = args.message
     if not message:
-        print("Enter your message (280 characters max):")
+        print(f"Enter your message ({MAX_MESSAGE_CHARS} characters max):")
         message = input("> ").strip()
     if not message:
         print("Error: Message cannot be empty.")
         sys.exit(1)
 
     char_count = len(message)
-    if char_count > 280:
-        print(f"Error: Message is {char_count} characters (max 280).")
+    if char_count > MAX_MESSAGE_CHARS:
+        print(f"Error: Message is {char_count} characters (max {MAX_MESSAGE_CHARS}).")
         sys.exit(1)
 
     # Collect private key to sign

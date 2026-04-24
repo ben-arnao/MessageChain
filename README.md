@@ -1,15 +1,15 @@
 # MessageChain
 
-[![tests](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml/badge.svg)](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml)
 [![release](https://img.shields.io/github/v/release/ben-arnao/MessageChain)](https://github.com/ben-arnao/MessageChain/releases)
 [![license](https://img.shields.io/github/license/ben-arnao/MessageChain)](./LICENSE)
 
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live since 2026-04-20. Chain ID `messagechain-v1`,
-genesis block 0
+**Status:** mainnet live. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
+
+**Live feed:** [messagechain.org](https://messagechain.org)
 
 ## Why
 
@@ -123,11 +123,16 @@ TCP 9333/9334 open. `key-status` warns you when to rotate your
 WOTS+ signing key before it exhausts.
 
 ```bash
+messagechain init                               # one-shot: keyfile, data-dir, systemd units
+messagechain doctor                             # preflight: perms, ports, seeds, disk
+messagechain config set auto_upgrade false      # toggle onboard.toml flags
 messagechain start --mine                       # run a validator
 messagechain stake --amount 10000               # lock as validator stake
 messagechain unstake --amount 5000              # ~15-day unbonding (was 7d pre block 50,000)
 messagechain key-status                         # WOTS+ leaf usage; when to rotate
 messagechain rotate-key                         # fresh keypair, old key retired
+messagechain rotate-key-if-needed               # daily watchdog; rotates at >=95% consumed
+messagechain upgrade                            # install the latest mainnet tag
 messagechain set-authority-key --authority-pubkey <cold_hex>
 messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
@@ -142,14 +147,54 @@ Minimum to participate in consensus:
 - **Host:** any always-on Linux box with Python 3.10+, ~2 GB RAM,
   and outbound+inbound TCP 9333 (P2P) and 9334 (RPC). Validator-1
   currently runs on a GCP `e2-small`.
-- **Keys:** generate a hot key with `messagechain generate-key` and
-  store the printed hex on paper. Optionally set a cold authority
-  key with `set-authority-key` so key rotations require the cold key.
+
+### Fast path: scripted install
+
+On a fresh Linux host (as root):
+
+```bash
+curl -L https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh \
+  | sudo bash -s -- --from-git https://github.com/ben-arnao/MessageChain.git
+```
+
+That runs `messagechain init` which lays out `/var/lib/messagechain`,
+generates a hot keyfile at `/etc/messagechain/keyfile` (0600), writes
+`/etc/messagechain/onboard.toml`, and drops systemd unit files for
+the validator + the weekly auto-upgrade timer + the daily auto
+key-rotation watchdog. Both timers are enabled by default; toggle
+with `messagechain config set auto_upgrade false` /
+`config set auto_rotate false`.
+
+Verify before enabling the service:
+
+```bash
+messagechain doctor         # preflight: perms, ports, seeds, disk
+messagechain status --full  # chain reachable, top validators, peers
+```
+
+Then enable + start:
+
+```bash
+systemctl enable --now messagechain-validator
+systemctl enable --now messagechain-upgrade.timer       # weekly binary upgrades
+systemctl enable --now messagechain-rotate-key.timer    # daily leaf-watermark watchdog
+```
+
+### Manual path
+
+- **Keys:** `messagechain generate-key` and store the printed hex on
+  paper. Optionally set a cold authority key with `set-authority-key`
+  so key rotations require the cold key.
 - **Run:** `messagechain start --mine --rpc-bind 0.0.0.0 --data-dir
   /var/lib/messagechain --keyfile /etc/messagechain/keyfile`. A
-  systemd unit example lives under `deploy/systemd/` in the repo.
-- **Upkeep:** run `key-status` periodically (WOTS+ leaves deplete
-  with use) and `rotate-key` before exhaustion.
+  systemd unit example ships as
+  [`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example)
+  — copy to `/etc/systemd/system/messagechain-validator.service`,
+  edit the paths, then `systemctl daemon-reload && systemctl enable
+  --now messagechain-validator`.
+- **Upkeep:** `key-status` and `rotate-key` by hand, or enable the
+  `messagechain-rotate-key.timer` unit for automatic rotation at
+  ≥95% WOTS+ leaf consumption.
 
 Rewards are a mix of block reward + transaction fees + attester
 pool share, split pro-rata by stake. Expect economics to tighten as

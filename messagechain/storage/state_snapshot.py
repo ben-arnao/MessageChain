@@ -95,6 +95,7 @@ from messagechain.config import (
     MAX_STATE_SNAPSHOT_BYTES as _MAX_DEFAULT,
     STATE_ROOT_VERSION as _STATE_ROOT_VERSION,
 )
+from messagechain.core.blockchain import ChainIntegrityError
 from messagechain.crypto.hashing import default_hash
 
 # Re-exported so callers don't need to import from both places.
@@ -398,8 +399,8 @@ _GLOBAL_TOTAL_BURNED = b"total_burned"
 _GLOBAL_BASE_FEE = b"base_fee"
 _GLOBAL_NEXT_ENTITY_INDEX = b"next_entity_index"
 # Proof-of-custody archive reward pool balance.  See
-# docs/proof-of-custody-archive-rewards.md and
-# messagechain/consensus/archive_challenge.py.  Single scalar; lives
+# `messagechain/consensus/archive_challenge.py` (module docstring)
+# for the authoritative design.  Single scalar; lives
 # under _TAG_GLOBAL so it shares the root-commitment path with other
 # supply-level counters.  MUST participate in the snapshot root for
 # consensus reasons: two state-synced nodes that disagree on the pool
@@ -1270,7 +1271,10 @@ def _encode_bytes_int_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
     for key in sorted(d.keys()):
-        assert isinstance(key, bytes), f"expected bytes key, got {type(key)}"
+        if not isinstance(key, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot dict expected bytes key, got {type(key).__name__}"
+            )
         out += struct.pack(">I", len(key)) + key
         out += struct.pack(">Q", int(d[key]))
     return bytes(out)
@@ -1295,7 +1299,10 @@ def _encode_bytes_bytes_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
     for key in sorted(d.keys()):
-        assert isinstance(key, bytes)
+        if not isinstance(key, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot dict expected bytes key, got {type(key).__name__}"
+            )
         val = d[key]
         if not isinstance(val, (bytes, bytearray)):
             raise TypeError(f"expected bytes value, got {type(val).__name__}")
@@ -1325,7 +1332,10 @@ def _encode_bytes_set(s) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(s))
     for key in sorted(s):
-        assert isinstance(key, bytes)
+        if not isinstance(key, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot set expected bytes element, got {type(key).__name__}"
+            )
         out += struct.pack(">I", len(key)) + key
     return bytes(out)
 
@@ -1347,7 +1357,10 @@ def _encode_int_bytes_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
     for key in sorted(d.keys()):
-        assert isinstance(key, int)
+        if not isinstance(key, int):
+            raise ChainIntegrityError(
+                f"state-snapshot dict expected int key, got {type(key).__name__}"
+            )
         val = d[key]
         out += struct.pack(">Q", key)
         out += struct.pack(">I", len(val)) + val

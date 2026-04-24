@@ -145,18 +145,15 @@ class TestGossipReceiverEnforcesRateLimit(_Base):
     def test_rate_limit_is_per_peer(self):
         """Flooding from one peer doesn't rate-limit a different peer."""
         srv = _build_server()
-        alice = _entity(b"alice")
-        self._register(srv.blockchain, alice)
-        srv.blockchain.supply.balances[alice.entity_id] = 10_000_000
 
+        # Drain the flooder's bucket with malformed payloads — same
+        # trick used by test_over_rate_gossip_dropped_and_scored.  The
+        # rate limiter keys on peer address, not payload content, so no
+        # real signed tx is needed and we skip 30 WOTS+ signs.
         flooder = _FakePeer(addr="10.0.0.2:9333")
         burst = RATE_PENDING_TX[1]
-        for n in range(burst + 10):
-            alice.keypair._next_leaf = n
-            tx = create_stake_transaction(alice, amount=100, nonce=n, fee=500)
-            srv._handle_announce_pending_tx(
-                {"kind": "stake", "tx": tx.serialize()}, flooder,
-            )
+        for _ in range(burst + 10):
+            srv._handle_announce_pending_tx({"kind": "bogus"}, flooder)
 
         # A different peer's bucket is still full.
         polite = _FakePeer(addr="10.0.0.3:9333")

@@ -19,6 +19,8 @@ from messagechain.config import (
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
     SIG_VERSION_CURRENT, FEE_INCLUDES_SIGNATURE_HEIGHT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
+    BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT,
+    BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
 )
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
@@ -310,9 +312,28 @@ def calculate_min_fee(
 ) -> int:
     """Calculate the minimum fee floor a tx must pay to be admitted.
 
-    At/after FLAT_FEE_HEIGHT: flat ``MIN_FEE_POST_FLAT`` regardless of
-    message or signature size.  Multi-part messages pay N × floor by
-    virtue of being N separate txs.
+    At/after BLOCK_BYTES_RAISE_HEIGHT (Tier 9): same linear formula as
+    Tier 8, but with the raised per-byte rate:
+
+        fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(message_bytes)
+
+    The per-byte rate triples (1 → 3) in step with the per-block byte
+    budget widening (15k → 45k) so bloat discipline scales with the
+    wider cap.
+
+    [LINEAR_FEE_HEIGHT, BLOCK_BYTES_RAISE_HEIGHT): linear-in-stored-
+    bytes formula at the Tier 8 rate:
+
+        fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
+
+    Pairs with the cap raise (MAX_MESSAGE_CHARS=1024) — long messages
+    pay proportionally for the bytes they pin to permanent state.
+    ``signature_bytes`` is ignored under the linear rule: the WOTS+
+    witness is amortized into BASE_TX_FEE, which is uniform per tx.
+
+    [FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT): flat ``MIN_FEE_POST_FLAT``
+    regardless of message or signature size.  Retained so blocks in
+    this height window replay deterministically.
 
     Before FLAT_FEE_HEIGHT (and when ``current_height`` is None — the
     legacy default for isolated tests and non-consensus call sites):
@@ -326,9 +347,12 @@ def calculate_min_fee(
     where ``bytes = len(message_bytes) + signature_bytes``.  The
     ``signature_bytes`` knob matches the pre-flat-fee
     FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
-    payload).  Post-flat-fee the witness size is moot — the flat floor
-    is uniform for every tx type — so ``signature_bytes`` is ignored.
+    payload).
     """
+    if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(message_bytes)
+    if current_height is not None and current_height >= LINEAR_FEE_HEIGHT:
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
     if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
         return MIN_FEE_POST_FLAT
     size = len(message_bytes) + signature_bytes
@@ -402,12 +426,21 @@ def create_transaction(
     message: str,
     fee: int,
     nonce: int,
+    current_height: int | None = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
 
     The fee is set by the user — higher fee means higher priority for
     block inclusion (BTC-style fee bidding).
+
+    ``current_height`` selects the fee rule used for the floor check:
+    pass the active chain tip so the caller pays the rule that
+    verify_transaction will apply.  Default (None) uses the legacy
+    rule, which is conservative — for any size, the legacy floor is
+    ≥ both the flat and linear floors, so a tx accepted here also
+    passes any later height-aware verification.  Tests targeting the
+    linear floor exactly must thread the height through.
     """
     valid, reason = _validate_message(message)
     if not valid:
@@ -423,7 +456,7 @@ def create_transaction(
             f"Stored message size {len(stored)} exceeds MAX_MESSAGE_BYTES "
             f"{MAX_MESSAGE_BYTES}"
         )
-    min_required = calculate_min_fee(stored)
+    min_required = calculate_min_fee(stored, current_height=current_height)
     if fee < min_required:
         raise ValueError(
             f"Fee must be at least {min_required} for this message "
@@ -487,25 +520,30 @@ def verify_transaction(
     canonical_stored, canonical_flag = encode_payload(plaintext)
     if canonical_stored != tx.message or canonical_flag != tx.compression_flag:
         return False
-    # Fee rule depends on block height:
-    #   * At/after FLAT_FEE_HEIGHT — flat per-tx floor (MIN_FEE_POST_FLAT).
-    #   * FEE_INCLUDES_SIGNATURE_HEIGHT..FLAT_FEE_HEIGHT-1 — legacy
-    #     quadratic priced on (message + signature) bytes.
-    #   * Pre-FEE_INCLUDES_SIGNATURE_HEIGHT (or no height context) —
-    #     legacy quadratic on message bytes only.
-    if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
-        if tx.fee < calculate_min_fee(tx.message, current_height=current_height):
-            return False
-    elif (
+    # Fee rule depends on block height.  Delegate the full dispatch to
+    # ``calculate_min_fee`` (single source of truth) instead of branching
+    # on each gate locally — this keeps verify in lockstep with the fee
+    # routing and is robust to schedule compressions where one fork
+    # supersedes another (e.g. bootstrap-compressed LINEAR < FLAT, where
+    # Tier 7 is retired in favor of Tier 8).
+    #
+    # Signature bytes feed the floor only in the legacy-quadratic window
+    # (``[FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT)``).  At/after
+    # FLAT or LINEAR the witness is amortized into the per-tx base and
+    # ``calculate_min_fee`` ignores the ``signature_bytes`` argument.
+    if (
         current_height is not None
         and current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
     ):
         sig_len = len(tx.signature.to_bytes())
-        if tx.fee < calculate_min_fee(tx.message, signature_bytes=sig_len):
-            return False
     else:
-        if tx.fee < calculate_min_fee(tx.message):
-            return False
+        sig_len = 0
+    if tx.fee < calculate_min_fee(
+        tx.message,
+        signature_bytes=sig_len,
+        current_height=current_height,
+    ):
+        return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False

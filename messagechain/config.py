@@ -137,6 +137,39 @@ HASH_ALGO = "sha3_256"
 HASH_VERSION_SHA256 = 1
 HASH_VERSION_CURRENT = HASH_VERSION_SHA256
 
+# Identity-derivation hash version — frozen at genesis and NEVER rotated.
+#
+# `derive_entity_id(pubkey)` and `_derive_signing_seed(privkey)` in
+# messagechain.identity.identity both need to return the exact same
+# bytes every time they are called over the ENTIRE lifetime of the
+# chain, because:
+#
+#   * A user's on-chain balance is keyed by the entity_id that
+#     `derive_entity_id` produced the first time they transferred.  If
+#     the function ever returns a different hash for the same public
+#     key, the user's wallet address silently changes and their funds
+#     are orphaned at an unreproducible address.
+#   * A user's keypair is re-derived from their private key every time
+#     they sign.  If `_derive_signing_seed` ever returns a different
+#     seed for the same private key, the recomputed WOTS+ keypair has
+#     a different public key than the one recorded on chain, so the
+#     user can no longer sign for their own account.
+#
+# Binding those derivations to `HASH_VERSION_CURRENT` (the ACTIVE hash
+# version, which governance is designed to rotate over the 100–1000
+# year horizon) would guarantee a full account wipe on the first
+# rotation — the exact failure mode the crypto-agility story exists to
+# prevent.  Pin a SEPARATE "identity hash version" register here that
+# NEVER rotates, so the on-chain identity namespace is immortal.
+#
+# If SHA3-256 is ever broken, we do NOT change this constant.  We ship
+# a migration tx type that lets a user SIGN (under the still-valid
+# signing primitive of the day) a "rebind from old_entity_id to
+# new_entity_id" instruction, moving their balance to the new
+# identity namespace under the new hash.  That keeps the namespace
+# change user-consented, not silent.
+IDENTITY_HASH_VERSION = HASH_VERSION_SHA256
+
 SIG_VERSION_WOTS_W16_K64 = 1      # WOTS W=16 chains=64 merkle h=20.
                                   # NOTE: checksum encoding in this version
                                   # truncates to always-zero — see V2 below.
@@ -268,6 +301,26 @@ def validate_block_serialization_version(version: int) -> tuple[bool, str]:
     return True, "OK"
 
 
+# Maximum block-header `version` this binary understands at the
+# consensus layer.  Distinct from BLOCK_SERIALIZATION_VERSION (wire
+# format): this is the CONSENSUS ruleset version carried inside the
+# header, and it exists specifically so an out-of-date binary can
+# HALT cleanly when the network activates newer rules rather than
+# rejecting post-fork blocks as "invalid" and spamming peer-ban
+# machinery.
+#
+# Current value is 1 (the only version ever shipped).  A future hard
+# fork that changes consensus semantics bumps this to 2 (or higher),
+# and ``messagechain upgrade`` installs the binary that understands
+# it.  Old binaries that see ``block.header.version = 2`` raise
+# ``BinaryOutOfDateError`` from ``validate_block`` with an operator-
+# facing message pointing at the upgrade command.
+#
+# See ``BinaryOutOfDateError`` in ``messagechain/core/blockchain.py``
+# for the halt semantics and the block-version gate that reads this.
+MAX_SUPPORTED_BLOCK_VERSION = 1
+
+
 def validate_tx_serialization_version(version: int) -> tuple[bool, str]:
     """Reject unknown transaction wire-format versions at the parse boundary.
 
@@ -317,8 +370,13 @@ def validate_receipt_version(version: int) -> tuple[bool, str]:
 
 
 # Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
-MAX_MESSAGE_CHARS = 280  # max characters per message
-MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
+# Cap raised from 280 → 1024 at LINEAR_FEE_HEIGHT (Tier 8 fork). The constant
+# itself is monotone-safe to bump: every historical (pre-fork) tx satisfied
+# len ≤ 280, which trivially still satisfies len ≤ 1024 — no replay risk.
+# Long-form posts pay the linear-in-bytes fee floor introduced by the same
+# fork; storage discipline lives in the fee, not in the cap.
+MAX_MESSAGE_CHARS = 1024  # max characters per message
+MAX_MESSAGE_BYTES = 1024  # 1:1 with chars (ASCII only, no multi-byte encoding)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
@@ -434,7 +492,16 @@ import hashlib as _hashlib
 # genesis ID the live chain has already committed to; a future hash
 # migration cannot change it even in principle.  See
 # tests/test_hash_dispatch.py ALLOWED_DIRECT_USES.
-TREASURY_ENTITY_ID = _hashlib.new(HASH_ALGO, b"messagechain-treasury-v1").digest()
+#
+# HASH LITERAL pinning: the hash family is spelled out as a bare
+# string ("sha3_256"), NOT the ``HASH_ALGO`` constant, so a future PR
+# that updates ``HASH_ALGO`` to track a rotated hash family cannot
+# silently move TREASURY_ENTITY_ID to a different 32-byte address.
+# Any relocation of the treasury address MUST be an explicit edit to
+# this line accompanied by an explicit governance migration — the
+# treasury holds 40M tokens and a silent address change orphans all
+# of them.
+TREASURY_ENTITY_ID = _hashlib.new("sha3_256", b"messagechain-treasury-v1").digest()
 TREASURY_ALLOCATION = 40_000_000  # ~28.6% of genesis supply (40M / 140M)
 
 # Default genesis allocation table: genesis validator + treasury.
@@ -522,7 +589,7 @@ FEE_PER_BYTE = 3  # legacy per-byte component (pre-FLAT_FEE_HEIGHT only)
 FEE_QUADRATIC_COEFF = 2  # legacy quadratic coeff (pre-FLAT_FEE_HEIGHT only)
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
 BASE_FEE_MAX_CHANGE_DENOMINATOR = 8  # max 12.5% change per block
-TARGET_BLOCK_SIZE = 10                # target txs per block (50% of MAX_TXS_PER_BLOCK)
+TARGET_BLOCK_SIZE = 10                # target txs per block (pre-Tier-9: 50% of legacy MAX_TXS_PER_BLOCK=20)
 MIN_TIP = 1                          # minimum priority tip to proposer
 
 # Timestamp tolerance
@@ -574,10 +641,27 @@ MAX_ACTIVE_PROPOSALS = 500
 # below.  Recovery on the way down is symmetric, so the cap also bounds
 # the post-attack recovery tail.
 MAX_BASE_FEE_MULTIPLIER = 10_000
-MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
+MAX_TXS_PER_BLOCK = 45  # max transactions per block (tx count cap)
+# Raised from 20 → 45 at BLOCK_BYTES_RAISE_HEIGHT (Tier 9).  Targets
+# ~24 GB/yr on-disk chain growth at 100-validator saturation.  Per-
+# message cap stays at MAX_MESSAGE_CHARS=1024 — this is a throughput
+# raise, not a message-size raise.  Monotone-safe to bump: pre-fork
+# blocks satisfied total ≤ 20, which trivially still satisfies ≤ 45.
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
-MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
-MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
+MAX_BLOCK_MESSAGE_BYTES = 45_000  # max total message payload bytes per block (byte budget cap)
+# Raised 10_000 → 15_000 at LINEAR_FEE_HEIGHT (Tier 8) alongside the
+# per-message cap raise, then 15_000 → 45_000 at BLOCK_BYTES_RAISE_HEIGHT
+# (Tier 9) to widen the per-block byte budget in step with the tx-count
+# raise.  Bloat discipline is preserved via the simultaneously-raised
+# FEE_PER_STORED_BYTE_POST_RAISE (1 → 3).  Monotone-safe to bump:
+# pre-fork blocks satisfied total ≤ 15_000, which trivially still
+# satisfies ≤ 45_000.
+MAX_BLOCK_SIG_COST = 250  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
+# Raised 100 → 250 at BLOCK_BYTES_RAISE_HEIGHT (Tier 9) to match the
+# MAX_TXS_PER_BLOCK raise — each tx carries a signature verification
+# cost, so the sig-cost ceiling has to widen in proportion.
+# Monotone-safe to bump: pre-fork blocks satisfied cost ≤ 100, which
+# trivially still satisfies ≤ 250.
 # COINBASE_MATURITY must cover the worst-case un-finalized window or a
 # reorg can double-spend a coinbase that the honest chain never minted.
 # Math: MAX_REORG_DEPTH = 100 caps explicit reorg, but finality lands
@@ -800,8 +884,21 @@ RPC_DEFAULT_PORT = 9334  # RPC listen port (clients speak JSON-RPC here)
 # only on non-genesis nodes.  As the validator set grows, shipped
 # defaults should expand and eventually give way to proper peer-exchange.
 SEED_NODES: list[tuple[str, int]] = [
-    ("35.237.211.12", DEFAULT_PORT),  # genesis validator — bootstrap phase
+    ("35.237.211.12", DEFAULT_PORT),  # validator-1 (founder / genesis) — us-east1-b
+    ("35.231.82.12", DEFAULT_PORT),   # validator-2 — us-east1-c (added v1.0.1)
 ]
+
+# Optional DNS seed domains. When set, nodes query TXT records on each
+# domain at startup for additional peer endpoints ("host=1.2.3.4 port=9333").
+# Empty by default — no public seed domain is live yet. Merged into the
+# hardcoded SEED_NODES list; operators can override via --seed.
+DNS_SEED_DOMAINS: list[str] = []
+
+# Auto-upgrade + auto-rotate defaults. Operators flip these in onboard.toml;
+# config-level constants exist so unit tests and scripts can read the
+# shipped default without parsing the TOML file.
+AUTO_UPGRADE_ENABLED = True
+AUTO_ROTATE_ENABLED = True
 
 # Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
 # to make its initial RPC connection.  Once connected, the CLI calls
@@ -813,7 +910,8 @@ SEED_NODES: list[tuple[str, int]] = [
 #
 # These must point at RPC ports (RPC_DEFAULT_PORT), not P2P ports.
 CLIENT_SEED_ENDPOINTS: list[tuple[str, int]] = [
-    ("35.237.211.12", RPC_DEFAULT_PORT),
+    ("35.237.211.12", RPC_DEFAULT_PORT),  # validator-1 — us-east1-b
+    ("35.231.82.12", RPC_DEFAULT_PORT),   # validator-2 — us-east1-c (added v1.0.1)
 ]
 MAX_PEERS = 50
 HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
@@ -831,10 +929,29 @@ HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
 # 1000 tokens each.  Consensus constant; changing is a hard fork.
 KEY_ROTATION_COOLDOWN_BLOCKS = 144
 
-PEER_READ_TIMEOUT = 300  # seconds - idle timeout for post-handshake peer
-                         # reads.  Previously a magic 300 literal scattered
-                         # across server.py + network/node.py (4 sites);
-                         # centralized so ops changes touch one knob.
+PEER_READ_TIMEOUT = 1800  # seconds (30 min) — idle timeout for
+                          # post-handshake peer reads.  Previously 300s,
+                          # but on a small network where block cadence
+                          # is ~10 min and the counter-party rarely
+                          # produces (low stake), the inbound read loop
+                          # timed out every ~block interval of silence
+                          # and killed live connections; the counter-
+                          # party's maintenance loop redialed 30s later,
+                          # accumulating ghost Peer entries.  Dead-
+                          # socket detection is now handled by TCP
+                          # keepalive (~2 min); the remaining job of
+                          # this timeout is slow-loris defense, where
+                          # 30 min + MAX_PEERS + ban_manager is fine.
+
+# Seed connections are established once at startup.  Without a
+# maintenance loop, a dropped connection (silent NAT timeout, peer
+# restart, transient network blip) is never retried — on a small
+# network this degrades to two solo-producing chains.  The maintenance
+# loop walks self.seed_nodes every PEER_MAINTENANCE_INTERVAL seconds
+# and kicks off a fresh _connect_to_peer for any seed whose Peer entry
+# is missing or has is_connected=False.  30s balances responsiveness
+# with log noise on a disconnected seed.
+PEER_MAINTENANCE_INTERVAL = 30  # seconds
 
 # Peer banning
 BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
@@ -1257,7 +1374,9 @@ def is_state_root_checkpoint_block(block_number: int) -> bool:
 # Consensus-enforced reward stream that pays nodes for provably holding
 # historical block data, defending the 1000-year permanence principle
 # against archive-operator attrition.  See
-# docs/proof-of-custody-archive-rewards.md for the full design.
+# `messagechain/consensus/archive_challenge.py` (module docstring +
+# `CustodyProof`, `ArchiveProofBundle`) and
+# `messagechain/consensus/archive_duty.py` for the full design.
 #
 # Each challenge block, the chain selects a random past height via
 # VRF-over-block-hash.  Any operator holding that block may submit a
@@ -1668,8 +1787,10 @@ SLASH_FINDER_REWARD_PCT = 10  # % of slashed amount paid to evidence submitter
 # it so someone else does) within the grace window, the user can
 # publish the receipt as slashable evidence on-chain.
 #
-# Two-phase slashing (critical — see docs/attestable-submission-receipts.md
-# "Security Analysis"):
+# Two-phase slashing (critical — see
+# `messagechain/network/submission_receipt.py` +
+# `messagechain/consensus/censorship_evidence.py` for the authoritative
+# design + security analysis):
 #   1. Accuser posts CensorshipEvidenceTx (pays MIN_FEE).
 #   2. Evidence is recorded in pending state, NOT yet applied.
 #   3. Accused validator has EVIDENCE_MATURITY_BLOCKS (defined below) to
@@ -2004,6 +2125,25 @@ SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC = 0.05  # 1 per 20 seconds steady
 SUBMISSION_REJECTION_BURST = 3                   # up to 3 rejection proofs immediately
 
 # ─────────────────────────────────────────────────────────────────────
+# Public read-only feed (messagechain.network.public_feed_server)
+# ─────────────────────────────────────────────────────────────────────
+# Operator-facing endpoint that lets non-technical visitors browse
+# recent on-chain messages over plain HTTP.  Read-only; no state
+# mutations possible.  Message payloads are public by design (see
+# CLAUDE.md "Payloads are fully public"), so nothing sensitive is
+# exposed that the chain hasn't already committed.
+#
+# Steady 4/sec with a 30-request burst per source IP: enough for a
+# browser polling /v1/latest every 10s with a handful of concurrent
+# visitors, tight enough that an unbounded scraper can't walk the
+# whole chain in a loop.  PUBLIC_FEED_MAX_LIMIT caps how far back a
+# single request can reach — a client asking for more just gets the
+# cap, same as `messagechain read --last N` clamps today.
+PUBLIC_FEED_RATE_LIMIT_PER_SEC = 4
+PUBLIC_FEED_BURST = 30
+PUBLIC_FEED_MAX_LIMIT = 50
+
+# ─────────────────────────────────────────────────────────────────────
 # Attestable submission receipts + censorship-evidence slashing
 # ─────────────────────────────────────────────────────────────────────
 # Validators issue signed "submission receipts" committing to having
@@ -2190,16 +2330,34 @@ UNBONDING_PERIOD_POST_EXTENSION = (
 #   Tier 6 — Sybil defense (depends on MIN_STAKE raise):
 #     96,000  VALIDATOR_REGISTRATION_BURN_HEIGHT
 #
-#   Tier 7 — Fee-model simplification:
-#     98,000  FLAT_FEE_HEIGHT  (flat per-tx floor; retires quadratic)
+#   Tier 7 — Fee-model simplification (RETIRED — superseded by Tier 8
+#            in the bootstrap-compressed schedule.  FLAT_FEE_HEIGHT is
+#            kept at 98,000 for code-path audit clarity but never
+#            activates, because Tier 8 (below) is now scheduled earlier
+#            and takes precedence in ``calculate_min_fee``):
+#     98,000  FLAT_FEE_HEIGHT  (flat per-tx floor; never live in prod)
+#
+#   Tier 8 — Linear-in-stored-bytes fees + per-message cap raise:
+#      4,300  LINEAR_FEE_HEIGHT  (pulled forward from 100,000 so the
+#             1024-char cap is testable inside the bootstrap window)
+#
+#   Tier 9 — Throughput raise (depends on LINEAR_FEE_HEIGHT active):
+#      4,500  BLOCK_BYTES_RAISE_HEIGHT
 #
 # Dependency invariants (enforced via load-time asserts where
 # declared):
 #   * SEED_DIVESTMENT_REDIST_HEIGHT  >= SEED_DIVESTMENT_RETUNE_HEIGHT
 #   * VALIDATOR_REGISTRATION_BURN_HEIGHT > MIN_STAKE_RAISE_HEIGHT
+#   * BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT
 #   * All heights < BOOTSTRAP_END_HEIGHT (105,192)
-#   * All heights > current_tip_height + 50,000 at deploy time
-#     (honest-node upgrade runway)
+#   * Honest-node upgrade runway: the 50,000-block rule from the
+#     original schedule is relaxed during bootstrap.  With only two
+#     operator-controlled validators, a sub-5k-block runway is
+#     acceptable — the rule scales with validator-set size and
+#     coordination cost, both minimal here.
+#   * LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT is NO LONGER required.  In
+#     compressed schedules Tier 7 is intentionally unreachable; the
+#     fee-routing code already prefers LINEAR first.
 #
 # DEPLOY CHECKLIST
 #   1. Confirm current tip leaves ≥50,000 blocks of runway before Tier 1.
@@ -2835,6 +2993,118 @@ assert FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT, (
     "the witness-aware formula during replay"
 )
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Linear-in-stored-bytes fee floor — supersedes the flat per-tx floor
+# ─────────────────────────────────────────────────────────────────────
+# At/after LINEAR_FEE_HEIGHT the fee floor becomes:
+#
+#     fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(stored_message)
+#
+# Paired with the cap raise (MAX_MESSAGE_CHARS 280 → 1024) and the
+# byte-budget raise (MAX_BLOCK_MESSAGE_BYTES 10_000 → 15_000), this
+# unlocks short-post-scale messages without giving away storage:
+# longer messages pay proportionally more for the bytes they pin to
+# permanent state.
+#
+# Why linear and not flat:
+#   * Under the raised cap, a flat per-tx floor under-prices long
+#     messages — a 1024-byte tx and a 10-byte tx pay the same minimum,
+#     and rational users fill the cap, donating bloat.
+#   * Linear is the simplest formula that prices stored bytes honestly.
+#     Quadratic distorts the market without adding bloat discipline
+#     (we already have a hard per-message cap).
+#   * The base term amortizes the per-tx WOTS+ signature overhead
+#     (~1.1 KB regardless of message size); without it, tiny messages
+#     would pay near-zero for the sig bloat they still impose.
+#
+# Calibration philosophy: keep the floor "very low" — symbolic, not a
+# spam deterrent on its own. The market (EIP-1559 base-fee + tip)
+# prices above the floor whenever there's competition. The floor only
+# guarantees no-free-txs; it doesn't try to set the equilibrium price.
+#
+# Legacy constants (MIN_FEE, MIN_FEE_POST_FLAT, FEE_PER_BYTE,
+# FEE_QUADRATIC_COEFF) are retained so pre-fork blocks replay
+# deterministically under the rule current at their height.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  Per the FORK
+# SCHEDULE: Tier 8, target 100_000 — after the last Tier 7 fork
+# (FLAT_FEE_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
+BASE_TX_FEE = 10                 # per-tx base — sig-overhead amortization
+FEE_PER_STORED_BYTE = 1          # per-byte component (charged on STORED, not plaintext)
+# Pulled forward from 100_000 so the 1024-char cap becomes testable inside
+# the bootstrap window.  LINEAR_FEE_HEIGHT now PRECEDES FLAT_FEE_HEIGHT; the
+# Tier 7 flat-fee intermediate is effectively retired — at its activation
+# height (98_000) the linear rule is already in force, so the flat floor
+# never applies in production.  Pre-linear heights still replay under
+# their original legacy-quadratic rules unchanged.
+LINEAR_FEE_HEIGHT = 4_300
+
+assert BASE_TX_FEE >= 0, "BASE_TX_FEE cannot be negative"
+assert FEE_PER_STORED_BYTE >= 1, (
+    "FEE_PER_STORED_BYTE must be at least 1 — a zero per-byte rate "
+    "lets long messages share the same floor as short ones, which is "
+    "the under-pricing failure mode the linear rule is designed to fix"
+)
+# NOTE: Prior schedules required LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT so the
+# flat-fee intermediate had a live window.  In bootstrap-compressed
+# schedules this invariant is deliberately inverted — the flat-fee
+# intermediate is retired before it ever activates.  The fee-routing code
+# in ``calculate_min_fee`` already checks LINEAR first, so LINEAR ≤ FLAT
+# is safe: linear takes precedence at every height ≥ LINEAR_FEE_HEIGHT.
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 9 — throughput raise (wider per-block budgets)
+# ─────────────────────────────────────────────────────────────────────
+# At/after BLOCK_BYTES_RAISE_HEIGHT the per-block throughput budgets
+# widen: MAX_TXS_PER_BLOCK 20 → 45, MAX_BLOCK_MESSAGE_BYTES 15k → 45k,
+# MAX_BLOCK_SIG_COST 100 → 250.  The constants above already carry the
+# post-fork values (they are monotone-safe bumps — pre-fork blocks
+# satisfied stricter bounds that trivially still satisfy the looser
+# ones).  This section carries the height-gated knobs that DO change
+# consensus-visible behavior with the fork:
+#
+#   * FEE_PER_STORED_BYTE_POST_RAISE — per-byte fee floor rises 1 → 3,
+#     preserving bloat discipline under the wider cap.  Without this,
+#     a 3× per-block byte budget at a flat 1/byte floor would let a
+#     block carry ~3× more permanent-state bytes at the same floor
+#     price.
+#   * TARGET_BLOCK_SIZE_POST_RAISE — EIP-1559 target climbs 10 → 22,
+#     tracking ~50% of the new MAX_TXS_PER_BLOCK=45.  Without this the
+#     base fee would saturate upward permanently at the old 10-tx
+#     target once the network fills beyond 10 txs/block.
+#
+# Per-message cap stays at MAX_MESSAGE_CHARS=1024 — this is a
+# THROUGHPUT raise, not a message-size raise.
+#
+# Ordering:
+#   * BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT — the linear fee
+#     formula must be active when the per-byte rate multiplies, since
+#     the post-raise branch reads BASE_TX_FEE and the post-raise
+#     per-byte rate.
+BLOCK_BYTES_RAISE_HEIGHT = 4_500         # Tier 9 (pulled forward alongside Tier 8)
+FEE_PER_STORED_BYTE_POST_RAISE = 3       # 3× Tier 8 floor — preserves bloat discipline under wider cap
+TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (was 10, 50% of 20)
+
+assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
+    "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
+    "throughput raise rides on top of the linear fee formula; pre-"
+    "linear heights still replay under the legacy flat / quadratic "
+    "rules and do not see the post-raise per-byte rate"
+)
+assert FEE_PER_STORED_BYTE_POST_RAISE > FEE_PER_STORED_BYTE, (
+    "FEE_PER_STORED_BYTE_POST_RAISE must raise (not lower) the per-byte "
+    "floor — lowering it under a wider cap is the bloat-discipline "
+    "failure mode the Tier 9 fork is designed to prevent"
+)
+assert TARGET_BLOCK_SIZE_POST_RAISE < MAX_TXS_PER_BLOCK, (
+    "TARGET_BLOCK_SIZE_POST_RAISE must fit under the new MAX_TXS_PER_BLOCK "
+    "cap — a target at or above the cap means the EIP-1559 controller "
+    "can never see 'above-target' blocks and base fee only ever drops"
+)
+
 # ─────────────────────────────────────────────────────────────────────
 # Fork-schedule ordering invariants (load-time asserts)
 # ─────────────────────────────────────────────────────────────────────
@@ -2895,6 +3165,8 @@ for _fork_name, _fork_height in (
     ("DEFLATION_FLOOR_V2_HEIGHT", DEFLATION_FLOOR_V2_HEIGHT),
     ("VALIDATOR_REGISTRATION_BURN_HEIGHT", VALIDATOR_REGISTRATION_BURN_HEIGHT),
     ("FLAT_FEE_HEIGHT", FLAT_FEE_HEIGHT),
+    ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
+    ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "

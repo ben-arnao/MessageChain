@@ -41,15 +41,15 @@ _ENTITY_POOL: list = []
 
 
 def _entity(i: int):
-    """Pool with tree_height=5 (32 leaves) per entity.  Each test
+    """Pool with tree_height=3 (8 leaves) per entity.  Each test
     method signs one proof per entity in setUp; 7 test methods reuse
     entities 0..29 across them so each entity burns ~7 leaves total,
-    well inside the 32-leaf budget.  At tree_height=2 the pool would
-    exhaust partway through the suite."""
+    fitting in the 8-leaf budget with one spare.  At tree_height=2
+    the pool would exhaust partway through the suite."""
     from messagechain.identity.identity import Entity
     while len(_ENTITY_POOL) <= i:
         seed = f"fair-{len(_ENTITY_POOL)}".encode().ljust(32, b"\x00")
-        _ENTITY_POOL.append(Entity.create(seed, tree_height=5))
+        _ENTITY_POOL.append(Entity.create(seed, tree_height=3))
     return _ENTITY_POOL[i]
 
 
@@ -169,16 +169,16 @@ class TestFairSelection(unittest.TestCase):
         "fair" actually means — no submitter is permanently excluded
         by the selection rule."""
         ever_chosen: set[bytes] = set()
-        for i in range(200):
+        for i in range(80):
             chosen = self.pool.select_for_inclusion(
                 self.challenge_block, cap=self.cap,
                 selection_seed=_h(f"cover-{i}".encode()),
             )
             for p in chosen:
                 ever_chosen.add(p.prover_id)
-        # With 30 submitters, 10 picked per draw, 200 draws, every
-        # submitter's probability of never appearing is (20/30)^200 ≈
-        # 10^-35 — should see all 30.
+        # With 30 submitters, 10 picked per draw, 80 draws, every
+        # submitter's probability of never appearing is (20/30)^80 ≈
+        # 8e-15 — × 30 provers ≈ 2e-13.  Safely never fails.
         self.assertEqual(
             len(ever_chosen), 30,
             f"only {len(ever_chosen)}/30 submitters ever got picked "

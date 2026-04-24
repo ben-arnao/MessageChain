@@ -13,10 +13,12 @@ import asyncio
 import getpass
 import logging
 import os
+import re
 import stat
 import sys
 
-from messagechain.config import DEFAULT_PORT
+from messagechain import __version__
+from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,6 +45,21 @@ def build_parser() -> argparse.ArgumentParser:
              "mnemonic, one line).  Allows unattended signing.  Ensure "
              "file permissions are 0400 or 0600.",
     )
+    # Global --data-dir.  When a signing command runs on the SAME host as
+    # the validator daemon (operator convenience case), passing --data-dir
+    # lets the CLI (a) reuse the daemon's cached WOTS+ keypair instead of
+    # regenerating a multi-minute tree, and (b) coordinate leaf reservation
+    # with the running server via the `reserve_leaf` RPC.  Without this
+    # flag, cmd_transfer / cmd_stake / etc. work the way they always did
+    # (fresh keygen, no daemon coordination) for off-host signers.
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Chain data directory (hot-validator co-host optimization).  "
+             "When set, signing subcommands load the keypair from the "
+             "daemon's on-disk cache and reserve leaves via the server's "
+             "reserve_leaf RPC -- eliminating the multi-minute CLI keygen "
+             "and preventing WOTS+ leaf collisions with the running daemon.",
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -60,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Kept callable here as `messagechain start --keyfile ...` for
     # systemd-unit compatibility; redundant but not conflicting.
     start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
+    start.add_argument(
+        "--skip-reachability-probe", action="store_true",
+        help="Skip the best-effort external-reachability probe on --mine",
+    )
+    start.add_argument(
+        "--yes-nat", action="store_true",
+        help="Acknowledge that this validator is behind NAT; continue despite a failed probe",
+    )
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
     start.add_argument(
         "--rpc-bind", type=str, default="127.0.0.1",
@@ -99,9 +124,9 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser(
         "send",
         help="Send a message",
-        description="Send a message to the chain (280 chars max).",
+        description="Send a message to the chain (1024 chars max).",
     )
-    send.add_argument("message", type=str, help="Message text (280 chars max)")
+    send.add_argument("message", type=str, help="Message text (1024 chars max)")
     send.add_argument(
         "--fee", type=int, default=None,
         help="Transaction fee (auto-detected if omitted)",
@@ -121,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
             "persisted under --receipts-dir for later evidence use."
         ),
     )
-    send_multi.add_argument("message", type=str, help="Message text (280 chars max)")
+    send_multi.add_argument("message", type=str, help="Message text (1024 chars max)")
     send_multi.add_argument(
         "--fee", type=int, required=True, help="Transaction fee (tokens)",
     )
@@ -168,10 +193,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send tokens to another entity",
         description="Transfer tokens to another registered entity.",
     )
-    transfer.add_argument("--to", required=True, help="Recipient address (mc1... checksummed or raw hex)")
+    transfer.add_argument("--to", required=True, help="Recipient address (mc1... checksummed form recommended; raw hex requires --allow-raw-hex-address)")
     transfer.add_argument("--amount", type=int, required=True, help="Amount to transfer")
     transfer.add_argument("--fee", type=int, default=None, help="Transaction fee (auto-detected if omitted)")
     transfer.add_argument("--server", type=str, default=None, help="Server address host:port")
+    transfer.add_argument(
+        "--allow-raw-hex-address", action="store_true",
+        help="Allow raw 64-char hex in --to (bypasses the mc1... "
+             "checksum layer).  Required if you are not passing an "
+             "mc1... form: raw hex has no typo protection, so a "
+             "single mistyped character sends funds to an "
+             "unrecoverable address.  Prefer the mc1... form.",
+    )
 
     # --- balance ---
     balance = sub.add_parser(
@@ -420,6 +453,10 @@ def build_parser() -> argparse.ArgumentParser:
             "chain-level checks run."
         ),
     )
+    status.add_argument(
+        "--full", action="store_true",
+        help="Also print validator-set summary, peer count, and auto-* state",
+    )
 
     # --- proposals ---
     proposals = sub.add_parser(
@@ -541,6 +578,190 @@ def build_parser() -> argparse.ArgumentParser:
         "--external-port", type=int, default=None,
         help="Port advertised on the .onion address (default: same as --rpc-port)",
     )
+
+    # --- migrate-chain-db ---
+    migrate_db = sub.add_parser(
+        "migrate-chain-db",
+        help="Run a one-shot schema migration on an existing chain.db",
+        description=(
+            "Upgrade an existing chain.db in place to the schema "
+            "version this binary expects.  Currently handles the "
+            "v1 -> v2 upgrade (populates reputation, key_history, "
+            "pending_unstakes, stake_snapshots, and the two new "
+            "supply_meta counters from replayed block history).  "
+            "Run this BEFORE starting the node on a v1 DB; the node "
+            "startup path refuses to open a v1 DB under the v2 "
+            "binary and points here for actionable remediation.  "
+            "Non-destructive: only writes to the six v2-new tables/"
+            "rows and the schema_version meta row.  Idempotent: a "
+            "second run on a v2 DB is a no-op.  Can take "
+            "minutes-to-hours on a chain with many blocks (replay "
+            "is O(chain_length))."
+        ),
+    )
+    migrate_db.add_argument(
+        "--data-dir", type=str, required=True,
+        help="Chain data directory containing chain.db",
+    )
+
+    # --- upgrade ---
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="Upgrade validator binary to a released tag (stop -> backup "
+             "-> fetch -> swap -> migrate -> start -> health-check -> rollback)",
+        description=(
+            "One-shot validator binary upgrade.  Stops the systemd "
+            "service, backs up the current install directory, clones "
+            "the requested release tag (default: latest GitHub "
+            "release), swaps in the new code, runs migrate-chain-db "
+            "(idempotent; skip with --skip-migrate for same-schema "
+            "hot restarts), starts the service, polls local RPC for "
+            "health, and rolls back to the backup on health-check "
+            "failure (suppress with --no-rollback).  Requires root "
+            "(systemctl) and git.  Pass --tag to pin a specific "
+            "release; without it the GitHub Releases API is consulted "
+            "and the command hard-fails if the API is unreachable."
+        ),
+    )
+    upgrade.add_argument(
+        "--tag", type=str, default=None,
+        help="Git tag to install (e.g. v1.2.0-mainnet).  If omitted, "
+             "the latest GitHub release tag is used.",
+    )
+    upgrade.add_argument(
+        "--install-dir", type=str, default="/opt/messagechain",
+        help="Filesystem path of the validator install directory "
+             "(default: /opt/messagechain)",
+    )
+    upgrade.add_argument(
+        "--data-dir", type=str, default="/var/lib/messagechain",
+        help="Chain data directory for the migrate-chain-db step "
+             "(default: /var/lib/messagechain)",
+    )
+    upgrade.add_argument(
+        "--service", type=str, default="messagechain-validator",
+        help="systemd service unit name (default: messagechain-validator)",
+    )
+    upgrade.add_argument(
+        "--repo", type=str,
+        default="https://github.com/ben-arnao/MessageChain",
+        help="Git repo URL to clone (default: upstream; override for "
+             "testing / mirrors)",
+    )
+    upgrade.add_argument(
+        "--service-user", type=str, default="messagechain:messagechain",
+        help="user:group to chown the new install dir to "
+             "(default: messagechain:messagechain)",
+    )
+    upgrade.add_argument(
+        "--no-rollback", action="store_true",
+        help="Do not rollback to the backup on post-start health-check "
+             "failure.  New code stays in place; operator must recover "
+             "by hand.",
+    )
+    upgrade.add_argument(
+        "--skip-migrate", action="store_true",
+        help="Skip the migrate-chain-db step.  Safe for same-schema "
+             "upgrades; migration is idempotent so running it on a "
+             "target schema DB is a no-op regardless.",
+    )
+    upgrade.add_argument(
+        "--rpc-host", type=str, default="127.0.0.1",
+        help="Local RPC host for the post-start health check "
+             "(default: 127.0.0.1)",
+    )
+    upgrade.add_argument(
+        "--rpc-port", type=int, default=9334,
+        help="Local RPC port for the post-start health check "
+             "(default: 9334)",
+    )
+    upgrade.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip interactive confirmation.",
+    )
+
+    # --- init ---
+    init_p = sub.add_parser(
+        "init",
+        help="One-shot operator setup: keyfile, data-dir, systemd units",
+        description=(
+            "Generate a private key (or adopt an existing one via --keyfile), "
+            "lay out the data directory, write /etc/messagechain/onboard.toml, "
+            "and emit systemd unit files. Does not enable any services."
+        ),
+    )
+    init_p.add_argument("--init-data-dir", dest="init_data_dir", type=str, default=None,
+                        help="Data directory to lay out (default: /var/lib/messagechain as root, ~/.messagechain/chaindata otherwise)")
+    init_p.add_argument(
+        "--systemd", dest="systemd", action="store_true", default=None,
+        help="Emit systemd unit files (default: on when running as root)",
+    )
+    init_p.add_argument(
+        "--no-systemd", dest="systemd", action="store_false",
+    )
+    init_p.add_argument(
+        "--auto-upgrade", dest="auto_upgrade", action="store_true", default=True,
+    )
+    init_p.add_argument(
+        "--no-auto-upgrade", dest="auto_upgrade", action="store_false",
+    )
+    init_p.add_argument(
+        "--auto-rotate", dest="auto_rotate", action="store_true", default=True,
+    )
+    init_p.add_argument(
+        "--no-auto-rotate", dest="auto_rotate", action="store_false",
+    )
+    init_p.add_argument("--yes", action="store_true",
+                        help="Non-interactive; accept all defaults")
+    init_p.add_argument("--print-only", action="store_true",
+                        help="Dry-run: print what would happen, write nothing")
+
+    # --- doctor ---
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Local-host preflight checks before starting a validator",
+        description=(
+            "Run a battery of local checks: Python version, data-dir + "
+            "keyfile permissions, disk free, P2P/RPC port bindability, "
+            "seed reachability, and (when auto-* is enabled) the "
+            "corresponding systemd timers. Exits 0/1/2 for green/yellow/red."
+        ),
+    )
+    doctor_p.add_argument("--doctor-data-dir", dest="doctor_data_dir", type=str, default=None,
+                          help="Data directory to inspect (defaults from onboard.toml)")
+    doctor_p.add_argument("--check-timers", action="store_true",
+                          help="Also probe systemctl is-enabled for auto-* timers")
+
+    # --- rotate-key-if-needed ---
+    rotate_if_p = sub.add_parser(
+        "rotate-key-if-needed",
+        help="Auto-rotate the validator's signing key when >= 95%% consumed",
+        description=(
+            "Queries the local chain for the current leaf watermark, computes "
+            "the consumption percentage, and rotates only when >= 95%%. Exits "
+            "0 on any no-op path. Designed to run daily under systemd."
+        ),
+    )
+    rotate_if_p.add_argument("--yes", action="store_true")
+    rotate_if_p.add_argument("--server", type=str, default=None)
+
+    # --- config ---
+    config_p = sub.add_parser(
+        "config",
+        help="Read or write onboard.toml flags",
+        description=(
+            "`messagechain config get <key>` prints the value; "
+            "`messagechain config set <key> <value>` writes it. "
+            "Supported keys: auto_upgrade, auto_rotate, data_dir, keyfile, entity_id_hex."
+        ),
+    )
+    config_sub = config_p.add_subparsers(dest="config_action", required=True)
+    config_get_p = config_sub.add_parser("get")
+    config_get_p.add_argument("key")
+    config_set_p = config_sub.add_parser("set")
+    config_set_p.add_argument("key")
+    config_set_p.add_argument("value")
+
 
     return parser
 
@@ -827,7 +1048,7 @@ class KeyFileError(Exception):
     """Raised when a --keyfile cannot be loaded (missing, empty, bad checksum)."""
 
 
-def _load_key_from_file(path: str) -> bytes:
+def _load_key_from_file(path: str, *, accept_raw_hex: bool = False) -> bytes:
     """Load and verify a checksummed private key from a file.
 
     Returns the raw 32-byte private key. Raises KeyFileError on any
@@ -837,6 +1058,12 @@ def _load_key_from_file(path: str) -> bytes:
     On POSIX systems, warns if the file is group/world-readable. We do
     NOT refuse to load - operators may have valid reasons (e.g. container
     secrets) for wider perms - but we surface the risk.
+
+    When *accept_raw_hex* is True, also accept the daemon-side 64-char
+    raw-hex format (what server.py --keyfile consumes).  Off by default
+    so paper-backup users still get the checksum check -- the CLI only
+    lowers the bar when it already knows it's running alongside a
+    daemon on the same host (operator path, via global --data-dir).
     """
     from messagechain.identity.key_encoding import (
         decode_private_key,
@@ -863,7 +1090,23 @@ def _load_key_from_file(path: str) -> bytes:
             "The file may be corrupted or truncated."
         )
     except InvalidKeyFormatError as e:
-        raise KeyFileError(f"Key file has invalid format: {path}: {e}")
+        # Daemon-format keyfiles are plain 64-char hex (no 8-char
+        # checksum suffix).  When the caller explicitly opts in, fall
+        # back to that format so `--data-dir --keyfile /etc/messagechain/
+        # mainnet-keyfile` works without hand-reformatting the operator
+        # key just to satisfy the CLI's paper-backup checksum path.
+        stripped = contents.strip()
+        if accept_raw_hex and len(stripped) == 64:
+            try:
+                key = bytes.fromhex(stripped)
+                if len(key) != 32:
+                    raise ValueError("expected 32 bytes")
+            except ValueError as exc:
+                raise KeyFileError(
+                    f"Key file has invalid format: {path}: {exc}"
+                )
+        else:
+            raise KeyFileError(f"Key file has invalid format: {path}: {e}")
 
     # Reject permissive permissions (POSIX only - Windows stat is different).
     if hasattr(os, "getuid"):
@@ -880,6 +1123,96 @@ def _load_key_from_file(path: str) -> bytes:
     return key
 
 
+def _load_cached_entity(private_key, data_dir):
+    """Load an Entity from the daemon's on-disk keypair cache, or None.
+
+    Used when a signing CLI runs co-resident with a validator daemon on
+    the same host: the daemon's cache (~30 min to regenerate from scratch
+    for a production tree_height=20 wallet) is reused, so `cli transfer`
+    / `cli stake` complete in seconds instead of forcing a fresh keygen.
+
+    Returns None if the cache is absent, stale, or the daemon was never
+    started from *data_dir* -- the caller falls back to the slow path.
+    Cache authenticity is HMAC-verified by the daemon's loader, so a
+    corrupted or tampered cache file can't leak a wrong public key.
+
+    The on-disk tree_height must match the chain's stored height for
+    this entity, which for existing wallets is tracked via the
+    `--wallet` mechanism on the daemon.  We try 16 (prototype / the
+    operator-chosen height on mainnet bootstrap) then the config
+    default -- both are cheap misses since _load_or_create_entity falls
+    straight through on a bad cache path without touching keygen.
+    """
+    try:
+        import importlib.util
+        import os as _os
+        spec = importlib.util.spec_from_file_location(
+            "_mc_server", _os.path.join(
+                _os.path.dirname(_os.path.dirname(__file__)), "server.py",
+            ),
+        )
+        if spec is None or spec.loader is None:
+            return None
+        srv = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(srv)
+    except Exception:
+        return None
+
+    from messagechain.config import MERKLE_TREE_HEIGHT, LEAF_INDEX_FILENAME
+    import os as _os
+    # Try the two most plausible heights in priority order: operator
+    # override (16) then the compiled-in default.  _load_or_create_entity
+    # falls straight through to fresh keygen on cache miss, so speculating
+    # costs only a short file-stat / HMAC-verify per attempt.
+    candidate_heights = []
+    for h in (16, MERKLE_TREE_HEIGHT):
+        if h not in candidate_heights:
+            candidate_heights.append(h)
+    for height in candidate_heights:
+        cache_path = srv._keypair_cache_path(private_key, height, data_dir)
+        if not _os.path.exists(cache_path):
+            continue
+        try:
+            entity = srv._load_or_create_entity(
+                private_key, height, data_dir, no_cache=False,
+            )
+        except Exception:
+            continue
+        # Bind leaf-index persistence so sign() durably burns the leaf
+        # before the signature can escape the process -- same invariant
+        # the daemon relies on.  load_leaf_index silently tolerates a
+        # missing file (fresh wallet, never signed).
+        leaf_path = _os.path.join(data_dir, LEAF_INDEX_FILENAME)
+        try:
+            entity.keypair.leaf_index_path = leaf_path
+            entity.keypair.load_leaf_index(leaf_path)
+        except Exception:
+            entity.keypair.leaf_index_path = None
+        return entity
+    return None
+
+
+def _reserve_leaf_via_rpc(host, port, entity_id_hex):
+    """Ask the server to atomically reserve a leaf for the given entity.
+
+    Returns the reserved leaf index, or None if the server doesn't
+    implement the RPC (older daemons) -- in which case the caller should
+    fall back to the chain-watermark path.  Reserving bumps the server's
+    in-memory _next_leaf so a subsequent block sign by the same wallet
+    will skip this leaf, preventing the CLI-vs-daemon collision that
+    would otherwise surface as two WOTS+ signatures at the same leaf.
+    """
+    from client import rpc_call
+    r = rpc_call(host, port, "reserve_leaf", {"entity_id": entity_id_hex})
+    if not r.get("ok"):
+        return None
+    result = r.get("result", {})
+    leaf = result.get("leaf_index")
+    if not isinstance(leaf, int):
+        return None
+    return leaf
+
+
 def _resolve_private_key(args=None):
     """Resolve the private key for a signing command.
 
@@ -892,8 +1225,14 @@ def _resolve_private_key(args=None):
     free, enabling unattended/scripted operation.
     """
     if args is not None and getattr(args, "keyfile", None):
+        # When --data-dir is set, the caller is co-resident with a
+        # daemon and the keyfile is almost certainly in daemon raw-hex
+        # format.  Opt into the 64-char parser so the CLI can sign
+        # with the SAME keyfile the validator unit is using, without
+        # needing a parallel checksummed copy of the operator key.
+        accept_raw = bool(getattr(args, "data_dir", None))
         try:
-            return _load_key_from_file(args.keyfile)
+            return _load_key_from_file(args.keyfile, accept_raw_hex=accept_raw)
         except KeyFileError as e:
             print(f"Error: {e}")
             sys.exit(1)
@@ -952,8 +1291,20 @@ def cmd_start(args):
     else:
         # Fall back to the shipped default seeds from config, so users
         # don't need to know a peer host:port out of band.
-        from messagechain.config import SEED_NODES
+        from messagechain.config import SEED_NODES, DNS_SEED_DOMAINS
         seed_nodes = list(SEED_NODES)
+        # Merge DNS-TXT discovered seeds; dedupe, preserve order.
+        if DNS_SEED_DOMAINS:
+            try:
+                from messagechain.network.seed_discovery import discover_dns_seeds
+                extra = discover_dns_seeds(DNS_SEED_DOMAINS)
+                seen = set(seed_nodes)
+                for entry in extra:
+                    if entry not in seen:
+                        seed_nodes.append(entry)
+                        seen.add(entry)
+            except Exception:
+                pass
         if seed_nodes:
             seed_str = ", ".join(f"{h}:{p}" for h, p in seed_nodes)
             print(f"Using default seed nodes: {seed_str}")
@@ -1001,6 +1352,27 @@ def cmd_start(args):
 
         server.set_wallet_entity(entity)
         print(f"\nMining as: {entity.entity_id_hex[:16]}...")
+
+        # Best-effort external-reachability probe. Runs before the async
+        # loop so the operator sees a visible NAT/firewall warning at
+        # startup, not buried in mid-flight logs. Skipped under tests
+        # via MC_SKIP_REACHABILITY=1.
+        if not getattr(args, "skip_reachability_probe", False):
+            from messagechain.runtime import onboarding as _ob
+            level, detail = _ob.run_reachability_probe(args.port)
+            if level == 2 and not getattr(args, "yes_nat", False):
+                print()
+                print("  [!] External reachability probe FAILED:")
+                print(f"      {detail}")
+                print("      Inbound P2P from the public internet is likely blocked.")
+                print("      Check NAT port-forwarding and host firewall.")
+                print("      To continue anyway: --yes-nat")
+                print("      To skip the probe entirely: --skip-reachability-probe")
+                sys.exit(2)
+            elif level == 1:
+                print(f"  [warn] reachability probe inconclusive: {detail}")
+            elif level == 0 and "skipped" not in detail:
+                print(f"  reachability: {detail}")
 
         # Nudge: if this validator has no separate cold authority key,
         # every destructive path (unstake, emergency revoke) is controlled
@@ -1147,8 +1519,8 @@ def cmd_send(args):
 
     message = args.message
     char_count = len(message)
-    if char_count > 280:
-        print(f"Error: Message is {char_count} characters (max 280).")
+    if char_count > MAX_MESSAGE_CHARS:
+        print(f"Error: Message is {char_count} characters (max {MAX_MESSAGE_CHARS}).")
         sys.exit(1)
     if not message.strip():
         print("Error: Message cannot be empty.")
@@ -1158,7 +1530,14 @@ def cmd_send(args):
 
     # Authenticate
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -1175,9 +1554,13 @@ def cmd_send(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    # Advance keypair past used leaves
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer server-mediated leaf reservation (see cmd_transfer for full
+    # rationale) so a co-resident daemon's next block sign skips the
+    # leaf this message is signed at.
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
@@ -1355,14 +1738,40 @@ def cmd_transfer(args):
     # having re-entered credentials.
     # Accept either the checksummed "mc1..." display form (preferred,
     # catches single-character typos offline) or the raw 64-char hex
-    # form (backward-compatible, no typo protection).
+    # form (no typo protection; opt-in via --allow-raw-hex-address).
     from messagechain.identity.address import (
         decode_address,
         InvalidAddressChecksumError,
         InvalidAddressError,
     )
+    # Gate raw-hex recipients behind an explicit flag.  The raw form
+    # has no checksum, so a single-character typo permanently sends
+    # funds to an unrecoverable address - a mainnet footgun.  A user
+    # who actually wants raw hex (scripting, integration tests) opts
+    # in and sees a clear reminder of the risk.
+    raw_to = args.to.strip()
+    looks_like_raw_hex = (
+        not raw_to.lower().startswith("mc1")
+        and len(raw_to) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in raw_to)
+    )
+    if looks_like_raw_hex and not getattr(args, "allow_raw_hex_address", False):
+        print(
+            "Error: --to looks like raw 64-char hex, which has NO "
+            "typo protection.  A single mistyped character sends "
+            "funds to an unrecoverable address."
+        )
+        print(
+            "  Prefer the checksummed mc1... form - ask the recipient "
+            "for it, or run `messagechain account` to see your own."
+        )
+        print(
+            "  If you really want to send to raw hex (scripts, "
+            "integration tests), pass --allow-raw-hex-address."
+        )
+        sys.exit(2)
     try:
-        recipient_id = decode_address(args.to)
+        recipient_id = decode_address(raw_to)
     except InvalidAddressChecksumError as e:
         print(f"Error: {e}")
         print(f"  Got: {args.to}")
@@ -1372,6 +1781,13 @@ def cmd_transfer(args):
         print(f"Error: invalid recipient address - {e}")
         print(f"  Got: {args.to}")
         sys.exit(1)
+    if looks_like_raw_hex:
+        # Explicit opt-in path: remind the operator they're bypassing
+        # the checksum layer so it's visible in CI logs / transcripts.
+        print(
+            "!  Proceeding with raw-hex --to (no checksum protection).  "
+            "Verify the address character-by-character before confirming."
+        )
 
     host, port = _parse_server(args.server)
     from client import rpc_call
@@ -1415,7 +1831,14 @@ def cmd_transfer(args):
         sys.exit(0)
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
 
     nonce_resp = rpc_call(host, port, "get_nonce", {
@@ -1425,8 +1848,16 @@ def cmd_transfer(args):
         print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer an atomic server-side leaf reservation when the signer
+    # shares a wallet with a running daemon: reserve_leaf bumps the
+    # daemon's in-memory _next_leaf so its next block sign won't
+    # collide with this transfer.  Falls back to the chain-watermark
+    # path when the server doesn't implement reserve_leaf (older
+    # daemons) or when the signer's entity isn't this daemon's wallet.
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Receive-to-exist: determine whether this is a first-spend tx
     # (server has no pubkey for this entity yet).  If so we include
@@ -1524,7 +1955,14 @@ def cmd_stake(args):
     print("=== Stake Tokens ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nStaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -1539,8 +1977,11 @@ def cmd_stake(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
 
-    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Prefer server-side atomic leaf reservation (see cmd_transfer).
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get("leaf_watermark", nonce)
+    entity.keypair.advance_to_leaf(leaf)
 
     # Default fee: post-flat floor is the safe choice pre- and post-
     # activation (MIN_FEE=100 pre, MIN_FEE_POST_FLAT=1000 post).  The
@@ -1585,7 +2026,19 @@ def cmd_unstake(args):
     print("=== Unstake Tokens ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    # Mirror cmd_stake / cmd_transfer: when --data-dir points at a
+    # running validator's data_dir, reuse the daemon's cached WOTS+
+    # keypair instead of regenerating the Merkle tree from scratch
+    # (~20-30 min on production tree_height=16/20 wallets; observed to
+    # wedge a CLI invocation for 10+ min on an e2-small mainnet node).
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nUnstaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -2469,8 +2922,50 @@ def cmd_status(args):
 
     # Emit report
     print(f"=== Status check against {host}:{port} ===\n")
+
+    # Surface onboard auto-* state at the top so an operator reading a
+    # single status pane sees whether their upgrade/rotate timers are
+    # armed. Tolerate missing onboard config silently.
+    try:
+        from messagechain.runtime import onboarding as _ob
+        onboard_cfg = _ob.read_onboard_config()
+        print(
+            f"  Auto-upgrade: {'ON' if onboard_cfg.get('auto_upgrade') else 'OFF'}"
+            f"  |  Auto-rotate: {'ON' if onboard_cfg.get('auto_rotate') else 'OFF'}"
+        )
+        print()
+    except Exception:
+        pass
+
     for line in lines:
         print(line)
+
+    if getattr(args, "full", False):
+        print()
+        print("=== Full view ===")
+        vr = rpc_call(host, port, "list_validators", {})
+        if vr.get("ok"):
+            vlist = vr["result"].get("validators", [])[:10]
+            print(f"  Top validators ({len(vlist)}):")
+            for v in vlist:
+                eid = v.get("entity_id", "")[:16]
+                print(
+                    f"    {eid}...  stake={v.get('staked', 0)}  "
+                    f"share={v.get('stake_pct', 0):.2f}%  "
+                    f"blocks={v.get('blocks_produced', 0)}"
+                )
+        pr = rpc_call(host, port, "get_peers", {})
+        if pr.get("ok"):
+            count = pr["result"].get("count", len(pr["result"].get("peers", [])))
+            print(f"  Peers: {count}")
+        if args.entity:
+            er = rpc_call(host, port, "get_entity", {"entity_id": args.entity})
+            if er.get("ok"):
+                e = er["result"]
+                print(
+                    f"  This node:  balance={e.get('balance', 0)}  "
+                    f"staked={e.get('staked', 0)}"
+                )
     print()
     verdict = {0: "GREEN (ok)", 1: "YELLOW (needs attention)",
                2: "RED (urgent)"}[worst]
@@ -2549,7 +3044,7 @@ def cmd_peers(args):
     print(f"=== Peers ({count}) ===\n")
     print(
         f"  {'Address':<22} {'Dir':<9} {'Type':<18} {'TLS':<5} {'Height':>8} "
-        f"{'Connected':>11} {'Entity':<20}"
+        f"{'Connected':>11} {'Version':<10} {'Entity':<20}"
     )
     def _fmt_elapsed(s: int) -> str:
         if s < 60:
@@ -2564,9 +3059,14 @@ def cmd_peers(args):
         # operator sees "I should upgrade" rather than a misleading "no".
         transport = p.get("transport")
         tls_disp = "yes" if transport == "tls" else ("no" if transport == "plain" else "?")
+        # Peers running <1.2.0 did not advertise a version in the
+        # handshake payload; the server maps "" -> "unknown" on receive,
+        # but guard here too so a missing/empty RPC field still renders
+        # cleanly instead of as blank whitespace.
+        version = p.get("version") or "unknown"
         print(
             f"  {p['address']:<22} {p['direction']:<9} {p['connection_type']:<18} {tls_disp:<5} "
-            f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {eid_disp:<20}"
+            f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {version:<10} {eid_disp:<20}"
         )
 
 
@@ -2785,6 +3285,618 @@ def cmd_gen_tor_config(args):
     print("#   4. Share the hostname with clients in censored networks", file=sys.stderr)
 
 
+def cmd_migrate_chain_db(args):
+    """Run a one-shot schema migration on an existing chain.db.
+
+    Operator-invoked after a binary upgrade whose new schema
+    requires rebuilding consensus-visible state surfaces that were
+    not persisted under the old binary.  Opens the DB with the
+    schema-check bypassed (the only caller allowed to), dispatches
+    to the appropriate version-pair migration, prints a summary.
+
+    Refuses to do anything if the DB is already at the target
+    schema version -- so accidental double-invocation is a no-op
+    rather than a replay-over-replay.
+    """
+    import os as _os
+    from messagechain.storage.chaindb import ChainDB, _SCHEMA_VERSION
+
+    db_path = _os.path.join(args.data_dir, "chain.db")
+    if not _os.path.isfile(db_path):
+        print(
+            f"Error: no chain.db found at {db_path}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Bypass the schema-version tripwire so we can inspect a v1 DB
+    # and dispatch to the right migration path.
+    db = ChainDB(db_path, skip_schema_check=True)
+    cur = db._conn.execute(
+        "SELECT value FROM meta WHERE key = ?", ("schema_version",),
+    )
+    row = cur.fetchone()
+    disk_version = int(row[0]) if row else 1
+
+    if disk_version == _SCHEMA_VERSION:
+        print(
+            f"chain.db at {db_path} is already at schema version "
+            f"{disk_version}; nothing to do.",
+        )
+        return
+
+    if disk_version == 1 and _SCHEMA_VERSION == 2:
+        print(
+            f"Migrating chain.db at {db_path} from schema v1 to v2 "
+            "(replaying block history to rebuild reputation, "
+            "key_history, pending_unstakes, stake_snapshots, and "
+            "supply_meta counters)...",
+        )
+        summary = db.migrate_schema_v1_to_v2()
+        print("Migration complete.")
+        for k, v in summary.items():
+            label = k.replace("_", " ").title()
+            print(f"  {label}: {v}")
+        return
+
+    print(
+        f"No migration path defined for schema {disk_version} -> "
+        f"{_SCHEMA_VERSION}.  Stop and contact the release manager.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# messagechain upgrade
+# ---------------------------------------------------------------------------
+#
+# One-shot validator binary upgrade.  Codifies the manual sequence
+# operators were running out of a shell buffer: stop -> backup -> clone tag
+# -> swap -> migrate-chain-db -> start -> health-check -> rollback-on-fail.
+# Using only stdlib (urllib, subprocess, shutil) keeps the dep graph empty,
+# which is an explicit project principle -- operators running this from a
+# fresh pip install should not need any third-party packages.
+
+_MAINNET_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-mainnet$")
+
+
+def _upgrade_resolve_latest_tag(repo_url: str) -> str:
+    """Return the highest-semver `vX.Y.Z-mainnet` git tag on *repo_url*.
+
+    Uses the GitHub git-tags API (``/repos/{owner}/{repo}/tags``), not
+    the Releases API.  Plain `git tag` / `git push --tags` creates tags
+    but NOT GitHub Release objects -- so the Releases API would return
+    only tags that were manually published via the Releases UI, which
+    is typically the first one ever and nothing since.  The tags API
+    returns every pushed tag regardless of Release-object status, which
+    matches the "just push the tag" publishing model this repo uses.
+
+    Filters to canonical mainnet-release tags (``vX.Y.Z-mainnet``),
+    parses the semver triple, and returns the highest by
+    (major, minor, patch).  Skips prereleases, testnet tags, and any
+    tag that doesn't match the canonical pattern.
+
+    Raises RuntimeError on any failure (network, parse, empty result).
+    Caller translates to exit(2).
+    """
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    # Parse owner/repo out of a URL like https://github.com/ben-arnao/MessageChain
+    parsed = urllib.parse.urlparse(repo_url)
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        raise RuntimeError(
+            f"cannot parse owner/repo from --repo {repo_url!r}; "
+            "pass --tag explicitly to skip API lookup"
+        )
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    # per_page=100 covers the first page; mainnet tags are low-volume so
+    # paginating is overkill here. If this repo ever accumulates >100
+    # tags we can add ?page= walking, but for now a one-shot is simpler.
+    api = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
+    req = urllib.request.Request(
+        api,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"messagechain/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(
+            f"GitHub tags API unreachable ({e}); "
+            "rerun with --tag <vX.Y.Z-mainnet> to pin a specific release"
+        )
+    try:
+        data = json.loads(body)
+    except ValueError as e:
+        raise RuntimeError(f"GitHub API returned non-JSON: {e}")
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "GitHub tags API returned non-list payload; "
+            "rerun with --tag <vX.Y.Z-mainnet> to pin a specific release"
+        )
+
+    best: tuple[int, int, int] | None = None
+    best_name: str | None = None
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        m = _MAINNET_TAG_RE.match(name)
+        if m is None:
+            continue
+        triple = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if best is None or triple > best:
+            best = triple
+            best_name = name
+
+    if best_name is None:
+        raise RuntimeError(
+            "no canonical vX.Y.Z-mainnet tags found on GitHub; "
+            "rerun with --tag to pin a specific tag"
+        )
+    return best_name
+
+
+def _upgrade_tag_to_version(tag: str) -> str:
+    """Strip a leading `v` and trailing `-mainnet`/`-testnet` from *tag*.
+
+    Operators tag releases like `v1.2.0-mainnet`; the runtime
+    __version__ is `1.2.0`.  Used only for the already-at-target
+    shortcut; never for anything consensus-critical.
+    """
+    v = tag
+    if v.startswith("v") or v.startswith("V"):
+        v = v[1:]
+    for suffix in ("-mainnet", "-testnet", "-rc1", "-rc2", "-rc3"):
+        if v.endswith(suffix):
+            v = v[: -len(suffix)]
+            break
+    return v
+
+
+def _upgrade_health_check(host: str, port: int, timeout_s: int = 60) -> bool:
+    """Poll local RPC for GREEN.  Returns True on first healthy
+    response, False after *timeout_s* seconds without one.
+    """
+    import time as _time_hc
+    from client import rpc_call
+
+    deadline = _time_hc.monotonic() + timeout_s
+    while _time_hc.monotonic() < deadline:
+        try:
+            resp = rpc_call(host, port, "get_chain_info", {})
+        except Exception:
+            resp = {"ok": False}
+        if resp.get("ok"):
+            info = resp.get("result") or {}
+            # GREEN = reachable + not reporting a stalled sync.  We do
+            # NOT require "idle" here -- a just-started node may be in
+            # syncing_headers legitimately; for upgrade health, the
+            # important invariant is "RPC is up and returning real
+            # chain-info without error".
+            if "height" in info:
+                return True
+        _time_hc.sleep(10)
+    return False
+
+
+def cmd_upgrade(args):
+    """Run the full validator binary-upgrade flow.
+
+    See subparser help for flags.  Exits non-zero on any step failure.
+    """
+    import datetime as _dt
+    import shutil
+    import subprocess
+
+    from messagechain import __version__ as _current_version
+
+    def _say(msg: str) -> None:
+        print(f"==> {msg}", flush=True)
+
+    def _fail(msg: str, code: int = 2) -> None:
+        print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+        sys.exit(code)
+
+    # --- Preflight ---
+    if shutil.which("git") is None:
+        _fail(
+            "git not found on PATH. Install with your distro package "
+            "manager (e.g. `apt install git` or `dnf install git`)."
+        )
+    if shutil.which("systemctl") is None:
+        _fail(
+            "systemctl not found on PATH. This upgrade command only "
+            "supports systemd-managed services."
+        )
+    # Root check (skip on non-POSIX: geteuid doesn't exist on Windows).
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() != 0:
+        _fail(
+            "this command must run as root (systemctl stop/start + "
+            "chown). Re-run with `sudo messagechain upgrade ...`."
+        )
+
+    # Resolve target tag.
+    target_tag = args.tag
+    if target_tag is None:
+        _say("Resolving latest release tag from GitHub...")
+        try:
+            target_tag = _upgrade_resolve_latest_tag(args.repo)
+        except RuntimeError as e:
+            _fail(str(e))
+        _say(f"Latest release: {target_tag}")
+    else:
+        _say(f"Target tag (pinned): {target_tag}")
+
+    target_version = _upgrade_tag_to_version(target_tag)
+    if target_version == _current_version:
+        _say(
+            f"Already at {_current_version}; nothing to do."
+        )
+        return
+
+    # Downgrade gate.  Only meaningful if versions parse cleanly; if
+    # not, fall through (rare tag format -- let operator see the mismatch
+    # in the summary prompt).
+    def _parse_ver(v: str):
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except Exception:
+            return None
+    cur = _parse_ver(_current_version)
+    tgt = _parse_ver(target_version)
+    is_downgrade = cur is not None and tgt is not None and tgt < cur
+    if is_downgrade and not args.yes:
+        _fail(
+            f"target version {target_version} is older than running "
+            f"version {_current_version}. Re-run with --yes to "
+            "force a downgrade."
+        )
+
+    # Confirmation prompt.
+    if not args.yes:
+        print()
+        print("  Upgrade summary:")
+        print(f"    current version : {_current_version}")
+        print(f"    target tag      : {target_tag}  ({target_version})")
+        print(f"    service         : {args.service}")
+        print(f"    install dir     : {args.install_dir}")
+        print(f"    data dir        : {args.data_dir}")
+        print(f"    repo            : {args.repo}")
+        print(f"    rollback on fail: {'no' if args.no_rollback else 'yes'}")
+        print(f"    skip migrate    : {'yes' if args.skip_migrate else 'no'}")
+        print()
+        try:
+            reply = input("  Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            _say("Aborted by operator.")
+            return
+
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = f"{args.install_dir}.bak-{ts}"
+    clone_dir = f"/tmp/mc-release-{ts}"
+
+    # --- Stop service ---
+    _say(f"Stopping {args.service}...")
+    try:
+        subprocess.run(
+            ["systemctl", "stop", args.service], check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _fail(f"systemctl stop failed: {e}")
+    # reset-failed is best-effort; a clean stop won't need it.
+    subprocess.run(
+        ["systemctl", "reset-failed", args.service], check=False,
+    )
+
+    # --- Backup ---
+    _say(f"Backing up {args.install_dir} -> {backup_dir}")
+    try:
+        shutil.move(args.install_dir, backup_dir)
+    except Exception as e:
+        # Restart service so we don't leave the node down on a mistake.
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+        _fail(f"backup move failed: {e}")
+
+    def _restore_backup_and_start() -> None:
+        """Best-effort rollback: remove any partial install, move the
+        backup back, restart service.  Swallows exceptions so the
+        outer failure reason is what the operator sees.
+        """
+        try:
+            if os.path.exists(args.install_dir):
+                shutil.rmtree(args.install_dir)
+        except Exception:
+            pass
+        try:
+            shutil.move(backup_dir, args.install_dir)
+        except Exception:
+            pass
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+
+    # --- Fetch tag ---
+    _say(f"Cloning {args.repo} @ {target_tag} -> {clone_dir}")
+    clone_cmd = [
+        "git", "clone", "--depth", "1", "--branch", target_tag,
+        args.repo, clone_dir,
+    ]
+    try:
+        subprocess.run(clone_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(
+            f"git clone failed ({e}); backup restored and service "
+            "restarted."
+        )
+
+    # --- Swap ---
+    _say(f"Installing new code -> {args.install_dir}")
+    try:
+        shutil.copytree(clone_dir, args.install_dir)
+    except Exception as e:
+        _restore_backup_and_start()
+        _fail(f"copytree failed: {e}; backup restored.")
+    # chown to service user.
+    try:
+        subprocess.run(
+            ["chown", "-R", args.service_user, args.install_dir],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(f"chown failed: {e}; backup restored.")
+
+    # --- Migrate chain.db ---
+    if not args.skip_migrate:
+        _say(
+            f"Running migrate-chain-db (idempotent) on {args.data_dir}"
+        )
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "messagechain",
+                    "migrate-chain-db", "--data-dir", args.data_dir,
+                ],
+                cwd=args.install_dir,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            _restore_backup_and_start()
+            _fail(
+                f"migrate-chain-db failed: {e}; backup restored."
+            )
+    else:
+        _say("Skipping migrate-chain-db (--skip-migrate).")
+
+    # --- Start service ---
+    _say(f"Starting {args.service}...")
+    try:
+        subprocess.run(
+            ["systemctl", "start", args.service], check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(f"systemctl start failed: {e}; backup restored.")
+
+    # --- Health check ---
+    _say(
+        f"Polling RPC {args.rpc_host}:{args.rpc_port} for up to 60s..."
+    )
+    healthy = _upgrade_health_check(
+        args.rpc_host, args.rpc_port, timeout_s=60,
+    )
+    if not healthy:
+        if args.no_rollback:
+            _fail(
+                "health check failed after 60s, but --no-rollback is "
+                f"set. New code left in place. To revert by hand: "
+                f"systemctl stop {args.service} && rm -rf "
+                f"{args.install_dir} && mv {backup_dir} "
+                f"{args.install_dir} && systemctl start {args.service}",
+            )
+        _say("Health check FAILED. Rolling back to backup...")
+        subprocess.run(
+            ["systemctl", "stop", args.service], check=False,
+        )
+        try:
+            shutil.rmtree(args.install_dir)
+        except Exception:
+            pass
+        try:
+            shutil.move(backup_dir, args.install_dir)
+        except Exception as e:
+            _fail(
+                f"rollback move failed: {e}. Install state is "
+                f"broken; backup still at {backup_dir}."
+            )
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+        # Short confirmation poll after rollback (10s).
+        if _upgrade_health_check(
+            args.rpc_host, args.rpc_port, timeout_s=10,
+        ):
+            _say(f"Rolled back to backup at {backup_dir}.")
+            _fail("upgrade failed; rollback succeeded.")
+        _fail(
+            f"rollback may be incomplete; backup at {backup_dir} -- "
+            "inspect by hand."
+        )
+
+    # --- Success ---
+    _say(
+        f"Upgrade complete. Version {target_version} active on "
+        f"service {args.service}. Backup preserved at {backup_dir}."
+    )
+
+
+def cmd_init(args):
+    """Operator setup: keyfile + data-dir + onboard.toml + systemd units."""
+    from messagechain.runtime import onboarding as _ob
+
+    plan = _ob.plan_init(
+        data_dir=getattr(args, "init_data_dir", None) or getattr(args, "data_dir", None),
+        keyfile=getattr(args, "keyfile", None),
+        systemd=getattr(args, "systemd", None),
+        auto_upgrade=getattr(args, "auto_upgrade", True),
+        auto_rotate=getattr(args, "auto_rotate", True),
+        print_only=getattr(args, "print_only", False),
+    )
+
+    if getattr(args, "print_only", False):
+        print("=== init (dry-run) ===\n")
+        print(f"  data_dir:       {plan.data_dir}")
+        print(f"  keyfile:        {plan.keyfile}")
+        print(f"  onboard_config: {plan.onboard_config}")
+        print(f"  entity_id_hex:  {plan.entity_id_hex or '(will generate)'}")
+        print(f"  auto_upgrade:   {plan.auto_upgrade}")
+        print(f"  auto_rotate:    {plan.auto_rotate}")
+        print(f"  systemd:        {plan.systemd}")
+        if plan.systemd_units:
+            print("\n  systemd units to write:")
+            for path in plan.systemd_units:
+                print(f"    {path}")
+        print()
+        print(plan.next_steps_text())
+        return
+
+    from messagechain.config import MERKLE_TREE_HEIGHT
+    print("Generating signing key tree (this can take a while at "
+          f"MERKLE_TREE_HEIGHT={MERKLE_TREE_HEIGHT})...")
+    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
+    _ob.apply_init(plan, progress=progress)
+    print()
+    print(plan.next_steps_text())
+
+
+def cmd_doctor(args):
+    """Preflight checks. Exit 0 green / 1 yellow / 2 red."""
+    from messagechain.runtime import onboarding as _ob
+
+    cfg = _ob.read_onboard_config()
+    ddir = getattr(args, "doctor_data_dir", None) or getattr(args, "data_dir", None)
+    worst, checks = _ob.run_doctor(
+        cfg,
+        data_dir=ddir,
+        check_timers=getattr(args, "check_timers", False),
+    )
+    print("=== doctor ===\n")
+    for c in checks:
+        tag = {0: "OK  ", 1: "WARN", 2: "FAIL"}[c.level]
+        line = f"  [{tag}] {c.label}: {c.status}"
+        if c.detail:
+            line += f" - {c.detail}"
+        print(line)
+    print()
+    verdict = {0: "GREEN", 1: "YELLOW (warnings)", 2: "RED (blocking)"}[worst]
+    print(f"  Result: {verdict}")
+    sys.exit(worst)
+
+
+def cmd_rotate_key_if_needed(args):
+    """Daily watchdog: rotate when the leaf watermark is >= 95%."""
+    from messagechain.runtime import onboarding as _ob
+    from messagechain.config import MERKLE_TREE_HEIGHT
+
+    cfg = _ob.read_onboard_config()
+    entity_hex = cfg.get("entity_id_hex", "")
+    if not entity_hex:
+        print("rotate-key-if-needed: entity_id_hex not in onboard.toml; run `messagechain init` first")
+        sys.exit(1)
+
+    host, port = _parse_server(getattr(args, "server", None))
+    from client import rpc_call
+
+    def fetcher() -> int:
+        r = rpc_call(host, port, "get_leaf_watermark", {"entity_id": entity_hex})
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error", "rpc error"))
+        return int(r["result"].get("leaf_watermark", 0))
+
+    def get_tree_height() -> int:
+        # Prefer chain-reported tree height; fall back to config.
+        r = rpc_call(host, port, "get_entity", {"entity_id": entity_hex})
+        if r.get("ok"):
+            h = r["result"].get("tree_height")
+            if isinstance(h, int) and h > 0:
+                return h
+        return MERKLE_TREE_HEIGHT
+
+    def has_cold_key() -> bool:
+        r = rpc_call(host, port, "get_authority_key", {"entity_id": entity_hex})
+        if not r.get("ok"):
+            return False
+        auth = r["result"].get("authority_pubkey")
+        own = r["result"].get("public_key")
+        return bool(auth) and auth != own
+
+    tree_height = get_tree_height()
+    cold = has_cold_key()
+
+    def rotate_now():
+        # Delegate to the existing rotate-key command. Build a minimal
+        # namespace so cmd_rotate_key can reuse the same interactive
+        # flags (--yes, --server). Prefer the keyfile listed in
+        # onboard.toml so the timer unit can run unattended.
+        import argparse as _ap
+        kf = getattr(args, "keyfile", None) or cfg.get("keyfile") or None
+        ns = _ap.Namespace(
+            server=args.server, yes=True, fee=None, keyfile=kf,
+        )
+        cmd_rotate_key(ns)
+
+    rc = _ob.run_rotate_if_needed(
+        watermark_fetcher=fetcher,
+        has_cold_authority_key=cold,
+        tree_height=tree_height,
+        rotate_impl=rotate_now,
+    )
+    sys.exit(rc)
+
+
+def cmd_config(args):
+    """Read or write onboard.toml flags."""
+    from messagechain.runtime import onboarding as _ob
+
+    action = getattr(args, "config_action", None)
+    key = args.key
+    try:
+        if action == "get":
+            print(_ob.config_get(key))
+        elif action == "set":
+            path = _ob.config_set(key, args.value)
+            print(f"wrote {key} to {path}")
+        else:
+            print("unknown action")
+            sys.exit(2)
+    except KeyError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2824,6 +3936,12 @@ def main():
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,
+        "migrate-chain-db": cmd_migrate_chain_db,
+        "upgrade": cmd_upgrade,
+        "init": cmd_init,
+        "doctor": cmd_doctor,
+        "rotate-key-if-needed": cmd_rotate_key_if_needed,
+        "config": cmd_config,
     }
 
     handler = commands.get(args.command)

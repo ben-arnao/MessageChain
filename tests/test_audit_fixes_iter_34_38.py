@@ -28,6 +28,11 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# deploy/ and docs/ are gitignored per CLAUDE.md (operator/founder-local
+# content).  These tests only run when those directories are present.
+_DEPLOY_PRESENT = (ROOT / "deploy").is_dir()
+_DOCS_PRESENT = (ROOT / "docs").is_dir()
+
 
 class TestBlockProductionRefusesWhenPeersAhead(unittest.TestCase):
     """The leaf-reuse defence — if `needs_sync()` returns True, block
@@ -83,10 +88,20 @@ class TestGenerateVerifyKeyPrintsAddress(unittest.TestCase):
 class TestSystemdHardening(unittest.TestCase):
     """Production validator unit file must carry baseline hardening.
     Adding a new required directive here serves as a regression gate if
-    the unit file is ever regenerated from a template."""
+    the unit file is ever regenerated from a template.
+
+    Runs against the PUBLIC shipped template
+    (``examples/messagechain-validator.service.example``) so any PR
+    that weakens the hardening surface fails CI immediately — the
+    previous ``deploy/``-gated form skipped on every public CI run
+    and the hardening contract was enforced only on the operator's
+    local machine.
+    """
 
     def test_unit_has_memory_deny_write_execute(self):
-        unit = (ROOT / "deploy" / "systemd" / "messagechain-validator.service").read_text(encoding="utf-8")
+        unit = (
+            ROOT / "examples" / "messagechain-validator.service.example"
+        ).read_text(encoding="utf-8")
         required = [
             "NoNewPrivileges=true",
             "PrivateTmp=true",
@@ -106,6 +121,7 @@ class TestSystemdHardening(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(_DOCS_PRESENT, "docs/ gitignored; operator-only test")
 class TestRunbookDocsUseDirectCLI(unittest.TestCase):
     """After `pip install .` ships the `messagechain` entry point (iter
     32), runbooks should show `messagechain foo` not `python -m

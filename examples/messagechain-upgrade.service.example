@@ -1,0 +1,41 @@
+[Unit]
+Description=MessageChain auto-upgrade runner
+After=network-online.target
+Wants=network-online.target
+# Only fire when the validator is healthy; don't pile an upgrade on top
+# of a crashing node.
+Requires=messagechain-validator.service
+
+[Service]
+Type=oneshot
+# Runs as root: the upgrade command calls `systemctl stop/start
+# messagechain-validator`, moves /opt/messagechain to a backup dir,
+# re-clones into /opt/messagechain, and chowns back to
+# messagechain:messagechain. None of that works under an unprivileged
+# user.  The hardening below still restricts the blast radius to the
+# paths actually touched by the upgrade flow.
+User=root
+Group=root
+WorkingDirectory=/opt/messagechain
+ExecStart=/usr/bin/env python3 -m messagechain upgrade --yes
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=false
+LockPersonality=true
+# Root needs to write /opt/messagechain (new release), /var/lib/messagechain
+# (migrate-chain-db), and /etc/systemd/system (re-enable on unit changes).
+ReadWritePaths=/opt /var/lib/messagechain /etc/systemd
+ReadOnlyPaths=/etc/messagechain

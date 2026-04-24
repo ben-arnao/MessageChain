@@ -8,15 +8,19 @@ threshold/Lagrange/NIZK math is identical at any modulus size — these tests
 exercise the math, not real-world security margins. Do NOT lift this size
 into any production code path.
 
-If safe-prime keygen at 512 bits proves too slow on CI, drop the SHARED_KEY
-fixture to 256 bits — meaninglessly weak even for tests but mathematically
-sufficient to exercise share/combine/verify.
+512-bit is also the MINIMUM that works: OAEP encoding needs
+``2 * h_len + 2`` bytes of overhead, so at 256-bit modulus only ~2 plaintext
+bytes fit — not enough for the 14-23 byte test messages below.
 
-Cached module-level fixtures avoid paying the safe-prime keygen cost more
-than once per (t, n) pair the suite touches.
+Keygen is cached on disk (``.pytest_cache/d/threshold_rsa_keys/``) so the
+safe-prime search cost is paid once per (t, n, bits) per machine; subsequent
+runs load the pickled keypair in milliseconds.
 """
 
+import os
+import pickle
 import unittest
+from pathlib import Path
 
 from messagechain.crypto import threshold_rsa as tr
 from messagechain.crypto.threshold_rsa import (
@@ -35,21 +39,66 @@ from messagechain.crypto.threshold_rsa import (
 
 
 # ---------------------------------------------------------------------------
-# Module-level cached fixtures — keygen with safe primes is the expensive
-# part of these tests, so we cache one keypair per (t, n) configuration.
+# Cached fixtures — safe-prime keygen dominates runtime.  We cache in-process
+# (module-level dict) and also on disk under .pytest_cache so the cost is
+# amortized across test runs.
 # ---------------------------------------------------------------------------
 
-_TEST_KEY_BITS = 512  # see module docstring re: speed-vs-security trade-off
+_TEST_KEY_BITS = 512  # see module docstring re: minimum workable size
 
 _CACHE: dict[tuple[int, int], tuple[PublicKey, list[KeyShare]]] = {}
 
+_DISK_CACHE_DIR = (
+    Path(__file__).parent.parent / ".pytest_cache" / "d" / "threshold_rsa_keys"
+)
+
+
+def _disk_path(t: int, n: int, bits: int) -> Path:
+    return _DISK_CACHE_DIR / f"t{t}_n{n}_b{bits}.pkl"
+
+
+def _rebuild_verification_table(pk: PublicKey, shares: list[KeyShare]) -> None:
+    # The dealer keeps a process-local table keyed by id(pk).  After
+    # loading from disk we have a fresh pk object and must repopulate it
+    # from (verification_base, share_value) ∈ pk × shares.
+    ThresholdKeyDealer._verification_table[id(pk)] = {
+        s.index: pow(pk.verification_base, s.share_value, pk.n) for s in shares
+    }
+
 
 def _key(t: int, n: int) -> tuple[PublicKey, list[KeyShare]]:
-    if (t, n) not in _CACHE:
-        _CACHE[(t, n)] = ThresholdKeyDealer.generate(
-            t=t, n=n, key_size_bits=_TEST_KEY_BITS
-        )
-    return _CACHE[(t, n)]
+    ck = (t, n)
+    if ck in _CACHE:
+        return _CACHE[ck]
+    path = _disk_path(t, n, _TEST_KEY_BITS)
+    if path.exists():
+        try:
+            with path.open("rb") as f:
+                pk_bytes, share_blobs = pickle.load(f)
+            pk = PublicKey.from_bytes(pk_bytes)
+            shares = [KeyShare.from_bytes(b) for b in share_blobs]
+            _rebuild_verification_table(pk, shares)
+            _CACHE[ck] = (pk, shares)
+            return _CACHE[ck]
+        except Exception:
+            # Corrupt cache file — fall through and regenerate.
+            pass
+    pk, shares = ThresholdKeyDealer.generate(
+        t=t, n=n, key_size_bits=_TEST_KEY_BITS
+    )
+    _CACHE[ck] = (pk, shares)
+    try:
+        _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
+        with tmp.open("wb") as f:
+            pickle.dump(
+                (pk.to_bytes(), [s.to_bytes() for s in shares]), f,
+            )
+        os.replace(tmp, path)
+    except Exception:
+        # Disk cache is an optimization; never fail the test over it.
+        pass
+    return _CACHE[ck]
 
 
 # ---------------------------------------------------------------------------

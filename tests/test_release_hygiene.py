@@ -119,5 +119,53 @@ class TestCollectPrivateKeyHasSingleInvalidKeyFormatHandler(unittest.TestCase):
         )
 
 
+class TestNoDeadDocsCrossRefsInPublicSource(unittest.TestCase):
+    """RB-11: public source code must not cross-reference `docs/*.md`.
+
+    `docs/` is gitignored per CLAUDE.md repo-hygiene — every file under
+    it is operator-local and invisible on a public clone.  Scattering
+    ``See docs/X.md for the authoritative design`` pointers through
+    public modules trains readers that such cross-references are
+    broken by default, which is a professional-polish failure for a
+    project whose pitch is 'anyone can audit the protocol'.
+
+    This test is a regression gate: the next contributor to write
+    ``# See docs/Y.md`` fails CI and is prompted to redirect the
+    pointer at the public source of truth (a sibling module's
+    docstring) or drop the cross-reference entirely.
+
+    Scoped to `messagechain/` source — .gitignore itself legitimately
+    carries `docs/` as a pattern, and the operator-only tests under
+    `tests/test_audit_fixes_iter_34_38.py` correctly gate their
+    `docs/` access on `_DOCS_PRESENT`.  Those paths are exempt.
+    """
+
+    def test_no_docs_md_refs_in_messagechain_package(self):
+        pkg_root = os.path.join(REPO_ROOT, "messagechain")
+        pattern = re.compile(r"docs/[A-Za-z0-9_\-]+\.md")
+        offenders: list[str] = []
+        for dirpath, _dirnames, filenames in os.walk(pkg_root):
+            for fn in filenames:
+                if not fn.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                if pattern.search(text):
+                    rel = os.path.relpath(path, REPO_ROOT)
+                    offenders.append(rel)
+        self.assertEqual(
+            offenders,
+            [],
+            msg=(
+                "Public source code cross-references `docs/*.md` — the "
+                "`docs/` directory is gitignored, so these pointers "
+                "resolve to 404 on any public clone. Redirect the "
+                "reference at the corresponding public source of truth "
+                "(a module docstring) or drop it. Offenders: {}"
+            ).format(offenders),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

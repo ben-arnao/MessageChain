@@ -453,6 +453,10 @@ class TestTransferRegression(unittest.TestCase):
             amount=10,
             fee=None,
             server="127.0.0.1:9334",
+            # This test exercises the confirmation gate, not the
+            # raw-hex safety gate; opt in so the raw-hex form reaches
+            # the confirmation prompt.
+            allow_raw_hex_address=True,
         )
 
         rpc_returns = {

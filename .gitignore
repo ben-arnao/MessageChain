@@ -6,5 +6,9 @@ CLAUDE.md
 messagechain/config_local.py
 docs/
 deploy/
+tools/
 .claude/
 *.egg-info/
+_test_*.txt
+onboard.toml
+.messagechain/

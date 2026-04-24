@@ -30,6 +30,7 @@ from messagechain.config import (
     PROPOSER_REWARD_CAP,
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
+    BLOCK_BYTES_RAISE_HEIGHT, TARGET_BLOCK_SIZE_POST_RAISE,
     get_unbonding_period,
     ATTESTER_REWARD_SPLIT_HEIGHT,
     ATTESTER_FEE_FUNDING_HEIGHT,
@@ -55,6 +56,16 @@ class SupplyTracker:
         self.staked: dict[bytes, int] = {}
         # Pending unstakes: entity_id -> list of (amount, release_block)
         self.pending_unstakes: dict[bytes, list[tuple[int, int]]] = {}
+        # Optional ChainDB handle.  When set by Blockchain.__init__ the
+        # pending_unstakes mutation paths (unstake / process / slash)
+        # mirror each change into the `pending_unstakes` SQL table so a
+        # cold process restart rehydrates the identical queue — without
+        # this mirror the in-memory queue is lost on restart and the
+        # next process_pending_unstakes call releases different tokens
+        # on restarted vs. un-restarted nodes, forking consensus at the
+        # next state_root check.  None-safe: tests and non-persisted
+        # contexts don't set it and the mirror calls are skipped.
+        self.db = None
         # EIP-1559 dynamic base fee
         self.base_fee: int = BASE_FEE_INITIAL
         # Per-block fee-burn ticker.  Incremented by every
@@ -756,24 +767,40 @@ class SupplyTracker:
         self.total_fees_collected += fee
         return True
 
-    def update_base_fee(self, parent_tx_count: int) -> int:
+    def update_base_fee(
+        self,
+        parent_tx_count: int,
+        current_height: int | None = None,
+    ) -> int:
         """Adjust base fee based on parent block fullness (EIP-1559).
 
-        If the parent block had more txs than TARGET_BLOCK_SIZE, base fee
-        increases. If fewer, it decreases. Max change per block is
+        If the parent block had more txs than the target block size, base
+        fee increases. If fewer, it decreases. Max change per block is
         1/BASE_FEE_MAX_CHANGE_DENOMINATOR of the current base fee.
+
+        ``current_height`` selects the post-fork target: at/after
+        BLOCK_BYTES_RAISE_HEIGHT (Tier 9) the target is
+        TARGET_BLOCK_SIZE_POST_RAISE (22, tracking the raised
+        MAX_TXS_PER_BLOCK=45).  Default ``None`` preserves the legacy
+        TARGET_BLOCK_SIZE=10 so pre-fork blocks and non-consensus call
+        sites (e.g. isolated tests) retain their prior behavior.
 
         Returns the new base fee.
         """
-        if parent_tx_count == TARGET_BLOCK_SIZE:
+        if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
+            target = TARGET_BLOCK_SIZE_POST_RAISE
+        else:
+            target = TARGET_BLOCK_SIZE
+
+        if parent_tx_count == target:
             return self.base_fee
 
         from messagechain.config import MIN_FEE, MAX_BASE_FEE_MULTIPLIER
         max_base_fee = MIN_FEE * MAX_BASE_FEE_MULTIPLIER
-        if parent_tx_count > TARGET_BLOCK_SIZE:
+        if parent_tx_count > target:
             # Block was over target — increase base fee
-            excess = parent_tx_count - TARGET_BLOCK_SIZE
-            delta = self.base_fee * excess // (TARGET_BLOCK_SIZE * BASE_FEE_MAX_CHANGE_DENOMINATOR)
+            excess = parent_tx_count - target
+            delta = self.base_fee * excess // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
             # Upper bound on base_fee: without a cap, a determined attacker
             # willing to burn tokens on full blocks can compound +12.5% per
             # block indefinitely, permanently pricing out honest users even
@@ -785,8 +812,8 @@ class SupplyTracker:
             self.base_fee = min(self.base_fee + max(1, delta), max_base_fee)
         else:
             # Block was under target — decrease base fee
-            deficit = TARGET_BLOCK_SIZE - parent_tx_count
-            delta = self.base_fee * deficit // (TARGET_BLOCK_SIZE * BASE_FEE_MAX_CHANGE_DENOMINATOR)
+            deficit = target - parent_tx_count
+            delta = self.base_fee * deficit // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
             self.base_fee = max(MIN_FEE, self.base_fee - delta)
 
         return self.base_fee
@@ -865,11 +892,14 @@ class SupplyTracker:
         if entity_id not in self.pending_unstakes:
             self.pending_unstakes[entity_id] = []
         self.pending_unstakes[entity_id].append((amount, release_block))
+        if self.db is not None and hasattr(self.db, "add_pending_unstake"):
+            self.db.add_pending_unstake(entity_id, amount, release_block)
         return True
 
     def process_pending_unstakes(self, current_block: int) -> int:
         """Release matured unstakes. Returns total tokens released."""
         total_released = 0
+        db = self.db if hasattr(self, "db") else None
         for entity_id in list(self.pending_unstakes.keys()):
             pending = self.pending_unstakes[entity_id]
             still_pending = []
@@ -877,6 +907,11 @@ class SupplyTracker:
                 if current_block >= release_block:
                     self.balances[entity_id] = self.balances.get(entity_id, 0) + amount
                     total_released += amount
+                    # Mirror the matured ticket's removal into the DB
+                    # so a cold-booted node rehydrates a queue that
+                    # matches what the running node just released.
+                    if db is not None and hasattr(db, "clear_pending_unstake"):
+                        db.clear_pending_unstake(entity_id, release_block)
                 else:
                     still_pending.append((amount, release_block))
             if still_pending:
@@ -1079,6 +1114,13 @@ class SupplyTracker:
         self.staked[offender_id] = 0
         if offender_id in self.pending_unstakes:
             del self.pending_unstakes[offender_id]
+        # Mirror the slash into the DB so restarted peers see the same
+        # empty queue — without this, a cold-booted node would rehydrate
+        # a ghost queue for a slashed offender and release tokens that
+        # the canonical chain burned.
+        db = self.db if hasattr(self, "db") else None
+        if db is not None and hasattr(db, "clear_all_pending_unstakes"):
+            db.clear_all_pending_unstakes(offender_id)
 
         # Pay finder
         self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward

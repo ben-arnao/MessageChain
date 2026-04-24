@@ -1,6 +1,6 @@
 """Tests for proof-of-custody archive rewards.
 
-Spec: docs/proof-of-custody-archive-rewards.md
+Spec: `messagechain/consensus/archive_challenge.py` (module docstring).
 
 Covers the eight TDD requirements:
     1. Challenge determinism & uniformity.
@@ -49,10 +49,18 @@ _ENTITY_POOL: list = []
 
 
 def _test_entity(i: int):
+    # Low-index entities (0..~10) are shared across many tests' setUps
+    # (entity 1 is signed ~5 times across the suite when a worker runs
+    # them sequentially).  High-index entities exist only for the bulk
+    # FCFS tests that sign each entity exactly once — for those,
+    # tree_height=1 keeps keygen cheap.  The bulk path dominates file
+    # runtime because TestFCFSCap creates 110 fresh entities.
     from messagechain.identity.identity import Entity
     while len(_ENTITY_POOL) <= i:
-        seed = f"ac-test-{len(_ENTITY_POOL)}".encode().ljust(32, b"\x00")
-        _ENTITY_POOL.append(Entity.create(seed, tree_height=4))
+        idx = len(_ENTITY_POOL)
+        seed = f"ac-test-{idx}".encode().ljust(32, b"\x00")
+        h = 3 if idx < 20 else 1
+        _ENTITY_POOL.append(Entity.create(seed, tree_height=h))
     return _ENTITY_POOL[i]
 
 

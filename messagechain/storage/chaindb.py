@@ -20,18 +20,54 @@ from pathlib import Path
 from messagechain.core.block import Block
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+# v1 -> v2 changelog (cold-restart-persistence class, rounds 7/13/14/
+# 15/17/18 of the pre-launch audit):
+#   * Added tables: pending_unstakes, key_history, reputation,
+#     stake_snapshots.
+#   * Added supply_meta keys: blocks_since_last_finalization,
+#     lottery_prize_pool.
+# All of these were consensus-visible in-memory state in v1 that
+# `_load_from_db` did not rebuild, which on a cold restart produced
+# a different state than uprestarted peers and forked the restarted
+# node off the honest chain at the next lottery / finality / slash
+# block.  v2 persists them explicitly.
+#
+# Migration shape: a v1 DB opened under a v2 binary has all the
+# balance/staked/nonce/supply_meta invariants already correct
+# (those were always persisted) but the six new state surfaces
+# are empty.  `migrate_schema_v1_to_v2` replays the persisted
+# blocks through an in-memory Blockchain to repopulate them from
+# history, then bumps the `schema_version` meta row.  Operators on
+# v1 DBs are pointed at `messagechain migrate-chain-db` in the
+# startup error rather than silently getting an incomplete state.
 
 
 class ChainDB:
     """SQLite-backed block and state storage."""
 
-    def __init__(self, db_path: str = "messagechain.db"):
+    def __init__(
+        self,
+        db_path: str = "messagechain.db",
+        *,
+        skip_schema_check: bool = False,
+    ):
+        """Open a chain.db.
+
+        ``skip_schema_check=True`` bypasses the schema-version
+        tripwire — used ONLY by the `migrate-chain-db` CLI path so
+        it can open a v1 DB to run `migrate_schema_v1_to_v2`.  Every
+        other caller (Blockchain __init__, tests, the server
+        startup path) leaves this at the default and takes the
+        actionable error if the DB isn't at the binary's expected
+        version.
+        """
         self.db_path = db_path
         self._local = threading.local()
         self._init_schema()
         self._check_db_permissions()
-        self._check_and_write_schema_version()
+        if not skip_schema_check:
+            self._check_and_write_schema_version()
 
     def _check_and_write_schema_version(self):
         """Enforce a schema-version pin in the meta table.
@@ -70,12 +106,220 @@ class ChainDB:
                 f"chain.db meta.schema_version is not an integer: {row[0]!r}"
             )
         if on_disk != _SCHEMA_VERSION:
+            # Actionable startup error: point the operator at the CLI
+            # migration rather than printing a cryptic mismatch.  The
+            # specific v1 -> v2 path is safe, non-destructive, and
+            # covered by `migrate_schema_v1_to_v2` below; anything
+            # further out should halt here and require an explicit
+            # ops-authored migration function before it's allowed to
+            # open.
+            if on_disk == 1 and _SCHEMA_VERSION == 2:
+                raise RuntimeError(
+                    f"chain.db schema version mismatch: disk=1, "
+                    f"code=2.  This binary adds six consensus-visible "
+                    f"cold-restart persistence surfaces (reputation, "
+                    f"key_history, pending_unstakes, stake_snapshots, "
+                    f"blocks_since_last_finalization, "
+                    f"lottery_prize_pool).  Run the one-shot migration "
+                    f"before starting the node:\n\n"
+                    f"    messagechain migrate-chain-db "
+                    f"--data-dir <path-containing-chain.db>\n\n"
+                    f"The migration replays block history through an "
+                    f"in-memory Blockchain to repopulate the six new "
+                    f"state surfaces from persisted blocks -- it is "
+                    f"non-destructive and idempotent."
+                )
             raise RuntimeError(
                 f"chain.db schema version mismatch: disk={on_disk}, "
                 f"code={_SCHEMA_VERSION}.  A migration is required before "
                 f"this binary can open this database — do NOT downgrade "
                 f"or upgrade across versions without running the migration."
             )
+
+    def migrate_schema_v1_to_v2(self) -> dict:
+        """Replay chain history to populate v2-new state surfaces.
+
+        v1 -> v2 added six consensus-visible state surfaces that
+        `_load_from_db` cannot reconstruct without replaying blocks:
+        `reputation`, `key_history`, `pending_unstakes`,
+        `stake_snapshots`, `blocks_since_last_finalization`,
+        `lottery_prize_pool`.  An operator upgrading the binary
+        without this migration gets empty versions of each and
+        diverges consensus at the first lottery / finality / slash
+        block after restart.
+
+        Strategy: build an in-memory Blockchain pointed at a
+        temporary *detached* ChainDB (to avoid double-writes back
+        to the file we're migrating), replay every persisted block
+        in order so the in-memory state accumulates the six
+        surfaces, then copy the accumulated state into the on-disk
+        DB and bump the schema_version row.
+
+        Non-destructive: the only table we rewrite is
+        `meta.schema_version`; the six target tables / supply_meta
+        rows are cleared first (in case a partial prior migration
+        left stale rows) and then repopulated.  Every other v1
+        table is untouched.
+
+        Idempotent: running twice on a v2 DB is a no-op because
+        `_check_and_write_schema_version` rejects the v2->v2 open
+        at the standard "no mismatch" path before we ever reach
+        here (the migration is only callable via the CLI).
+
+        Returns a summary dict for the CLI to print.
+        """
+        from messagechain.core.blockchain import Blockchain
+
+        # Force the current schema_version back to 1 in memory so
+        # the migration can actually examine a v1 DB -- the
+        # __init__ tripwire would otherwise have blocked us.
+        # (The CLI opens us with an explicit "migration" flag that
+        # bypasses the tripwire.)
+
+        # Step 1: Rebuild an in-memory Blockchain from the
+        # persisted blocks.  We route it at a scratch db so its
+        # own writes don't double-commit into the live file.
+        import tempfile
+        import os as _os
+        scratch_dir = tempfile.mkdtemp(prefix="mc_migrate_")
+        scratch_path = _os.path.join(scratch_dir, "scratch.db")
+        # Stamp the scratch DB to v2 so it doesn't itself trigger
+        # the tripwire.  The scratch file is discarded at the end.
+        scratch_db = ChainDB(scratch_path)
+
+        rebuilt = Blockchain(db=scratch_db)
+
+        # Pre-seed entity-index mappings from the v1 DB so compact
+        # entity-refs in post-genesis blocks can be decoded before
+        # the replay loop walks the registrations.  Without this,
+        # `get_block_by_number` at the first height that references
+        # a non-genesis entity by index raises
+        # `entity ref uses unknown index N (state lacks mapping)`
+        # and the whole migration aborts — because `rebuilt` is a
+        # fresh Blockchain pointed at a scratch DB, so its maps
+        # start empty while the on-disk `entity_indices` table is
+        # fully populated.
+        persisted_indices = self.get_all_entity_indices()
+        if persisted_indices:
+            rebuilt.entity_id_to_index = dict(persisted_indices)
+            rebuilt.entity_index_to_id = {
+                idx: eid for eid, idx in persisted_indices.items()
+            }
+            rebuilt._next_entity_index = max(persisted_indices.values()) + 1
+
+        # Copy v1 state (balances, staked, etc.) into `rebuilt` so
+        # block replay starts from the live state.  Simpler: just
+        # replay every block from 0.
+        block_count = self.get_block_count()
+        for height in range(block_count):
+            block = self.get_block_by_number(height, state=rebuilt)
+            if block is None:
+                continue
+            if height == 0:
+                # Genesis is initialized fresh by the Blockchain
+                # constructor's pipeline; skip re-applying block 0
+                # to avoid the "genesis already applied" guard.
+                continue
+            rebuilt._apply_block_state(block)
+            rebuilt.chain.append(block)
+
+        # Step 2: Copy the six new state surfaces from the rebuilt
+        # in-memory Blockchain into this (v1-on-disk) ChainDB.
+        conn = self._conn
+        conn.execute("BEGIN")
+        try:
+            # Clear then repopulate the six surfaces.
+            conn.execute("DELETE FROM reputation")
+            for eid, count in rebuilt.reputation.items():
+                conn.execute(
+                    "INSERT INTO reputation (entity_id, count) "
+                    "VALUES (?, ?)",
+                    (eid, int(count)),
+                )
+            conn.execute("DELETE FROM key_history")
+            for eid, entries in rebuilt.key_history.items():
+                for installed_at, public_key in entries:
+                    conn.execute(
+                        "INSERT INTO key_history "
+                        "(entity_id, installed_at, public_key) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(installed_at), public_key),
+                    )
+            conn.execute("DELETE FROM pending_unstakes")
+            for eid, tickets in rebuilt.supply.pending_unstakes.items():
+                for amount, release_block in tickets:
+                    conn.execute(
+                        "INSERT INTO pending_unstakes "
+                        "(entity_id, release_block, amount) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(release_block), int(amount)),
+                    )
+            conn.execute("DELETE FROM stake_snapshots")
+            for block_number, stake_map in rebuilt._stake_snapshots.items():
+                for entity_id, amount in stake_map.items():
+                    conn.execute(
+                        "INSERT INTO stake_snapshots "
+                        "(block_number, entity_id, amount) "
+                        "VALUES (?, ?, ?)",
+                        (int(block_number), entity_id, int(amount)),
+                    )
+            # Two scalar supply_meta keys.
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "blocks_since_last_finalization",
+                    int(rebuilt.blocks_since_last_finalization),
+                ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "lottery_prize_pool",
+                    int(rebuilt.supply.lottery_prize_pool),
+                ),
+            )
+            # Step 3: stamp the new schema version LAST so a crash
+            # mid-migration leaves the DB at v1 and the operator's
+            # next start re-runs the migration (idempotent).
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("schema_version", str(2)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            # Scratch DB cleanup.
+            try:
+                sc = getattr(scratch_db._local, "conn", None)
+                if sc is not None:
+                    sc.close()
+            except Exception:
+                pass
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(scratch_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return {
+            "schema_from": 1,
+            "schema_to": 2,
+            "blocks_replayed": max(0, block_count - 1),
+            "reputation_entries": len(rebuilt.reputation),
+            "key_history_entities": len(rebuilt.key_history),
+            "pending_unstake_entities": len(
+                rebuilt.supply.pending_unstakes,
+            ),
+            "stake_snapshots_heights": len(rebuilt._stake_snapshots),
+            "blocks_since_last_finalization": (
+                rebuilt.blocks_since_last_finalization
+            ),
+            "lottery_prize_pool": rebuilt.supply.lottery_prize_pool,
+        }
 
     def _check_db_permissions(self):
         """Warn if chain.db is world-writable.
@@ -146,6 +390,24 @@ class ChainDB:
                 amount INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Pending unbonding tickets for every validator that has
+            -- called unstake() but whose UNBONDING_PERIOD hasn't elapsed.
+            -- Tokens have been debited from `staked` but not yet
+            -- credited back to `balances` — they live here in the
+            -- meantime.  Consensus-critical: without persistence,
+            -- process_pending_unstakes(block_height) runs on a cold-
+            -- booted node with an empty queue while uprestarted peers
+            -- release the real tokens, producing a state_root mismatch
+            -- and forking the restarted node off the honest chain.
+            -- Composite key (entity_id, release_block) lets a single
+            -- entity stack multiple concurrent unstakes.
+            CREATE TABLE IF NOT EXISTS pending_unstakes (
+                entity_id BLOB NOT NULL,
+                release_block INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (entity_id, release_block)
+            );
+
             CREATE TABLE IF NOT EXISTS nonces (
                 entity_id BLOB PRIMARY KEY,
                 nonce INTEGER NOT NULL DEFAULT 0
@@ -156,10 +418,82 @@ class ChainDB:
                 public_key BLOB NOT NULL
             );
 
+            -- Per-entity public-key rotation history.  Append-only log
+            -- of (installed_at, public_key) tuples: one entry per
+            -- first-spend install + one per key rotation.  Used by
+            -- `validate_slash_transaction` to look up the
+            -- PRE-rotation pubkey an equivocation was signed under, so
+            -- a validator that equivocates at height M and then
+            -- rotates at height N > M can still be slashed with
+            -- evidence signed by the old key.  Consensus-critical:
+            -- without persistence, cold-restart empties the history,
+            -- `_public_key_at_height` falls back to the CURRENT
+            -- (post-rotation) pubkey, WOTS+ verify against old-key-
+            -- signed evidence fails, and the restarted node rejects
+            -- a slash block uprestarted peers accept — state_root
+            -- divergence + silent slash evasion.  Composite PK allows
+            -- multiple rotations for the same entity at distinct
+            -- heights; repeated installs at the exact same height are
+            -- a no-op under INSERT OR REPLACE (replay fidelity with
+            -- the in-memory list, where duplicates at the same height
+            -- are tolerated but not deduped).
+            CREATE TABLE IF NOT EXISTS key_history (
+                entity_id BLOB NOT NULL,
+                installed_at INTEGER NOT NULL,
+                public_key BLOB NOT NULL,
+                PRIMARY KEY (entity_id, installed_at)
+            );
+
+            -- Per-entity accepted-attestation counter that drives the
+            -- bootstrap-era reputation-weighted lottery.  Every
+            -- LOTTERY_INTERVAL block, `select_lottery_winner` reads
+            -- the current reputation map and picks a winner who
+            -- receives a `bounty + pool_payout` mint/redirect -- the
+            -- winner's balance changes, total_supply / total_minted
+            -- bump, so the reputation input is fully consensus-
+            -- visible.  Consensus-critical: without persistence, a
+            -- cold-booted peer starts with an empty map,
+            -- `select_lottery_winner(candidates=[], ...)` returns
+            -- None, no bounty is paid, balances diverge from
+            -- uprestarted peers, and the restarted peer forks off at
+            -- the next lottery firing.  Same structural shape as the
+            -- `pending_unstakes` / `key_history` cold-restart fixes.
+            CREATE TABLE IF NOT EXISTS reputation (
+                entity_id BLOB PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS message_counts (
                 entity_id BLOB PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
             );
+
+            -- Per-block pinned stake distributions used as the 2/3
+            -- finality denominator in `_process_attestations` and
+            -- `_process_finality_votes`.  Consensus-critical: the
+            -- finality-vote path can target a block up to
+            -- FINALITY_VOTE_MAX_AGE_BLOCKS (=1000) slots back, and
+            -- the threshold-crossing predicate must use the stake
+            -- distribution AS-OF the target block (not post-churn
+            -- live state) or validators who unstaked after casting
+            -- are silently dropped from the denominator and the
+            -- `crossed` decision diverges.  Without persistence, a
+            -- cold-booted peer loses every historical snapshot and
+            -- falls back to live stakes -- uprestarted peers reach
+            -- finality on blocks restarted peers don't, and
+            -- `finalized_checkpoints` (the long-range-attack
+            -- ratchet) diverges irreversibly.  Bounded: pruned to
+            -- the trailing FINALITY_VOTE_MAX_AGE_BLOCKS window on
+            -- every insert, so table size is O(1000 * |validators|)
+            -- regardless of chain length.
+            CREATE TABLE IF NOT EXISTS stake_snapshots (
+                block_number INTEGER NOT NULL,
+                entity_id BLOB NOT NULL,
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (block_number, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stake_snapshots_block
+                ON stake_snapshots(block_number);
 
             CREATE TABLE IF NOT EXISTS proposer_sig_counts (
                 entity_id BLOB PRIMARY KEY,
@@ -562,6 +896,138 @@ class ChainDB:
         cur = self._conn.execute("SELECT entity_id, amount FROM staked WHERE amount > 0")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
+    # ── State: Pending Unstakes ──────────────────────────────────
+    # Unbonding queue per validator.  Tokens here have been debited
+    # from `staked` but are not yet in `balances`; they sit for
+    # UNBONDING_PERIOD blocks before process_pending_unstakes releases
+    # them.  The table must be kept in lockstep with
+    # SupplyTracker.pending_unstakes — every queue insert in
+    # SupplyTracker.unstake() must mirror into add_pending_unstake(),
+    # and every matured release in process_pending_unstakes() must
+    # call clear_pending_unstake() for the (entity_id, release_block)
+    # composite key.
+
+    def add_pending_unstake(
+        self, entity_id: bytes, amount: int, release_block: int,
+    ) -> None:
+        """Persist one pending unstake ticket.
+
+        Uses INSERT OR REPLACE so a re-apply of the same (entity,
+        release_block) pair overwrites rather than duplicating —
+        matches the in-memory list semantics where a second append at
+        the exact same release_block is unreachable in normal flow but
+        deterministic under reorg replay.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO pending_unstakes "
+            "(entity_id, release_block, amount) VALUES (?, ?, ?)",
+            (entity_id, int(release_block), int(amount)),
+        )
+        self._maybe_commit()
+
+    def clear_pending_unstake(
+        self, entity_id: bytes, release_block: int,
+    ) -> None:
+        """Delete one matured or slashed pending-unstake ticket."""
+        self._conn.execute(
+            "DELETE FROM pending_unstakes "
+            "WHERE entity_id = ? AND release_block = ?",
+            (entity_id, int(release_block)),
+        )
+        self._maybe_commit()
+
+    def clear_all_pending_unstakes(self, entity_id: bytes) -> None:
+        """Delete every pending-unstake ticket for an entity (slash path)."""
+        self._conn.execute(
+            "DELETE FROM pending_unstakes WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_pending_unstakes(
+        self,
+    ) -> dict[bytes, list[tuple[int, int]]]:
+        """Rehydrate the full pending-unstakes map on cold start.
+
+        Returns `{entity_id: [(amount, release_block), ...]}` with
+        release_block ordering preserved (ascending), matching the
+        in-memory list shape SupplyTracker expects.
+        """
+        cur = self._conn.execute(
+            "SELECT entity_id, amount, release_block "
+            "FROM pending_unstakes "
+            "ORDER BY entity_id, release_block",
+        )
+        out: dict[bytes, list[tuple[int, int]]] = {}
+        for eid, amount, release_block in cur.fetchall():
+            out.setdefault(bytes(eid), []).append(
+                (int(amount), int(release_block)),
+            )
+        return out
+
+    # ── State: Stake Snapshots (per-block finality denominator) ──
+    # Must mirror `Blockchain._stake_snapshots`.  Every
+    # `_record_stake_snapshot(block_number)` call on the Blockchain
+    # side routes through `add_stake_snapshot` here when a db
+    # handle is attached.  Pruning keeps the persisted tail bounded
+    # to FINALITY_VOTE_MAX_AGE_BLOCKS so a decades-old chain
+    # doesn't carry a stake-snapshot row for every entity at every
+    # historical height -- anything older than that window cannot
+    # be a valid finality-vote target anyway.
+
+    def add_stake_snapshot(
+        self, block_number: int, stakes: dict[bytes, int],
+    ) -> None:
+        """Persist one (block_number, entity_id, amount) row per
+        entity in the supplied stake map.
+
+        INSERT OR REPLACE so a re-apply of the same block overwrites
+        cleanly (matches the in-memory `self._stake_snapshots
+        [block_number] = dict(self.supply.staked)` replace-on-write
+        semantics).
+        """
+        for entity_id, amount in stakes.items():
+            self._conn.execute(
+                "INSERT OR REPLACE INTO stake_snapshots "
+                "(block_number, entity_id, amount) VALUES (?, ?, ?)",
+                (int(block_number), entity_id, int(amount)),
+            )
+        self._maybe_commit()
+
+    def prune_stake_snapshots_before(self, height_cutoff: int) -> None:
+        """Delete every stake_snapshots row with block_number <
+        height_cutoff.  Bounds the table to a trailing window so a
+        long-running chain doesn't accumulate snapshots forever.
+        """
+        self._conn.execute(
+            "DELETE FROM stake_snapshots WHERE block_number < ?",
+            (int(height_cutoff),),
+        )
+        self._maybe_commit()
+
+    def get_all_stake_snapshots(
+        self,
+    ) -> dict[int, dict[bytes, int]]:
+        """Rehydrate the full stake-snapshots map on cold start.
+
+        Returns ``{block_number: {entity_id: amount, ...}, ...}`` --
+        the same shape `Blockchain._stake_snapshots` holds in memory.
+        Bounded by whatever the most recent `prune_stake_snapshots_
+        before` left behind (≤ FINALITY_VOTE_MAX_AGE_BLOCKS entries
+        under normal operation).
+        """
+        cur = self._conn.execute(
+            "SELECT block_number, entity_id, amount "
+            "FROM stake_snapshots "
+            "ORDER BY block_number, entity_id",
+        )
+        out: dict[int, dict[bytes, int]] = {}
+        for block_number, entity_id, amount in cur.fetchall():
+            out.setdefault(int(block_number), {})[
+                bytes(entity_id)
+            ] = int(amount)
+        return out
+
     # ── State: Nonces ────────────────────────────────────────────
 
     def get_nonce(self, entity_id: bytes) -> int:
@@ -595,6 +1061,107 @@ class ChainDB:
     def get_all_public_keys(self) -> dict[bytes, bytes]:
         cur = self._conn.execute("SELECT entity_id, public_key FROM public_keys")
         return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
+
+    # ── State: Key Rotation History ──────────────────────────────
+    # Append-only audit log of every public-key install for every
+    # entity.  Must stay in lockstep with
+    # `Blockchain.key_history` — every `_record_key_history` call on
+    # the Blockchain side must mirror into `add_key_history_entry`
+    # here, and the full dict is rehydrated on cold start via
+    # `get_all_key_history()`.  See the `key_history` table comment
+    # in the schema block for the slash-evasion / consensus-divergence
+    # rationale.
+
+    def add_key_history_entry(
+        self, entity_id: bytes, installed_at: int, public_key: bytes,
+    ) -> None:
+        """Persist one (entity_id, installed_at) → public_key entry.
+
+        INSERT OR REPLACE mirrors the in-memory list's behaviour:
+        the Blockchain side deliberately does not guard against
+        duplicate inserts at the same height (replay fidelity is
+        more important than deduplication), so repeated calls at the
+        same height overwrite rather than error.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO key_history "
+            "(entity_id, installed_at, public_key) VALUES (?, ?, ?)",
+            (entity_id, int(installed_at), public_key),
+        )
+        self._maybe_commit()
+
+    def clear_key_history(self, entity_id: bytes) -> None:
+        """Delete every key_history row for an entity.
+
+        Used by the reorg-rollback path: when a replay re-applies
+        installs from genesis forward, the DB rows from the old
+        history must be cleared first so the replay doesn't leave
+        stale (height, pubkey) pairs that a later
+        `_public_key_at_height` lookup could incorrectly resolve to.
+        """
+        self._conn.execute(
+            "DELETE FROM key_history WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_key_history(
+        self,
+    ) -> dict[bytes, list[tuple[int, bytes]]]:
+        """Rehydrate the full key_history map on cold start.
+
+        Returns ``{entity_id: [(installed_at, public_key), ...]}``
+        with entries ordered ascending by ``installed_at`` so
+        `_public_key_at_height` can walk them in forward-order (the
+        same shape the in-memory list holds after a linear replay).
+        """
+        cur = self._conn.execute(
+            "SELECT entity_id, installed_at, public_key "
+            "FROM key_history "
+            "ORDER BY entity_id, installed_at",
+        )
+        out: dict[bytes, list[tuple[int, bytes]]] = {}
+        for eid, installed_at, public_key in cur.fetchall():
+            out.setdefault(bytes(eid), []).append(
+                (int(installed_at), bytes(public_key)),
+            )
+        return out
+
+    # ── State: Reputation ────────────────────────────────────────
+    # Per-entity accepted-attestation count driving the bootstrap
+    # reputation-weighted lottery.  Must mirror
+    # `Blockchain.reputation` in lockstep: every increment in
+    # `_process_attestations` and every reset in
+    # `apply_slash_transaction` routes through here when a db handle
+    # is attached.  On cold start `_load_from_db` rehydrates the full
+    # dict via `get_all_reputation()` — without this the restarted
+    # peer starts empty, `select_lottery_winner` returns None, no
+    # bounty is paid, and the balance diverges from uprestarted peers
+    # at the next lottery firing.
+
+    def set_reputation(self, entity_id: bytes, count: int) -> None:
+        """Upsert the reputation counter for an entity."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO reputation (entity_id, count) "
+            "VALUES (?, ?)",
+            (entity_id, int(count)),
+        )
+        self._maybe_commit()
+
+    def clear_reputation(self, entity_id: bytes) -> None:
+        """Delete the reputation row for an entity (slash path)."""
+        self._conn.execute(
+            "DELETE FROM reputation WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_reputation(self) -> dict[bytes, int]:
+        """Rehydrate the full reputation map on cold start."""
+        cur = self._conn.execute(
+            "SELECT entity_id, count FROM reputation",
+        )
+        return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
 
     # ── State: Entity Index Registry (bloat reduction) ──────────
 
@@ -786,6 +1353,54 @@ class ChainDB:
             "INSERT OR REPLACE INTO supply_meta (key, value) VALUES (?, ?)",
             (key, value),
         )
+
+    # ── Finalization-stall counter ───────────────────────────────
+    # The number of blocks since the most recent finalization.
+    # Consensus-critical because `_apply_block_state` reads this
+    # counter to decide whether the inactivity leak activates, and
+    # (if active) scales the per-validator burn QUADRATICALLY with
+    # the counter — so a cold-restart that resets the counter to 0
+    # silently stops the burn on the restarted peer while uprestarted
+    # peers continue burning, diverging `supply.staked` +
+    # `supply.total_supply` + state_root.  Rides the existing
+    # `supply_meta` key/value table (no new schema), with the key
+    # "blocks_since_last_finalization".  Dedicated wrapper pair
+    # below so the mutation site in Blockchain stays single-line
+    # and includes the `_maybe_commit` that `set_supply_meta` on
+    # its own omits.
+
+    def get_finalization_stall_counter(self) -> int:
+        """Return the persisted finalization-stall counter (0 if unset)."""
+        return int(self.get_supply_meta("blocks_since_last_finalization"))
+
+    def set_finalization_stall_counter(self, value: int) -> None:
+        """Persist the finalization-stall counter.  Idempotent upsert."""
+        self.set_supply_meta("blocks_since_last_finalization", int(value))
+        self._maybe_commit()
+
+    # ── Lottery Prize Pool ───────────────────────────────────────
+    # Consensus-visible scalar accumulator for the seed-divestment
+    # redistribution lottery (post-SEED_DIVESTMENT_REDIST_HEIGHT).
+    # Accumulated at REDIST-era divestment blocks, drained into the
+    # lottery winner's balance at every LOTTERY_INTERVAL firing.
+    # Rides the existing `supply_meta` key/value table under the key
+    # "lottery_prize_pool" (no new schema needed for a single
+    # scalar).  Without persistence, cold-restart zeros the pool on
+    # the restarted peer while uprestarted peers carry the
+    # accumulated value -- next lottery firing pays different
+    # amounts to the winner, `supply.balances` diverges, state_root
+    # mismatches.  Sixth in the cold-restart-persistence class after
+    # pending_unstakes / key_history / reputation /
+    # blocks_since_last_finalization / stake_snapshots.
+
+    def get_lottery_prize_pool(self) -> int:
+        """Return the persisted lottery prize pool (0 if unset)."""
+        return int(self.get_supply_meta("lottery_prize_pool"))
+
+    def set_lottery_prize_pool(self, value: int) -> None:
+        """Persist the lottery prize pool.  Idempotent upsert."""
+        self.set_supply_meta("lottery_prize_pool", int(value))
+        self._maybe_commit()
 
     # ── Phantom-Supply Migration (one-shot correctness repair) ──────────
     #
@@ -1150,6 +1765,51 @@ class ChainDB:
             "proposer_sig_counts": self.get_all_proposer_sig_counts(),
             "leaf_watermarks": self.get_all_leaf_watermarks(),
             "authority_keys": self.get_all_authority_keys(),
+            # pending_unstakes must round-trip with the other supply
+            # state: a reorg that rolls past an unstake tx (but not past
+            # its maturity block) has to restore the ticket so the
+            # re-applied chain releases the same tokens at the same
+            # height a peer who never forked would.  Without this, a
+            # reorg-and-restore silently clears the queue and diverges
+            # consensus at the next `process_pending_unstakes`.
+            "pending_unstakes": self.get_all_pending_unstakes(),
+            # key_history must round-trip with public_keys: a reorg
+            # that rolls past a key-rotation block has to restore
+            # the pre-rotation entry so post-reorg slash-evidence
+            # lookups at pre-rotation heights still resolve to the
+            # correct pubkey.  See the `key_history` table comment
+            # in the schema block for the full consensus rationale.
+            "key_history": self.get_all_key_history(),
+            # reputation must round-trip with supply state because
+            # lottery payouts debit/credit supply.balances and the
+            # winner is a function of this map; a reorg that rolls
+            # past attestations must restore the pre-reorg counts
+            # so the post-reorg replay converges on the same winner.
+            "reputation": self.get_all_reputation(),
+            # Per-block pinned stake snapshots used as the 2/3
+            # finality denominator.  Must round-trip with supply
+            # state: a reorg that rolls past any block whose stake
+            # pin we've already consumed (or will consume for a
+            # finality vote targeting that height) has to restore
+            # the ancestor's snapshot so post-reorg replay converges
+            # on the same crossing decision.
+            "stake_snapshots": self.get_all_stake_snapshots(),
+            # Finalization-stall counter — scalar input to the
+            # quadratic inactivity leak.  Must round-trip with supply
+            # state because a reorg that rolls past the finalization-
+            # reset block has to restore the pre-reorg counter, or
+            # the post-reorg replay computes a different burn than
+            # peers that never forked.
+            "blocks_since_last_finalization": (
+                self.get_finalization_stall_counter()
+            ),
+            # Lottery prize pool -- scalar input to
+            # `select_lottery_winner` + pool_payout math at every
+            # LOTTERY_INTERVAL firing.  Must round-trip with supply
+            # state because payouts mutate supply.balances, so the
+            # pool's value at the fork point must be restored on
+            # reorg rollback.
+            "lottery_prize_pool": self.get_lottery_prize_pool(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1173,6 +1833,26 @@ class ChainDB:
             # Authority keys revert with the block that set them. Keys set
             # on a fork that lost the reorg must not persist silently.
             conn.execute("DELETE FROM authority_keys")
+            # Pending-unstakes mirror the supply-state balances/staked
+            # that we just wiped — restore them alongside so the
+            # validator unbonding queue reflects the ancestor state.
+            conn.execute("DELETE FROM pending_unstakes")
+            # key_history must roll back with public_keys: a
+            # SetAuthorityKey / KeyRotation / first-spend install
+            # on the losing fork must have its history entry
+            # reverted, or post-reorg `_public_key_at_height`
+            # lookups would resolve to a key the canonical chain
+            # never installed.
+            conn.execute("DELETE FROM key_history")
+            # reputation mirrors attestation counts -- must roll
+            # back with them so the post-reorg replay rebuilds from
+            # the ancestor's state, not the losing fork's.
+            conn.execute("DELETE FROM reputation")
+            # stake_snapshots pin the 2/3 finality denominator at
+            # each block's apply -- must roll back with the blocks
+            # themselves so post-reorg replay repopulates pins
+            # consistent with the canonical chain.
+            conn.execute("DELETE FROM stake_snapshots")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -1193,10 +1873,64 @@ class ChainDB:
                     "INSERT INTO authority_keys (entity_id, authority_public_key) VALUES (?, ?)",
                     (eid, ak),
                 )
+            for eid, tickets in snapshot.get("pending_unstakes", {}).items():
+                for amount, release_block in tickets:
+                    conn.execute(
+                        "INSERT INTO pending_unstakes "
+                        "(entity_id, release_block, amount) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(release_block), int(amount)),
+                    )
+            for eid, entries in snapshot.get("key_history", {}).items():
+                for installed_at, public_key in entries:
+                    conn.execute(
+                        "INSERT INTO key_history "
+                        "(entity_id, installed_at, public_key) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(installed_at), public_key),
+                    )
+            for eid, count in snapshot.get("reputation", {}).items():
+                conn.execute(
+                    "INSERT INTO reputation (entity_id, count) "
+                    "VALUES (?, ?)",
+                    (eid, int(count)),
+                )
+            for block_number, stake_map in snapshot.get(
+                "stake_snapshots", {},
+            ).items():
+                for entity_id, amount in stake_map.items():
+                    conn.execute(
+                        "INSERT INTO stake_snapshots "
+                        "(block_number, entity_id, amount) "
+                        "VALUES (?, ?, ?)",
+                        (int(block_number), entity_id, int(amount)),
+                    )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_fees_collected'", (snapshot["total_fees_collected"],))
+            # Finalization-stall counter round-trip -- INSERT OR
+            # REPLACE because older snapshots predate this field and
+            # the supply_meta row may not exist yet on the disk.
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "blocks_since_last_finalization",
+                    int(snapshot.get("blocks_since_last_finalization", 0)),
+                ),
+            )
+            # Lottery prize pool -- same INSERT OR REPLACE shape so
+            # pre-field snapshots still round-trip cleanly (default
+            # 0 on older snapshots predating this field).
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "lottery_prize_pool",
+                    int(snapshot.get("lottery_prize_pool", 0)),
+                ),
+            )
             conn.commit()
         except Exception:
             conn.rollback()

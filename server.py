@@ -33,6 +33,7 @@ from messagechain.config import (
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
     HANDSHAKE_TIMEOUT, PEER_READ_TIMEOUT, MAX_PEERS,
+    PEER_MAINTENANCE_INTERVAL,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -52,6 +53,7 @@ from messagechain.core.transfer import (
 )
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
+    enable_tcp_keepalive,
 )
 from messagechain.consensus.checkpoint import load_checkpoints_file
 from messagechain.network.peer import Peer, ConnectionType
@@ -73,6 +75,7 @@ from messagechain.network.ratelimit import PeerRateLimiter
 
 import hashlib
 from messagechain.config import HASH_ALGO
+from messagechain import __version__
 from messagechain.validation import (
     parse_hex, sanitize_error, safe_json_loads,
     is_valid_peer_address as _is_valid_peer_address,
@@ -1070,9 +1073,25 @@ class Server(SharedRuntimeMixin):
         self.mempool = Mempool()
         self.consensus = ProofOfStake()
         self.peers: dict[str, Peer] = {}
+        # In-flight outbound dials, keyed by "host:port".  A Peer only
+        # lands in self.peers after asyncio.open_connection returns;
+        # without this set the startup seed loop and the maintenance
+        # tick race during that window and produce two sockets for
+        # the same remote.  Observed on live mainnet 2026-04-24.
+        self._connecting: set[str] = set()
 
         self.wallet_id: bytes | None = None  # the entity_id that earns fees
         self.wallet_entity: Entity | None = None  # full entity for block signing
+        # Serializes read-and-advance of wallet_entity.keypair._next_leaf
+        # across (a) block-production sign() calls running in the thread
+        # pool via asyncio.to_thread and (b) reserve_leaf RPC handlers
+        # running on the event loop thread.  Without this lock, an
+        # operator CLI transfer could read the same _next_leaf value
+        # that the block producer is about to consume — two WOTS+
+        # signatures at the same leaf mathematically reveal the private
+        # key, so the lock is a correctness guard, not an optimization.
+        import threading as _threading_wl
+        self._wallet_leaf_lock = _threading_wl.Lock()
         self.receipt_issuer = None  # ReceiptIssuer for submission receipts
         self._running = False
 
@@ -1340,6 +1359,13 @@ class Server(SharedRuntimeMixin):
                 lambda x: self._handle_task_exception("connect_to_peer(seed)", x)
             )
 
+        # Peer maintenance: re-dial dropped seeds.  Without this, a
+        # dead seed connection never heals and the node stays solo.
+        t = asyncio.create_task(self._peer_maintenance_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("peer_maintenance_loop", x)
+        )
+
         # Start block production
         t = asyncio.create_task(self._block_production_loop())
         t.add_done_callback(
@@ -1488,6 +1514,14 @@ class Server(SharedRuntimeMixin):
             writer.write(struct.pack(">I", len(resp_bytes)))
             writer.write(resp_bytes)
             await writer.drain()
+        except asyncio.IncompleteReadError as e:
+            # A client (or TCP health probe) closed the connection
+            # before sending the full 4-byte length prefix — benign
+            # and expected on GCE where the load balancer dials then
+            # immediately closes.  Demoted to DEBUG so the journal
+            # stays readable during incident triage.  Mid-body
+            # IncompleteRead is still DEBUG for the same reason.
+            logger.debug(f"RPC client closed early: {e}")
         except Exception as e:
             logger.error(f"RPC error: {e}")
         finally:
@@ -1640,6 +1674,9 @@ class Server(SharedRuntimeMixin):
 
         elif method == "submit_transfer":
             return self._rpc_submit_transfer(request["params"])
+
+        elif method == "reserve_leaf":
+            return self._rpc_reserve_leaf(request["params"])
 
         elif method == "submit_proposal":
             return self._rpc_submit_proposal(request["params"])
@@ -2538,6 +2575,88 @@ class Server(SharedRuntimeMixin):
         }
         return {"ok": True, "result": result}
 
+    def _rpc_reserve_leaf(self, params: dict) -> dict:
+        """Atomically reserve the next WOTS+ leaf for a co-resident signer.
+
+        Co-resident operator flow:
+          1. CLI (cmd_transfer / cmd_stake) runs on the same host as the
+             validator daemon and signs with the same entity the daemon
+             block-signs with.
+          2. CLI calls reserve_leaf before signing.
+          3. Server picks `leaf = max(in-memory _next_leaf, chain watermark)`,
+             advances its in-memory _next_leaf to leaf+1 (and persists the
+             leaf index if a path is wired), returns leaf.
+          4. CLI signs at leaf; submits tx via the usual RPC path.
+          5. The daemon's next block sign will NOT collide — its own
+             _next_leaf was already bumped past `leaf` in step 3.
+
+        If the caller's entity_id doesn't match this daemon's wallet,
+        no reservation is possible — we return the current chain
+        watermark as a hint so the caller can still use the legacy
+        watermark-only path (off-host signers never had coordination
+        and this RPC doesn't regress them).
+
+        Returns {'leaf_index': int, 'reserved': bool} where `reserved`
+        is True iff the daemon actually advanced its counter.
+        """
+        entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
+        if entity_id is None:
+            return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
+
+        chain_watermark = self.blockchain.get_leaf_watermark(entity_id)
+
+        # Off-host / third-party signer case: we don't hold their keypair,
+        # so we cannot burn a leaf on their behalf.  Return the watermark
+        # as a hint and let the caller fall back to legacy semantics.
+        if (
+            self.wallet_entity is None
+            or self.wallet_id is None
+            or entity_id != self.wallet_id
+        ):
+            return {
+                "ok": True,
+                "result": {
+                    "leaf_index": chain_watermark,
+                    "reserved": False,
+                },
+            }
+
+        # Co-resident signer: serialize with block production via the
+        # shared lock.  max() takes the later of (our in-memory counter,
+        # chain-visible watermark) so a CLI tx signed at leaf L that is
+        # still in the mempool — not yet folded into the chain watermark
+        # but already persisted to _next_leaf via this RPC — won't be
+        # handed out again to a second concurrent reserve_leaf caller.
+        with self._wallet_leaf_lock:
+            kp = self.wallet_entity.keypair
+            leaf = max(kp._next_leaf, chain_watermark)
+            if leaf >= kp.num_leaves:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"WOTS+ tree exhausted (leaf {leaf} >= "
+                        f"{kp.num_leaves}).  Rotate the key before signing."
+                    ),
+                }
+            try:
+                kp.advance_to_leaf(leaf + 1)
+                # Persist the advance so a crash-reboot skips the reserved
+                # leaf even if the caller never submits the tx.  Burning a
+                # leaf without a corresponding sign is cheap; reusing one
+                # is catastrophic.
+                if kp.leaf_index_path is not None:
+                    kp.persist_leaf_index(kp.leaf_index_path)
+            except Exception as e:
+                return {"ok": False, "error": sanitize_error(str(e))}
+
+        return {
+            "ok": True,
+            "result": {
+                "leaf_index": leaf,
+                "reserved": True,
+            },
+        }
+
     def _rpc_submit_transfer(self, params: dict) -> dict:
         """Accept a signed transfer transaction from a client."""
         try:
@@ -2578,9 +2697,23 @@ class Server(SharedRuntimeMixin):
         entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
         if entity_id is None:
             return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
-        if entity_id not in self.blockchain.public_keys:
+        pubkey_registered = entity_id in self.blockchain.public_keys
+        balance = self.blockchain.supply.get_balance(entity_id)
+        # Receive-to-exist: an entity can hold a balance before its
+        # pubkey is installed (the pubkey is revealed by the first
+        # outgoing transfer).  Previously get_entity returned "Entity
+        # not found" for these, wrongly suggesting the balance was
+        # lost (observed 2026-04-24 mainnet smoke test).  Now return
+        # the partial info with pubkey_registered=False so operators
+        # and integrators can distinguish "has balance but key not
+        # yet revealed" from "truly unknown entity".  The ok=False
+        # path is preserved for the truly-unknown case, so existing
+        # not-found checks keep working.
+        if not pubkey_registered and balance == 0:
             return {"ok": False, "error": "Entity not found"}
-        return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}
+        result = self.blockchain.get_entity_stats(entity_id)
+        result["pubkey_registered"] = pubkey_registered
+        return {"ok": True, "result": result}
 
     def _rpc_get_latest_release(self, params: dict) -> dict:
         """Return the current on-chain release manifest, if any.
@@ -2831,15 +2964,20 @@ class Server(SharedRuntimeMixin):
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
 
-        block = self.blockchain.propose_block(
-            self.consensus, self.wallet_entity, txs,
-            transfer_transactions=transfer_txs,
-            slash_transactions=slash_txs,
-            authority_txs=authority_txs,
-            stake_transactions=stake_txs,
-            unstake_transactions=unstake_txs,
-            governance_txs=governance_txs,
-        )
+        # Serialize block sign with reserve_leaf RPC via the same lock
+        # — see _rpc_reserve_leaf / self._wallet_leaf_lock for the full
+        # rationale.  Without this, an operator CLI running on the same
+        # host can race the block producer for the same _next_leaf.
+        with self._wallet_leaf_lock:
+            block = self.blockchain.propose_block(
+                self.consensus, self.wallet_entity, txs,
+                transfer_transactions=transfer_txs,
+                slash_transactions=slash_txs,
+                authority_txs=authority_txs,
+                stake_transactions=stake_txs,
+                unstake_transactions=unstake_txs,
+                governance_txs=governance_txs,
+            )
 
         success, reason = self.blockchain.add_block(block)
         if success:
@@ -2959,6 +3097,11 @@ class Server(SharedRuntimeMixin):
             writer.close()
             return
 
+        # Symmetric with outbound: enable SO_KEEPALIVE on the accepted
+        # socket so the server notices silent idle drops (GCP VPC
+        # cross-zone NAT) without waiting for PEER_READ_TIMEOUT.
+        enable_tcp_keepalive(writer)
+
         # "tls" iff asyncio.start_server was bound with an SSLContext —
         # writer's extra_info carries the negotiated session.  Honest
         # observability; matches the pattern in network/node.py.
@@ -2995,6 +3138,11 @@ class Server(SharedRuntimeMixin):
             )
         finally:
             peer.is_connected = False
+            # Evict the Peer entry so reconnects from the same remote
+            # on a fresh ephemeral port don't accumulate as zombies.
+            # The HANDSHAKE handler keyed this peer by peer.address; if
+            # the handshake never completed, there's nothing to remove.
+            self.peers.pop(peer.address, None)
             self.rate_limiter.remove_peer(address)
             writer.close()
 
@@ -3002,9 +3150,15 @@ class Server(SharedRuntimeMixin):
         addr = f"{host}:{port}"
         if addr in self.peers and self.peers[addr].is_connected:
             return
+        # Dedup concurrent dials: a second call while the first is
+        # still inside asyncio.open_connection must no-op, or the
+        # seed loop and the maintenance tick produce duplicate sockets.
+        if addr in self._connecting:
+            return
         if self.ban_manager.is_banned(addr):
             logger.debug(f"Skipping banned peer {addr}")
             return
+        self._connecting.add(addr)
         # Match the listener's TLS setting on the outbound side.  Both
         # peers of a TLS-enabled connection must negotiate TLS or the
         # handshake fails — this is the outbound half of the fix at
@@ -3016,11 +3170,18 @@ class Server(SharedRuntimeMixin):
             if getattr(_cfg, "P2P_TLS_ENABLED", True)
             else None
         )
+        peer = None
+        writer = None
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=client_ssl),
                 timeout=HANDSHAKE_TIMEOUT,
             )
+            # SO_KEEPALIVE keeps cross-zone GCP VPC NAT mappings alive
+            # and surfaces dead sockets in ~2 min instead of hanging on
+            # readexactly until PEER_READ_TIMEOUT (5 min).  Paired with
+            # the maintenance loop, dropped seed links self-heal.
+            enable_tcp_keepalive(writer)
             conn_type = self._next_connection_type()
             transport = "tls" if client_ssl is not None else "plain"
             import time as _time_peer
@@ -3041,10 +3202,12 @@ class Server(SharedRuntimeMixin):
                     "chain_height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
                     "cumulative_weight": self._current_cumulative_weight(),
+                    "version": __version__,
                 },
                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
             )
             await write_message(writer, handshake)
+            peer.handshake_sent = True
             while self._running and peer.is_connected:
                 try:
                     msg = await asyncio.wait_for(read_message(reader), timeout=PEER_READ_TIMEOUT)
@@ -3058,6 +3221,60 @@ class Server(SharedRuntimeMixin):
             logger.debug(f"Peer connection timed out {addr}")
         except Exception as e:
             logger.debug(f"Peer connection failed {addr}: {e}")
+        finally:
+            # Mirror the inbound handler's cleanup: flip is_connected so
+            # the maintenance loop (and get_peers observability) see an
+            # honest state, drop the rate-limit bucket, and close the
+            # socket.  Without this, a dead outbound lingers with
+            # is_connected=True forever and blocks reconnect.
+            self._connecting.discard(addr)
+            if peer is not None:
+                peer.is_connected = False
+            # Symmetric with the inbound handler: drop the entry so
+            # the maintenance tick sees a clean slate on re-dial
+            # instead of hitting the "already in self.peers" guard
+            # against a long-dead Peer object.
+            self.peers.pop(addr, None)
+            self.rate_limiter.remove_peer(addr)
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+    async def _peer_maintenance_tick(self):
+        """Single pass of the seed-reconnect scan.  Broken out from the
+        loop so tests can exercise the logic deterministically without
+        juggling asyncio.sleep."""
+        for host, port in list(self.seed_nodes):
+            addr = f"{host}:{port}"
+            existing = self.peers.get(addr)
+            if existing is not None and existing.is_connected:
+                continue
+            if self.ban_manager.is_banned(addr):
+                continue
+            t = asyncio.create_task(self._connect_to_peer(host, port))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception(
+                    "connect_to_peer(maintenance)", x
+                )
+            )
+
+    async def _peer_maintenance_loop(self):
+        """Reconnect dropped seed peers every PEER_MAINTENANCE_INTERVAL.
+
+        Seeds are connected once at startup; without this loop, a single
+        dropped connection (silent NAT timeout, peer restart, transient
+        blip) leaves the node permanently unpeered.  Combined with the
+        finally-block cleanup in _connect_to_peer, a dead outbound now
+        flips is_connected=False and this loop re-dials on the next tick.
+        """
+        while self._running:
+            try:
+                await self._peer_maintenance_tick()
+            except Exception as e:
+                logger.debug(f"Peer maintenance tick failed: {e}")
+            await asyncio.sleep(PEER_MAINTENANCE_INTERVAL)
 
     async def _handle_p2p_message(self, msg: NetworkMessage, peer: Peer):
         peer.touch()
@@ -3096,7 +3313,7 @@ class Server(SharedRuntimeMixin):
             # tracks peer heights for sync decisions via a separate
             # path; this field is observability-only.
             peer.peer_height = peer_height
-            peer.peer_version = str(msg.payload.get("version", ""))
+            peer.peer_version = str(msg.payload.get("version", "") or "unknown")
             self.peers[peer.address] = peer
             # Track peer height AND cumulative weight for sync
             best_hash = msg.payload.get("best_block_hash", "")
@@ -3117,6 +3334,41 @@ class Server(SharedRuntimeMixin):
                     lambda x: self._handle_task_exception("syncer.start_sync", x)
                 )
 
+            # Echo our HANDSHAKE back to an inbound peer so its Peer
+            # record can populate entity/height/version. The sync path
+            # only needs the one-way HANDSHAKE (update_peer_height above),
+            # but without the echo the CLI on the dialer side shows
+            # Entity=(none) / Height=0 / Version=unknown forever.
+            # handshake_sent guards against re-echo on reconnect.
+            if (
+                getattr(peer, "direction", "inbound") == "inbound"
+                and not getattr(peer, "handshake_sent", False)
+            ):
+                latest_local = self.blockchain.get_latest_block()
+                reply = NetworkMessage(
+                    msg_type=MessageType.HANDSHAKE,
+                    payload={
+                        "port": self.p2p_port,
+                        "chain_height": self.blockchain.height,
+                        "best_block_hash": (
+                            latest_local.block_hash.hex() if latest_local else ""
+                        ),
+                        "cumulative_weight": self._current_cumulative_weight(),
+                        "version": __version__,
+                    },
+                    sender_id=self.wallet_id.hex() if self.wallet_id else "",
+                )
+                try:
+                    await write_message(peer.writer, reply)
+                    try:
+                        peer.handshake_sent = True
+                    except AttributeError:
+                        pass
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to echo handshake to {peer.address}: {e}"
+                    )
+
         elif msg.msg_type == MessageType.INV:
             await self._handle_inv(msg.payload, peer)
 
@@ -3124,8 +3376,23 @@ class Server(SharedRuntimeMixin):
             await self._handle_getdata(msg.payload, peer)
 
         elif msg.msg_type == MessageType.ANNOUNCE_TX:
+            # ANNOUNCE_TX carries either a MessageTransaction payload or
+            # a TransferTransaction payload — both land in the shared
+            # mempool and both are legitimate gossip targets.  Pre-fix,
+            # this handler only deserialized MessageTransaction, so a
+            # transfer announced by an off-host submitter (CLI on a peer
+            # node) failed to parse, got scored as invalid_tx_data, and
+            # never reached the block producer's mempool.  Dispatch on
+            # the `type` discriminator that TransferTransaction.serialize
+            # writes into the dict.
+            payload = msg.payload
+            tx_type = payload.get("type") if isinstance(payload, dict) else None
+            is_transfer = tx_type == "transfer"
             try:
-                tx = MessageTransaction.deserialize(msg.payload)
+                if is_transfer:
+                    tx = TransferTransaction.deserialize(payload)
+                else:
+                    tx = MessageTransaction.deserialize(payload)
             except Exception:
                 self.ban_manager.record_offense(
                     address, OFFENSE_PROTOCOL_VIOLATION, "invalid_tx_data"
@@ -3135,9 +3402,18 @@ class Server(SharedRuntimeMixin):
             if tx_hash_hex in self._seen_txs:
                 return
             pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
-            valid, reason = self.blockchain.validate_transaction(
-                tx, expected_nonce=pending_nonce,
-            )
+            # Route validation through the type-specific validator —
+            # validate_transaction only understands MessageTransaction
+            # and will reject transfers for structural reasons that
+            # would look like malice (missing fields, etc.).
+            if is_transfer:
+                valid, reason = self.blockchain.validate_transfer_transaction(
+                    tx, expected_nonce=pending_nonce,
+                )
+            else:
+                valid, reason = self.blockchain.validate_transaction(
+                    tx, expected_nonce=pending_nonce,
+                )
             if valid:
                 self._track_seen_tx(tx_hash_hex)
                 # Record arrival height - see _rpc_submit_transaction for rationale.
@@ -3705,6 +3981,39 @@ class Server(SharedRuntimeMixin):
 
 
 async def run(args):
+    # Binary-out-of-date halt handler.  Installed as an asyncio loop-level
+    # exception hook so BinaryOutOfDateError raised from any task (P2P
+    # receive, block production, sync, orphan-retry) terminates the
+    # process with a single clear message instead of being silently logged
+    # as "Task exception was never retrieved" and leaving the validator
+    # spinning in a half-alive state.  Uses os._exit(42) to bypass the
+    # asyncio cleanup dance -- the validator is deliberately being killed
+    # because it can no longer validate incoming blocks; a graceful
+    # shutdown would try to process more blocks on the way out, which is
+    # the exact thing we're trying to stop.
+    from messagechain.core.blockchain import BinaryOutOfDateError
+    def _binary_version_exception_handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, BinaryOutOfDateError):
+            import os as _os, sys as _sys
+            msg = str(exc)
+            _sys.stderr.write("=" * 72 + "\n")
+            _sys.stderr.write("BINARY OUT OF DATE -- HALTING\n")
+            _sys.stderr.write(msg + "\n")
+            _sys.stderr.write("=" * 72 + "\n")
+            _sys.stderr.flush()
+            logger.critical("BINARY OUT OF DATE: %s", msg)
+            for h in list(logger.handlers):
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            _os._exit(42)
+        loop.default_exception_handler(context)
+    asyncio.get_running_loop().set_exception_handler(
+        _binary_version_exception_handler,
+    )
+
     seed_nodes = []
     if args.seed:
         for s in args.seed:
@@ -3907,6 +4216,21 @@ async def run(args):
             args.submission_bind, args.submission_port,
         )
 
+    public_feed_server = None
+    if args.public_feed_port is not None:
+        from messagechain.network.public_feed_server import PublicFeedServer
+
+        public_feed_server = PublicFeedServer(
+            blockchain=server.blockchain,
+            port=args.public_feed_port,
+            bind=args.public_feed_bind,
+        )
+        public_feed_server.start()
+        logger.info(
+            "Public feed active on http://%s:%d/  (front with Caddy/Cloudflare for TLS)",
+            args.public_feed_bind, args.public_feed_port,
+        )
+
     # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run
     # the same cleanup path as Ctrl-C.  Without this, Python's default
     # SIGTERM action is immediate exit — server.stop() never runs, the
@@ -3940,6 +4264,8 @@ async def run(args):
     logger.info("Shutting down")
     if submission_server is not None:
         submission_server.stop()
+    if public_feed_server is not None:
+        public_feed_server.stop()
     await server.stop()
 
 
@@ -3992,6 +4318,25 @@ def main():
         help="Bind address for the submission server (default: 0.0.0.0 — "
              "this endpoint is intentionally public).",
     )
+    # --- Public read-only feed (opt-in) ---
+    # Off by default.  Set --public-feed-port (typ. 8080) to expose a
+    # GET-only HTTP endpoint serving recent on-chain messages plus a
+    # bundled HTML viewer.  Plain HTTP — operators should front this
+    # with Caddy/Cloudflare for TLS.  See
+    # messagechain/network/public_feed_server.py.
+    parser.add_argument(
+        "--public-feed-port", type=int, default=None,
+        help="If set, start a public read-only HTTP feed on this port "
+             "serving GET /v1/latest (newest messages), GET /v1/info "
+             "(chain height), and GET / (bundled HTML viewer). Plain "
+             "HTTP — front with Caddy/Cloudflare for TLS.",
+    )
+    parser.add_argument(
+        "--public-feed-bind", type=str, default="127.0.0.1",
+        help="Bind address for the public feed (default: 127.0.0.1). "
+             "Typically bound to localhost and fronted by a reverse proxy; "
+             "use 0.0.0.0 only if exposing directly to the public internet.",
+    )
     args = parser.parse_args()
 
     if args.submission_port is not None:
@@ -4032,7 +4377,24 @@ def main():
         FEE_INCLUDES_SIGNATURE_HEIGHT,
     )
 
-    asyncio.run(run(args))
+    # Binary-out-of-date halt gate.  The loop-level hook inside `run()`
+    # handles the common path (BinaryOutOfDateError raised from an
+    # asyncio task -- e.g., P2P receive or block production).  This
+    # outer try/except is the backstop for the rarer case where it
+    # fires synchronously, outside of any task (e.g., startup chain
+    # replay from disk).  Both paths exit non-zero with code 42 so the
+    # operator + systemd see the same halt signal.
+    from messagechain.core.blockchain import BinaryOutOfDateError
+    try:
+        asyncio.run(run(args))
+    except BinaryOutOfDateError as e:
+        sys.stderr.write("=" * 72 + "\n")
+        sys.stderr.write("BINARY OUT OF DATE -- HALTING\n")
+        sys.stderr.write(str(e) + "\n")
+        sys.stderr.write("=" * 72 + "\n")
+        sys.stderr.flush()
+        logger.critical("BINARY OUT OF DATE: %s", str(e))
+        sys.exit(42)
 
 
 if __name__ == "__main__":

@@ -35,10 +35,11 @@ from tests import register_entity_for_test
 class _Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # tree_height=6 → 64 leaves; enough headroom for tests that
-        # build blocks of 30+ transfers from the same entity.
+        # tree_height=5 → 32 leaves.  The heaviest test signs 16 txs
+        # per setUp (test_mixed_11_new_5_existing_rejected), and setUp
+        # resets _next_leaf=0 between tests, so 32 leaves is ample.
         cls.alice = Entity.create(
-            b"alice-cap-test".ljust(32, b"\x00"), tree_height=6,
+            b"alice-cap-test".ljust(32, b"\x00"), tree_height=5,
         )
 
     def setUp(self):
@@ -118,8 +119,10 @@ class TestMaxNewAccountsEnforcement(_Base):
         count = MAX_NEW_ACCOUNTS_PER_BLOCK + 1
         existing = []
         for i in range(count):
+            # Recipients are never signed — tree_height=1 keeps keygen cheap.
             e = Entity.create(
                 (f"existing-{i}-cap").encode().ljust(32, b"\x00"),
+                tree_height=1,
             )
             e.keypair._next_leaf = 0
             register_entity_for_test(self.chain, e)
@@ -145,7 +148,8 @@ class TestMaxNewAccountsEnforcement(_Base):
         """
         existing = []
         for i in range(5):
-            e = Entity.create((f"mix-exist-{i}").encode().ljust(32, b"\x00"))
+            e = Entity.create((f"mix-exist-{i}").encode().ljust(32, b"\x00"),
+                              tree_height=1)
             e.keypair._next_leaf = 0
             register_entity_for_test(self.chain, e)
             self.chain.supply.balances[e.entity_id] = 10
@@ -176,7 +180,8 @@ class TestMaxNewAccountsEnforcement(_Base):
         """11 new + 5 existing = 11 new accounts → rejected (over cap)."""
         existing = []
         for i in range(5):
-            e = Entity.create((f"mixE-exist-{i}").encode().ljust(32, b"\x00"))
+            e = Entity.create((f"mixE-exist-{i}").encode().ljust(32, b"\x00"),
+                              tree_height=1)
             e.keypair._next_leaf = 0
             register_entity_for_test(self.chain, e)
             self.chain.supply.balances[e.entity_id] = 10
