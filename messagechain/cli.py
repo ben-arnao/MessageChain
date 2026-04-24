@@ -1779,7 +1779,19 @@ def cmd_unstake(args):
     print("=== Unstake Tokens ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    # Mirror cmd_stake / cmd_transfer: when --data-dir points at a
+    # running validator's data_dir, reuse the daemon's cached WOTS+
+    # keypair instead of regenerating the Merkle tree from scratch
+    # (~20-30 min on production tree_height=16/20 wallets; observed to
+    # wedge a CLI invocation for 10+ min on an e2-small mainnet node).
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nUnstaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
