@@ -4785,7 +4785,7 @@ class Blockchain:
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
         mempool_tx_hashes: list[bytes] | None = None,
-        acks_observed_this_block: list[bytes] | None = None,
+        acks_observed_this_block: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -4885,21 +4885,32 @@ class Blockchain:
         if acks_observed_this_block is None:
             acks_observed_this_block = self._derive_observed_acks_for_block()
         else:
-            # Caller-supplied list — apply the same canonical-form rules
-            # (sort + dedupe + cap) so a wired-in list stays valid even
-            # if the caller didn't pre-sort.  Length validation and
-            # 32-byte shape are enforced at validate_block; we still
-            # truncate here so a benign over-long list doesn't get the
-            # block rejected on the proposer's own side.
+            # Caller-supplied list of SubmissionAck objects -- apply
+            # the same canonical-form rules (dedupe by request_hash +
+            # sort by request_hash + cap) so a wired-in list stays
+            # valid.  Full verification (signature + root binding)
+            # is enforced at validate_block; we still truncate here
+            # so a benign over-long list doesn't get the block
+            # rejected on the proposer's own side.
             from messagechain.config import MAX_ACKS_PER_BLOCK as _MAX_ACK
-            seen: set[bytes] = set()
-            filtered: list[bytes] = []
-            for rh in acks_observed_this_block:
-                if rh in seen:
+            from messagechain.consensus.witness_submission import (
+                SubmissionAck as _SubmissionAck,
+            )
+            seen_rh: set[bytes] = set()
+            filtered: list = []
+            for ack in acks_observed_this_block:
+                if not isinstance(ack, _SubmissionAck):
+                    raise TypeError(
+                        "acks_observed_this_block entries must be "
+                        f"SubmissionAck objects, got {type(ack).__name__}"
+                    )
+                if ack.request_hash in seen_rh:
                     continue
-                seen.add(rh)
-                filtered.append(bytes(rh))
-            acks_observed_this_block = sorted(filtered)[:_MAX_ACK]
+                seen_rh.add(ack.request_hash)
+                filtered.append(ack)
+            acks_observed_this_block = sorted(
+                filtered, key=lambda a: a.request_hash,
+            )[:_MAX_ACK]
         return consensus.create_block(
             proposer_entity, transactions, prev,
             state_root=state_root, attestations=attestations,
@@ -4919,19 +4930,19 @@ class Blockchain:
             acks_observed_this_block=acks_observed_this_block,
         )
 
-    def _derive_observed_acks_for_block(self) -> list[bytes]:
+    def _derive_observed_acks_for_block(self) -> list:
         """Read the local witness_observation_store (if attached) and
-        return up to MAX_ACKS_PER_BLOCK request_hashes whose acks the
-        proposer has observed but the chain has not yet recorded.
+        return up to MAX_ACKS_PER_BLOCK full ``SubmissionAck`` objects
+        the proposer has observed but the chain has not yet recorded.
 
-        Sort key: oldest ack_height first (so a long-running proposer
-        catches up on backlog before fresh acks).  The returned list
-        is then re-sorted into canonical wire order (raw-bytes
-        ascending) so the on-chain commitment is deterministic
-        regardless of the underlying observation order.
+        Sort key: oldest commit_height first (so a long-running
+        proposer catches up on backlog before fresh acks).  The
+        returned list is re-sorted into canonical wire order
+        (request_hash ascending) so the on-chain commitment is
+        deterministic regardless of the underlying observation order.
 
         Returns an empty list when the proposer has no store attached
-        — typical for tests that don't wire one in.
+        -- typical for tests that don't wire one in.
         """
         from messagechain.config import MAX_ACKS_PER_BLOCK as _MAX_ACK
         store = getattr(self, "witness_observation_store", None)
@@ -4940,18 +4951,18 @@ class Blockchain:
         try:
             entries = store.list_acks()
         except AttributeError:
-            # Older store implementation without list_acks — degrade
+            # Older store implementation without list_acks -- degrade
             # gracefully to "no acks this block".
             return []
-        candidates: list[bytes] = []
-        for rh, _ack_h in entries:
-            if rh in self.witness_ack_registry:
+        candidates: list = []
+        for ack in entries:
+            if ack.request_hash in self.witness_ack_registry:
                 continue  # chain already knows; don't re-embed
-            candidates.append(bytes(rh))
+            candidates.append(ack)
             if len(candidates) >= _MAX_ACK:
                 break
-        # Canonical wire order: raw-bytes ascending.
-        return sorted(candidates)
+        # Canonical wire order: request_hash ascending.
+        return sorted(candidates, key=lambda a: a.request_hash)
 
     def _compute_snapshot_root_live(self) -> bytes:
         """Snapshot-root commitment over the current live chain state.
@@ -5520,17 +5531,36 @@ class Blockchain:
         self, block: Block,
     ) -> tuple[bool, str]:
         """Validate `block.acks_observed_this_block` against the
-        canonical-form rules.
+        canonical-form rules AND prove each entry.
 
         Soft-vote semantics: the validator does NOT need to have
-        observed the same acks locally — proposer mempool views are
-        subjective.  The block remains VALID even if a request_hash
-        appears here that has no corresponding outstanding
-        obligation in chain state.  We only enforce the wire-format
-        rules: shape (32 bytes), order (sorted ascending), no
-        duplicates, and the per-block count cap.
+        observed the same acks locally -- proposer mempool views are
+        subjective, and a MISSING ack for an obligation does not
+        invalidate a block.
+
+        Hard-vote semantics on the POSITIVE side (the fix for the
+        ack-forgery exploit): every listed entry MUST be a fully
+        signed ``SubmissionAck`` whose signature verifies under the
+        target validator's chain-registered
+        ``receipt_subtree_roots[ack.issuer_id]``.  Without this
+        cryptographic proof, a colluding proposer could forge
+        ``witness_ack_registry`` entries for any gossip-visible
+        request_hash -- defeating the non-response slashing path
+        and shielding silent-drop censors (the primary threat model).
+
+        Enforced here:
+          * per-block count cap
+          * sorted ascending by request_hash (canonical order)
+          * no duplicate request_hash
+          * each entry is a SubmissionAck whose stateless verify
+            passes AND whose issuer_root_public_key matches the
+            chain's currently-registered receipt-subtree root for
+            ack.issuer_id
         """
         from messagechain.config import MAX_ACKS_PER_BLOCK
+        from messagechain.consensus.witness_submission import (
+            SubmissionAck, verify_submission_ack,
+        )
         acks = getattr(block, "acks_observed_this_block", None) or []
         if not acks:
             return True, "no acks observed"
@@ -5539,30 +5569,60 @@ class Blockchain:
                 f"Too many acks_observed_this_block entries: "
                 f"{len(acks)} > MAX_ACKS_PER_BLOCK={MAX_ACKS_PER_BLOCK}"
             )
-        prev: bytes | None = None
-        for rh in acks:
-            if not isinstance(rh, (bytes, bytearray)):
+        prev_rh: bytes | None = None
+        for ack in acks:
+            if not isinstance(ack, SubmissionAck):
                 return False, (
-                    "acks_observed_this_block entry must be bytes, "
-                    f"got {type(rh).__name__}"
+                    "acks_observed_this_block entry must be "
+                    f"SubmissionAck, got {type(ack).__name__}"
                 )
+            rh = ack.request_hash
             if len(rh) != 32:
                 return False, (
-                    "acks_observed_this_block entry must be 32 bytes, "
-                    f"got {len(rh)}"
+                    "acks_observed_this_block entry request_hash "
+                    f"must be 32 bytes, got {len(rh)}"
                 )
-            if prev is not None:
-                if rh == prev:
+            if prev_rh is not None:
+                if rh == prev_rh:
                     return False, (
                         "duplicate request_hash in "
                         f"acks_observed_this_block: {rh.hex()[:16]}"
                     )
-                if rh < prev:
+                if rh < prev_rh:
                     return False, (
                         "acks_observed_this_block must be sorted "
-                        "ascending by raw bytes"
+                        "ascending by request_hash"
                     )
-            prev = bytes(rh)
+            prev_rh = bytes(rh)
+            # Stateless crypto + structural check.
+            ok, reason = verify_submission_ack(ack)
+            if not ok:
+                return False, (
+                    f"acks_observed_this_block entry request_hash "
+                    f"{rh.hex()[:16]} fails ack verify: {reason}"
+                )
+            # Bind the ack to the chain's currently-registered receipt
+            # subtree root for the issuer.  An ack signed under an
+            # obsolete or attacker-chosen root must NOT credit the
+            # issuer.  Without this binding, a compromised validator
+            # could pre-sign discharge acks under a throwaway root and
+            # inject them via a colluding proposer to forge witness_ack
+            # registry entries.
+            registered = self.receipt_subtree_roots.get(ack.issuer_id)
+            if registered is None:
+                return False, (
+                    "acks_observed_this_block entry from issuer "
+                    f"{ack.issuer_id.hex()[:16]} has no registered "
+                    "receipt_subtree_root -- issuer must call "
+                    "SetReceiptSubtreeRoot before any of their acks "
+                    "are admissible here"
+                )
+            if registered != ack.issuer_root_public_key:
+                return False, (
+                    "acks_observed_this_block entry issuer_root_public_key "
+                    "does not match chain-registered receipt_subtree_root "
+                    f"for issuer {ack.issuer_id.hex()[:16]}"
+                )
         return True, "ok"
 
     def validate_block(self, block: Block) -> tuple[bool, str]:
@@ -8308,9 +8368,16 @@ class Blockchain:
         # `validate_non_response_evidence_tx`).  First-write wins —
         # an earlier block's ack_height stays authoritative.
         block_acks = getattr(block, "acks_observed_this_block", None) or []
-        for rh in block_acks:
+        for ack in block_acks:
+            rh = ack.request_hash
             if rh not in self.witness_ack_registry:
-                self.witness_ack_registry[rh] = block.header.block_number
+                # Record the ack's OWN commit_height (committed in the
+                # signed payload, so the issuer cannot lie about when
+                # they dispatched the ack).  Using block.header.
+                # block_number here would have let a colluding
+                # proposer shift the recorded discharge height
+                # arbitrarily, even though the ack signature is valid.
+                self.witness_ack_registry[rh] = int(ack.commit_height)
         # Prune entries older than
         # WITNESS_OBSERVATION_RETENTION_BLOCKS + WITNESS_RESPONSE_DEADLINE_BLOCKS
         # — anything beyond that window is past evidence-assembly

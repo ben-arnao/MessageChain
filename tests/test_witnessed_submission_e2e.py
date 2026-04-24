@@ -338,12 +338,32 @@ class TestEndToEndSilentDrop(unittest.TestCase):
     def test_responsive_validator_no_evidence_assembled(self):
         """If the validator publishes an ack, the WitnessObservationStore
         marks the obligation discharged and no evidence is signed."""
+        from messagechain.consensus.witness_submission import (
+            SubmissionAck, ACK_ADMITTED,
+        )
+        from messagechain.crypto.keys import Signature
         req = self._signed_request(nonce_seed=b"\x10")
         store = WitnessObservationStore()
         observed_height = 0
         store.record_request(req.request_hash, observed_height)
         # Validator publishes an ack at height 3 — within deadline.
-        store.record_ack(req.request_hash, 3)
+        # Build a properly-signed ack so record_ack accepts it.
+        target_kp = KeyPair.generate(
+            seed=b"receipt-subtree-responsive-target", height=4,
+        )
+        ack = SubmissionAck(
+            request_hash=req.request_hash,
+            issuer_id=self.target.entity_id,
+            issuer_root_public_key=target_kp.public_key,
+            action_code=ACK_ADMITTED,
+            commit_height=3,
+            signature=Signature([], 0, [], b"", b""),
+        )
+        import hashlib as _hl
+        msg_hash = _hl.new(HASH_ALGO, ack._signable_data()).digest()
+        ack.signature = target_kp.sign(msg_hash)
+        ack.ack_hash = ack._compute_hash()
+        store.record_ack(ack)
 
         current_height = WITNESS_RESPONSE_DEADLINE_BLOCKS + 5
         overdue = store.is_overdue(

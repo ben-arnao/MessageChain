@@ -687,7 +687,14 @@ class WitnessObservationStore:
         from threading import Lock
         self._lock = Lock()
         self._observations: dict[bytes, int] = {}  # request_hash -> observed_height
-        self._acks: dict[bytes, int] = {}          # request_hash -> ack_height
+        # request_hash -> SubmissionAck.  Storing the FULL signed ack
+        # (not just the commit_height) lets a block proposer embed the
+        # signed payload in ``acks_observed_this_block`` -- required so
+        # the consensus-level validator can verify the ack under the
+        # target validator's registered receipt-subtree root, closing
+        # the forgery vector where any gossip-visible request_hash
+        # could be echoed into the registry without a signature.
+        self._acks: dict[bytes, "SubmissionAck"] = {}
         self._max_entries = int(max_entries)
 
     def record_request(self, request_hash: bytes, observed_height: int) -> None:
@@ -714,21 +721,34 @@ class WitnessObservationStore:
                     self._acks.pop(k, None)
             self._observations[request_hash] = int(observed_height)
 
-    def record_ack(self, request_hash: bytes, ack_height: int) -> None:
-        """Record that we saw an ack for `request_hash` at `ack_height`.
+    def record_ack(self, ack: "SubmissionAck") -> None:
+        """Record a witnessed SubmissionAck.
 
-        First-write wins.  An ack discharges the obligation regardless
-        of whether the observation has been recorded yet — a
-        well-connected peer that sees the ack before the request still
-        marks the request done so a later-arriving observation is
+        First-write wins.  The full ``SubmissionAck`` is stored (not
+        just the commit_height) so a block proposer can later embed
+        the signed payload into ``Block.acks_observed_this_block``
+        -- the consensus layer verifies each entry's signature under
+        the issuer's registered receipt-subtree root, which is the
+        only defense against a colluding proposer forging registry
+        entries from publicly-gossiped request_hashes.
+
+        A well-connected peer that sees the ack before the request
+        still marks it here so a later-arriving observation is
         immediately discharged.
         """
-        if len(request_hash) != 32:
+        if not isinstance(ack, SubmissionAck):
+            raise TypeError(
+                f"record_ack now requires a SubmissionAck, got "
+                f"{type(ack).__name__}; pre-signature fix callers must "
+                "pass the full signed ack so consensus-layer verification "
+                "can succeed"
+            )
+        if len(ack.request_hash) != 32:
             raise ValueError("request_hash must be 32 bytes")
         with self._lock:
-            if request_hash in self._acks:
+            if ack.request_hash in self._acks:
                 return
-            self._acks[request_hash] = int(ack_height)
+            self._acks[ack.request_hash] = ack
 
     def has_ack(self, request_hash: bytes) -> bool:
         with self._lock:
@@ -739,6 +759,11 @@ class WitnessObservationStore:
             return self._observations.get(request_hash)
 
     def get_ack_height(self, request_hash: bytes) -> Optional[int]:
+        with self._lock:
+            ack = self._acks.get(request_hash)
+            return int(ack.commit_height) if ack is not None else None
+
+    def get_ack(self, request_hash: bytes) -> Optional["SubmissionAck"]:
         with self._lock:
             return self._acks.get(request_hash)
 
@@ -775,8 +800,8 @@ class WitnessObservationStore:
                 if h < cutoff:
                     del self._observations[k]
                     dropped += 1
-            for k, h in list(self._acks.items()):
-                if h < cutoff:
+            for k, ack in list(self._acks.items()):
+                if int(ack.commit_height) < cutoff:
                     del self._acks[k]
                     dropped += 1
         return dropped
@@ -786,17 +811,20 @@ class WitnessObservationStore:
         with self._lock:
             return (len(self._observations), len(self._acks))
 
-    def list_acks(self) -> list[tuple[bytes, int]]:
-        """Snapshot the (request_hash, ack_height) entries currently
-        in the ack table.
+    def list_acks(self) -> list["SubmissionAck"]:
+        """Snapshot the SubmissionAck entries currently in the ack table.
 
-        Returned entries are sorted by ack_height ascending so a
-        block-proposer can take the OLDEST unrecorded acks first when
-        deciding what to embed in `Block.acks_observed_this_block`.
-        Pure read; the lock is released before returning.
+        Returned entries are sorted by (commit_height, request_hash)
+        so a block-proposer takes the OLDEST unrecorded acks first
+        when deciding what to embed in
+        ``Block.acks_observed_this_block``.  Returns full
+        ``SubmissionAck`` objects so the proposer can emit signed
+        payloads that the consensus layer will verify.  Pure read;
+        the lock is released before returning.
         """
         with self._lock:
             entries = sorted(
-                self._acks.items(), key=lambda kv: (kv[1], kv[0]),
+                self._acks.values(),
+                key=lambda a: (int(a.commit_height), a.request_hash),
             )
-        return [(rh, h) for rh, h in entries]
+        return list(entries)

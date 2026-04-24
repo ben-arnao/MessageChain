@@ -104,44 +104,57 @@ def _decode_optional_inclusion_list(data: bytes, off: int):
     return lst, off
 
 
-def _encode_acks_observed(acks: list[bytes]) -> bytes:
+def _encode_acks_observed(acks: list) -> bytes:
     """Wire encoding for Block.acks_observed_this_block.
 
-    Layout: u32 count followed by N × 32-byte raw `request_hash`.  The
-    encoder writes whatever order it receives; canonical-form
-    enforcement (sorted ascending + no duplicates + length cap) lives in
-    `validate_block` so a dishonest proposer's malformed list is caught
-    at consensus time, not silently re-canonicalized.
+    Each entry is a full signed ``SubmissionAck`` so a proposer must
+    PROVE discharge (signature verifies under the target validator's
+    registered receipt-subtree root), not just claim it by echoing a
+    request_hash any gossip observer could compute.
+
+    Layout: u32 count followed by N × (u32 ack_blob_len + ack_blob).
+    Canonical-form enforcement (sort by request_hash ascending, no
+    duplicate request_hash, per-block cap) lives in ``validate_block``.
     """
     import struct as _struct
+    from messagechain.consensus.witness_submission import SubmissionAck
     out = bytearray(_struct.pack(">I", len(acks)))
-    for rh in acks:
-        if not isinstance(rh, (bytes, bytearray)):
+    for ack in acks:
+        if not isinstance(ack, SubmissionAck):
             raise TypeError(
-                f"ack entry must be bytes, got {type(rh).__name__}"
+                f"ack entry must be SubmissionAck, got {type(ack).__name__}"
             )
-        out += bytes(rh)
+        blob = ack.to_bytes()
+        out += _struct.pack(">I", len(blob))
+        out += blob
     return bytes(out)
 
 
 def _decode_acks_observed(data: bytes, off: int):
     """Inverse of _encode_acks_observed.  Returns (acks, new_off).
 
-    Strict 32-byte-per-entry decode — a malformed entry surfaces here
-    rather than letting the validator's shape check carry the load.
+    Each entry decodes as a full ``SubmissionAck`` -- the decoded ack's
+    hash integrity is verified inside SubmissionAck.from_bytes; caller
+    must still run signature + root-binding checks at validate time.
     """
     import struct as _struct
+    from messagechain.consensus.witness_submission import SubmissionAck
     if off + 4 > len(data):
         raise ValueError("Block blob truncated at acks_observed count")
     n = _struct.unpack_from(">I", data, off)[0]; off += 4
-    acks: list[bytes] = []
+    acks: list = []
     for _ in range(n):
-        if off + 32 > len(data):
+        if off + 4 > len(data):
+            raise ValueError(
+                "Block blob truncated at acks_observed entry length"
+            )
+        blob_len = _struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + blob_len > len(data):
             raise ValueError(
                 "Block blob truncated mid-acks_observed entry"
             )
-        acks.append(bytes(data[off:off + 32]))
-        off += 32
+        acks.append(SubmissionAck.from_bytes(bytes(data[off:off + blob_len])))
+        off += blob_len
     return acks, off
 
 
@@ -253,13 +266,17 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     if inclusion_list_obj is not None:
         out.append(inclusion_list_obj.list_hash)
 
-    # acks_observed_this_block: every observed `request_hash` is folded
-    # in directly so a relayer cannot strip or mutate the list without
-    # invalidating the proposer's signature (same hygiene as every
-    # other block-body type).  Append in the on-wire canonical order
-    # (sorted ascending) so two nodes building the same merkle root
-    # from the same multiset of acks land on the same value.
-    out.extend(sorted(acks_observed))
+    # acks_observed_this_block: every observed SubmissionAck contributes
+    # its ``ack_hash`` so a relayer cannot strip or mutate the list
+    # without invalidating the proposer's signature (same hygiene as
+    # every other block-body type).  Append in the on-wire canonical
+    # order (sorted by ack.request_hash ascending) so two nodes building
+    # the same merkle root from the same multiset of acks land on the
+    # same value.
+    out.extend(
+        a.ack_hash
+        for a in sorted(acks_observed, key=lambda x: x.request_hash)
+    )
 
     # Archive-proof bundle (aggregated custody commitment) — derived,
     # not read from the block's optional bundle slot, so the proposer
@@ -771,12 +788,14 @@ class Block:
         if self.inclusion_list is not None:
             result["inclusion_list"] = self.inclusion_list.serialize()
         if self.acks_observed_this_block:
-            # Hex-encoded for JSON-friendliness; the on-wire binary
-            # encoder uses raw 32-byte form.  Empty list omitted entirely
-            # so blocks without witness-ack traffic stay byte-identical
-            # to the pre-feature serialization.
+            # Each entry is a full SubmissionAck so the proposer must
+            # PROVE discharge (signature verifies under the target
+            # validator's registered receipt-subtree root).  Serialized
+            # via SubmissionAck.serialize() -- a dict shape, not raw
+            # hex, so the cross-chain wire stays self-describing.  Empty
+            # list omitted entirely.
             result["acks_observed_this_block"] = [
-                rh.hex() for rh in self.acks_observed_this_block
+                ack.serialize() for ack in self.acks_observed_this_block
             ]
         if self.archive_proof_bundle is not None:
             # Serialized as hex of canonical bytes — a scalar blob, not
@@ -1309,8 +1328,12 @@ class Block:
             )
         acks_observed_this_block = []
         if data.get("acks_observed_this_block"):
+            from messagechain.consensus.witness_submission import (
+                SubmissionAck,
+            )
             acks_observed_this_block = [
-                bytes.fromhex(rh) for rh in data["acks_observed_this_block"]
+                SubmissionAck.deserialize(d)
+                for d in data["acks_observed_this_block"]
             ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
