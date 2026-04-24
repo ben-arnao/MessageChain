@@ -60,7 +60,7 @@ else
     pip install --target /opt/messagechain messagechain
 fi
 
-echo "[4/6] Running `messagechain init`..."
+echo "[4/6] Running messagechain init..."
 python3 -m messagechain init --yes --systemd
 
 echo "[5/6] Reloading systemd daemon..."
