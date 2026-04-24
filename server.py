@@ -3124,6 +3124,11 @@ class Server(SharedRuntimeMixin):
             )
         finally:
             peer.is_connected = False
+            # Evict the Peer entry so reconnects from the same remote
+            # on a fresh ephemeral port don't accumulate as zombies.
+            # The HANDSHAKE handler keyed this peer by peer.address; if
+            # the handshake never completed, there's nothing to remove.
+            self.peers.pop(peer.address, None)
             self.rate_limiter.remove_peer(address)
             writer.close()
 
@@ -3210,6 +3215,11 @@ class Server(SharedRuntimeMixin):
             self._connecting.discard(addr)
             if peer is not None:
                 peer.is_connected = False
+            # Symmetric with the inbound handler: drop the entry so
+            # the maintenance tick sees a clean slate on re-dial
+            # instead of hitting the "already in self.peers" guard
+            # against a long-dead Peer object.
+            self.peers.pop(addr, None)
             self.rate_limiter.remove_peer(addr)
             if writer is not None:
                 try:
