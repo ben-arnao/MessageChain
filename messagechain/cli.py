@@ -185,10 +185,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Send tokens to another entity",
         description="Transfer tokens to another registered entity.",
     )
-    transfer.add_argument("--to", required=True, help="Recipient address (mc1... checksummed or raw hex)")
+    transfer.add_argument("--to", required=True, help="Recipient address (mc1... checksummed form recommended; raw hex requires --allow-raw-hex-address)")
     transfer.add_argument("--amount", type=int, required=True, help="Amount to transfer")
     transfer.add_argument("--fee", type=int, default=None, help="Transaction fee (auto-detected if omitted)")
     transfer.add_argument("--server", type=str, default=None, help="Server address host:port")
+    transfer.add_argument(
+        "--allow-raw-hex-address", action="store_true",
+        help="Allow raw 64-char hex in --to (bypasses the mc1... "
+             "checksum layer).  Required if you are not passing an "
+             "mc1... form: raw hex has no typo protection, so a "
+             "single mistyped character sends funds to an "
+             "unrecoverable address.  Prefer the mc1... form.",
+    )
 
     # --- balance ---
     balance = sub.add_parser(
@@ -1602,14 +1610,40 @@ def cmd_transfer(args):
     # having re-entered credentials.
     # Accept either the checksummed "mc1..." display form (preferred,
     # catches single-character typos offline) or the raw 64-char hex
-    # form (backward-compatible, no typo protection).
+    # form (no typo protection; opt-in via --allow-raw-hex-address).
     from messagechain.identity.address import (
         decode_address,
         InvalidAddressChecksumError,
         InvalidAddressError,
     )
+    # Gate raw-hex recipients behind an explicit flag.  The raw form
+    # has no checksum, so a single-character typo permanently sends
+    # funds to an unrecoverable address - a mainnet footgun.  A user
+    # who actually wants raw hex (scripting, integration tests) opts
+    # in and sees a clear reminder of the risk.
+    raw_to = args.to.strip()
+    looks_like_raw_hex = (
+        not raw_to.lower().startswith("mc1")
+        and len(raw_to) == 64
+        and all(c in "0123456789abcdefABCDEF" for c in raw_to)
+    )
+    if looks_like_raw_hex and not getattr(args, "allow_raw_hex_address", False):
+        print(
+            "Error: --to looks like raw 64-char hex, which has NO "
+            "typo protection.  A single mistyped character sends "
+            "funds to an unrecoverable address."
+        )
+        print(
+            "  Prefer the checksummed mc1... form - ask the recipient "
+            "for it, or run `messagechain account` to see your own."
+        )
+        print(
+            "  If you really want to send to raw hex (scripts, "
+            "integration tests), pass --allow-raw-hex-address."
+        )
+        sys.exit(2)
     try:
-        recipient_id = decode_address(args.to)
+        recipient_id = decode_address(raw_to)
     except InvalidAddressChecksumError as e:
         print(f"Error: {e}")
         print(f"  Got: {args.to}")
@@ -1619,6 +1653,13 @@ def cmd_transfer(args):
         print(f"Error: invalid recipient address - {e}")
         print(f"  Got: {args.to}")
         sys.exit(1)
+    if looks_like_raw_hex:
+        # Explicit opt-in path: remind the operator they're bypassing
+        # the checksum layer so it's visible in CI logs / transcripts.
+        print(
+            "!  Proceeding with raw-hex --to (no checksum protection).  "
+            "Verify the address character-by-character before confirming."
+        )
 
     host, port = _parse_server(args.server)
     from client import rpc_call
