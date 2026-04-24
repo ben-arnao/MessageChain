@@ -4,6 +4,27 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] — 2026-04-24
+
+Patch release — fixes a regression in the schema v1→v2 migration
+introduced alongside the six cold-restart persistence surfaces. Any
+operator running 1.1.0 and attempting `migrate-chain-db` on a chain.db
+that contains blocks referencing non-genesis entities (i.e. any live
+chain past block 0) would hit:
+
+    ValueError: entity ref uses unknown index N (state lacks mapping)
+
+and abort before stamping schema_version to 2.
+
+### Fixed
+
+- `migrate_schema_v1_to_v2` now pre-seeds the rebuilt Blockchain's
+  `entity_id_to_index` / `entity_index_to_id` maps from the v1 DB's
+  `entity_indices` table before the replay loop. Compact entity-refs
+  in persisted blocks now decode correctly through
+  `get_block_by_number`. Verified end-to-end against a live mainnet
+  v1 chain.db (183 blocks replayed cleanly).
+
 ## [1.1.0] — 2026-04-24
 
 Minor release — two sequential hard forks activate inside the bootstrap
