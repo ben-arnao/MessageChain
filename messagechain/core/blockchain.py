@@ -885,12 +885,32 @@ class Blockchain:
         for tip_hash_db, tip_num, tip_w in self.db.get_all_tips():
             self.fork_choice.add_tip(tip_hash_db, tip_num, tip_w)
 
-        # Pin a single stake snapshot at the loaded tip so ongoing
-        # finality processing after load has a correct denominator for
-        # the next block's attestations. We can't reconstruct full
-        # historical snapshots from a cold load, but the tip's snapshot
-        # is all the next block needs.
-        if self.chain:
+        # Rehydrate the per-block stake snapshots from the chaindb
+        # `stake_snapshots` table if it's present -- this carries
+        # the trailing FINALITY_VOTE_MAX_AGE_BLOCKS window of pins
+        # so `_process_finality_votes` can look up the correct 2/3
+        # denominator for any in-flight finality vote without
+        # falling through to the live-stakes branch that diverges
+        # consensus across restarted vs. uprestarted peers.
+        # Legacy chain.db files (pre-stake_snapshots-table) fall
+        # through the hasattr gate and land on the single-tip pin
+        # below, which is the old cold-start behaviour.
+        rehydrated = False
+        if hasattr(self.db, "get_all_stake_snapshots"):
+            persisted = self.db.get_all_stake_snapshots()
+            if persisted:
+                self._stake_snapshots = persisted
+                rehydrated = True
+        if not rehydrated and self.chain:
+            # Fallback: pin a single stake snapshot at the loaded
+            # tip so ongoing finality processing after load has a
+            # correct denominator for the next block's
+            # attestations.  Finality votes targeting older blocks
+            # still hit the live-stakes fallback on this path --
+            # that's the pre-persistence behaviour and is the best
+            # we can do for legacy chain.db files.  New chain.db
+            # files built under this binary always take the
+            # rehydrated path above and never land here.
             self._record_stake_snapshot(self.chain[-1].header.block_number)
 
         # Rehydrate seed_entity_ids from block 0.  This set is consensus-
@@ -5245,36 +5265,47 @@ class Blockchain:
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
 
-        Snapshots are permanent.  CLAUDE.md principle #2 (message
-        permanence & censorship resistance) applies equally to
-        consensus-critical state: a finality proof or attestation-
-        validity check that works today must still work in 100+
-        years, and that requires the stake map at every block to
-        remain reconstructible from chain state.
+        In-memory map (`self._stake_snapshots`) retains every
+        snapshot since chain start for replay fidelity; the chaindb
+        mirror (`stake_snapshots` table) is pruned to a trailing
+        ``FINALITY_VOTE_MAX_AGE_BLOCKS`` window because:
 
-        Snapshots are small — dict[entity_id_32B, int] — so the
-        per-block footprint scales with live validator-set size,
-        not chain length.  At ~500 validators with 40-byte entries
-        (32B id + 8B int + dict overhead) a snapshot is ~20 KB.
-        One block per ~12 s gives ~2.6M blocks/year, so an upper-
-        bound annual cost is ~50 GB even if the validator set is
-        saturated every single block — and in practice the set
-        churns slowly and most snapshots share structure, so this
-        is a comfortable ceiling, not a typical cost.  Relative to
-        message payloads (every on-chain message lives forever too),
-        stake snapshots are negligible.
+        * Attestations target the immediate parent (N → N-1), so
+          only the most recent pin is needed there.
+        * FinalityVotes may target a block up to
+          ``FINALITY_VOTE_MAX_AGE_BLOCKS`` slots back; anything
+          older is rejected at validation time before the consumer
+          sees it, so persisting older pins would never be read.
+        * Without the mirror, a cold-restart loses every pin
+          except the one `_load_from_db` installs at the loaded
+          tip -- FinalityVotes targeting older-than-tip blocks
+          then fall through to the `dict(self.supply.staked)`
+          live-state branch in `_process_finality_votes`, which
+          corrupts the 2/3 denominator (post-restart stake churn
+          vs. the pinned-correct pre-churn distribution) and
+          diverges the `crossed` decision vs. uprestarted peers.
 
         See `_process_attestations`: attestations in block N vote
         for block N-1, so the 2/3 denominator must be pinned to
         the stake set that existed at the attestation's target
         block, not the post-churn live set.  Finality votes
         (`_apply_finality_votes`) consult the same map for the
-        long-range-defense threshold — both callers used to have
-        "snapshot may have been pruned" fallbacks, but with
-        unbounded retention those fallbacks only fire during cold-
-        load bootstrap, never for organic traffic.
+        long-range-defense threshold.
         """
-        self._stake_snapshots[block_number] = dict(self.supply.staked)
+        stakes = dict(self.supply.staked)
+        self._stake_snapshots[block_number] = stakes
+        if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
+            self.db.add_stake_snapshot(block_number, stakes)
+            # Prune persisted rows older than the oldest block any
+            # finality vote could legally target.  In-memory map
+            # stays untouched -- callers that still hold a
+            # Blockchain instance across the activation window may
+            # want the older pins for analytics; the consensus
+            # consumers never look that far back.
+            from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
+            cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
+            if cutoff > 0:
+                self.db.prune_stake_snapshots_before(cutoff)
 
     def _validate_custody_proofs(
         self, block: Block, parent: Block,
