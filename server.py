@@ -3931,6 +3931,39 @@ class Server(SharedRuntimeMixin):
 
 
 async def run(args):
+    # Binary-out-of-date halt handler.  Installed as an asyncio loop-level
+    # exception hook so BinaryOutOfDateError raised from any task (P2P
+    # receive, block production, sync, orphan-retry) terminates the
+    # process with a single clear message instead of being silently logged
+    # as "Task exception was never retrieved" and leaving the validator
+    # spinning in a half-alive state.  Uses os._exit(42) to bypass the
+    # asyncio cleanup dance -- the validator is deliberately being killed
+    # because it can no longer validate incoming blocks; a graceful
+    # shutdown would try to process more blocks on the way out, which is
+    # the exact thing we're trying to stop.
+    from messagechain.core.blockchain import BinaryOutOfDateError
+    def _binary_version_exception_handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, BinaryOutOfDateError):
+            import os as _os, sys as _sys
+            msg = str(exc)
+            _sys.stderr.write("=" * 72 + "\n")
+            _sys.stderr.write("BINARY OUT OF DATE -- HALTING\n")
+            _sys.stderr.write(msg + "\n")
+            _sys.stderr.write("=" * 72 + "\n")
+            _sys.stderr.flush()
+            logger.critical("BINARY OUT OF DATE: %s", msg)
+            for h in list(logger.handlers):
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            _os._exit(42)
+        loop.default_exception_handler(context)
+    asyncio.get_running_loop().set_exception_handler(
+        _binary_version_exception_handler,
+    )
+
     seed_nodes = []
     if args.seed:
         for s in args.seed:
@@ -4258,7 +4291,24 @@ def main():
         FEE_INCLUDES_SIGNATURE_HEIGHT,
     )
 
-    asyncio.run(run(args))
+    # Binary-out-of-date halt gate.  The loop-level hook inside `run()`
+    # handles the common path (BinaryOutOfDateError raised from an
+    # asyncio task -- e.g., P2P receive or block production).  This
+    # outer try/except is the backstop for the rarer case where it
+    # fires synchronously, outside of any task (e.g., startup chain
+    # replay from disk).  Both paths exit non-zero with code 42 so the
+    # operator + systemd see the same halt signal.
+    from messagechain.core.blockchain import BinaryOutOfDateError
+    try:
+        asyncio.run(run(args))
+    except BinaryOutOfDateError as e:
+        sys.stderr.write("=" * 72 + "\n")
+        sys.stderr.write("BINARY OUT OF DATE -- HALTING\n")
+        sys.stderr.write(str(e) + "\n")
+        sys.stderr.write("=" * 72 + "\n")
+        sys.stderr.flush()
+        logger.critical("BINARY OUT OF DATE: %s", str(e))
+        sys.exit(42)
 
 
 if __name__ == "__main__":

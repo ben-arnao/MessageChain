@@ -301,6 +301,26 @@ def validate_block_serialization_version(version: int) -> tuple[bool, str]:
     return True, "OK"
 
 
+# Maximum block-header `version` this binary understands at the
+# consensus layer.  Distinct from BLOCK_SERIALIZATION_VERSION (wire
+# format): this is the CONSENSUS ruleset version carried inside the
+# header, and it exists specifically so an out-of-date binary can
+# HALT cleanly when the network activates newer rules rather than
+# rejecting post-fork blocks as "invalid" and spamming peer-ban
+# machinery.
+#
+# Current value is 1 (the only version ever shipped).  A future hard
+# fork that changes consensus semantics bumps this to 2 (or higher),
+# and ``messagechain upgrade`` installs the binary that understands
+# it.  Old binaries that see ``block.header.version = 2`` raise
+# ``BinaryOutOfDateError`` from ``validate_block`` with an operator-
+# facing message pointing at the upgrade command.
+#
+# See ``BinaryOutOfDateError`` in ``messagechain/core/blockchain.py``
+# for the halt semantics and the block-version gate that reads this.
+MAX_SUPPORTED_BLOCK_VERSION = 1
+
+
 def validate_tx_serialization_version(version: int) -> tuple[bool, str]:
     """Reject unknown transaction wire-format versions at the parse boundary.
 

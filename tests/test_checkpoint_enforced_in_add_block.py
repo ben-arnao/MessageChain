@@ -31,6 +31,12 @@ def _fake_block(block_number: int, block_hash: bytes, prev_hash: bytes = b"\x00"
     blk = MagicMock()
     blk.header.block_number = block_number
     blk.header.prev_hash = prev_hash
+    # Pin version=1 so the v1.3.0 binary-out-of-date gate
+    # (validate_block: version > MAX_SUPPORTED_BLOCK_VERSION -> raise
+    # BinaryOutOfDateError) doesn't trip on MagicMock's default
+    # comparison truthiness.  This test is about the checkpoint gate,
+    # not the version gate.
+    blk.header.version = 1
     blk.block_hash = block_hash
     return blk
 

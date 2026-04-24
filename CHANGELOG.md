@@ -4,6 +4,57 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-04-24
+
+Minor release — fork-skew halt semantics. An out-of-date binary now
+halts cleanly with an actionable operator message instead of rejecting
+post-fork blocks as "invalid" and spamming peer-ban state.
+
+### Added
+
+- `MAX_SUPPORTED_BLOCK_VERSION` config constant (currently 1). A
+  future hard fork that changes consensus semantics bumps this to 2+;
+  `messagechain upgrade` installs the binary that understands it.
+- `BinaryOutOfDateError` (`messagechain/core/blockchain.py`) — a
+  distinct exception class (sibling to `ChainIntegrityError`) raised
+  by `validate_block` when a block carries a version newer than this
+  binary understands. Semantically: "the network has moved past my
+  binary" — NOT "the chain is broken" and NOT "the block is malicious".
+- `server.py` installs an asyncio loop-level exception handler that
+  converts `BinaryOutOfDateError` from any task into a clean
+  `os._exit(42)` with a single clear journald entry:
+  `BINARY OUT OF DATE -- HALTING: Block at height N has version V,
+  but this binary supports up to W. Run \`messagechain upgrade\``.
+  Systemd's `StartLimitBurst=5` turns the repeated exit into a
+  failed-unit state, which is exactly the operator signal we want.
+
+### Changed
+
+- `Blockchain.validate_block` no longer treats unknown-version blocks
+  as soft rejections. A `version > MAX_SUPPORTED_BLOCK_VERSION` now
+  raises `BinaryOutOfDateError` (halt). A `version < 1` (malformed
+  input, not fork-skew) remains a regular `(False, reason)` rejection
+  so peer-ban machinery fires normally.
+
+### Operator UX
+
+No action needed to adopt 1.3.0 — the halt path only fires when a
+future fork activates. When that happens on an old binary:
+
+1. The unit exits with code 42 and journald records
+   `BINARY OUT OF DATE -- HALTING`.
+2. Systemd tries 5 restarts, hits `StartLimitBurst`, marks the unit
+   failed.
+3. Operator sees the failed unit, runs `messagechain upgrade --yes`.
+4. New binary boots, accepts the blocks that the old one couldn't,
+   catches up via normal P2P sync.
+
+Previously, the old binary would spin instead of halting — rejecting
+every post-fork block as "invalid block", ban-scoring every peer that
+relayed one, and silently losing proposal slots to inactivity
+slashing. 1.3.0 turns that failure mode into a fast, loud, actionable
+halt.
+
 ## [1.2.2] — 2026-04-24
 
 Patch release — fixes `messagechain upgrade` default tag resolution so
