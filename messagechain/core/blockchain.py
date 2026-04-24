@@ -727,6 +727,17 @@ class Blockchain:
             self.blocks_since_last_finalization = (
                 self.db.get_finalization_stall_counter()
             )
+        # Rehydrate the lottery prize pool.  Consensus-visible: the
+        # `pool_payout` paid to the lottery winner at every
+        # LOTTERY_INTERVAL firing is computed from this pool -- cold
+        # restart that zeros the pool while uprestarted peers retain
+        # the accumulated value pays a different bounty and diverges
+        # `supply.balances[winner]` at the next firing.  `hasattr`
+        # gate keeps legacy chain.db files loadable.
+        if hasattr(self.db, "get_lottery_prize_pool"):
+            self.supply.lottery_prize_pool = (
+                self.db.get_lottery_prize_pool()
+            )
 
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
@@ -1443,9 +1454,11 @@ class Blockchain:
         # a stale pool would compute a different payout amount at the
         # next lottery firing and silently fork.  Committed to the
         # snapshot root under _TAG_GLOBAL / _GLOBAL_LOTTERY_PRIZE_POOL.
-        self.supply.lottery_prize_pool = int(
-            snap.get("lottery_prize_pool", 0),
-        )
+        # Routed through `_set_lottery_prize_pool` so the chaindb
+        # mirror is populated at checkpoint-sync install time --
+        # subsequent cold restarts on this node then rehydrate from
+        # the DB row the install wrote.
+        self._set_lottery_prize_pool(int(snap.get("lottery_prize_pool", 0)))
         # Treasury cap-tightening rolling-window debit list
         # (TREASURY_CAP_TIGHTEN_HEIGHT hard fork).  Consensus-visible
         # list driving the annual 5%-of-balance ceiling on
@@ -2645,6 +2658,28 @@ class Blockchain:
             self.db, "set_finalization_stall_counter",
         ):
             self.db.set_finalization_stall_counter(int(value))
+
+    def _set_lottery_prize_pool(self, value: int) -> None:
+        """Set `self.supply.lottery_prize_pool`, DB-mirrored.
+
+        Single chokepoint for every mutation of the lottery prize
+        pool so the in-memory scalar and the chaindb `supply_meta`
+        row stay in lockstep.  The pool drives `select_lottery_
+        winner`'s `pool_payout` amount at every LOTTERY_INTERVAL
+        firing post-`SEED_DIVESTMENT_REDIST_HEIGHT` -- a cold-booted
+        peer that reads a stale 0 while uprestarted peers hold N>0
+        would pay the winner 0 tokens while peers continue paying
+        N/remaining, diverging `supply.balances` and state_root at
+        the next lottery firing.  Direct `+=` / `-=` writes on
+        `self.supply.lottery_prize_pool` would bypass the DB mirror
+        and silently reopen the cold-restart divergence the
+        persistence closes, so ALL mutations go through this helper.
+        """
+        self.supply.lottery_prize_pool = int(value)
+        if self.db is not None and hasattr(
+            self.db, "set_lottery_prize_pool",
+        ):
+            self.db.set_lottery_prize_pool(int(value))
 
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
@@ -7354,9 +7389,14 @@ class Blockchain:
                 # consensus-visible scalar pool; total circulating
                 # supply is preserved until the lottery pays out to a
                 # winner's balance.  Pool is snapshotted for reorg
-                # rollback and committed to the state-snapshot root;
-                # see SupplyTracker.lottery_prize_pool.
-                self.supply.lottery_prize_pool += lottery_share
+                # rollback, committed to the state-snapshot root, AND
+                # mirrored into chaindb via `_set_lottery_prize_pool`
+                # so cold restart doesn't zero the pool while
+                # uprestarted peers retain it.
+                # See SupplyTracker.lottery_prize_pool.
+                self._set_lottery_prize_pool(
+                    self.supply.lottery_prize_pool + lottery_share,
+                )
 
     def _apply_block_state(self, block: Block):
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
@@ -7971,7 +8011,14 @@ class Blockchain:
                         self.supply.total_supply += bounty
                         self.supply.total_minted += bounty
                     if pool_payout > 0:
-                        self.supply.lottery_prize_pool -= pool_payout
+                        # Route through the helper so the chaindb
+                        # mirror of lottery_prize_pool tracks this
+                        # drain -- direct `-=` would bypass the DB
+                        # write and diverge from uprestarted peers
+                        # at the NEXT lottery firing.
+                        self._set_lottery_prize_pool(
+                            self.supply.lottery_prize_pool - pool_payout,
+                        )
                     if escrow_len > 0:
                         self._escrow.add(
                             entity_id=winner, amount=total_bounty,
