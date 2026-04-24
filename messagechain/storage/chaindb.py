@@ -224,6 +224,33 @@ class ChainDB:
                 count INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Per-block pinned stake distributions used as the 2/3
+            -- finality denominator in `_process_attestations` and
+            -- `_process_finality_votes`.  Consensus-critical: the
+            -- finality-vote path can target a block up to
+            -- FINALITY_VOTE_MAX_AGE_BLOCKS (=1000) slots back, and
+            -- the threshold-crossing predicate must use the stake
+            -- distribution AS-OF the target block (not post-churn
+            -- live state) or validators who unstaked after casting
+            -- are silently dropped from the denominator and the
+            -- `crossed` decision diverges.  Without persistence, a
+            -- cold-booted peer loses every historical snapshot and
+            -- falls back to live stakes -- uprestarted peers reach
+            -- finality on blocks restarted peers don't, and
+            -- `finalized_checkpoints` (the long-range-attack
+            -- ratchet) diverges irreversibly.  Bounded: pruned to
+            -- the trailing FINALITY_VOTE_MAX_AGE_BLOCKS window on
+            -- every insert, so table size is O(1000 * |validators|)
+            -- regardless of chain length.
+            CREATE TABLE IF NOT EXISTS stake_snapshots (
+                block_number INTEGER NOT NULL,
+                entity_id BLOB NOT NULL,
+                amount INTEGER NOT NULL,
+                PRIMARY KEY (block_number, entity_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_stake_snapshots_block
+                ON stake_snapshots(block_number);
+
             CREATE TABLE IF NOT EXISTS proposer_sig_counts (
                 entity_id BLOB PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
@@ -692,6 +719,69 @@ class ChainDB:
             out.setdefault(bytes(eid), []).append(
                 (int(amount), int(release_block)),
             )
+        return out
+
+    # ── State: Stake Snapshots (per-block finality denominator) ──
+    # Must mirror `Blockchain._stake_snapshots`.  Every
+    # `_record_stake_snapshot(block_number)` call on the Blockchain
+    # side routes through `add_stake_snapshot` here when a db
+    # handle is attached.  Pruning keeps the persisted tail bounded
+    # to FINALITY_VOTE_MAX_AGE_BLOCKS so a decades-old chain
+    # doesn't carry a stake-snapshot row for every entity at every
+    # historical height -- anything older than that window cannot
+    # be a valid finality-vote target anyway.
+
+    def add_stake_snapshot(
+        self, block_number: int, stakes: dict[bytes, int],
+    ) -> None:
+        """Persist one (block_number, entity_id, amount) row per
+        entity in the supplied stake map.
+
+        INSERT OR REPLACE so a re-apply of the same block overwrites
+        cleanly (matches the in-memory `self._stake_snapshots
+        [block_number] = dict(self.supply.staked)` replace-on-write
+        semantics).
+        """
+        for entity_id, amount in stakes.items():
+            self._conn.execute(
+                "INSERT OR REPLACE INTO stake_snapshots "
+                "(block_number, entity_id, amount) VALUES (?, ?, ?)",
+                (int(block_number), entity_id, int(amount)),
+            )
+        self._maybe_commit()
+
+    def prune_stake_snapshots_before(self, height_cutoff: int) -> None:
+        """Delete every stake_snapshots row with block_number <
+        height_cutoff.  Bounds the table to a trailing window so a
+        long-running chain doesn't accumulate snapshots forever.
+        """
+        self._conn.execute(
+            "DELETE FROM stake_snapshots WHERE block_number < ?",
+            (int(height_cutoff),),
+        )
+        self._maybe_commit()
+
+    def get_all_stake_snapshots(
+        self,
+    ) -> dict[int, dict[bytes, int]]:
+        """Rehydrate the full stake-snapshots map on cold start.
+
+        Returns ``{block_number: {entity_id: amount, ...}, ...}`` --
+        the same shape `Blockchain._stake_snapshots` holds in memory.
+        Bounded by whatever the most recent `prune_stake_snapshots_
+        before` left behind (≤ FINALITY_VOTE_MAX_AGE_BLOCKS entries
+        under normal operation).
+        """
+        cur = self._conn.execute(
+            "SELECT block_number, entity_id, amount "
+            "FROM stake_snapshots "
+            "ORDER BY block_number, entity_id",
+        )
+        out: dict[int, dict[bytes, int]] = {}
+        for block_number, entity_id, amount in cur.fetchall():
+            out.setdefault(int(block_number), {})[
+                bytes(entity_id)
+            ] = int(amount)
         return out
 
     # ── State: Nonces ────────────────────────────────────────────
@@ -1428,6 +1518,14 @@ class ChainDB:
             # past attestations must restore the pre-reorg counts
             # so the post-reorg replay converges on the same winner.
             "reputation": self.get_all_reputation(),
+            # Per-block pinned stake snapshots used as the 2/3
+            # finality denominator.  Must round-trip with supply
+            # state: a reorg that rolls past any block whose stake
+            # pin we've already consumed (or will consume for a
+            # finality vote targeting that height) has to restore
+            # the ancestor's snapshot so post-reorg replay converges
+            # on the same crossing decision.
+            "stake_snapshots": self.get_all_stake_snapshots(),
             # Finalization-stall counter — scalar input to the
             # quadratic inactivity leak.  Must round-trip with supply
             # state because a reorg that rolls past the finalization-
@@ -1475,6 +1573,11 @@ class ChainDB:
             # back with them so the post-reorg replay rebuilds from
             # the ancestor's state, not the losing fork's.
             conn.execute("DELETE FROM reputation")
+            # stake_snapshots pin the 2/3 finality denominator at
+            # each block's apply -- must roll back with the blocks
+            # themselves so post-reorg replay repopulates pins
+            # consistent with the canonical chain.
+            conn.execute("DELETE FROM stake_snapshots")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -1517,6 +1620,16 @@ class ChainDB:
                     "VALUES (?, ?)",
                     (eid, int(count)),
                 )
+            for block_number, stake_map in snapshot.get(
+                "stake_snapshots", {},
+            ).items():
+                for entity_id, amount in stake_map.items():
+                    conn.execute(
+                        "INSERT INTO stake_snapshots "
+                        "(block_number, entity_id, amount) "
+                        "VALUES (?, ?, ?)",
+                        (int(block_number), entity_id, int(amount)),
+                    )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
