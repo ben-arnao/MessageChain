@@ -2113,6 +2113,25 @@ SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC = 0.05  # 1 per 20 seconds steady
 SUBMISSION_REJECTION_BURST = 3                   # up to 3 rejection proofs immediately
 
 # ─────────────────────────────────────────────────────────────────────
+# Public read-only feed (messagechain.network.public_feed_server)
+# ─────────────────────────────────────────────────────────────────────
+# Operator-facing endpoint that lets non-technical visitors browse
+# recent on-chain messages over plain HTTP.  Read-only; no state
+# mutations possible.  Message payloads are public by design (see
+# CLAUDE.md "Payloads are fully public"), so nothing sensitive is
+# exposed that the chain hasn't already committed.
+#
+# Steady 4/sec with a 30-request burst per source IP: enough for a
+# browser polling /v1/latest every 10s with a handful of concurrent
+# visitors, tight enough that an unbounded scraper can't walk the
+# whole chain in a loop.  PUBLIC_FEED_MAX_LIMIT caps how far back a
+# single request can reach — a client asking for more just gets the
+# cap, same as `messagechain read --last N` clamps today.
+PUBLIC_FEED_RATE_LIMIT_PER_SEC = 4
+PUBLIC_FEED_BURST = 30
+PUBLIC_FEED_MAX_LIMIT = 50
+
+# ─────────────────────────────────────────────────────────────────────
 # Attestable submission receipts + censorship-evidence slashing
 # ─────────────────────────────────────────────────────────────────────
 # Validators issue signed "submission receipts" committing to having

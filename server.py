@@ -4166,6 +4166,21 @@ async def run(args):
             args.submission_bind, args.submission_port,
         )
 
+    public_feed_server = None
+    if args.public_feed_port is not None:
+        from messagechain.network.public_feed_server import PublicFeedServer
+
+        public_feed_server = PublicFeedServer(
+            blockchain=server.blockchain,
+            port=args.public_feed_port,
+            bind=args.public_feed_bind,
+        )
+        public_feed_server.start()
+        logger.info(
+            "Public feed active on http://%s:%d/  (front with Caddy/Cloudflare for TLS)",
+            args.public_feed_bind, args.public_feed_port,
+        )
+
     # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run
     # the same cleanup path as Ctrl-C.  Without this, Python's default
     # SIGTERM action is immediate exit — server.stop() never runs, the
@@ -4199,6 +4214,8 @@ async def run(args):
     logger.info("Shutting down")
     if submission_server is not None:
         submission_server.stop()
+    if public_feed_server is not None:
+        public_feed_server.stop()
     await server.stop()
 
 
@@ -4250,6 +4267,25 @@ def main():
         "--submission-bind", type=str, default="0.0.0.0",
         help="Bind address for the submission server (default: 0.0.0.0 — "
              "this endpoint is intentionally public).",
+    )
+    # --- Public read-only feed (opt-in) ---
+    # Off by default.  Set --public-feed-port (typ. 8080) to expose a
+    # GET-only HTTP endpoint serving recent on-chain messages plus a
+    # bundled HTML viewer.  Plain HTTP — operators should front this
+    # with Caddy/Cloudflare for TLS.  See
+    # messagechain/network/public_feed_server.py.
+    parser.add_argument(
+        "--public-feed-port", type=int, default=None,
+        help="If set, start a public read-only HTTP feed on this port "
+             "serving GET /v1/latest (newest messages), GET /v1/info "
+             "(chain height), and GET / (bundled HTML viewer). Plain "
+             "HTTP — front with Caddy/Cloudflare for TLS.",
+    )
+    parser.add_argument(
+        "--public-feed-bind", type=str, default="127.0.0.1",
+        help="Bind address for the public feed (default: 127.0.0.1). "
+             "Typically bound to localhost and fronted by a reverse proxy; "
+             "use 0.0.0.0 only if exposing directly to the public internet.",
     )
     args = parser.parse_args()
 

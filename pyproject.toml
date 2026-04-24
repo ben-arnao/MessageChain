@@ -30,6 +30,11 @@ py-modules = ["client", "server"]
 include = ["messagechain*"]
 exclude = ["tests*", "deploy*", "docs*", ".claude*"]
 
+[tool.setuptools.package-data]
+# Ship the static HTML page served by the public-feed endpoint so
+# `pip install .` deployments can expose /v1/latest + the bundled viewer.
+messagechain = ["static/*.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # -n auto              parallelise across CPU cores (pytest-xdist)
