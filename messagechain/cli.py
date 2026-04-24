@@ -690,6 +690,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", "-y", action="store_true",
         help="Skip interactive confirmation.",
     )
+    upgrade.add_argument(
+        "--lock-path", type=str, default="/run/messagechain-upgrade.lock",
+        help="Advisory lock file used to prevent the weekly "
+             "auto-upgrade timer and a manual invocation from "
+             "running concurrently (default: "
+             "/run/messagechain-upgrade.lock).  Use a writable path "
+             "on non-systemd hosts.",
+    )
+    upgrade.add_argument(
+        "--no-lock", action="store_true",
+        help="Skip the upgrade-contention advisory lock check.  Only "
+             "use when recovering from a stale lock file or running "
+             "in a container where /run/ is not writable.",
+    )
 
     # --- init ---
     init_p = sub.add_parser(
@@ -3635,6 +3649,58 @@ def _upgrade_health_check(host: str, port: int, timeout_s: int = 60) -> bool:
     return False
 
 
+def _upgrade_acquire_lock(lock_path: str):
+    """Acquire an exclusive non-blocking advisory lock on ``lock_path``.
+
+    Purpose: the weekly auto-upgrade systemd timer and an operator
+    running ``messagechain upgrade --yes`` manually can fire in the
+    same window.  Two concurrent upgrades on the same install
+    directory would race on systemctl stop/start, the backup move,
+    and the install swap -- corrupting the install or losing the
+    backup the manual-rollback path depends on.
+
+    Returns an opaque handle (open file object) the caller MUST keep
+    alive for the duration of the upgrade.  The advisory lock is
+    bound to the fd's lifetime; letting the fd be garbage-collected
+    releases the lock, so callers must hold a reference through all
+    of cmd_upgrade.  Raises ``RuntimeError`` if the lock is already
+    held by another process.
+
+    Returns ``None`` on platforms without ``fcntl`` (Windows dev env,
+    non-POSIX) -- callers treat that as "lock disabled, cannot check
+    contention".  Validators run on Linux so the lock is active where
+    it matters; the no-op path keeps the test suite portable.
+    """
+    try:
+        import fcntl as _fcntl
+    except ImportError:
+        return None
+
+    try:
+        handle = open(lock_path, "a+")
+    except OSError as e:
+        raise RuntimeError(
+            f"cannot open upgrade lock file {lock_path}: {e}. "
+            "Pass --lock-path to point at a writable location, or "
+            "--no-lock to skip the contention check."
+        ) from e
+
+    try:
+        _fcntl.flock(
+            handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB,
+        )
+    except OSError as e:
+        handle.close()
+        raise RuntimeError(
+            f"upgrade already in progress (advisory lock held on "
+            f"{lock_path}). Wait for the other upgrade to complete, "
+            "or -- if you are certain the lock is stale -- remove "
+            "the file and retry, or pass --no-lock."
+        ) from e
+
+    return handle
+
+
 def _upgrade_gc_old_backups(install_dir: str, keep: int) -> list:
     """Prune old ``{install_dir}.bak-*`` directories, keeping the
     ``keep`` most recent by mtime.  Returns the list of paths removed.
@@ -3707,6 +3773,19 @@ def cmd_upgrade(args):
             "this command must run as root (systemctl stop/start + "
             "chown). Re-run with `sudo messagechain upgrade ...`."
         )
+
+    # --- Upgrade-contention lock ---
+    # Keeps the handle alive for the whole function -- advisory
+    # flock is bound to the fd lifetime.  See docstring on
+    # _upgrade_acquire_lock for why this matters (weekly auto-
+    # upgrade timer vs. manual invocation can otherwise race on
+    # systemctl stop/start + backup move + install swap).
+    _lock_handle = None  # noqa: F841 -- referenced to keep fd open
+    if not args.no_lock:
+        try:
+            _lock_handle = _upgrade_acquire_lock(args.lock_path)
+        except RuntimeError as e:
+            _fail(str(e), code=3)
 
     # Resolve target tag.
     target_tag = args.tag

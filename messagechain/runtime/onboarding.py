@@ -318,6 +318,20 @@ def render_upgrade_service() -> str:
     # Runs as root because `messagechain upgrade` invokes systemctl stop/
     # start, writes /opt/messagechain, and chowns the new install. An
     # unprivileged user cannot do any of that.
+    #
+    # ExecStart is wrapped in ``flock -n`` on the same advisory lock
+    # path the Python-level check uses.  Two defenses for the
+    # timer-vs-manual race:
+    #   * systemd-level: ``flock -n`` makes the timer's ExecStart bail
+    #     at the shell (exit 1) without even launching Python if an
+    #     operator is currently running ``messagechain upgrade --yes``
+    #     by hand.  Silent no-op from the timer's perspective.
+    #   * Python-level: ``_upgrade_acquire_lock`` in cmd_upgrade
+    #     re-acquires the same flock, so two manual invocations (or
+    #     two timer hosts pointed at a shared NFS) also bail cleanly.
+    # ``-n`` is non-blocking (no waiting); ``-E 0`` makes flock exit 0
+    # when the lock can't be acquired so the timer unit doesn't go
+    # red on a normal contention event.
     return (
         "[Unit]\n"
         "Description=MessageChain auto-upgrade runner\n"
@@ -330,7 +344,8 @@ def render_upgrade_service() -> str:
         "User=root\n"
         "Group=root\n"
         "WorkingDirectory=/opt/messagechain\n"
-        "ExecStart=/usr/bin/env python3 -m messagechain upgrade --yes\n"
+        "ExecStart=/usr/bin/flock -n -E 0 /run/messagechain-upgrade.lock "
+        "/usr/bin/env python3 -m messagechain upgrade --yes\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"
         "\n"

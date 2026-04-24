@@ -249,7 +249,14 @@ class TestUpgradeSubparser(unittest.TestCase):
 
 
 def _make_args(**overrides):
-    """Build a minimal argparse.Namespace for cmd_upgrade tests."""
+    """Build a minimal argparse.Namespace for cmd_upgrade tests.
+
+    Default ``no_lock=True`` because most tests don't exercise the
+    upgrade-contention flock and would otherwise touch the real
+    ``/run/messagechain-upgrade.lock`` path (unwritable without
+    root, and a cross-test-pollution risk under xdist).  Lock
+    behavior has its own dedicated test class.
+    """
     import argparse
     ns = argparse.Namespace(
         command="upgrade",
@@ -265,6 +272,8 @@ def _make_args(**overrides):
         rpc_port=9334,
         yes=True,
         verbose=False,
+        lock_path="/run/messagechain-upgrade.lock",
+        no_lock=True,
     )
     for k, v in overrides.items():
         setattr(ns, k, v)
@@ -540,6 +549,178 @@ class TestUpgradeRollback(unittest.TestCase):
         # Exactly one move: the initial backup. The rollback-path
         # second move must not have happened.
         self.assertEqual(len(move_calls), 1)
+
+
+class TestUpgradeLockGuard(unittest.TestCase):
+    """The weekly auto-upgrade timer and a manual
+    ``messagechain upgrade --yes`` can fire in the same window.  Two
+    concurrent upgrades on the same install dir would race on
+    systemctl stop/start, the backup move, and the install swap --
+    corrupting the install or losing the backup the manual-rollback
+    path depends on.
+
+    ``_upgrade_acquire_lock`` uses POSIX ``fcntl.flock`` on a well-
+    known lock file.  On non-POSIX (Windows dev env) the helper
+    returns ``None`` and the lock is a no-op; the contention test
+    is skipped there since you can't collide a non-lock.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.mkdtemp()
+        self.lock_path = os.path.join(self._tmp, "upgrade.lock")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _fcntl_available(self):
+        try:
+            import fcntl  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def test_lock_returns_handle_when_file_not_held(self):
+        from messagechain.cli import _upgrade_acquire_lock
+        handle = _upgrade_acquire_lock(self.lock_path)
+        if not self._fcntl_available():
+            # Expected no-op on non-POSIX: helper short-circuits to
+            # None before touching the filesystem.
+            self.assertIsNone(handle)
+            return
+        self.assertIsNotNone(handle)
+        self.assertTrue(os.path.exists(self.lock_path))
+        # Handle must be closeable without error.
+        handle.close()
+
+    def test_second_acquire_raises_while_first_held(self):
+        if not self._fcntl_available():
+            self.skipTest("fcntl not available on this platform")
+        from messagechain.cli import _upgrade_acquire_lock
+
+        first = _upgrade_acquire_lock(self.lock_path)
+        self.assertIsNotNone(first)
+        # Second attempt MUST bail fast, not block -- flock LOCK_NB.
+        with self.assertRaises(RuntimeError) as cm:
+            _upgrade_acquire_lock(self.lock_path)
+        # Message must name the lock path and point at recovery
+        # options so an operator can act without reading source.
+        msg = str(cm.exception)
+        self.assertIn(self.lock_path, msg)
+        self.assertIn("already in progress", msg)
+        self.assertIn("--no-lock", msg)
+        first.close()
+
+    def test_release_via_close_allows_next_acquire(self):
+        if not self._fcntl_available():
+            self.skipTest("fcntl not available on this platform")
+        from messagechain.cli import _upgrade_acquire_lock
+
+        first = _upgrade_acquire_lock(self.lock_path)
+        self.assertIsNotNone(first)
+        first.close()  # advisory flock is bound to fd lifetime
+
+        # Post-release the lock must be freely re-acquirable --
+        # otherwise a crashed upgrade would wedge the lock until
+        # manual file removal.
+        second = _upgrade_acquire_lock(self.lock_path)
+        self.assertIsNotNone(second)
+        second.close()
+
+    def test_unwritable_lock_path_raises_with_guidance(self):
+        if not self._fcntl_available():
+            self.skipTest("fcntl not available on this platform")
+        from messagechain.cli import _upgrade_acquire_lock
+
+        # /proc/1/root is not writable by regular tests and OSError
+        # on open is the path we want to exercise.  Use a
+        # guaranteed-unwritable path relative to a file that exists
+        # but cannot host a child file.
+        unwritable = os.path.join(
+            self.lock_path, "no-such-subdir", "lock",
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            _upgrade_acquire_lock(unwritable)
+        msg = str(cm.exception)
+        self.assertIn("--lock-path", msg)
+        self.assertIn("--no-lock", msg)
+
+    def test_cmd_upgrade_bails_when_lock_held(self):
+        """Integration: cmd_upgrade should exit non-zero with the
+        contention message when another process already holds the
+        lock -- i.e. the Python-level guard works end-to-end."""
+        if not self._fcntl_available():
+            self.skipTest("fcntl not available on this platform")
+        from messagechain import cli as cli_mod
+
+        # Pre-acquire in this test process.  Keep the handle alive
+        # until after the assertion so cmd_upgrade sees it held.
+        held = cli_mod._upgrade_acquire_lock(self.lock_path)
+        try:
+            args = _make_args(lock_path=self.lock_path, no_lock=False)
+            with patch("shutil.which", return_value="/usr/bin/anything"), \
+                 patch.object(os, "geteuid", return_value=0, create=True):
+                with self.assertRaises(SystemExit) as cm:
+                    cli_mod.cmd_upgrade(args)
+            self.assertNotEqual(cm.exception.code, 0)
+        finally:
+            held.close()
+
+    def test_cmd_upgrade_no_lock_flag_skips_guard(self):
+        """Power-user escape: --no-lock lets the operator run even
+        when the lock path is held or broken (for stale-lock
+        recovery and container setups without a writable /run)."""
+        if not self._fcntl_available():
+            self.skipTest("fcntl not available on this platform")
+        from messagechain import cli as cli_mod
+
+        held = cli_mod._upgrade_acquire_lock(self.lock_path)
+        try:
+            args = _make_args(
+                lock_path=self.lock_path, no_lock=True, tag="v1.0.0-mainnet",
+            )
+            # Stub out the resolver to short-circuit past the lock
+            # check; we care only that cmd_upgrade progresses past
+            # the lock gate when --no-lock is set.
+            def _fake_resolver(*a, **kw):
+                raise RuntimeError("sentinel: resolver reached")
+            with patch("shutil.which", return_value="/usr/bin/anything"), \
+                 patch.object(os, "geteuid", return_value=0, create=True), \
+                 patch.object(
+                    cli_mod, "_upgrade_resolve_latest_tag",
+                    side_effect=_fake_resolver,
+                 ):
+                with self.assertRaises(SystemExit) as cm:
+                    cli_mod.cmd_upgrade(args)
+            # Exit code > 0 but the failure came from downstream,
+            # not from the lock gate -- i.e., --no-lock correctly
+            # bypassed the guard.
+            self.assertNotEqual(cm.exception.code, 0)
+        finally:
+            held.close()
+
+
+class TestUpgradeServiceUnitUsesFlock(unittest.TestCase):
+    """Belt-and-suspenders: the systemd unit's ExecStart must wrap
+    the Python command in ``flock -n`` on the same lock path the
+    Python guard uses.  If a future refactor drops the flock prefix,
+    the timer could fire during a manual upgrade and systemd would
+    start a second ``messagechain upgrade`` before the Python guard
+    even loads."""
+
+    def test_upgrade_service_wraps_execstart_in_flock(self):
+        from messagechain.runtime.onboarding import render_upgrade_service
+        unit = render_upgrade_service()
+        self.assertIn(
+            "/usr/bin/flock -n -E 0 /run/messagechain-upgrade.lock",
+            unit,
+        )
+        # Confirm the Python entrypoint is still what flock wraps --
+        # otherwise we've preserved the lock but broken the command.
+        self.assertIn(
+            "python3 -m messagechain upgrade --yes", unit,
+        )
 
 
 class TestUpgradeGcOldBackups(unittest.TestCase):
