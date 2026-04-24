@@ -19,6 +19,7 @@ from messagechain.config import (
     FEE_QUADRATIC_COEFF, MAX_TIMESTAMP_DRIFT, CHAIN_ID,
     SIG_VERSION_CURRENT, FEE_INCLUDES_SIGNATURE_HEIGHT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
+    BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT,
 )
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
@@ -310,9 +311,18 @@ def calculate_min_fee(
 ) -> int:
     """Calculate the minimum fee floor a tx must pay to be admitted.
 
-    At/after FLAT_FEE_HEIGHT: flat ``MIN_FEE_POST_FLAT`` regardless of
-    message or signature size.  Multi-part messages pay N × floor by
-    virtue of being N separate txs.
+    At/after LINEAR_FEE_HEIGHT: linear-in-stored-bytes formula:
+
+        fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
+
+    Pairs with the cap raise (MAX_MESSAGE_CHARS=1024) — long messages
+    pay proportionally for the bytes they pin to permanent state.
+    ``signature_bytes`` is ignored under the linear rule: the WOTS+
+    witness is amortized into BASE_TX_FEE, which is uniform per tx.
+
+    [FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT): flat ``MIN_FEE_POST_FLAT``
+    regardless of message or signature size.  Retained so blocks in
+    this height window replay deterministically.
 
     Before FLAT_FEE_HEIGHT (and when ``current_height`` is None — the
     legacy default for isolated tests and non-consensus call sites):
@@ -326,9 +336,10 @@ def calculate_min_fee(
     where ``bytes = len(message_bytes) + signature_bytes``.  The
     ``signature_bytes`` knob matches the pre-flat-fee
     FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
-    payload).  Post-flat-fee the witness size is moot — the flat floor
-    is uniform for every tx type — so ``signature_bytes`` is ignored.
+    payload).
     """
+    if current_height is not None and current_height >= LINEAR_FEE_HEIGHT:
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
     if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
         return MIN_FEE_POST_FLAT
     size = len(message_bytes) + signature_bytes
@@ -402,12 +413,21 @@ def create_transaction(
     message: str,
     fee: int,
     nonce: int,
+    current_height: int | None = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
 
     The fee is set by the user — higher fee means higher priority for
     block inclusion (BTC-style fee bidding).
+
+    ``current_height`` selects the fee rule used for the floor check:
+    pass the active chain tip so the caller pays the rule that
+    verify_transaction will apply.  Default (None) uses the legacy
+    rule, which is conservative — for any size, the legacy floor is
+    ≥ both the flat and linear floors, so a tx accepted here also
+    passes any later height-aware verification.  Tests targeting the
+    linear floor exactly must thread the height through.
     """
     valid, reason = _validate_message(message)
     if not valid:
@@ -423,7 +443,7 @@ def create_transaction(
             f"Stored message size {len(stored)} exceeds MAX_MESSAGE_BYTES "
             f"{MAX_MESSAGE_BYTES}"
         )
-    min_required = calculate_min_fee(stored)
+    min_required = calculate_min_fee(stored, current_height=current_height)
     if fee < min_required:
         raise ValueError(
             f"Fee must be at least {min_required} for this message "
@@ -487,9 +507,11 @@ def verify_transaction(
     canonical_stored, canonical_flag = encode_payload(plaintext)
     if canonical_stored != tx.message or canonical_flag != tx.compression_flag:
         return False
-    # Fee rule depends on block height:
-    #   * At/after FLAT_FEE_HEIGHT — flat per-tx floor (MIN_FEE_POST_FLAT).
-    #   * FEE_INCLUDES_SIGNATURE_HEIGHT..FLAT_FEE_HEIGHT-1 — legacy
+    # Fee rule depends on block height (calculate_min_fee dispatches):
+    #   * At/after LINEAR_FEE_HEIGHT — linear in stored bytes
+    #     (BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message)).
+    #   * [FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT) — flat per-tx floor.
+    #   * [FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT) — legacy
     #     quadratic priced on (message + signature) bytes.
     #   * Pre-FEE_INCLUDES_SIGNATURE_HEIGHT (or no height context) —
     #     legacy quadratic on message bytes only.

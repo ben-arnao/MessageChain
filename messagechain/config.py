@@ -317,8 +317,13 @@ def validate_receipt_version(version: int) -> tuple[bool, str]:
 
 
 # Message constraints — ASCII-only (printable bytes 32-126), so 1 char = 1 byte.
-MAX_MESSAGE_CHARS = 280  # max characters per message
-MAX_MESSAGE_BYTES = 280  # 1:1 with chars (ASCII only, no multi-byte encoding)
+# Cap raised from 280 → 1024 at LINEAR_FEE_HEIGHT (Tier 8 fork). The constant
+# itself is monotone-safe to bump: every historical (pre-fork) tx satisfied
+# len ≤ 280, which trivially still satisfies len ≤ 1024 — no replay risk.
+# Long-form posts pay the linear-in-bytes fee floor introduced by the same
+# fork; storage discipline lives in the fee, not in the cap.
+MAX_MESSAGE_CHARS = 1024  # max characters per message
+MAX_MESSAGE_BYTES = 1024  # 1:1 with chars (ASCII only, no multi-byte encoding)
 
 # Token economics — inflationary to offset natural loss (deaths, lost keys)
 # BLOCK_REWARD must be a power of 2 so halvings divide cleanly.
@@ -576,7 +581,13 @@ MAX_ACTIVE_PROPOSALS = 500
 MAX_BASE_FEE_MULTIPLIER = 10_000
 MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
-MAX_BLOCK_MESSAGE_BYTES = 10_000  # max total message payload bytes per block (byte budget cap)
+MAX_BLOCK_MESSAGE_BYTES = 15_000  # max total message payload bytes per block (byte budget cap)
+# Raised from 10_000 → 15_000 alongside the per-message cap raise at
+# LINEAR_FEE_HEIGHT.  Headroom for occasional long-form posts without
+# fully doubling the per-block bloat ceiling.  Worst-case 14 max-size
+# messages fit; typical short-message traffic (well below cap) is
+# unconstrained.  Monotone-safe to bump: pre-fork blocks satisfied
+# total ≤ 10_000, which trivially still satisfies ≤ 15_000.
 MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
 # COINBASE_MATURITY must cover the worst-case un-finalized window or a
 # reorg can double-spend a coinbase that the honest chain never minted.
@@ -2835,6 +2846,60 @@ assert FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT, (
     "the witness-aware formula during replay"
 )
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Linear-in-stored-bytes fee floor — supersedes the flat per-tx floor
+# ─────────────────────────────────────────────────────────────────────
+# At/after LINEAR_FEE_HEIGHT the fee floor becomes:
+#
+#     fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(stored_message)
+#
+# Paired with the cap raise (MAX_MESSAGE_CHARS 280 → 1024) and the
+# byte-budget raise (MAX_BLOCK_MESSAGE_BYTES 10_000 → 15_000), this
+# unlocks short-post-scale messages without giving away storage:
+# longer messages pay proportionally more for the bytes they pin to
+# permanent state.
+#
+# Why linear and not flat:
+#   * Under the raised cap, a flat per-tx floor under-prices long
+#     messages — a 1024-byte tx and a 10-byte tx pay the same minimum,
+#     and rational users fill the cap, donating bloat.
+#   * Linear is the simplest formula that prices stored bytes honestly.
+#     Quadratic distorts the market without adding bloat discipline
+#     (we already have a hard per-message cap).
+#   * The base term amortizes the per-tx WOTS+ signature overhead
+#     (~1.1 KB regardless of message size); without it, tiny messages
+#     would pay near-zero for the sig bloat they still impose.
+#
+# Calibration philosophy: keep the floor "very low" — symbolic, not a
+# spam deterrent on its own. The market (EIP-1559 base-fee + tip)
+# prices above the floor whenever there's competition. The floor only
+# guarantees no-free-txs; it doesn't try to set the equilibrium price.
+#
+# Legacy constants (MIN_FEE, MIN_FEE_POST_FLAT, FEE_PER_BYTE,
+# FEE_QUADRATIC_COEFF) are retained so pre-fork blocks replay
+# deterministically under the rule current at their height.
+#
+# Operators MUST replace the placeholder height with a concrete
+# coordinated-fork height before deploying to mainnet.  Per the FORK
+# SCHEDULE: Tier 8, target 100_000 — after the last Tier 7 fork
+# (FLAT_FEE_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
+BASE_TX_FEE = 10                 # per-tx base — sig-overhead amortization
+FEE_PER_STORED_BYTE = 1          # per-byte component (charged on STORED, not plaintext)
+LINEAR_FEE_HEIGHT = 100_000
+
+assert BASE_TX_FEE >= 0, "BASE_TX_FEE cannot be negative"
+assert FEE_PER_STORED_BYTE >= 1, (
+    "FEE_PER_STORED_BYTE must be at least 1 — a zero per-byte rate "
+    "lets long messages share the same floor as short ones, which is "
+    "the under-pricing failure mode the linear rule is designed to fix"
+)
+assert LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT, (
+    "LINEAR_FEE_HEIGHT must follow FLAT_FEE_HEIGHT — the linear formula "
+    "supersedes the flat floor, so blocks in [FLAT_FEE_HEIGHT, "
+    "LINEAR_FEE_HEIGHT) still apply MIN_FEE_POST_FLAT during replay"
+)
+
 # ─────────────────────────────────────────────────────────────────────
 # Fork-schedule ordering invariants (load-time asserts)
 # ─────────────────────────────────────────────────────────────────────
@@ -2895,6 +2960,7 @@ for _fork_name, _fork_height in (
     ("DEFLATION_FLOOR_V2_HEIGHT", DEFLATION_FLOOR_V2_HEIGHT),
     ("VALIDATOR_REGISTRATION_BURN_HEIGHT", VALIDATOR_REGISTRATION_BURN_HEIGHT),
     ("FLAT_FEE_HEIGHT", FLAT_FEE_HEIGHT),
+    ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "

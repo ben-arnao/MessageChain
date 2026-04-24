@@ -154,23 +154,32 @@ class TestBlockByteBudget(unittest.TestCase):
     def test_byte_budget_exists(self):
         self.assertGreater(MAX_BLOCK_MESSAGE_BYTES, 0)
 
-    def test_byte_budget_is_10kb(self):
-        self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 10_000)
+    def test_byte_budget_is_15kb(self):
+        # Raised from 10_000 → 15_000 alongside the per-message cap raise
+        # at LINEAR_FEE_HEIGHT.  See test_linear_fees for the post-fork
+        # block-budget invariants.
+        self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 15_000)
 
-    def test_max_size_messages_fit_within_budget(self):
-        """20 max-size messages (280 bytes each = 5,600) fit within the 10KB budget."""
-        total = MAX_TXS_PER_BLOCK * MAX_MESSAGE_BYTES
+    def test_typical_messages_fit_within_budget(self):
+        """20 short (280 B) messages still fit comfortably in the budget."""
+        total = MAX_TXS_PER_BLOCK * 280
         self.assertLess(total, MAX_BLOCK_MESSAGE_BYTES)
 
     def test_small_messages_fit_within_budget(self):
-        """20 small messages (50 bytes each = 1000) fit within the 10KB budget."""
+        """20 small messages (50 bytes each = 1000) fit within the budget."""
         total = MAX_TXS_PER_BLOCK * 50
         self.assertLess(total, MAX_BLOCK_MESSAGE_BYTES)
 
-    def test_byte_budget_allows_all_max_size_messages(self):
-        """At 280 bytes each, all 20 max-size messages fit in the 10KB budget."""
+    def test_byte_budget_holds_some_max_size_messages(self):
+        """At 1024 bytes each, at least 14 max-size messages fit in the 15KB budget.
+
+        Worst-case 20 max-size messages intentionally exceed the budget —
+        the per-message cap is a ceiling, not a guarantee that 20 of them
+        fit. Validators pack greedily by fee-per-byte; oversized blocks
+        face the byte-budget wall naturally.
+        """
         max_fit = MAX_BLOCK_MESSAGE_BYTES // MAX_MESSAGE_BYTES
-        self.assertGreaterEqual(max_fit, MAX_TXS_PER_BLOCK)
+        self.assertGreaterEqual(max_fit, 14)
 
 
 class TestBlockSizeParameters(unittest.TestCase):
@@ -256,26 +265,26 @@ class TestChainGrowthAnalysis(unittest.TestCase):
         """Daily max message payload should be reasonable."""
         blocks_per_day = 24 * 3600 / BLOCK_TIME_TARGET  # 144
         daily_message_bytes = blocks_per_day * MAX_BLOCK_MESSAGE_BYTES
-        # 144 blocks * 10KB = 1.44MB/day max message payload
-        self.assertLess(daily_message_bytes, 2_000_000)  # under 2MB/day
+        # 144 blocks * 15KB = 2.16MB/day max message payload
+        self.assertLess(daily_message_bytes, 3_000_000)  # under 3MB/day
 
     def test_annual_growth_bounded(self):
         """Annual max storage should stay reasonable."""
         blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
         annual_bytes = blocks_per_year * MAX_BLOCK_MESSAGE_BYTES
-        # ~52,560 blocks * 10KB = ~526MB/year max message payload
-        self.assertLess(annual_bytes, 600_000_000)  # under 600MB/year
+        # ~52,560 blocks * 15KB ≈ ~789MB/year max message payload
+        self.assertLess(annual_bytes, 1_000_000_000)  # under 1GB/year
 
     def test_1000_year_projection(self):
         """Over 1000 years, permanent-message storage stays bounded by the
         per-block byte budget — no pruning, no deletion, ever."""
         blocks_per_year = 365.25 * 24 * 3600 / BLOCK_TIME_TARGET
         annual_bytes = blocks_per_year * MAX_BLOCK_MESSAGE_BYTES
-        # Permanent storage: ~526GB over 1000 years at the byte-budget ceiling.
+        # Permanent storage: ~789GB over 1000 years at the byte-budget ceiling.
         # Fees, size caps, compression, and witness separation are the only
         # bloat levers — the chain itself is append-only forever.
         thousand_year_bytes = 1000 * annual_bytes
-        self.assertLess(thousand_year_bytes, 600_000_000_000)  # under 600GB over 1000 years
+        self.assertLess(thousand_year_bytes, 1_000_000_000_000)  # under 1TB over 1000 years
 
 
 if __name__ == "__main__":

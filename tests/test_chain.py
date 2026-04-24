@@ -134,7 +134,8 @@ class TestBlockchain(unittest.TestCase):
         self.assertIn("nonce", reason.lower())
 
     def test_message_too_long_rejected(self):
-        long_msg = "a" * 281  # 281 characters
+        from messagechain.config import MAX_MESSAGE_CHARS
+        long_msg = "a" * (MAX_MESSAGE_CHARS + 1)
         with self.assertRaises(ValueError):
             create_transaction(
                 self.alice, long_msg,
