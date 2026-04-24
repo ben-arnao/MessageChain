@@ -3276,6 +3276,46 @@ class Server(SharedRuntimeMixin):
                 logger.debug(f"Peer maintenance tick failed: {e}")
             await asyncio.sleep(PEER_MAINTENANCE_INTERVAL)
 
+    def _dedup_entity_sessions(self, peer: Peer) -> Peer | None:
+        """If another live session exists with the same remote entity,
+        pick one to close via a symmetric tiebreaker. Returns the Peer
+        that was closed (may be `peer` itself or the duplicate), or
+        None if no duplicate was found.
+
+        Tiebreaker: keep the session where the LOWER entity_id is the
+        outbound dialer. Both ends apply the same rule against the
+        same pair of ids, so both ends drop the same TCP connection
+        and the network converges to one session per peer.
+        """
+        if not peer.entity_id or not self.wallet_id:
+            return None
+        my_id_hex = self.wallet_id.hex()
+        for other in list(self.peers.values()):
+            if other is peer:
+                continue
+            if other.entity_id != peer.entity_id:
+                continue
+            if not other.is_connected:
+                continue
+            i_am_lower = my_id_hex < peer.entity_id
+            # Surviving session: direction matches "who is the lower-id
+            # side" — if I'm lower, my outbound survives; if I'm higher,
+            # my inbound survives.
+            new_survives = (peer.direction == "outbound") == i_am_lower
+            drop = peer if not new_survives else other
+            logger.info(
+                "p2p dedup: closing duplicate %s session to entity %s",
+                drop.direction, peer.entity_id[:16],
+            )
+            drop.is_connected = False
+            self.peers.pop(drop.address, None)
+            try:
+                drop.writer.close()
+            except Exception:
+                pass
+            return drop
+        return None
+
     async def _handle_p2p_message(self, msg: NetworkMessage, peer: Peer):
         peer.touch()
         address = peer.address
@@ -3315,6 +3355,17 @@ class Server(SharedRuntimeMixin):
             peer.peer_height = peer_height
             peer.peer_version = str(msg.payload.get("version", "") or "unknown")
             self.peers[peer.address] = peer
+            # Entity-level dedup: when two validators dial each other
+            # simultaneously, each ends up with both an inbound and an
+            # outbound session to the same remote entity. Apply a
+            # symmetric tiebreaker so both ends close the same TCP
+            # connection and converge to one session per pair.
+            if self._dedup_entity_sessions(peer) is peer:
+                # We decided to drop THIS session — stop processing the
+                # rest of the HANDSHAKE (no sync kick, no echo) and let
+                # the finally block close the socket.
+                peer.is_connected = False
+                return
             # Track peer height AND cumulative weight for sync
             best_hash = msg.payload.get("best_block_hash", "")
             peer_weight_raw = msg.payload.get("cumulative_weight", 0)
