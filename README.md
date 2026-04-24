@@ -9,9 +9,7 @@ built to last centuries.
 **Status:** mainnet live. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
 
-**Live feed:** [messagechain.org](https://messagechain.org) — recent
-on-chain messages, auto-refreshing every 15 seconds. No account, no
-install. JSON at `/v1/latest?limit=50`.
+**Live feed:** [messagechain.org](https://messagechain.org)
 
 ## Why
 
