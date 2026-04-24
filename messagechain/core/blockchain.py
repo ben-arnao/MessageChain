@@ -96,6 +96,28 @@ class ChainIntegrityError(RuntimeError):
     """
 
 
+class BinaryOutOfDateError(RuntimeError):
+    """Block header advertises a protocol version newer than this binary.
+
+    Semantically distinct from ``ChainIntegrityError`` (which means *chain
+    state is broken*) and from a plain invalid-block rejection (which means
+    *the block is malformed or malicious*).  This one means *the network has
+    moved past my binary* — I am running an old release; the blocks I'm
+    seeing are valid under newer consensus rules I don't understand.
+
+    The correct response is NOT to reject the block as invalid (which on a
+    cascade makes every new block look adversarial and spams peer-ban state),
+    and it is NOT to apply it blindly (I can't — I don't know the new rules).
+    It is to HALT with a clear, actionable operator message pointing at the
+    upgrade path.  Systemd will restart the unit a few times and then hit its
+    StartLimitBurst; the operator sees a failed unit and runs
+    ``messagechain upgrade``.
+
+    Distinct from ChainIntegrityError so post-mortem / on-call can tell
+    "my node is broken" from "my binary is stale" at a glance.
+    """
+
+
 def _hash(data: bytes) -> bytes:
     return default_hash(data)
 
@@ -5520,8 +5542,32 @@ class Blockchain:
         if not ok:
             return False, reason
 
-        # Block version must be a known protocol version
-        if block.header.version != 1:
+        # Block version gate.
+        #
+        # A block header whose `version` exceeds `MAX_SUPPORTED_BLOCK_VERSION`
+        # isn't a malicious or malformed block -- it means the network is
+        # running a consensus ruleset this binary doesn't know.  Treating it
+        # as "invalid block" would (a) never-endingly spam the peer-ban
+        # machinery as every post-fork block looks adversarial, and
+        # (b) silently keep the validator stuck at an old tip while its
+        # stake drifts to inactivity slashing.  Instead, raise
+        # ``BinaryOutOfDateError`` so the caller can halt with a clear
+        # "run `messagechain upgrade`" message.
+        #
+        # A version BELOW the minimum (or == 0) is still a real malformation
+        # -- that stays a normal rejection.
+        from messagechain.config import MAX_SUPPORTED_BLOCK_VERSION
+        if block.header.version > MAX_SUPPORTED_BLOCK_VERSION:
+            raise BinaryOutOfDateError(
+                f"Block at height {block.header.block_number} has version "
+                f"{block.header.version}, but this binary supports up to "
+                f"{MAX_SUPPORTED_BLOCK_VERSION}. The network has activated "
+                f"a consensus ruleset newer than your binary. Run "
+                f"`messagechain upgrade` (or `messagechain upgrade --tag "
+                f"vX.Y.Z-mainnet`) to install the release that implements "
+                f"this version, then restart the validator."
+            )
+        if block.header.version < 1:
             return False, f"Unknown block version {block.header.version}"
 
         # Crypto-agility gate: reject any block whose header advertises an

@@ -266,6 +266,13 @@ class TestMerklePadding(unittest.TestCase):
 class TestBlockVersionCheck(unittest.TestCase):
 
     def test_rejects_unknown_version(self):
+        """Post-1.3.0 contract: a block with version > MAX_SUPPORTED_BLOCK_VERSION
+        raises BinaryOutOfDateError (halt signal), not a (False, reason)
+        rejection.  See `messagechain/core/blockchain.py:BinaryOutOfDateError`
+        docstring for the rationale -- rejecting post-fork blocks as
+        "invalid" cascades into peer-ban state and masks the real issue
+        (operator's binary is stale) as adversarial behavior."""
+        from messagechain.core.blockchain import BinaryOutOfDateError
         bc, entity = _setup_chain()
         from messagechain.core.block import Block, BlockHeader
         genesis = bc.get_latest_block()
@@ -280,8 +287,8 @@ class TestBlockVersionCheck(unittest.TestCase):
         header.proposer_signature = entity.keypair.sign(header_hash)
         blk = Block(header=header, transactions=[])
         blk.block_hash = blk._compute_hash()
-        valid, reason = bc.validate_block(blk)
-        self.assertFalse(valid)
+        with self.assertRaises(BinaryOutOfDateError):
+            bc.validate_block(blk)
 
 
 # ===========================================================================
