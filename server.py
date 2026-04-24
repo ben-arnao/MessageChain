@@ -1072,6 +1072,12 @@ class Server(SharedRuntimeMixin):
         self.mempool = Mempool()
         self.consensus = ProofOfStake()
         self.peers: dict[str, Peer] = {}
+        # In-flight outbound dials, keyed by "host:port".  A Peer only
+        # lands in self.peers after asyncio.open_connection returns;
+        # without this set the startup seed loop and the maintenance
+        # tick race during that window and produce two sockets for
+        # the same remote.  Observed on live mainnet 2026-04-24.
+        self._connecting: set[str] = set()
 
         self.wallet_id: bytes | None = None  # the entity_id that earns fees
         self.wallet_entity: Entity | None = None  # full entity for block signing
@@ -1507,6 +1513,14 @@ class Server(SharedRuntimeMixin):
             writer.write(struct.pack(">I", len(resp_bytes)))
             writer.write(resp_bytes)
             await writer.drain()
+        except asyncio.IncompleteReadError as e:
+            # A client (or TCP health probe) closed the connection
+            # before sending the full 4-byte length prefix — benign
+            # and expected on GCE where the load balancer dials then
+            # immediately closes.  Demoted to DEBUG so the journal
+            # stays readable during incident triage.  Mid-body
+            # IncompleteRead is still DEBUG for the same reason.
+            logger.debug(f"RPC client closed early: {e}")
         except Exception as e:
             logger.error(f"RPC error: {e}")
         finally:
@@ -3116,9 +3130,15 @@ class Server(SharedRuntimeMixin):
         addr = f"{host}:{port}"
         if addr in self.peers and self.peers[addr].is_connected:
             return
+        # Dedup concurrent dials: a second call while the first is
+        # still inside asyncio.open_connection must no-op, or the
+        # seed loop and the maintenance tick produce duplicate sockets.
+        if addr in self._connecting:
+            return
         if self.ban_manager.is_banned(addr):
             logger.debug(f"Skipping banned peer {addr}")
             return
+        self._connecting.add(addr)
         # Match the listener's TLS setting on the outbound side.  Both
         # peers of a TLS-enabled connection must negotiate TLS or the
         # handshake fails — this is the outbound half of the fix at
@@ -3185,6 +3205,7 @@ class Server(SharedRuntimeMixin):
             # honest state, drop the rate-limit bucket, and close the
             # socket.  Without this, a dead outbound lingers with
             # is_connected=True forever and blocks reconnect.
+            self._connecting.discard(addr)
             if peer is not None:
                 peer.is_connected = False
             self.rate_limiter.remove_peer(addr)
