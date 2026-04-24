@@ -101,6 +101,7 @@ messagechain verify-key                         # confirm backup
 messagechain account                            # print your address + entity_id
 messagechain balance                            # liquid + staked tokens
 messagechain send "hello"                       # post a message
+messagechain send "reply" --prev <tx_hash>      # reply/chain to a prior message
 messagechain transfer --to mc1… --amount 100    # send tokens
 messagechain read --last 50                     # recent messages
 messagechain estimate-fee --message "hi"        # fee preview

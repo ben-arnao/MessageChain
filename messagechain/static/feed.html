@@ -95,10 +95,32 @@
     gap: 0.3rem;
   }
   .msg .prev .arrow { color: var(--accent); }
-  .msg .prev .ref {
+  .msg .prev a.ref {
+    color: var(--accent);
+    text-decoration: none;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
+  }
+  .msg .prev a.ref:hover { text-decoration: underline; }
+  .msg .prev a.ref.missing {
+    color: var(--muted);
+    cursor: default;
+    pointer-events: none;
+  }
+  /* When the user clicks a ref link the referenced card becomes the
+     URL fragment target; highlight it briefly so the scroll lands
+     somewhere visible.  Keeps state in the URL so it survives a
+     feed repaint that recreates the card element. */
+  .msg:target {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    animation: mc-flash 1.8s ease-out;
+  }
+  @keyframes mc-flash {
+    0%   { background: color-mix(in srgb, var(--accent) 25%, var(--card)); }
+    100% { background: var(--card); }
   }
   .msg.empty {
     text-align: center;
@@ -152,9 +174,16 @@
     return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
   }
 
-  function renderMessage(m) {
+  function renderMessage(m, knownHashes) {
     const card = document.createElement("div");
     card.className = "msg";
+    // Card id = "tx-" + full tx_hash so a `prev` anchor can jump here.
+    // Using the full hash (not the shortened one) matches the data
+    // key we get from /v1/latest, and keeps anchors stable across
+    // feed repaints.
+    if (m.tx_hash) {
+      card.id = "tx-" + m.tx_hash;
+    }
     const meta = document.createElement("div");
     meta.className = "meta";
     const entity = document.createElement("span");
@@ -174,10 +203,21 @@
       const arrow = document.createElement("span");
       arrow.className = "arrow";
       arrow.textContent = "↳";
-      const ref = document.createElement("span");
+      const ref = document.createElement("a");
       ref.className = "ref";
       ref.textContent = "refs " + shortHex(m.prev, 10, 6);
       ref.title = m.prev;
+      // Anchor-jump to the referenced card when it's in the current
+      // feed window.  When the target isn't rendered (older than the
+      // last LIMIT messages), mark the link as `missing` so styling
+      // goes muted and pointer-events disable — the user sees there's
+      // a reference but it's out of view rather than a broken click.
+      if (knownHashes.has(m.prev)) {
+        ref.href = "#tx-" + m.prev;
+      } else {
+        ref.classList.add("missing");
+        ref.title = m.prev + " (older than this view)";
+      }
       prevRow.appendChild(arrow);
       prevRow.appendChild(ref);
       card.appendChild(prevRow);
@@ -198,10 +238,26 @@
       feedEl.appendChild(empty);
       return;
     }
+    // Build the set of tx_hashes present in THIS render pass so
+    // renderMessage can decide whether a `prev` anchor has a target.
+    // Out-of-window refs get muted styling instead of a dead link.
+    const knownHashes = new Set();
     for (const m of messages) {
-      feedEl.appendChild(renderMessage(m));
+      if (m.tx_hash) knownHashes.add(m.tx_hash);
+    }
+    for (const m of messages) {
+      feedEl.appendChild(renderMessage(m, knownHashes));
     }
     statusEl.textContent = "Chain height " + height + " · showing " + messages.length + " newest";
+    // If the URL already has a fragment (user landed here via an
+    // inbound link or an earlier click), re-scroll to it now that the
+    // target card has been re-rendered.  Without this, a poll()
+    // repaint silently breaks the :target selector and the user
+    // loses their place.
+    if (location.hash && document.getElementById(location.hash.slice(1))) {
+      const target = document.getElementById(location.hash.slice(1));
+      target.scrollIntoView({ block: "center", behavior: "instant" });
+    }
   }
 
   async function poll() {
