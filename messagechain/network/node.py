@@ -20,6 +20,7 @@ import os
 import time
 from collections import OrderedDict
 from messagechain.config import (
+    CHAIN_ID,
     DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_BLOCK_RELAY_ONLY_SLOTS, OUTBOUND_FULL_RELAY_SLOTS,
@@ -27,6 +28,8 @@ from messagechain.config import (
     MEMPOOL_DIGEST_MAX_HASHES, MEMPOOL_DIGEST_MIN_INTERVAL_SEC,
     MAX_BLOCK_HEX_SIZE, validate_block_hex_size,
 )
+
+_CHAIN_ID_STR = CHAIN_ID.decode("ascii")
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.mempool import Mempool
@@ -740,6 +743,7 @@ class Node(SharedRuntimeMixin):
                     "best_block_hash": latest.block_hash.hex() if latest else "",
                     "cumulative_weight": self._current_cumulative_weight(),
                     "genesis_hash": our_genesis_hex,
+                    "chain_id": _CHAIN_ID_STR,
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -846,6 +850,33 @@ class Node(SharedRuntimeMixin):
                 )
                 peer.is_connected = False
                 return
+
+            # chain_id cross-chain guard (defense-in-depth over genesis_hash).
+            # Absent field = legacy peer → tolerate (mirrors the legacy-genesis
+            # rule).  Present but non-string, or present and != our CHAIN_ID,
+            # = hard reject so a fork that remints an identical genesis still
+            # can't silently peer with us.
+            if "chain_id" in msg.payload:
+                peer_chain_id = msg.payload["chain_id"]
+                if not isinstance(peer_chain_id, str):
+                    self.ban_manager.record_offense(
+                        address, OFFENSE_PROTOCOL_VIOLATION, "invalid_chain_id"
+                    )
+                    peer.is_connected = False
+                    return
+                if peer_chain_id != _CHAIN_ID_STR:
+                    peer_short = peer_chain_id[:32]
+                    logger.warning(
+                        f"chain_id mismatch from {peer.address}: "
+                        f"peer={peer_short!r} ours={_CHAIN_ID_STR!r} — closing."
+                    )
+                    self.ban_manager.record_offense(
+                        address,
+                        OFFENSE_PROTOCOL_VIOLATION,
+                        f"chain_id_mismatch:{peer_short}:{_CHAIN_ID_STR}",
+                    )
+                    peer.is_connected = False
+                    return
 
             # M1: Bind the TOFU TLS pin to the declared entity_id.
             # A peer that pinned a legitimate cert on first sight cannot
