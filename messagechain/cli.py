@@ -3336,7 +3336,7 @@ def cmd_migrate_chain_db(args):
         )
         return
 
-    if disk_version == 1 and _SCHEMA_VERSION == 2:
+    if disk_version == 1 and _SCHEMA_VERSION >= 2:
         print(
             f"Migrating chain.db at {db_path} from schema v1 to v2 "
             "(replaying block history to rebuild reputation, "
@@ -3344,10 +3344,27 @@ def cmd_migrate_chain_db(args):
             "supply_meta counters)...",
         )
         summary = db.migrate_schema_v1_to_v2()
-        print("Migration complete.")
+        print("v1 -> v2 migration complete.")
         for k, v in summary.items():
             label = k.replace("_", " ").title()
             print(f"  {label}: {v}")
+        # Fall through to v2 -> v3 if the binary is even newer.
+        disk_version = 2
+
+    if disk_version == 2 and _SCHEMA_VERSION == 3:
+        print(
+            f"Migrating chain.db at {db_path} from schema v2 to v3 "
+            "(backfilling the tx_locations index used by strict-prev "
+            "pointer resolution)...",
+        )
+        summary = db.migrate_schema_v2_to_v3()
+        print("v2 -> v3 migration complete.")
+        for k, v in summary.items():
+            label = k.replace("_", " ").title()
+            print(f"  {label}: {v}")
+        return
+
+    if disk_version == _SCHEMA_VERSION:
         return
 
     print(
