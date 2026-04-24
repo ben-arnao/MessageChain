@@ -145,8 +145,29 @@ def cmd_send_message(args):
         fee_input = input(f"Fee [{suggested}]: ").strip()
         fee = int(fee_input) if fee_input else suggested
 
+    # Optional --prev pointer: parse & validate before we burn a
+    # WOTS+ leaf on signing.  The server will re-validate strict-prev
+    # against the chain, but catching malformed input here avoids a
+    # doomed signature + rejection round-trip.
+    prev_bytes = None
+    if getattr(args, "prev", None):
+        prev_hex = args.prev.strip()
+        if len(prev_hex) != 64:
+            print(
+                f"Error: --prev must be exactly 64 hex chars "
+                f"(got {len(prev_hex)})."
+            )
+            sys.exit(1)
+        try:
+            prev_bytes = bytes.fromhex(prev_hex)
+        except ValueError:
+            print("Error: --prev is not valid hex.")
+            sys.exit(1)
+
     # Create and sign transaction locally
-    tx = create_transaction(entity, message, fee=fee, nonce=nonce)
+    tx = create_transaction(
+        entity, message, fee=fee, nonce=nonce, prev=prev_bytes,
+    )
 
     # Submit to server
     print(f"Submitting transaction...")
@@ -390,6 +411,17 @@ def main():
     send_parser = subparsers.add_parser("send-message", help="Send a message to the chain")
     send_parser.add_argument("-m", "--message", type=str, help="Message text (or enter interactively)")
     send_parser.add_argument("-f", "--fee", type=int, help="Transaction fee (or enter interactively)")
+    send_parser.add_argument(
+        "--prev",
+        type=str,
+        help=(
+            "Optional tx_hash (64 hex chars) this message references as "
+            "its predecessor — e.g. a reply, or the previous chunk of a "
+            "longer chained document.  The referenced tx must already be "
+            "on-chain in a strictly earlier block.  Adds 33 stored bytes "
+            "to the fee basis but does NOT count against the 1024-char cap."
+        ),
+    )
 
     # transfer
     transfer_parser = subparsers.add_parser("transfer", help="Transfer tokens to another entity")

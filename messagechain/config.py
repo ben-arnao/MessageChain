@@ -3088,6 +3088,18 @@ BLOCK_BYTES_RAISE_HEIGHT = 4_500         # Tier 9 (pulled forward alongside Tier
 FEE_PER_STORED_BYTE_POST_RAISE = 3       # 3× Tier 8 floor — preserves bloat discipline under wider cap
 TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (was 10, 50% of 20)
 
+# Tier 10 — `prev` pointer activation.
+# Enables a single 32-byte `prev` pointer on message transactions (tx
+# version=2), forming a single-linked list of prior messages.  Strict:
+# `prev` must resolve to a tx that already appears on-chain in a
+# strictly earlier block (or same block at an earlier tx index).
+# Bytes are charged at the per-stored-byte rate (33B: 1B presence flag +
+# 32B tx_hash) but do NOT count against MAX_MESSAGE_CHARS — the cap is
+# a human-content constraint, the pointer is structural metadata.
+# Pre-activation: tx version must be 1 (no prev field).  Post-activation:
+# version=2 is accepted; version=1 remains valid for prev-less txs.
+PREV_POINTER_HEIGHT = 6_000              # Tier 10
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3103,6 +3115,12 @@ assert TARGET_BLOCK_SIZE_POST_RAISE < MAX_TXS_PER_BLOCK, (
     "TARGET_BLOCK_SIZE_POST_RAISE must fit under the new MAX_TXS_PER_BLOCK "
     "cap — a target at or above the cap means the EIP-1559 controller "
     "can never see 'above-target' blocks and base fee only ever drops"
+)
+assert PREV_POINTER_HEIGHT > BLOCK_BYTES_RAISE_HEIGHT, (
+    "PREV_POINTER_HEIGHT must follow BLOCK_BYTES_RAISE_HEIGHT — the "
+    "prev-pointer feature prices the 33 extra bytes at the per-stored-"
+    "byte rate, so the linear fee formula and its post-raise per-byte "
+    "multiplier must already be active"
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3167,6 +3185,7 @@ for _fork_name, _fork_height in (
     ("FLAT_FEE_HEIGHT", FLAT_FEE_HEIGHT),
     ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
     ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
+    ("PREV_POINTER_HEIGHT", PREV_POINTER_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
