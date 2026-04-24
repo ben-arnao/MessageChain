@@ -4,6 +4,22 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] — 2026-04-24
+
+Patch release. Display-only bugfix in `messagechain stake` and
+`messagechain unstake`: the CLI attempted to print
+`result['staked']` and `result['balance']` on successful
+submission, but the RPC handlers return `{entity_id, tx_hash,
+status}` — raising `KeyError` and exiting 1 even though the tx
+had already been queued for inclusion. Operators saw the
+exception and reasonably assumed the submission failed. The fix
+prints `tx_hash` and `status` from the real response and adds a
+regression test that exercises both commands against the actual
+server contract so the next contract shift fails at test time
+rather than silently on mainnet. No consensus change; operators
+can upgrade at their convenience, but should upgrade before
+driving the next stake/unstake so the CLI exits cleanly.
+
 ## [1.7.0] — 2026-04-24
 
 Minor release. Extends the WOTS+ leaf-reuse gate to evidence txs
