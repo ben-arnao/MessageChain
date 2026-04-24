@@ -123,11 +123,16 @@ TCP 9333/9334 open. `key-status` warns you when to rotate your
 WOTS+ signing key before it exhausts.
 
 ```bash
+messagechain init                               # one-shot: keyfile, data-dir, systemd units
+messagechain doctor                             # preflight: perms, ports, seeds, disk
+messagechain config set auto_upgrade false      # toggle onboard.toml flags
 messagechain start --mine                       # run a validator
 messagechain stake --amount 10000               # lock as validator stake
 messagechain unstake --amount 5000              # ~15-day unbonding (was 7d pre block 50,000)
 messagechain key-status                         # WOTS+ leaf usage; when to rotate
 messagechain rotate-key                         # fresh keypair, old key retired
+messagechain rotate-key-if-needed               # daily watchdog; rotates at >=95% consumed
+messagechain upgrade                            # install the latest mainnet tag
 messagechain set-authority-key --authority-pubkey <cold_hex>
 messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
