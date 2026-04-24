@@ -1,6 +1,12 @@
 """Shared pytest configuration and fixtures for MessageChain tests."""
 
+import os
+
 import pytest
+
+# Guard the CLI `start --mine` reachability probe so unit tests never hit
+# the network. Tests that specifically exercise the probe clear this.
+os.environ.setdefault("MC_SKIP_REACHABILITY", "1")
 
 # ---------------------------------------------------------------------------
 # Reduce MERKLE_TREE_HEIGHT for tests (height=4 -> 16 leaves instead of 1M).
