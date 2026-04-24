@@ -1,0 +1,11 @@
+[Unit]
+Description=MessageChain weekly auto-upgrade timer
+
+[Timer]
+OnCalendar=Sun 03:17
+RandomizedDelaySec=30min
+Persistent=true
+Unit=messagechain-upgrade.service
+
+[Install]
+WantedBy=timers.target

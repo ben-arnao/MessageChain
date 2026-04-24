@@ -77,6 +77,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Kept callable here as `messagechain start --keyfile ...` for
     # systemd-unit compatibility; redundant but not conflicting.
     start.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
+    start.add_argument(
+        "--skip-reachability-probe", action="store_true",
+        help="Skip the best-effort external-reachability probe on --mine",
+    )
+    start.add_argument(
+        "--yes-nat", action="store_true",
+        help="Acknowledge that this validator is behind NAT; continue despite a failed probe",
+    )
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
     start.add_argument(
         "--rpc-bind", type=str, default="127.0.0.1",
@@ -445,6 +453,10 @@ def build_parser() -> argparse.ArgumentParser:
             "chain-level checks run."
         ),
     )
+    status.add_argument(
+        "--full", action="store_true",
+        help="Also print validator-set summary, peer count, and auto-* state",
+    )
 
     # --- proposals ---
     proposals = sub.add_parser(
@@ -667,6 +679,89 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", "-y", action="store_true",
         help="Skip interactive confirmation.",
     )
+
+    # --- init ---
+    init_p = sub.add_parser(
+        "init",
+        help="One-shot operator setup: keyfile, data-dir, systemd units",
+        description=(
+            "Generate a private key (or adopt an existing one via --keyfile), "
+            "lay out the data directory, write /etc/messagechain/onboard.toml, "
+            "and emit systemd unit files. Does not enable any services."
+        ),
+    )
+    init_p.add_argument("--init-data-dir", dest="init_data_dir", type=str, default=None,
+                        help="Data directory to lay out (default: /var/lib/messagechain as root, ~/.messagechain/chaindata otherwise)")
+    init_p.add_argument(
+        "--systemd", dest="systemd", action="store_true", default=None,
+        help="Emit systemd unit files (default: on when running as root)",
+    )
+    init_p.add_argument(
+        "--no-systemd", dest="systemd", action="store_false",
+    )
+    init_p.add_argument(
+        "--auto-upgrade", dest="auto_upgrade", action="store_true", default=True,
+    )
+    init_p.add_argument(
+        "--no-auto-upgrade", dest="auto_upgrade", action="store_false",
+    )
+    init_p.add_argument(
+        "--auto-rotate", dest="auto_rotate", action="store_true", default=True,
+    )
+    init_p.add_argument(
+        "--no-auto-rotate", dest="auto_rotate", action="store_false",
+    )
+    init_p.add_argument("--yes", action="store_true",
+                        help="Non-interactive; accept all defaults")
+    init_p.add_argument("--print-only", action="store_true",
+                        help="Dry-run: print what would happen, write nothing")
+
+    # --- doctor ---
+    doctor_p = sub.add_parser(
+        "doctor",
+        help="Local-host preflight checks before starting a validator",
+        description=(
+            "Run a battery of local checks: Python version, data-dir + "
+            "keyfile permissions, disk free, P2P/RPC port bindability, "
+            "seed reachability, and (when auto-* is enabled) the "
+            "corresponding systemd timers. Exits 0/1/2 for green/yellow/red."
+        ),
+    )
+    doctor_p.add_argument("--doctor-data-dir", dest="doctor_data_dir", type=str, default=None,
+                          help="Data directory to inspect (defaults from onboard.toml)")
+    doctor_p.add_argument("--check-timers", action="store_true",
+                          help="Also probe systemctl is-enabled for auto-* timers")
+
+    # --- rotate-key-if-needed ---
+    rotate_if_p = sub.add_parser(
+        "rotate-key-if-needed",
+        help="Auto-rotate the validator's signing key when >= 95%% consumed",
+        description=(
+            "Queries the local chain for the current leaf watermark, computes "
+            "the consumption percentage, and rotates only when >= 95%%. Exits "
+            "0 on any no-op path. Designed to run daily under systemd."
+        ),
+    )
+    rotate_if_p.add_argument("--rotate-yes", dest="rotate_yes", action="store_true")
+    rotate_if_p.add_argument("--server", type=str, default=None)
+
+    # --- config ---
+    config_p = sub.add_parser(
+        "config",
+        help="Read or write onboard.toml flags",
+        description=(
+            "`messagechain config get <key>` prints the value; "
+            "`messagechain config set <key> <value>` writes it. "
+            "Supported keys: auto_upgrade, auto_rotate, data_dir, keyfile, entity_id_hex."
+        ),
+    )
+    config_sub = config_p.add_subparsers(dest="config_action", required=True)
+    config_get_p = config_sub.add_parser("get")
+    config_get_p.add_argument("key")
+    config_set_p = config_sub.add_parser("set")
+    config_set_p.add_argument("key")
+    config_set_p.add_argument("value")
+
 
     return parser
 
@@ -1196,8 +1291,20 @@ def cmd_start(args):
     else:
         # Fall back to the shipped default seeds from config, so users
         # don't need to know a peer host:port out of band.
-        from messagechain.config import SEED_NODES
+        from messagechain.config import SEED_NODES, DNS_SEED_DOMAINS
         seed_nodes = list(SEED_NODES)
+        # Merge DNS-TXT discovered seeds; dedupe, preserve order.
+        if DNS_SEED_DOMAINS:
+            try:
+                from messagechain.network.seed_discovery import discover_dns_seeds
+                extra = discover_dns_seeds(DNS_SEED_DOMAINS)
+                seen = set(seed_nodes)
+                for entry in extra:
+                    if entry not in seen:
+                        seed_nodes.append(entry)
+                        seen.add(entry)
+            except Exception:
+                pass
         if seed_nodes:
             seed_str = ", ".join(f"{h}:{p}" for h, p in seed_nodes)
             print(f"Using default seed nodes: {seed_str}")
@@ -1245,6 +1352,27 @@ def cmd_start(args):
 
         server.set_wallet_entity(entity)
         print(f"\nMining as: {entity.entity_id_hex[:16]}...")
+
+        # Best-effort external-reachability probe. Runs before the async
+        # loop so the operator sees a visible NAT/firewall warning at
+        # startup, not buried in mid-flight logs. Skipped under tests
+        # via MC_SKIP_REACHABILITY=1.
+        if not getattr(args, "skip_reachability_probe", False):
+            from messagechain.runtime import onboarding as _ob
+            level, detail = _ob.run_reachability_probe(args.port)
+            if level == 2 and not getattr(args, "yes_nat", False):
+                print()
+                print("  [!] External reachability probe FAILED:")
+                print(f"      {detail}")
+                print("      Inbound P2P from the public internet is likely blocked.")
+                print("      Check NAT port-forwarding and host firewall.")
+                print("      To continue anyway: --yes-nat")
+                print("      To skip the probe entirely: --skip-reachability-probe")
+                sys.exit(2)
+            elif level == 1:
+                print(f"  [warn] reachability probe inconclusive: {detail}")
+            elif level == 0 and "skipped" not in detail:
+                print(f"  reachability: {detail}")
 
         # Nudge: if this validator has no separate cold authority key,
         # every destructive path (unstake, emergency revoke) is controlled
@@ -2794,8 +2922,50 @@ def cmd_status(args):
 
     # Emit report
     print(f"=== Status check against {host}:{port} ===\n")
+
+    # Surface onboard auto-* state at the top so an operator reading a
+    # single status pane sees whether their upgrade/rotate timers are
+    # armed. Tolerate missing onboard config silently.
+    try:
+        from messagechain.runtime import onboarding as _ob
+        onboard_cfg = _ob.read_onboard_config()
+        print(
+            f"  Auto-upgrade: {'ON' if onboard_cfg.get('auto_upgrade') else 'OFF'}"
+            f"  |  Auto-rotate: {'ON' if onboard_cfg.get('auto_rotate') else 'OFF'}"
+        )
+        print()
+    except Exception:
+        pass
+
     for line in lines:
         print(line)
+
+    if getattr(args, "full", False):
+        print()
+        print("=== Full view ===")
+        vr = rpc_call(host, port, "list_validators", {})
+        if vr.get("ok"):
+            vlist = vr["result"].get("validators", [])[:10]
+            print(f"  Top validators ({len(vlist)}):")
+            for v in vlist:
+                eid = v.get("entity_id", "")[:16]
+                print(
+                    f"    {eid}...  stake={v.get('staked', 0)}  "
+                    f"share={v.get('stake_pct', 0):.2f}%  "
+                    f"blocks={v.get('blocks_produced', 0)}"
+                )
+        pr = rpc_call(host, port, "get_peers", {})
+        if pr.get("ok"):
+            count = pr["result"].get("count", len(pr["result"].get("peers", [])))
+            print(f"  Peers: {count}")
+        if args.entity:
+            er = rpc_call(host, port, "get_entity", {"entity_id": args.entity})
+            if er.get("ok"):
+                e = er["result"]
+                print(
+                    f"  This node:  balance={e.get('balance', 0)}  "
+                    f"staked={e.get('staked', 0)}"
+                )
     print()
     verdict = {0: "GREEN (ok)", 1: "YELLOW (needs attention)",
                2: "RED (urgent)"}[worst]
@@ -3580,6 +3750,149 @@ def cmd_upgrade(args):
     )
 
 
+def cmd_init(args):
+    """Operator setup: keyfile + data-dir + onboard.toml + systemd units."""
+    from messagechain.runtime import onboarding as _ob
+
+    plan = _ob.plan_init(
+        data_dir=getattr(args, "init_data_dir", None) or getattr(args, "data_dir", None),
+        keyfile=getattr(args, "keyfile", None),
+        systemd=getattr(args, "systemd", None),
+        auto_upgrade=getattr(args, "auto_upgrade", True),
+        auto_rotate=getattr(args, "auto_rotate", True),
+        print_only=getattr(args, "print_only", False),
+    )
+
+    if getattr(args, "print_only", False):
+        print("=== init (dry-run) ===\n")
+        print(f"  data_dir:       {plan.data_dir}")
+        print(f"  keyfile:        {plan.keyfile}")
+        print(f"  onboard_config: {plan.onboard_config}")
+        print(f"  entity_id_hex:  {plan.entity_id_hex or '(will generate)'}")
+        print(f"  auto_upgrade:   {plan.auto_upgrade}")
+        print(f"  auto_rotate:    {plan.auto_rotate}")
+        print(f"  systemd:        {plan.systemd}")
+        if plan.systemd_units:
+            print("\n  systemd units to write:")
+            for path in plan.systemd_units:
+                print(f"    {path}")
+        print()
+        print(plan.next_steps_text())
+        return
+
+    _ob.apply_init(plan)
+    print()
+    print(plan.next_steps_text())
+
+
+def cmd_doctor(args):
+    """Preflight checks. Exit 0 green / 1 yellow / 2 red."""
+    from messagechain.runtime import onboarding as _ob
+
+    cfg = _ob.read_onboard_config()
+    ddir = getattr(args, "doctor_data_dir", None) or getattr(args, "data_dir", None)
+    worst, checks = _ob.run_doctor(
+        cfg,
+        data_dir=ddir,
+        check_timers=getattr(args, "check_timers", False),
+    )
+    print("=== doctor ===\n")
+    for c in checks:
+        tag = {0: "OK  ", 1: "WARN", 2: "FAIL"}[c.level]
+        line = f"  [{tag}] {c.label}: {c.status}"
+        if c.detail:
+            line += f" - {c.detail}"
+        print(line)
+    print()
+    verdict = {0: "GREEN", 1: "YELLOW (warnings)", 2: "RED (blocking)"}[worst]
+    print(f"  Result: {verdict}")
+    sys.exit(worst)
+
+
+def cmd_rotate_key_if_needed(args):
+    """Daily watchdog: rotate when the leaf watermark is >= 95%."""
+    from messagechain.runtime import onboarding as _ob
+    from messagechain.config import MERKLE_TREE_HEIGHT
+
+    cfg = _ob.read_onboard_config()
+    entity_hex = cfg.get("entity_id_hex", "")
+    if not entity_hex:
+        print("rotate-key-if-needed: entity_id_hex not in onboard.toml; run `messagechain init` first")
+        sys.exit(1)
+
+    host, port = _parse_server(getattr(args, "server", None))
+    from client import rpc_call
+
+    def fetcher() -> int:
+        r = rpc_call(host, port, "get_leaf_watermark", {"entity_id": entity_hex})
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error", "rpc error"))
+        return int(r["result"].get("leaf_watermark", 0))
+
+    def get_tree_height() -> int:
+        # Prefer chain-reported tree height; fall back to config.
+        r = rpc_call(host, port, "get_entity", {"entity_id": entity_hex})
+        if r.get("ok"):
+            h = r["result"].get("tree_height")
+            if isinstance(h, int) and h > 0:
+                return h
+        return MERKLE_TREE_HEIGHT
+
+    def has_cold_key() -> bool:
+        r = rpc_call(host, port, "get_authority_key", {"entity_id": entity_hex})
+        if not r.get("ok"):
+            return False
+        auth = r["result"].get("authority_pubkey")
+        own = r["result"].get("public_key")
+        return bool(auth) and auth != own
+
+    tree_height = get_tree_height()
+    cold = has_cold_key()
+
+    def rotate_now():
+        # Delegate to the existing rotate-key command. Build a minimal
+        # namespace so cmd_rotate_key can reuse the same interactive
+        # flags (--yes, --server). Prefer the keyfile listed in
+        # onboard.toml so the timer unit can run unattended.
+        import argparse as _ap
+        kf = getattr(args, "keyfile", None) or cfg.get("keyfile") or None
+        ns = _ap.Namespace(
+            server=args.server, yes=True, fee=None, keyfile=kf,
+        )
+        cmd_rotate_key(ns)
+
+    rc = _ob.run_rotate_if_needed(
+        watermark_fetcher=fetcher,
+        has_cold_authority_key=cold,
+        tree_height=tree_height,
+        rotate_impl=rotate_now,
+    )
+    sys.exit(rc)
+
+
+def cmd_config(args):
+    """Read or write onboard.toml flags."""
+    from messagechain.runtime import onboarding as _ob
+
+    action = getattr(args, "config_action", None)
+    key = args.key
+    try:
+        if action == "get":
+            print(_ob.config_get(key))
+        elif action == "set":
+            path = _ob.config_set(key, args.value)
+            print(f"wrote {key} to {path}")
+        else:
+            print("unknown action")
+            sys.exit(2)
+    except KeyError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -3621,6 +3934,10 @@ def main():
         "gen-tor-config": cmd_gen_tor_config,
         "migrate-chain-db": cmd_migrate_chain_db,
         "upgrade": cmd_upgrade,
+        "init": cmd_init,
+        "doctor": cmd_doctor,
+        "rotate-key-if-needed": cmd_rotate_key_if_needed,
+        "config": cmd_config,
     }
 
     handler = commands.get(args.command)

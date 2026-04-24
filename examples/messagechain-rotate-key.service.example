@@ -1,0 +1,40 @@
+[Unit]
+Description=MessageChain auto key-rotation runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=messagechain
+Group=messagechain
+WorkingDirectory=/opt/messagechain
+ExecStart=/usr/bin/env python3 -m messagechain rotate-key-if-needed --yes
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — mirrors the validator unit.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+PrivateIPC=true
+RemoveIPC=true
+ProcSubset=pid
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadWritePaths=/var/lib/messagechain
+ReadOnlyPaths=/etc/messagechain /opt/messagechain
