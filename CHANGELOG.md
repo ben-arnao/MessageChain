@@ -4,6 +4,26 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1] — 2026-04-24
+
+Patch release — P2P session dedup. No consensus changes.
+
+### Fixed
+
+- **Entity-level peer session dedup.** When two validators dialed
+  each other simultaneously, each ended up with two live sockets to
+  the same remote entity (one inbound on an ephemeral source port
+  plus one outbound to the remote's listen port). The existing
+  address-level dial dedup (keyed on `host:port`) couldn't catch
+  this because the two sockets had genuinely different `host:port`
+  tuples. Add a symmetric post-handshake tiebreaker — keep the
+  session where the LOWER entity_id is the outbound dialer. Both
+  ends apply the same rule against the same id pair, so both ends
+  close the same TCP connection and the network converges to one
+  session per peer pair. Observed on live mainnet after 1.5.0
+  rollout; does not affect consensus or message delivery, only peer
+  bookkeeping and metric honesty. (62eeabd, 18083cb)
+
 ## [1.5.0] — 2026-04-24
 
 Minor release — validator operator onboarding automation plus a P2P
