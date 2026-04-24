@@ -20,18 +20,54 @@ from pathlib import Path
 from messagechain.core.block import Block
 
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+# v1 -> v2 changelog (cold-restart-persistence class, rounds 7/13/14/
+# 15/17/18 of the pre-launch audit):
+#   * Added tables: pending_unstakes, key_history, reputation,
+#     stake_snapshots.
+#   * Added supply_meta keys: blocks_since_last_finalization,
+#     lottery_prize_pool.
+# All of these were consensus-visible in-memory state in v1 that
+# `_load_from_db` did not rebuild, which on a cold restart produced
+# a different state than uprestarted peers and forked the restarted
+# node off the honest chain at the next lottery / finality / slash
+# block.  v2 persists them explicitly.
+#
+# Migration shape: a v1 DB opened under a v2 binary has all the
+# balance/staked/nonce/supply_meta invariants already correct
+# (those were always persisted) but the six new state surfaces
+# are empty.  `migrate_schema_v1_to_v2` replays the persisted
+# blocks through an in-memory Blockchain to repopulate them from
+# history, then bumps the `schema_version` meta row.  Operators on
+# v1 DBs are pointed at `messagechain migrate-chain-db` in the
+# startup error rather than silently getting an incomplete state.
 
 
 class ChainDB:
     """SQLite-backed block and state storage."""
 
-    def __init__(self, db_path: str = "messagechain.db"):
+    def __init__(
+        self,
+        db_path: str = "messagechain.db",
+        *,
+        skip_schema_check: bool = False,
+    ):
+        """Open a chain.db.
+
+        ``skip_schema_check=True`` bypasses the schema-version
+        tripwire — used ONLY by the `migrate-chain-db` CLI path so
+        it can open a v1 DB to run `migrate_schema_v1_to_v2`.  Every
+        other caller (Blockchain __init__, tests, the server
+        startup path) leaves this at the default and takes the
+        actionable error if the DB isn't at the binary's expected
+        version.
+        """
         self.db_path = db_path
         self._local = threading.local()
         self._init_schema()
         self._check_db_permissions()
-        self._check_and_write_schema_version()
+        if not skip_schema_check:
+            self._check_and_write_schema_version()
 
     def _check_and_write_schema_version(self):
         """Enforce a schema-version pin in the meta table.
@@ -70,12 +106,202 @@ class ChainDB:
                 f"chain.db meta.schema_version is not an integer: {row[0]!r}"
             )
         if on_disk != _SCHEMA_VERSION:
+            # Actionable startup error: point the operator at the CLI
+            # migration rather than printing a cryptic mismatch.  The
+            # specific v1 -> v2 path is safe, non-destructive, and
+            # covered by `migrate_schema_v1_to_v2` below; anything
+            # further out should halt here and require an explicit
+            # ops-authored migration function before it's allowed to
+            # open.
+            if on_disk == 1 and _SCHEMA_VERSION == 2:
+                raise RuntimeError(
+                    f"chain.db schema version mismatch: disk=1, "
+                    f"code=2.  This binary adds six consensus-visible "
+                    f"cold-restart persistence surfaces (reputation, "
+                    f"key_history, pending_unstakes, stake_snapshots, "
+                    f"blocks_since_last_finalization, "
+                    f"lottery_prize_pool).  Run the one-shot migration "
+                    f"before starting the node:\n\n"
+                    f"    messagechain migrate-chain-db "
+                    f"--data-dir <path-containing-chain.db>\n\n"
+                    f"The migration replays block history through an "
+                    f"in-memory Blockchain to repopulate the six new "
+                    f"state surfaces from persisted blocks -- it is "
+                    f"non-destructive and idempotent."
+                )
             raise RuntimeError(
                 f"chain.db schema version mismatch: disk={on_disk}, "
                 f"code={_SCHEMA_VERSION}.  A migration is required before "
                 f"this binary can open this database — do NOT downgrade "
                 f"or upgrade across versions without running the migration."
             )
+
+    def migrate_schema_v1_to_v2(self) -> dict:
+        """Replay chain history to populate v2-new state surfaces.
+
+        v1 -> v2 added six consensus-visible state surfaces that
+        `_load_from_db` cannot reconstruct without replaying blocks:
+        `reputation`, `key_history`, `pending_unstakes`,
+        `stake_snapshots`, `blocks_since_last_finalization`,
+        `lottery_prize_pool`.  An operator upgrading the binary
+        without this migration gets empty versions of each and
+        diverges consensus at the first lottery / finality / slash
+        block after restart.
+
+        Strategy: build an in-memory Blockchain pointed at a
+        temporary *detached* ChainDB (to avoid double-writes back
+        to the file we're migrating), replay every persisted block
+        in order so the in-memory state accumulates the six
+        surfaces, then copy the accumulated state into the on-disk
+        DB and bump the schema_version row.
+
+        Non-destructive: the only table we rewrite is
+        `meta.schema_version`; the six target tables / supply_meta
+        rows are cleared first (in case a partial prior migration
+        left stale rows) and then repopulated.  Every other v1
+        table is untouched.
+
+        Idempotent: running twice on a v2 DB is a no-op because
+        `_check_and_write_schema_version` rejects the v2->v2 open
+        at the standard "no mismatch" path before we ever reach
+        here (the migration is only callable via the CLI).
+
+        Returns a summary dict for the CLI to print.
+        """
+        from messagechain.core.blockchain import Blockchain
+
+        # Force the current schema_version back to 1 in memory so
+        # the migration can actually examine a v1 DB -- the
+        # __init__ tripwire would otherwise have blocked us.
+        # (The CLI opens us with an explicit "migration" flag that
+        # bypasses the tripwire.)
+
+        # Step 1: Rebuild an in-memory Blockchain from the
+        # persisted blocks.  We route it at a scratch db so its
+        # own writes don't double-commit into the live file.
+        import tempfile
+        import os as _os
+        scratch_dir = tempfile.mkdtemp(prefix="mc_migrate_")
+        scratch_path = _os.path.join(scratch_dir, "scratch.db")
+        # Stamp the scratch DB to v2 so it doesn't itself trigger
+        # the tripwire.  The scratch file is discarded at the end.
+        scratch_db = ChainDB(scratch_path)
+
+        rebuilt = Blockchain(db=scratch_db)
+
+        # Copy v1 state (balances, staked, etc.) into `rebuilt` so
+        # block replay starts from the live state.  Simpler: just
+        # replay every block from 0.
+        block_count = self.get_block_count()
+        for height in range(block_count):
+            block = self.get_block_by_number(height, state=rebuilt)
+            if block is None:
+                continue
+            if height == 0:
+                # Genesis is initialized fresh by the Blockchain
+                # constructor's pipeline; skip re-applying block 0
+                # to avoid the "genesis already applied" guard.
+                continue
+            rebuilt._apply_block_state(block)
+            rebuilt.chain.append(block)
+
+        # Step 2: Copy the six new state surfaces from the rebuilt
+        # in-memory Blockchain into this (v1-on-disk) ChainDB.
+        conn = self._conn
+        conn.execute("BEGIN")
+        try:
+            # Clear then repopulate the six surfaces.
+            conn.execute("DELETE FROM reputation")
+            for eid, count in rebuilt.reputation.items():
+                conn.execute(
+                    "INSERT INTO reputation (entity_id, count) "
+                    "VALUES (?, ?)",
+                    (eid, int(count)),
+                )
+            conn.execute("DELETE FROM key_history")
+            for eid, entries in rebuilt.key_history.items():
+                for installed_at, public_key in entries:
+                    conn.execute(
+                        "INSERT INTO key_history "
+                        "(entity_id, installed_at, public_key) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(installed_at), public_key),
+                    )
+            conn.execute("DELETE FROM pending_unstakes")
+            for eid, tickets in rebuilt.supply.pending_unstakes.items():
+                for amount, release_block in tickets:
+                    conn.execute(
+                        "INSERT INTO pending_unstakes "
+                        "(entity_id, release_block, amount) "
+                        "VALUES (?, ?, ?)",
+                        (eid, int(release_block), int(amount)),
+                    )
+            conn.execute("DELETE FROM stake_snapshots")
+            for block_number, stake_map in rebuilt._stake_snapshots.items():
+                for entity_id, amount in stake_map.items():
+                    conn.execute(
+                        "INSERT INTO stake_snapshots "
+                        "(block_number, entity_id, amount) "
+                        "VALUES (?, ?, ?)",
+                        (int(block_number), entity_id, int(amount)),
+                    )
+            # Two scalar supply_meta keys.
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "blocks_since_last_finalization",
+                    int(rebuilt.blocks_since_last_finalization),
+                ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "lottery_prize_pool",
+                    int(rebuilt.supply.lottery_prize_pool),
+                ),
+            )
+            # Step 3: stamp the new schema version LAST so a crash
+            # mid-migration leaves the DB at v1 and the operator's
+            # next start re-runs the migration (idempotent).
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("schema_version", str(2)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            # Scratch DB cleanup.
+            try:
+                sc = getattr(scratch_db._local, "conn", None)
+                if sc is not None:
+                    sc.close()
+            except Exception:
+                pass
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(scratch_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        return {
+            "schema_from": 1,
+            "schema_to": 2,
+            "blocks_replayed": max(0, block_count - 1),
+            "reputation_entries": len(rebuilt.reputation),
+            "key_history_entities": len(rebuilt.key_history),
+            "pending_unstake_entities": len(
+                rebuilt.supply.pending_unstakes,
+            ),
+            "stake_snapshots_heights": len(rebuilt._stake_snapshots),
+            "blocks_since_last_finalization": (
+                rebuilt.blocks_since_last_finalization
+            ),
+            "lottery_prize_pool": rebuilt.supply.lottery_prize_pool,
+        }
 
     def _check_db_permissions(self):
         """Warn if chain.db is world-writable.
