@@ -2148,6 +2148,20 @@ class Blockchain:
             return self.db.has_block(block_hash)
         return False
 
+    def _prev_tx_lookup(self, tx_hash: bytes) -> tuple[int, int] | None:
+        """Resolve a Tier 10 `prev` pointer via the persisted tx index.
+
+        Returns (block_height, tx_index) for the earliest block the
+        referenced MessageTransaction appears in, or None if it's not
+        on-chain.  When no chain.db is attached (ephemeral Blockchain
+        fixtures), returns None — verify_transaction treats that as
+        "no chain context supplied" and skips the strict-prev check,
+        so unit tests constructing standalone txs keep validating.
+        """
+        if self.db is None:
+            return None
+        return self.db.get_tx_location(tx_hash)
+
     def validate_transaction(
         self, tx: MessageTransaction, *, expected_nonce: int | None = None,
     ) -> tuple[bool, str]:
@@ -2202,7 +2216,11 @@ class Blockchain:
         # A mempool-admitted tx lands in the next block (height+1), so gate
         # the fee-includes-signature rule on that target height.
         if not verify_transaction(
-            tx, public_key, current_height=self.height + 1,
+            tx, public_key,
+            current_height=self.height + 1,
+            prev_lookup=(
+                self._prev_tx_lookup if self.db is not None else None
+            ),
         ):
             return False, "Invalid signature"
 
@@ -6061,9 +6079,14 @@ class Blockchain:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Unknown entity — must register first"
             public_key = self.public_keys[tx.entity_id]
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
-            # applies to consensus verification.
+            # applies to consensus verification.  prev_lookup resolves
+            # Tier 10 prev pointers against the tx_locations index.
             if not verify_transaction(
-                tx, public_key, current_height=block.header.block_number,
+                tx, public_key,
+                current_height=block.header.block_number,
+                prev_lookup=(
+                self._prev_tx_lookup if self.db is not None else None
+            ),
             ):
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
 
@@ -6866,9 +6889,14 @@ class Blockchain:
             pk = self.public_keys[tx.entity_id]
             from messagechain.core.transaction import verify_transaction
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
-            # applies to consensus verification.
+            # applies to consensus verification.  prev_lookup resolves
+            # Tier 10 prev pointers against the tx_locations index.
             if not verify_transaction(
-                tx, pk, current_height=block.header.block_number,
+                tx, pk,
+                current_height=block.header.block_number,
+                prev_lookup=(
+                self._prev_tx_lookup if self.db is not None else None
+            ),
             ):
                 return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
 

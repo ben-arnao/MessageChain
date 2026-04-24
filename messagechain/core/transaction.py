@@ -21,7 +21,18 @@ from messagechain.config import (
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
     BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT,
     BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
+    PREV_POINTER_HEIGHT,
 )
+
+# Tx-logic version that enables the optional `prev` pointer (Tier 10).
+# Version 1 txs hash/sign exactly the pre-fork bytes (backward-compatible).
+# Version 2 txs include the `prev` field (1-byte presence flag, +32 bytes
+# when set) in both _signable_data and the wire form.
+TX_VERSION_PREV_POINTER = 2
+# Raw byte cost of the `prev` field when set (1B presence flag + 32B hash).
+# Added to the per-stored-byte fee basis so pointer-bearing txs pay
+# uniformly for their on-chain footprint.
+PREV_POINTER_STORED_BYTES = 33
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -44,6 +55,15 @@ class MessageTransaction:
     # compression_flag: 0 = raw, 1 = raw-deflate (zlib level 9, header/adler32 stripped).
     # Part of _signable_data — tx_hash commits to the canonical encoding.
     compression_flag: int = RAW_FLAG
+    # `prev` (optional): 32-byte tx_hash this message references as its
+    # immediate predecessor, forming a single-linked list of prior
+    # messages.  Only meaningful at version >= TX_VERSION_PREV_POINTER;
+    # version=1 txs MUST leave this as None.  At version 2, may be None
+    # (no pointer) or exactly 32 bytes.  Strict validation: when set,
+    # the referenced tx_hash must resolve to a tx included in a strictly
+    # earlier block (same-height same-block earlier tx_index is also
+    # accepted at block-validate time).
+    prev: bytes | None = None
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -72,7 +92,7 @@ class MessageTransaction:
         ever checked.
         """
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
-        return (
+        base = (
             CHAIN_ID
             + b"message"  # domain-separation tag: prevents cross-type sig replay
             + struct.pack(">I", self.version)
@@ -84,6 +104,20 @@ class MessageTransaction:
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
         )
+        # Version 1 txs hash the exact pre-fork bytes (backward-compat).
+        # Version 2 txs append a 1-byte presence flag + 32-byte hash if
+        # set.  The flag is part of the signed payload so an attacker
+        # can't flip "no prev" ↔ "prev set" without invalidating the sig.
+        if self.version >= TX_VERSION_PREV_POINTER:
+            if self.prev is None:
+                base += b"\x00"
+            else:
+                if len(self.prev) != 32:
+                    raise ValueError(
+                        f"prev must be exactly 32 bytes, got {len(self.prev)}"
+                    )
+                base += b"\x01" + self.prev
+        return base
 
     @property
     def plaintext(self) -> bytes:
@@ -123,7 +157,7 @@ class MessageTransaction:
         stored bytes — the pair is a lossless round-trip because the
         encoder is deterministic.
         """
-        return {
+        d = {
             "version": self.version,
             "entity_id": self.entity_id.hex(),
             "message": self.plaintext.decode("ascii", errors="replace"),
@@ -134,6 +168,13 @@ class MessageTransaction:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+        # Only surface `prev` in the dict form for version 2+ txs that
+        # actually carry a pointer — version 1 txs and prev-less v2 txs
+        # omit the key entirely so JSON output stays clean and
+        # deserialize() can round-trip pre-fork wire formats unchanged.
+        if self.version >= TX_VERSION_PREV_POINTER and self.prev is not None:
+            d["prev"] = self.prev.hex()
+        return d
 
     def to_bytes(self, state=None) -> bytes:
         """Compact binary encoding for storage/wire.
@@ -187,10 +228,21 @@ class MessageTransaction:
             struct.pack(">d", float(self.timestamp)),
             struct.pack(">Q", self.nonce),
             struct.pack(">Q", self.fee),
+        ]
+        # Version 2 wire form: 1-byte presence flag + 32B hash if set.
+        # Placed BEFORE the signature blob and tx_hash so the prev-
+        # bearing payload travels as a contiguous block — simpler to
+        # parse and keeps the layout stable under future additions.
+        if self.version >= TX_VERSION_PREV_POINTER:
+            if self.prev is None:
+                parts.append(b"\x00")
+            else:
+                parts.append(b"\x01" + self.prev)
+        parts.extend([
             struct.pack(">I", len(sig_blob)),
             sig_blob,
             self.tx_hash,
-        ]
+        ])
         return b"".join(parts)
 
     @classmethod
@@ -229,6 +281,24 @@ class MessageTransaction:
         timestamp = struct.unpack_from(">d", data, offset)[0]; offset += 8
         nonce = struct.unpack_from(">Q", data, offset)[0]; offset += 8
         fee = struct.unpack_from(">Q", data, offset)[0]; offset += 8
+        # Version 2 wire form: read the prev presence flag + optional hash.
+        # Version 1 blobs skip this section entirely (preserves binary
+        # compatibility with pre-fork chain data).
+        prev: bytes | None = None
+        if version >= TX_VERSION_PREV_POINTER:
+            if offset + 1 > len(data):
+                raise ValueError("MessageTransaction prev flag truncated")
+            prev_flag = data[offset]; offset += 1
+            if prev_flag == 0x00:
+                prev = None
+            elif prev_flag == 0x01:
+                if offset + 32 > len(data):
+                    raise ValueError("MessageTransaction prev hash truncated")
+                prev = bytes(data[offset:offset + 32]); offset += 32
+            else:
+                raise ValueError(
+                    f"MessageTransaction prev flag must be 0 or 1, got {prev_flag}"
+                )
         sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
         if offset + sig_len > len(data):
             raise ValueError("MessageTransaction signature truncated")
@@ -248,6 +318,7 @@ class MessageTransaction:
             signature=sig,
             version=version,
             compression_flag=compression_flag,
+            prev=prev,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -284,6 +355,8 @@ class MessageTransaction:
         else:
             # Legacy format (pre-compression): no flag field → assume raw.
             stored, flag = plaintext, RAW_FLAG
+        prev_hex = data.get("prev")
+        prev_bytes = bytes.fromhex(prev_hex) if prev_hex else None
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             message=stored,
@@ -293,6 +366,7 @@ class MessageTransaction:
             signature=sig,
             version=data.get("version", 1),
             compression_flag=flag,
+            prev=prev_bytes,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -309,6 +383,7 @@ def calculate_min_fee(
     message_bytes: bytes,
     signature_bytes: int = 0,
     current_height: int | None = None,
+    prev_bytes: int = 0,
 ) -> int:
     """Calculate the minimum fee floor a tx must pay to be admitted.
 
@@ -349,10 +424,19 @@ def calculate_min_fee(
     FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
     payload).
     """
+    # At/after PREV_POINTER_HEIGHT the `prev` pointer adds 33 stored
+    # bytes (1B presence flag + 32B hash) when set.  Charged at the
+    # live per-stored-byte rate so pointer txs pay uniformly for their
+    # on-chain footprint — keeps the fee market neutral between
+    # pointer and non-pointer messages, while still letting users opt
+    # into the 33-byte pointer in exchange for not burning ~64 chars
+    # of their 1024 text budget on inline hex.
     if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
-        return BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(message_bytes)
+        total_bytes = len(message_bytes) + prev_bytes
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * total_bytes
     if current_height is not None and current_height >= LINEAR_FEE_HEIGHT:
-        return BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
+        total_bytes = len(message_bytes) + prev_bytes
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE * total_bytes
     if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
         return MIN_FEE_POST_FLAT
     size = len(message_bytes) + signature_bytes
@@ -427,6 +511,7 @@ def create_transaction(
     fee: int,
     nonce: int,
     current_height: int | None = None,
+    prev: bytes | None = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
@@ -456,11 +541,31 @@ def create_transaction(
             f"Stored message size {len(stored)} exceeds MAX_MESSAGE_BYTES "
             f"{MAX_MESSAGE_BYTES}"
         )
-    min_required = calculate_min_fee(stored, current_height=current_height)
+    # `prev`-bearing txs opt into tx version 2 and get charged 33 extra
+    # stored bytes.  The presence-flag byte (+1B) is included even when
+    # prev is None if version=2 — but we only bump version when the
+    # caller actually provides a pointer, so prev-less senders keep the
+    # legacy version=1 bytes-for-bytes.
+    if prev is not None:
+        if len(prev) != 32:
+            raise ValueError(
+                f"prev must be exactly 32 bytes, got {len(prev)}"
+            )
+        tx_version = TX_VERSION_PREV_POINTER
+        prev_overhead = PREV_POINTER_STORED_BYTES
+    else:
+        tx_version = 1
+        prev_overhead = 0
+    min_required = calculate_min_fee(
+        stored,
+        current_height=current_height,
+        prev_bytes=prev_overhead,
+    )
     if fee < min_required:
         raise ValueError(
             f"Fee must be at least {min_required} for this message "
-            f"({len(stored)} stored bytes, flag={flag})"
+            f"({len(stored)} stored bytes, flag={flag}"
+            f"{', prev=set' if prev is not None else ''})"
         )
 
     tx = MessageTransaction(
@@ -470,7 +575,9 @@ def create_transaction(
         nonce=nonce,
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
+        version=tx_version,
         compression_flag=flag,
+        prev=prev,
     )
 
     # Sign the transaction data with quantum-resistant signature
@@ -486,6 +593,7 @@ def verify_transaction(
     tx: MessageTransaction,
     public_key: bytes,
     current_height: int | None = None,
+    prev_lookup=None,
 ) -> bool:
     """Verify a transaction's quantum-resistant signature and well-formedness.
 
@@ -503,6 +611,25 @@ def verify_transaction(
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
+    # ── Version gate for the Tier 10 `prev` pointer ────────────────
+    # Pre-activation: only version=1 txs are accepted.  A version>=2
+    # tx arriving before the fork point would allow its extra bytes
+    # to land in a block whose replay semantics don't know about the
+    # field, so we reject at the validation boundary.
+    # Post-activation: version=1 stays valid for prev-less messages;
+    # version=2 is accepted and may or may not carry a prev pointer.
+    # Any future version is rejected until its own activation fork.
+    if tx.version > TX_VERSION_PREV_POINTER:
+        return False
+    if tx.version >= TX_VERSION_PREV_POINTER:
+        if current_height is not None and current_height < PREV_POINTER_HEIGHT:
+            return False
+        if tx.prev is not None and len(tx.prev) != 32:
+            return False
+    else:
+        # version=1 MUST NOT carry a prev field.
+        if tx.prev is not None:
+            return False
     # Decode plaintext for ASCII/char-count validation
     try:
         plaintext = tx.plaintext
@@ -538,14 +665,38 @@ def verify_transaction(
         sig_len = len(tx.signature.to_bytes())
     else:
         sig_len = 0
+    prev_overhead = PREV_POINTER_STORED_BYTES if tx.prev is not None else 0
     if tx.fee < calculate_min_fee(
         tx.message,
         signature_bytes=sig_len,
         current_height=current_height,
+        prev_bytes=prev_overhead,
     ):
         return False
     # Reject timestamps too far in the future (clock drift protection)
     if tx.timestamp > time.time() + MAX_TIMESTAMP_DRIFT:
         return False
+    # Strict-prev check: when chain context is supplied via `prev_lookup`,
+    # the referenced tx_hash MUST resolve to a tx already on-chain.
+    # `prev_lookup(tx_hash) -> (block_height, tx_index) | None` — callers
+    # without chain context (isolated unit tests, fixture builders) omit
+    # the argument and the pointer is treated as structurally valid but
+    # unresolved.  Self-reference is rejected unconditionally because the
+    # tx can't precede itself.
+    if tx.prev is not None:
+        if tx.prev == tx.tx_hash:
+            return False
+        if prev_lookup is not None:
+            loc = prev_lookup(tx.prev)
+            if loc is None:
+                return False
+            if current_height is not None:
+                prev_height, _prev_index = loc
+                # Strictly earlier block.  Same-block-earlier-index is
+                # resolved at block-validate time (where tx_index is
+                # known); at mempool admit we only require the referent
+                # to exist in a prior block.
+                if prev_height >= current_height:
+                    return False
     msg_hash = default_hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

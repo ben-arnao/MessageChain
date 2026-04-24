@@ -20,7 +20,7 @@ from pathlib import Path
 from messagechain.core.block import Block
 
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 # v1 -> v2 changelog (cold-restart-persistence class, rounds 7/13/14/
 # 15/17/18 of the pre-launch audit):
 #   * Added tables: pending_unstakes, key_history, reputation,
@@ -41,6 +41,17 @@ _SCHEMA_VERSION = 2
 # history, then bumps the `schema_version` meta row.  Operators on
 # v1 DBs are pointed at `messagechain migrate-chain-db` in the
 # startup error rather than silently getting an incomplete state.
+#
+# v2 -> v3 changelog (Tier 10 prev-pointer feature):
+#   * Added table: tx_locations — indexes every MessageTransaction
+#     tx_hash to the (block_height, tx_index) where it landed.  The
+#     strict-prev validator needs an O(1) lookup to answer "does this
+#     tx_hash resolve to a prior on-chain tx?" — O(chain_length) walks
+#     would make the feature untenable once the chain grows.
+# Migration shape: index is backfilled by replaying persisted blocks
+# and recording each message tx's position.  Non-destructive; idempotent
+# (re-running on v3 is a no-op because the schema_version tripwire
+# rejects the v3->v3 open before migration is reachable).
 
 
 class ChainDB:
@@ -128,6 +139,21 @@ class ChainDB:
                     f"in-memory Blockchain to repopulate the six new "
                     f"state surfaces from persisted blocks -- it is "
                     f"non-destructive and idempotent."
+                )
+            if on_disk == 2 and _SCHEMA_VERSION == 3:
+                raise RuntimeError(
+                    f"chain.db schema version mismatch: disk=2, "
+                    f"code=3.  This binary adds the `tx_locations` "
+                    f"index (Tier 10 prev-pointer feature) — maps every "
+                    f"MessageTransaction tx_hash to the "
+                    f"(block_height, tx_index) where it was included, "
+                    f"enabling O(1) strict-prev resolution.  Run the "
+                    f"one-shot migration before starting the node:\n\n"
+                    f"    messagechain migrate-chain-db "
+                    f"--data-dir <path-containing-chain.db>\n\n"
+                    f"The migration walks persisted blocks and records "
+                    f"each message tx's location -- non-destructive "
+                    f"and idempotent."
                 )
             raise RuntimeError(
                 f"chain.db schema version mismatch: disk={on_disk}, "
@@ -320,6 +346,132 @@ class ChainDB:
             ),
             "lottery_prize_pool": rebuilt.supply.lottery_prize_pool,
         }
+
+    def migrate_schema_v2_to_v3(self) -> dict:
+        """Backfill the tx_locations index from persisted blocks.
+
+        v2 -> v3 adds the Tier 10 prev-pointer feature's per-tx index
+        (tx_hash -> (block_height, tx_index)) so strict-prev validation
+        resolves in O(1).  The table is append-only and derived entirely
+        from existing block storage, so the migration just walks every
+        persisted block and records each MessageTransaction's position.
+
+        Non-destructive: only writes to `tx_locations` (created fresh by
+        `_init_schema` on the v3 binary) and bumps the `meta.schema_version`
+        row.  Every other table is untouched.
+
+        Idempotent: running on a v3 DB is blocked by the schema_version
+        tripwire before this function is reachable.  Within the migration
+        we use INSERT OR REPLACE so a partial-prior migration's rows are
+        overwritten cleanly on re-run from the CLI.
+        """
+        conn = self._conn
+        block_count = self.get_block_count()
+        total_tx_indexed = 0
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM tx_locations")
+            for height in range(block_count):
+                # Pass state=None — at migration time we don't have a
+                # live Blockchain to resolve compact entity refs.  If a
+                # block uses the compact form, it'll raise; the v1->v2
+                # path handles that case by threading a rebuilt state,
+                # but for v2->v3 the tx_locations population only needs
+                # tx_hash + block_hash + height + index, none of which
+                # depend on entity-id resolution.  If decode fails for
+                # that reason, fall back to a state-threaded path.
+                try:
+                    block = self.get_block_by_number(height, state=None)
+                except Exception:
+                    # Rebuild state for compact-ref resolution.  Lazy
+                    # import to avoid the circular dep at module load.
+                    from messagechain.core.blockchain import Blockchain
+                    import tempfile as _tempfile
+                    import os as _os
+                    scratch_dir = _tempfile.mkdtemp(prefix="mc_v3_migrate_")
+                    scratch_path = _os.path.join(scratch_dir, "scratch.db")
+                    scratch_db = ChainDB(scratch_path)
+                    rebuilt = Blockchain(db=scratch_db)
+                    persisted_indices = self.get_all_entity_indices()
+                    if persisted_indices:
+                        rebuilt.entity_id_to_index = dict(persisted_indices)
+                        rebuilt.entity_index_to_id = {
+                            idx: eid for eid, idx in persisted_indices.items()
+                        }
+                        rebuilt._next_entity_index = (
+                            max(persisted_indices.values()) + 1
+                        )
+                    block = self.get_block_by_number(height, state=rebuilt)
+                if block is None:
+                    continue
+                for tx_index, tx in enumerate(block.transactions):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO tx_locations "
+                        "(tx_hash, block_hash, block_height, tx_index) "
+                        "VALUES (?, ?, ?, ?)",
+                        (
+                            tx.tx_hash,
+                            block.block_hash,
+                            height,
+                            tx_index,
+                        ),
+                    )
+                    total_tx_indexed += 1
+            # Stamp the schema version LAST so a crash mid-migration
+            # leaves the DB at v2 and the operator's next start re-runs
+            # the migration cleanly.
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                ("schema_version", str(3)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return {
+            "schema_from": 2,
+            "schema_to": 3,
+            "blocks_walked": block_count,
+            "tx_locations_indexed": total_tx_indexed,
+        }
+
+    # ── tx_locations helpers (Tier 10 prev-pointer) ──────────────────
+
+    def record_tx_location(
+        self,
+        tx_hash: bytes,
+        block_hash: bytes,
+        block_height: int,
+        tx_index: int,
+    ) -> None:
+        """Record where a message tx landed.  Idempotent under fork replay."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO tx_locations "
+            "(tx_hash, block_hash, block_height, tx_index) "
+            "VALUES (?, ?, ?, ?)",
+            (tx_hash, block_hash, block_height, tx_index),
+        )
+        self._maybe_commit()
+
+    def get_tx_location(self, tx_hash: bytes) -> tuple[int, int] | None:
+        """Return (block_height, tx_index) for the earliest block this
+        tx_hash appears in, or None if it's not in the index.
+
+        "Earliest" = lowest block_height, breaking ties by block_hash
+        (deterministic).  Callers that need the full (block_hash, height,
+        index) tuple can use the raw table; strict-prev only needs
+        existence + height for the "strictly earlier block" check.
+        """
+        cur = self._conn.execute(
+            "SELECT block_height, tx_index FROM tx_locations "
+            "WHERE tx_hash = ? ORDER BY block_height ASC, block_hash ASC "
+            "LIMIT 1",
+            (tx_hash,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return (int(row[0]), int(row[1]))
 
     def _check_db_permissions(self):
         """Warn if chain.db is world-writable.
@@ -692,6 +844,28 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_seen_sigs_first_seen
                 ON seen_signatures(first_seen_block_height);
+
+            -- Tier 10 prev-pointer feature: per-tx index mapping every
+            -- MessageTransaction tx_hash to the block_height and
+            -- in-block tx_index where it was included.  Strict-prev
+            -- validation resolves a tx's `prev` pointer via this index
+            -- in O(1) rather than walking block history on every check.
+            -- Populated on store_block; entries are append-only under
+            -- normal operation.  Permanent history means no pruning.
+            --
+            -- block_hash is stored alongside so fork-aware lookups can
+            -- distinguish multiple inclusions of the same tx across
+            -- competing blocks at the same height (rare; strict-prev
+            -- only requires existence in some persisted block).
+            CREATE TABLE IF NOT EXISTS tx_locations (
+                tx_hash BLOB NOT NULL,
+                block_hash BLOB NOT NULL,
+                block_height INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                PRIMARY KEY (tx_hash, block_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tx_locations_hash
+                ON tx_locations(tx_hash);
         """)
         conn.commit()
 
@@ -760,6 +934,26 @@ class ChainDB:
             "INSERT OR REPLACE INTO blocks (block_hash, block_number, prev_hash, data) VALUES (?, ?, ?, ?)",
             (block.block_hash, block.header.block_number, block.header.prev_hash, data),
         )
+        # Tier 10 prev-pointer: populate tx_locations index for every
+        # message tx in this block.  Idempotent via INSERT OR REPLACE —
+        # re-storing a block under fork replay cleanly refreshes its
+        # rows.  Non-message txs (governance, transfer, etc.) are
+        # currently not indexed; the prev-pointer feature only
+        # references MessageTransaction tx_hashes.
+        from messagechain.core.transaction import MessageTransaction
+        for tx_index, tx in enumerate(block.transactions):
+            if isinstance(tx, MessageTransaction):
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO tx_locations "
+                    "(tx_hash, block_hash, block_height, tx_index) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        tx.tx_hash,
+                        block.block_hash,
+                        block.header.block_number,
+                        tx_index,
+                    ),
+                )
         self._maybe_commit()
 
     def get_block_by_hash(self, block_hash: bytes, state=None, include_witnesses=False) -> Block | None:
