@@ -42,6 +42,14 @@ class Peer:
     connected_at: float = 0.0        # unix seconds; 0 until socket opens
     peer_height: int = 0             # peer's last-reported chain height
     peer_version: str = ""           # peer's self-reported version string
+    # The listen port the remote advertised in its HANDSHAKE payload.
+    # For outbound peers this equals self.port (we dialed the listen
+    # port). For inbound peers self.port is the remote's ephemeral
+    # source port — advertised_port is how the maintenance loop
+    # recognizes "I already have a session with the validator at
+    # (host, listen_port)" and skips a redundant re-dial that would
+    # just race into the entity-level dedup and churn.
+    advertised_port: int = 0
     # Transport security: "plain" | "tls".  Set by the connection-
     # establishment path when it knows whether the socket was wrapped
     # in an SSLContext.  Default is "plain" — an honest default lets
