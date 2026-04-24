@@ -1,6 +1,5 @@
 # MessageChain
 
-[![tests](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml/badge.svg)](https://github.com/ben-arnao/MessageChain/actions/workflows/tests.yml)
 [![release](https://img.shields.io/github/v/release/ben-arnao/MessageChain)](https://github.com/ben-arnao/MessageChain/releases)
 [![license](https://img.shields.io/github/license/ben-arnao/MessageChain)](./LICENSE)
 
