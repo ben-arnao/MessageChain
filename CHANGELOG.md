@@ -4,6 +4,50 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-04-24
+
+Minor release — **consensus-breaking hard fork**. Pulls the Tier 8
+(linear-in-stored-bytes fees + 1024-char cap raise) and Tier 9
+(throughput raise) activation heights forward into the bootstrap
+window so the cap raise is testable on a realistic timeline with
+the current two-validator network.
+
+### Changed (consensus)
+
+- `LINEAR_FEE_HEIGHT`: **100,000 → 4,300**. The linear formula
+  (`BASE_TX_FEE + FEE_PER_STORED_BYTE × stored_bytes`) and the
+  `MAX_MESSAGE_CHARS` raise to 1024 now activate ~28 days (nominal
+  10-min blocks) after release instead of ~2 years.
+- `BLOCK_BYTES_RAISE_HEIGHT`: **102,000 → 4,500**. Follows Tier 8
+  immediately, same per-byte floor and tx-per-block bumps as before.
+- **Tier 7 (`FLAT_FEE_HEIGHT = 98,000`) retired.** The flat-fee
+  intermediate is superseded by Tier 8 at a lower height — in
+  `calculate_min_fee` the LINEAR branch is checked first, so at height
+  98,000 the linear rule is already in force and the flat floor
+  never activates. The constant is kept for code-path audit clarity.
+- The Tier-2 `FEE_INCLUDES_SIGNATURE_HEIGHT = 64,000` sig-aware
+  quadratic rule is similarly unreachable for `MessageTransaction`
+  (Tier 8 precedes it). Non-MessageTx tx types (transfer / stake /
+  governance / etc.) still traverse the sig-aware branch via
+  `enforce_signature_aware_min_fee`.
+
+### Fixed
+
+- `verify_transaction` now delegates fee-floor selection to
+  `calculate_min_fee` (single source of truth) instead of branching
+  on each gate locally. Previously, at heights in
+  `[LINEAR_FEE_HEIGHT, FEE_INCLUDES_SIGNATURE_HEIGHT)` the verifier
+  fell through to the legacy quadratic rule while `calculate_min_fee`
+  had already routed to linear — the two disagreed. Unified. Only
+  surfaces under compressed schedules where LINEAR precedes FLAT.
+
+### Upgrade notes
+
+Consensus-breaking. Both validators MUST upgrade before height
+4,300 (~28 days from release at nominal pace). The two-validator
+bootstrap set makes coordination trivial; re-tighten the
+50,000-block runway rule in CLAUDE.md once the validator set grows.
+
 ## [1.3.1] — 2026-04-24
 
 Patch release — P2P handshake symmetry for peer observability.
