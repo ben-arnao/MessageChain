@@ -3193,6 +3193,7 @@ class Server(SharedRuntimeMixin):
                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
             )
             await write_message(writer, handshake)
+            peer.handshake_sent = True
             while self._running and peer.is_connected:
                 try:
                     msg = await asyncio.wait_for(read_message(reader), timeout=PEER_READ_TIMEOUT)
@@ -3318,6 +3319,41 @@ class Server(SharedRuntimeMixin):
                 t.add_done_callback(
                     lambda x: self._handle_task_exception("syncer.start_sync", x)
                 )
+
+            # Echo our HANDSHAKE back to an inbound peer so its Peer
+            # record can populate entity/height/version. The sync path
+            # only needs the one-way HANDSHAKE (update_peer_height above),
+            # but without the echo the CLI on the dialer side shows
+            # Entity=(none) / Height=0 / Version=unknown forever.
+            # handshake_sent guards against re-echo on reconnect.
+            if (
+                getattr(peer, "direction", "inbound") == "inbound"
+                and not getattr(peer, "handshake_sent", False)
+            ):
+                latest_local = self.blockchain.get_latest_block()
+                reply = NetworkMessage(
+                    msg_type=MessageType.HANDSHAKE,
+                    payload={
+                        "port": self.p2p_port,
+                        "chain_height": self.blockchain.height,
+                        "best_block_hash": (
+                            latest_local.block_hash.hex() if latest_local else ""
+                        ),
+                        "cumulative_weight": self._current_cumulative_weight(),
+                        "version": __version__,
+                    },
+                    sender_id=self.wallet_id.hex() if self.wallet_id else "",
+                )
+                try:
+                    await write_message(peer.writer, reply)
+                    try:
+                        peer.handshake_sent = True
+                    except AttributeError:
+                        pass
+                except Exception as e:
+                    logger.debug(
+                        f"Failed to echo handshake to {peer.address}: {e}"
+                    )
 
         elif msg.msg_type == MessageType.INV:
             await self._handle_inv(msg.payload, peer)
