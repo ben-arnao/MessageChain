@@ -487,5 +487,106 @@ class TestUpgradeTagResolutionFailure(unittest.TestCase):
         self.assertIn("--tag", str(cm.exception))
 
 
+class TestUpgradeTagResolutionPicksHighestSemver(unittest.TestCase):
+    """The resolver uses the git-tags API (not releases API), because
+    this repo publishes by pushing git tags rather than creating
+    GitHub Release objects.  The tags API returns every pushed tag,
+    but in *creation order*, not semver order -- so the resolver must
+    sort vX.Y.Z-mainnet tags by (major, minor, patch) and pick the
+    highest, skipping any tag that doesn't match the canonical
+    pattern."""
+
+    def _mock_urlopen_with(self, tags_payload):
+        """Return a patcher that makes urlopen yield *tags_payload*
+        JSON-encoded on first .read()."""
+        import io
+        import json
+
+        body = json.dumps(tags_payload).encode("utf-8")
+
+        class _Resp:
+            def __init__(self, data):
+                self._buf = io.BytesIO(data)
+
+            def read(self):
+                return self._buf.read()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        return patch("urllib.request.urlopen", return_value=_Resp(body))
+
+    def test_picks_highest_semver_not_creation_order(self):
+        from messagechain.cli import _upgrade_resolve_latest_tag
+
+        # Creation order puts 1.0.0 *last* (oldest) -- the releases
+        # API would have returned 1.0.0 (the only one ever published
+        # as a Release object). The tags-API + semver-sort path
+        # must instead pick v1.2.1-mainnet.
+        payload = [
+            {"name": "v1.2.1-mainnet"},
+            {"name": "v1.2.0-mainnet"},
+            {"name": "v1.1.1-mainnet"},
+            {"name": "v1.1.0-mainnet"},
+            {"name": "v1.0.2-mainnet"},
+            {"name": "v1.0.1-mainnet"},
+            {"name": "v1.0.0-mainnet"},
+        ]
+        with self._mock_urlopen_with(payload):
+            tag = _upgrade_resolve_latest_tag(
+                "https://github.com/ben-arnao/MessageChain",
+            )
+        self.assertEqual(tag, "v1.2.1-mainnet")
+
+    def test_ignores_non_mainnet_tags(self):
+        from messagechain.cli import _upgrade_resolve_latest_tag
+
+        payload = [
+            {"name": "v2.0.0-testnet"},
+            {"name": "v1.9.9-rc1"},
+            {"name": "random-tag"},
+            {"name": "v1.1.0-mainnet"},
+            {"name": "v1.0.0-mainnet"},
+        ]
+        with self._mock_urlopen_with(payload):
+            tag = _upgrade_resolve_latest_tag(
+                "https://github.com/ben-arnao/MessageChain",
+            )
+        self.assertEqual(tag, "v1.1.0-mainnet")
+
+    def test_sorts_semver_not_lexicographic(self):
+        from messagechain.cli import _upgrade_resolve_latest_tag
+
+        # Lexicographic would pick v1.9.0 over v1.10.0.  Semver sorting
+        # must pick v1.10.0.
+        payload = [
+            {"name": "v1.9.0-mainnet"},
+            {"name": "v1.10.0-mainnet"},
+            {"name": "v1.2.0-mainnet"},
+        ]
+        with self._mock_urlopen_with(payload):
+            tag = _upgrade_resolve_latest_tag(
+                "https://github.com/ben-arnao/MessageChain",
+            )
+        self.assertEqual(tag, "v1.10.0-mainnet")
+
+    def test_raises_if_no_mainnet_tags_found(self):
+        from messagechain.cli import _upgrade_resolve_latest_tag
+
+        payload = [
+            {"name": "v1.0.0-testnet"},
+            {"name": "nightly-2026-04-24"},
+        ]
+        with self._mock_urlopen_with(payload):
+            with self.assertRaises(RuntimeError) as cm:
+                _upgrade_resolve_latest_tag(
+                    "https://github.com/ben-arnao/MessageChain",
+                )
+        self.assertIn("no canonical", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
