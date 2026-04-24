@@ -2697,9 +2697,23 @@ class Server(SharedRuntimeMixin):
         entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
         if entity_id is None:
             return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
-        if entity_id not in self.blockchain.public_keys:
+        pubkey_registered = entity_id in self.blockchain.public_keys
+        balance = self.blockchain.supply.get_balance(entity_id)
+        # Receive-to-exist: an entity can hold a balance before its
+        # pubkey is installed (the pubkey is revealed by the first
+        # outgoing transfer).  Previously get_entity returned "Entity
+        # not found" for these, wrongly suggesting the balance was
+        # lost (observed 2026-04-24 mainnet smoke test).  Now return
+        # the partial info with pubkey_registered=False so operators
+        # and integrators can distinguish "has balance but key not
+        # yet revealed" from "truly unknown entity".  The ok=False
+        # path is preserved for the truly-unknown case, so existing
+        # not-found checks keep working.
+        if not pubkey_registered and balance == 0:
             return {"ok": False, "error": "Entity not found"}
-        return {"ok": True, "result": self.blockchain.get_entity_stats(entity_id)}
+        result = self.blockchain.get_entity_stats(entity_id)
+        result["pubkey_registered"] = pubkey_registered
+        return {"ok": True, "result": result}
 
     def _rpc_get_latest_release(self, params: dict) -> dict:
         """Return the current on-chain release manifest, if any.
