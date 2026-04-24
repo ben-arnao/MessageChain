@@ -4,6 +4,61 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] — 2026-04-24
+
+Patch release. Bundles a security audit rollup with a P2P
+maintenance-loop fix. No consensus changes.
+
+### Security
+
+- **C1 — validator-collusion censorship escape.**
+  `BogusRejectionProcessor.process()` and its state-root simulator
+  re-verified the embedded message tx without threading
+  `current_height`, so at LINEAR-era heights `verify_transaction`
+  fell back to the legacy quadratic fee rule. Low-fee txs that
+  were valid under consensus but below the legacy floor were
+  dismissed as "honest rejection," letting a lying validator
+  escape slashing and successfully censor the message — directly
+  defeating the stated primary-threat defense. Thread
+  `block_height` through both paths and through mempool RBF.
+  Regression test exercises the LINEAR-era gap window end to end.
+  (ebde4d1)
+- **C2 — supply-chain RCE in `messagechain upgrade`.** The
+  upgrade CLI cloned and installed any `vX.Y.Z-mainnet` tag as
+  root without verifying the tag's signature against an
+  authoritative key. Now pins the release signer's SSH pubkey in
+  `messagechain/release_signers.py` and runs `git tag -v` with
+  `gpg.ssh.allowedSignersFile` pointed at that pinned list after
+  clone, before the copytree swap. On verification failure:
+  discard the clone, restore the backup, exit non-zero. The
+  allowed-signers file is binary-local so a repo-level compromise
+  cannot rotate the trust anchor. (ebde4d1)
+- **C3 — fee-rule height threading in CLI send.**
+  `calculate_min_fee` was called without `current_height`, so CLI
+  users overpaid ~5–10× on short messages under the live LINEAR
+  rule and low-fee dissident submissions were silently rejected
+  client-side even though the chain would have accepted them.
+  Thread tip+1 through the fee estimator; add an optional
+  `current_height` arg to mempool RBF for consistent dispatch.
+  (ebde4d1)
+
+### Fixed
+
+- **Maintenance loop now entity-aware.** After the 1.5.1
+  entity-dedup rollout, the lower-entity side of each pair kept
+  logging `p2p dedup: closing duplicate inbound session` every 30
+  seconds. Root cause: the maintenance tick was keyed on
+  `(host, listen_port)` and didn't recognize an inbound session
+  from the same remote (keyed by the peer's ephemeral source
+  port) as "already peered," so it re-dialed the seed every
+  interval and each redial completed TLS+handshake just to be
+  closed by the dedup. Now stores the remote's advertised listen
+  port from the HANDSHAKE payload on `Peer.advertised_port`; the
+  maintenance tick skips a seed `(host, port)` when any live,
+  handshook peer already advertises that exact endpoint.
+  Cosmetic at n=2, but the churn went quadratic as the validator
+  set grew. (81298fb, a16a347)
+
 ## [1.5.1] — 2026-04-24
 
 Patch release — P2P session dedup. No consensus changes.
