@@ -742,7 +742,7 @@ def build_parser() -> argparse.ArgumentParser:
             "0 on any no-op path. Designed to run daily under systemd."
         ),
     )
-    rotate_if_p.add_argument("--rotate-yes", dest="rotate_yes", action="store_true")
+    rotate_if_p.add_argument("--yes", action="store_true")
     rotate_if_p.add_argument("--server", type=str, default=None)
 
     # --- config ---

@@ -294,23 +294,47 @@ def render_validator_unit(entity_id_hex: str, keyfile: str, data_dir: str) -> st
     )
 
 
+_UPGRADE_HARDENING = """\
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=false
+LockPersonality=true
+ReadWritePaths=/opt /var/lib/messagechain /etc/systemd
+ReadOnlyPaths=/etc/messagechain
+"""
+
+
 def render_upgrade_service() -> str:
+    # Runs as root because `messagechain upgrade` invokes systemctl stop/
+    # start, writes /opt/messagechain, and chowns the new install. An
+    # unprivileged user cannot do any of that.
     return (
         "[Unit]\n"
         "Description=MessageChain auto-upgrade runner\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
+        "Requires=messagechain-validator.service\n"
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
-        "User=messagechain\n"
-        "Group=messagechain\n"
+        "User=root\n"
+        "Group=root\n"
         "WorkingDirectory=/opt/messagechain\n"
         "ExecStart=/usr/bin/env python3 -m messagechain upgrade --yes\n"
         "StandardOutput=journal\n"
         "StandardError=journal\n"
         "\n"
-        + _HARDENING
+        + _UPGRADE_HARDENING
     )
 
 

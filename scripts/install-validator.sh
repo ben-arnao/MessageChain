@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-FROM_GIT=""
+FROM_GIT="https://github.com/ben-arnao/MessageChain.git"
 while [ $# -gt 0 ]; do
     case "$1" in
         --from-git)
@@ -19,9 +19,13 @@ while [ $# -gt 0 ]; do
             cat <<EOF
 Usage: sudo ./install-validator.sh [--from-git <url>]
 
+Clones MessageChain into /opt/messagechain, installs it, and runs
+\`messagechain init\` to lay out the data dir, keyfile, onboard config,
+and systemd units.
+
 Options:
-  --from-git <url>    Clone + install from a git URL instead of pypi
-                      (useful until the pypi package is published).
+  --from-git <url>    Clone + install from a git URL
+                      (default: upstream MessageChain repo)
 EOF
             exit 0
             ;;
@@ -48,17 +52,15 @@ chown -R messagechain:messagechain /opt/messagechain /var/lib/messagechain
 chown root:messagechain /etc/messagechain
 chmod 0750 /etc/messagechain
 
-echo "[3/6] Installing MessageChain..."
-if [ -n "$FROM_GIT" ]; then
-    if [ ! -d /opt/messagechain/.git ]; then
-        rm -rf /opt/messagechain
-        sudo -u messagechain git clone "$FROM_GIT" /opt/messagechain
-    fi
-    cd /opt/messagechain
-    sudo -u messagechain pip install --user -e .
-else
-    pip install --target /opt/messagechain messagechain
+echo "[3/6] Installing MessageChain from $FROM_GIT..."
+if [ ! -d /opt/messagechain/.git ]; then
+    rm -rf /opt/messagechain
+    sudo -u messagechain git clone "$FROM_GIT" /opt/messagechain
 fi
+cd /opt/messagechain
+# --break-system-packages lets Debian/Ubuntu's pip write to site-packages
+# on PEP 668 systems; harmless on distros that don't know the flag.
+pip install -e . --break-system-packages 2>/dev/null || pip install -e .
 
 echo "[4/6] Running messagechain init..."
 python3 -m messagechain init --yes --systemd
