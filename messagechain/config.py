@@ -888,6 +888,18 @@ SEED_NODES: list[tuple[str, int]] = [
     ("35.231.82.12", DEFAULT_PORT),   # validator-2 — us-east1-c (added v1.0.1)
 ]
 
+# Optional DNS seed domains. When set, nodes query TXT records on each
+# domain at startup for additional peer endpoints ("host=1.2.3.4 port=9333").
+# Empty by default — no public seed domain is live yet. Merged into the
+# hardcoded SEED_NODES list; operators can override via --seed.
+DNS_SEED_DOMAINS: list[str] = []
+
+# Auto-upgrade + auto-rotate defaults. Operators flip these in onboard.toml;
+# config-level constants exist so unit tests and scripts can read the
+# shipped default without parsing the TOML file.
+AUTO_UPGRADE_ENABLED = True
+AUTO_ROTATE_ENABLED = True
+
 # Hardcoded entry-point endpoints for CLI clients.  The CLI uses them
 # to make its initial RPC connection.  Once connected, the CLI calls
 # get_network_validators to discover the rest of the network and — if

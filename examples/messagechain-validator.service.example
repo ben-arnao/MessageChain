@@ -135,3 +135,22 @@ WantedBy=multi-user.target
 #
 # You earn block rewards and attestation rewards once your stake lands
 # on chain.  See README.md "Validator operations" for `stake` / `unstake`.
+#
+# ─────────────────────────────────────────────────────────────────────
+# Companion timers (optional — both default ON via `messagechain init`)
+# ─────────────────────────────────────────────────────────────────────
+#
+# * messagechain-upgrade.timer    — weekly auto-upgrade to the latest
+#                                   -mainnet tag; rolls back on health-
+#                                   check failure.  See
+#                                   examples/messagechain-upgrade.{service,timer}.example
+#
+# * messagechain-rotate-key.timer — daily watchdog that rotates the
+#                                   WOTS+ tree once >= 95% of leaves are
+#                                   consumed.  Skipped if a cold authority
+#                                   key is set.  See
+#                                   examples/messagechain-rotate-key.{service,timer}.example
+#
+# Disable either per-host:
+#   messagechain config set auto_upgrade false
+#   messagechain config set auto_rotate false
