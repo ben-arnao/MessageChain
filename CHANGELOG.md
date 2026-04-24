@@ -4,6 +4,12 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-04-24
+
+Version-bump-only release. No behavior changes; cut to exercise the
+`messagechain upgrade` command end-to-end on live mainnet validators.
+Safe no-op rollout.
+
 ## [1.2.0] — 2026-04-24
 
 Minor release — operator ergonomics. Adds a one-shot `messagechain upgrade`

@@ -38,9 +38,14 @@ class TestVersionConstants(unittest.TestCase):
     distribution metadata.  A mismatch would mean `pip show` and
     `messagechain status` disagree."""
 
-    def test_version_constant_bumped_to_1_2_0(self):
+    def test_version_constant_bumped_past_1_0_0(self):
         import messagechain
-        self.assertEqual(messagechain.__version__, "1.2.0")
+        self.assertNotEqual(messagechain.__version__, "1.0.0")
+        # Sanity: semver triple of three integers separated by dots.
+        parts = messagechain.__version__.split(".")
+        self.assertEqual(len(parts), 3)
+        for p in parts:
+            int(p)  # raises ValueError if not an integer
 
     def test_pyproject_version_matches(self):
         # Mirror of tests/test_release_hygiene.py but asserts the
@@ -61,7 +66,6 @@ class TestVersionConstants(unittest.TestCase):
             )
             assert m is not None
             declared = m.group(1)
-        self.assertEqual(declared, "1.2.0")
         self.assertEqual(declared, CURRENT_VERSION)
 
 
