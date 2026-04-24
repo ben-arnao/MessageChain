@@ -1134,6 +1134,30 @@ class ChainDB:
         self.set_supply_meta("blocks_since_last_finalization", int(value))
         self._maybe_commit()
 
+    # ── Lottery Prize Pool ───────────────────────────────────────
+    # Consensus-visible scalar accumulator for the seed-divestment
+    # redistribution lottery (post-SEED_DIVESTMENT_REDIST_HEIGHT).
+    # Accumulated at REDIST-era divestment blocks, drained into the
+    # lottery winner's balance at every LOTTERY_INTERVAL firing.
+    # Rides the existing `supply_meta` key/value table under the key
+    # "lottery_prize_pool" (no new schema needed for a single
+    # scalar).  Without persistence, cold-restart zeros the pool on
+    # the restarted peer while uprestarted peers carry the
+    # accumulated value -- next lottery firing pays different
+    # amounts to the winner, `supply.balances` diverges, state_root
+    # mismatches.  Sixth in the cold-restart-persistence class after
+    # pending_unstakes / key_history / reputation /
+    # blocks_since_last_finalization / stake_snapshots.
+
+    def get_lottery_prize_pool(self) -> int:
+        """Return the persisted lottery prize pool (0 if unset)."""
+        return int(self.get_supply_meta("lottery_prize_pool"))
+
+    def set_lottery_prize_pool(self, value: int) -> None:
+        """Persist the lottery prize pool.  Idempotent upsert."""
+        self.set_supply_meta("lottery_prize_pool", int(value))
+        self._maybe_commit()
+
     # ── Phantom-Supply Migration (one-shot correctness repair) ──────────
     #
     # Earlier mainnet builds set GENESIS_SUPPLY = 1_000_000_000 while the
@@ -1535,6 +1559,13 @@ class ChainDB:
             "blocks_since_last_finalization": (
                 self.get_finalization_stall_counter()
             ),
+            # Lottery prize pool -- scalar input to
+            # `select_lottery_winner` + pool_payout math at every
+            # LOTTERY_INTERVAL firing.  Must round-trip with supply
+            # state because payouts mutate supply.balances, so the
+            # pool's value at the fork point must be restored on
+            # reorg rollback.
+            "lottery_prize_pool": self.get_lottery_prize_pool(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1643,6 +1674,17 @@ class ChainDB:
                 (
                     "blocks_since_last_finalization",
                     int(snapshot.get("blocks_since_last_finalization", 0)),
+                ),
+            )
+            # Lottery prize pool -- same INSERT OR REPLACE shape so
+            # pre-field snapshots still round-trip cleanly (default
+            # 0 on older snapshots predating this field).
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "lottery_prize_pool",
+                    int(snapshot.get("lottery_prize_pool", 0)),
                 ),
             )
             conn.commit()
