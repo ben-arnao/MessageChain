@@ -7,8 +7,7 @@
 A blockchain for sending messages. Quantum-resistant, proof-of-stake,
 built to last centuries.
 
-**Status:** mainnet live; current chain minted 2026-04-22 during
-bootstrap. Chain ID `messagechain-v1`, genesis block 0
+**Status:** mainnet live. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
 
 ## Why
