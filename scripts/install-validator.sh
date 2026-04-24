@@ -55,7 +55,8 @@ chmod 0750 /etc/messagechain
 echo "[3/6] Installing MessageChain from $FROM_GIT..."
 if [ ! -d /opt/messagechain/.git ]; then
     rm -rf /opt/messagechain
-    sudo -u messagechain git clone "$FROM_GIT" /opt/messagechain
+    git clone "$FROM_GIT" /opt/messagechain
+    chown -R messagechain:messagechain /opt/messagechain
 fi
 cd /opt/messagechain
 # --break-system-packages lets Debian/Ubuntu's pip write to site-packages
