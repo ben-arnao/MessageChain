@@ -629,5 +629,121 @@ class TestMempoolAdmission(unittest.TestCase):
         self.assertFalse(mp.add_censorship_evidence_tx(etx))
 
 
+class TestEvidenceLeafReuseRejection(unittest.TestCase):
+    """Round-4 defense-in-depth: evidence-tx submitter signatures MUST
+    enforce the WOTS+ leaf-reuse gate at per-tx validation AND in the
+    block-level ``_check_leaf`` dedupe -- same class of defense as
+    round-2 governance and round-3 ack-forgery fixes.  A submitter
+    signing at an already-consumed leaf would leak that leaf's
+    one-time secret; reject to close the class consistently.
+    """
+
+    def setUp(self):
+        self.alice = Entity.create(b"alice-evleaf".ljust(32, b"\x00"))
+        self.bob = Entity.create(b"bob-evleaf".ljust(32, b"\x00"))
+        self.alice.keypair._next_leaf = 0
+        self.bob.keypair._next_leaf = 0
+        self.chain = Blockchain()
+        self.chain.initialize_genesis(self.alice)
+        register_entity_for_test(self.chain, self.bob)
+        self.chain.supply.balances[self.alice.entity_id] = 1_000_000
+        self.chain.supply.balances[self.bob.entity_id] = 1_000_000
+        self.chain.supply.staked[self.alice.entity_id] = 100_000
+        self.alice_receipt_kp = _make_receipt_subtree_keypair(
+            self.alice.entity_id[:16],
+        )
+        self.chain.receipt_subtree_roots[self.alice.entity_id] = (
+            self.alice_receipt_kp.public_key
+        )
+
+    def _make_evidence_at_leaf(
+        self, commit_height: int, submitter_leaf: int,
+    ) -> CensorshipEvidenceTx:
+        """Build a signed CensorshipEvidenceTx where bob signs at
+        ``submitter_leaf`` (regardless of what the inner message_tx
+        consumed).  Used to construct leaf-collision fixtures.
+        """
+        issuer = ReceiptIssuer(
+            self.alice.entity_id,
+            self.alice_receipt_kp,
+            height_fn=lambda: commit_height,
+        )
+        # The inner message_tx is structurally required but its leaf
+        # is irrelevant to this test -- only the submitter's evidence
+        # signature leaf matters for the watermark/dedupe gates.
+        # Use a pre-canned mtx (bob signs once for it) then rewind
+        # bob's signer for the evidence signature.
+        mtx = create_transaction(self.bob, "hi", MIN_FEE + 200, nonce=0)
+        receipt = issuer.issue(mtx.tx_hash)
+        self.bob.keypair._next_leaf = submitter_leaf
+        return _sign_evidence_tx(self.bob, receipt, mtx)
+
+    def test_evidence_tx_rejected_at_admission_after_watermark_bump(self):
+        """After bob's hot-key leaf L is consumed on-chain (e.g. a
+        prior message tx), signing a CensorshipEvidenceTx at the same
+        leaf L MUST be rejected by ``validate_censorship_evidence_tx``
+        on the watermark rule -- without this gate, the submitter
+        could self-expose a leaf via the evidence path."""
+        # Build the evidence at commit-height 0 FIRST so its receipt
+        # isn't "too fresh" once we advance the chain.
+        etx = self._make_evidence_at_leaf(
+            commit_height=0, submitter_leaf=0,
+        )
+        # Advance chain past the inclusion window so the "too fresh"
+        # gate passes and the watermark gate is reached.
+        from messagechain.consensus.pos import ProofOfStake
+        consensus = ProofOfStake()
+        for _ in range(EVIDENCE_INCLUSION_WINDOW + 1):
+            blk = self.chain.propose_block(consensus, self.alice, [])
+            ok, reason = self.chain.add_block(blk)
+            self.assertTrue(ok, reason)
+        # Fast-forward bob's on-chain watermark past leaf 0 directly
+        # (the earlier propose_block runs don't consume bob's leaves).
+        self.chain.leaf_watermarks[self.bob.entity_id] = 5
+        self.assertLess(
+            etx.signature.leaf_index,
+            self.chain.leaf_watermarks[self.bob.entity_id],
+        )
+        ok, reason = self.chain.validate_censorship_evidence_tx(etx)
+        self.assertFalse(ok)
+        self.assertIn("leaf", reason.lower())
+
+    def test_same_block_leaf_collision_with_message_tx_rejected(self):
+        """An evidence tx sharing a (submitter, leaf_index) with a
+        message tx in the SAME block is caught by the block-level
+        ``_check_leaf`` loop.  Before the fix, the evidence-tx path
+        was not in that loop -- a malicious submitter could place a
+        MessageTx at leaf L and a CensorshipEvidenceTx also at leaf
+        L in one block, and both landed."""
+        commit_h = self.chain.height
+        # bob signs a message tx (consumes leaf 0).
+        msg = create_transaction(
+            self.bob, "payload", MIN_FEE + 200, nonce=0,
+            current_height=self.chain.height + 1,
+        )
+        # Build the evidence with bob signing at the SAME leaf 0.
+        # _make_evidence_at_leaf rewinds the signer internally.
+        etx = self._make_evidence_at_leaf(
+            commit_height=commit_h,
+            submitter_leaf=msg.signature.leaf_index,
+        )
+        self.assertEqual(
+            etx.signature.leaf_index, msg.signature.leaf_index,
+        )
+        from messagechain.consensus.pos import ProofOfStake
+        consensus = ProofOfStake()
+        block = self.chain.propose_block(
+            consensus, self.alice, [msg],
+            censorship_evidence_txs=[etx],
+        )
+        if etx not in block.censorship_evidence_txs:
+            block.censorship_evidence_txs = list(
+                block.censorship_evidence_txs,
+            ) + [etx]
+        ok, reason = self.chain.validate_block(block)
+        self.assertFalse(ok)
+        self.assertIn("leaf", reason.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

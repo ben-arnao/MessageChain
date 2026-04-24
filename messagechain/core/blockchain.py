@@ -3104,6 +3104,27 @@ class Blockchain:
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
 
+        # WOTS+ leaf-reuse gate at admission.  Every other hot-key-
+        # signed tx type (message, transfer, stake, governance,
+        # attestation, finality vote, authority) enforces
+        # leaf_index >= leaf_watermarks[submitter] at per-tx
+        # validation.  Evidence txs previously skipped this gate,
+        # leaving a self-expose window where a malicious submitter
+        # could sign a MessageTx + CensorshipEvidenceTx at the same
+        # leaf in the same block (or across blocks) and leak the
+        # leaf's one-time secret.  Close the class consistently with
+        # the round-2 governance + round-3 ack-forgery fixes.
+        if (
+            tx.signature.leaf_index
+            < self.leaf_watermarks.get(tx.submitter_id, 0)
+        ):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark "
+                f"{self.leaf_watermarks[tx.submitter_id]}) — "
+                "leaf reuse rejected"
+            )
+
         submitter_pk = self.public_keys[tx.submitter_id]
         valid, reason = verify_censorship_evidence_tx(tx, submitter_pk)
         if not valid:
@@ -3154,6 +3175,18 @@ class Blockchain:
             )
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
+        # WOTS+ leaf-reuse gate at admission -- see comment on the
+        # matching censorship-evidence path above.
+        if (
+            tx.signature.leaf_index
+            < self.leaf_watermarks.get(tx.submitter_id, 0)
+        ):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark "
+                f"{self.leaf_watermarks[tx.submitter_id]}) — "
+                "leaf reuse rejected"
+            )
         submitter_pk = self.public_keys[tx.submitter_id]
         valid, reason = verify_bogus_rejection_evidence_tx(tx, submitter_pk)
         if not valid:
@@ -3203,6 +3236,18 @@ class Blockchain:
             )
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
+        # WOTS+ leaf-reuse gate at admission -- see comment on the
+        # matching censorship-evidence path above.
+        if (
+            tx.signature.leaf_index
+            < self.leaf_watermarks.get(tx.submitter_id, 0)
+        ):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark "
+                f"{self.leaf_watermarks[tx.submitter_id]}) — "
+                "leaf reuse rejected"
+            )
         # Re-derive the witness public-key map from chain state for the
         # observations bound into the evidence.  An observation whose
         # witness has no chain pubkey yet will surface here as a clear
@@ -4482,6 +4527,16 @@ class Blockchain:
                 sim_balances[payout.prover_id] = (
                     sim_balances.get(payout.prover_id, 0) + payout.amount
                 )
+            # Mirror the apply path's watermark bump for every
+            # custody-proof prover who has an on-chain pubkey.
+            # Without this mirror, the sim state-root diverges from
+            # apply any time a registered prover's proof is admitted.
+            for proof in custody_proofs:
+                sig = getattr(proof, "signature", None)
+                if sig is None:
+                    continue
+                if proof.prover_id in sim_public_keys:
+                    _bump_wm(proof.prover_id, sig.leaf_index)
 
         # Simulate inactivity leak — must mirror _apply_block_state.
         # The counter is incremented first; if the leak is active, inactive
@@ -5538,6 +5593,29 @@ class Blockchain:
                     f"{proof.prover_id.hex()[:16]} in challenge block"
                 )
             seen_provers.add(proof.prover_id)
+            # WOTS+ leaf-reuse gate at admission -- mirrors the
+            # evidence-tx gates.  A prover signing at an already-
+            # consumed leaf would leak their one-time secret for
+            # that leaf; reject to close the class consistently
+            # with every other hot-key signed path.  Registered-
+            # prover path: look up leaf_watermarks by prover_id.
+            # Hobbyist-archivist path (prover has no on-chain
+            # pubkey): skip the watermark check -- verify_custody
+            # _proof already binds the signature to the embedded
+            # pubkey, and with no on-chain history there's no
+            # prior leaf to collide with.
+            sig = getattr(proof, "signature", None)
+            if sig is not None and proof.prover_id in self.public_keys:
+                if (
+                    sig.leaf_index
+                    < self.leaf_watermarks.get(proof.prover_id, 0)
+                ):
+                    return False, (
+                        f"Custody proof WOTS+ leaf {sig.leaf_index} "
+                        f"already consumed (watermark "
+                        f"{self.leaf_watermarks[proof.prover_id]}) -- "
+                        "leaf reuse rejected"
+                    )
             ok, reason = verify_custody_proof(
                 proof, expected_block_hash=expected_block_hash,
             )
@@ -5900,6 +5978,55 @@ class Blockchain:
             authority_pk = self.get_authority_key(utx.entity_id)
             signer_key = authority_pk if authority_pk is not None else utx.entity_id
             ok, reason = _check_leaf(signer_key, utx.signature.leaf_index, "unstake tx")
+            if not ok:
+                return False, reason
+        # Evidence txs: CensorshipEvidence / BogusRejection /
+        # NonResponse / InclusionListViolation all carry a submitter
+        # signature in the submitter's HOT-key leaf namespace.
+        # Reusing a leaf between any of these and a message/transfer/
+        # attestation/finality-vote/governance/stake from the same
+        # submitter leaks the WOTS+ one-time secret for that leaf.
+        # Close the gap so a malicious submitter cannot self-expose
+        # a leaf via an evidence-tx path that previously skipped the
+        # dedupe (hot-key leak has no consensus impact on this chain
+        # given the watermark ratchet -- but closes the class and
+        # mirrors the round-2 governance / round-3 ack fixes).
+        for etx in getattr(block, "censorship_evidence_txs", []):
+            ok, reason = _check_leaf(
+                etx.submitter_id, etx.signature.leaf_index,
+                "censorship evidence tx",
+            )
+            if not ok:
+                return False, reason
+        for etx in getattr(block, "bogus_rejection_evidence_txs", []):
+            ok, reason = _check_leaf(
+                etx.submitter_id, etx.signature.leaf_index,
+                "bogus-rejection evidence tx",
+            )
+            if not ok:
+                return False, reason
+        for etx in getattr(
+            block, "inclusion_list_violation_evidence_txs", [],
+        ):
+            ok, reason = _check_leaf(
+                etx.submitter_id, etx.signature.leaf_index,
+                "inclusion-list violation evidence tx",
+            )
+            if not ok:
+                return False, reason
+        # Custody proofs commit under the prover's hot key.  Same
+        # leaf-reuse class as the evidence txs above.  Skip entries
+        # whose signature hasn't been attached -- they'll be rejected
+        # by verify_custody_proof downstream; we only dedupe on
+        # signed proofs.
+        for proof in getattr(block, "custody_proofs", []):
+            sig = getattr(proof, "signature", None)
+            if sig is None:
+                continue
+            ok, reason = _check_leaf(
+                proof.prover_id, sig.leaf_index,
+                "custody proof",
+            )
             if not ok:
                 return False, reason
         if block.header.proposer_signature is not None:
@@ -8614,6 +8741,21 @@ class Blockchain:
                     + payout.amount
                 )
             self.archive_reward_pool = wrapper.balance
+            # Bump the watermark for every included proof whose prover
+            # has an on-chain pubkey -- mirrors the consume-leaf rule
+            # for every other hot-key signed path so the validator
+            # path's leaf-reuse gate actually constrains future blocks.
+            # Hobbyist archivists without on-chain pubkeys are not
+            # tracked here; they cannot collide with any prior leaf
+            # anyway (nothing to collide with).
+            for proof in proofs:
+                sig = getattr(proof, "signature", None)
+                if sig is None:
+                    continue
+                if proof.prover_id in self.public_keys:
+                    self._bump_watermark(
+                        proof.prover_id, sig.leaf_index,
+                    )
             if result.total_paid > 0:
                 logger.info(
                     f"ARCHIVE REWARDS: block #{block.header.block_number} "
