@@ -13,6 +13,7 @@ import asyncio
 import getpass
 import logging
 import os
+import re
 import stat
 import sys
 
@@ -3146,11 +3147,27 @@ def cmd_migrate_chain_db(args):
 # which is an explicit project principle -- operators running this from a
 # fresh pip install should not need any third-party packages.
 
-def _upgrade_resolve_latest_tag(repo_url: str) -> str:
-    """Hit the GitHub Releases API for the latest tag on *repo_url*.
+_MAINNET_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-mainnet$")
 
-    Raises RuntimeError with an operator-friendly message on any failure
-    (network, parse, missing tag_name).  Caller translates to exit(2).
+
+def _upgrade_resolve_latest_tag(repo_url: str) -> str:
+    """Return the highest-semver `vX.Y.Z-mainnet` git tag on *repo_url*.
+
+    Uses the GitHub git-tags API (``/repos/{owner}/{repo}/tags``), not
+    the Releases API.  Plain `git tag` / `git push --tags` creates tags
+    but NOT GitHub Release objects -- so the Releases API would return
+    only tags that were manually published via the Releases UI, which
+    is typically the first one ever and nothing since.  The tags API
+    returns every pushed tag regardless of Release-object status, which
+    matches the "just push the tag" publishing model this repo uses.
+
+    Filters to canonical mainnet-release tags (``vX.Y.Z-mainnet``),
+    parses the semver triple, and returns the highest by
+    (major, minor, patch).  Skips prereleases, testnet tags, and any
+    tag that doesn't match the canonical pattern.
+
+    Raises RuntimeError on any failure (network, parse, empty result).
+    Caller translates to exit(2).
     """
     import json
     import urllib.error
@@ -3169,7 +3186,10 @@ def _upgrade_resolve_latest_tag(repo_url: str) -> str:
     if repo.endswith(".git"):
         repo = repo[:-4]
 
-    api = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    # per_page=100 covers the first page; mainnet tags are low-volume so
+    # paginating is overkill here. If this repo ever accumulates >100
+    # tags we can add ?page= walking, but for now a one-shot is simpler.
+    api = f"https://api.github.com/repos/{owner}/{repo}/tags?per_page=100"
     req = urllib.request.Request(
         api,
         headers={
@@ -3182,20 +3202,41 @@ def _upgrade_resolve_latest_tag(repo_url: str) -> str:
             body = resp.read()
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         raise RuntimeError(
-            f"GitHub Releases API unreachable ({e}); "
-            "rerun with --tag <vX.Y.Z> to pin a specific release"
+            f"GitHub tags API unreachable ({e}); "
+            "rerun with --tag <vX.Y.Z-mainnet> to pin a specific release"
         )
     try:
         data = json.loads(body)
     except ValueError as e:
         raise RuntimeError(f"GitHub API returned non-JSON: {e}")
-    tag = data.get("tag_name")
-    if not tag or not isinstance(tag, str):
+    if not isinstance(data, list):
         raise RuntimeError(
-            "GitHub API response missing 'tag_name'; "
-            "rerun with --tag <vX.Y.Z> to pin a specific release"
+            "GitHub tags API returned non-list payload; "
+            "rerun with --tag <vX.Y.Z-mainnet> to pin a specific release"
         )
-    return tag
+
+    best: tuple[int, int, int] | None = None
+    best_name: str | None = None
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        m = _MAINNET_TAG_RE.match(name)
+        if m is None:
+            continue
+        triple = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        if best is None or triple > best:
+            best = triple
+            best_name = name
+
+    if best_name is None:
+        raise RuntimeError(
+            "no canonical vX.Y.Z-mainnet tags found on GitHub; "
+            "rerun with --tag to pin a specific tag"
+        )
+    return best_name
 
 
 def _upgrade_tag_to_version(tag: str) -> str:

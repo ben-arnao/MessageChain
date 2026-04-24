@@ -4,6 +4,24 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-04-24
+
+Patch release — fixes `messagechain upgrade` default tag resolution so
+it actually finds the latest release with zero flags.
+
+### Fixed
+
+- `messagechain upgrade` (no `--tag`) previously queried the GitHub
+  *Releases* API, which only returns tags that were explicitly
+  published as GitHub Release objects via the Releases UI. This
+  repo publishes by pushing git tags directly, so the Releases API
+  returned the one-and-only pre-existing Release (v1.0.0-mainnet)
+  and the command would attempt a downgrade. Now the resolver hits
+  the git-tags API (`/repos/{owner}/{repo}/tags`), filters to
+  canonical `vX.Y.Z-mainnet` tags, and picks the highest by semver
+  triple — not lexicographic order, so `v1.10.0-mainnet` correctly
+  ranks above `v1.9.0-mainnet`.
+
 ## [1.2.1] — 2026-04-24
 
 Version-bump-only release. No behavior changes; cut to exercise the
