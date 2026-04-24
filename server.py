@@ -1568,6 +1568,18 @@ class Server(SharedRuntimeMixin):
                     "error": f"Rate limited: method '{method}' exceeds budget",
                 }
 
+        # Audit-log any action method (anything with RPC_COST > CHEAP,
+        # i.e. every mutating RPC that runs a WOTS+ verify or touches
+        # mempool / stake / governance / authority state).  Cheap read
+        # methods (get_chain_info, get_entity, get_peers) stay silent
+        # to keep this useful as a GCP alert signal -- polling status
+        # would otherwise drown the real peer actions.  The
+        # "PEER_ACTION" prefix is deliberately stable and greppable
+        # for log-based alerting; see docs of release-procedure /
+        # alerting in CLAUDE.md.
+        if method in _RPC_METHOD_COST and client_ip:
+            logger.info(f"PEER_ACTION client={client_ip} action={method}")
+
         if method == "submit_transaction":
             return self._rpc_submit_transaction(request["params"])
 

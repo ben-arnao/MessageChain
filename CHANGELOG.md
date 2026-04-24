@@ -4,6 +4,28 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] — 2026-04-24
+
+Minor release — adds peer-action audit logging for GCP log-based
+alerting. Operators can now wire a Cloud Logging alert to fire when
+any remote IP submits a mutating transaction (`submit_transaction`,
+`submit_transfer`, `stake`, `unstake`, governance, key rotation,
+etc.) against a validator, giving real-time visibility into who is
+using their nodes.
+
+### Added
+
+- `PEER_ACTION client=<ip> action=<method>` log line emitted by
+  `_process_rpc` (`server.py`) for every RPC method registered in
+  `_RPC_METHOD_COST` (i.e. every action method that runs a WOTS+
+  verify or mutates mempool / stake / governance / authority state).
+  Cheap read-only methods (`get_chain_info`, `get_peers`, etc.) are
+  intentionally silent so status-check polling doesn't drown out
+  real peer actions in the alert stream.
+- The log prefix `PEER_ACTION` is stable and greppable for log-based
+  metric matching; see CLAUDE.md "Alerting" for the Cloud Logging
+  filter that wires this to a GCP alert policy.
+
 ## [1.2.2] — 2026-04-24
 
 Patch release — fixes `messagechain upgrade` default tag resolution so
