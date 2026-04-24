@@ -19,6 +19,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from messagechain import __version__
 from messagechain.config import (
     DEFAULT_PORT, SEED_NODES, MAX_PEERS, MAX_TXS_PER_BLOCK,
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
@@ -740,6 +741,7 @@ class Node(SharedRuntimeMixin):
                     "best_block_hash": latest.block_hash.hex() if latest else "",
                     "cumulative_weight": self._current_cumulative_weight(),
                     "genesis_hash": our_genesis_hex,
+                    "version": __version__,
                 },
                 sender_id=self.entity.entity_id_hex,
             )
@@ -874,6 +876,8 @@ class Node(SharedRuntimeMixin):
                 return
 
             peer.entity_id = sender_id
+            peer.peer_height = peer_height
+            peer.peer_version = str(msg.payload.get("version", "") or "unknown")
             self.peers[peer.address] = peer
             logger.info(f"Handshake from {peer.address} (entity: {sender_id[:16]})")
 

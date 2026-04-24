@@ -4,6 +4,32 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-04-24
+
+Minor release — operator ergonomics. Adds a one-shot `messagechain upgrade`
+command and surfaces peer binary versions in the `peers` table.
+
+### Added
+
+- `messagechain upgrade [--tag vX.Y.Z-mainnet]` — stops the validator
+  service, backs up the install dir, fetches the release tag, swaps in
+  the new code, runs `migrate-chain-db` (idempotent), restarts the
+  service, polls local RPC status, and rolls back to the backup on
+  health-check failure. Replaces the 20-line bash procedure we were
+  running by hand. `--no-rollback` keeps the new code even on health
+  failure. Defaults: install-dir `/opt/messagechain`, data-dir
+  `/var/lib/messagechain`, service `messagechain-validator`.
+- Peer binary versions now flow through the P2P handshake. `peers`
+  output gains a **Version** column; peers running ≤1.1.1 show as
+  `unknown` (they didn't advertise a version before this release).
+
+### Changed
+
+- Runtime `__version__` bumped 1.0.0 → 1.2.0. The 1.0.0 constant had
+  drifted stale across 1.0.1, 1.0.2, 1.1.0, and 1.1.1 releases;
+  1.2.0 resumes correct versioning and is advertised in handshakes
+  from now on.
+
 ## [1.1.1] — 2026-04-24
 
 Patch release — fixes a regression in the schema v1→v2 migration
