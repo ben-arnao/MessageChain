@@ -3734,13 +3734,73 @@ def cmd_upgrade(args):
     backup_dir = f"{args.install_dir}.bak-{ts}"
     clone_dir = f"/tmp/mc-release-{ts}"
 
+    # --- Fetch tag (service still running) ---
+    # Ordering: clone + verify BEFORE stopping the service or moving
+    # the live install.  Two reasons:
+    #   1. Supply-chain gate (signature verify) imports
+    #      ``messagechain.release_signers`` -- a LAZY import inside
+    #      ``_upgrade_verify_tag_signature``.  At verify time the
+    #      interpreter resolves that module against sys.path, which
+    #      points into the running install.  If we had already moved
+    #      /opt/messagechain to the backup dir, that import would
+    #      fail and the operator would be left with a stopped service
+    #      AND no live install at all (the 1.5.x bug that left
+    #      validator-1 needing manual restore during the 1.5.2 -> 1.6.0
+    #      rollout).  Running verify while the install is still in
+    #      place keeps the pinned signer list reachable.
+    #   2. If clone or verify fails, the service never needed to stop
+    #      -- the old binary keeps validating.  Zero downtime on a
+    #      rejected upgrade.
+    # NOTE: ``--depth 1 --branch <tag>`` creates a shallow clone that
+    # still includes the tag object and the commit it points at, which
+    # is all ``git tag -v`` needs.  If the remote is configured to
+    # refuse shallow tag fetches for signed-tag verification, fall
+    # back to a full clone by removing --depth 1.
+    _say(f"Cloning {args.repo} @ {target_tag} -> {clone_dir}")
+    clone_cmd = [
+        "git", "clone", "--depth", "1", "--branch", target_tag,
+        args.repo, clone_dir,
+    ]
+    try:
+        subprocess.run(clone_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        _fail(
+            f"git clone failed ({e}); service untouched and still "
+            "running on prior binary."
+        )
+
+    # --- Verify tag signature against pinned release signers ---
+    # This is the supply-chain gate: no unsigned / unknown-signer tag
+    # is ever allowed to swap into the install directory.  Verified
+    # here, BEFORE any mutation of the live install, so a bad signature
+    # cannot leave the node in a half-upgraded state.
+    _say(f"Verifying {target_tag} signature against pinned signers...")
+    try:
+        _upgrade_verify_tag_signature(clone_dir, target_tag)
+    except RuntimeError as e:
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
+        _fail(
+            f"release tag verification failed: {e}; service untouched "
+            "and still running on prior binary."
+        )
+    _say("Signature OK.")
+
     # --- Stop service ---
+    # Only reached after clone + verify succeed.  From here on we own
+    # the downtime window and any failure triggers backup restore.
     _say(f"Stopping {args.service}...")
     try:
         subprocess.run(
             ["systemctl", "stop", args.service], check=True,
         )
     except subprocess.CalledProcessError as e:
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
         _fail(f"systemctl stop failed: {e}")
     # reset-failed is best-effort; a clean stop won't need it.
     subprocess.run(
@@ -3753,6 +3813,10 @@ def cmd_upgrade(args):
         shutil.move(args.install_dir, backup_dir)
     except Exception as e:
         # Restart service so we don't leave the node down on a mistake.
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
         subprocess.run(
             ["systemctl", "start", args.service], check=False,
         )
@@ -3775,43 +3839,6 @@ def cmd_upgrade(args):
         subprocess.run(
             ["systemctl", "start", args.service], check=False,
         )
-
-    # --- Fetch tag ---
-    # NOTE: ``--depth 1 --branch <tag>`` creates a shallow clone that
-    # still includes the tag object and the commit it points at, which
-    # is all ``git tag -v`` needs.  If the remote is configured to
-    # refuse shallow tag fetches for signed-tag verification, fall
-    # back to a full clone by removing --depth 1.
-    _say(f"Cloning {args.repo} @ {target_tag} -> {clone_dir}")
-    clone_cmd = [
-        "git", "clone", "--depth", "1", "--branch", target_tag,
-        args.repo, clone_dir,
-    ]
-    try:
-        subprocess.run(clone_cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        _restore_backup_and_start()
-        _fail(
-            f"git clone failed ({e}); backup restored and service "
-            "restarted."
-        )
-
-    # --- Verify tag signature against pinned release signers ---
-    # This is the supply-chain gate: no unsigned / unknown-signer tag
-    # is ever allowed to swap into /opt/messagechain.  Must run BEFORE
-    # the copytree swap -- if verification fails we throw away the
-    # clone and restore the backup without touching the install dir.
-    _say(f"Verifying {target_tag} signature against pinned signers...")
-    try:
-        _upgrade_verify_tag_signature(clone_dir, target_tag)
-    except RuntimeError as e:
-        try:
-            shutil.rmtree(clone_dir)
-        except OSError:
-            pass
-        _restore_backup_and_start()
-        _fail(f"release tag verification failed: {e}; backup restored.")
-    _say("Signature OK.")
 
     # --- Swap ---
     _say(f"Installing new code -> {args.install_dir}")

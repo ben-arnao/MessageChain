@@ -4,6 +4,30 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] — 2026-04-24
+
+Patch release. Fixes the `messagechain upgrade` CLI ordering bug
+that bricked validator-1 during the 1.5.2 -> 1.6.0 rollout and
+required a manual backup-directory restore before the service could
+come back up. No consensus changes.
+
+### Fixed
+
+- **`messagechain upgrade` ordering: clone + verify now run BEFORE
+  the live install is moved to backup.** The 1.5.x CLI moved
+  `/opt/messagechain` to a `.bak-*` directory and THEN invoked
+  `_upgrade_verify_tag_signature`, which lazily imports
+  `messagechain.release_signers` from sys.path. With the install
+  directory already gone, the import raised `ModuleNotFoundError`
+  and the upgrade aborted with the service stopped and no live
+  install — leaving the operator to `mv .bak-* /opt/messagechain`
+  by hand. Fixed by reordering: clone to `/tmp`, verify against the
+  still-in-place install's pinned signer list, stop the service,
+  move the install to backup, copy the verified clone into place.
+  Failure in clone or verify now leaves the prior binary running
+  and untouched (zero downtime on rejected upgrades). Regression
+  test asserts the ordering invariant.
+
 ## [1.6.0] — 2026-04-24
 
 Minor release. Ships the **Tier 10 `prev` pointer** feature and pulls

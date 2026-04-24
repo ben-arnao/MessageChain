@@ -417,6 +417,91 @@ class TestUpgradeRollback(unittest.TestCase):
         # And rmtree was called on the failed install before restore.
         self.assertIn(args.install_dir, rmtree_calls)
 
+    def test_clone_and_verify_run_before_service_stop(self):
+        """Supply-chain gate ordering: ``git clone`` and the signature
+        verify helper MUST both run BEFORE ``systemctl stop`` and
+        ``shutil.move(install_dir -> backup_dir)``.
+
+        Rationale: ``_upgrade_verify_tag_signature`` lazily imports
+        ``messagechain.release_signers`` — if the install directory has
+        already been moved to the backup path, that import resolves
+        against a filesystem path that no longer exists and the
+        upgrade aborts with the service stopped and no live install.
+        The 1.5.x rollout to the 1.6.0 release hit this bug: validator-1
+        needed a manual ``mv`` of the backup directory back to
+        /opt/messagechain before it could restart.  Fixed by reordering
+        so a failed clone or verify leaves the prior binary running
+        and untouched.
+        """
+        from messagechain import cli as cli_mod
+
+        args = _make_args(
+            tag="v99.99.99-mainnet",
+            skip_migrate=True,
+        )
+
+        events: list[str] = []
+
+        def fake_run(cmd, *a, **kw):
+            joined = " ".join(cmd)
+            if "git clone" in joined:
+                events.append("git_clone")
+            elif joined.startswith("systemctl stop"):
+                events.append("systemctl_stop")
+            elif joined.startswith("systemctl start"):
+                events.append("systemctl_start")
+            elif joined.startswith("chown"):
+                events.append("chown")
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def fake_move(src, dst):
+            if src == args.install_dir:
+                events.append("move_install_to_backup")
+            else:
+                events.append("move_other")
+
+        def fake_verify(clone_dir, tag):
+            events.append("verify_signature")
+
+        def fake_health(host, port, timeout_s=60):
+            # Pass so we exercise the happy-path ordering up to
+            # completion rather than the rollback branch.
+            return True
+
+        with patch("shutil.which", return_value="/usr/bin/anything"), \
+             patch.object(os, "geteuid", return_value=0, create=True), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("shutil.rmtree"), \
+             patch("shutil.move", side_effect=fake_move), \
+             patch("shutil.copytree"), \
+             patch("os.path.exists", return_value=True), \
+             patch.object(cli_mod, "_upgrade_verify_tag_signature",
+                          side_effect=fake_verify), \
+             patch.object(cli_mod, "_upgrade_health_check",
+                          side_effect=fake_health):
+            cli_mod.cmd_upgrade(args)
+
+        # The critical invariants: clone and verify must BOTH land
+        # before the service stop and before the backup move.
+        clone_idx = events.index("git_clone")
+        verify_idx = events.index("verify_signature")
+        stop_idx = events.index("systemctl_stop")
+        backup_idx = events.index("move_install_to_backup")
+        self.assertLess(clone_idx, stop_idx,
+                        f"git clone must precede systemctl stop; got {events}")
+        self.assertLess(verify_idx, stop_idx,
+                        f"verify must precede systemctl stop; got {events}")
+        self.assertLess(clone_idx, backup_idx,
+                        f"git clone must precede backup move; got {events}")
+        self.assertLess(verify_idx, backup_idx,
+                        f"verify must precede backup move; got {events}")
+        # And verify runs on the clone that git clone produced, so
+        # verify must follow the clone.
+        self.assertLess(clone_idx, verify_idx,
+                        f"verify must follow git clone; got {events}")
+
     def test_no_rollback_flag_leaves_new_code_in_place(self):
         """With --no-rollback, a failed health check must NOT move the
         backup back — operator recovers by hand using the printed
