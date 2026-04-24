@@ -259,7 +259,10 @@ class Mempool:
         return time.time() - tx.timestamp > self.tx_ttl
 
     def try_replace_by_fee(
-        self, new_tx: MessageTransaction, public_key: bytes | None = None,
+        self,
+        new_tx: MessageTransaction,
+        public_key: bytes | None = None,
+        current_height: int | None = None,
     ) -> bool:
         """Replace an existing unconfirmed transaction with a higher-fee version.
 
@@ -267,6 +270,11 @@ class Mempool:
         nonce as an existing mempool transaction, and a strictly higher fee.
         The replacement must also have a valid signature to prevent censorship
         attacks where an attacker evicts valid txns with unsigned replacements.
+
+        ``current_height`` MUST be the current chain tip so the signature
+        check uses the same fee rule consensus is enforcing.  Omitting it
+        routes through the legacy quadratic floor, which rejects
+        LINEAR-era low-fee replacements that are perfectly valid on-chain.
 
         Returns True if replacement succeeded, False otherwise.
         """
@@ -289,7 +297,9 @@ class Mempool:
         if public_key is None:
             return False
         from messagechain.core.transaction import verify_transaction
-        if not verify_transaction(new_tx, public_key):
+        if not verify_transaction(
+            new_tx, public_key, current_height=current_height,
+        ):
             return False
 
         # Remove old, add new.  Carry the original arrival height forward

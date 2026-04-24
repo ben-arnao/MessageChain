@@ -1583,16 +1583,27 @@ def cmd_send(args):
     if info_resp.get("ok"):
         count = info_resp["result"].get("height", 0) or 0
         tip_height = max(count - 1, 0)
-    if tip_height + 1 >= FEE_INCLUDES_SIGNATURE_HEIGHT:
+    # Thread the target inclusion height (tip+1) so calculate_min_fee
+    # dispatches to the live fee rule (LINEAR at/after LINEAR_FEE_HEIGHT)
+    # instead of the stricter legacy quadratic default -- without this,
+    # CLI users silently overpay ~5-10x on short messages and low-fee
+    # dissident submissions get rejected client-side even though the
+    # chain would accept them.
+    target_height = tip_height + 1
+    if target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
         # Signature size is deterministic for the scheme parameters baked
         # into the keypair, so compute it without actually signing (a
         # probe-sign would consume a one-time WOTS+ leaf).
         sig_bytes_len = _estimate_signature_size(entity.keypair)
         local_min = calculate_min_fee(
-            stored_bytes, signature_bytes=sig_bytes_len,
+            stored_bytes,
+            signature_bytes=sig_bytes_len,
+            current_height=target_height,
         )
     else:
-        local_min = calculate_min_fee(stored_bytes)
+        local_min = calculate_min_fee(
+            stored_bytes, current_height=target_height,
+        )
     fee = args.fee
     if fee is None:
         est_resp = rpc_call(host, port, "get_fee_estimate", {})
@@ -3361,6 +3372,78 @@ def cmd_migrate_chain_db(args):
 _MAINNET_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)-mainnet$")
 
 
+def _upgrade_verify_tag_signature(clone_dir: str, tag: str) -> None:
+    """Verify *tag* in *clone_dir* is signed by a pinned release signer.
+
+    MessageChain release tags are SSH-signed (``git tag -s``) by a
+    maintainer whose pubkey is pinned in
+    ``messagechain/release_signers.py``.  Without this check, the
+    upgrade path would ``git clone --branch <tag>`` and swap ANY tag
+    pushed to the repo into /opt/messagechain as root -- an attacker
+    who compromised a maintainer's GitHub credentials, a GitHub
+    incident, or a branch-protection bypass could push a malicious
+    tag and every validator running ``messagechain upgrade`` would
+    execute it as root on next run.  This function closes that
+    supply-chain path by refusing to proceed past tag resolution
+    unless ``git tag -v`` succeeds against our pinned allowed-signers
+    set.
+
+    Raises RuntimeError on any verification failure; caller translates
+    to a fatal restore-and-exit.
+    """
+    import subprocess
+    import tempfile
+    from messagechain.release_signers import ALLOWED_SIGNERS
+
+    # Write the pinned allowed-signers file to a tempfile for the
+    # duration of this verify.  Using tempfile (not a fixed path)
+    # means parallel upgrades don't collide and we don't pollute
+    # the host filesystem with a persistent signers file.
+    with tempfile.NamedTemporaryFile(
+        prefix="mc-allowed-signers-",
+        suffix=".txt",
+        delete=False,
+    ) as tf:
+        tf.write(ALLOWED_SIGNERS)
+        signers_path = tf.name
+    try:
+        # ``git tag -v`` exits non-zero if the tag is unsigned, signed
+        # by an unknown key, or the signature is invalid.  We override
+        # the local git config with -c so the operator's personal
+        # allowedSignersFile (or lack thereof) doesn't affect the
+        # outcome -- only the pinned set matters.
+        proc = subprocess.run(
+            [
+                "git",
+                "-C", clone_dir,
+                "-c", f"gpg.ssh.allowedSignersFile={signers_path}",
+                "-c", "gpg.format=ssh",
+                "tag", "-v", tag,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            stderr = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(
+                f"tag {tag!r} failed signature verification against "
+                f"pinned release signers: {stderr[:400]}"
+            )
+        # Belt-and-braces: the output must reference a "Good" signature.
+        # git tag -v sends the signature report to stderr; accept either.
+        combined = (proc.stderr or "") + (proc.stdout or "")
+        if "Good" not in combined and "good" not in combined:
+            raise RuntimeError(
+                f"tag {tag!r} verified with unexpected output (no "
+                f"'Good signature' marker): {combined[:400]}"
+            )
+    finally:
+        try:
+            os.unlink(signers_path)
+        except OSError:
+            pass
+
+
 def _upgrade_resolve_latest_tag(repo_url: str) -> str:
     """Return the highest-semver `vX.Y.Z-mainnet` git tag on *repo_url*.
 
@@ -3635,6 +3718,11 @@ def cmd_upgrade(args):
         )
 
     # --- Fetch tag ---
+    # NOTE: ``--depth 1 --branch <tag>`` creates a shallow clone that
+    # still includes the tag object and the commit it points at, which
+    # is all ``git tag -v`` needs.  If the remote is configured to
+    # refuse shallow tag fetches for signed-tag verification, fall
+    # back to a full clone by removing --depth 1.
     _say(f"Cloning {args.repo} @ {target_tag} -> {clone_dir}")
     clone_cmd = [
         "git", "clone", "--depth", "1", "--branch", target_tag,
@@ -3648,6 +3736,23 @@ def cmd_upgrade(args):
             f"git clone failed ({e}); backup restored and service "
             "restarted."
         )
+
+    # --- Verify tag signature against pinned release signers ---
+    # This is the supply-chain gate: no unsigned / unknown-signer tag
+    # is ever allowed to swap into /opt/messagechain.  Must run BEFORE
+    # the copytree swap -- if verification fails we throw away the
+    # clone and restore the backup without touching the install dir.
+    _say(f"Verifying {target_tag} signature against pinned signers...")
+    try:
+        _upgrade_verify_tag_signature(clone_dir, target_tag)
+    except RuntimeError as e:
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
+        _restore_backup_and_start()
+        _fail(f"release tag verification failed: {e}; backup restored.")
+    _say("Signature OK.")
 
     # --- Swap ---
     _say(f"Installing new code -> {args.install_dir}")

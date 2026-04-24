@@ -211,7 +211,7 @@ class TestBogusRejectionProcessor(unittest.TestCase):
 
         proc = BogusRejectionProcessor()
         stake_before = self.chain.supply.staked[self.alice.entity_id]
-        result = proc.process(etx, self.chain)
+        result = proc.process(etx, self.chain, block_height=self.chain.height + 1)
         self.assertTrue(result.slashed)
         self.assertEqual(result.offender_id, self.alice.entity_id)
         self.assertEqual(
@@ -238,7 +238,7 @@ class TestBogusRejectionProcessor(unittest.TestCase):
 
         proc = BogusRejectionProcessor()
         stake_before = self.chain.supply.staked[self.alice.entity_id]
-        result = proc.process(etx, self.chain)
+        result = proc.process(etx, self.chain, block_height=self.chain.height + 1)
         self.assertFalse(result.slashed)
         self.assertFalse(result.accepted)
         self.assertIn("honest", result.reason.lower())
@@ -260,7 +260,7 @@ class TestBogusRejectionProcessor(unittest.TestCase):
 
             proc = BogusRejectionProcessor()
             stake_before = self.chain.supply.staked[self.alice.entity_id]
-            result = proc.process(etx, self.chain)
+            result = proc.process(etx, self.chain, block_height=self.chain.height + 1)
             self.assertFalse(result.slashed, f"reason {rc} must not slash")
             self.assertTrue(result.accepted, f"reason {rc} must be accepted")
             self.assertIn(etx.evidence_hash, proc.processed)
@@ -268,16 +268,52 @@ class TestBogusRejectionProcessor(unittest.TestCase):
                 self.chain.supply.staked[self.alice.entity_id], stake_before,
             )
 
+    def test_linear_era_low_fee_tx_still_refutable(self):
+        """Regression (censorship-escape fix): a LINEAR-era low-fee
+        message_tx whose fee is valid under the live linear rule but
+        below the legacy quadratic floor MUST still be treated as a
+        valid tx by the refutation path.  Before the fix, ``process``
+        called ``verify_transaction`` without ``current_height``, which
+        routed through the legacy rule and returned False for any
+        signature-valid tx in the gap window — dismissing legitimate
+        evidence and letting the lying validator escape slashing.
+        """
+        from messagechain.config import BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT
+        # LINEAR-valid fee ("hi" stored canonical is 2 bytes;
+        # BASE_TX_FEE + 2 * FEE_PER_STORED_BYTE = 12) that falls below
+        # the legacy quadratic floor (~106) — exactly the censor's
+        # escape window before the fix.
+        linear_fee = BASE_TX_FEE + 2 * FEE_PER_STORED_BYTE + 40
+        mtx = create_transaction(
+            self.bob, "hi", linear_fee, nonce=0,
+            current_height=LINEAR_FEE_HEIGHT + 100,
+        )
+        rej = self._make_rejection(mtx, REJECT_INVALID_SIG)
+        etx = _sign_evidence(self.bob, rej, mtx)
+
+        proc = BogusRejectionProcessor()
+        # Apply at a LINEAR-era block height — the rule consensus is
+        # actually enforcing on this tx.
+        result = proc.process(
+            etx, self.chain, block_height=LINEAR_FEE_HEIGHT + 100,
+        )
+        self.assertTrue(
+            result.slashed,
+            "LINEAR-era low-fee tx must still refute the bogus rejection "
+            "— without height threading, verify_transaction uses the "
+            "legacy quadratic floor and would dismiss valid evidence.",
+        )
+
     def test_double_submit_prevented(self):
         mtx = create_transaction(self.bob, "hi", MIN_FEE + 100, nonce=0)
         rej = self._make_rejection(mtx, REJECT_INVALID_SIG)
         etx = _sign_evidence(self.bob, rej, mtx)
 
         proc = BogusRejectionProcessor()
-        first = proc.process(etx, self.chain)
+        first = proc.process(etx, self.chain, block_height=self.chain.height + 1)
         self.assertTrue(first.slashed)
         # Second submission of identical evidence: rejected as already-processed.
-        second = proc.process(etx, self.chain)
+        second = proc.process(etx, self.chain, block_height=self.chain.height + 1)
         self.assertFalse(second.slashed)
         self.assertFalse(second.accepted)
         self.assertIn("processed", second.reason.lower())

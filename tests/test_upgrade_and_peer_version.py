@@ -375,6 +375,7 @@ class TestUpgradeRollback(unittest.TestCase):
              patch("shutil.move", side_effect=fake_move), \
              patch("shutil.copytree", side_effect=fake_copytree), \
              patch("os.path.exists", return_value=True), \
+             patch.object(cli_mod, "_upgrade_verify_tag_signature"), \
              patch.object(cli_mod, "_upgrade_health_check", side_effect=fake_health):
             with self.assertRaises(SystemExit) as cm:
                 cli_mod.cmd_upgrade(args)
@@ -445,6 +446,7 @@ class TestUpgradeRollback(unittest.TestCase):
              patch("shutil.move", side_effect=lambda s, d: move_calls.append((s, d))), \
              patch("shutil.copytree"), \
              patch("os.path.exists", return_value=True), \
+             patch.object(cli_mod, "_upgrade_verify_tag_signature"), \
              patch.object(cli_mod, "_upgrade_health_check", side_effect=fake_health):
             with self.assertRaises(SystemExit) as cm:
                 cli_mod.cmd_upgrade(args)
@@ -586,6 +588,123 @@ class TestUpgradeTagResolutionPicksHighestSemver(unittest.TestCase):
                     "https://github.com/ben-arnao/MessageChain",
                 )
         self.assertIn("no canonical", str(cm.exception))
+
+
+class TestUpgradeTagSignatureVerification(unittest.TestCase):
+    """Supply-chain gate: ``_upgrade_verify_tag_signature`` must accept
+    tags signed by pinned release signers and reject everything else
+    (unsigned tags, unknown signers, missing tags).  Without this
+    gate, ``messagechain upgrade`` would install any tag pushed to
+    the repo as root — an attacker who compromised a maintainer's
+    GitHub token could ship arbitrary code to every validator on
+    next upgrade.
+    """
+
+    def test_unknown_signer_rejected(self):
+        """git tag -v returns non-zero when the signer is not in the
+        pinned allowed_signers file.  Simulate via a fake subprocess
+        that returns exit 1 with a 'no principal matched' style error —
+        exactly what git emits for a tag signed by a key outside the
+        allowed set."""
+        from messagechain.cli import _upgrade_verify_tag_signature
+        from unittest.mock import patch, MagicMock
+
+        def fake_run(cmd, *a, **kw):
+            r = MagicMock()
+            r.returncode = 1
+            r.stderr = (
+                "error: gpg.ssh.allowedSignersFile needs to be "
+                "configured and exist for ssh signature verification\n"
+                "no principal matched"
+            )
+            r.stdout = ""
+            return r
+
+        with patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as cm:
+                _upgrade_verify_tag_signature("/tmp/fake", "v1.2.3-mainnet")
+        self.assertIn("signature verification", str(cm.exception).lower())
+
+    def test_unsigned_tag_rejected(self):
+        """git tag -v returns non-zero with 'no signature found' on an
+        unsigned tag.  The verifier must propagate this as a fatal
+        RuntimeError."""
+        from messagechain.cli import _upgrade_verify_tag_signature
+        from unittest.mock import patch, MagicMock
+
+        def fake_run(cmd, *a, **kw):
+            r = MagicMock()
+            r.returncode = 1
+            r.stderr = "error: no signature found"
+            r.stdout = ""
+            return r
+
+        with patch("subprocess.run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as cm:
+                _upgrade_verify_tag_signature("/tmp/fake", "v1.2.3-mainnet")
+        self.assertIn("no signature", str(cm.exception).lower())
+
+    def test_authorized_signer_accepted(self):
+        """A git tag -v run that exits 0 and emits a 'Good signature'
+        line passes verification without raising."""
+        from messagechain.cli import _upgrade_verify_tag_signature
+        from unittest.mock import patch, MagicMock
+
+        def fake_run(cmd, *a, **kw):
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = (
+                'Good "git" signature for arnaoben@gmail.com with '
+                "ED25519 key SHA256:abcdef"
+            )
+            r.stdout = ""
+            return r
+
+        with patch("subprocess.run", side_effect=fake_run):
+            # Must not raise.
+            _upgrade_verify_tag_signature("/tmp/fake", "v1.2.3-mainnet")
+
+    def test_verifier_pins_allowed_signers_via_c_flag(self):
+        """The verifier MUST pass -c gpg.ssh.allowedSignersFile=<tmp>
+        so the pinned set (not the host's global git config) decides
+        which keys are trusted.  Otherwise an attacker who can edit
+        the operator's ~/.gitconfig would bypass the gate."""
+        from messagechain.cli import _upgrade_verify_tag_signature
+        from unittest.mock import patch, MagicMock
+
+        observed_cmds: list[list[str]] = []
+
+        def fake_run(cmd, *a, **kw):
+            observed_cmds.append(list(cmd))
+            r = MagicMock()
+            r.returncode = 0
+            r.stderr = 'Good "git" signature for arnaoben@gmail.com'
+            r.stdout = ""
+            return r
+
+        with patch("subprocess.run", side_effect=fake_run):
+            _upgrade_verify_tag_signature("/tmp/fake", "v1.2.3-mainnet")
+
+        self.assertEqual(len(observed_cmds), 1)
+        cmd = observed_cmds[0]
+        # -c gpg.ssh.allowedSignersFile=<path> is present.
+        joined = " ".join(cmd)
+        self.assertIn("gpg.ssh.allowedSignersFile=", joined)
+        self.assertIn("gpg.format=ssh", joined)
+        # tag -v is the terminal operation.
+        self.assertIn("tag", cmd)
+        self.assertIn("-v", cmd)
+
+    def test_allowed_signers_pins_known_maintainer(self):
+        """The pinned allowed-signers blob MUST contain the documented
+        MessageChain release-signer pubkey — regression against
+        accidental edits that would break the signature chain on every
+        validator on next upgrade."""
+        from messagechain.release_signers import ALLOWED_SIGNERS
+
+        self.assertIn(b"arnaoben@gmail.com", ALLOWED_SIGNERS)
+        self.assertIn(b'namespaces="git"', ALLOWED_SIGNERS)
+        self.assertIn(b"ssh-ed25519", ALLOWED_SIGNERS)
 
 
 if __name__ == "__main__":

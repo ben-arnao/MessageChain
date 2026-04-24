@@ -4615,7 +4615,10 @@ class Blockchain:
                     # Honest rejection (no key to verify against) —
                     # evidence rejected at apply-time, no fee.
                     continue
-                if not _verify_msg_tx(etx.message_tx, offender_pk):
+                if not _verify_msg_tx(
+                    etx.message_tx, offender_pk,
+                    current_height=block_height,
+                ):
                     # Honest rejection — evidence rejected, no fee.
                     continue
                 # Bogus → slash + charge fee + record processed.
@@ -7605,7 +7608,9 @@ class Blockchain:
                     f"rejected at apply-time: {reason}"
                 )
                 continue
-            result = self.bogus_rejection_processor.process(etx, self)
+            result = self.bogus_rejection_processor.process(
+                etx, self, block_height=block.header.block_number,
+            )
             if not result.accepted:
                 # Honest rejection or already-processed — no fee, no
                 # watermark bump.  The evidence_tx is rejected entirely.

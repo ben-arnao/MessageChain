@@ -327,6 +327,8 @@ class BogusRejectionProcessor:
         self,
         tx: BogusRejectionEvidenceTx,
         blockchain,
+        *,
+        block_height: int,
     ) -> BogusRejectionResult:
         """Decide the outcome of a BogusRejectionEvidenceTx.
 
@@ -338,6 +340,14 @@ class BogusRejectionProcessor:
 
         For non-slashable reason codes: admit + record processed,
         no slash.  Caller charges the fee normally.
+
+        ``block_height`` MUST be the height of the applying block so
+        ``verify_transaction`` dispatches to the same fee rule consensus
+        is currently enforcing.  Omitting it (or passing None) routes
+        through the legacy quadratic floor — for a LINEAR-era low-fee
+        tx this rejects a signature-valid message_tx as "honest
+        rejection," letting the lying validator escape slashing and
+        censor the message.
 
         Already-processed evidence is rejected unconditionally.
         """
@@ -371,7 +381,9 @@ class BogusRejectionProcessor:
                         "on-chain public key to verify against"
                     ),
                 )
-            sig_verifies = verify_transaction(tx.message_tx, offender_pk)
+            sig_verifies = verify_transaction(
+                tx.message_tx, offender_pk, current_height=block_height,
+            )
             if not sig_verifies:
                 # Rejection was HONEST — the tx's signature actually
                 # fails to verify.  Caller MUST NOT charge fee — the
