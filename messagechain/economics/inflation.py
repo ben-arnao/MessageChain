@@ -30,6 +30,7 @@ from messagechain.config import (
     PROPOSER_REWARD_CAP,
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
+    BLOCK_BYTES_RAISE_HEIGHT, TARGET_BLOCK_SIZE_POST_RAISE,
     get_unbonding_period,
     ATTESTER_REWARD_SPLIT_HEIGHT,
     ATTESTER_FEE_FUNDING_HEIGHT,
@@ -766,24 +767,40 @@ class SupplyTracker:
         self.total_fees_collected += fee
         return True
 
-    def update_base_fee(self, parent_tx_count: int) -> int:
+    def update_base_fee(
+        self,
+        parent_tx_count: int,
+        current_height: int | None = None,
+    ) -> int:
         """Adjust base fee based on parent block fullness (EIP-1559).
 
-        If the parent block had more txs than TARGET_BLOCK_SIZE, base fee
-        increases. If fewer, it decreases. Max change per block is
+        If the parent block had more txs than the target block size, base
+        fee increases. If fewer, it decreases. Max change per block is
         1/BASE_FEE_MAX_CHANGE_DENOMINATOR of the current base fee.
+
+        ``current_height`` selects the post-fork target: at/after
+        BLOCK_BYTES_RAISE_HEIGHT (Tier 9) the target is
+        TARGET_BLOCK_SIZE_POST_RAISE (22, tracking the raised
+        MAX_TXS_PER_BLOCK=45).  Default ``None`` preserves the legacy
+        TARGET_BLOCK_SIZE=10 so pre-fork blocks and non-consensus call
+        sites (e.g. isolated tests) retain their prior behavior.
 
         Returns the new base fee.
         """
-        if parent_tx_count == TARGET_BLOCK_SIZE:
+        if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
+            target = TARGET_BLOCK_SIZE_POST_RAISE
+        else:
+            target = TARGET_BLOCK_SIZE
+
+        if parent_tx_count == target:
             return self.base_fee
 
         from messagechain.config import MIN_FEE, MAX_BASE_FEE_MULTIPLIER
         max_base_fee = MIN_FEE * MAX_BASE_FEE_MULTIPLIER
-        if parent_tx_count > TARGET_BLOCK_SIZE:
+        if parent_tx_count > target:
             # Block was over target — increase base fee
-            excess = parent_tx_count - TARGET_BLOCK_SIZE
-            delta = self.base_fee * excess // (TARGET_BLOCK_SIZE * BASE_FEE_MAX_CHANGE_DENOMINATOR)
+            excess = parent_tx_count - target
+            delta = self.base_fee * excess // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
             # Upper bound on base_fee: without a cap, a determined attacker
             # willing to burn tokens on full blocks can compound +12.5% per
             # block indefinitely, permanently pricing out honest users even
@@ -795,8 +812,8 @@ class SupplyTracker:
             self.base_fee = min(self.base_fee + max(1, delta), max_base_fee)
         else:
             # Block was under target — decrease base fee
-            deficit = TARGET_BLOCK_SIZE - parent_tx_count
-            delta = self.base_fee * deficit // (TARGET_BLOCK_SIZE * BASE_FEE_MAX_CHANGE_DENOMINATOR)
+            deficit = target - parent_tx_count
+            delta = self.base_fee * deficit // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
             self.base_fee = max(MIN_FEE, self.base_fee - delta)
 
         return self.base_fee

@@ -8183,8 +8183,10 @@ class Blockchain:
             current_height=block.header.block_number,
         )
 
-        # Update base fee for next block based on this block's fullness
-        self.supply.update_base_fee(total_tx_count)
+        # Update base fee for next block based on this block's fullness.
+        # Pass the block's height so the EIP-1559 target tracks the
+        # post-Tier-9 raised target (22) at/after BLOCK_BYTES_RAISE_HEIGHT.
+        self.supply.update_base_fee(total_tx_count, block.header.block_number)
         self.base_fee = self.supply.base_fee
 
         # Update bootstrap_progress ratchet.  Deliberately the LAST step
