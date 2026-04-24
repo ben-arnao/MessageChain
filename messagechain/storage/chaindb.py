@@ -1020,6 +1020,30 @@ class ChainDB:
             (key, value),
         )
 
+    # ── Finalization-stall counter ───────────────────────────────
+    # The number of blocks since the most recent finalization.
+    # Consensus-critical because `_apply_block_state` reads this
+    # counter to decide whether the inactivity leak activates, and
+    # (if active) scales the per-validator burn QUADRATICALLY with
+    # the counter — so a cold-restart that resets the counter to 0
+    # silently stops the burn on the restarted peer while uprestarted
+    # peers continue burning, diverging `supply.staked` +
+    # `supply.total_supply` + state_root.  Rides the existing
+    # `supply_meta` key/value table (no new schema), with the key
+    # "blocks_since_last_finalization".  Dedicated wrapper pair
+    # below so the mutation site in Blockchain stays single-line
+    # and includes the `_maybe_commit` that `set_supply_meta` on
+    # its own omits.
+
+    def get_finalization_stall_counter(self) -> int:
+        """Return the persisted finalization-stall counter (0 if unset)."""
+        return int(self.get_supply_meta("blocks_since_last_finalization"))
+
+    def set_finalization_stall_counter(self, value: int) -> None:
+        """Persist the finalization-stall counter.  Idempotent upsert."""
+        self.set_supply_meta("blocks_since_last_finalization", int(value))
+        self._maybe_commit()
+
     # ── Phantom-Supply Migration (one-shot correctness repair) ──────────
     #
     # Earlier mainnet builds set GENESIS_SUPPLY = 1_000_000_000 while the
@@ -1404,6 +1428,15 @@ class ChainDB:
             # past attestations must restore the pre-reorg counts
             # so the post-reorg replay converges on the same winner.
             "reputation": self.get_all_reputation(),
+            # Finalization-stall counter — scalar input to the
+            # quadratic inactivity leak.  Must round-trip with supply
+            # state because a reorg that rolls past the finalization-
+            # reset block has to restore the pre-reorg counter, or
+            # the post-reorg replay computes a different burn than
+            # peers that never forked.
+            "blocks_since_last_finalization": (
+                self.get_finalization_stall_counter()
+            ),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -1488,6 +1521,17 @@ class ChainDB:
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_fees_collected'", (snapshot["total_fees_collected"],))
+            # Finalization-stall counter round-trip -- INSERT OR
+            # REPLACE because older snapshots predate this field and
+            # the supply_meta row may not exist yet on the disk.
+            conn.execute(
+                "INSERT OR REPLACE INTO supply_meta (key, value) "
+                "VALUES (?, ?)",
+                (
+                    "blocks_since_last_finalization",
+                    int(snapshot.get("blocks_since_last_finalization", 0)),
+                ),
+            )
             conn.commit()
         except Exception:
             conn.rollback()

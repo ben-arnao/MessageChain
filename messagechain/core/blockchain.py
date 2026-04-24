@@ -715,6 +715,18 @@ class Blockchain:
         # legacy chain.db files (pre-reputation-table) loadable.
         if hasattr(self.db, "get_all_reputation"):
             self.reputation = self.db.get_all_reputation()
+        # Rehydrate the finalization-stall counter.  Consensus-visible:
+        # `_apply_block_state` reads it to decide whether to fire the
+        # inactivity leak AND scales the per-validator burn
+        # quadratically with its value -- so a cold-restart that
+        # resets the counter to 0 while uprestarted peers hold N>0
+        # stops burning on the restarted peer while peers continue,
+        # diverging supply.staked + supply.total_supply at the next
+        # block.  `hasattr` gate keeps legacy chain.db files loadable.
+        if hasattr(self.db, "get_finalization_stall_counter"):
+            self.blocks_since_last_finalization = (
+                self.db.get_finalization_stall_counter()
+            )
 
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
@@ -2592,6 +2604,27 @@ class Blockchain:
         self.reputation.pop(entity_id, None)
         if self.db is not None and hasattr(self.db, "clear_reputation"):
             self.db.clear_reputation(entity_id)
+
+    def _set_finalization_stall_counter(self, value: int) -> None:
+        """Set `self.blocks_since_last_finalization`, DB-mirrored.
+
+        Single chokepoint for every mutation of the finalization-stall
+        counter so the in-memory int and the chaindb `supply_meta` row
+        stay in lockstep.  The counter gates the quadratic inactivity-
+        leak burn in `_apply_block_state` — a cold-booted peer that
+        reads a stale 0 while uprestarted peers hold N>0 would stop
+        burning inactive-validator stake while peers continue,
+        diverging `supply.staked` + state_root at the next block.
+        Direct writes to `self.blocks_since_last_finalization` would
+        bypass the DB mirror and silently reopen the cold-restart
+        divergence the persistence closes, so ALL mutations go
+        through this helper.
+        """
+        self.blocks_since_last_finalization = int(value)
+        if self.db is not None and hasattr(
+            self.db, "set_finalization_stall_counter",
+        ):
+            self.db.set_finalization_stall_counter(int(value))
 
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
@@ -5070,7 +5103,7 @@ class Blockchain:
             if justified:
                 # Reset inactivity leak counter: finalization resumed.
                 # Penalties stop immediately on the next block.
-                self.blocks_since_last_finalization = 0
+                self._set_finalization_stall_counter(0)
                 logger.info(
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
@@ -7964,7 +7997,13 @@ class Blockchain:
         # this block, _process_attestations (called after us from add_block)
         # will reset it to 0.  The counter drives quadratic penalties on
         # non-attesting validators during prolonged finalization stalls.
-        self.blocks_since_last_finalization += 1
+        # Routed through `_set_finalization_stall_counter` so the
+        # chaindb `supply_meta` row stays in lockstep with the in-
+        # memory int — without the DB mirror, a cold-restart during a
+        # stall would silently diverge the burn from uprestarted peers.
+        self._set_finalization_stall_counter(
+            self.blocks_since_last_finalization + 1,
+        )
 
         from messagechain.consensus.inactivity import (
             is_leak_active,
@@ -9342,8 +9381,9 @@ class Blockchain:
         # Leaving it stale lets replay stack a fresh leak window on top
         # of the old one — if finality stalls again after the merge,
         # honest validators take a SECOND quadratic inactivity-leak
-        # penalty for the same outage.
-        self.blocks_since_last_finalization = 0
+        # penalty for the same outage.  Routed through the helper so
+        # the chaindb row clears alongside the in-memory int.
+        self._set_finalization_stall_counter(0)
         # Coverage-divergence leak counter — fully derived from forward
         # block replay (each block with an inclusion_list invokes
         # _apply_inclusion_list_coverage_leak which writes here).  Reset
