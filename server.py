@@ -75,6 +75,7 @@ from messagechain.network.ratelimit import PeerRateLimiter
 
 import hashlib
 from messagechain.config import HASH_ALGO
+from messagechain import __version__
 from messagechain.validation import (
     parse_hex, sanitize_error, safe_json_loads,
     is_valid_peer_address as _is_valid_peer_address,
@@ -3182,6 +3183,7 @@ class Server(SharedRuntimeMixin):
                     "chain_height": self.blockchain.height,
                     "best_block_hash": latest.block_hash.hex() if latest else "",
                     "cumulative_weight": self._current_cumulative_weight(),
+                    "version": __version__,
                 },
                 sender_id=self.wallet_id.hex() if self.wallet_id else "",
             )
@@ -3286,7 +3288,7 @@ class Server(SharedRuntimeMixin):
             # tracks peer heights for sync decisions via a separate
             # path; this field is observability-only.
             peer.peer_height = peer_height
-            peer.peer_version = str(msg.payload.get("version", ""))
+            peer.peer_version = str(msg.payload.get("version", "") or "unknown")
             self.peers[peer.address] = peer
             # Track peer height AND cumulative weight for sync
             best_hash = msg.payload.get("best_block_hash", "")

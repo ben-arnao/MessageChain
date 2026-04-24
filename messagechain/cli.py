@@ -16,6 +16,7 @@ import os
 import stat
 import sys
 
+from messagechain import __version__
 from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS
 
 
@@ -580,6 +581,82 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_db.add_argument(
         "--data-dir", type=str, required=True,
         help="Chain data directory containing chain.db",
+    )
+
+    # --- upgrade ---
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="Upgrade validator binary to a released tag (stop -> backup "
+             "-> fetch -> swap -> migrate -> start -> health-check -> rollback)",
+        description=(
+            "One-shot validator binary upgrade.  Stops the systemd "
+            "service, backs up the current install directory, clones "
+            "the requested release tag (default: latest GitHub "
+            "release), swaps in the new code, runs migrate-chain-db "
+            "(idempotent; skip with --skip-migrate for same-schema "
+            "hot restarts), starts the service, polls local RPC for "
+            "health, and rolls back to the backup on health-check "
+            "failure (suppress with --no-rollback).  Requires root "
+            "(systemctl) and git.  Pass --tag to pin a specific "
+            "release; without it the GitHub Releases API is consulted "
+            "and the command hard-fails if the API is unreachable."
+        ),
+    )
+    upgrade.add_argument(
+        "--tag", type=str, default=None,
+        help="Git tag to install (e.g. v1.2.0-mainnet).  If omitted, "
+             "the latest GitHub release tag is used.",
+    )
+    upgrade.add_argument(
+        "--install-dir", type=str, default="/opt/messagechain",
+        help="Filesystem path of the validator install directory "
+             "(default: /opt/messagechain)",
+    )
+    upgrade.add_argument(
+        "--data-dir", type=str, default="/var/lib/messagechain",
+        help="Chain data directory for the migrate-chain-db step "
+             "(default: /var/lib/messagechain)",
+    )
+    upgrade.add_argument(
+        "--service", type=str, default="messagechain-validator",
+        help="systemd service unit name (default: messagechain-validator)",
+    )
+    upgrade.add_argument(
+        "--repo", type=str,
+        default="https://github.com/ben-arnao/MessageChain",
+        help="Git repo URL to clone (default: upstream; override for "
+             "testing / mirrors)",
+    )
+    upgrade.add_argument(
+        "--service-user", type=str, default="messagechain:messagechain",
+        help="user:group to chown the new install dir to "
+             "(default: messagechain:messagechain)",
+    )
+    upgrade.add_argument(
+        "--no-rollback", action="store_true",
+        help="Do not rollback to the backup on post-start health-check "
+             "failure.  New code stays in place; operator must recover "
+             "by hand.",
+    )
+    upgrade.add_argument(
+        "--skip-migrate", action="store_true",
+        help="Skip the migrate-chain-db step.  Safe for same-schema "
+             "upgrades; migration is idempotent so running it on a "
+             "target schema DB is a no-op regardless.",
+    )
+    upgrade.add_argument(
+        "--rpc-host", type=str, default="127.0.0.1",
+        help="Local RPC host for the post-start health check "
+             "(default: 127.0.0.1)",
+    )
+    upgrade.add_argument(
+        "--rpc-port", type=int, default=9334,
+        help="Local RPC port for the post-start health check "
+             "(default: 9334)",
+    )
+    upgrade.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip interactive confirmation.",
     )
 
     return parser
@@ -2755,7 +2832,7 @@ def cmd_peers(args):
     print(f"=== Peers ({count}) ===\n")
     print(
         f"  {'Address':<22} {'Dir':<9} {'Type':<18} {'TLS':<5} {'Height':>8} "
-        f"{'Connected':>11} {'Entity':<20}"
+        f"{'Connected':>11} {'Version':<10} {'Entity':<20}"
     )
     def _fmt_elapsed(s: int) -> str:
         if s < 60:
@@ -2770,9 +2847,14 @@ def cmd_peers(args):
         # operator sees "I should upgrade" rather than a misleading "no".
         transport = p.get("transport")
         tls_disp = "yes" if transport == "tls" else ("no" if transport == "plain" else "?")
+        # Peers running <1.2.0 did not advertise a version in the
+        # handshake payload; the server maps "" -> "unknown" on receive,
+        # but guard here too so a missing/empty RPC field still renders
+        # cleanly instead of as blank whitespace.
+        version = p.get("version") or "unknown"
         print(
             f"  {p['address']:<22} {p['direction']:<9} {p['connection_type']:<18} {tls_disp:<5} "
-            f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {eid_disp:<20}"
+            f"{p['height']:>8} {_fmt_elapsed(p['seconds_connected']):>11} {version:<10} {eid_disp:<20}"
         )
 
 
@@ -3053,6 +3135,369 @@ def cmd_migrate_chain_db(args):
     sys.exit(2)
 
 
+# ---------------------------------------------------------------------------
+# messagechain upgrade
+# ---------------------------------------------------------------------------
+#
+# One-shot validator binary upgrade.  Codifies the manual sequence
+# operators were running out of a shell buffer: stop -> backup -> clone tag
+# -> swap -> migrate-chain-db -> start -> health-check -> rollback-on-fail.
+# Using only stdlib (urllib, subprocess, shutil) keeps the dep graph empty,
+# which is an explicit project principle -- operators running this from a
+# fresh pip install should not need any third-party packages.
+
+def _upgrade_resolve_latest_tag(repo_url: str) -> str:
+    """Hit the GitHub Releases API for the latest tag on *repo_url*.
+
+    Raises RuntimeError with an operator-friendly message on any failure
+    (network, parse, missing tag_name).  Caller translates to exit(2).
+    """
+    import json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    # Parse owner/repo out of a URL like https://github.com/ben-arnao/MessageChain
+    parsed = urllib.parse.urlparse(repo_url)
+    parts = [p for p in parsed.path.strip("/").split("/") if p]
+    if len(parts) < 2:
+        raise RuntimeError(
+            f"cannot parse owner/repo from --repo {repo_url!r}; "
+            "pass --tag explicitly to skip API lookup"
+        )
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    api = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
+    req = urllib.request.Request(
+        api,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": f"messagechain/{__version__}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(
+            f"GitHub Releases API unreachable ({e}); "
+            "rerun with --tag <vX.Y.Z> to pin a specific release"
+        )
+    try:
+        data = json.loads(body)
+    except ValueError as e:
+        raise RuntimeError(f"GitHub API returned non-JSON: {e}")
+    tag = data.get("tag_name")
+    if not tag or not isinstance(tag, str):
+        raise RuntimeError(
+            "GitHub API response missing 'tag_name'; "
+            "rerun with --tag <vX.Y.Z> to pin a specific release"
+        )
+    return tag
+
+
+def _upgrade_tag_to_version(tag: str) -> str:
+    """Strip a leading `v` and trailing `-mainnet`/`-testnet` from *tag*.
+
+    Operators tag releases like `v1.2.0-mainnet`; the runtime
+    __version__ is `1.2.0`.  Used only for the already-at-target
+    shortcut; never for anything consensus-critical.
+    """
+    v = tag
+    if v.startswith("v") or v.startswith("V"):
+        v = v[1:]
+    for suffix in ("-mainnet", "-testnet", "-rc1", "-rc2", "-rc3"):
+        if v.endswith(suffix):
+            v = v[: -len(suffix)]
+            break
+    return v
+
+
+def _upgrade_health_check(host: str, port: int, timeout_s: int = 60) -> bool:
+    """Poll local RPC for GREEN.  Returns True on first healthy
+    response, False after *timeout_s* seconds without one.
+    """
+    import time as _time_hc
+    from client import rpc_call
+
+    deadline = _time_hc.monotonic() + timeout_s
+    while _time_hc.monotonic() < deadline:
+        try:
+            resp = rpc_call(host, port, "get_chain_info", {})
+        except Exception:
+            resp = {"ok": False}
+        if resp.get("ok"):
+            info = resp.get("result") or {}
+            # GREEN = reachable + not reporting a stalled sync.  We do
+            # NOT require "idle" here -- a just-started node may be in
+            # syncing_headers legitimately; for upgrade health, the
+            # important invariant is "RPC is up and returning real
+            # chain-info without error".
+            if "height" in info:
+                return True
+        _time_hc.sleep(10)
+    return False
+
+
+def cmd_upgrade(args):
+    """Run the full validator binary-upgrade flow.
+
+    See subparser help for flags.  Exits non-zero on any step failure.
+    """
+    import datetime as _dt
+    import shutil
+    import subprocess
+
+    from messagechain import __version__ as _current_version
+
+    def _say(msg: str) -> None:
+        print(f"==> {msg}", flush=True)
+
+    def _fail(msg: str, code: int = 2) -> None:
+        print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+        sys.exit(code)
+
+    # --- Preflight ---
+    if shutil.which("git") is None:
+        _fail(
+            "git not found on PATH. Install with your distro package "
+            "manager (e.g. `apt install git` or `dnf install git`)."
+        )
+    if shutil.which("systemctl") is None:
+        _fail(
+            "systemctl not found on PATH. This upgrade command only "
+            "supports systemd-managed services."
+        )
+    # Root check (skip on non-POSIX: geteuid doesn't exist on Windows).
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and geteuid() != 0:
+        _fail(
+            "this command must run as root (systemctl stop/start + "
+            "chown). Re-run with `sudo messagechain upgrade ...`."
+        )
+
+    # Resolve target tag.
+    target_tag = args.tag
+    if target_tag is None:
+        _say("Resolving latest release tag from GitHub...")
+        try:
+            target_tag = _upgrade_resolve_latest_tag(args.repo)
+        except RuntimeError as e:
+            _fail(str(e))
+        _say(f"Latest release: {target_tag}")
+    else:
+        _say(f"Target tag (pinned): {target_tag}")
+
+    target_version = _upgrade_tag_to_version(target_tag)
+    if target_version == _current_version:
+        _say(
+            f"Already at {_current_version}; nothing to do."
+        )
+        return
+
+    # Downgrade gate.  Only meaningful if versions parse cleanly; if
+    # not, fall through (rare tag format -- let operator see the mismatch
+    # in the summary prompt).
+    def _parse_ver(v: str):
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except Exception:
+            return None
+    cur = _parse_ver(_current_version)
+    tgt = _parse_ver(target_version)
+    is_downgrade = cur is not None and tgt is not None and tgt < cur
+    if is_downgrade and not args.yes:
+        _fail(
+            f"target version {target_version} is older than running "
+            f"version {_current_version}. Re-run with --yes to "
+            "force a downgrade."
+        )
+
+    # Confirmation prompt.
+    if not args.yes:
+        print()
+        print("  Upgrade summary:")
+        print(f"    current version : {_current_version}")
+        print(f"    target tag      : {target_tag}  ({target_version})")
+        print(f"    service         : {args.service}")
+        print(f"    install dir     : {args.install_dir}")
+        print(f"    data dir        : {args.data_dir}")
+        print(f"    repo            : {args.repo}")
+        print(f"    rollback on fail: {'no' if args.no_rollback else 'yes'}")
+        print(f"    skip migrate    : {'yes' if args.skip_migrate else 'no'}")
+        print()
+        try:
+            reply = input("  Proceed? [y/N] ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            _say("Aborted by operator.")
+            return
+
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = f"{args.install_dir}.bak-{ts}"
+    clone_dir = f"/tmp/mc-release-{ts}"
+
+    # --- Stop service ---
+    _say(f"Stopping {args.service}...")
+    try:
+        subprocess.run(
+            ["systemctl", "stop", args.service], check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _fail(f"systemctl stop failed: {e}")
+    # reset-failed is best-effort; a clean stop won't need it.
+    subprocess.run(
+        ["systemctl", "reset-failed", args.service], check=False,
+    )
+
+    # --- Backup ---
+    _say(f"Backing up {args.install_dir} -> {backup_dir}")
+    try:
+        shutil.move(args.install_dir, backup_dir)
+    except Exception as e:
+        # Restart service so we don't leave the node down on a mistake.
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+        _fail(f"backup move failed: {e}")
+
+    def _restore_backup_and_start() -> None:
+        """Best-effort rollback: remove any partial install, move the
+        backup back, restart service.  Swallows exceptions so the
+        outer failure reason is what the operator sees.
+        """
+        try:
+            if os.path.exists(args.install_dir):
+                shutil.rmtree(args.install_dir)
+        except Exception:
+            pass
+        try:
+            shutil.move(backup_dir, args.install_dir)
+        except Exception:
+            pass
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+
+    # --- Fetch tag ---
+    _say(f"Cloning {args.repo} @ {target_tag} -> {clone_dir}")
+    clone_cmd = [
+        "git", "clone", "--depth", "1", "--branch", target_tag,
+        args.repo, clone_dir,
+    ]
+    try:
+        subprocess.run(clone_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(
+            f"git clone failed ({e}); backup restored and service "
+            "restarted."
+        )
+
+    # --- Swap ---
+    _say(f"Installing new code -> {args.install_dir}")
+    try:
+        shutil.copytree(clone_dir, args.install_dir)
+    except Exception as e:
+        _restore_backup_and_start()
+        _fail(f"copytree failed: {e}; backup restored.")
+    # chown to service user.
+    try:
+        subprocess.run(
+            ["chown", "-R", args.service_user, args.install_dir],
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(f"chown failed: {e}; backup restored.")
+
+    # --- Migrate chain.db ---
+    if not args.skip_migrate:
+        _say(
+            f"Running migrate-chain-db (idempotent) on {args.data_dir}"
+        )
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "messagechain",
+                    "migrate-chain-db", "--data-dir", args.data_dir,
+                ],
+                cwd=args.install_dir,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            _restore_backup_and_start()
+            _fail(
+                f"migrate-chain-db failed: {e}; backup restored."
+            )
+    else:
+        _say("Skipping migrate-chain-db (--skip-migrate).")
+
+    # --- Start service ---
+    _say(f"Starting {args.service}...")
+    try:
+        subprocess.run(
+            ["systemctl", "start", args.service], check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        _restore_backup_and_start()
+        _fail(f"systemctl start failed: {e}; backup restored.")
+
+    # --- Health check ---
+    _say(
+        f"Polling RPC {args.rpc_host}:{args.rpc_port} for up to 60s..."
+    )
+    healthy = _upgrade_health_check(
+        args.rpc_host, args.rpc_port, timeout_s=60,
+    )
+    if not healthy:
+        if args.no_rollback:
+            _fail(
+                "health check failed after 60s, but --no-rollback is "
+                f"set. New code left in place. To revert by hand: "
+                f"systemctl stop {args.service} && rm -rf "
+                f"{args.install_dir} && mv {backup_dir} "
+                f"{args.install_dir} && systemctl start {args.service}",
+            )
+        _say("Health check FAILED. Rolling back to backup...")
+        subprocess.run(
+            ["systemctl", "stop", args.service], check=False,
+        )
+        try:
+            shutil.rmtree(args.install_dir)
+        except Exception:
+            pass
+        try:
+            shutil.move(backup_dir, args.install_dir)
+        except Exception as e:
+            _fail(
+                f"rollback move failed: {e}. Install state is "
+                f"broken; backup still at {backup_dir}."
+            )
+        subprocess.run(
+            ["systemctl", "start", args.service], check=False,
+        )
+        # Short confirmation poll after rollback (10s).
+        if _upgrade_health_check(
+            args.rpc_host, args.rpc_port, timeout_s=10,
+        ):
+            _say(f"Rolled back to backup at {backup_dir}.")
+            _fail("upgrade failed; rollback succeeded.")
+        _fail(
+            f"rollback may be incomplete; backup at {backup_dir} -- "
+            "inspect by hand."
+        )
+
+    # --- Success ---
+    _say(
+        f"Upgrade complete. Version {target_version} active on "
+        f"service {args.service}. Backup preserved at {backup_dir}."
+    )
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -3093,6 +3538,7 @@ def main():
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,
         "migrate-chain-db": cmd_migrate_chain_db,
+        "upgrade": cmd_upgrade,
     }
 
     handler = commands.get(args.command)
