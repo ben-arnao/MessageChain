@@ -66,6 +66,12 @@ pip install -e . --break-system-packages 2>/dev/null || pip install -e .
 echo "[4/6] Running messagechain init..."
 python3 -m messagechain init --yes --systemd
 
+# Init runs as root and writes root-owned files; the validator service
+# runs as user `messagechain` so it must be able to read them.
+chown messagechain:messagechain /etc/messagechain/keyfile
+chown root:messagechain /etc/messagechain/onboard.toml
+chmod 0640 /etc/messagechain/onboard.toml
+
 echo "[5/6] Reloading systemd daemon..."
 systemctl daemon-reload
 
