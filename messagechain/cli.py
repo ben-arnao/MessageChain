@@ -2205,8 +2205,7 @@ def cmd_stake(args):
         result = response["result"]
         print(f"\nStake submitted!")
         print(f"  TX hash: {result['tx_hash']}")
-        print(f"  Staked:  {result['staked']} tokens")
-        print(f"  Balance: {result['balance']} tokens")
+        print(f"  Status:  {result.get('status', 'pending')}")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -2288,8 +2287,7 @@ def cmd_unstake(args):
         result = response["result"]
         print(f"\nUnstake submitted!")
         print(f"  TX hash: {result['tx_hash']}")
-        print(f"  Staked:  {result['staked']} tokens")
-        print(f"  Balance: {result['balance']} tokens")
+        print(f"  Status:  {result.get('status', 'pending')}")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)

@@ -71,10 +71,9 @@ class TestCmdUnstakeUsesCachedEntity(unittest.TestCase):
                     return {"ok": True, "result": {"nonce": 3, "leaf_watermark": 5}}
                 if method == "unstake":
                     return {"ok": True, "result": {
+                        "entity_id": cached_entity.entity_id_hex,
                         "tx_hash": "deadbeef",
-                        "staked": 50000000,
-                        "balance": 0,
-                        "unstaking": 47494250,
+                        "status": "pending — will be included in next block",
                     }}
                 if method == "get_chain_info":
                     return {"ok": True, "result": {"height": 180}}
