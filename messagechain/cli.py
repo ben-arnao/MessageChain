@@ -3635,6 +3635,42 @@ def _upgrade_health_check(host: str, port: int, timeout_s: int = 60) -> bool:
     return False
 
 
+def _upgrade_gc_old_backups(install_dir: str, keep: int) -> list:
+    """Prune old ``{install_dir}.bak-*`` directories, keeping the
+    ``keep`` most recent by mtime.  Returns the list of paths removed.
+
+    Runs on the upgrade success path only -- the upgrade is already
+    done, so a GC failure must never fail the whole flow.  Any
+    ``OSError`` on rmtree is swallowed; the caller logs what was
+    actually removed.
+
+    Why keep >= 1: the most recent backup is the manual-rollback
+    parachute referenced in the failure message on `--no-rollback`
+    and in the skill's manual-revert section.  Pruning it would
+    strand an operator who skipped the auto-rollback.
+    """
+    import glob as _glob
+
+    if keep < 1:
+        keep = 1
+    siblings = _glob.glob(f"{install_dir}.bak-*")
+    # Newest first.  Same-second mtimes tie-break on path, which
+    # embeds the YYYYMMDD-HHMMSS timestamp -- so ordering is stable
+    # and deterministic even at sub-second collision.
+    siblings.sort(
+        key=lambda p: (os.path.getmtime(p), p), reverse=True,
+    )
+    removed = []
+    import shutil as _shutil
+    for old in siblings[keep:]:
+        try:
+            _shutil.rmtree(old)
+            removed.append(old)
+        except OSError:
+            pass
+    return removed
+
+
 def cmd_upgrade(args):
     """Run the full validator binary-upgrade flow.
 
@@ -3939,6 +3975,19 @@ def cmd_upgrade(args):
         f"Upgrade complete. Version {target_version} active on "
         f"service {args.service}. Backup preserved at {backup_dir}."
     )
+
+    # --- GC old backups ---
+    # Keep the two most recent: the one we just created, and the one
+    # before it as an operator parachute.  On a busy release day
+    # (multiple upgrades, e.g. a patch hot on a minor) the bak dirs
+    # accumulate fast -- seen 13 on validator-1 across a single day --
+    # and each is a full install-tree copy.  Fills disk eventually.
+    _gc_removed = _upgrade_gc_old_backups(args.install_dir, keep=2)
+    if _gc_removed:
+        _say(
+            f"Pruned {len(_gc_removed)} old backup dir(s): "
+            + ", ".join(os.path.basename(p) for p in _gc_removed)
+        )
 
 
 def cmd_init(args):

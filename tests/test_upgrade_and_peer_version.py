@@ -542,6 +542,177 @@ class TestUpgradeRollback(unittest.TestCase):
         self.assertEqual(len(move_calls), 1)
 
 
+class TestUpgradeGcOldBackups(unittest.TestCase):
+    """The upgrade CLI leaves a timestamped ``.bak-YYYYMMDD-HHMMSS``
+    dir next to the install on every run.  Without a GC step, these
+    accumulate fast on a busy release day (observed: 13 on validator-1
+    across one day of 1.5.x→1.6.1 churn) and each is a full copy of
+    the install tree, which fills small validator disks eventually.
+
+    The helper keeps the N most recent by mtime and deletes the rest.
+    Invariants tested here: correct count kept, newest-first ordering,
+    non-matching siblings untouched, swallowed errors on rmtree, and
+    the ``keep>=1`` floor (the most recent backup is the manual-
+    rollback parachute; pruning it would strand an operator).
+    """
+
+    def _make_bak(self, base, tag, mtime=None):
+        import os
+        import time as _time
+        path = f"{base}.bak-{tag}"
+        os.makedirs(path, exist_ok=True)
+        # Put a sentinel file inside so rmtree has something to remove.
+        with open(os.path.join(path, "marker"), "w") as f:
+            f.write(tag)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        else:
+            # Spread mtimes by 1s so the newer/older ordering is
+            # unambiguous regardless of filesystem resolution.
+            _time.sleep(0.01)
+        return path
+
+    def test_keeps_most_recent_n_and_deletes_older(self):
+        import os
+        import tempfile
+        from messagechain.cli import _upgrade_gc_old_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            # Five backups, mtimes explicitly ordered oldest→newest.
+            tags = [f"t{i}" for i in range(5)]
+            for i, tag in enumerate(tags):
+                self._make_bak(install, tag, mtime=1_000_000 + i)
+
+            removed = _upgrade_gc_old_backups(install, keep=2)
+
+            # Oldest three removed.
+            self.assertEqual(
+                sorted(os.path.basename(p) for p in removed),
+                [
+                    "messagechain.bak-t0",
+                    "messagechain.bak-t1",
+                    "messagechain.bak-t2",
+                ],
+            )
+            # Two newest preserved.
+            survivors = sorted(
+                os.path.basename(p)
+                for p in _glob_bak(install)
+            )
+            self.assertEqual(
+                survivors,
+                ["messagechain.bak-t3", "messagechain.bak-t4"],
+            )
+
+    def test_keep_floor_is_one_even_on_zero_or_negative(self):
+        import os
+        import tempfile
+        from messagechain.cli import _upgrade_gc_old_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            for i in range(3):
+                self._make_bak(install, f"t{i}", mtime=1_000_000 + i)
+
+            # keep=0 should still preserve the most recent — the
+            # manual-rollback parachute must never be pruned.
+            _upgrade_gc_old_backups(install, keep=0)
+            survivors = sorted(
+                os.path.basename(p) for p in _glob_bak(install)
+            )
+            self.assertEqual(survivors, ["messagechain.bak-t2"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            for i in range(3):
+                self._make_bak(install, f"t{i}", mtime=1_000_000 + i)
+
+            _upgrade_gc_old_backups(install, keep=-5)
+            survivors = sorted(
+                os.path.basename(p) for p in _glob_bak(install)
+            )
+            self.assertEqual(survivors, ["messagechain.bak-t2"])
+
+    def test_noop_when_fewer_backups_than_keep(self):
+        import os
+        import tempfile
+        from messagechain.cli import _upgrade_gc_old_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            self._make_bak(install, "only", mtime=1_000_000)
+
+            removed = _upgrade_gc_old_backups(install, keep=2)
+            self.assertEqual(removed, [])
+            survivors = sorted(
+                os.path.basename(p) for p in _glob_bak(install)
+            )
+            self.assertEqual(survivors, ["messagechain.bak-only"])
+
+    def test_ignores_non_backup_siblings(self):
+        import os
+        import tempfile
+        from messagechain.cli import _upgrade_gc_old_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            # Real backups.
+            for i in range(3):
+                self._make_bak(install, f"t{i}", mtime=1_000_000 + i)
+            # Other sibling dirs that must NOT be touched: the live
+            # install itself, a sibling repo checkout, and the .broken
+            # parking spot manual-rollback uses.
+            for extra in [
+                "messagechain",
+                "messagechain.broken",
+                "messagechain-release-clone",
+            ]:
+                p = os.path.join(tmp, extra)
+                os.makedirs(p, exist_ok=True)
+                with open(os.path.join(p, "marker"), "w") as f:
+                    f.write(extra)
+
+            _upgrade_gc_old_backups(install, keep=1)
+
+            remaining = sorted(os.listdir(tmp))
+            # Two oldest bak removed; one newest bak + all three
+            # non-bak siblings survive.
+            self.assertEqual(remaining, [
+                "messagechain",
+                "messagechain-release-clone",
+                "messagechain.bak-t2",
+                "messagechain.broken",
+            ])
+
+    def test_rmtree_errors_are_swallowed(self):
+        """The upgrade is already successful by the time this runs —
+        a stuck handle or permission denial on an old backup must not
+        raise into the caller's success path."""
+        import os
+        import tempfile
+        from unittest.mock import patch
+        from messagechain.cli import _upgrade_gc_old_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            install = os.path.join(tmp, "messagechain")
+            for i in range(3):
+                self._make_bak(install, f"t{i}", mtime=1_000_000 + i)
+
+            def _rmtree_boom(path, *a, **kw):
+                raise OSError("simulated: handle in use")
+
+            with patch("shutil.rmtree", side_effect=_rmtree_boom):
+                # Must not raise, must report zero removed.
+                removed = _upgrade_gc_old_backups(install, keep=1)
+            self.assertEqual(removed, [])
+
+
+def _glob_bak(install_dir):
+    import glob as _glob
+    return _glob.glob(f"{install_dir}.bak-*")
+
+
 class TestUpgradeTagHelpers(unittest.TestCase):
     def test_tag_to_version_strips_v_prefix(self):
         from messagechain.cli import _upgrade_tag_to_version
