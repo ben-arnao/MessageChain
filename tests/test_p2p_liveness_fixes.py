@@ -52,12 +52,13 @@ def _mk_server(data_dir: str, seed_nodes=None):
 
 class TestOutboundConnectMarksDisconnectedOnExit(unittest.TestCase):
     """Ghost-peer fix: when `_connect_to_peer`'s read loop exits, the
-    Peer object left in `self.peers` must have `is_connected=False`.
-    Observability callers (get_peers RPC) and the seed-reconnect guard
-    (`if addr in self.peers and self.peers[addr].is_connected`) both
-    depend on this flag being honest."""
+    Peer entry MUST be removed from self.peers (not just flipped to
+    is_connected=False).  Earlier revs kept dead peers for "churn
+    visibility" which led to 19 zombie entries piling up on live v1
+    over 4 hours of v2 reconnects.  Current contract: evict on exit.
+    The seed-reconnect guard and get_peers RPC see a clean slate."""
 
-    def test_is_connected_cleared_after_read_loop_exit(self):
+    def test_peer_entry_evicted_after_read_loop_exit(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             s = _mk_server(td)
 
@@ -84,13 +85,12 @@ class TestOutboundConnectMarksDisconnectedOnExit(unittest.TestCase):
                     await s._connect_to_peer("10.0.0.99", 19333)
 
             _run(drive())
-            peer = s.peers.get("10.0.0.99:19333")
-            self.assertIsNotNone(peer, "peer should linger for churn visibility")
-            self.assertFalse(
-                peer.is_connected,
-                "is_connected must be False after the read loop exits, "
-                "otherwise the seed-reconnect guard will never retry and "
-                "observability is misleading",
+            self.assertNotIn(
+                "10.0.0.99:19333", s.peers,
+                "outbound peer entry must be evicted from self.peers "
+                "after the read loop exits; otherwise reconnects "
+                "accumulate as zombie entries (observed on live v1: "
+                "19 dead entries from the same remote over 4 hours)",
             )
 
 

@@ -897,10 +897,19 @@ HANDSHAKE_TIMEOUT = 10  # seconds - raised from 5 to accommodate TLS
 # 1000 tokens each.  Consensus constant; changing is a hard fork.
 KEY_ROTATION_COOLDOWN_BLOCKS = 144
 
-PEER_READ_TIMEOUT = 300  # seconds - idle timeout for post-handshake peer
-                         # reads.  Previously a magic 300 literal scattered
-                         # across server.py + network/node.py (4 sites);
-                         # centralized so ops changes touch one knob.
+PEER_READ_TIMEOUT = 1800  # seconds (30 min) — idle timeout for
+                          # post-handshake peer reads.  Previously 300s,
+                          # but on a small network where block cadence
+                          # is ~10 min and the counter-party rarely
+                          # produces (low stake), the inbound read loop
+                          # timed out every ~block interval of silence
+                          # and killed live connections; the counter-
+                          # party's maintenance loop redialed 30s later,
+                          # accumulating ghost Peer entries.  Dead-
+                          # socket detection is now handled by TCP
+                          # keepalive (~2 min); the remaining job of
+                          # this timeout is slow-loris defense, where
+                          # 30 min + MAX_PEERS + ban_manager is fine.
 
 # Seed connections are established once at startup.  Without a
 # maintenance loop, a dropped connection (silent NAT timeout, peer

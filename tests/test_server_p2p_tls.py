@@ -135,6 +135,7 @@ class TestServerOutboundConnectUsesTLS(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
             s = _mk_server(td)
             captured_kwargs = {}
+            captured_peers = []
 
             async def fake_open_connection(host, port, **kwargs):
                 captured_kwargs["ssl"] = kwargs.get("ssl")
@@ -155,12 +156,24 @@ class TestServerOutboundConnectUsesTLS(unittest.TestCase):
                 writer.drain = AsyncMock()
                 return reader, writer
 
+            # Capture the Peer object at construction time.  The finally
+            # block in _connect_to_peer now evicts the entry from
+            # self.peers on exit (zombie-entry cleanup), so we can't
+            # read it back afterward — but the transport='tls' stamp
+            # is set on the Peer ctor, which this spy observes.
+            import server as server_mod
+            real_peer_cls = server_mod.Peer
+
+            def peer_spy(**kwargs):
+                obj = real_peer_cls(**kwargs)
+                captured_peers.append(obj)
+                return obj
+
             async def drive():
-                # Don't patch asyncio.wait_for — it unwraps coroutines
-                # fine for real, and the fake returns instantly.
                 with patch("asyncio.open_connection",
                            side_effect=fake_open_connection), \
                      patch.object(cfg, "P2P_TLS_ENABLED", True), \
+                     patch("server.Peer", side_effect=peer_spy), \
                      patch("server.read_message",
                            new=AsyncMock(return_value=None)), \
                      patch("server.write_message",
@@ -173,10 +186,10 @@ class TestServerOutboundConnectUsesTLS(unittest.TestCase):
                 "Outbound connection must pass an ssl context when "
                 "P2P_TLS_ENABLED=True",
             )
-            peer = s.peers.get("10.0.0.5:19333")
-            self.assertIsNotNone(peer, "Peer should have been added")
+            self.assertEqual(len(captured_peers), 1,
+                             "exactly one Peer should have been constructed")
             self.assertEqual(
-                getattr(peer, "transport", None), "tls",
+                captured_peers[0].transport, "tls",
                 "Peer transport must be 'tls' when TLS is enabled",
             )
 
