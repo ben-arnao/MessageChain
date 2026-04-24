@@ -336,7 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
         "key-status",
         help="Show current key state, leaf usage, and rotation number",
     )
-    key_status.add_argument("--server", type=str, default=None, help="Server address host:port")
+    key_status.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334 -- "
+             "queries YOUR local node for YOUR entity's leaf watermark)",
+    )
 
     # --- emergency-revoke ---
     revoke = sub.add_parser(
@@ -496,7 +500,11 @@ def build_parser() -> argparse.ArgumentParser:
             "routing decisions are not made from CLI output."
         ),
     )
-    peers.add_argument("--server", type=str, default=None, help="Server address host:port")
+    peers.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334 -- "
+             "queries YOUR local node's peer table)",
+    )
 
     # --- cut-checkpoint ---
     cut_cp = sub.add_parser(
@@ -786,7 +794,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     rotate_if_p.add_argument("--yes", action="store_true")
-    rotate_if_p.add_argument("--server", type=str, default=None)
+    rotate_if_p.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334 -- "
+             "the daily timer runs on the validator host and asks "
+             "the LOCAL node for OUR entity's watermark)",
+    )
 
     # --- config ---
     config_p = sub.add_parser(
@@ -852,6 +865,37 @@ def _describe_unbonding_period(tip_height: int | None) -> str:
     )
 
 
+def _parse_server_local_default(server_str):
+    """Resolve a --server value, defaulting to localhost:RPC_DEFAULT_PORT.
+
+    Use this for OPERATOR-INTROSPECTION commands where the question
+    is "what's the state of MY node?" and routing to a remote seed
+    would silently return someone else's data.  Concretely:
+      * ``status``  -- is MY validator healthy
+      * ``peers``   -- who is MY node connected to
+      * ``key-status`` -- MY entity's leaf watermark from MY node
+      * ``rotate-key-if-needed`` (daily timer on a validator host)
+
+    For wallet / chain-state commands (send, balance, info, read,
+    propose, ...), the right default is the seed auto-pick in
+    ``_parse_server`` -- a wallet user on a laptop with no local
+    node should still be able to submit txs and read chain state.
+
+    Real bug this fixes: pre-fix ``messagechain status`` on a
+    validator host probed SEED_NODES and routed to the FIRST
+    reachable seed, which on a 2-validator mainnet is the OTHER
+    validator.  Operator saw "[OK] rpc reachable: height=284"
+    referring to the wrong node and had no way to tell.
+    """
+    from messagechain.config import RPC_DEFAULT_PORT
+    if server_str is not None and server_str != "":
+        if ":" in server_str:
+            host, port = server_str.rsplit(":", 1)
+            return host, int(port)
+        return server_str, RPC_DEFAULT_PORT
+    return "127.0.0.1", RPC_DEFAULT_PORT
+
+
 def _parse_server(server_str):
     """Resolve a --server value to a (host, port) tuple.
 
@@ -872,6 +916,11 @@ def _parse_server(server_str):
     4. Final fallback: localhost:9333 (useful for dev).
 
     Users always retain manual override via `--server`.
+
+    For OPERATOR-INTROSPECTION commands (status / peers / key-status
+    / rotate-key-if-needed), use ``_parse_server_local_default``
+    instead -- those questions are inherently local and the seed
+    auto-pick silently returns the wrong answer.
     """
     if server_str is not None and server_str != "":
         if ":" in server_str:
@@ -2545,7 +2594,11 @@ def cmd_key_status(args):
     private_key = _resolve_private_key(args)
     entity = Entity.create(private_key)
 
-    host, port = _parse_server(args.server)
+    # Operator-introspection: query the leaf watermark of THIS
+    # entity from the LOCAL node.  Default to localhost so the
+    # rotation-urgency answer is not silently sourced from a
+    # different validator's chain view.
+    host, port = _parse_server_local_default(args.server)
     from client import rpc_call
 
     status = rpc_call(host, port, "get_key_status", {
@@ -2934,7 +2987,11 @@ def cmd_status(args):
       1 - at least one yellow (warning but functional)
       2 - at least one red (rotation overdue / chain stalled / unreachable)
     """
-    host, port = _parse_server(args.server)
+    # Default to LOCAL node (operator-introspection): "is MY node
+    # healthy" can't be answered by routing to a remote seed -- the
+    # pre-fix behavior silently returned the OTHER validator's
+    # state on a 2-node mainnet.  --server pins a remote target.
+    host, port = _parse_server_local_default(args.server)
 
     from client import rpc_call
     worst = 0  # 0=green 1=yellow 2=red
@@ -3169,7 +3226,11 @@ def cmd_validators(args):
 
 def cmd_peers(args):
     """List peers connected to the target node, with metadata."""
-    host, port = _parse_server(args.server)
+    # Default to LOCAL node: "who is MY node connected to" is a
+    # different question for every node, so the seed-pick default
+    # would route to a remote validator and show its peer table
+    # instead of yours.  --server pins a remote target.
+    host, port = _parse_server_local_default(args.server)
 
     from client import rpc_call
     response = rpc_call(host, port, "get_peers", {})
@@ -4335,7 +4396,12 @@ def cmd_rotate_key_if_needed(args):
         print("rotate-key-if-needed: entity_id_hex not in onboard.toml; run `messagechain init` first")
         sys.exit(1)
 
-    host, port = _parse_server(getattr(args, "server", None))
+    # Daily systemd timer fires this on the validator host; query
+    # OUR node for OUR entity's leaf watermark.  Seed-pick default
+    # would route to a remote validator's view, which on a 2-node
+    # mainnet is the OTHER validator -- making the rotation-urgency
+    # decision off the wrong watermark.
+    host, port = _parse_server_local_default(getattr(args, "server", None))
     from client import rpc_call
 
     def fetcher() -> int:

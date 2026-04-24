@@ -119,5 +119,109 @@ class TestAutoRouting(unittest.TestCase):
         self.assertEqual((host, port), ("external.example", 9333))
 
 
+class TestLocalDefaultHelper(unittest.TestCase):
+    """``_parse_server_local_default`` is the operator-introspection
+    variant of ``_parse_server``: it defaults to localhost on the
+    RPC port instead of the seed-pick path, because questions like
+    "is MY node healthy" or "who is MY node connected to" return
+    silently-wrong answers when routed to a remote seed.
+    """
+
+    def test_no_arg_defaults_to_localhost_rpc_port(self):
+        host, port = cli._parse_server_local_default(None)
+        self.assertEqual(host, "127.0.0.1")
+        # RPC port (9334), distinct from the P2P-port default the
+        # other helper falls back to.
+        self.assertEqual(port, config.RPC_DEFAULT_PORT)
+
+    def test_empty_string_defaults_to_localhost(self):
+        # CLI sometimes passes "" rather than None for unset flags.
+        host, port = cli._parse_server_local_default("")
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, config.RPC_DEFAULT_PORT)
+
+    def test_explicit_host_port_overrides(self):
+        host, port = cli._parse_server_local_default("remote.example:12345")
+        self.assertEqual((host, port), ("remote.example", 12345))
+
+    def test_explicit_host_only_uses_rpc_port(self):
+        host, port = cli._parse_server_local_default("remote.example")
+        self.assertEqual(host, "remote.example")
+        self.assertEqual(port, config.RPC_DEFAULT_PORT)
+
+    def test_does_not_consult_seed_endpoints(self):
+        """The whole point: even if every seed is reachable, the
+        local-default helper must NOT route to one.  Patch
+        _auto_pick_endpoint to assert it's never invoked."""
+        called = []
+        with patch.object(
+            cli, "_auto_pick_endpoint",
+            side_effect=lambda *a, **kw: called.append(1) or ("seed", 9333),
+        ):
+            host, port = cli._parse_server_local_default(None)
+        self.assertEqual(called, [])
+        self.assertEqual(host, "127.0.0.1")
+
+
+class TestOperatorCommandsDefaultToLocalhost(unittest.TestCase):
+    """Regression for the bug observed in tonight's mainnet rollout:
+    ``messagechain status`` on a validator host queried the OTHER
+    validator's RPC because ``_parse_server(None)`` ran the seed-
+    pick path.  These tests pin every operator-introspection
+    command to localhost when --server is unset; an accidental
+    revert to ``_parse_server`` would surface immediately.
+    """
+
+    def _capture_rpc_target(self, target_func, args):
+        """Run a cmd_* function with a stubbed rpc_call and return
+        the (host, port) of the first call."""
+        targets = []
+        def _stub_rpc(host, port, method, params):
+            targets.append((host, port))
+            # Return a minimal valid response so the command can
+            # terminate without crashing on result parsing.
+            return {"ok": True, "result": {
+                "height": 1, "latest_block_hash": "ab" * 32,
+                "seconds_since_last_block": 1,
+                "sync_status": {"state": "idle"},
+                "peers": [], "count": 0,
+                "leaf_watermark": 0, "rotation_number": 0,
+                "public_key": "00" * 32,
+            }}
+        import client as _client
+        with patch.object(_client, "rpc_call", side_effect=_stub_rpc):
+            try:
+                target_func(args)
+            except SystemExit:
+                pass
+        self.assertGreater(
+            len(targets), 0,
+            "command never made an RPC call; can't verify routing",
+        )
+        return targets[0]
+
+    def test_cmd_status_defaults_to_localhost(self):
+        import argparse
+        args = argparse.Namespace(server=None, entity=None)
+        host, port = self._capture_rpc_target(cli.cmd_status, args)
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, config.RPC_DEFAULT_PORT)
+
+    def test_cmd_status_explicit_remote_routes_there(self):
+        import argparse
+        args = argparse.Namespace(
+            server="remote.example:9999", entity=None,
+        )
+        host, port = self._capture_rpc_target(cli.cmd_status, args)
+        self.assertEqual((host, port), ("remote.example", 9999))
+
+    def test_cmd_peers_defaults_to_localhost(self):
+        import argparse
+        args = argparse.Namespace(server=None)
+        host, port = self._capture_rpc_target(cli.cmd_peers, args)
+        self.assertEqual(host, "127.0.0.1")
+        self.assertEqual(port, config.RPC_DEFAULT_PORT)
+
+
 if __name__ == "__main__":
     unittest.main()
