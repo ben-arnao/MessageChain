@@ -192,3 +192,57 @@ async def write_message(writer, msg: NetworkMessage):
     encoded = encode_message(msg)
     writer.write(encoded)
     await asyncio.wait_for(writer.drain(), timeout=P2P_WRITE_TIMEOUT)
+
+
+# TCP keepalive tunables.  Defaults chosen for cross-zone GCP VPC flows:
+# idle connections between zones are dropped without RST after ~10 min,
+# and the MC protocol is "quiet" (long gaps between block announcements
+# on a small network), so we need to generate traffic frequently enough
+# to keep the NAT/firewall mapping alive, and detect dead peers quickly
+# enough that a maintenance loop can reconnect.  60s idle + 15s probe *
+# 4 retries = NAT heartbeat every 60s, dead-peer detection in ~2 min.
+_KEEPALIVE_IDLE_S = 60
+_KEEPALIVE_INTVL_S = 15
+_KEEPALIVE_COUNT = 4
+
+
+def enable_tcp_keepalive(writer) -> bool:
+    """Enable SO_KEEPALIVE on the TCP socket behind an asyncio writer.
+
+    Returns True iff SO_KEEPALIVE was successfully set.  Platform-
+    specific TCP_KEEP* tunables are best-effort: present on Linux
+    (validators), absent on some Windows / BSD builds.  We never raise
+    — a keepalive failure must not tear down a working connection.
+
+    MC operators on mainnet observed cross-zone GCP VPC flows dying
+    silently without RST, leaving both sides waiting on `readexactly`
+    until the application-level idle timeout (5 min).  Enabling
+    keepalive lets the kernel surface dead sockets in ~2 min and keeps
+    NAT mappings alive so healthy sockets never die in the first place.
+    """
+    import socket as _sock
+    try:
+        s = writer.get_extra_info("socket")
+    except Exception:
+        return False
+    if s is None:
+        return False
+    try:
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
+    except (OSError, AttributeError):
+        return False
+    # Per-OS tunables — missing on some platforms, so guard each one.
+    for opt_name, value in (
+        ("TCP_KEEPIDLE", _KEEPALIVE_IDLE_S),
+        ("TCP_KEEPINTVL", _KEEPALIVE_INTVL_S),
+        ("TCP_KEEPCNT", _KEEPALIVE_COUNT),
+    ):
+        opt = getattr(_sock, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            s.setsockopt(_sock.IPPROTO_TCP, opt, value)
+        except (OSError, AttributeError):
+            # Best-effort; SO_KEEPALIVE alone still helps.
+            pass
+    return True

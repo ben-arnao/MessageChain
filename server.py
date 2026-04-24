@@ -33,6 +33,7 @@ from messagechain.config import (
     SEEN_TX_CACHE_SIZE, TRUSTED_CHECKPOINTS, REQUIRE_CHECKPOINTS,
     OUTBOUND_FULL_RELAY_SLOTS, OUTBOUND_BLOCK_RELAY_ONLY_SLOTS,
     HANDSHAKE_TIMEOUT, PEER_READ_TIMEOUT, MAX_PEERS,
+    PEER_MAINTENANCE_INTERVAL,
 )
 from messagechain.identity.identity import Entity
 from messagechain.core.blockchain import Blockchain
@@ -52,6 +53,7 @@ from messagechain.core.transfer import (
 )
 from messagechain.network.protocol import (
     MessageType, NetworkMessage, read_message, write_message,
+    enable_tcp_keepalive,
 )
 from messagechain.consensus.checkpoint import load_checkpoints_file
 from messagechain.network.peer import Peer, ConnectionType
@@ -1349,6 +1351,13 @@ class Server(SharedRuntimeMixin):
             t.add_done_callback(
                 lambda x: self._handle_task_exception("connect_to_peer(seed)", x)
             )
+
+        # Peer maintenance: re-dial dropped seeds.  Without this, a
+        # dead seed connection never heals and the node stays solo.
+        t = asyncio.create_task(self._peer_maintenance_loop())
+        t.add_done_callback(
+            lambda x: self._handle_task_exception("peer_maintenance_loop", x)
+        )
 
         # Start block production
         t = asyncio.create_task(self._block_production_loop())
@@ -3059,6 +3068,11 @@ class Server(SharedRuntimeMixin):
             writer.close()
             return
 
+        # Symmetric with outbound: enable SO_KEEPALIVE on the accepted
+        # socket so the server notices silent idle drops (GCP VPC
+        # cross-zone NAT) without waiting for PEER_READ_TIMEOUT.
+        enable_tcp_keepalive(writer)
+
         # "tls" iff asyncio.start_server was bound with an SSLContext —
         # writer's extra_info carries the negotiated session.  Honest
         # observability; matches the pattern in network/node.py.
@@ -3116,11 +3130,18 @@ class Server(SharedRuntimeMixin):
             if getattr(_cfg, "P2P_TLS_ENABLED", True)
             else None
         )
+        peer = None
+        writer = None
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port, ssl=client_ssl),
                 timeout=HANDSHAKE_TIMEOUT,
             )
+            # SO_KEEPALIVE keeps cross-zone GCP VPC NAT mappings alive
+            # and surfaces dead sockets in ~2 min instead of hanging on
+            # readexactly until PEER_READ_TIMEOUT (5 min).  Paired with
+            # the maintenance loop, dropped seed links self-heal.
+            enable_tcp_keepalive(writer)
             conn_type = self._next_connection_type()
             transport = "tls" if client_ssl is not None else "plain"
             import time as _time_peer
@@ -3158,6 +3179,54 @@ class Server(SharedRuntimeMixin):
             logger.debug(f"Peer connection timed out {addr}")
         except Exception as e:
             logger.debug(f"Peer connection failed {addr}: {e}")
+        finally:
+            # Mirror the inbound handler's cleanup: flip is_connected so
+            # the maintenance loop (and get_peers observability) see an
+            # honest state, drop the rate-limit bucket, and close the
+            # socket.  Without this, a dead outbound lingers with
+            # is_connected=True forever and blocks reconnect.
+            if peer is not None:
+                peer.is_connected = False
+            self.rate_limiter.remove_peer(addr)
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+    async def _peer_maintenance_tick(self):
+        """Single pass of the seed-reconnect scan.  Broken out from the
+        loop so tests can exercise the logic deterministically without
+        juggling asyncio.sleep."""
+        for host, port in list(self.seed_nodes):
+            addr = f"{host}:{port}"
+            existing = self.peers.get(addr)
+            if existing is not None and existing.is_connected:
+                continue
+            if self.ban_manager.is_banned(addr):
+                continue
+            t = asyncio.create_task(self._connect_to_peer(host, port))
+            t.add_done_callback(
+                lambda x: self._handle_task_exception(
+                    "connect_to_peer(maintenance)", x
+                )
+            )
+
+    async def _peer_maintenance_loop(self):
+        """Reconnect dropped seed peers every PEER_MAINTENANCE_INTERVAL.
+
+        Seeds are connected once at startup; without this loop, a single
+        dropped connection (silent NAT timeout, peer restart, transient
+        blip) leaves the node permanently unpeered.  Combined with the
+        finally-block cleanup in _connect_to_peer, a dead outbound now
+        flips is_connected=False and this loop re-dials on the next tick.
+        """
+        while self._running:
+            try:
+                await self._peer_maintenance_tick()
+            except Exception as e:
+                logger.debug(f"Peer maintenance tick failed: {e}")
+            await asyncio.sleep(PEER_MAINTENANCE_INTERVAL)
 
     async def _handle_p2p_message(self, msg: NetworkMessage, peer: Peer):
         peer.touch()

@@ -880,6 +880,16 @@ PEER_READ_TIMEOUT = 300  # seconds - idle timeout for post-handshake peer
                          # across server.py + network/node.py (4 sites);
                          # centralized so ops changes touch one knob.
 
+# Seed connections are established once at startup.  Without a
+# maintenance loop, a dropped connection (silent NAT timeout, peer
+# restart, transient network blip) is never retried — on a small
+# network this degrades to two solo-producing chains.  The maintenance
+# loop walks self.seed_nodes every PEER_MAINTENANCE_INTERVAL seconds
+# and kicks off a fresh _connect_to_peer for any seed whose Peer entry
+# is missing or has is_connected=False.  30s balances responsiveness
+# with log noise on a disconnected seed.
+PEER_MAINTENANCE_INTERVAL = 30  # seconds
+
 # Peer banning
 BAN_THRESHOLD = 100       # misbehavior score that triggers a ban
 BAN_DURATION = 86400      # ban length in seconds (24 hours)
