@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Chain data directory (hot-validator co-host optimization).  "
              "When set, signing subcommands load the keypair from the "
              "daemon's on-disk cache and reserve leaves via the server's "
-             "reserve_leaf RPC — eliminating the multi-minute CLI keygen "
+             "reserve_leaf RPC -- eliminating the multi-minute CLI keygen "
              "and preventing WOTS+ leaf collisions with the running daemon.",
     )
 
@@ -557,6 +557,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Port advertised on the .onion address (default: same as --rpc-port)",
     )
 
+    # --- migrate-chain-db ---
+    migrate_db = sub.add_parser(
+        "migrate-chain-db",
+        help="Run a one-shot schema migration on an existing chain.db",
+        description=(
+            "Upgrade an existing chain.db in place to the schema "
+            "version this binary expects.  Currently handles the "
+            "v1 -> v2 upgrade (populates reputation, key_history, "
+            "pending_unstakes, stake_snapshots, and the two new "
+            "supply_meta counters from replayed block history).  "
+            "Run this BEFORE starting the node on a v1 DB; the node "
+            "startup path refuses to open a v1 DB under the v2 "
+            "binary and points here for actionable remediation.  "
+            "Non-destructive: only writes to the six v2-new tables/"
+            "rows and the schema_version meta row.  Idempotent: a "
+            "second run on a v2 DB is a no-op.  Can take "
+            "minutes-to-hours on a chain with many blocks (replay "
+            "is O(chain_length))."
+        ),
+    )
+    migrate_db.add_argument(
+        "--data-dir", type=str, required=True,
+        help="Chain data directory containing chain.db",
+    )
+
     return parser
 
 
@@ -855,7 +880,7 @@ def _load_key_from_file(path: str, *, accept_raw_hex: bool = False) -> bytes:
 
     When *accept_raw_hex* is True, also accept the daemon-side 64-char
     raw-hex format (what server.py --keyfile consumes).  Off by default
-    so paper-backup users still get the checksum check — the CLI only
+    so paper-backup users still get the checksum check -- the CLI only
     lowers the bar when it already knows it's running alongside a
     daemon on the same host (operator path, via global --data-dir).
     """
@@ -926,7 +951,7 @@ def _load_cached_entity(private_key, data_dir):
     / `cli stake` complete in seconds instead of forcing a fresh keygen.
 
     Returns None if the cache is absent, stale, or the daemon was never
-    started from *data_dir* — the caller falls back to the slow path.
+    started from *data_dir* -- the caller falls back to the slow path.
     Cache authenticity is HMAC-verified by the daemon's loader, so a
     corrupted or tampered cache file can't leak a wrong public key.
 
@@ -934,7 +959,7 @@ def _load_cached_entity(private_key, data_dir):
     this entity, which for existing wallets is tracked via the
     `--wallet` mechanism on the daemon.  We try 16 (prototype / the
     operator-chosen height on mainnet bootstrap) then the config
-    default — both are cheap misses since _load_or_create_entity falls
+    default -- both are cheap misses since _load_or_create_entity falls
     straight through on a bad cache path without touching keygen.
     """
     try:
@@ -973,7 +998,7 @@ def _load_cached_entity(private_key, data_dir):
         except Exception:
             continue
         # Bind leaf-index persistence so sign() durably burns the leaf
-        # before the signature can escape the process — same invariant
+        # before the signature can escape the process -- same invariant
         # the daemon relies on.  load_leaf_index silently tolerates a
         # missing file (fresh wallet, never signed).
         leaf_path = _os.path.join(data_dir, LEAF_INDEX_FILENAME)
@@ -990,7 +1015,7 @@ def _reserve_leaf_via_rpc(host, port, entity_id_hex):
     """Ask the server to atomically reserve a leaf for the given entity.
 
     Returns the reserved leaf index, or None if the server doesn't
-    implement the RPC (older daemons) — in which case the caller should
+    implement the RPC (older daemons) -- in which case the caller should
     fall back to the chain-watermark path.  Reserving bumps the server's
     in-memory _next_leaf so a subsequent block sign by the same wallet
     will skip this leaf, preventing the CLI-vs-daemon collision that
@@ -2954,6 +2979,68 @@ def cmd_gen_tor_config(args):
     print("#   4. Share the hostname with clients in censored networks", file=sys.stderr)
 
 
+def cmd_migrate_chain_db(args):
+    """Run a one-shot schema migration on an existing chain.db.
+
+    Operator-invoked after a binary upgrade whose new schema
+    requires rebuilding consensus-visible state surfaces that were
+    not persisted under the old binary.  Opens the DB with the
+    schema-check bypassed (the only caller allowed to), dispatches
+    to the appropriate version-pair migration, prints a summary.
+
+    Refuses to do anything if the DB is already at the target
+    schema version -- so accidental double-invocation is a no-op
+    rather than a replay-over-replay.
+    """
+    import os as _os
+    from messagechain.storage.chaindb import ChainDB, _SCHEMA_VERSION
+
+    db_path = _os.path.join(args.data_dir, "chain.db")
+    if not _os.path.isfile(db_path):
+        print(
+            f"Error: no chain.db found at {db_path}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Bypass the schema-version tripwire so we can inspect a v1 DB
+    # and dispatch to the right migration path.
+    db = ChainDB(db_path, skip_schema_check=True)
+    cur = db._conn.execute(
+        "SELECT value FROM meta WHERE key = ?", ("schema_version",),
+    )
+    row = cur.fetchone()
+    disk_version = int(row[0]) if row else 1
+
+    if disk_version == _SCHEMA_VERSION:
+        print(
+            f"chain.db at {db_path} is already at schema version "
+            f"{disk_version}; nothing to do.",
+        )
+        return
+
+    if disk_version == 1 and _SCHEMA_VERSION == 2:
+        print(
+            f"Migrating chain.db at {db_path} from schema v1 to v2 "
+            "(replaying block history to rebuild reputation, "
+            "key_history, pending_unstakes, stake_snapshots, and "
+            "supply_meta counters)...",
+        )
+        summary = db.migrate_schema_v1_to_v2()
+        print("Migration complete.")
+        for k, v in summary.items():
+            label = k.replace("_", " ").title()
+            print(f"  {label}: {v}")
+        return
+
+    print(
+        f"No migration path defined for schema {disk_version} -> "
+        f"{_SCHEMA_VERSION}.  Stop and contact the release manager.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -2993,6 +3080,7 @@ def main():
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
         "gen-tor-config": cmd_gen_tor_config,
+        "migrate-chain-db": cmd_migrate_chain_db,
     }
 
     handler = commands.get(args.command)
