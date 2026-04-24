@@ -76,10 +76,14 @@ class TestCalculateMinFeePostActivation(unittest.TestCase):
         self.assertEqual(bare, MIN_FEE_POST_FLAT)
 
     def test_above_activation_stays_flat(self):
-        """Many blocks past activation, the floor is unchanged."""
+        """Within the [FLAT_FEE_HEIGHT, LINEAR_FEE_HEIGHT) window the floor
+        is unchanged — clamp to one block before LINEAR_FEE_HEIGHT to stay
+        in the flat-fee regime.  Past LINEAR_FEE_HEIGHT the floor is
+        linear in stored bytes (covered by test_linear_fees)."""
+        from messagechain.config import LINEAR_FEE_HEIGHT
         self.assertEqual(
             calculate_min_fee(
-                b"x" * 100, current_height=FLAT_FEE_HEIGHT + 1_000_000,
+                b"x" * 100, current_height=LINEAR_FEE_HEIGHT - 1,
             ),
             MIN_FEE_POST_FLAT,
         )

@@ -16,7 +16,7 @@ import os
 import stat
 import sys
 
-from messagechain.config import DEFAULT_PORT
+from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -114,9 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     send = sub.add_parser(
         "send",
         help="Send a message",
-        description="Send a message to the chain (280 chars max).",
+        description="Send a message to the chain (1024 chars max).",
     )
-    send.add_argument("message", type=str, help="Message text (280 chars max)")
+    send.add_argument("message", type=str, help="Message text (1024 chars max)")
     send.add_argument(
         "--fee", type=int, default=None,
         help="Transaction fee (auto-detected if omitted)",
@@ -136,7 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
             "persisted under --receipts-dir for later evidence use."
         ),
     )
-    send_multi.add_argument("message", type=str, help="Message text (280 chars max)")
+    send_multi.add_argument("message", type=str, help="Message text (1024 chars max)")
     send_multi.add_argument(
         "--fee", type=int, required=True, help="Transaction fee (tokens)",
     )
@@ -1305,8 +1305,8 @@ def cmd_send(args):
 
     message = args.message
     char_count = len(message)
-    if char_count > 280:
-        print(f"Error: Message is {char_count} characters (max 280).")
+    if char_count > MAX_MESSAGE_CHARS:
+        print(f"Error: Message is {char_count} characters (max {MAX_MESSAGE_CHARS}).")
         sys.exit(1)
     if not message.strip():
         print("Error: Message cannot be empty.")

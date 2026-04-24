@@ -2,7 +2,7 @@
 
 Messages must contain only printable ASCII characters (bytes 32-126):
 letters, digits, punctuation, and space. No emoji, no Unicode, no
-control characters. 1 char = 1 byte, so MAX_MESSAGE_BYTES = MAX_MESSAGE_CHARS = 280.
+control characters. 1 char = 1 byte, so MAX_MESSAGE_BYTES = MAX_MESSAGE_CHARS = 1024.
 """
 
 import unittest
@@ -23,8 +23,11 @@ class TestASCIIOnlyConstants(unittest.TestCase):
     def test_max_bytes_equals_max_chars(self):
         self.assertEqual(MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS)
 
-    def test_max_chars_is_280(self):
-        self.assertEqual(MAX_MESSAGE_CHARS, 280)
+    def test_max_chars_is_1024(self):
+        # Raised from 280 → 1024 at LINEAR_FEE_HEIGHT (Tier 8 fork).
+        # Storage discipline now lives in the linear-in-bytes fee floor;
+        # see test_linear_fees for the post-fork pricing invariants.
+        self.assertEqual(MAX_MESSAGE_CHARS, 1024)
 
 
 class TestASCIIValidation(unittest.TestCase):
@@ -41,11 +44,11 @@ class TestASCIIValidation(unittest.TestCase):
         self.assertTrue(valid)
 
     def test_max_length_accepted(self):
-        valid, _ = _validate_message("A" * 280)
+        valid, _ = _validate_message("A" * MAX_MESSAGE_CHARS)
         self.assertTrue(valid)
 
     def test_over_max_length_rejected(self):
-        valid, _ = _validate_message("A" * 281)
+        valid, _ = _validate_message("A" * (MAX_MESSAGE_CHARS + 1))
         self.assertFalse(valid)
 
     def test_empty_message_accepted(self):

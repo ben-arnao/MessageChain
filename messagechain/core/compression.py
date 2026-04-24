@@ -32,11 +32,11 @@ import zlib
 RAW_FLAG = 0
 COMPRESSED_FLAG = 1
 
-# Hard cap on decompressed payload size.  4x MAX_MESSAGE_CHARS (280)
+# Hard cap on decompressed payload size.  4x MAX_MESSAGE_CHARS (1024)
 # gives generous margin for any valid message while stopping
 # decompression bombs cold.  A malicious tx with small compressed
 # bytes that decompress to megabytes/gigabytes is rejected here.
-MAX_DECOMPRESSED_MESSAGE_SIZE = 1120
+MAX_DECOMPRESSED_MESSAGE_SIZE = 4096
 
 
 def encode_payload(plaintext: bytes) -> tuple[bytes, int]:

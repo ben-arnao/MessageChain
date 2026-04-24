@@ -33,10 +33,11 @@ class TestDecompressionBombRejected(unittest.TestCase):
         self.assertIn("exceeds", str(ctx.exception))
 
     def test_max_decompressed_size_constant_is_sane(self):
-        """MAX_DECOMPRESSED_MESSAGE_SIZE should be >= 280 (MAX_MESSAGE_CHARS)
+        """MAX_DECOMPRESSED_MESSAGE_SIZE should be >= MAX_MESSAGE_CHARS
         and not absurdly large."""
-        self.assertGreaterEqual(MAX_DECOMPRESSED_MESSAGE_SIZE, 280)
-        self.assertLessEqual(MAX_DECOMPRESSED_MESSAGE_SIZE, 4096)
+        from messagechain.config import MAX_MESSAGE_CHARS
+        self.assertGreaterEqual(MAX_DECOMPRESSED_MESSAGE_SIZE, MAX_MESSAGE_CHARS)
+        self.assertLessEqual(MAX_DECOMPRESSED_MESSAGE_SIZE, 4 * MAX_MESSAGE_CHARS)
 
 
 class TestNormalRoundtrip(unittest.TestCase):
