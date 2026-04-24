@@ -519,6 +519,18 @@ class ChainDB:
                 rotation_number INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Per-entity height of the most-recent applied KeyRotation,
+            -- driving the KEY_ROTATION_COOLDOWN_BLOCKS gate in
+            -- validate_key_rotation.  Prior to this table the map was
+            -- in-memory-only -- a cold-booted node rehydrated empty
+            -- and would accept a rotation the warm cluster rejected,
+            -- silently forking.  Included in the state-root commitment
+            -- (v18) and mirrored here for cold-boot rehydration.
+            CREATE TABLE IF NOT EXISTS key_rotation_last_height (
+                entity_id BLOB PRIMARY KEY,
+                block_height INTEGER NOT NULL
+            );
+
             -- WOTS+ Merkle tree height per entity.  Recorded the moment
             -- the entity's pubkey is installed on chain (genesis,
             -- first-spend reveal, or direct install).  The server looks
@@ -1252,6 +1264,23 @@ class ChainDB:
 
     def get_all_leaf_watermarks(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, next_leaf FROM leaf_watermarks")
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # -- State: Key-rotation last heights (cooldown gate) -----------
+
+    def set_key_rotation_last_height(
+        self, entity_id: bytes, block_height: int,
+    ):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO key_rotation_last_height "
+            "(entity_id, block_height) VALUES (?, ?)",
+            (entity_id, int(block_height)),
+        )
+
+    def get_all_key_rotation_last_height(self) -> dict[bytes, int]:
+        cur = self._conn.execute(
+            "SELECT entity_id, block_height FROM key_rotation_last_height",
+        )
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
     # ── State: Authority Keys (cold-key withdrawal gating) ──────

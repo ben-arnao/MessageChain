@@ -108,7 +108,7 @@ class TestFinalityVoteBasic(unittest.TestCase):
 
     def test_sign_and_verify_roundtrip(self):
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=100)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=100, signed_at_height=100)
         self.assertEqual(vote.signer_entity_id, self.alice.entity_id)
         self.assertEqual(vote.target_block_hash, target_hash)
         self.assertEqual(vote.target_block_number, 100)
@@ -116,12 +116,12 @@ class TestFinalityVoteBasic(unittest.TestCase):
 
     def test_wrong_pubkey_rejects(self):
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=100)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=100, signed_at_height=100)
         self.assertFalse(verify_finality_vote(vote, self.bob.public_key))
 
     def test_binary_roundtrip(self):
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=42)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=42, signed_at_height=42)
         blob = vote.to_bytes()
         restored = FinalityVote.from_bytes(blob)
         self.assertEqual(restored.signer_entity_id, vote.signer_entity_id)
@@ -132,7 +132,7 @@ class TestFinalityVoteBasic(unittest.TestCase):
 
     def test_dict_roundtrip(self):
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=42)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=42, signed_at_height=42)
         restored = FinalityVote.deserialize(vote.serialize())
         self.assertEqual(restored.consensus_hash(), vote.consensus_hash())
         self.assertTrue(verify_finality_vote(restored, self.alice.public_key))
@@ -140,7 +140,7 @@ class TestFinalityVoteBasic(unittest.TestCase):
     def test_consensus_hash_stable(self):
         """consensus_hash must be deterministic + use _signable_data."""
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=42)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=42, signed_at_height=42)
         h1 = vote.consensus_hash()
         h2 = vote.consensus_hash()
         self.assertEqual(h1, h2)
@@ -151,9 +151,9 @@ class TestFinalityVoteBasic(unittest.TestCase):
     def test_consensus_hash_differs_by_target(self):
         target_a = _hash(b"target_a")
         target_b = _hash(b"target_b")
-        vote_a = create_finality_vote(self.alice, target_a, target_block_number=42)
+        vote_a = create_finality_vote(self.alice, target_a, target_block_number=42, signed_at_height=42)
         # Fresh leaf for the second signature
-        vote_b = create_finality_vote(self.alice, target_b, target_block_number=42)
+        vote_b = create_finality_vote(self.alice, target_b, target_block_number=42, signed_at_height=42)
         self.assertNotEqual(vote_a.consensus_hash(), vote_b.consensus_hash())
 
     def test_distinct_domain_tag(self):
@@ -163,7 +163,7 @@ class TestFinalityVoteBasic(unittest.TestCase):
         """
         from messagechain.consensus.attestation import create_attestation
         target_hash = _hash(b"target_block")
-        vote = create_finality_vote(self.alice, target_hash, target_block_number=42)
+        vote = create_finality_vote(self.alice, target_hash, target_block_number=42, signed_at_height=42)
         # Fresh leaf
         self.alice.keypair._next_leaf = 1
         att = create_attestation(self.alice, target_hash, block_number=42)
@@ -201,6 +201,7 @@ class TestBlockSerializationWithFinalityVotes(unittest.TestCase):
         # Fresh leaves (both bob and alice are attesting to block1)
         vote = create_finality_vote(
             self.bob, block1.block_hash, block1.header.block_number,
+            signed_at_height=block1.header.block_number,
         )
         prev = self.chain.get_latest_block()
         block2 = self.chain.propose_block(
@@ -221,6 +222,7 @@ class TestBlockSerializationWithFinalityVotes(unittest.TestCase):
 
         vote = create_finality_vote(
             self.bob, block1.block_hash, block1.header.block_number,
+            signed_at_height=block1.header.block_number,
         )
         prev = self.chain.get_latest_block()
         block2 = self.chain.propose_block(
@@ -246,6 +248,7 @@ class TestFinalityCheckpointsUnit(unittest.TestCase):
             signer_entity_id=signer_id,
             target_block_hash=target_hash,
             target_block_number=target_num,
+            signed_at_height=target_num,
             signature=Signature([], 0, [], b"", b""),
         )
 
@@ -339,7 +342,7 @@ class TestFinalityIntegration(unittest.TestCase):
         # Build 3 finality votes (full stake) on block 1 and bundle
         # them into block 2.  Integer 2/3 threshold: 3000*3 >= 3000*2 ✓
         votes = [
-            create_finality_vote(e, block1.block_hash, block1.header.block_number)
+            create_finality_vote(e, block1.block_hash, block1.header.block_number, signed_at_height=block1.header.block_number)
             for e in self._all()
         ]
 
@@ -370,6 +373,7 @@ class TestFinalityIntegration(unittest.TestCase):
         # Only bob votes — 1/3 of stake, below threshold
         vote = create_finality_vote(
             self.bob, block1.block_hash, block1.header.block_number,
+            signed_at_height=block1.header.block_number,
         )
         proposer = pick_selected_proposer(self.chain, self._all())
         block2 = self.chain.propose_block(
@@ -399,7 +403,7 @@ class TestFinalityIntegration(unittest.TestCase):
 
         # Craft three votes for block 1
         votes = [
-            create_finality_vote(e, block1.block_hash, block1.header.block_number)
+            create_finality_vote(e, block1.block_hash, block1.header.block_number, signed_at_height=block1.header.block_number)
             for e in self._all()
         ]
         # Baseline (proposer+treasury) net balance
@@ -458,7 +462,7 @@ class TestFinalityIntegration(unittest.TestCase):
 
         # Finalize block 1 via 3 votes
         votes = [
-            create_finality_vote(e, block1.block_hash, block1.header.block_number)
+            create_finality_vote(e, block1.block_hash, block1.header.block_number, signed_at_height=block1.header.block_number)
             for e in self._all()
         ]
         proposer = pick_selected_proposer(self.chain, self._all())
@@ -526,8 +530,8 @@ class TestFinalityIntegration(unittest.TestCase):
         hash_a = _hash(b"block_a")
         hash_b = _hash(b"block_b")
         # Bob equivocates
-        vote_a = create_finality_vote(self.bob, hash_a, 5)
-        vote_b = create_finality_vote(self.bob, hash_b, 5)
+        vote_a = create_finality_vote(self.bob, hash_a, 5, signed_at_height=5)
+        vote_b = create_finality_vote(self.bob, hash_b, 5, signed_at_height=5)
 
         evidence = FinalityDoubleVoteEvidence(
             offender_id=self.bob.entity_id,
@@ -556,8 +560,8 @@ class TestFinalityIntegration(unittest.TestCase):
     def test_double_vote_evidence_roundtrip(self):
         hash_a = _hash(b"block_a")
         hash_b = _hash(b"block_b")
-        vote_a = create_finality_vote(self.bob, hash_a, 5)
-        vote_b = create_finality_vote(self.bob, hash_b, 5)
+        vote_a = create_finality_vote(self.bob, hash_a, 5, signed_at_height=5)
+        vote_b = create_finality_vote(self.bob, hash_b, 5, signed_at_height=5)
         evidence = FinalityDoubleVoteEvidence(
             offender_id=self.bob.entity_id, vote_a=vote_a, vote_b=vote_b,
         )
@@ -572,8 +576,8 @@ class TestFinalityIntegration(unittest.TestCase):
     def test_slash_tx_with_finality_evidence_serialization(self):
         hash_a = _hash(b"block_a")
         hash_b = _hash(b"block_b")
-        vote_a = create_finality_vote(self.bob, hash_a, 5)
-        vote_b = create_finality_vote(self.bob, hash_b, 5)
+        vote_a = create_finality_vote(self.bob, hash_a, 5, signed_at_height=5)
+        vote_b = create_finality_vote(self.bob, hash_b, 5, signed_at_height=5)
         evidence = FinalityDoubleVoteEvidence(
             offender_id=self.bob.entity_id, vote_a=vote_a, vote_b=vote_b,
         )
@@ -609,6 +613,7 @@ class TestFinalityIntegration(unittest.TestCase):
             signer_entity_id=self.bob.entity_id,
             target_block_hash=block1.block_hash,
             target_block_number=block1.header.block_number,
+            signed_at_height=block1.header.block_number,
             signature=Signature([], 0, [], b"", b""),
         )
         votes = [placeholder] * (MAX_FINALITY_VOTES_PER_BLOCK + 1)
@@ -624,7 +629,7 @@ class TestFinalityIntegration(unittest.TestCase):
     def test_vote_for_nonexistent_block_rejected(self):
         """A FinalityVote whose target is not in the chain is rejected."""
         bogus_hash = _hash(b"does_not_exist")
-        vote = create_finality_vote(self.bob, bogus_hash, target_block_number=1)
+        vote = create_finality_vote(self.bob, bogus_hash, target_block_number=1, signed_at_height=1)
 
         prev = self.chain.get_latest_block()
         proposer = pick_selected_proposer(self.chain, self._all())
@@ -653,6 +658,7 @@ class TestFinalityIntegration(unittest.TestCase):
         # impractical, we directly test the validator.
         vote = create_finality_vote(
             self.bob, block1.block_hash, block1.header.block_number,
+            signed_at_height=block1.header.block_number,
         )
         # Manually build a bogus "block" wrapper that will reuse
         # validate logic.  Simpler: bypass and call the internal
@@ -719,7 +725,7 @@ class TestFinalityPersistence(unittest.TestCase):
         self.assertTrue(ok, reason)
 
         votes = [
-            create_finality_vote(e, block1.block_hash, block1.header.block_number)
+            create_finality_vote(e, block1.block_hash, block1.header.block_number, signed_at_height=block1.header.block_number)
             for e in (self.alice, self.bob, self.carol)
         ]
         proposer = pick_selected_proposer(chain, [self.alice, self.bob, self.carol])

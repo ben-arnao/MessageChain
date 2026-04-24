@@ -249,7 +249,7 @@ from messagechain.crypto.hashing import default_hash
 #      layout: appended strictly after v16's registered_validators
 #      set as a single u8 flag (0 = False, 1 = True) for a compact
 #      encoding — simpler than widening the _TAG_GLOBAL scheme.
-STATE_SNAPSHOT_VERSION = 17  # wire format version for encode/decode
+STATE_SNAPSHOT_VERSION = 18  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -265,6 +265,16 @@ _TAG_PUBKEY = b"pub"
 _TAG_AUTHORITY = b"auth"
 _TAG_LEAF_WATERMARK = b"lwm"
 _TAG_ROTATION = b"rot"
+# v18: key_rotation_last_height -- bytes->int dict mapping entity_id to
+# the block height at which that entity's most-recent KeyRotation was
+# applied.  Consensus-critical: drives KEY_ROTATION_COOLDOWN_BLOCKS
+# rejection in validate_key_rotation.  Prior to v18 this field lived in
+# in-memory reorg snapshots but was NOT in the state-root commitment or
+# the persistence layer -- a cold-booted node rehydrated an empty map
+# and silently accepted rotations the warm cluster rejected, splitting
+# consensus.  MUST participate in the snapshot root so state-synced and
+# cold-booted nodes agree on the per-entity cooldown clock.
+_TAG_KEY_ROTATION_LAST_HEIGHT = b"krlh"
 _TAG_REVOKED = b"rev"
 _TAG_SLASHED = b"slh"
 _TAG_ENTITY_INDEX = b"eidx"
@@ -461,6 +471,12 @@ def serialize_state(blockchain) -> dict:
         "authority_keys": dict(blockchain.authority_keys),
         "leaf_watermarks": dict(blockchain.leaf_watermarks),
         "key_rotation_counts": dict(blockchain.key_rotation_counts),
+        # v18: per-entity last-rotation-height map.  Consensus-critical
+        # for the KEY_ROTATION_COOLDOWN_BLOCKS gate -- see
+        # _TAG_KEY_ROTATION_LAST_HEIGHT docstring.
+        "key_rotation_last_height": dict(
+            getattr(blockchain, "key_rotation_last_height", {})
+        ),
         "revoked_entities": set(blockchain.revoked_entities),
         "slashed_validators": set(blockchain.slashed_validators),
         "entity_id_to_index": dict(blockchain.entity_id_to_index),
@@ -880,6 +896,15 @@ def deserialize_state(snapshot: dict) -> dict:
     # both sides.  Binary decode populates this strictly so the
     # default only affects hand-built snapshot dicts.
     out.setdefault("rolling_fee_burn_seeded", False)
+    # Pre-v18 snapshots lack the key_rotation_last_height map.  A
+    # migrating chain starts with an empty map -- after the upgrade,
+    # cold-boot replays or state-sync fills it from the block stream
+    # going forward.  Starting empty is the correct migration default:
+    # any entity whose last rotation predates the migration would have
+    # passed its cooldown long before any honest node observes the
+    # empty map, and the worst case is one extra rotation immediately
+    # post-migration (bounded by the cooldown, not a consensus fault).
+    out.setdefault("key_rotation_last_height", {})
     return out
 
 
@@ -995,6 +1020,15 @@ def compute_state_root(snapshot: dict) -> bytes:
             _TAG_LEAF_WATERMARK, snap["leaf_watermarks"])),
         _TAG_ROTATION: _merkle(_entries_for_section(
             _TAG_ROTATION, snap["key_rotation_counts"])),
+        # v18: per-entity last-rotation-height.  Drives the
+        # KEY_ROTATION_COOLDOWN_BLOCKS gate; a state-synced or cold-
+        # booted node that inherits a stale map would accept rotations
+        # the warm cluster rejects and silently fork.  See
+        # _TAG_KEY_ROTATION_LAST_HEIGHT docstring.
+        _TAG_KEY_ROTATION_LAST_HEIGHT: _merkle(_entries_for_section(
+            _TAG_KEY_ROTATION_LAST_HEIGHT,
+            snap["key_rotation_last_height"],
+        )),
         _TAG_REVOKED: _merkle(_entries_for_section(
             _TAG_REVOKED, snap["revoked_entities"])),
         _TAG_SLASHED: _merkle(_entries_for_section(
@@ -1580,6 +1614,11 @@ def encode_snapshot(snap: dict) -> bytes:
         ">B",
         1 if bool(snap.get("rolling_fee_burn_seeded", False)) else 0,
     )
+    # v18: key_rotation_last_height (bytes->int dict).  Strictly
+    # appended after the v17 seeded flag so a v17 blob is a strict
+    # prefix of a v18 blob.  See _TAG_KEY_ROTATION_LAST_HEIGHT for why
+    # this must live in the state-root commitment.
+    out += _encode_bytes_int_dict(snap.get("key_rotation_last_height", {}))
     return bytes(out)
 
 
@@ -1702,6 +1741,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
             f"rolling_fee_burn_seeded flag must be 0 or 1, got {_seed_flag}"
         )
     rolling_fee_burn_seeded = bool(_seed_flag)
+    # v18+: key_rotation_last_height (bytes->int dict).  Always
+    # present on v18+ blobs; the strict version check above rejects
+    # earlier versions.
+    key_rotation_last_height, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1753,4 +1796,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "rolling_fee_burn": rolling_fee_burn,
         "registered_validators": registered_validators,
         "rolling_fee_burn_seeded": rolling_fee_burn_seeded,
+        "key_rotation_last_height": key_rotation_last_height,
     }

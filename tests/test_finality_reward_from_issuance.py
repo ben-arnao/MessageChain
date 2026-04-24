@@ -101,6 +101,7 @@ class _BaseChainFixture(unittest.TestCase):
         votes = [
             create_finality_vote(
                 e, block1.block_hash, block1.header.block_number,
+                signed_at_height=block1.header.block_number,
             )
             for e in self._all()
         ]

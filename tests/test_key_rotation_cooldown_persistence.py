@@ -286,5 +286,83 @@ class TestRPCPathRegression(_Base):
         )
 
 
+class TestColdBootChaindbRehydration(_Base):
+    """Test E (v18 fix): a cold-booted node rehydrating from chaindb
+    MUST restore `key_rotation_last_height` so the
+    KEY_ROTATION_COOLDOWN_BLOCKS gate fires consistently with a warm
+    cluster.  Before the v18 fix, the map was in-memory-only -- restart
+    wiped it, and a rotation already rejected by warm peers was
+    accepted by the restarted node, splitting consensus.
+    """
+
+    def test_chaindb_persists_and_rehydrates_cooldown_map(self):
+        import tempfile
+        import os
+        from messagechain.storage.chaindb import ChainDB
+
+        tmp = tempfile.mkdtemp()
+        try:
+            db_path = os.path.join(tmp, "chain.db")
+            db = ChainDB(db_path)
+
+            # Mimic apply-time write: record rotation_last_height for alice.
+            alice_id = b"alice-cold".ljust(32, b"\x00")
+            db.set_key_rotation_last_height(alice_id, 777)
+            db.flush_state() if hasattr(db, "flush_state") else None
+
+            # Re-open the DB (new handle) and confirm the row is readable.
+            db2 = ChainDB(db_path)
+            rehydrated = db2.get_all_key_rotation_last_height()
+            self.assertEqual(
+                rehydrated.get(alice_id), 777,
+                "chaindb must persist key_rotation_last_height across a "
+                "process restart -- without this, a cold-booted validator "
+                "silently accepts rotations the warm cluster rejects, "
+                "forking consensus",
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_state_snapshot_roundtrip_includes_krlh(self):
+        """The v18 state snapshot MUST round-trip
+        key_rotation_last_height AND the snapshot root must change
+        when the map changes (ensures the field participates in the
+        consensus commitment, not just the wire format)."""
+        from messagechain.storage.state_snapshot import (
+            serialize_state, encode_snapshot, decode_snapshot,
+            compute_state_root, STATE_SNAPSHOT_VERSION,
+        )
+        self.assertGreaterEqual(STATE_SNAPSHOT_VERSION, 18)
+        chain, _, alice, _ = self._bootstrap()
+        chain.key_rotation_last_height[alice.entity_id] = 42
+
+        snap = serialize_state(chain)
+        self.assertEqual(
+            snap["key_rotation_last_height"].get(alice.entity_id), 42,
+        )
+        blob = encode_snapshot(snap)
+        restored = decode_snapshot(blob)
+        self.assertEqual(
+            restored["key_rotation_last_height"].get(alice.entity_id), 42,
+        )
+        # Root sensitivity: changing krlh must change the root.  Without
+        # this the field is not in the consensus commitment and two
+        # nodes can disagree on the map without tripping root mismatch.
+        root_with_42 = compute_state_root(snap)
+        snap2 = dict(snap)
+        snap2["key_rotation_last_height"] = dict(
+            snap["key_rotation_last_height"],
+        )
+        snap2["key_rotation_last_height"][alice.entity_id] = 9999
+        root_with_9999 = compute_state_root(snap2)
+        self.assertNotEqual(
+            root_with_42, root_with_9999,
+            "state-root must commit to key_rotation_last_height -- "
+            "otherwise two nodes disagreeing on the map compute the "
+            "same root and fork silently at the next rotation",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

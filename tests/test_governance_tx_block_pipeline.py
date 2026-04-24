@@ -190,5 +190,101 @@ class TestAutoExecuteThroughBlock(_Base):
         self.assertEqual(entry["recipient_id"], bob.entity_id.hex())
         self.assertEqual(entry["amount"], 5_000)
 
+class TestGovernanceLeafReuseRejection(_Base):
+    """Governance txs MUST enforce the same WOTS+ leaf-reuse gate as
+    every other signed tx type.  A leaf reused across tx types (e.g.
+    a message tx at leaf N followed by a governance tx at the same
+    leaf N) exposes enough of the one-time secret to forge signatures
+    at that leaf — Transfer, SetAuthorityKey, etc.  The validation
+    layer must reject the second-use regardless of direction.
+    """
+
+    def test_governance_tx_rejected_after_hot_key_leaf_consumed(self):
+        """A message tx consumes leaf N.  A governance tx signed at
+        the same leaf N must be rejected by per-tx validation (the
+        second-block route) — not silently accepted and only bumped
+        at apply-time."""
+        from messagechain.core.transaction import create_transaction
+        from messagechain.config import MIN_FEE
+        chain, alice = _make_single_chain()
+        consensus = ProofOfStake()
+
+        # Burn leaf 0 via a message tx.
+        msg = create_transaction(
+            alice, "hi", MIN_FEE + 100, nonce=0,
+            current_height=chain.height + 1,
+        )
+        b1 = chain.propose_block(consensus, alice, [msg])
+        ok, reason = chain.add_block(b1)
+        self.assertTrue(ok, reason)
+        burned_leaf = msg.signature.leaf_index
+        self.assertGreater(
+            chain.leaf_watermarks[alice.entity_id], burned_leaf,
+        )
+
+        # Build a governance proposal at the SAME leaf that message tx
+        # burned.  Manually rewind the keypair's next_leaf to force
+        # the collision (simulating a signer with stale state — the
+        # realistic attack model).
+        alice.keypair._next_leaf = burned_leaf
+        proposal = create_proposal(alice, "Rewind", "Details")
+        self.assertEqual(
+            proposal.signature.leaf_index, burned_leaf,
+        )
+
+        # Per-tx validation must now reject the governance tx on the
+        # watermark rule alone — without this gate, the block-level
+        # dedupe only catches same-block collisions.
+        ok, reason = chain._validate_governance_tx(proposal)
+        self.assertFalse(ok)
+        self.assertIn("leaf", reason.lower())
+
+    def test_governance_leaf_collision_within_same_block_rejected(self):
+        """Two governance txs from the same entity at the same
+        leaf_index in ONE block must be rejected by the block-level
+        _check_leaf loop — mirrors the gate for message/transfer/
+        attestation/finality-vote."""
+        chain, alice = _make_single_chain()
+        p1 = create_proposal(alice, "First", "Details")
+        # Force second proposal to reuse the same leaf.
+        alice.keypair._next_leaf = p1.signature.leaf_index
+        p2 = create_proposal(alice, "Second", "OtherDetails")
+        self.assertEqual(
+            p1.signature.leaf_index, p2.signature.leaf_index,
+        )
+        self.assertNotEqual(p1.proposal_id, p2.proposal_id)
+
+        consensus = ProofOfStake()
+        # propose_block normally filters the second as invalid, so
+        # construct the block directly via the underlying path and
+        # let validate_block catch the dup.
+        block = chain.propose_block(
+            consensus, alice, [], governance_txs=[p1, p2],
+        )
+        # If propose_block filtered p2 out of the final block, the
+        # dedupe loop never sees a collision.  Force the collision by
+        # injecting p2 manually.
+        if p2 not in block.governance_txs:
+            block.governance_txs = list(block.governance_txs) + [p2]
+        ok, reason = chain.validate_block(block)
+        self.assertFalse(ok)
+        self.assertIn("leaf", reason.lower())
+
+
+def _make_single_chain():
+    alice = _entity(b"leaf-reuse-alice")
+    alice.keypair._next_leaf = 0
+    chain = Blockchain()
+    chain.initialize_genesis(
+        alice,
+        allocation_table={
+            TREASURY_ENTITY_ID: TREASURY_ALLOCATION,
+            alice.entity_id: 1_000_000,
+        },
+    )
+    chain.supply.staked[alice.entity_id] = 10_000
+    return chain, alice
+
+
 if __name__ == "__main__":
     unittest.main()

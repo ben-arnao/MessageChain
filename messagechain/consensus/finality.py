@@ -89,11 +89,27 @@ class FinalityVote:
         signer_entity_id:    validator that signed this vote
         target_block_hash:   block hash being committed to
         target_block_number: height of the committed block
+        signed_at_height:    chain height at which this vote was
+                             signed.  Distinct from
+                             ``target_block_number`` -- a finality
+                             vote may be signed up to
+                             FINALITY_VOTE_MAX_AGE_BLOCKS after the
+                             target.  Included in the signable data so
+                             FinalityDoubleVoteEvidence slashing can
+                             resolve the offender's public key at the
+                             actual signing height (not the target
+                             height), which closes the rotation-race
+                             slash-evasion path -- a validator who
+                             equivocated at height H with key K and
+                             rotated afterwards cannot escape the 100%
+                             slash because ``_public_key_at_height(H)``
+                             still returns K.
         signature:           WOTS+ signature over _signable_data()
     """
     signer_entity_id: bytes
     target_block_hash: bytes
     target_block_number: int
+    signed_at_height: int
     signature: Signature
 
     def _signable_data(self) -> bytes:
@@ -112,6 +128,7 @@ class FinalityVote:
             + struct.pack(">B", sig_version)
             + self.target_block_hash
             + struct.pack(">Q", self.target_block_number)
+            + struct.pack(">Q", self.signed_at_height)
             + self.signer_entity_id
         )
 
@@ -124,6 +141,7 @@ class FinalityVote:
             "signer_entity_id": self.signer_entity_id.hex(),
             "target_block_hash": self.target_block_hash.hex(),
             "target_block_number": self.target_block_number,
+            "signed_at_height": self.signed_at_height,
             "signature": self.signature.serialize(),
         }
 
@@ -133,14 +151,15 @@ class FinalityVote:
             signer_entity_id=bytes.fromhex(data["signer_entity_id"]),
             target_block_hash=bytes.fromhex(data["target_block_hash"]),
             target_block_number=data["target_block_number"],
+            signed_at_height=data["signed_at_height"],
             signature=Signature.deserialize(data["signature"]),
         )
 
     def to_bytes(self, state=None) -> bytes:
         """Binary: 32 signer_id | 32 target_hash | u64 target_number |
-        u32 sig_len | sig_blob.
+        u64 signed_at_height | u32 sig_len | sig_blob.
 
-        signer_entity_id stays full-width (32 bytes) — finality votes
+        signer_entity_id stays full-width (32 bytes) -- finality votes
         may target and gossip across validators that predate the
         current entity-index registry, and keeping the encoding state-
         free avoids the cross-chain encoding footgun where a vote
@@ -151,18 +170,20 @@ class FinalityVote:
             self.signer_entity_id,
             self.target_block_hash,
             struct.pack(">Q", self.target_block_number),
+            struct.pack(">Q", self.signed_at_height),
             struct.pack(">I", len(sig_blob)),
             sig_blob,
         ])
 
     @classmethod
     def from_bytes(cls, data: bytes, state=None) -> "FinalityVote":
-        if len(data) < 32 + 32 + 8 + 4:
+        if len(data) < 32 + 32 + 8 + 8 + 4:
             raise ValueError("FinalityVote blob too short")
         off = 0
         signer_id = bytes(data[off:off + 32]); off += 32
         target_hash = bytes(data[off:off + 32]); off += 32
         target_num = struct.unpack_from(">Q", data, off)[0]; off += 8
+        signed_at_height = struct.unpack_from(">Q", data, off)[0]; off += 8
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
         if off + sig_len > len(data):
             raise ValueError("FinalityVote truncated at signature")
@@ -173,6 +194,7 @@ class FinalityVote:
             signer_entity_id=signer_id,
             target_block_hash=target_hash,
             target_block_number=target_num,
+            signed_at_height=signed_at_height,
             signature=sig,
         )
 
@@ -181,18 +203,28 @@ def create_finality_vote(
     signer_entity,
     target_block_hash: bytes,
     target_block_number: int,
+    signed_at_height: int,
 ) -> FinalityVote:
     """Sign a FinalityVote for (target_block_hash, target_block_number).
 
-    Consumes one WOTS+ leaf from signer_entity.keypair — finality
+    Consumes one WOTS+ leaf from signer_entity.keypair -- finality
     signing is leaf-budget-visible just like block proposal and
     attestation.  Validators that sign votes every FINALITY_INTERVAL
     blocks use leaves at roughly 1/100 the attestation rate.
+
+    ``signed_at_height`` MUST be the current chain tip at the moment
+    of signing.  It is committed in the signable data so the
+    FinalityDoubleVoteEvidence slash path can resolve the offender's
+    key at the signing height -- closing the rotation-race evasion
+    where an equivocator rotates keys between casting conflicting
+    votes and the evidence being submitted.  See the field docstring
+    on ``FinalityVote.signed_at_height`` for the full rationale.
     """
     vote = FinalityVote(
         signer_entity_id=signer_entity.entity_id,
         target_block_hash=target_block_hash,
         target_block_number=target_block_number,
+        signed_at_height=signed_at_height,
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )
     msg_hash = _hash(vote._signable_data())

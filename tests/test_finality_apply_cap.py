@@ -42,6 +42,7 @@ def _fake_vote(signer_id: bytes, target_hash: bytes, target_num: int) -> Finalit
         signer_entity_id=signer_id,
         target_block_hash=target_hash,
         target_block_number=target_num,
+        signed_at_height=target_num,
         signature=Signature([], 0, [], b"", b""),
     )
 

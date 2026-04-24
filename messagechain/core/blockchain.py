@@ -820,6 +820,17 @@ class Blockchain:
         if hasattr(self.db, 'get_all_key_rotation_counts'):
             self.key_rotation_counts = self.db.get_all_key_rotation_counts()
 
+        # Restore per-entity key_rotation_last_height so the
+        # KEY_ROTATION_COOLDOWN_BLOCKS gate survives a cold boot.
+        # Before this restore existed, a restart wiped the map and
+        # the node silently accepted rotations the warm cluster
+        # rejected -- a hard consensus split.  See the matching
+        # persistence write in _apply_authority_tx.
+        if hasattr(self.db, 'get_all_key_rotation_last_height'):
+            self.key_rotation_last_height = (
+                self.db.get_all_key_rotation_last_height()
+            )
+
         # Restore per-entity WOTS+ tree heights.  Consulted at server
         # startup to rebuild the SAME keypair from the operator's
         # private key, independent of whatever global config the
@@ -1038,6 +1049,9 @@ class Blockchain:
             if hasattr(self.db, 'set_key_rotation_count'):
                 for eid, rn in _scoped(self.key_rotation_counts):
                     self.db.set_key_rotation_count(eid, rn)
+            if hasattr(self.db, 'set_key_rotation_last_height'):
+                for eid, bh in _scoped(self.key_rotation_last_height):
+                    self.db.set_key_rotation_last_height(eid, bh)
             if hasattr(self.db, 'set_wots_tree_height'):
                 # Set-once at the storage layer (INSERT OR IGNORE), so
                 # re-persisting unchanged entries is a cheap no-op.
@@ -1442,6 +1456,14 @@ class Blockchain:
         self.authority_keys = dict(snap["authority_keys"])
         self.leaf_watermarks = dict(snap["leaf_watermarks"])
         self.key_rotation_counts = dict(snap["key_rotation_counts"])
+        # v18: per-entity last-rotation-height.  Drives the
+        # KEY_ROTATION_COOLDOWN_BLOCKS gate; a cold-booted or state-
+        # synced node that inherits an empty map would accept
+        # rotations the warm cluster rejects -- silent consensus
+        # fork.  See _TAG_KEY_ROTATION_LAST_HEIGHT in state_snapshot.
+        self.key_rotation_last_height = dict(
+            snap.get("key_rotation_last_height", {})
+        )
         self.revoked_entities = set(snap["revoked_entities"])
         self.slashed_validators = set(snap["slashed_validators"])
 
@@ -2521,6 +2543,15 @@ class Blockchain:
                 self.db.set_key_rotation_count(
                     tx.entity_id, self.key_rotation_counts[tx.entity_id],
                 )
+            # Mirror key_rotation_last_height to disk so a cold-booted
+            # node rehydrates the cooldown clock.  Without this, the
+            # warm cluster rejects rotations during cooldown while a
+            # restarted peer (empty map) accepts them, silently forking
+            # consensus.
+            if hasattr(self.db, 'set_key_rotation_last_height'):
+                self.db.set_key_rotation_last_height(
+                    tx.entity_id, self.height,
+                )
             self.db.flush_state()
 
         return True, "Key rotated successfully"
@@ -2839,8 +2870,21 @@ class Blockchain:
         if hasattr(evidence, 'attestation_a'):
             return evidence.attestation_a.block_number
         if hasattr(evidence, 'vote_a'):
-            # FinalityDoubleVoteEvidence: use the target block number.
-            return evidence.vote_a.target_block_number
+            # FinalityDoubleVoteEvidence: use the vote's SIGNING height,
+            # NOT the target height.  Finality votes may be signed up to
+            # FINALITY_VOTE_MAX_AGE_BLOCKS after the target they commit
+            # to, so target_block_number is not the height at which the
+            # WOTS+ signature was produced.  Using target_block_number
+            # for the key-at-height lookup lets an equivocator who
+            # rotated keys between target and signing escape the 100%
+            # slash -- _public_key_at_height(target) returns the pre-
+            # rotation key, but the vote was signed with the post-
+            # rotation key, so signature verification fails and the
+            # evidence is dismissed.  vote_a.signed_at_height is the
+            # actual height the offender signed at (committed in the
+            # signable data, so the offender cannot spoof it), which
+            # returns the exact key that produced the signature.
+            return evidence.vote_a.signed_at_height
         return None
 
     def apply_slash_transaction(self, tx: SlashTransaction, proposer_id: bytes) -> tuple[bool, str]:
@@ -5748,6 +5792,28 @@ class Blockchain:
             ok, reason = _check_leaf(stx.entity_id, stx.signature.leaf_index, "stake tx")
             if not ok:
                 return False, reason
+        # Governance txs share the signer's hot-key leaf namespace.
+        # Sender is proposer_id for proposals / treasury-spends,
+        # voter_id for votes — dispatch so the dedupe key matches the
+        # same key other hot-key signers use.  Without this loop, a
+        # message-tx + governance-vote (or any two governance txs) at
+        # the same leaf_index from the same entity would both land in
+        # one block, exposing the WOTS+ one-time secret.
+        for gtx in getattr(block, "governance_txs", []):
+            if hasattr(gtx, "voter_id"):
+                gov_sender = gtx.voter_id
+            elif hasattr(gtx, "proposer_id"):
+                gov_sender = gtx.proposer_id
+            else:
+                return False, (
+                    f"Unknown governance tx type {type(gtx).__name__} — "
+                    "cannot resolve sender for leaf-reuse check"
+                )
+            ok, reason = _check_leaf(
+                gov_sender, gtx.signature.leaf_index, "governance tx",
+            )
+            if not ok:
+                return False, reason
         for utx in getattr(block, "unstake_transactions", []):
             # Unstake is authority-gated (signed by the cold key when one
             # has been promoted), so its leaf lives in the cold tree —
@@ -6600,6 +6666,21 @@ class Blockchain:
             return False, f"Unknown governance tx type {type(gtx).__name__}"
         if sender not in self.public_keys:
             return False, f"Unknown sender {sender.hex()[:16]}"
+        # WOTS+ leaf-reuse gate: every other signed tx type (Message,
+        # Transfer, Stake, KeyRotation, SetAuthorityKey, attestation,
+        # finality vote) enforces leaf_index >= leaf_watermarks[...]
+        # at per-tx validation.  Governance txs previously did not —
+        # letting a governance signature at an already-consumed leaf
+        # land.  Reusing a WOTS+ leaf across two different signed
+        # messages exposes enough of the one-time secret to forge
+        # signatures at that leaf (Transfer, SetAuthorityKey, etc.),
+        # so this MUST be rejected at validation, not only at apply.
+        if gtx.signature.leaf_index < self.leaf_watermarks.get(sender, 0):
+            return False, (
+                f"WOTS+ leaf {gtx.signature.leaf_index} already consumed "
+                f"(watermark {self.leaf_watermarks[sender]}) — "
+                "leaf reuse rejected"
+            )
         if not verifier(
             gtx, self.public_keys[sender], current_height=self.height + 1,
         ):
@@ -6905,6 +6986,13 @@ class Blockchain:
                 if hasattr(self.db, "set_key_rotation_count"):
                     self.db.set_key_rotation_count(
                         atx.entity_id, self.key_rotation_counts[atx.entity_id],
+                    )
+                # Mirror key_rotation_last_height for cold-boot
+                # rehydration -- see the comment on the RPC-apply
+                # path above.
+                if hasattr(self.db, "set_key_rotation_last_height"):
+                    self.db.set_key_rotation_last_height(
+                        atx.entity_id, self.height,
                     )
         elif cls_name == "SetReceiptSubtreeRootTransaction":
             ok, _ = self.validate_set_receipt_subtree_root(atx)

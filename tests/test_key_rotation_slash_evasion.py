@@ -106,5 +106,88 @@ class TestKeyHistorySnapshotRestore(unittest.TestCase):
         self.assertEqual(chain.key_history, {})
 
 
+class TestFinalityDoubleVoteSigningHeightLookup(unittest.TestCase):
+    """C3 (round 2): FinalityDoubleVoteEvidence slashing MUST use the
+    vote's SIGNING height for the offender-pubkey lookup, not the
+    target height.  Finality votes may be signed up to
+    FINALITY_VOTE_MAX_AGE_BLOCKS after the target they commit to, so
+    if target_block_number is used for the key-at-height lookup, an
+    equivocator who rotates between target and signing escapes the
+    100%-slash -- the lookup returns the pre-rotation key, but the
+    vote was signed with the post-rotation key, so signature
+    verification fails and the evidence is dismissed.
+    """
+
+    def test_evidence_block_number_for_finality_uses_signing_height(self):
+        """_evidence_block_number MUST return the vote's signed_at_height
+        for FinalityDoubleVoteEvidence -- not target_block_number.
+        """
+        from messagechain.consensus.finality import (
+            FinalityVote, FinalityDoubleVoteEvidence,
+        )
+        from messagechain.crypto.keys import Signature
+        # Construct two conflicting votes targeting block 10 but signed
+        # at block 100 -- the exact gap the rotation-race attack exploits.
+        vote_a = FinalityVote(
+            signer_entity_id=b"v" * 32,
+            target_block_hash=b"\x11" * 32,
+            target_block_number=10,
+            signed_at_height=100,
+            signature=Signature([], 0, [], b"", b""),
+        )
+        vote_b = FinalityVote(
+            signer_entity_id=b"v" * 32,
+            target_block_hash=b"\x22" * 32,
+            target_block_number=10,
+            signed_at_height=100,
+            signature=Signature([], 0, [], b"", b""),
+        )
+        ev = FinalityDoubleVoteEvidence(
+            offender_id=b"v" * 32, vote_a=vote_a, vote_b=vote_b,
+        )
+        chain = Blockchain()
+        result = chain._evidence_block_number(ev)
+        self.assertEqual(
+            result, 100,
+            "Finality double-vote evidence block number must be the "
+            "signing height (100), not the target height (10) -- "
+            "using target height lets a rotator defeat the slash.",
+        )
+        self.assertNotEqual(
+            result, 10,
+            "Regression guard: the previous buggy implementation "
+            "returned target_block_number (10). That path allows "
+            "rotation-race slash evasion.",
+        )
+
+    def test_finality_vote_signing_height_is_in_signable_data(self):
+        """signed_at_height MUST be covered by the signature so an
+        equivocator cannot spoof it to dodge the key-at-height lookup.
+        Changing signed_at_height must change the signable bytes --
+        otherwise signature replay with a forged height succeeds.
+        """
+        from messagechain.consensus.finality import FinalityVote
+        from messagechain.crypto.keys import Signature
+        base = FinalityVote(
+            signer_entity_id=b"v" * 32,
+            target_block_hash=b"\x11" * 32,
+            target_block_number=10,
+            signed_at_height=100,
+            signature=Signature([], 0, [], b"", b""),
+        )
+        spoofed = FinalityVote(
+            signer_entity_id=b"v" * 32,
+            target_block_hash=b"\x11" * 32,
+            target_block_number=10,
+            signed_at_height=999,  # attacker claims a different signing height
+            signature=Signature([], 0, [], b"", b""),
+        )
+        self.assertNotEqual(
+            base._signable_data(), spoofed._signable_data(),
+            "signed_at_height must be committed in the signable bytes "
+            "so the offender cannot spoof it post-hoc.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

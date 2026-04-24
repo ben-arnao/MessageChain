@@ -189,6 +189,7 @@ class TestFinalityMintIndependentOfTreasury(unittest.TestCase):
             signer_entity_id=self.bob.entity_id,
             target_block_hash=b"\x22" * 32,
             target_block_number=1,
+            signed_at_height=1,
             signature=Signature([], 0, [], b"", b""),
         )
         fake = SimpleNamespace(
