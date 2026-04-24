@@ -4,6 +4,70 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] — 2026-04-24
+
+Minor release. Extends the WOTS+ leaf-reuse gate to evidence txs
+and custody proofs so every hot-key-signed tx type enforces the
+same single-use-leaf invariant. Consensus-affecting: block-
+validity rules are stricter and the state-root simulator gains a
+new watermark bump for admitted custody proofs — requires all
+validators to upgrade before producing blocks with the new
+transaction flavors.
+
+### Security
+
+- **Round-4 defense-in-depth: evidence-tx + custody-proof WOTS+
+  leaf-reuse gate.** Previously, every other hot-key-signed tx
+  type (message, transfer, stake, governance, attestation,
+  finality vote, authority) enforced the `leaf_index >=
+  leaf_watermarks[submitter_id]` gate at both per-tx validation
+  and the block-level `_check_leaf` dedupe. Evidence txs
+  (censorship, bogus-rejection, inclusion-list violation,
+  non-response) and custody proofs skipped both gates. A
+  malicious submitter could sign a MessageTx +
+  CensorshipEvidenceTx at the same `leaf_index` in one block (or
+  across blocks) and leak the one-time WOTS+ secret by publishing
+  two signatures under the same private material. Damage stopped
+  at submitter self-compromise — the ratcheted watermark elsewhere
+  keeps the leaked leaf unusable for any future tx — so this was
+  not critical, but closing it here keeps the invariant uniform
+  across tx types and insures against future refactors that could
+  make leaf-leak actually exploitable. The block-level
+  `_check_leaf` loop now iterates evidence txs and custody proofs
+  (hot-key leaf namespace keyed by `submitter_id` / `prover_id`);
+  each evidence validator gains the watermark check;
+  `_apply_archive_rewards` bumps the watermark for every admitted
+  custody-proof prover with an on-chain pubkey; the state-root
+  simulator mirrors the bump so sim and apply stay in lockstep.
+  Custody proofs from hobbyist-archivist provers without on-chain
+  pubkeys are exempt (no prior leaf to collide with). (15d5539)
+
+### Changed
+
+- **Public feed: `refs` spans are now clickable anchors.** Each
+  message card on https://messagechain.org now carries
+  `id="tx-<full_hash>"` so a prev-pointer row can link to its
+  target via URL fragment. When the referenced tx is in the
+  current feed window, the ref span is an `<a href="#tx-<hash>">`
+  that scrolls to and highlights the target card (CSS `:target` +
+  keyframe flash). When the reference points at a tx older than
+  the last LIMIT messages, the link is marked `.missing` (muted
+  color, `pointer-events: none`) so users can see the reference
+  exists but know it's out of view rather than clicking a dead
+  link. README also surfaces `messagechain send --prev <tx_hash>`
+  in the wallet CLI-reference block. (276e294)
+
+### Fixed
+
+- **Test hygiene: deterministic slot-0 proposer in
+  `TestAckForgeryRejected`.** The ack-forgery regression suite
+  added in 1.6.0 gave `self.proposer` and `self.target` equal
+  stake, so the PoS slot-0 election was a coin flip against
+  genesis-timestamp entropy — `test_legitimate_ack_accepted_and_
+  commit_height_honored` flaked ~50% of the time. Proposer stake
+  is now `VALIDATOR_MIN_STAKE * 1000` (vs. target's ×10) so the
+  election is reliably deterministic. No production code change.
+
 ## [1.6.1] — 2026-04-24
 
 Patch release. Fixes the `messagechain upgrade` CLI ordering bug

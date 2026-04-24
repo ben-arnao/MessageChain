@@ -1019,10 +1019,14 @@ class TestAckForgeryRejected(unittest.TestCase):
         register_entity_for_test(self.chain, self.target)
         register_entity_for_test(self.chain, self.client)
         self.chain.supply.balances[self.proposer.entity_id] = (
-            VALIDATOR_MIN_STAKE * 100
+            VALIDATOR_MIN_STAKE * 1000
         )
+        # Proposer stake must dominate target stake so the PoS slot-0
+        # election is deterministic — equal stakes make slot 0 a coin
+        # flip against genesis-timestamp entropy and turn add_block
+        # into a 50/50 flake.
         self.chain.supply.staked[self.proposer.entity_id] = (
-            VALIDATOR_MIN_STAKE * 10
+            VALIDATOR_MIN_STAKE * 1000
         )
         self.chain.supply.staked[self.target.entity_id] = (
             VALIDATOR_MIN_STAKE * 10
