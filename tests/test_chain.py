@@ -157,6 +157,26 @@ class TestBlockchain(unittest.TestCase):
         self.assertIn("registered_entities", info)
         self.assertEqual(info["registered_entities"], 2)
 
+    def test_chain_info_includes_chain_id_and_genesis_hash(self):
+        """Init pre-flight: a fresh validator probes a seed's
+        get_chain_info RPC BEFORE starting the ~90-min WOTS+ keygen,
+        and compares chain_id + genesis_hash against local config to
+        catch MESSAGECHAIN_PROFILE mismatches before a keyfile is
+        built that the chain will reject."""
+        from messagechain.config import CHAIN_ID
+        info = self.chain.get_chain_info()
+        self.assertIn("chain_id", info)
+        self.assertIn("genesis_hash", info)
+        # chain_id is the ASCII decode of config CHAIN_ID -- a
+        # mismatch here means the identity check would spuriously
+        # abort every init that points at this binary.
+        self.assertEqual(info["chain_id"], CHAIN_ID.decode("ascii"))
+        # genesis_hash is the hex block_hash of block[0]; with a
+        # live chain it must be 64-char hex (SHA-256).
+        self.assertIsInstance(info["genesis_hash"], str)
+        self.assertEqual(len(info["genesis_hash"]), 64)
+        int(info["genesis_hash"], 16)  # raises on non-hex
+
     def test_block_serialization_roundtrip(self):
         tx = create_transaction(
             self.alice, "Serialize me",

@@ -406,6 +406,134 @@ def render_rotate_timer() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Chain-identity probe — init pre-flight
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SeedProbeResult:
+    """Outcome of a single seed's get_chain_info RPC probe.
+
+    ``ok=True, mismatch=False`` -> seed is compatible with our local
+    config; safe to proceed with keygen.  ``ok=True, mismatch=True``
+    -> seed is reachable but its chain_id or genesis_hash disagree
+    with ours; abort before wasting a keygen on a chain the operator
+    will be rejected from.  ``ok=False`` -> seed unreachable /
+    malformed response; caller decides whether to try the next seed
+    or warn-and-continue (first validator / air-gapped deploys).
+    """
+    ok: bool
+    host: str
+    port: int
+    chain_id: str = ""
+    genesis_hash: str = ""
+    height: int = 0
+    version: str = ""
+    mismatch: bool = False
+    error: str = ""
+
+
+def probe_seed_chain_identity(
+    host: str, port: int, timeout: float = 5.0,
+) -> SeedProbeResult:
+    """Call ``get_chain_info`` on a seed and return the identity
+    fields.  Never raises; failures are returned as ``ok=False`` so
+    the caller can distinguish "skip this seed" from "abort the
+    init".  Chain-identity mismatch detection is the caller's job
+    (see ``verify_seed_compatible``); this function is pure
+    transport.
+    """
+    try:
+        from client import rpc_call
+    except Exception as e:
+        return SeedProbeResult(
+            ok=False, host=host, port=port,
+            error=f"rpc_call import failed: {e}",
+        )
+
+    try:
+        resp = rpc_call(host, port, "get_chain_info", {})
+    except Exception as e:
+        return SeedProbeResult(
+            ok=False, host=host, port=port,
+            error=f"rpc error: {e}",
+        )
+
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return SeedProbeResult(
+            ok=False, host=host, port=port,
+            error=f"rpc error: {resp.get('error', 'bad response') if isinstance(resp, dict) else 'non-dict response'}",
+        )
+
+    info = resp.get("result") or {}
+    return SeedProbeResult(
+        ok=True,
+        host=host,
+        port=port,
+        chain_id=str(info.get("chain_id", "")),
+        genesis_hash=str(info.get("genesis_hash") or ""),
+        height=int(info.get("height") or 0),
+        version=str(info.get("version", "")),
+    )
+
+
+def verify_seed_compatible(
+    probe: SeedProbeResult,
+    our_chain_id: str,
+    our_genesis_hex: str | None,
+) -> tuple[bool, str]:
+    """Check a successful probe against local config.
+
+    Returns (compatible, operator_message).  ``compatible=False``
+    means the operator's local config disagrees with the seed on
+    either chain_id or (if our side has any chain state) genesis
+    hash.  Message text is written for direct display and includes
+    concrete recovery guidance so a fresh operator can fix the
+    config without reading source.
+
+    If the local node has no chain_db yet (common for a fresh
+    validator mid-init), genesis_hash comparison is skipped and
+    only chain_id is used.  A mismatch on chain_id alone is enough
+    to abort: it's a profile-config error (mainnet vs testnet vs
+    prototype) and cannot be resolved by "just syncing".
+    """
+    if not probe.ok:
+        # Caller should treat probe failure as "skip this seed",
+        # not "incompatible".  Return True with a diagnostic so
+        # compose_verify_report can log the skip reason.
+        return True, f"probe skipped: {probe.error}"
+
+    if probe.chain_id and probe.chain_id != our_chain_id:
+        return False, (
+            f"chain_id mismatch with seed {probe.host}:{probe.port}: "
+            f"seed reports {probe.chain_id!r}, local config is "
+            f"{our_chain_id!r}. Your MESSAGECHAIN_PROFILE env var or "
+            "config_local.py likely targets the wrong network. "
+            "Fix the config BEFORE running init -- a keyfile "
+            "generated for a different chain_id will be rejected by "
+            "every tx on this chain."
+        )
+
+    if (
+        our_genesis_hex
+        and probe.genesis_hash
+        and probe.genesis_hash != our_genesis_hex
+    ):
+        return False, (
+            f"genesis_hash mismatch with seed {probe.host}:{probe.port}: "
+            f"seed={probe.genesis_hash[:16]}..., ours={our_genesis_hex[:16]}... "
+            "This usually means a stale local chain_db from a "
+            "previous testnet / fork.  Wipe the data dir or point "
+            "init at a fresh one, then retry."
+        )
+
+    return True, (
+        f"seed {probe.host}:{probe.port} compatible "
+        f"(chain_id={probe.chain_id}, height={probe.height})"
+    )
+
+
+# ---------------------------------------------------------------------------
 # init command
 # ---------------------------------------------------------------------------
 

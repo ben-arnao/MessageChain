@@ -740,6 +740,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Non-interactive; accept all defaults")
     init_p.add_argument("--print-only", action="store_true",
                         help="Dry-run: print what would happen, write nothing")
+    init_p.add_argument(
+        "--verify-seed", type=str, default=None, metavar="HOST[:PORT]",
+        help="Probe this seed's get_chain_info RPC BEFORE starting "
+             "WOTS+ keygen and abort if its chain_id or genesis_hash "
+             "disagrees with local config -- catches wrong "
+             "MESSAGECHAIN_PROFILE / stale config_local.py before you "
+             "spend ~90 min on a keyfile the chain will reject.  "
+             "PORT defaults to the RPC port (9334).  Without this "
+             "flag, init probes the first reachable entry in "
+             "SEED_NODES; network errors log a warning but do not "
+             "abort (supports air-gapped / first-validator setups).",
+    )
+    init_p.add_argument(
+        "--skip-verify", action="store_true",
+        help="Skip the chain-identity pre-flight probe entirely.  "
+             "Use for the first validator on a new chain (no peers "
+             "to probe) or air-gapped deployments.",
+    )
 
     # --- doctor ---
     doctor_p = sub.add_parser(
@@ -4099,6 +4117,19 @@ def cmd_init(args):
         print(plan.next_steps_text())
         return
 
+    # --- Chain-identity pre-flight ---
+    # Before committing to a ~90-min WOTS+ keygen, verify that at
+    # least one reachable seed is running the same chain (chain_id +
+    # genesis_hash).  Default: probe the first reachable entry in
+    # SEED_NODES, warn-and-continue on network errors, ABORT on a
+    # real mismatch.  --verify-seed overrides the seed list;
+    # --skip-verify bypasses the whole step (first validator /
+    # air-gapped deploys).
+    if not getattr(args, "skip_verify", False):
+        _cmd_init_run_seed_verification(
+            getattr(args, "verify_seed", None),
+        )
+
     from messagechain.config import MERKLE_TREE_HEIGHT
     print("Generating signing key tree (this can take a while at "
           f"MERKLE_TREE_HEIGHT={MERKLE_TREE_HEIGHT})...")
@@ -4106,6 +4137,107 @@ def cmd_init(args):
     _ob.apply_init(plan, progress=progress)
     print()
     print(plan.next_steps_text())
+
+
+def _cmd_init_run_seed_verification(explicit_seed: str | None) -> None:
+    """Probe seeds and abort on a chain-identity mismatch.
+
+    If ``explicit_seed`` is given, probe only that one (HOST or
+    HOST:PORT; PORT defaults to the RPC port) and abort on any
+    problem -- the operator asked for a specific check.
+
+    Otherwise, iterate SEED_NODES and abort on the FIRST reachable
+    seed that reports a mismatch.  Unreachable seeds are logged as
+    warnings and skipped; if every seed is unreachable we warn-and-
+    continue (first-validator / air-gapped scenarios shouldn't be
+    blocked by a cosmetic feature).
+    """
+    from messagechain.runtime import onboarding as _ob
+    from messagechain.config import (
+        CHAIN_ID as _CHAIN_ID,
+        RPC_DEFAULT_PORT,
+        SEED_NODES,
+    )
+
+    our_chain_id = _CHAIN_ID.decode("ascii")
+    # Local genesis hash is unavailable pre-init (no chain_db); the
+    # verify step only compares chain_id in that case.  If a
+    # chain_db already exists (re-running init), the genesis hash
+    # is derivable from it -- but skipping that is fine since the
+    # chain_id check alone catches profile mismatches.
+    our_genesis_hex = None
+
+    def _parse(s: str) -> tuple[str, int]:
+        if ":" in s:
+            h, p = s.rsplit(":", 1)
+            return h, int(p)
+        return s, RPC_DEFAULT_PORT
+
+    def _fail(msg: str) -> None:
+        print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+        print(
+            "  (override with --skip-verify if you know what you're "
+            "doing, e.g. first validator on a new chain)",
+            file=sys.stderr, flush=True,
+        )
+        sys.exit(2)
+
+    if explicit_seed:
+        host, port = _parse(explicit_seed)
+        print(f"==> Probing seed {host}:{port} for chain identity...")
+        probe = _ob.probe_seed_chain_identity(host, port)
+        if not probe.ok:
+            _fail(
+                f"seed {host}:{port} unreachable: {probe.error}. "
+                "Either the seed is down or you have the wrong "
+                "host/port."
+            )
+        ok, msg = _ob.verify_seed_compatible(
+            probe, our_chain_id, our_genesis_hex,
+        )
+        if not ok:
+            _fail(msg)
+        print(f"    OK: {msg}")
+        return
+
+    # Default path: walk SEED_NODES, first reachable wins.
+    if not SEED_NODES:
+        print(
+            "==> SEED_NODES is empty; skipping chain-identity probe. "
+            "If this is the first validator on a new chain, "
+            "continuing is correct.  Otherwise set SEED_NODES in "
+            "config_local.py or pass --verify-seed HOST."
+        )
+        return
+
+    print("==> Probing bootstrap seeds for chain identity...")
+    unreachable = []
+    for host, _p2p_port in SEED_NODES:
+        port = RPC_DEFAULT_PORT
+        probe = _ob.probe_seed_chain_identity(host, port)
+        if not probe.ok:
+            unreachable.append((host, port, probe.error))
+            print(f"    skip {host}:{port}: {probe.error}")
+            continue
+        ok, msg = _ob.verify_seed_compatible(
+            probe, our_chain_id, our_genesis_hex,
+        )
+        if not ok:
+            _fail(msg)
+        print(f"    OK: {msg}")
+        return
+
+    # All seeds unreachable.  Warn, don't block -- this is the
+    # normal case on an air-gapped box or a box without outbound
+    # internet to the GCP IPs.  Operator can re-check with
+    # `messagechain doctor` once the node is up.
+    print(
+        f"==> WARNING: none of the {len(SEED_NODES)} configured "
+        "seeds were reachable; skipping chain-identity verification.",
+        file=sys.stderr,
+    )
+    for host, port, err in unreachable[:3]:
+        print(f"    {host}:{port}: {err}", file=sys.stderr)
 
 
 def cmd_doctor(args):

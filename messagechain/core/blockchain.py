@@ -10353,10 +10353,24 @@ class Blockchain:
         seconds_since_last = (
             int(_time.time() - latest_ts) if latest_ts is not None else None
         )
+        # chain_id + genesis_hash identify WHICH chain this node is
+        # running, independent of how far along it is.  Exposed so a
+        # fresh validator's `messagechain init` can probe a bootstrap
+        # seed BEFORE spending ~90 min on WOTS+ keygen and verify it
+        # will be producing blocks for the chain the operator thinks
+        # they're joining.  Without this pre-flight a misconfigured
+        # MESSAGECHAIN_PROFILE (prototype / testnet / mainnet mismatch)
+        # only surfaces after keygen when txs get rejected.
+        from messagechain.config import CHAIN_ID as _CHAIN_ID
+        genesis_hash_hex = (
+            self.chain[0].block_hash.hex() if self.chain else None
+        )
         return {
+            "chain_id": _CHAIN_ID.decode("ascii"),
+            "genesis_hash": genesis_hash_hex,
             "height": self.height,
             "latest_block_hash": self.chain[-1].block_hash.hex() if self.chain else None,
-            # state_root of the tip — consumed by operators cutting a
+            # state_root of the tip -- consumed by operators cutting a
             # weak-subjectivity checkpoint (see `messagechain cut-checkpoint`).
             # Already derivable from the chain, so no new information is
             # leaked; just saves the caller a full get_block round trip.
