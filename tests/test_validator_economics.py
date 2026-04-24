@@ -232,12 +232,29 @@ class TestBaseFee(unittest.TestCase):
         self.assertGreaterEqual(tracker.base_fee, MIN_FEE)
 
     def test_base_fee_max_change_rate(self):
-        """Base fee changes by at most 1/BASE_FEE_MAX_CHANGE_DENOMINATOR per block."""
+        """Base fee changes by at most 1/BASE_FEE_MAX_CHANGE_DENOMINATOR per block.
+
+        The EIP-1559 invariant |Δbase_fee|/base_fee ≤ 1/DENOMINATOR holds
+        at |excess| ≤ target (i.e. tx_count in [0, 2·target]).  Past
+        2·target the excess/target ratio exceeds 1.0 and the linear
+        delta formula can exceed 1/DENOMINATOR per block — that is not
+        a tested invariant here, since the per-block tx cap
+        (MAX_TXS_PER_BLOCK=45 vs post-Tier-9 target=22) allows
+        excess > target at MAX_TXS.
+        """
+        from messagechain.config import (
+            BLOCK_BYTES_RAISE_HEIGHT, TARGET_BLOCK_SIZE_POST_RAISE,
+        )
         tracker = SupplyTracker()
         tracker.base_fee = 800
         initial = tracker.base_fee
-        # Full block — max upward pressure
-        tracker.update_base_fee(MAX_TXS_PER_BLOCK)
+        # Exercise the invariant at its boundary: 2× target.
+        boundary_tx_count = min(
+            MAX_TXS_PER_BLOCK, 2 * TARGET_BLOCK_SIZE_POST_RAISE,
+        )
+        tracker.update_base_fee(
+            boundary_tx_count, current_height=BLOCK_BYTES_RAISE_HEIGHT,
+        )
         max_increase = initial // BASE_FEE_MAX_CHANGE_DENOMINATOR
         self.assertLessEqual(tracker.base_fee - initial, max_increase + 1)
 

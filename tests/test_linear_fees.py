@@ -48,7 +48,10 @@ class TestLinearFeeConstants(unittest.TestCase):
         self.assertEqual(MAX_MESSAGE_BYTES, MAX_MESSAGE_CHARS)
 
     def test_max_block_message_bytes_raised_to_15000(self):
-        self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 15_000)
+        # Tier 8 raised this 10_000 → 15_000.  Tier 9 subsequently
+        # raised it 15_000 → 45_000 (see test_tier9_throughput); the
+        # Tier-9 value is canonical and monotone-supersedes Tier 8.
+        self.assertEqual(MAX_BLOCK_MESSAGE_BYTES, 45_000)
 
     def test_base_tx_fee_default(self):
         self.assertEqual(BASE_TX_FEE, 10)

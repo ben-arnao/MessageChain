@@ -569,7 +569,7 @@ FEE_PER_BYTE = 3  # legacy per-byte component (pre-FLAT_FEE_HEIGHT only)
 FEE_QUADRATIC_COEFF = 2  # legacy quadratic coeff (pre-FLAT_FEE_HEIGHT only)
 BASE_FEE_INITIAL = 100               # starting base fee (= MIN_FEE)
 BASE_FEE_MAX_CHANGE_DENOMINATOR = 8  # max 12.5% change per block
-TARGET_BLOCK_SIZE = 10                # target txs per block (50% of MAX_TXS_PER_BLOCK)
+TARGET_BLOCK_SIZE = 10                # target txs per block (pre-Tier-9: 50% of legacy MAX_TXS_PER_BLOCK=20)
 MIN_TIP = 1                          # minimum priority tip to proposer
 
 # Timestamp tolerance
@@ -621,16 +621,27 @@ MAX_ACTIVE_PROPOSALS = 500
 # below.  Recovery on the way down is symmetric, so the cap also bounds
 # the post-attack recovery tail.
 MAX_BASE_FEE_MULTIPLIER = 10_000
-MAX_TXS_PER_BLOCK = 20  # max transactions per block (tx count cap)
+MAX_TXS_PER_BLOCK = 45  # max transactions per block (tx count cap)
+# Raised from 20 → 45 at BLOCK_BYTES_RAISE_HEIGHT (Tier 9).  Targets
+# ~24 GB/yr on-disk chain growth at 100-validator saturation.  Per-
+# message cap stays at MAX_MESSAGE_CHARS=1024 — this is a throughput
+# raise, not a message-size raise.  Monotone-safe to bump: pre-fork
+# blocks satisfied total ≤ 20, which trivially still satisfies ≤ 45.
 MAX_TXS_PER_ENTITY_PER_BLOCK = 3  # anti-flooding: max message txs from one sender per block
-MAX_BLOCK_MESSAGE_BYTES = 15_000  # max total message payload bytes per block (byte budget cap)
-# Raised from 10_000 → 15_000 alongside the per-message cap raise at
-# LINEAR_FEE_HEIGHT.  Headroom for occasional long-form posts without
-# fully doubling the per-block bloat ceiling.  Worst-case 14 max-size
-# messages fit; typical short-message traffic (well below cap) is
-# unconstrained.  Monotone-safe to bump: pre-fork blocks satisfied
-# total ≤ 10_000, which trivially still satisfies ≤ 15_000.
-MAX_BLOCK_SIG_COST = 100  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
+MAX_BLOCK_MESSAGE_BYTES = 45_000  # max total message payload bytes per block (byte budget cap)
+# Raised 10_000 → 15_000 at LINEAR_FEE_HEIGHT (Tier 8) alongside the
+# per-message cap raise, then 15_000 → 45_000 at BLOCK_BYTES_RAISE_HEIGHT
+# (Tier 9) to widen the per-block byte budget in step with the tx-count
+# raise.  Bloat discipline is preserved via the simultaneously-raised
+# FEE_PER_STORED_BYTE_POST_RAISE (1 → 3).  Monotone-safe to bump:
+# pre-fork blocks satisfied total ≤ 15_000, which trivially still
+# satisfies ≤ 45_000.
+MAX_BLOCK_SIG_COST = 250  # max signature verification cost per block (1 per tx + 1 proposer + attestations)
+# Raised 100 → 250 at BLOCK_BYTES_RAISE_HEIGHT (Tier 9) to match the
+# MAX_TXS_PER_BLOCK raise — each tx carries a signature verification
+# cost, so the sig-cost ceiling has to widen in proportion.
+# Monotone-safe to bump: pre-fork blocks satisfied cost ≤ 100, which
+# trivially still satisfies ≤ 250.
 # COINBASE_MATURITY must cover the worst-case un-finalized window or a
 # reorg can double-spend a coinbase that the honest chain never minted.
 # Math: MAX_REORG_DEPTH = 100 caps explicit reorg, but finality lands
@@ -2958,6 +2969,57 @@ assert LINEAR_FEE_HEIGHT > FLAT_FEE_HEIGHT, (
     "LINEAR_FEE_HEIGHT) still apply MIN_FEE_POST_FLAT during replay"
 )
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 9 — throughput raise (wider per-block budgets)
+# ─────────────────────────────────────────────────────────────────────
+# At/after BLOCK_BYTES_RAISE_HEIGHT the per-block throughput budgets
+# widen: MAX_TXS_PER_BLOCK 20 → 45, MAX_BLOCK_MESSAGE_BYTES 15k → 45k,
+# MAX_BLOCK_SIG_COST 100 → 250.  The constants above already carry the
+# post-fork values (they are monotone-safe bumps — pre-fork blocks
+# satisfied stricter bounds that trivially still satisfy the looser
+# ones).  This section carries the height-gated knobs that DO change
+# consensus-visible behavior with the fork:
+#
+#   * FEE_PER_STORED_BYTE_POST_RAISE — per-byte fee floor rises 1 → 3,
+#     preserving bloat discipline under the wider cap.  Without this,
+#     a 3× per-block byte budget at a flat 1/byte floor would let a
+#     block carry ~3× more permanent-state bytes at the same floor
+#     price.
+#   * TARGET_BLOCK_SIZE_POST_RAISE — EIP-1559 target climbs 10 → 22,
+#     tracking ~50% of the new MAX_TXS_PER_BLOCK=45.  Without this the
+#     base fee would saturate upward permanently at the old 10-tx
+#     target once the network fills beyond 10 txs/block.
+#
+# Per-message cap stays at MAX_MESSAGE_CHARS=1024 — this is a
+# THROUGHPUT raise, not a message-size raise.
+#
+# Ordering:
+#   * BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT — the linear fee
+#     formula must be active when the per-byte rate multiplies, since
+#     the post-raise branch reads BASE_TX_FEE and the post-raise
+#     per-byte rate.
+BLOCK_BYTES_RAISE_HEIGHT = 102_000       # Tier 9
+FEE_PER_STORED_BYTE_POST_RAISE = 3       # 3× Tier 8 floor — preserves bloat discipline under wider cap
+TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (was 10, 50% of 20)
+
+assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
+    "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
+    "throughput raise rides on top of the linear fee formula; pre-"
+    "linear heights still replay under the legacy flat / quadratic "
+    "rules and do not see the post-raise per-byte rate"
+)
+assert FEE_PER_STORED_BYTE_POST_RAISE > FEE_PER_STORED_BYTE, (
+    "FEE_PER_STORED_BYTE_POST_RAISE must raise (not lower) the per-byte "
+    "floor — lowering it under a wider cap is the bloat-discipline "
+    "failure mode the Tier 9 fork is designed to prevent"
+)
+assert TARGET_BLOCK_SIZE_POST_RAISE < MAX_TXS_PER_BLOCK, (
+    "TARGET_BLOCK_SIZE_POST_RAISE must fit under the new MAX_TXS_PER_BLOCK "
+    "cap — a target at or above the cap means the EIP-1559 controller "
+    "can never see 'above-target' blocks and base fee only ever drops"
+)
+
 # ─────────────────────────────────────────────────────────────────────
 # Fork-schedule ordering invariants (load-time asserts)
 # ─────────────────────────────────────────────────────────────────────
@@ -3019,6 +3081,7 @@ for _fork_name, _fork_height in (
     ("VALIDATOR_REGISTRATION_BURN_HEIGHT", VALIDATOR_REGISTRATION_BURN_HEIGHT),
     ("FLAT_FEE_HEIGHT", FLAT_FEE_HEIGHT),
     ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
+    ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "

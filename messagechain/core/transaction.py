@@ -20,6 +20,7 @@ from messagechain.config import (
     SIG_VERSION_CURRENT, FEE_INCLUDES_SIGNATURE_HEIGHT,
     TX_SERIALIZATION_VERSION, validate_tx_serialization_version,
     BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT,
+    BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
 )
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
@@ -311,7 +312,17 @@ def calculate_min_fee(
 ) -> int:
     """Calculate the minimum fee floor a tx must pay to be admitted.
 
-    At/after LINEAR_FEE_HEIGHT: linear-in-stored-bytes formula:
+    At/after BLOCK_BYTES_RAISE_HEIGHT (Tier 9): same linear formula as
+    Tier 8, but with the raised per-byte rate:
+
+        fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(message_bytes)
+
+    The per-byte rate triples (1 → 3) in step with the per-block byte
+    budget widening (15k → 45k) so bloat discipline scales with the
+    wider cap.
+
+    [LINEAR_FEE_HEIGHT, BLOCK_BYTES_RAISE_HEIGHT): linear-in-stored-
+    bytes formula at the Tier 8 rate:
 
         fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
 
@@ -338,6 +349,8 @@ def calculate_min_fee(
     FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
     payload).
     """
+    if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
+        return BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(message_bytes)
     if current_height is not None and current_height >= LINEAR_FEE_HEIGHT:
         return BASE_TX_FEE + FEE_PER_STORED_BYTE * len(message_bytes)
     if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
