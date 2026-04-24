@@ -4,6 +4,44 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-04-24
+
+Minor release — two sequential hard forks activate inside the bootstrap
+window. Coordinated validator-binary upgrade required before the first
+activation height (100,000). Current tip is well below the activation
+window; operators have ample runway to roll the upgrade.
+
+### Added
+
+- **Tier 8 (`LINEAR_FEE_HEIGHT = 100_000`)** — retires the flat per-tx
+  floor in favor of a linear-in-stored-bytes formula
+  `fee_floor = BASE_TX_FEE + FEE_PER_STORED_BYTE * len(stored)`.
+  Longer messages pay proportionally for the bytes they pin to
+  permanent state. Pre-fork replay paths (flat floor, legacy
+  quadratic) keep their semantics so historical blocks validate
+  unchanged.
+- **Tier 8 cap raises** — `MAX_MESSAGE_CHARS` 280 → 1024 (short-post
+  scale, not document scale) and `MAX_BLOCK_MESSAGE_BYTES`
+  10,000 → 15,000.
+- **Tier 9 (`BLOCK_BYTES_RAISE_HEIGHT = 102_000`)** — per-block
+  throughput raise: `MAX_BLOCK_MESSAGE_BYTES` 15,000 → 45,000,
+  `MAX_TXS_PER_BLOCK` 20 → 45, `MAX_BLOCK_SIG_COST` 100 → 250.
+  Per-message cap unchanged. Targets ~24 GB/yr on-disk chain growth
+  at 100-validator saturation. Attestation overhead dominates total
+  size at that scale; future ceiling raises live in a sig-aggregation
+  fork, not in byte caps.
+- **Tier 9 economic retune** — `FEE_PER_STORED_BYTE` 1 → 3 at fork
+  height (preserves bloat discipline under the wider byte budget);
+  `TARGET_BLOCK_SIZE` 10 → 22 at fork height (~50% of the new
+  `MAX_TXS_PER_BLOCK` for EIP-1559 base-fee targeting).
+
+### Operator action required
+
+- All honest validators must run 1.1.0 (or later) before block
+  height 100,000. An older binary past that height will reject
+  valid post-fork blocks and halt — losing its slot and bleeding
+  stake to inactivity penalties until upgraded.
+
 ## [1.0.2] — 2026-04-23
 
 Patch release — ship validator-2 in the default seed list so fresh
