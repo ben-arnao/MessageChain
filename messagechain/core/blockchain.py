@@ -10169,17 +10169,28 @@ class Blockchain:
         }
 
     def get_recent_messages(self, count: int) -> list[dict]:
-        """Get the most recent messages from the chain, newest first."""
+        """Get the most recent messages from the chain, newest first.
+
+        Each entry includes an optional `prev` field (hex tx_hash of a
+        prior message this one references, Tier 10 single-linked-list
+        feature).  `prev` is omitted for pre-fork txs and for post-fork
+        txs that don't carry a pointer — clients should treat its
+        absence as "no predecessor."
+        """
         messages = []
         for block in reversed(self.chain):
             for tx in reversed(block.transactions):
-                messages.append({
+                entry = {
                     "message": tx.plaintext.decode("utf-8", errors="replace"),
                     "entity_id": tx.entity_id.hex(),
                     "timestamp": tx.timestamp,
                     "tx_hash": tx.tx_hash.hex(),
                     "block_number": block.header.block_number,
-                })
+                }
+                prev = getattr(tx, "prev", None)
+                if prev is not None:
+                    entry["prev"] = prev.hex()
+                messages.append(entry)
                 if len(messages) >= count:
                     return messages
         return messages

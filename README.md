@@ -66,12 +66,22 @@ chain state the moment someone sends you a transfer.
 ```bash
 messagechain send "hello world"                 # auto-priced (default)
 messagechain send "hello world" --fee 500       # pay a specific amount
+messagechain send "reply" --prev <tx_hash_hex>  # reference a prior message
 messagechain estimate-fee --message "hello world"   # preview cost
 ```
 
 Your first outgoing transaction reveals your public key on-chain
 (the "first-spend pubkey install" path). After that, every
 subsequent transaction is verified against the installed key.
+
+The optional `--prev` flag attaches a 32-byte pointer to a prior
+on-chain message (by its `tx_hash`), forming a single-linked list —
+protocol-agnostic: apps can render this as a reply thread, a chained
+long-form document, a citation, etc. The referenced tx must already
+be on-chain in a strictly earlier block. The pointer adds 33 bytes
+to the fee basis but does NOT count against the 1024-char message
+cap, so you keep the full text budget. (Activates at
+`PREV_POINTER_HEIGHT`.)
 
 ### 4. Read messages back
 

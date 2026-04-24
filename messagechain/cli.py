@@ -135,6 +135,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--server", type=str, default=None,
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
+    send.add_argument(
+        "--prev", type=str, default=None, metavar="TX_HASH",
+        help=(
+            "Optional 64-hex-char tx_hash this message references as "
+            "its predecessor (reply, chained document, citation, etc). "
+            "The referenced tx must already be on-chain in a strictly "
+            "earlier block. Adds 33 bytes to the fee basis; does not "
+            "count against the 1024-char cap. Activates at "
+            "PREV_POINTER_HEIGHT."
+        ),
+    )
 
     # --- send-multi ---
     send_multi = sub.add_parser(
@@ -1562,11 +1573,32 @@ def cmd_send(args):
         leaf = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(leaf)
 
+    # Parse the optional --prev pointer before we burn a WOTS+ leaf on
+    # signing.  Server will re-validate strict-prev against chain state;
+    # catching malformed input here avoids a doomed sign + reject round.
+    prev_bytes_arg: bytes | None = None
+    if getattr(args, "prev", None):
+        prev_hex = args.prev.strip()
+        if len(prev_hex) != 64:
+            print(
+                f"Error: --prev must be exactly 64 hex chars "
+                f"(got {len(prev_hex)})."
+            )
+            sys.exit(1)
+        try:
+            prev_bytes_arg = bytes.fromhex(prev_hex)
+        except ValueError:
+            print("Error: --prev is not valid hex.")
+            sys.exit(1)
+
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
     # always take max(local_min, server_suggestion) to avoid silently
     # submitting a tx the chain will reject.
-    from messagechain.core.transaction import calculate_min_fee
+    from messagechain.core.transaction import (
+        calculate_min_fee,
+        PREV_POINTER_STORED_BYTES,
+    )
     from messagechain.core.compression import encode_payload
     from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT
     # Fee is charged on the canonical stored size - compute locally so
@@ -1590,6 +1622,9 @@ def cmd_send(args):
     # dissident submissions get rejected client-side even though the
     # chain would accept them.
     target_height = tip_height + 1
+    prev_overhead = (
+        PREV_POINTER_STORED_BYTES if prev_bytes_arg is not None else 0
+    )
     if target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
         # Signature size is deterministic for the scheme parameters baked
         # into the keypair, so compute it without actually signing (a
@@ -1599,10 +1634,13 @@ def cmd_send(args):
             stored_bytes,
             signature_bytes=sig_bytes_len,
             current_height=target_height,
+            prev_bytes=prev_overhead,
         )
     else:
         local_min = calculate_min_fee(
-            stored_bytes, current_height=target_height,
+            stored_bytes,
+            current_height=target_height,
+            prev_bytes=prev_overhead,
         )
     fee = args.fee
     if fee is None:
@@ -1623,7 +1661,11 @@ def cmd_send(args):
         print(f"Fee: {fee} tokens")
 
     # Create, sign, submit
-    tx = create_transaction(entity, message, fee=fee, nonce=nonce)
+    tx = create_transaction(
+        entity, message, fee=fee, nonce=nonce, prev=prev_bytes_arg,
+    )
+    if prev_bytes_arg is not None:
+        print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
     print("Submitting...")
 
     response = rpc_call(host, port, "submit_transaction", {

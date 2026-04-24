@@ -85,6 +85,21 @@
     word-wrap: break-word;
     font-size: 0.95rem;
   }
+  .msg .prev {
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    margin-bottom: 0.3rem;
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+  .msg .prev .arrow { color: var(--accent); }
+  .msg .prev .ref {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .msg.empty {
     text-align: center;
     color: var(--muted);
@@ -149,10 +164,27 @@
     right.textContent = "block " + m.block_number + " · " + formatTs(m.timestamp);
     meta.appendChild(entity);
     meta.appendChild(right);
+    card.appendChild(meta);
+    // Optional `prev` ref: the Tier 10 pointer to a prior message.
+    // Absence means "no predecessor" — render nothing, keep layout
+    // identical to pre-fork cards.
+    if (m.prev) {
+      const prevRow = document.createElement("div");
+      prevRow.className = "prev";
+      const arrow = document.createElement("span");
+      arrow.className = "arrow";
+      arrow.textContent = "↳";
+      const ref = document.createElement("span");
+      ref.className = "ref";
+      ref.textContent = "refs " + shortHex(m.prev, 10, 6);
+      ref.title = m.prev;
+      prevRow.appendChild(arrow);
+      prevRow.appendChild(ref);
+      card.appendChild(prevRow);
+    }
     const text = document.createElement("div");
     text.className = "text";
     text.textContent = m.message;
-    card.appendChild(meta);
     card.appendChild(text);
     return card;
   }

@@ -348,6 +348,45 @@ class TestPrevPointerDoesNotEatTextBudget(unittest.TestCase):
         self.assertEqual(tx.prev, b"\xbb" * 32)
 
 
+class TestGetRecentMessagesIncludesPrev(unittest.TestCase):
+    """Public feed JSON surfaces `prev` when set, omits when not."""
+
+    def setUp(self):
+        self.entity = Entity.create(
+            b"feed-prev-test-seed-padded-to-32b!!!!"
+        )
+
+    def _emit_entry(self, tx) -> dict:
+        """Mirror of Blockchain.get_recent_messages' dict-emission shape."""
+        entry = {
+            "message": tx.plaintext.decode("utf-8", errors="replace"),
+            "entity_id": tx.entity_id.hex(),
+            "timestamp": tx.timestamp,
+            "tx_hash": tx.tx_hash.hex(),
+            "block_number": 1,
+        }
+        prev = getattr(tx, "prev", None)
+        if prev is not None:
+            entry["prev"] = prev.hex()
+        return entry
+
+    def test_omits_prev_for_version_1_tx(self):
+        tx = create_transaction(self.entity, "hi", fee=1000, nonce=0)
+        self.assertEqual(tx.version, 1)
+        self.assertIsNone(getattr(tx, "prev", None))
+        entry = self._emit_entry(tx)
+        self.assertNotIn("prev", entry)
+
+    def test_includes_prev_for_version_2_tx(self):
+        prev_hash = b"\xbc" * 32
+        tx = create_transaction(
+            self.entity, "reply", fee=10_000, nonce=0,
+            current_height=PREV_POINTER_HEIGHT, prev=prev_hash,
+        )
+        entry = self._emit_entry(tx)
+        self.assertEqual(entry["prev"], prev_hash.hex())
+
+
 class TestTxLocationsIndex(unittest.TestCase):
     """ChainDB's tx_locations index powers O(1) strict-prev resolution."""
 
