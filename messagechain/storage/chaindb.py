@@ -189,6 +189,24 @@ class ChainDB:
 
         rebuilt = Blockchain(db=scratch_db)
 
+        # Pre-seed entity-index mappings from the v1 DB so compact
+        # entity-refs in post-genesis blocks can be decoded before
+        # the replay loop walks the registrations.  Without this,
+        # `get_block_by_number` at the first height that references
+        # a non-genesis entity by index raises
+        # `entity ref uses unknown index N (state lacks mapping)`
+        # and the whole migration aborts — because `rebuilt` is a
+        # fresh Blockchain pointed at a scratch DB, so its maps
+        # start empty while the on-disk `entity_indices` table is
+        # fully populated.
+        persisted_indices = self.get_all_entity_indices()
+        if persisted_indices:
+            rebuilt.entity_id_to_index = dict(persisted_indices)
+            rebuilt.entity_index_to_id = {
+                idx: eid for eid, idx in persisted_indices.items()
+            }
+            rebuilt._next_entity_index = max(persisted_indices.values()) + 1
+
         # Copy v1 state (balances, staked, etc.) into `rebuilt` so
         # block replay starts from the live state.  Simpler: just
         # replay every block from 0.
