@@ -3251,6 +3251,19 @@ class Server(SharedRuntimeMixin):
             existing = self.peers.get(addr)
             if existing is not None and existing.is_connected:
                 continue
+            # If an inbound peer is already handshook and advertises
+            # this exact (host, listen_port), the seed is already
+            # reachable via that session. Re-dialing just burns a
+            # TLS handshake and gets closed by entity-level dedup
+            # 30 seconds later — avoid the churn.
+            if any(
+                p.is_connected
+                and p.entity_id
+                and p.host == host
+                and p.advertised_port == port
+                for p in self.peers.values()
+            ):
+                continue
             if self.ban_manager.is_banned(addr):
                 continue
             t = asyncio.create_task(self._connect_to_peer(host, port))
@@ -3354,6 +3367,18 @@ class Server(SharedRuntimeMixin):
             # path; this field is observability-only.
             peer.peer_height = peer_height
             peer.peer_version = str(msg.payload.get("version", "") or "unknown")
+            # Remember the remote's advertised listen port so the
+            # maintenance loop can match this session against a seed
+            # entry at (peer.host, advertised_port). Without this,
+            # an inbound peer looks like "something at an ephemeral
+            # source port" to the seed-dial scan and the maintenance
+            # tick re-dials the listen port every interval — each
+            # redial completing handshake just to get closed by the
+            # entity-level dedup. Validate before storing so a
+            # misbehaving peer can't poison the maintenance scan.
+            advertised = msg.payload.get("port")
+            if isinstance(advertised, int) and 0 < advertised < 65536:
+                peer.advertised_port = advertised
             self.peers[peer.address] = peer
             # Entity-level dedup: when two validators dial each other
             # simultaneously, each ends up with both an inbound and an
