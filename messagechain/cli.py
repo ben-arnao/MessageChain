@@ -1051,38 +1051,98 @@ def _recv_n(sock, n: int) -> bytes:
     return buf
 
 
+def _format_eta_seconds(seconds: float) -> str:
+    """Format a duration in seconds as a human-friendly ETA.
+
+    Kept tiny and deterministic so the progress reporter's output is
+    easy to eyeball (``1h23m`` / ``15m42s`` / ``8s``) and the
+    accompanying unit tests can assert the exact shape.  Negative or
+    infinite inputs map to ``"?"`` -- they only show up in the
+    first fraction of a second when rate hasn't stabilized yet.
+    """
+    import math as _math
+    # Catches NaN, +/-inf, negatives, and sub-second values that
+    # would round to "0s" and look broken next to a multi-hour job.
+    if not _math.isfinite(seconds) or seconds < 1:
+        return "?"
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    return f"{hours}h{minutes:02d}m"
+
+
 def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
     """Build a progress callback for KeyPair generation.
 
-    At production tree height (20 = 1M leaves), keygen takes a long time.
-    Without feedback, users kill the process thinking it hung. This
-    callback prints a single-line progress percentage to stderr roughly
-    every 5% so the output is readable but not spammy. Returns None if
-    the tree is small enough that progress is unnecessary.
+    At production tree height (20 = 1M leaves), keygen takes 90+
+    minutes on a typical VM.  Without feedback operators kill the
+    process thinking it hung; with coarse 5% ticks they still see
+    ~5 min of silence at startup and have no way to estimate total
+    runtime on their hardware.
+
+    This reporter prints a single self-overwriting line to stderr
+    with percent, leaves done, current rate (leaves/sec), and a
+    running ETA.  Cadence:
+      * first tick at leaf 1 (confirms keygen kicked off)
+      * 1% increments until 5% (dense early feedback when the
+        operator is most anxious)
+      * 5% increments after (~20 total updates across the run)
+      * forced final tick at 100% followed by a newline
+
+    Returns None if the tree is small enough that progress is
+    noise (tests, prototype profile) -- the printing overhead
+    would dwarf the keygen itself.
     """
-    # Skip for small trees (tests, small configs) - the overhead of
+    # Skip for small trees (tests, small configs): the overhead of
     # printing exceeds the wait time.
     if total_leaves < 4096:
         return None
 
-    # Throttle to ~20 updates total
-    step = max(1, total_leaves // 20)
-    state = {"next": step, "done": 0}
+    import time as _time
+    # 1% and 5% step sizes; each path gates one cadence regime.
+    step_early = max(1, total_leaves // 100)   # 1% increments
+    step_steady = max(1, total_leaves // 20)   # 5% increments
+    # "next" starts at 1 so the operator sees a ping as soon as
+    # the first leaf finishes -- this is the biggest anxiety
+    # reducer; first tick arrives within seconds even on a weak VM.
+    state = {"next": 1, "done": 0, "start": _time.monotonic()}
 
     def report(_leaf_index: int):
         state["done"] += 1
         done = state["done"]
-        if done >= state["next"] or done == total_leaves:
-            pct = int(100 * done / total_leaves)
-            print(
-                f"\r{label}: {pct}% ({done:,}/{total_leaves:,} leaves)",
-                end="",
-                file=sys.stderr,
-                flush=True,
-            )
-            state["next"] += step
-            if done == total_leaves:
-                print("", file=sys.stderr)  # newline after final update
+        if done < state["next"] and done != total_leaves:
+            return
+
+        elapsed = _time.monotonic() - state["start"]
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remaining = total_leaves - done
+        eta_sec = remaining / rate if rate > 0 else float("inf")
+        pct = 100.0 * done / total_leaves
+
+        # Trailing spaces pad over the previous line in case a
+        # longer ETA string ("1h02m") was overwritten by a shorter
+        # one ("8s"); without this the stale tail lingers on screen.
+        print(
+            f"\r{label}: {pct:5.1f}% "
+            f"({done:,}/{total_leaves:,} leaves) "
+            f"[{rate:.0f}/s, ETA {_format_eta_seconds(eta_sec)}]     ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # Cadence switch at 5%: dense early, steady after.
+        if pct < 5:
+            state["next"] = done + step_early
+        else:
+            state["next"] = done + step_steady
+
+        if done == total_leaves:
+            print("", file=sys.stderr)  # newline after final update
 
     return report
 
