@@ -3780,7 +3780,11 @@ def cmd_init(args):
         print(plan.next_steps_text())
         return
 
-    _ob.apply_init(plan)
+    from messagechain.config import MERKLE_TREE_HEIGHT
+    print("Generating signing key tree (this can take a while at "
+          f"MERKLE_TREE_HEIGHT={MERKLE_TREE_HEIGHT})...")
+    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
+    _ob.apply_init(plan, progress=progress)
     print()
     print(plan.next_steps_text())
 

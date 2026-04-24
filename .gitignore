@@ -9,3 +9,6 @@ deploy/
 tools/
 .claude/
 *.egg-info/
+_test_*.txt
+onboard.toml
+.messagechain/

@@ -154,10 +154,20 @@ def config_get(key: str, path: str | None = None) -> object:
 
 
 def config_set(key: str, value, path: str | None = None) -> str:
-    """Persist a single key. Returns the file path written to."""
+    """Persist a single key. Returns the file path written to.
+
+    Path resolution for first-write cases: explicit path > env var >
+    already-existing config file > role-based default.
+    """
     if key not in _ALLOWED_CONFIG_KEYS:
         raise KeyError(f"Unknown onboard config key: {key}")
-    resolved = path or resolve_onboard_config_path() or default_onboard_config_path()
+    env_path = os.environ.get(ENV_ONBOARD_CONFIG)
+    resolved = (
+        path
+        or env_path
+        or resolve_onboard_config_path()
+        or default_onboard_config_path()
+    )
     cfg = read_onboard_config(resolved)
     # Normalize booleans from CLI-supplied strings.
     if key in ("auto_upgrade", "auto_rotate"):
@@ -410,7 +420,11 @@ def plan_init(
     ocfg = onboard_config_path or default_onboard_config_path()
     sm = systemd if systemd is not None else _is_root()
 
-    # Resolve/derive entity_id: either read an existing keyfile or use key_override.
+    # Resolve the private-key source but DO NOT build the WOTS+ tree here.
+    # Entity.create at production MERKLE_TREE_HEIGHT=20 is a multi-hour
+    # keygen; plan_init must stay cheap so --print-only and unit tests
+    # run in milliseconds. The tree is built once in apply_init with a
+    # progress reporter.
     entity_hex = ""
     keyfile_exists = os.path.exists(kf)
     pk_bytes: bytes | None = None
@@ -423,10 +437,10 @@ def plan_init(
             pk_bytes = None
     elif key_override is not None:
         pk_bytes = key_override
-    else:
-        pk_bytes = generate_new_private_key()
 
-    if pk_bytes is not None:
+    # Only derive entity_id here when a caller passed key_override
+    # (unit tests, which pin MERKLE_TREE_HEIGHT=4 via conftest).
+    if pk_bytes is not None and key_override is not None:
         try:
             from messagechain.identity.identity import Entity
             entity = Entity.create(pk_bytes)
@@ -461,32 +475,45 @@ def apply_init(
     plan: InitPlan,
     *,
     key_override: bytes | None = None,
+    build_tree: bool = True,
+    progress=None,
 ) -> None:
-    """Perform disk writes for a plan. Idempotent where safe."""
+    """Perform disk writes for a plan. Idempotent where safe.
+
+    With build_tree=True (default), the WOTS+ Merkle tree is built so
+    entity_id_hex can be derived and baked into the systemd unit's
+    --wallet flag. At production MERKLE_TREE_HEIGHT=20 this is a
+    multi-hour operation — pass a progress reporter from the CLI so
+    operators see motion. Callers that only need the scaffolding (tests,
+    --print-only via a different code path) pass build_tree=False.
+    """
     os.makedirs(plan.data_dir, exist_ok=True)
 
     if not plan.keyfile_exists:
         pk = key_override if key_override is not None else generate_new_private_key()
         write_keyfile(plan.keyfile, pk)
-        # Refresh the entity hex from the key we just wrote, in case
-        # plan.entity_id_hex was computed from a different byte-sequence.
-        try:
-            from messagechain.identity.identity import Entity
-            plan.entity_id_hex = Entity.create(pk).entity_id_hex
-        except Exception:
-            pass
     else:
-        # Verify we can read it; don't overwrite.
         try:
             from messagechain.identity.key_encoding import decode_private_key
             with open(plan.keyfile, "r") as f:
-                _ = decode_private_key(f.read())
+                pk = decode_private_key(f.read())
         except Exception as e:
             raise RuntimeError(
                 f"Existing keyfile at {plan.keyfile} cannot be decoded: {e}"
             )
 
-    # Persist onboard config.
+    if build_tree and not plan.entity_id_hex:
+        try:
+            from messagechain.identity.identity import Entity
+            entity = Entity.create(pk, progress=progress) if progress else Entity.create(pk)
+            plan.entity_id_hex = entity.entity_id_hex
+            if plan.systemd and plan.systemd_units:
+                plan.systemd_units[VALIDATOR_UNIT_PATH] = render_validator_unit(
+                    plan.entity_id_hex, plan.keyfile, plan.data_dir,
+                )
+        except Exception:
+            pass
+
     write_onboard_config(plan.onboard_config, {
         "auto_upgrade": plan.auto_upgrade,
         "auto_rotate": plan.auto_rotate,
@@ -495,7 +522,6 @@ def apply_init(
         "entity_id_hex": plan.entity_id_hex,
     })
 
-    # Write systemd units if requested.
     if plan.systemd:
         for path, body in plan.systemd_units.items():
             parent = os.path.dirname(path)
@@ -538,7 +564,8 @@ def _check_data_dir(data_dir: str) -> CheckResult:
     if not data_dir:
         return CheckResult(1, "data-dir", "unset")
     if not os.path.exists(data_dir):
-        return CheckResult(2, "data-dir", "missing", data_dir)
+        return CheckResult(2, "data-dir", "missing",
+                           f"{data_dir} -- run `messagechain init` first")
     if not os.access(data_dir, os.W_OK):
         return CheckResult(2, "data-dir", "not writable", data_dir)
     return CheckResult(0, "data-dir", data_dir)
@@ -548,7 +575,8 @@ def _check_keyfile(keyfile: str) -> CheckResult:
     if not keyfile:
         return CheckResult(1, "keyfile", "unset")
     if not os.path.exists(keyfile):
-        return CheckResult(2, "keyfile", "missing", keyfile)
+        return CheckResult(2, "keyfile", "missing",
+                           f"{keyfile} -- run `messagechain init` or `generate-key`")
     try:
         st = os.stat(keyfile)
     except OSError as e:
