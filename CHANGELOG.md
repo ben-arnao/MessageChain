@@ -4,6 +4,27 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] — 2026-04-24
+
+Patch release — P2P handshake symmetry for peer observability.
+
+### Fixed
+
+- The inbound side of the P2P handshake now echoes its own `HANDSHAKE`
+  back to the dialer, so the dialer's `Peer` record populates with the
+  peer's `entity_id`, `chain_height`, and `version`. Before this,
+  outbound peers on `messagechain peers` output showed `Entity: (none)`,
+  `Height: 0`, and `Version: unknown` indefinitely. Chain sync was
+  unaffected (it runs off the inbound path) — this was an observability
+  fix, not a liveness fix. Applied to both the `Server` runtime
+  (`server.py`) and the `Node` class (`messagechain/network/node.py`).
+
+### Added
+
+- `Peer.handshake_sent` flag (`messagechain/network/peer.py`) — guards
+  the new echo against re-firing on a reconnecting peer and is set on
+  outbound at dial time for symmetry.
+
 ## [1.3.0] — 2026-04-24
 
 Minor release — fork-skew halt semantics. An out-of-date binary now
