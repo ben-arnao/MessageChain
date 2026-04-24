@@ -4,6 +4,49 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] — 2026-04-24
+
+Minor release — validator operator onboarding automation plus a P2P
+security hardening. No consensus changes.
+
+### Added
+
+- **Validator onboarding pack**: `messagechain init` / `doctor` /
+  `config` / `rotate-if-needed` CLI surface, plus
+  `scripts/install-validator.sh` for a one-command fresh-host install.
+  Covers keyfile + hot-key generation, systemd unit install, seed
+  configuration, reachability checks, and routine key rotation.
+  (32ddfa7, bb1a91d, adc80b7, 7ee590e)
+- **CLI reference** documents the full onboarding surface
+  (`init`, `doctor`, `config`, `upgrade`, `rotate-if-needed`). (7ee590e)
+
+### Security
+
+- P2P handshake now gates on `CHAIN_ID` in addition to `genesis_hash`
+  (defense-in-depth — an attacker flipping either field is rejected
+  before the handshake completes). (35c7f7f)
+
+### Fixed
+
+- `install-validator.sh` clones the repo as root then chowns to the
+  `messagechain` user, instead of attempting the clone as the
+  unprivileged user against a root-owned target. (51ddf29)
+- `init` now chowns `/etc/messagechain/*` to the `messagechain` user
+  after writing, so the service user can read its own config. (6bd1445)
+- Escape backticks in `install-validator.sh` progress echo so shell
+  expansion doesn't garble output on some terminals. (1da5c30)
+- `upgrade` runs as root end-to-end (fixes file-permission failures on
+  validator hosts); `rotate` accepts `--yes` to skip the interactive
+  prompt for automation; defer WOTS+ Merkle tree build during `init`
+  so onboarding doesn't block on key derivation; env-scoped config
+  lookup in `doctor` with actionable hint text. (91fbc0a, e3e9fcd)
+- Drop duplicate `test_upgrade_command.py` left over after rebase. (8ce0ad7)
+
+### Tests
+
+- Cover `init`, `doctor`, `upgrade`, `rotate`, seeds, reachability,
+  and config commands end-to-end. (bb1a91d)
+
 ## [1.4.0] — 2026-04-24
 
 Minor release — **consensus-breaking hard fork**. Pulls the Tier 8
