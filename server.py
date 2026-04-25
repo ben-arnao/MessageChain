@@ -1589,7 +1589,15 @@ class Server(SharedRuntimeMixin):
             entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
             if entity_id is None:
                 return {"ok": False, "error": "Invalid entity_id (must be 32 bytes hex)"}
-            nonce = self.blockchain.nonces.get(entity_id, 0)
+            # Use the mempool-aware computation so consecutive client
+            # submissions don't collide with their own still-pending txs.
+            # Submission validation gates on _get_pending_nonce_all_pools
+            # too (see _rpc_submit_transaction / _rpc_stake / _rpc_unstake),
+            # so this RPC must agree — otherwise a client that fetches
+            # the chain-only nonce, signs, and submits while a prior tx
+            # is still in mempool gets "Invalid nonce: expected N+1, got N"
+            # rejections that only clear when the pending tx lands.
+            nonce = self._get_pending_nonce_all_pools(entity_id)
             watermark = self.blockchain.get_leaf_watermark(entity_id)
             # Return both together so clients only need one roundtrip to
             # safely position their WOTS+ keypair before signing. The
