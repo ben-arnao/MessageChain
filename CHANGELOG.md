@@ -4,6 +4,22 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.6] — 2026-04-25
+
+Patch release. Adds an outbound-click redirect on the public feed
+viewer so operators can count how many people click through to the
+GitHub repo from `https://messagechain.org`. Cosmetic; no protocol
+or consensus impact.
+
+### Added
+
+- **`GET /gh` on `PublicFeedServer`** — 302 redirect to
+  `https://github.com/ben-arnao/MessageChain`. The homepage's
+  `<a>github</a>` link now points here instead of straight at
+  GitHub, so each click lands in the Caddy access log under a path
+  the `mc-feed-stats` script can grep for and report alongside the
+  feed-viewer headcount.
+
 ## [1.7.5] — 2026-04-25
 
 Patch release. Closes the mempool-sweep gap that prevented
