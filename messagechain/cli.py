@@ -391,6 +391,19 @@ def build_parser() -> argparse.ArgumentParser:
              "broadcasting. Pair with --root and --entity-id for an "
              "air-gapped sign-on-cold, broadcast-on-hot workflow.",
     )
+    set_root.add_argument(
+        "--cold-leaf", type=int, default=0, metavar="N",
+        help="WOTS+ leaf index to sign with on the cold key. Default 0 "
+             "(first ever use). Each cold-key signing burns one leaf, "
+             "and signing two different messages with the same leaf is "
+             "a WOTS+ key-reuse vulnerability that the chain rejects. "
+             "Cold-key leaf state is not tracked on-chain (the chain "
+             "only updates hot-key watermarks), so the operator must "
+             "advance this manually across multiple uses of the same "
+             "cold key. Tree height is 8 (256 leaves total) by default, "
+             "which is plenty for a validator's lifetime of authority "
+             "operations.",
+    )
 
     # --- emergency-revoke ---
     revoke = sub.add_parser(
@@ -1727,6 +1740,27 @@ def cmd_send(args):
     if not message.strip():
         print("Error: Message cannot be empty.")
         sys.exit(1)
+    # Catch non-ASCII early with a friendly diagnostic.  Without this,
+    # `args.message.encode("ascii")` later raises UnicodeEncodeError as
+    # a Python traceback that exposes the stack -- common trigger is
+    # smart-quotes or em-dashes pasted from a word processor or web
+    # page.  The chain enforces ASCII for long-term replay determinism
+    # (see tests/test_cli_ascii_only.py), so name the offending char
+    # and exit cleanly so the user can fix it.
+    try:
+        message.encode("ascii")
+    except UnicodeEncodeError as e:
+        bad = message[e.start:e.start + 1]
+        print(
+            f"Error: Message contains a non-ASCII character "
+            f"({bad!r}, U+{ord(bad):04X}) at position {e.start}.\n"
+            f"  The chain enforces ASCII-only messages so blocks "
+            f"replay deterministically across all platforms.\n"
+            f"  Common culprits: smart-quotes (curly U+201C/U+201D), "
+            f"em-dash (U+2014), ellipsis (U+2026).  Replace with "
+            f"plain ASCII equivalents and retry."
+        )
+        sys.exit(1)
 
     print(f"=== Send Message ({char_count} chars) ===\n")
 
@@ -1851,9 +1885,17 @@ def cmd_send(args):
             sys.exit(1)
         print(f"Fee: {fee} tokens")
 
-    # Create, sign, submit
+    # Create, sign, submit.  Thread the live target_height so the
+    # client-side fee floor matches the live (LINEAR-era) rule the
+    # chain enforces -- without this, create_transaction defaults to
+    # the legacy quadratic floor and rejects auto-fee txs that are
+    # correctly priced under LINEAR.  Observed on mainnet 2026-04-25:
+    # CLI computed local_min=223 (LINEAR), create_transaction enforced
+    # 323 (legacy), every fresh-user submit hit "Fee must be at least
+    # 323 ..." and bounced.
     tx = create_transaction(
-        entity, message, fee=fee, nonce=nonce, prev=prev_bytes_arg,
+        entity, message, fee=fee, nonce=nonce,
+        current_height=target_height, prev=prev_bytes_arg,
     )
     if prev_bytes_arg is not None:
         print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
@@ -1869,7 +1911,27 @@ def cmd_send(args):
         print(f"  TX hash: {result['tx_hash']}")
         print(f"  Fee:     {result['fee']} tokens")
     else:
-        print(f"\nFailed: {response.get('error')}")
+        err = response.get("error", "")
+        print(f"\nFailed: {err}")
+        # Surface actionable next-step text for the most common
+        # cold-start failure mode.  receive-to-exist + no faucet means
+        # a fresh wallet hits "Unknown entity" with no clue what to do
+        # next.  Without this hint the chain looks broken to first-time
+        # users (observed during 2026-04-25 submit-UX probe).
+        if "Unknown entity" in err or "must register first" in err:
+            print(
+                "\n"
+                "Why this happens: MessageChain uses a 'receive-to-exist'\n"
+                "model -- a wallet only becomes an on-chain entity once\n"
+                "it has received tokens from another entity.  Your wallet\n"
+                f"  {entity.entity_id_hex}\n"
+                "has no on-chain history yet, so it cannot pay the fee\n"
+                "for its own first message.\n"
+                "\n"
+                "Bootstrap path: ask an existing token holder to send a\n"
+                "small transfer to your address.  Once that lands, your\n"
+                "next 'messagechain send' will work."
+            )
         sys.exit(1)
 
 
@@ -2797,6 +2859,18 @@ def cmd_set_receipt_subtree_root(args):
     private_key = _resolve_private_key(args)
     cold = Entity.create(private_key)
 
+    # Advance past prior cold-key uses.  Cold-key leaf state is NOT
+    # tracked on chain (only the hot-key watermark is updated by
+    # SetReceiptSubtreeRoot.apply -- see the comment in
+    # apply_set_receipt_subtree_root).  Without --cold-leaf, every
+    # invocation signs at leaf 0, so a second invocation with a
+    # different timestamp is leaf-reuse and the chain rejects.
+    # Operators must self-track; we surface the leaf used after
+    # signing so the next invocation is N+1.
+    cold_leaf = max(0, int(getattr(args, "cold_leaf", 0)))
+    if cold_leaf > 0:
+        cold.keypair.advance_to_leaf(cold_leaf)
+
     host, port = _parse_server(args.server)
     from client import rpc_call
 
@@ -2854,11 +2928,17 @@ def cmd_set_receipt_subtree_root(args):
         if remote_entity != target_entity_id:
             print(
                 f"Error: validator at {host}:{port} is entity "
-                f"{result['entity_id'][:16]}..., but the cold key (or "
-                f"--entity-id) resolves to {target_entity_id.hex()[:16]}..."
+                f"{result['entity_id'][:16]}..., but you are registering "
+                f"a root for entity {target_entity_id.hex()[:16]}..."
             )
             print(
-                "       Refusing to register a root for the wrong entity."
+                "       This usually means you are broadcasting through a "
+                "PEER validator (not the one being registered).  That is "
+                "fine, but the CLI cannot fetch the local root from a "
+                "different entity's server.  Re-run with --root <hex> "
+                "to skip the local-root fetch and broadcast through this "
+                "peer.  The root value is in the target validator's boot "
+                "log: 'Receipt issuer installed: entity=... root=<hex>'."
             )
             sys.exit(1)
         root_pk = bytes.fromhex(result["root_public_key"])
@@ -2912,13 +2992,21 @@ def cmd_set_receipt_subtree_root(args):
     if response.get("ok"):
         result = response["result"]
         print(f"\nReceipt-subtree root submitted!")
-        print(f"  Entity ID: {result['entity_id']}")
-        print(f"  Root:      {result['root_public_key']}")
-        print(f"  TX hash:   {result['tx_hash']}")
-        print(f"  Status:    {result['status']}")
+        print(f"  Entity ID:  {result['entity_id']}")
+        print(f"  Root:       {result['root_public_key']}")
+        print(f"  TX hash:    {result['tx_hash']}")
+        print(f"  Status:     {result['status']}")
+        print(f"  Cold leaf:  {tx.signature.leaf_index} (BURNED)")
         print(
-            "\nVerify with `messagechain info --entity-id "
-            f"{target_entity_id.hex()}` after the next block lands."
+            f"\nNEXT TIME you sign anything with this cold key, pass "
+            f"--cold-leaf {tx.signature.leaf_index + 1} (or higher) to "
+            f"avoid WOTS+ leaf-reuse rejection.  Cold-key leaf state is "
+            f"not tracked on-chain; only the operator knows."
+        )
+        print(
+            "\nVerify on-chain with `messagechain info --server "
+            f"{host}:{port}` (or check via "
+            f"get_local_receipt_root RPC) after the next block lands."
         )
     else:
         print(f"\nFailed: {response.get('error')}")

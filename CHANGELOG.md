@@ -4,6 +4,56 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.7] — 2026-04-25
+
+Patch release. Closes the five submit-side UX gaps surfaced during
+the 2026-04-25 first-ever-user-message probe and the v2 receipt-
+subtree-root registration debug. No consensus changes; CLI-only.
+
+### Fixed
+
+- **`messagechain send` auto-fee was rejected by the chain.** The
+  CLI computed `local_min` under the live LINEAR rule and passed it
+  to `create_transaction`, but did not thread `current_height`, so
+  `create_transaction` fell back to the legacy quadratic floor and
+  rejected fees that the chain would have accepted at LINEAR. Net
+  effect on mainnet (LINEAR_FEE_HEIGHT=300, tip~432): every fresh
+  user with auto-fee hit `Fee must be at least 323 ...` and bounced.
+  Pass `target_height` through; client-side floor now matches the
+  on-chain rule.
+- **`messagechain send` non-ASCII messages now produce a friendly
+  diagnostic, not a Python traceback.** Pasting from a word
+  processor (smart-quotes, em-dash, ellipsis) used to surface
+  `UnicodeEncodeError: 'ascii' codec can't encode character ...`
+  with the call stack. Now: clean error naming the offending
+  character + codepoint + position, with a list of common culprits.
+- **`Unknown entity -- must register first` now explains the
+  receive-to-exist model.** A fresh wallet trying to send its first
+  message gets rejected because it has no on-chain history to fund
+  the fee. Pre-1.7.7 the CLI surfaced a bare `Failed: ...` with no
+  next step, so users assumed the chain was broken. The CLI now
+  detects this specific error and prints the bootstrap path: ask an
+  existing token holder to send a small transfer to the user's
+  address, then retry.
+- **`messagechain set-receipt-subtree-root` now exposes a
+  `--cold-leaf N` flag and surfaces the leaf used after signing.**
+  Cold-key leaf state is not tracked on chain (see
+  `apply_set_receipt_subtree_root`), so successive invocations with
+  the default leaf 0 produce different messages signed at the same
+  WOTS+ leaf -- a leaf-reuse violation the chain rejects. Operators
+  must self-track; the post-signing output now says "Cold leaf: N
+  (BURNED)" + "NEXT TIME pass --cold-leaf N+1". Discovered while
+  registering validator-2's receipt root on 2026-04-25 -- worked
+  around manually; now first-class.
+- **`messagechain set-receipt-subtree-root` `--server` mismatch
+  error now points at the workaround.** When the operator targets
+  a peer validator (broadcasting through a node other than the one
+  being registered), the local-root fetch returns the peer's own
+  entity_id and the safety check fired with no actionable next
+  step. Now: explains the cross-validator submission case and tells
+  the operator to pass `--root <hex>` (with a pointer to the boot-
+  log line where the root is printed).
+
 ## [1.7.6] — 2026-04-25
 
 Patch release. Adds an outbound-click redirect on the public feed
