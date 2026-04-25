@@ -4,6 +4,26 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] — 2026-04-24
+
+Patch release. `messagechain set-authority-key` and `messagechain
+rotate-key` now use the daemon's cached WOTS+ keypair when invoked
+with `--data-dir`, mirroring the existing fast-path in `cmd_stake`,
+`cmd_unstake`, and `cmd_transfer`. Previously both commands called
+`Entity.create(private_key)` unconditionally on every invocation,
+regenerating the full Merkle tree from scratch — a 20-30 minute
+operation at production `tree_height=20` (1M leaves) that wedged
+the CLI on a live validator host. Observed on mainnet 2026-04-24
+when promoting a cold authority key to separate withdrawal
+authority from block-signing authority. New regression tests bind
+all four authority-gated CLI flows (stake / unstake /
+set-authority-key / rotate-key) to the same cached-entity contract
+so the next addition can't silently regress. Also adds
+`scripts/generate_cold_authority_key.py`, an operator utility that
+generates a cold authority key and pipes the secret material
+directly to GCP Secret Manager via stdin (private material never
+touches disk). No consensus change.
+
 ## [1.7.1] — 2026-04-24
 
 Patch release. Display-only bugfix in `messagechain stake` and
