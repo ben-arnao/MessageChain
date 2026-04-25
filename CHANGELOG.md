@@ -4,6 +4,23 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] — 2026-04-25
+
+Patch release. The `get_nonce` RPC now returns the mempool-aware
+next nonce, matching what the submit-side validators
+(`_rpc_submit_transaction`, `_rpc_stake`, `_rpc_unstake`,
+`_rpc_set_authority_key`, etc.) gate on. Previously the read
+path returned the chain-state nonce only while the write path
+gated on `_get_pending_nonce_all_pools`, so a client that
+fetched the nonce while a prior tx was still in mempool would
+sign with a stale value and get rejected with `Invalid nonce:
+expected N+1, got N` until the prior tx landed in a block
+(~10 min per wedge). Observed on mainnet 2026-04-25 when
+chaining a transfer immediately after a set-authority-key
+submission. Read and write paths now share the same helper, so
+the contract holds for any pool combination. Empty-mempool
+behavior is unchanged. No consensus change.
+
 ## [1.7.2] — 2026-04-24
 
 Patch release. `messagechain set-authority-key` and `messagechain
