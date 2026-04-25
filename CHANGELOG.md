@@ -36,6 +36,12 @@ CLI relies on. No consensus changes.
   `messagechain set-receipt-subtree-root` invocation with concrete
   arguments.
 
+### Changed
+
+- **Public feed header**: replaced the tagline with a bare GitHub
+  link, dropping one line of chrome above the message stream.
+  (e711d28, b9c09dd)
+
 ## [1.7.3] — 2026-04-25
 
 Patch release. The `get_nonce` RPC now returns the mempool-aware
