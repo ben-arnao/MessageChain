@@ -4,6 +4,31 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.5] — 2026-04-25
+
+Patch release. Closes the mempool-sweep gap that prevented
+SetReceiptSubtreeRoot transactions from ever landing on chain
+when the validator entity had a non-zero hot-key leaf watermark.
+No consensus changes.
+
+### Fixed
+
+- **`_sweep_stale_pending_txs` now treats SetReceiptSubtreeRoot
+  as cold-signed.** Observed on mainnet 2026-04-25 when registering
+  validator-2's receipt-subtree root post cold-key promotion: the
+  RPC accepted the tx into `_pending_authority_txs` (returning a
+  tx_hash), but the sweep run immediately before each block
+  proposal compared the cold key's leaf_index (single digits) against
+  the validator entity's hot-key leaf_watermark (high triple digits
+  after sustained block production), declared it "stale leaf reuse,"
+  and dropped it before `propose_block` could pull it. The carve-out
+  for cold-signed txs only listed `RevokeTransaction` and
+  cold-promoted `UnstakeTransaction`; `SetReceiptSubtreeRootTransaction`
+  fell through. Net effect: a hot/cold validator could never register
+  its receipt-subtree root on-chain, which broke every receipt that
+  validator would issue at evidence-admission time. Carve-out now
+  covers `SetReceiptSubtreeRootTransaction` explicitly.
+
 ## [1.7.4] — 2026-04-25
 
 Patch release. Adds the missing operator CLI for registering a

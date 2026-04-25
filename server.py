@@ -1962,13 +1962,25 @@ class Server(SharedRuntimeMixin):
             # Leaf below watermark — signature leaf_index already
             # consumed, tx can never pass validate_block.  Only applies
             # to txs that live in the HOT leaf namespace (entity_id
-            # keyed).  Cold-signed txs (Revoke, Unstake when a
-            # separate cold key exists) use a different watermark so
-            # we skip the check for them.
+            # keyed).  Cold-signed txs use the cold key's own leaf
+            # namespace — nothing to do with the entity's hot-key
+            # watermark — so skip the check for them.
+            #
+            # SetReceiptSubtreeRootTransaction is ALWAYS cold-signed
+            # (the cold-key gate is the whole point — a compromised
+            # hot key must not be able to swap the receipting
+            # identity).  Without this carve-out, the cold key's leaf
+            # 0/1/2/etc. is compared against the validator entity's
+            # hot-key watermark (often in the hundreds after sustained
+            # block production) and the tx is silently swept every
+            # proposal round, never landing.  Observed on mainnet
+            # 2026-04-25 when registering validator-2's receipt root
+            # post cold-key promotion.
             sig = getattr(tx, "signature", None)
             cls_name = tx.__class__.__name__
             is_cold_signed = (
                 cls_name == "RevokeTransaction"
+                or cls_name == "SetReceiptSubtreeRootTransaction"
                 or (
                     cls_name == "UnstakeTransaction"
                     and self.blockchain.get_authority_key(eid)
