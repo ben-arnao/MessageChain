@@ -342,6 +342,56 @@ def build_parser() -> argparse.ArgumentParser:
              "queries YOUR local node for YOUR entity's leaf watermark)",
     )
 
+    # --- set-receipt-subtree-root ---
+    set_root = sub.add_parser(
+        "set-receipt-subtree-root",
+        help="Register this validator's receipt-subtree root on-chain "
+             "(cold key required)",
+        description=(
+            "Publish the WOTS+ root that verifies this validator's "
+            "submission receipts. Cold-key signed: a compromised hot "
+            "key must not be able to swap the receipting identity. "
+            "Run from a host that holds the cold authority key. By "
+            "default the local root is fetched from the running "
+            "validator at --server (no need to copy roots out of logs); "
+            "pass --root <hex> to skip the fetch in a fully air-gapped "
+            "flow. Until this tx lands, receipts issued by this "
+            "validator fail verification at evidence-admission time, "
+            "which collapses the censorship-evidence pipeline for "
+            "anyone receipting through this node."
+        ),
+    )
+    set_root.add_argument(
+        "--server", type=str, default=None,
+        help="Validator host:port to fetch the local root from and "
+             "broadcast through (default: 127.0.0.1:9334).",
+    )
+    set_root.add_argument(
+        "--root", type=str, default=None,
+        help="Receipt-subtree root public key as hex (32 bytes). "
+             "Skips the get_local_receipt_root RPC fetch -- use for "
+             "air-gapped signing where the operator copied the root "
+             "out of band.",
+    )
+    set_root.add_argument(
+        "--entity-id", type=str, default=None,
+        help="Validator entity ID (hex). Defaults to the entity derived "
+             "from the cold key in --keyfile.",
+    )
+    set_root.add_argument(
+        "--fee", type=int, default=None, help="Transaction fee",
+    )
+    set_root.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
+    set_root.add_argument(
+        "--print-tx", action="store_true",
+        help="Print the signed tx as JSON to stdout instead of "
+             "broadcasting. Pair with --root and --entity-id for an "
+             "air-gapped sign-on-cold, broadcast-on-hot workflow.",
+    )
+
     # --- emergency-revoke ---
     revoke = sub.add_parser(
         "emergency-revoke",
@@ -2731,6 +2781,150 @@ def cmd_emergency_revoke(args):
         sys.exit(1)
 
 
+def cmd_set_receipt_subtree_root(args):
+    """Register this validator's receipt-subtree root on-chain (cold key)."""
+    from messagechain.identity.identity import Entity
+    from messagechain.core.receipt_subtree_root import (
+        create_set_receipt_subtree_root_transaction,
+    )
+
+    print("=== Set Receipt Subtree Root ===\n")
+    print("Authenticate with your COLD (authority) key. Registers the WOTS+")
+    print("root that verifies this validator's submission receipts. Without")
+    print("this, receipts fail verification at evidence-admission time and")
+    print("the censorship-evidence pipeline collapses for this validator.\n")
+
+    private_key = _resolve_private_key(args)
+    cold = Entity.create(private_key)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    # Resolve the entity_id we're registering for.  Default: derive
+    # from the cold key.  In hot/cold split the cold key's entity_id
+    # equals the validator's entity_id (set-authority-key changes
+    # which key signs authority txs, not which entity_id is on chain).
+    if args.entity_id:
+        try:
+            target_entity_id = bytes.fromhex(args.entity_id.strip())
+        except ValueError:
+            print("Error: --entity-id must be valid hex.")
+            sys.exit(1)
+        if len(target_entity_id) != 32:
+            print(
+                f"Error: entity ID must be 32 bytes, got "
+                f"{len(target_entity_id)}."
+            )
+            sys.exit(1)
+    else:
+        target_entity_id = cold.entity_id
+
+    # Resolve the root.  --root wins; otherwise fetch from the running
+    # validator at --server.  This avoids forcing operators to scrape
+    # the root out of journald / cache files.
+    if args.root:
+        try:
+            root_pk = bytes.fromhex(args.root.strip())
+        except ValueError:
+            print("Error: --root must be valid hex.")
+            sys.exit(1)
+        if len(root_pk) != 32:
+            print(
+                f"Error: root public key must be 32 bytes, got "
+                f"{len(root_pk)}."
+            )
+            sys.exit(1)
+        registered_hex = "<not fetched -- pass without --root to compare>"
+    else:
+        resp = rpc_call(host, port, "get_local_receipt_root", {})
+        if not resp.get("ok"):
+            print(
+                f"Error: could not fetch local receipt root from "
+                f"{host}:{port}: {resp.get('error')}"
+            )
+            sys.exit(1)
+        result = resp["result"]
+        if not result.get("installed"):
+            print(
+                f"Error: validator at {host}:{port} reports no receipt "
+                f"issuer installed (relay-only node?)."
+            )
+            sys.exit(1)
+        remote_entity = bytes.fromhex(result["entity_id"])
+        if remote_entity != target_entity_id:
+            print(
+                f"Error: validator at {host}:{port} is entity "
+                f"{result['entity_id'][:16]}..., but the cold key (or "
+                f"--entity-id) resolves to {target_entity_id.hex()[:16]}..."
+            )
+            print(
+                "       Refusing to register a root for the wrong entity."
+            )
+            sys.exit(1)
+        root_pk = bytes.fromhex(result["root_public_key"])
+        registered_hex = (
+            result["registered_root"][:16] + "..."
+            if result.get("registered_root") else "<none>"
+        )
+        if not result.get("registration_needed"):
+            print(
+                f"Local root {root_pk.hex()[:16]}... already matches "
+                f"on-chain root for this entity. Nothing to do."
+            )
+            sys.exit(0)
+
+    # SetReceiptSubtreeRoot is nonce-free (idempotent / pre-signable).
+    # Default fee mirrors emergency-revoke / set-authority-key.
+    from messagechain.config import MIN_FEE_POST_FLAT
+    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
+    tx = create_set_receipt_subtree_root_transaction(
+        entity_id=target_entity_id,
+        root_public_key=root_pk,
+        authority_signer=cold,
+        fee=fee,
+    )
+
+    if not getattr(args, "yes", False) and not args.print_tx:
+        print(f"\nAbout to register receipt-subtree root:")
+        print(f"  Validator entity:   {target_entity_id.hex()[:16]}...")
+        print(f"  New root:           {root_pk.hex()[:16]}...")
+        print(f"  Currently on-chain: {registered_hex}")
+        print(f"  Fee:                {fee} tokens")
+        print(
+            "  Signed by the cold authority key.  Idempotent -- "
+            "submitting the same root again is a no-op."
+        )
+        confirm = input(
+            "\nConfirm set-receipt-subtree-root (type 'yes' to proceed): "
+        ).strip().lower()
+        if confirm != "yes":
+            print("Set-receipt-subtree-root cancelled.")
+            sys.exit(0)
+
+    if args.print_tx:
+        import json
+        print(json.dumps(tx.serialize(), indent=2))
+        return
+
+    response = rpc_call(host, port, "set_receipt_subtree_root", {
+        "transaction": tx.serialize(),
+    })
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nReceipt-subtree root submitted!")
+        print(f"  Entity ID: {result['entity_id']}")
+        print(f"  Root:      {result['root_public_key']}")
+        print(f"  TX hash:   {result['tx_hash']}")
+        print(f"  Status:    {result['status']}")
+        print(
+            "\nVerify with `messagechain info --entity-id "
+            f"{target_entity_id.hex()}` after the next block lands."
+        )
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_propose(args):
     """Create a governance proposal."""
     from messagechain.identity.identity import Entity
@@ -4517,6 +4711,7 @@ def main():
         "stake": cmd_stake,
         "unstake": cmd_unstake,
         "set-authority-key": cmd_set_authority_key,
+        "set-receipt-subtree-root": cmd_set_receipt_subtree_root,
         "bootstrap-seed": cmd_bootstrap_seed,
         "emergency-revoke": cmd_emergency_revoke,
         "rotate-key": cmd_rotate_key,
