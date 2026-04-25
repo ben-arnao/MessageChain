@@ -4353,16 +4353,30 @@ async def run(args):
     if args.public_feed_port is not None:
         from messagechain.network.public_feed_server import PublicFeedServer
 
+        # Optional cold-start faucet.  Requires --public-feed-port
+        # to expose the /faucet POST handler.  When --faucet-keyfile
+        # is unset the feed stays read-only.
+        faucet_state = None
+        if getattr(args, "faucet_keyfile", None):
+            faucet_state = _build_faucet(server, args.faucet_keyfile)
+
         public_feed_server = PublicFeedServer(
             blockchain=server.blockchain,
             port=args.public_feed_port,
             bind=args.public_feed_bind,
+            faucet=faucet_state,
         )
         public_feed_server.start()
         logger.info(
             "Public feed active on http://%s:%d/  (front with Caddy/Cloudflare for TLS)",
             args.public_feed_bind, args.public_feed_port,
         )
+        if faucet_state is not None:
+            logger.info(
+                "Faucet active: drip=%d daily_cap=%d",
+                faucet_state.drip_amount,
+                faucet_state.daily_cap,
+            )
 
     # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run
     # the same cleanup path as Ctrl-C.  Without this, Python's default
@@ -4400,6 +4414,126 @@ async def run(args):
     if public_feed_server is not None:
         public_feed_server.stop()
     await server.stop()
+
+
+def _build_faucet(server, keyfile_path: str):
+    """Load the faucet wallet, install it, and return a FaucetState.
+
+    Side effect: keypair is generated (or loaded from cache) at the
+    chain-recorded tree height for this entity if known, otherwise
+    16 (=65,536 leaves -- ample for years of bootstrap drips, ~10-20
+    min cold keygen, instant warm restarts via the keypair cache).
+
+    The build/submit callbacks close over the faucet entity, the
+    chain, and the in-process mempool/RPC plumbing.  They do NOT
+    do an outbound RPC roundtrip -- the faucet runs in the same
+    Python process as the validator, so the cheapest correct path
+    is to call _rpc_submit_transfer directly.
+    """
+    from messagechain.core.transfer import create_transfer_transaction
+    from messagechain.identity.identity import Entity
+    from messagechain.network.faucet import FaucetState, FAUCET_DRIP
+    from messagechain.config import MIN_FEE_POST_FLAT
+
+    # Read the daemon-format keyfile (raw 64-char hex, no checksum)
+    # the same way the main --keyfile loader does at server startup.
+    # Operator workflow: scripts/generate_faucet_key.py produces the
+    # paper-backup format and pushes raw hex to a deploy-time secret
+    # store; the systemd unit drops just the raw hex into /dev/shm.
+    with open(keyfile_path) as _kf:
+        hex_key = _kf.read().strip()
+    try:
+        private_key = bytes.fromhex(hex_key)
+    except ValueError as e:
+        raise SystemExit(
+            f"--faucet-keyfile {keyfile_path} does not contain valid hex: {e}"
+        )
+    if len(private_key) != 32:
+        raise SystemExit(
+            f"--faucet-keyfile {keyfile_path} must be exactly 64 hex chars "
+            f"(got {len(hex_key)})"
+        )
+
+    chain = server.blockchain
+    # Resolve the entity's recorded WOTS+ tree height if it has any
+    # chain history; fall back to 16.  Mirrors the same lookup the
+    # main wallet does via --wallet.
+    probe_entity_id = Entity.create(private_key, tree_height=4).entity_id
+    stored_height = None
+    if hasattr(chain, "get_wots_tree_height"):
+        try:
+            stored_height = chain.get_wots_tree_height(probe_entity_id)
+        except Exception:
+            stored_height = None
+    tree_height = stored_height if stored_height is not None else 16
+
+    data_dir = getattr(server, "data_dir", None)
+    entity = _load_or_create_entity(
+        private_key, tree_height, data_dir,
+        no_cache=getattr(server, "no_keypair_cache", False),
+    )
+    logger.info(
+        "Faucet wallet loaded: entity=%s tree_height=%d",
+        entity.entity_id_hex[:16], tree_height,
+    )
+
+    # Track whether the faucet's hot pubkey is already installed on
+    # chain.  Set on first successful drip so subsequent transfers
+    # skip the (rejected) repeat-pubkey path.  Bootstrap from current
+    # chain state so a restart after one drip does not re-include.
+    pubkey_installed = entity.entity_id in chain.public_keys
+
+    def build_tx(recipient_bytes: bytes) -> dict:
+        nonlocal pubkey_installed
+        # Re-check chain state every time -- handles the case where
+        # the chain advanced and installed our pubkey via someone
+        # else's transfer between drips.
+        if not pubkey_installed:
+            pubkey_installed = entity.entity_id in chain.public_keys
+
+        # Advance the keypair past the chain-recorded watermark so a
+        # cold restart between drips does not retry a burned leaf.
+        wm = 0
+        if hasattr(chain, "get_leaf_watermark"):
+            try:
+                wm = chain.get_leaf_watermark(entity.entity_id) or 0
+            except Exception:
+                wm = 0
+        if wm > entity.keypair._next_leaf:
+            entity.keypair.advance_to_leaf(wm)
+
+        # Mirror cmd_transfer's pattern: use server's pending-nonce
+        # helper so back-to-back drips inside one block window pick
+        # up sequential nonces without waiting for inclusion.
+        nonce = server._get_pending_nonce_all_pools(entity.entity_id)
+        tx = create_transfer_transaction(
+            entity,
+            recipient_id=recipient_bytes,
+            amount=FAUCET_DRIP,
+            nonce=nonce,
+            fee=MIN_FEE_POST_FLAT,
+            include_pubkey=not pubkey_installed,
+        )
+        # Optimistically flip the flag so two near-simultaneous
+        # build_tx calls do not both set include_pubkey=True (the
+        # second would be rejected).  FaucetState.try_drip's lock
+        # serializes us here, so this is safe.
+        if not pubkey_installed:
+            pubkey_installed = True
+        return tx.serialize()
+
+    def submit_tx(tx_dict: dict) -> tuple[bool, str]:
+        # In-process RPC equivalent: hits the same code path the
+        # external `submit_transfer` JSON-RPC method does.
+        resp = server._rpc_submit_transfer({"transaction": tx_dict})
+        if resp.get("ok"):
+            return True, ""
+        return False, str(resp.get("error", "unknown"))
+
+    return FaucetState(
+        submit_callback=submit_tx,
+        build_tx_callback=build_tx,
+    )
 
 
 def main():
@@ -4469,6 +4603,26 @@ def main():
         help="Bind address for the public feed (default: 127.0.0.1). "
              "Typically bound to localhost and fronted by a reverse proxy; "
              "use 0.0.0.0 only if exposing directly to the public internet.",
+    )
+    # --- Cold-start funding faucet (opt-in, requires --public-feed-port) ---
+    # Off by default.  When set, the validator loads a separate WOTS+
+    # wallet from --faucet-keyfile and exposes a POST /faucet endpoint
+    # on the public feed server.  Each request drips a small fixed
+    # amount to the requested address, gated by per-IP, per-address,
+    # and daily-aggregate rate limits (see messagechain/network/faucet.py).
+    # Closes the receive-to-exist cold-start gap: a fresh user with
+    # a freshly-generated keyfile cannot send their first message
+    # without prior on-chain balance, and there is no other allocation
+    # path during bootstrap.  Operator funds the faucet wallet out-of-
+    # band with a one-time transfer; refill is manual.
+    parser.add_argument(
+        "--faucet-keyfile", type=str, default=None,
+        help="Path to a hex-checksummed private-key file for the cold-"
+             "start faucet wallet.  When set AND --public-feed-port is "
+             "also set, the public feed exposes POST /faucet for "
+             "operator-funded drips to fresh user wallets.  "
+             "Generate with scripts/generate_faucet_key.py.  See "
+             "messagechain/network/faucet.py for rate-limit details.",
     )
     args = parser.parse_args()
 

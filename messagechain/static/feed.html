@@ -136,6 +136,67 @@
     text-align: center;
   }
   footer a { color: var(--accent); }
+  details.faucet {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    margin: 0.6rem 0 1rem;
+    font-size: 0.9rem;
+  }
+  details.faucet summary {
+    cursor: pointer;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  details.faucet .body {
+    margin-top: 0.6rem;
+    line-height: 1.5;
+  }
+  details.faucet input {
+    width: 100%;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    margin-top: 0.4rem;
+  }
+  details.faucet button {
+    margin-top: 0.5rem;
+    padding: 0.45rem 0.9rem;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  details.faucet button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  details.faucet .result {
+    margin-top: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  details.faucet .result.error { color: #c33; }
+  details.faucet .result.success { color: var(--accent); }
+  details.faucet code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    background: var(--bg);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
+  details.faucet ol { padding-left: 1.2rem; }
+  details.faucet ol li { margin: 0.25rem 0; }
 </style>
 </head>
 <body>
@@ -146,6 +207,26 @@
   </p>
 </header>
 <main>
+  <details class="faucet" id="faucetBox" hidden>
+    <summary>First time? Get starter tokens (<span id="faucetRemaining">…</span> left today)</summary>
+    <div class="body">
+      <p>
+        New wallets need on-chain balance before they can send their first
+        message. Paste your address below to receive a starter drip
+        (<span id="faucetAmount">…</span> tokens, enough for ~3 short
+        messages). One drip per address, one drip per network per 24h.
+      </p>
+      <ol>
+        <li>Generate a key offline: <code>messagechain generate-key</code></li>
+        <li>Paste the printed entity ID here:</li>
+      </ol>
+      <input id="faucetAddr" type="text" autocomplete="off"
+             placeholder="64-char hex entity_id"
+             aria-label="Wallet address (entity_id)">
+      <button id="faucetBtn" type="button">Get tokens</button>
+      <div id="faucetResult" class="result"></div>
+    </div>
+  </details>
   <p class="status" id="status">Loading…</p>
   <div id="feed"></div>
 </main>
@@ -270,6 +351,74 @@
       statusEl.textContent = "Feed unreachable (" + e.message + "). Retrying…";
     }
   }
+
+  // --- Cold-start faucet UI -------------------------------------------------
+  // Only render the form when the validator advertises faucet_enabled=true
+  // on /v1/info.  Servers without --faucet-keyfile keep the feed read-only
+  // and the box stays hidden (no surprise 405 from a stale UI element).
+  const faucetBox = document.getElementById("faucetBox");
+  const faucetBtn = document.getElementById("faucetBtn");
+  const faucetAddr = document.getElementById("faucetAddr");
+  const faucetResult = document.getElementById("faucetResult");
+  const faucetAmount = document.getElementById("faucetAmount");
+  const faucetRemaining = document.getElementById("faucetRemaining");
+
+  async function refreshFaucetInfo() {
+    try {
+      const r = await fetch("/v1/info", { cache: "no-store" });
+      const data = await r.json();
+      if (data.ok && data.faucet_enabled && data.faucet) {
+        faucetBox.hidden = false;
+        faucetAmount.textContent = data.faucet.drip_amount;
+        faucetRemaining.textContent = data.faucet.remaining_today;
+      } else {
+        faucetBox.hidden = true;
+      }
+    } catch (e) {
+      faucetBox.hidden = true;
+    }
+  }
+
+  async function requestDrip() {
+    const addr = (faucetAddr.value || "").trim().toLowerCase();
+    // Cheap client-side guard so an obviously malformed address does
+    // not cost a round trip + slot of the per-IP cooldown bucket.
+    if (!/^[0-9a-f]{64}$/.test(addr)) {
+      faucetResult.className = "result error";
+      faucetResult.textContent = "Address must be exactly 64 hex characters.";
+      return;
+    }
+    faucetBtn.disabled = true;
+    faucetResult.className = "result";
+    faucetResult.textContent = "Requesting drip…";
+    try {
+      const r = await fetch("/faucet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: addr }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok && data.ok) {
+        faucetResult.className = "result success";
+        faucetResult.textContent =
+          "Sent " + data.amount + " tokens. Tx " + data.tx_hash.slice(0, 16) +
+          "… will land in the next block (~10 min). Then run " +
+          "`messagechain send \"hello world\"` to post.";
+      } else {
+        faucetResult.className = "result error";
+        faucetResult.textContent = "Drip failed: " + (data.error || ("HTTP " + r.status));
+      }
+      // Counter has changed (success or rate-limit-fail) — refresh.
+      refreshFaucetInfo();
+    } catch (e) {
+      faucetResult.className = "result error";
+      faucetResult.textContent = "Network error: " + e.message;
+    } finally {
+      faucetBtn.disabled = false;
+    }
+  }
+  faucetBtn.addEventListener("click", requestDrip);
+  refreshFaucetInfo();
 
   poll();
   setInterval(poll, POLL_MS);

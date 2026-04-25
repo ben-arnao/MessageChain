@@ -69,8 +69,12 @@ _GITHUB_REPO_URL = "https://github.com/ben-arnao/MessageChain"
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
 
-    def __init__(self, blockchain):
+    def __init__(self, blockchain, faucet=None):
         self.blockchain = blockchain
+        # Optional FaucetState (messagechain.network.faucet).  When
+        # None the /faucet POST endpoint returns 405 and the public
+        # feed remains read-only.
+        self.faucet = faucet
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -181,7 +185,69 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        # The only POST route is the optional cold-start funding
+        # faucet.  Every other path returns 405 so the public feed
+        # surface stays read-only by default.
+        ctx = self.server._feed_context
+        split = urlsplit(self.path)
+        if split.path == "/faucet" and ctx.faucet is not None:
+            if not ctx.rate_limit_check(self._client_ip()):
+                self._send_text(429, "Too Many Requests")
+                return
+            self._serve_faucet(ctx)
+            return
         self._send_text(405, "Method Not Allowed")
+
+    def _serve_faucet(self, ctx):
+        """POST /faucet  body: {"address": "<entity_id_hex>"}.
+
+        Returns JSON {"ok": ..., "tx_hash": ..., "amount": ...,
+        "remaining_today": ..., "error": ...}.  The three
+        rate-limit layers (per-/24 IP, per-address, daily cap) are
+        enforced inside FaucetState.try_drip; this handler is just
+        the HTTP boundary.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        # Reject pathologically large bodies upfront -- the JSON we
+        # care about is well under 200 bytes.  Keeps a stray 1 GB
+        # POST from blocking the handler thread.
+        if length < 0 or length > 4096:
+            self._send_json(400, {"ok": False, "error": "bad body length"})
+            return
+        try:
+            body = self.rfile.read(length) if length else b""
+            payload = json.loads(body or b"{}")
+        except (json.JSONDecodeError, OSError):
+            self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"ok": False, "error": "body must be a JSON object"})
+            return
+        address = payload.get("address", "")
+        if not isinstance(address, str):
+            self._send_json(400, {"ok": False, "error": "address must be a string"})
+            return
+
+        result = ctx.faucet.try_drip(self._client_ip(), address)
+        if result.ok:
+            self._send_json(200, {
+                "ok": True,
+                "tx_hash": result.tx_hash,
+                "amount": result.amount,
+                "remaining_today": result.remaining_today,
+            })
+        else:
+            # 429 for rate-limit-style refusals so well-behaved
+            # clients can detect/back-off; 400 for malformed input.
+            status = 400 if "must be" in result.error else 429
+            self._send_json(status, {
+                "ok": False,
+                "error": result.error,
+                "remaining_today": result.remaining_today,
+            })
 
     def do_PUT(self):
         self._send_text(405, "Method Not Allowed")
@@ -252,12 +318,24 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         latest_ts = (
             chain.chain[-1].header.timestamp if chain.chain else None
         )
-        self._send_json(200, {
+        body = {
             "ok": True,
             "chain_id": CHAIN_ID.decode("ascii", errors="replace"),
             "height": height,
             "last_block_timestamp": latest_ts,
-        })
+            "faucet_enabled": ctx.faucet is not None,
+        }
+        if ctx.faucet is not None:
+            # Surface the visible knobs so the UI can render an
+            # accurate "X drips remaining today" line without a second
+            # round trip.  The drip amount and per-IP cooldown rarely
+            # change but operators may tweak them across releases.
+            body["faucet"] = {
+                "drip_amount": ctx.faucet.drip_amount,
+                "remaining_today": ctx.faucet.remaining_today(),
+                "daily_cap": ctx.faucet.daily_cap,
+            }
+        self._send_json(200, body)
 
     def _serve_latest(self, ctx: _FeedHandlerContext, query: str):
         params = parse_qs(query)
@@ -312,10 +390,12 @@ class PublicFeedServer:
         blockchain,
         port: int,
         bind: str = "127.0.0.1",
+        faucet=None,
     ):
         self.blockchain = blockchain
         self.port = port
         self.bind = bind
+        self.faucet = faucet
         self._httpd: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -325,7 +405,9 @@ class PublicFeedServer:
         self._httpd = _ThreadingHTTPServer(
             (self.bind, self.port), _FeedHandler,
         )
-        self._httpd._feed_context = _FeedHandlerContext(self.blockchain)
+        self._httpd._feed_context = _FeedHandlerContext(
+            self.blockchain, faucet=self.faucet,
+        )
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             name=f"mc-public-feed-{self.port}",

@@ -4,6 +4,60 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] — 2026-04-25
+
+Minor release. Closes the receive-to-exist cold-start gap with an
+opt-in operator-funded faucet on the public feed server. Pure
+addition: no consensus changes; default-off so existing operators
+get identical behavior.
+
+### Added
+
+- **Cold-start funding faucet (`POST /faucet`).**
+  When the validator is launched with `--faucet-keyfile <path>` and
+  `--public-feed-port` is set, the public feed exposes a JSON POST
+  endpoint at `/faucet` that drips a fixed `FAUCET_DRIP=1000` tokens
+  to the requested address. Three rate-limit layers stack: per-/24
+  IP cooldown (24h), per-address one-shot (in-memory for the process
+  lifetime), and a global daily cap (`FAUCET_DAILY_CAP=50`). Closes
+  the receive-to-exist gap that made fresh wallets unable to send
+  their first message without an out-of-band token transfer -- the
+  dominant cold-start failure documented during the 2026-04-25
+  submit-UX probe. (`messagechain/network/faucet.py`,
+  `messagechain/network/public_feed_server.py`,
+  `server.py:_build_faucet`)
+- **"Get starter tokens" UI on `messagechain.org`.**
+  Collapsible section above the live feed with an address input,
+  one-line bootstrap explanation, and a "Get tokens" button that
+  POSTs `/faucet`. Hidden when the validator does not advertise
+  `faucet_enabled=true` on `/v1/info`. Counter shows remaining
+  drips today so a visitor sees the daily cap state at a glance.
+  (`messagechain/static/feed.html`)
+- **`/v1/info.faucet`** block: when the faucet is enabled the info
+  endpoint reports `{drip_amount, daily_cap, remaining_today}` so
+  the UI does not need a separate roundtrip and operator dashboards
+  can poll the cap counter.
+- **`scripts/generate_faucet_key.py`** mirrors the cold-authority
+  generator: produces a tree_height=16 wallet key, prints the public
+  key on stdout, pushes private material straight to GCP Secret
+  Manager via stdin (no filesystem touch).
+
+### Operator workflow
+
+1. `python scripts/generate_faucet_key.py <project> mc-faucet-key`
+   -> records the printed pubkey.
+2. Update the validator deploy script to fetch the secret to
+   `/dev/shm/mc-faucet-key` (raw 64-char hex, mode 0400) at boot
+   and pass `--faucet-keyfile /dev/shm/mc-faucet-key` to `server.py`.
+3. Restart the validator (cold keygen ~10-20 min the first time;
+   warm restarts hit the keypair cache).
+4. From any wallet with sufficient balance, transfer the desired
+   runway: `messagechain transfer --to <faucet-pubkey>
+   --amount <N>`. A common starting allocation is
+   `FAUCET_DRIP * 200 = 200,000` tokens (~4 days at peak cap).
+5. Verify: `curl -X POST -H 'Content-Type: application/json'
+   -d '{"address":"<test-entity-id>"}' https://messagechain.org/faucet`.
+
 ## [1.7.7] — 2026-04-25
 
 Patch release. Closes the five submit-side UX gaps surfaced during
