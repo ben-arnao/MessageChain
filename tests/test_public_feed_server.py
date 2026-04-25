@@ -278,5 +278,31 @@ class TestXssSafety(PublicFeedTestBase):
         self.assertNotIn(".innerHTML=m.message", src)
 
 
+class TestGitHubRedirect(PublicFeedTestBase):
+    """`/gh` is a 302 redirect to the public GitHub repo so operators
+    can count outbound clicks via the access log instead of losing them
+    to a bare anchor href."""
+
+    GITHUB_URL = "https://github.com/ben-arnao/MessageChain"
+
+    def test_gh_returns_302(self):
+        status, _, _ = self._get("/gh")
+        self.assertEqual(status, 302)
+
+    def test_gh_location_points_to_repo(self):
+        _, headers, _ = self._get("/gh")
+        self.assertEqual(headers.get("Location"), self.GITHUB_URL)
+
+    def test_gh_post_returns_405(self):
+        status, _, _ = self._get("/gh", method="POST")
+        self.assertEqual(status, 405)
+
+    def test_feed_page_links_through_redirect(self):
+        _, _, body = self._get("/")
+        src = body.decode("utf-8")
+        self.assertIn('href="/gh"', src)
+        self.assertNotIn('href="https://github.com/ben-arnao', src)
+
+
 if __name__ == "__main__":
     unittest.main()

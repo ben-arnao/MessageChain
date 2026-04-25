@@ -62,6 +62,9 @@ _STATIC_DIR = os.path.join(
 )
 _FEED_HTML_PATH = os.path.join(_STATIC_DIR, "feed.html")
 
+# Outbound link target for the `/gh` redirect (the public repo).
+_GITHUB_REPO_URL = "https://github.com/ben-arnao/MessageChain"
+
 
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
@@ -220,6 +223,16 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/v1/latest":
             self._serve_latest(ctx, split.query)
+            return
+        if path == "/gh":
+            # 302 to the public repo so outbound clicks land in the
+            # access log (a bare anchor href would let the browser
+            # navigate away with no record on our side).
+            self.send_response(302)
+            self.send_header("Location", _GITHUB_REPO_URL)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
 
         self._send_text(404, "Not Found")
