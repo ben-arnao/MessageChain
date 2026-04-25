@@ -4,6 +4,38 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.4] — 2026-04-25
+
+Patch release. Adds the missing operator CLI for registering a
+validator's receipt-subtree root from a cold key, plus the RPC the
+CLI relies on. No consensus changes.
+
+### Fixed
+
+- **`messagechain set-receipt-subtree-root` exists.** After the cold-
+  authority-key promotion landed on validator-2 on 2026-04-25, the
+  boot-time receipt-subtree auto-submit detected the cold-key gap
+  and printed an actionable warning telling the operator to run
+  `client.py set-receipt-subtree-root`. That command did not exist
+  in either `client.py` or the `messagechain` CLI. Net effect: v2's
+  receipt-subtree root has sat unregistered since the promotion,
+  which would have made every receipt issued by v2 fail at evidence-
+  admission time and collapsed the censorship-evidence pipeline for
+  any submitter routed through that node. The new CLI fetches the
+  validator's local root via the new `get_local_receipt_root` RPC
+  (no scraping it out of journald or cache files), signs the
+  `SetReceiptSubtreeRoot` tx with the cold key, and broadcasts via
+  `set_receipt_subtree_root`. Refuses to broadcast when the remote
+  validator's entity_id does not match the cold key's, exits zero
+  when the on-chain root already matches (idempotent re-runs), and
+  supports `--root` + `--print-tx` for fully air-gapped sign-on-cold,
+  broadcast-on-hot workflows.
+- **Boot-time warning text now references the real command.** The
+  warning in `_bootstrap_receipt_subtree` previously pointed at
+  `client.py set-receipt-subtree-root`; updated to the correct
+  `messagechain set-receipt-subtree-root` invocation with concrete
+  arguments.
+
 ## [1.7.3] — 2026-04-25
 
 Patch release. The `get_nonce` RPC now returns the mempool-aware

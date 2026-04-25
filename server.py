@@ -982,10 +982,16 @@ def _bootstrap_receipt_subtree(
             "  entity_id:        %s\n"
             "  local root:       %s\n"
             "  currently on-chain: %s\n"
-            "ACTION: sign a SetReceiptSubtreeRoot tx with the cold key "
-            "and broadcast via `client.py set-receipt-subtree-root`.  "
-            "Until this lands, receipts issued by this validator will "
-            "fail verification at evidence-admission time.",
+            "ACTION: from a host with the cold key, run\n"
+            "  messagechain set-receipt-subtree-root \\\n"
+            "      --keyfile <cold-key-path> \\\n"
+            "      --server <this-validator-host>:9334 \\\n"
+            "      --yes\n"
+            "The CLI fetches the local root via get_local_receipt_root, "
+            "signs the tx with the cold key, and broadcasts via the "
+            "set_receipt_subtree_root RPC.  Until this lands, receipts "
+            "issued by this validator will fail verification at "
+            "evidence-admission time.",
             entity.entity_id_hex[:16],
             local_root.hex()[:16] + "...",
             registered_root.hex()[:16] + "..." if registered_root else "<none>",
@@ -1631,6 +1637,9 @@ class Server(SharedRuntimeMixin):
 
         elif method == "set_receipt_subtree_root":
             return self._rpc_set_receipt_subtree_root(request["params"])
+
+        elif method == "get_local_receipt_root":
+            return self._rpc_get_local_receipt_root(request["params"])
 
         elif method == "is_revoked":
             entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
@@ -2427,6 +2436,34 @@ class Server(SharedRuntimeMixin):
             }}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_get_local_receipt_root(self, _params: dict) -> dict:
+        """Return this validator's locally-derived receipt-subtree root.
+
+        Operators in the hot/cold split need this value to build a
+        SetReceiptSubtreeRoot tx with the cold key from a separate
+        machine — without it they would have to scrape the root out of
+        boot logs or the cache file. The root is a public commitment
+        that's about to be written on-chain anyway, so no auth is
+        required.
+
+        Returns `{"installed": False}` on a relay-only node (no receipt
+        issuer).
+        """
+        issuer = getattr(self, "receipt_issuer", None)
+        if issuer is None:
+            return {"ok": True, "result": {"installed": False}}
+        local_root = issuer.subtree_keypair.public_key
+        registered = self.blockchain.receipt_subtree_roots.get(
+            issuer.issuer_id,
+        )
+        return {"ok": True, "result": {
+            "installed": True,
+            "entity_id": issuer.issuer_id.hex(),
+            "root_public_key": local_root.hex(),
+            "registered_root": registered.hex() if registered else None,
+            "registration_needed": registered != local_root,
+        }}
 
     def _rpc_submit_proposal(self, params: dict) -> dict:
         """Accept a signed governance proposal from a client.
