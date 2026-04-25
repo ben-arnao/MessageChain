@@ -2448,7 +2448,20 @@ def cmd_set_authority_key(args):
         sys.exit(1)
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    # Mirror cmd_stake / cmd_unstake / cmd_transfer: when --data-dir
+    # points at a running validator's data_dir, reuse the daemon's
+    # cached WOTS+ keypair instead of regenerating the Merkle tree
+    # from scratch (~20-30 min on production tree_height=16/20
+    # wallets; observed to wedge a CLI invocation for 10+ min on an
+    # e2-small mainnet node).
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -2518,7 +2531,19 @@ def cmd_rotate_key(args):
     print("Your entity ID, balance, and stake are preserved.\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    # Mirror cmd_stake / cmd_unstake / cmd_set_authority_key: when
+    # --data-dir is co-resident with a daemon, prefer the cached
+    # WOTS+ keypair to avoid a 20-30 min Merkle regen at production
+    # tree height. Note: this only saves regen of the CURRENT tree;
+    # the new (post-rotation) tree still has to be derived below.
+    data_dir = getattr(args, "data_dir", None)
+    entity = None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            print(f"\nUsing cached keypair from {data_dir} (fast path)")
+    if entity is None:
+        entity = Entity.create(private_key)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
