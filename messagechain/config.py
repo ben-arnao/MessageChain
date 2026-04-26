@@ -3115,6 +3115,38 @@ PREV_POINTER_HEIGHT = 400                # Tier 10 (bootstrap-compressed: pulled
 # v1/v2 remain valid for senders already on chain.
 FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 
+# Tier 12: international (UTF-8) message bodies.  Pre-activation:
+# message plaintexts MUST be printable ASCII (codepoints 32-126) — the
+# legacy rule, kept so historical blocks replay deterministically.
+# Post-activation: plaintexts MUST be NFC-normalized UTF-8 whose
+# codepoints fall under General_Category L*/M*/N*/P*/Zs (letters,
+# marks, numbers, punctuation, space), plus a narrow allowlist of
+# format characters required for script shaping (U+200C ZWNJ,
+# U+200D ZWJ).  Bidi override / isolate characters
+# (U+202A-U+202E, U+2066-U+2069) are explicitly rejected as spoofing
+# vectors.  All `S*` (symbols, including emoji and currency), `C*`
+# (controls, surrogates, private-use, unassigned) outside the ZWJ/ZWNJ
+# allowlist, and Zl/Zp (line/paragraph separators) are rejected.
+#
+# Why structural categories rather than a script allowlist:
+# "Allow Latin/Cyrillic/Arabic/CJK..." is a discretionary admission
+# rule — moving the cutoff line is a political knob, and the project's
+# audience (dissidents, coerced-speech contexts) is disproportionately
+# small-population languages that a "popular scripts" cutoff would
+# strand.  The L/M/N/P/Zs whitelist has no knob: every modern living
+# language is structurally letters + marks + numbers + punctuation,
+# and any future Unicode script automatically becomes valid without
+# a config change.
+#
+# Storage: post-activation, the byte cap MAX_MESSAGE_CHARS still binds,
+# but it now caps UTF-8-encoded plaintext bytes rather than ASCII
+# characters.  The fee market already prices stored bytes via
+# FEE_PER_STORED_BYTE_POST_RAISE, so the bloat-discipline math stays
+# clean — a CJK user gets ~341 chars for the same byte budget an
+# English user gets 1024 chars; each pays per byte for the storage
+# they actually pin to permanent state.
+INTL_MESSAGE_HEIGHT = 1500              # Tier 12
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3142,6 +3174,13 @@ assert FIRST_SEND_PUBKEY_HEIGHT > PREV_POINTER_HEIGHT, (
     "first-send pubkey field is encoded in v3 txs that ALSO carry the "
     "prev-pointer presence-flag (in the same wire layout), so the "
     "prev-pointer dispatch must already be live before v3 is admitted"
+)
+assert INTL_MESSAGE_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
+    "INTL_MESSAGE_HEIGHT must follow FIRST_SEND_PUBKEY_HEIGHT — the "
+    "Tier 12 UTF-8 plaintext rule rides on top of the established "
+    "v3 message-tx layout; activating it before v3 would mean the "
+    "post-fork validator dispatches on a height range where the "
+    "wire format the chain expects is still v1/v2-only"
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3207,6 +3246,8 @@ for _fork_name, _fork_height in (
     ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
     ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
     ("PREV_POINTER_HEIGHT", PREV_POINTER_HEIGHT),
+    ("FIRST_SEND_PUBKEY_HEIGHT", FIRST_SEND_PUBKEY_HEIGHT),
+    ("INTL_MESSAGE_HEIGHT", INTL_MESSAGE_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "

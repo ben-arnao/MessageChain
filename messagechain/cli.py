@@ -1734,35 +1734,32 @@ def cmd_send(args):
 
     message = args.message
     char_count = len(message)
-    if char_count > MAX_MESSAGE_CHARS:
-        print(f"Error: Message is {char_count} characters (max {MAX_MESSAGE_CHARS}).")
-        sys.exit(1)
     if not message.strip():
         print("Error: Message cannot be empty.")
         sys.exit(1)
-    # Catch non-ASCII early with a friendly diagnostic.  Without this,
-    # `args.message.encode("ascii")` later raises UnicodeEncodeError as
-    # a Python traceback that exposes the stack -- common trigger is
-    # smart-quotes or em-dashes pasted from a word processor or web
-    # page.  The chain enforces ASCII for long-term replay determinism
-    # (see tests/test_cli_ascii_only.py), so name the offending char
-    # and exit cleanly so the user can fix it.
+    # Pre-INTL_MESSAGE_HEIGHT: ASCII only.  Post-INTL_MESSAGE_HEIGHT:
+    # NFC UTF-8 in the L/M/N/P/Zs whitelist.  We don't yet know the
+    # tip height (it's fetched below), so emit a friendly diagnostic
+    # for the most common pre-flight failure (non-UTF-8-encodable input
+    # or oversize bytes); the chain validator and create_transaction's
+    # height-aware check cover the rest.
     try:
-        message.encode("ascii")
+        msg_bytes_preview = message.encode("utf-8")
     except UnicodeEncodeError as e:
         bad = message[e.start:e.start + 1]
         print(
-            f"Error: Message contains a non-ASCII character "
-            f"({bad!r}, U+{ord(bad):04X}) at position {e.start}.\n"
-            f"  The chain enforces ASCII-only messages so blocks "
-            f"replay deterministically across all platforms.\n"
-            f"  Common culprits: smart-quotes (curly U+201C/U+201D), "
-            f"em-dash (U+2014), ellipsis (U+2026).  Replace with "
-            f"plain ASCII equivalents and retry."
+            f"Error: Message contains an unencodable character "
+            f"({bad!r}, U+{ord(bad):04X}) at position {e.start}."
+        )
+        sys.exit(1)
+    if len(msg_bytes_preview) > MAX_MESSAGE_CHARS:
+        print(
+            f"Error: Message is {len(msg_bytes_preview)} bytes UTF-8 "
+            f"(max {MAX_MESSAGE_CHARS})."
         )
         sys.exit(1)
 
-    print(f"=== Send Message ({char_count} chars) ===\n")
+    print(f"=== Send Message ({char_count} chars, {len(msg_bytes_preview)} bytes) ===\n")
 
     # Authenticate
     private_key = _resolve_private_key(args)
@@ -1829,7 +1826,10 @@ def cmd_send(args):
     # Fee is charged on the canonical stored size - compute locally so
     # we never overpay and never underpay relative to what the chain
     # will enforce.
-    msg_bytes = args.message.encode("ascii")
+    # UTF-8 is byte-identical to ASCII for printable-ASCII input, so
+    # this is safe pre-fork; post-INTL_MESSAGE_HEIGHT it carries the
+    # multi-byte sequences the chain validator now accepts.
+    msg_bytes = args.message.encode("utf-8")
     stored_bytes, _ = encode_payload(msg_bytes)
     # Post-activation the chain prices (message + signature) bytes; ask
     # the server for its tip height to decide which rule to apply.  On
