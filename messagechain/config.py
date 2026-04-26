@@ -3354,6 +3354,60 @@ assert MARKET_FEE_FLOOR_HEIGHT > GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT, (
     "established fork schedule"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 17: ReactTransaction (user-trust + message-react votes)
+# ─────────────────────────────────────────────────────────────────────
+# Activation gate for the ReactTransaction tx kind.  A ReactTx
+# represents a single voter casting a {clear, up, down} signal against
+# either another entity (user-trust vote) or a message tx_hash
+# (message-react vote).  See messagechain/core/reaction.py for the full
+# field layout, signing rules, and validation.
+#
+# Aggregation semantics: each (voter, target) pair has a single latest
+# choice in consensus state; superseding votes mutate the entry rather
+# than appending to a tally.  Per-target sums (user_trust_score,
+# message_score) are denormalised inside the same state map and
+# committed into the chain's state root, so light clients can verify a
+# score with a Merkle proof rooted in any block header at or after the
+# activation height.
+#
+# Spam discipline: ReactTx pays the same MARKET_FEE_FLOOR-driven fee
+# as every other tx kind; the byte cost is permanent (every vote and
+# every supersede is stored forever) so flipping a vote pays full
+# freight, which is the whole anti-bulk-vote lever (per the settled
+# fee-only anti-spam rule).
+#
+# Activation: rides above Tier 16 (MARKET_FEE_FLOOR_HEIGHT = 7000).
+# Runway 7000 → 9000 = ~2000 blocks (~14 days at 600 s/block) to give
+# operators time to upgrade past the prior fork before the new tx kind
+# starts admitting.
+REACT_TX_HEIGHT = 9000  # Tier 17
+
+# ReactTransaction choice byte values (packed into the flags field —
+# see reaction.py).  CLEAR retracts a prior vote; UP and DOWN are the
+# two signed positions.  Numeric values are fixed at the protocol
+# boundary so the linear score formula
+#     +1 for UP, -1 for DOWN, 0 for CLEAR
+# is unambiguous across implementations.
+REACT_CHOICE_CLEAR = 0
+REACT_CHOICE_UP = 1
+REACT_CHOICE_DOWN = 2
+
+# ReactTransaction target-type bit (packed into the flags field).
+# 0 = the 32-byte target is a message tx_hash (message-react vote);
+# 1 = the 32-byte target is an entity_id (user-trust vote).  The bit
+# is committed into the tx hash so swapping target_type after signing
+# is tamper-evident.
+REACT_TARGET_MESSAGE = 0
+REACT_TARGET_USER = 1
+
+assert REACT_TX_HEIGHT > MARKET_FEE_FLOOR_HEIGHT, (
+    "REACT_TX_HEIGHT must follow MARKET_FEE_FLOOR_HEIGHT — Tier 17 rides "
+    "on the post-Tier-16 protocol fee floor; activating before the floor "
+    "is in effect would let ReactTx admit under the legacy linear-fee "
+    "rule, diverging from the floor the rest of the chain has settled on"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
