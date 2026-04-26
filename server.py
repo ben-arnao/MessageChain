@@ -4129,6 +4129,26 @@ class Server(SharedRuntimeMixin):
                 )
                 if signer_id is None or signer_id not in self.blockchain.public_keys:
                     return
+                # Round-10 fix: verify the signature before admitting.
+                # Pre-fix this branch only checked that signer_id was a
+                # registered entity -- ANY peer could craft a
+                # ProposalTx / VoteTx / TreasurySpendTx with a forged
+                # signer_id (any registered entity) and the validator
+                # would admit it to `_pending_governance_txs` and
+                # rebroadcast.  When the validator next became
+                # proposer it packed the forged tx into its block;
+                # `validate_block` then rejected the block at
+                # `_validate_governance_tx_in_block` (sig fails) -->
+                # the proposer wasted its slot, produced no block,
+                # and accrued inactivity penalties.  Sustained flood
+                # across rotated peers prevents block production
+                # indefinitely on a 2-validator chain.  Mirrors the
+                # verify-before-admit pattern of the stake / unstake
+                # / authority branches above, using the same helper
+                # the consensus-time validator already trusts.
+                ok, _ = self.blockchain._validate_governance_tx(tx)
+                if not ok:
+                    return
                 if not self._check_leaf_across_all_pools(tx):
                     return
                 if not self._admit_to_pool("_pending_governance_txs", tx):
