@@ -1145,6 +1145,25 @@ class Blockchain:
                 for eid, roots in self.past_receipt_subtree_roots.items():
                     for rk in roots:
                         self.db.add_past_receipt_subtree_root(eid, rk)
+            # Per-entity key_history mirror -- routed through this
+            # transaction-wrapped flush so a block whose state-root
+            # rejects has its rotation rows rolled back atomically
+            # alongside the rest of the block's state.  Pre-round-9
+            # the chaindb writes lived eagerly inside
+            # `_record_key_history` and `apply_key_rotation`, which
+            # ran BEFORE the per-block transaction opened in
+            # `_apply_block_state` -- a rejected block left phantom
+            # rows that a cold-restarting node rehydrated, silently
+            # forking off the canonical chain on every block signed
+            # by the affected entity.  INSERT OR REPLACE at the
+            # storage layer makes re-flushing identical (height,
+            # pubkey) tuples idempotent, so the per-block flush is
+            # safe to call on every persist regardless of whether
+            # the history has changed.
+            if hasattr(self.db, "add_key_history_entry"):
+                for eid, entries in self.key_history.items():
+                    for (h, pk) in entries:
+                        self.db.add_key_history_entry(eid, int(h), pk)
             self.db.commit_transaction()
         except Exception:
             self.db.rollback_transaction()
@@ -2654,25 +2673,28 @@ class Blockchain:
         # Track rotation block height for cooldown enforcement (iter 6 H2).
         self.key_rotation_last_height[tx.entity_id] = self.height
 
-        # Persist
-        if self.db is not None:
-            self.db.set_public_key(tx.entity_id, tx.new_public_key)
-            if hasattr(self.db, 'set_leaf_watermark'):
-                self.db.set_leaf_watermark(tx.entity_id, 0)
-            if hasattr(self.db, 'set_key_rotation_count'):
-                self.db.set_key_rotation_count(
-                    tx.entity_id, self.key_rotation_counts[tx.entity_id],
-                )
-            # Mirror key_rotation_last_height to disk so a cold-booted
-            # node rehydrates the cooldown clock.  Without this, the
-            # warm cluster rejects rotations during cooldown while a
-            # restarted peer (empty map) accepts them, silently forking
-            # consensus.
-            if hasattr(self.db, 'set_key_rotation_last_height'):
-                self.db.set_key_rotation_last_height(
-                    tx.entity_id, self.height,
-                )
-            self.db.flush_state()
+        # Persistence: in-memory only here.  Chaindb mirroring of
+        # public_keys / leaf_watermarks / key_rotation_counts /
+        # key_rotation_last_height happens later via `_persist_state`,
+        # which already iterates over each of these dicts and is
+        # called inside the per-block SQL transaction wrapper in
+        # `_apply_block_state`.  Round-9 audit found that the prior
+        # eager `db.set_public_key` / `set_leaf_watermark` /
+        # `set_key_rotation_count` / `set_key_rotation_last_height`
+        # writes -- plus the explicit `db.flush_state()` that called
+        # `self._conn.commit()` outright -- executed BEFORE the
+        # per-block transaction opened.  A block carrying a
+        # KeyRotation with a deliberately-failing state_root
+        # therefore landed the attacker's chosen pubkey in chaindb
+        # while in-memory rolled back via `_restore_memory_snapshot`.
+        # A subsequent cold restart rehydrated the corrupted disk and
+        # silently forked off the canonical chain on every block
+        # signed by the affected entity, plus on every slash decision
+        # touching it.  The `flush_state` call was particularly bad:
+        # placed inside any future outer transaction it would have
+        # prematurely committed it, breaking the atomicity guarantee
+        # the wrapper exists to provide.  Same surgical fix as
+        # round-7 for `_record_receipt_subtree_root`.
 
         return True, "Key rotated successfully"
 
@@ -2768,25 +2790,31 @@ class Blockchain:
         the same height — replay fidelity is more important than
         deduplication.
 
-        Mirrored into the `key_history` chaindb table so a cold
-        restart (which does NOT replay blocks — ``_load_from_db``
-        reads persisted tables directly) still has the pre-rotation
-        pubkey available for ``_public_key_at_height`` lookups during
-        slash-evidence verification.  Without the mirror, a validator
-        that rotates keys after equivocating can escape slashing on
-        any peer that has restarted since the rotation, because the
-        cold-booted peer falls back to the CURRENT pubkey and the
-        pre-rotation evidence signature fails to verify — plus the
-        restarted peer would reject the slash block an uprestarted
-        peer accepts, producing a state_root divergence.
+        In-memory only here.  Chaindb mirroring of the `key_history`
+        table happens later via `_persist_state`, which is called
+        inside the per-block SQL transaction wrapper in
+        `_apply_block_state`.  Round-9 audit found that the prior
+        eager `db.add_key_history_entry` call executed BEFORE the
+        per-block transaction opened, so a block whose state-root
+        mismatched (and was rejected after in-memory apply +
+        rollback via `_restore_memory_snapshot`) leaked the rotation
+        row into chaindb permanently.  A subsequent cold restart
+        rehydrated a `key_history` map that had silently forked off
+        the canonical chain -- `_public_key_at_height` then resolved
+        an attacker-chosen pubkey for any block the affected entity
+        signed, while warm peers held the canonical key.
+
+        Without the mirror, a validator that rotates keys after
+        equivocating could escape slashing on any peer that has
+        restarted since the rotation; that mirror still happens, but
+        now via `_persist_state`'s atomic per-block flush so the
+        rotation is committed iff the block is committed.  Same
+        surgical pattern as the round-7 fix to
+        `_record_receipt_subtree_root`.
         """
         self.key_history.setdefault(entity_id, []).append(
             (self.height, public_key),
         )
-        if self.db is not None and hasattr(self.db, "add_key_history_entry"):
-            self.db.add_key_history_entry(
-                entity_id, self.height, public_key,
-            )
 
     def _bump_reputation(self, entity_id: bytes, delta: int = 1) -> None:
         """Increment an entity's reputation counter, DB-mirrored.
@@ -9907,79 +9935,92 @@ class Blockchain:
             if simulated_root is not None and block.header.state_root != simulated_root:
                 return False, "Invalid state_root — state commitment mismatch"
 
-        # Snapshot state BEFORE mutation so we can rollback if state_root is wrong.
-        # This prevents a block with invalid state_root from corrupting chain state.
-        snapshot = self._snapshot_memory_state()
-
-        # Apply state changes (single code path for normal + reorg)
-        self._apply_block_state(block)
-        reward = self.supply.calculate_block_reward(block.header.block_number)
-        total_fees = sum(tx.fee for tx in block.transactions)
-        burned = total_fees  # approximate — each tx burns base_fee
-
-        # Incrementally refresh only the state_tree rows touched by this
-        # block. This is the O(K * TREE_DEPTH) path that replaces the
-        # O(N * TREE_DEPTH) full-rebuild — every block's cost is now
-        # bounded by the number of entities it touched, not the total
-        # account count.
-        self._touch_state(self._block_affected_entities(block))
-
-        # Verify state_root commitment (mandatory for all post-genesis blocks).
-        # Every block must commit to the post-application state. A zeroed
-        # state_root no longer bypasses validation — this prevents attackers
-        # from submitting blocks with fabricated state.
-        expected_state_root = self.compute_current_state_root()
-        if block.header.state_root != expected_state_root:
-            # Rollback: restore state from snapshot to prevent corruption.
-            # The state_tree now diverges from the restored dicts, so
-            # rebuild it from scratch to bring them back in sync. This
-            # is the slow path (O(N * TREE_DEPTH)) but it only fires on
-            # the rare rejection case.
-            self._restore_memory_snapshot(snapshot)
-            self._rebuild_state_tree()
-            return False, "Invalid state_root — state commitment mismatch"
-
-        self.chain.append(block)
-        self._block_by_hash[block.block_hash] = block
-
-        # Update fork choice: remove old tip, add new
-        old_tip = block.header.prev_hash
-        old_tip_data = self.fork_choice.tips.get(old_tip)
-        old_weight = old_tip_data[1] if old_tip_data else 0
-        block_weight = compute_block_stake_weight(block, self.supply.staked)
-        new_weight = old_weight + block_weight
-
-        self.fork_choice.remove_tip(old_tip)
-        self.fork_choice.add_tip(block.block_hash, block.header.block_number, new_weight)
-
-        # Process attestations for finality — uses pinned snapshot for
-        # the attestations' target block (N-1) rather than the live
-        # post-N stake to avoid validator churn corrupting the 2/3 check.
-        self._process_attestations(block, self.supply.staked)
-
-        # Pin the stake snapshot for this block so the NEXT block's
-        # attestations (which will target this block) can consult it.
-        self._record_stake_snapshot(block.header.block_number)
-
-        # Persist — atomic across the four writes.  Without the
-        # wrapping transaction, each helper auto-commits independently:
-        # a SIGKILL between `add_chain_tip` and `_persist_state`
-        # leaves the chain head pointing at block N while persisted
-        # balances/nonces/supply are still as-of N-1.  On restart,
-        # `_load_from_db` then loads the inconsistent state and every
-        # subsequent block fails state_root verification with no
-        # auto-repair path (integrity-check + reindex_state are
-        # currently unwired).  The genesis path at
-        # `_apply_mainnet_genesis_state` solves this exact problem with
-        # the same wrapper — the comment there is the authoritative
-        # explanation.  Mirror it here so the steady-state apply path
-        # has the same crash-window guarantee.
+        # Round-9 fix: wrap apply + state-root verify + persist in a
+        # SINGLE chaindb transaction.  Pre-fix multiple apply-time
+        # helpers (apply_key_rotation, _record_key_history,
+        # apply_revoke_transaction, first-spend pubkey installs in
+        # transfer / message tx) eagerly committed to chaindb BEFORE
+        # the per-block transaction opened below.  A block whose
+        # state_root mismatched got rolled back in-memory by
+        # `_restore_memory_snapshot`, but the disk mirror kept the
+        # rejected-block writes -- a subsequent cold restart
+        # rehydrated the corrupted state and silently forked off the
+        # canonical chain (e.g. a self-targeted KeyRotation in a
+        # bad-state-root block leaks `(height, attacker_pk)` into
+        # `key_history`; cold-restart `_public_key_at_height` then
+        # resolves attacker_pk for any block the entity signs).
+        #
+        # The wrapping transaction now covers `_apply_block_state`
+        # too: every chaindb write inside apply rides the outer txn
+        # via the chaindb's `_txn_depth` nesting (inner
+        # begin_transaction calls are no-ops at depth > 0; inner
+        # `_maybe_commit` calls become no-ops; only the outer commits
+        # or rolls back).  On state_root mismatch we
+        # `rollback_transaction` to undo all eager DB writes, AND
+        # restore the in-memory snapshot so the dicts agree with disk.
+        # Same defect-class fix as round 7's
+        # `_record_receipt_subtree_root` deferral, but applied at the
+        # apply-loop boundary so it covers ALL current and future
+        # eager writers without per-helper plumbing changes.
         if self.db is not None:
-            # Entity indices assigned by _apply_block_state above are
-            # already in self.entity_id_to_index, so any RegistrationTx
-            # in this block can now be referenced compactly too.
             self.db.begin_transaction()
-            try:
+        try:
+            # Snapshot state BEFORE mutation so we can rollback if
+            # state_root is wrong.  This prevents a block with
+            # invalid state_root from corrupting chain state.
+            snapshot = self._snapshot_memory_state()
+
+            # Apply state changes (single code path for normal + reorg).
+            self._apply_block_state(block)
+            reward = self.supply.calculate_block_reward(block.header.block_number)
+            total_fees = sum(tx.fee for tx in block.transactions)
+            burned = total_fees  # approximate — each tx burns base_fee
+
+            # Incrementally refresh only the state_tree rows touched by
+            # this block. O(K * TREE_DEPTH).
+            self._touch_state(self._block_affected_entities(block))
+
+            # Verify state_root commitment.  Mandatory for all
+            # post-genesis blocks; rejected blocks unwind both the
+            # in-memory snapshot AND the chaindb transaction.
+            expected_state_root = self.compute_current_state_root()
+            if block.header.state_root != expected_state_root:
+                self._restore_memory_snapshot(snapshot)
+                self._rebuild_state_tree()
+                if self.db is not None:
+                    self.db.rollback_transaction()
+                return False, "Invalid state_root — state commitment mismatch"
+
+            self.chain.append(block)
+            self._block_by_hash[block.block_hash] = block
+
+            # Update fork choice: remove old tip, add new
+            old_tip = block.header.prev_hash
+            old_tip_data = self.fork_choice.tips.get(old_tip)
+            old_weight = old_tip_data[1] if old_tip_data else 0
+            block_weight = compute_block_stake_weight(block, self.supply.staked)
+            new_weight = old_weight + block_weight
+
+            self.fork_choice.remove_tip(old_tip)
+            self.fork_choice.add_tip(block.block_hash, block.header.block_number, new_weight)
+
+            # Process attestations for finality — uses pinned snapshot
+            # for the attestations' target block (N-1) rather than the
+            # live post-N stake to avoid validator churn corrupting
+            # the 2/3 check.
+            self._process_attestations(block, self.supply.staked)
+
+            # Pin the stake snapshot for this block so the NEXT
+            # block's attestations consult the right pin.
+            self._record_stake_snapshot(block.header.block_number)
+
+            # Persist (still inside the outer transaction — the
+            # nested begin/commit in _persist_state is a no-op at
+            # depth > 0).  See the genesis path at
+            # `_apply_mainnet_genesis_state` for the authoritative
+            # rationale on why store_block / chain_tip / _persist_state
+            # MUST commit atomically with the apply.
+            if self.db is not None:
                 self.db.store_block(block, state=self)
                 self.db.remove_chain_tip(old_tip)
                 self.db.add_chain_tip(
@@ -9987,9 +10028,10 @@ class Blockchain:
                 )
                 self._persist_state()
                 self.db.commit_transaction()
-            except BaseException:
+        except BaseException:
+            if self.db is not None:
                 self.db.rollback_transaction()
-                raise
+            raise
 
         # Process any orphan blocks that depend on this block
         self._process_orphans(block.block_hash)

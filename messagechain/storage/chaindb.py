@@ -2314,8 +2314,21 @@ class ChainDB:
             raise
 
     def flush_state(self):
-        """Commit any pending writes."""
-        self._conn.commit()
+        """Commit any pending writes -- depth-aware.
+
+        Routes through `_maybe_commit` so a caller invoked inside an
+        outer `begin_transaction` scope (e.g. `Blockchain.add_block`'s
+        round-9 apply+verify+persist wrap) does NOT prematurely
+        commit the outer transaction mid-flight, breaking the
+        atomicity guarantee the wrap exists to provide.  Direct
+        `self._conn.commit()` was the prior implementation and would
+        flush the outer wrap on the first apply-time helper that
+        called flush_state (apply_revoke_transaction,
+        apply_key_rotation, _install_pubkey_direct, etc.), partially
+        defeating the round-9 fix.  Outside any wrap (cold-start
+        bootstrap, standalone tests) this still commits immediately.
+        """
+        self._maybe_commit()
 
     def _txn_depth(self) -> int:
         """Thread-local counter: how many begin_transaction scopes are

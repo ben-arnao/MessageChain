@@ -137,6 +137,16 @@ class TestBlockchainMirrorsKeyHistoryToDB(unittest.TestCase):
 
         self._pad_chain(chain, 42)
         chain._record_key_history(eid, old_pk)
+        # Round-9: chaindb mirroring of key_history no longer
+        # happens eagerly inside `_record_key_history` (the eager
+        # write leaked past in-memory rollback when a block's
+        # state-root mismatched).  Writes are now deferred to
+        # `_persist_state`, which is called inside the per-block
+        # SQL transaction wrapper in `_apply_block_state` /
+        # `add_block`.  Drive a flush here to keep the persistence
+        # round-trip semantics this test was originally written for.
+        chain._dirty_entities = None
+        chain._persist_state()
         db1.flush_state()
         _close_chaindb(db1)
 
@@ -184,6 +194,13 @@ class TestColdRestartPreservesPublicKeyAtHeight(unittest.TestCase):
         chain_a._record_key_history(eid, new_pk)
         # Current pubkey post-rotation is new_pk.
         chain_a.public_keys[eid] = new_pk
+        # Round-9: writes to chaindb's `key_history` table now happen
+        # via `_persist_state` rather than eagerly inside
+        # `_record_key_history` (eager-write leaked past in-memory
+        # rollback on a state-root rejection).  Drive a flush so the
+        # cold-restart half of this test sees the rotation history.
+        chain_a._dirty_entities = None
+        chain_a._persist_state()
         db_a.flush_state()
         _close_chaindb(db_a)
 
