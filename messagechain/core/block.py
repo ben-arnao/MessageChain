@@ -1360,8 +1360,30 @@ class Block:
         # acks_observed_this_block so a pre-Tier-17 blob is a strict
         # prefix.  Empty list on pre-activation blocks (and on every
         # post-activation block that simply happens to carry no votes).
+        #
+        # Backward-compat shim (1.19.1 fix): every pre-Tier-17 block
+        # already on disk was serialized WITHOUT this field.  Such
+        # blobs end with the 32-byte declared_hash exactly at this
+        # offset -- there is no u32 count of `react_transactions`.
+        # Decoding `dec_list(ReactTransaction)` on a pre-Tier-17 blob
+        # raised "Block blob truncated" inside `_load_from_db` on
+        # node startup, taking the validator down before it could
+        # serve a single block.  Detect end-of-blob (or
+        # declared_hash-only-remaining) and treat the field as `[]`
+        # without consuming any bytes.  Post-Tier-17 blobs are
+        # decoded normally.
         from messagechain.core.reaction import ReactTransaction
-        react_transactions = dec_list(ReactTransaction)
+        # Remaining bytes after this point MUST be at least 32 (the
+        # trailing declared_hash).  If exactly 32 remain, the blob
+        # has no react_transactions slot at all -- it predates the
+        # Tier-17 wire-format addition.  Treat as empty.  Any value
+        # in (32, 36) is a malformed blob (caught by the explicit
+        # length check below).
+        remaining = len(data) - off
+        if remaining == 32:
+            react_transactions = []
+        else:
+            react_transactions = dec_list(ReactTransaction)
 
         declared_hash = take(32)
         if off != len(data):
