@@ -25,6 +25,8 @@ built to last centuries.
 - **Democratic by default.** On-chain governance, distributed
   validation, no privileged operators. L2s can layer reputation,
   identity, and moderation on top.
+- **Cheap to validate.** Runs on commodity hardware — no GPUs, no
+  specialized rigs.
 
 ## Install
 
