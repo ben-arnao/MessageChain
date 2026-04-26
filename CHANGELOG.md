@@ -4,6 +4,74 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] — 2026-04-26
+
+Minor release. Two CRITICAL silent-fork fixes from the round-8 audit
+pass against the post-v1.16.0 chain state. Both are state-sync /
+cold-restart hazards: a node bootstrapped from a checkpoint snapshot
+or restarted after a failed reorg ended up with empty maps that the
+warm cluster relied on for evidence verification. **All mainnet
+operators should upgrade ASAP** — once Fix #1 is in place, freshly
+bootstrapped validators will correctly verify slash evidence at
+pre-rotation heights.
+
+Hard fork: `STATE_SNAPSHOT_VERSION 19 → 20`. Adds the new
+`key_history` section (per-entity rotation history) to the
+state-snapshot wire format and snapshot-root commitment. Pre-v20
+snapshots can no longer be decoded; the in-memory `setdefault` to an
+empty `key_history` is preserved for hand-built snapshot dicts in
+tests, but the binary decoder is strict.
+
+### Security
+
+- **`key_history` now lives in the state snapshot** (04d2548). Pre-fix
+  the snapshot did not encode `key_history` at all. State-synced nodes
+  bootstrapping from a checkpoint started with `self.key_history = {}`
+  for every entity, so `_public_key_at_height` fell back to the
+  CURRENT pubkey for any rotated entity. Slash evidence whose signing
+  height predated the rotation verified against the wrong key on the
+  synced node — slash rejected, while warm nodes admitted — silent
+  fork at the slash block. Adds:
+  - `_TAG_KEY_HISTORY` (`khist`) section with a custom
+    `(eid, height, pk)` leaf builder so the snapshot root commits to
+    every rotation tuple
+  - `_encode_key_history` / `_decode_key_history` with deterministic
+    outer-by-eid + inner-by-(height, pk) sort order
+  - `serialize_state` extracts `blockchain.key_history`
+  - `_install_state_snapshot` installs the dict AND mirrors entries
+    into chaindb's `key_history` table so cold restart on the synced
+    node rehydrates from disk
+- **chaindb save/restore symmetry on receipt-subtree + key-rotation-
+  cooldown mirror tables** (04d2548). Pre-fix `save_state_snapshot`
+  did NOT capture `receipt_subtree_roots`,
+  `past_receipt_subtree_roots`, or `key_rotation_last_height`, but
+  `restore_state_snapshot` DELETEd all three. The reorg-failure path
+  in blockchain.py called `restore_state_snapshot` then returned
+  without `_persist_state` — in the post-restore window a process
+  exit (operator restart, OOM, SIGKILL) cold-restarted the node into
+  empty mirrors. After the round-7 forged-receipt fix an empty
+  `receipt_subtree_roots` makes LEGITIMATE `CensorshipEvidence`
+  rejected on the cold-restarted node while warm nodes admit —
+  silent fork. The fix:
+  - `save_state_snapshot` includes the three missing keys
+  - `restore_state_snapshot` adds three INSERT loops that re-populate
+    from the snapshot dict atomically inside the same transaction
+    that ran the DELETEs
+  - belt-and-suspenders: the reorg-failure path now calls
+    `_persist_state` after `_reset_state` + replay so future fields
+    added to one side without the other still resync before the next
+    block.
+
+### Notes
+
+- `STATE_SNAPSHOT_VERSION` bump is a wire-format break: a v1.17+ node
+  cannot decode a v19 snapshot blob. Live operators do not currently
+  bootstrap via checkpoint, so this is forward-only — re-bake any
+  archived snapshots on the upgraded code.
+- No new CLI commands, no new RPC methods, no behavior change for
+  honest operators on the steady-state path. The fixes are purely
+  "make state-sync and post-reorg-crash recovery actually work."
+
 ## [1.16.0] — 2026-04-26
 
 Minor release. Four CRITICAL security fixes from the round-7 audit
