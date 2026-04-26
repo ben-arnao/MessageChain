@@ -29,6 +29,7 @@ from messagechain.config import (
     KEY_ROTATION_COOLDOWN_BLOCKS, BASE_FEE_INITIAL,
     NEW_ACCOUNT_FEE, MAX_NEW_ACCOUNTS_PER_BLOCK,
     EVIDENCE_INCLUSION_WINDOW, EVIDENCE_EXPIRY_BLOCKS,
+    REACT_TX_HEIGHT,
 )
 from messagechain.core.block import (
     Block, compute_merkle_root, compute_state_root, create_genesis_block,
@@ -75,6 +76,22 @@ from messagechain.consensus.fork_choice import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _mix_state_roots(entity_root: bytes, reaction_root: bytes) -> bytes:
+    """Combine entity-state and reaction-state subroots into one state root.
+
+    Used at and after REACT_TX_HEIGHT to fold ReactionState into the
+    chain's single-32-byte state-root commitment.  Pre-activation the
+    function is unused — historical block headers commit only to the
+    entity-SMT root, so re-validating those headers under post-fork
+    code uses ``entity_root`` directly.
+
+    Domain-separated by a fixed prefix so the mix can never coincide
+    with any other 64-byte concatenation hashed elsewhere in the
+    pipeline.
+    """
+    return default_hash(b"react_state_mix_v1" + entity_root + reaction_root)
 
 
 class ChainIntegrityError(RuntimeError):
@@ -618,6 +635,17 @@ class Blockchain:
         # WITNESS_RESPONSE_DEADLINE_BLOCKS window.  See
         # _prune_witness_ack_registry.
         self.witness_ack_registry: dict[bytes, int] = {}
+
+        # Tier 17 ReactTransaction state — owns the (voter, target,
+        # target_is_user) -> latest_choice map and the per-target
+        # denormalised aggregates (user_trust_score, message_score).
+        # Mutated during _apply_block_state's react-tx loop, committed
+        # into the chain state root post-REACT_TX_HEIGHT, and rebuilt
+        # by chain replay on restart (no chaindb persistence in this
+        # iteration — the rebuild cost is bounded by chain length).
+        # See messagechain/core/reaction.py.
+        from messagechain.core.reaction import ReactionState
+        self.reaction_state: ReactionState = ReactionState()
 
         # Non-response-evidence processor (silent-TCP-drop slashing).
         # One-phase: every admitted NonResponseEvidenceTx triggers
@@ -3703,9 +3731,24 @@ class Blockchain:
         that trusts the tree without resync is a follow-up, gated on
         auditing every mutation path through a single `_touch_state`
         hook.
+
+        Tier 17 ReactTransaction state mixes in at/after REACT_TX_HEIGHT.
+        Pre-activation chains commit only the entity-state SMT root so
+        every historical block round-trips bit-for-bit through the
+        post-fork code.  Post-activation, the canonical state root is
+        ``H(entity_smt_root || reaction_state_contribution)`` — both
+        components live in the same hard-fork-gated commitment so a
+        light client with a single state-root proof verifies both the
+        per-account state AND any reaction-state value with one anchor.
         """
         self._rebuild_state_tree()
-        return self.state_tree.root()
+        entity_root = self.state_tree.root()
+        if self.height >= REACT_TX_HEIGHT:
+            return _mix_state_roots(
+                entity_root,
+                self.reaction_state.state_root_contribution(),
+            )
+        return entity_root
 
     def compute_post_state_root(
         self,
@@ -3724,6 +3767,7 @@ class Blockchain:
         custody_proofs: list | None = None,
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
+        react_transactions: list | None = None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -3885,6 +3929,35 @@ class Blockchain:
             _accumulate_attester_fee(effective_base_fee)
             sim_nonces[ttx.entity_id] = ttx.nonce + 1
             _bump_wm(ttx.entity_id, ttx.signature.leaf_index)
+
+        # Simulate Tier 17 ReactTransactions.  Mirrors _apply_block_state's
+        # react-tx loop exactly — fee-with-burn (no surcharge), nonce
+        # bump, leaf-watermark bump, and a delta into a sim copy of
+        # ReactionState.choices.  The sim copy lives only inside this
+        # call; the final state_root mix below uses it to derive the
+        # post-block reaction-state contribution without mutating
+        # self.reaction_state.  Pre-Tier-17 callers pass an empty list
+        # (or omit the kwarg) and the loop is a no-op.
+        sim_react_choices = dict(self.reaction_state.choices)
+        for rtx in (react_transactions or []):
+            effective_base_fee = min(current_base_fee, rtx.fee)
+            tip = rtx.fee - effective_base_fee
+            sim_balances[rtx.voter_id] = (
+                sim_balances.get(rtx.voter_id, 0) - rtx.fee
+            )
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + tip
+            )
+            _accumulate_attester_fee(effective_base_fee)
+            sim_nonces[rtx.voter_id] = rtx.nonce + 1
+            _bump_wm(rtx.voter_id, rtx.signature.leaf_index)
+            # Mirror ReactionState.apply on the local sim dict.
+            from messagechain.core.reaction import REACT_CHOICE_CLEAR
+            key = (rtx.voter_id, rtx.target, rtx.target_is_user)
+            if rtx.choice == REACT_CHOICE_CLEAR:
+                sim_react_choices.pop(key, None)
+            else:
+                sim_react_choices[key] = rtx.choice
 
         # Simulate authority transactions — fee-with-burn plus each
         # type's distinctive authority-state mutation.  Keep in lockstep
@@ -5117,13 +5190,31 @@ class Blockchain:
                     is_revoked=new_tuple[7],
                     is_slashed=new_tuple[8],
                 )
-            return self.state_tree.root()
+            entity_root = self.state_tree.root()
         finally:
             # Unconditional rollback: the sim must never leak mutations
             # into the live tree, even on an exception path.  Rollback
             # is O(changes) and doesn't snapshot the tree, so it's
             # cheap regardless of K.
             self.state_tree.rollback()
+
+        # Tier 17: at/after REACT_TX_HEIGHT the canonical state root
+        # mixes the reaction-state contribution.  Use the sim_react_choices
+        # dict built above so the post-state root reflects every
+        # ReactTransaction in this proposed block.  Pre-activation
+        # heights short-circuit to entity_root, exactly matching
+        # compute_current_state_root's symmetric path.
+        if block_height >= REACT_TX_HEIGHT:
+            from messagechain.core.reaction import (
+                ReactionState as _ReactionState,
+            )
+            sim_state = _ReactionState()
+            sim_state.choices = sim_react_choices
+            return _mix_state_roots(
+                entity_root,
+                sim_state.state_root_contribution(),
+            )
+        return entity_root
 
     def propose_block(
         self,
@@ -5142,6 +5233,7 @@ class Blockchain:
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
         acks_observed_this_block: list | None = None,
+        react_transactions: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -5201,6 +5293,7 @@ class Blockchain:
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+            react_transactions=react_transactions,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -5283,6 +5376,7 @@ class Blockchain:
             timestamp=timestamp,
             state_root_checkpoint=state_root_checkpoint,
             acks_observed_this_block=acks_observed_this_block,
+            react_transactions=react_transactions,
         )
 
     def _derive_observed_acks_for_block(self) -> list:
@@ -6141,6 +6235,24 @@ class Blockchain:
         if not ok:
             return False, reason
 
+        # Tier 17: structural pre-activation emptiness — runs BEFORE
+        # any cryptographic / merkle work so a pre-fork block with
+        # ReactTransactions in it gets rejected for the right reason
+        # (activation gate) and not "invalid merkle root" or some
+        # downstream error.  Per-tx admission still runs in the main
+        # validation loop below for post-activation blocks.
+        _react_txs_early = getattr(block, "react_transactions", []) or []
+        if (
+            block.header.block_number < REACT_TX_HEIGHT
+            and _react_txs_early
+        ):
+            return False, (
+                f"react_transactions must be empty before "
+                f"REACT_TX_HEIGHT={REACT_TX_HEIGHT} "
+                f"(block height {block.header.block_number} carries "
+                f"{len(_react_txs_early)})"
+            )
+
         # Block version gate.
         #
         # A block header whose `version` exceeds `MAX_SUPPORTED_BLOCK_VERSION`
@@ -6926,6 +7038,115 @@ class Blockchain:
             )
             if not ok:
                 return False, f"Invalid unstake tx: {reason}"
+
+        # ── Tier 17 ReactTransactions ────────────────────────────────
+        # Pre-activation: list MUST be empty.  Post-activation: every
+        # entry passes the admission gate (registered voter, valid
+        # target, signature ok, nonce monotonic, fee >= base_fee, no
+        # self-trust).  Nonce and balance share the same pending_*
+        # dicts as message / transfer / stake txs above so a single
+        # voter can interleave kinds within one block under a shared
+        # monotonic nonce space.
+        react_txs = getattr(block, "react_transactions", []) or []
+        if block.header.block_number < REACT_TX_HEIGHT and react_txs:
+            return False, (
+                f"react_transactions must be empty before "
+                f"REACT_TX_HEIGHT={REACT_TX_HEIGHT} "
+                f"(block height {block.header.block_number} carries "
+                f"{len(react_txs)})"
+            )
+        if react_txs:
+            from messagechain.core.reaction import (
+                verify_react_transaction,
+            )
+            for rtx in react_txs:
+                # Voter must be a registered entity (public_key on
+                # chain or installed earlier in this block via a
+                # first-send).  Unlike Transfer's first-spend reveal,
+                # ReactTransaction has no sender_pubkey field — react
+                # txs are NOT a first-spend admission path, voters
+                # must already be registered.
+                voter_pk = (
+                    self.public_keys.get(rtx.voter_id)
+                    or pending_pubkey_installs.get(rtx.voter_id)
+                )
+                if voter_pk is None:
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"voter {rtx.voter_id.hex()[:16]} not registered"
+                    )
+                # Base-fee gate (mirrors the per-type checks above).
+                if rtx.fee < current_base_fee:
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"fee {rtx.fee} below current base_fee {current_base_fee}"
+                    )
+                # Fee-floor + activation + canon-form + self-trust + sig.
+                if not verify_react_transaction(
+                    rtx, voter_pk,
+                    current_height=block.header.block_number,
+                ):
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"signature/fee/canon-form/activation gate failed"
+                    )
+                # Target existence — strict.
+                if rtx.target_is_user:
+                    target_known = (
+                        rtx.target in self.public_keys
+                        or rtx.target in pending_pubkey_installs
+                    )
+                    if not target_known:
+                        return False, (
+                            f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                            f"user-trust target "
+                            f"{rtx.target.hex()[:16]} not registered"
+                        )
+                else:
+                    # Message-react target must reference a confirmed
+                    # message tx_hash in canonical chain history.  The
+                    # tx-location index is the canonical existence
+                    # oracle.  Pre-message-tx (genesis-only chains) the
+                    # db handle may be None — in that case there are no
+                    # message txs to react to and any non-None target
+                    # is invalid.
+                    target_loc = (
+                        self.db.get_tx_location(rtx.target)
+                        if self.db is not None
+                        else None
+                    )
+                    if target_loc is None:
+                        return False, (
+                            f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                            f"message-react target "
+                            f"{rtx.target.hex()[:16]} not in chain"
+                        )
+                # Nonce — shares the same monotonic counter as every
+                # other fee-paying tx kind from the same voter.
+                expected_nonce = pending_nonces.get(
+                    rtx.voter_id, self.nonces.get(rtx.voter_id, 0),
+                )
+                if rtx.nonce != expected_nonce:
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"Invalid nonce: expected {expected_nonce}, "
+                        f"got {rtx.nonce}"
+                    )
+                # Cumulative balance check — voter must afford fee on
+                # top of every other fee paid earlier in this block.
+                spent_so_far = pending_balance_spent.get(rtx.voter_id, 0)
+                if (
+                    self.get_spendable_balance(rtx.voter_id)
+                    < spent_so_far + rtx.fee
+                ):
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"insufficient balance for fee {rtx.fee}"
+                    )
+                pending_nonces[rtx.voter_id] = expected_nonce + 1
+                pending_balance_spent[rtx.voter_id] = (
+                    spent_so_far + rtx.fee
+                )
 
         # Custody-proof hygiene + cryptographic validation.  Matches
         # the state_root_checkpoint hygiene pattern: non-challenge
@@ -8408,6 +8629,25 @@ class Blockchain:
         for ttx in block.transfer_transactions:
             self._apply_transfer_with_burn(ttx, proposer_id, current_base_fee)
             self._bump_watermark(ttx.entity_id, ttx.signature.leaf_index)
+        # Apply Tier 17 ReactTransactions: charge fee, bump nonce + leaf
+        # watermark, mutate ReactionState by the choice delta.  Same
+        # pay_fee_with_burn pricing as MessageTransaction so the fee
+        # market prices a vote uniformly with every other tx kind.
+        # validate_block has already run admission checks (signature,
+        # height-gate, no self-trust, target validity) — this loop
+        # only mutates state.
+        for rtx in getattr(block, "react_transactions", []) or []:
+            if not self.supply.pay_fee_with_burn(
+                rtx.voter_id, proposer_id, rtx.fee, current_base_fee,
+            ):
+                logger.error(
+                    f"React tx {rtx.tx_hash.hex()[:16]} fee payment failed "
+                    f"(fee {rtx.fee} vs base_fee {current_base_fee}) — skipping"
+                )
+                continue
+            self.nonces[rtx.voter_id] = rtx.nonce + 1
+            self._bump_watermark(rtx.voter_id, rtx.signature.leaf_index)
+            self.reaction_state.apply(rtx)
         # Apply slash transactions.  Burns stake + accumulated escrow;
         # escrow burn runs first so any bootstrap-era rewards the
         # offender had built up also evaporate.  Matches the policy
@@ -10454,6 +10694,13 @@ class Blockchain:
         self.validator_archive_misses = {}
         self.validator_first_active_block = {}
         self.validator_archive_success_streak = {}
+        # Tier 17 ReactionState — replay-rebuilt from blocks containing
+        # ReactTransactions, mirroring the rest of the in-memory dicts
+        # cleared above.  Cleared here so a reorg that rolls past the
+        # vote(s) backing a particular score correctly re-derives the
+        # canonical-chain state.
+        from messagechain.core.reaction import ReactionState
+        self.reaction_state = ReactionState()
         # Reset first-divestment stake reference.  This is NOT a security
         # ratchet — it's the "stake at first observed divestment" anchor
         # used to measure drain debt.  On a reorg that rolls past the
