@@ -232,6 +232,7 @@ class ProofOfStake:
         timestamp: float | None = None,
         state_root_checkpoint: bytes = b"\x00" * 32,
         acks_observed_this_block: list[bytes] | None = None,
+        react_transactions: list | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -265,6 +266,7 @@ class ProofOfStake:
         censorship_txs = list(censorship_evidence_txs or [])
         bogus_rej_txs = list(bogus_rejection_evidence_txs or [])
         acks_observed = list(acks_observed_this_block or [])
+        react_txs = list(react_transactions or [])
         # Route through the canonical tx-hash builder so proposer and
         # validator cannot drift on what's in the merkle tree.  We
         # assemble a minimal namespace-like object that exposes the
@@ -284,6 +286,7 @@ class ProofOfStake:
             censorship_evidence_txs=censorship_txs,
             bogus_rejection_evidence_txs=bogus_rej_txs,
             acks_observed_this_block=acks_observed,
+            react_transactions=react_txs,
         )
         from messagechain.core.block import canonical_block_tx_hashes
         tx_hashes = canonical_block_tx_hashes(_block_like)
@@ -383,6 +386,7 @@ class ProofOfStake:
             censorship_evidence_txs=censorship_txs,
             bogus_rejection_evidence_txs=bogus_rej_txs,
             acks_observed_this_block=acks_observed,
+            react_transactions=react_txs,
         )
         block.block_hash = block._compute_hash()
         return block

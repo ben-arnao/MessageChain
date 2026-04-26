@@ -242,6 +242,7 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     acks_observed = list(
         getattr(block, "acks_observed_this_block", []) or []
     )
+    react_txs = list(getattr(block, "react_transactions", []) or [])
 
     out: list[bytes] = []
     out.extend(tx.tx_hash for tx in msg_txs)
@@ -263,6 +264,11 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     # InclusionListViolationEvidenceTx commits via tx_hash.  Order
     # follows the wire-format slot order — append-only, never reorder.
     out.extend(tx.tx_hash for tx in ilv_txs)
+    # ReactTransaction (Tier 17) commits via tx_hash.  Append-only at
+    # the tail of the existing entries — the on-wire slot order has
+    # to match this list for merkle_root to agree across producers and
+    # validators.
+    out.extend(tx.tx_hash for tx in react_txs)
     # The InclusionList itself (the consensus-objective forced-inclusion
     # commitment) commits via its list_hash.  At most one per block, so
     # contribute exactly one hash on populated blocks and zero
@@ -803,6 +809,18 @@ class Block:
     # late joiners can still use to audit "validator X was credited in
     # epoch E."
     archive_proof_bundle: object = None  # Optional[ArchiveProofBundle]
+    # ReactTransaction list (Tier 17 / REACT_TX_HEIGHT) — user-trust
+    # and message-react votes.  Each entry mutates the per-(voter,
+    # target) latest choice in Blockchain.reaction_state on apply, and
+    # the resulting state root contribution is folded into the block's
+    # state_root.  Empty pre-activation; populated post-fork blocks
+    # carry one entry per included vote.  Folded into merkle_root via
+    # canonical_block_tx_hashes so a relayer cannot strip or mutate
+    # entries without invalidating the proposer's signature.  Same
+    # consensus-format hard-fork shape as every other slot here:
+    # pre-Tier-17 binaries cannot decode blocks emitted with this slot
+    # populated.
+    react_transactions: list = field(default_factory=list)
     # Witness-ack aggregation: list of 32-byte `request_hash`es whose
     # corresponding SubmissionAck the proposer observed in their local
     # WitnessObservationStore.  Validators apply each entry by writing
@@ -901,6 +919,13 @@ class Block:
             # list omitted entirely.
             result["acks_observed_this_block"] = [
                 ack.serialize() for ack in self.acks_observed_this_block
+            ]
+        if self.react_transactions:
+            # Tier 17 ReactTransactions — same dict-shape pattern as
+            # every other tx slot.  Empty list omitted entirely on
+            # pre-activation and idle-vote-window blocks.
+            result["react_transactions"] = [
+                tx.serialize() for tx in self.react_transactions
             ]
         if self.archive_proof_bundle is not None:
             # Serialized as hex of canonical bytes — a scalar blob, not
@@ -1119,6 +1144,14 @@ class Block:
             # format change: pre-feature binaries cannot decode blocks
             # with this slot populated.
             _encode_acks_observed(self.acks_observed_this_block),
+            # react_transactions (Tier 17) — strictly appended after
+            # acks_observed_this_block so a pre-Tier-17 blob is a
+            # strict prefix of a post-Tier-17 blob (modulo the
+            # block_hash trailer).  Empty list pays 4 bytes (u32 zero
+            # count) on every pre-activation block.  Consensus-format
+            # change: pre-Tier-17 binaries cannot decode blocks
+            # emitted with this slot populated.
+            enc_list(self.react_transactions),
             self.block_hash,
         ])
 
@@ -1323,6 +1356,13 @@ class Block:
         # enforced at validate_block time, not here.
         acks_observed_this_block, off = _decode_acks_observed(data, off)
 
+        # react_transactions (Tier 17) — appended after
+        # acks_observed_this_block so a pre-Tier-17 blob is a strict
+        # prefix.  Empty list on pre-activation blocks (and on every
+        # post-activation block that simply happens to carry no votes).
+        from messagechain.core.reaction import ReactTransaction
+        react_transactions = dec_list(ReactTransaction)
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -1347,6 +1387,7 @@ class Block:
             inclusion_list=inclusion_list_obj,
             archive_proof_bundle=archive_proof_bundle,
             acks_observed_this_block=acks_observed_this_block,
+            react_transactions=react_transactions,
         )
         expected_hash = block._compute_hash()
         if expected_hash != declared_hash:
@@ -1451,6 +1492,13 @@ class Block:
                 SubmissionAck.deserialize(d)
                 for d in data["acks_observed_this_block"]
             ]
+        react_transactions = []
+        if data.get("react_transactions"):
+            from messagechain.core.reaction import ReactTransaction
+            react_transactions = [
+                ReactTransaction.deserialize(t)
+                for t in data["react_transactions"]
+            ]
         block = cls(header=header, transactions=txs, validator_signatures=val_sigs,
                     slash_transactions=slash_txs, attestations=attestations,
                     transfer_transactions=transfer_txs, governance_txs=governance_txs,
@@ -1465,7 +1513,8 @@ class Block:
                     ),
                     inclusion_list=inclusion_list_obj,
                     archive_proof_bundle=archive_proof_bundle,
-                    acks_observed_this_block=acks_observed_this_block)
+                    acks_observed_this_block=acks_observed_this_block,
+                    react_transactions=react_transactions)
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = block._compute_hash()
         declared_hash = bytes.fromhex(data["block_hash"])
