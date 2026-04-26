@@ -209,26 +209,34 @@ class TestMempoolParameters(unittest.TestCase):
         self.assertEqual(MEMPOOL_MAX_ANCESTORS, 5)
 
 
-class TestDynamicFeeCeiling(unittest.TestCase):
-    """Dynamic fee ceiling punishes spam during congestion."""
+class TestDynamicFeeNoOpShim(unittest.TestCase):
+    """DynamicFeePolicy is a no-op shim — relay floor is flat MARKET_FEE_FLOOR.
 
-    def test_default_max_fee_is_10000(self):
-        policy = DynamicFeePolicy()
-        self.assertEqual(policy.max_fee, 10_000)
+    The fee model deliberately does NOT scale per-tx fees with mempool
+    pressure: the spam ceiling is delivered by block cadence + per-block
+    byte budget, not fee inflation.  See CLAUDE.md "Fee model — minimum
+    fee is 1, never 0; spam ceiling is block timing, not per-tx fee
+    inflation."  These tests pin the no-op behavior so a future change
+    that re-introduces dynamic scaling fails loudly.
+    """
 
-    def test_default_base_fee_is_min_fee(self):
-        policy = DynamicFeePolicy()
-        self.assertEqual(policy.base_fee, MIN_FEE)
-
-    def test_full_mempool_fee_reaches_ceiling(self):
+    def test_full_mempool_fee_is_market_floor(self):
+        from messagechain.config import MARKET_FEE_FLOOR
         policy = DynamicFeePolicy()
         fee = policy.get_min_relay_fee(5000, 5000)
-        self.assertEqual(fee, 10_000)
+        self.assertEqual(fee, MARKET_FEE_FLOOR)
 
-    def test_empty_mempool_fee_is_base(self):
+    def test_empty_mempool_fee_is_market_floor(self):
+        from messagechain.config import MARKET_FEE_FLOOR
         policy = DynamicFeePolicy()
         fee = policy.get_min_relay_fee(0, 5000)
-        self.assertEqual(fee, MIN_FEE)
+        self.assertEqual(fee, MARKET_FEE_FLOOR)
+
+    def test_constructor_args_have_no_effect(self):
+        """base_fee and max_fee constructor args are accepted but ignored."""
+        from messagechain.config import MARKET_FEE_FLOOR
+        policy = DynamicFeePolicy(base_fee=999, max_fee=99_999)
+        self.assertEqual(policy.get_min_relay_fee(2500, 5000), MARKET_FEE_FLOOR)
 
 
 class TestGovernanceFees(unittest.TestCase):

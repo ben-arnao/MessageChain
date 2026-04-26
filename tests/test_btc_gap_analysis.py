@@ -523,45 +523,27 @@ class TestSoftForkSignaling(unittest.TestCase):
         self.assertFalse(tracker.is_active_at(tracker.lock_in_height + 2))
 
 
-# ─── 10. Dynamic Minimum Relay Fee ───────────────────────────────────
+# ─── 10. Flat MARKET_FEE_FLOOR replaces dynamic relay fee ────────────
 
-class TestDynamicMinRelayFee(unittest.TestCase):
-    """Dynamic minimum relay fee adjusts based on mempool pressure."""
+class TestFlatRelayFee(unittest.TestCase):
+    """Relay floor is flat MARKET_FEE_FLOOR — no pressure scaling.
 
-    def test_min_fee_at_empty_mempool(self):
-        """When mempool is empty, minimum fee is the base MIN_FEE."""
-        from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
-        self.assertEqual(policy.get_min_relay_fee(mempool_size=0, mempool_max=5000), 100)
+    Per CLAUDE.md "Fee model — minimum fee is 1, never 0; spam ceiling
+    is block timing, not per-tx fee inflation."  ``DynamicFeePolicy``
+    is now a no-op shim retained for back-compat with old constructor
+    args.
+    """
 
-    def test_min_fee_increases_with_mempool_pressure(self):
-        """As mempool fills up, minimum relay fee increases."""
-        from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
-
-        fee_low = policy.get_min_relay_fee(mempool_size=100, mempool_max=5000)
-        fee_mid = policy.get_min_relay_fee(mempool_size=2500, mempool_max=5000)
-        fee_high = policy.get_min_relay_fee(mempool_size=4500, mempool_max=5000)
-
-        self.assertLessEqual(fee_low, fee_mid)
-        self.assertLessEqual(fee_mid, fee_high)
-
-    def test_min_fee_capped_at_max(self):
-        """Minimum relay fee never exceeds the configured max."""
-        from messagechain.economics.dynamic_fee import DynamicFeePolicy
-        policy = DynamicFeePolicy(base_fee=100, max_fee=5000)
-
-        fee = policy.get_min_relay_fee(mempool_size=5000, mempool_max=5000)
-        self.assertLessEqual(fee, 5000)
-
-    def test_mempool_rejects_below_dynamic_fee(self):
-        """Mempool integration: transactions below dynamic fee are rejected."""
+    def test_relay_fee_is_flat_market_floor_at_all_pressures(self):
+        from messagechain.config import MARKET_FEE_FLOOR
         from messagechain.economics.dynamic_fee import DynamicFeePolicy
         policy = DynamicFeePolicy(base_fee=100, max_fee=10000)
 
-        # When mempool is 90% full, min fee should be > 100
-        min_fee = policy.get_min_relay_fee(mempool_size=4500, mempool_max=5000)
-        self.assertGreater(min_fee, 100)
+        for size in (0, 100, 2500, 4500, 5000):
+            self.assertEqual(
+                policy.get_min_relay_fee(mempool_size=size, mempool_max=5000),
+                MARKET_FEE_FLOOR,
+            )
 
 
 if __name__ == "__main__":

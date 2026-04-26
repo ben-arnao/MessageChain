@@ -245,14 +245,21 @@ class ProofOfStake:
         were attached post-signing and not cryptographically bound — any
         relay node could drop them in transit.
         """
-        # Apply both tx count cap and message byte budget.
-        # Byte budget ensures large messages compete for limited space.
+        # Best-fit knapsack fill: walk the density-sorted candidate list
+        # and skip txs that don't fit in the remaining byte budget,
+        # rather than stopping at the first oversize tx.  When a 1024B
+        # tx can't fit but a 200B tx further down the list can, we
+        # still pack it — keeps the byte budget tight under the
+        # fee-per-byte selection priority.  Stop only when the count
+        # cap is hit or the candidate list is exhausted.
         txs = []
         msg_bytes_used = 0
-        for tx in transactions[:MAX_TXS_PER_BLOCK]:
+        for tx in transactions:
+            if len(txs) >= MAX_TXS_PER_BLOCK:
+                break
             tx_msg_size = len(tx.message)
             if msg_bytes_used + tx_msg_size > MAX_BLOCK_MESSAGE_BYTES:
-                break
+                continue  # too big to fit here; try smaller txs next
             txs.append(tx)
             msg_bytes_used += tx_msg_size
         transfer_txs = (transfer_transactions or [])[:MAX_TXS_PER_BLOCK]

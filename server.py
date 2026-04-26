@@ -1679,7 +1679,17 @@ class Server(SharedRuntimeMixin):
             return self._rpc_get_latest_release(request["params"])
 
         elif method == "get_fee_estimate":
-            return {"ok": True, "result": {"fee_estimate": self.mempool.get_fee_estimate()}}
+            # Optional ``message_bytes`` lets callers get a size-aware
+            # absolute-fee estimate (median fee-per-byte × size, floored
+            # at MARKET_FEE_FLOOR).  Omitted/zero → returns the floor.
+            mb_raw = request.get("params", {}).get("message_bytes", 0)
+            try:
+                mb = int(mb_raw)
+            except (TypeError, ValueError):
+                mb = 0
+            return {"ok": True, "result": {
+                "fee_estimate": self.mempool.get_fee_estimate(message_bytes=mb)
+            }}
 
         elif method == "get_nonce":
             entity_id = parse_hex(request["params"].get("entity_id", ""), expected_len=32)
@@ -2713,12 +2723,19 @@ class Server(SharedRuntimeMixin):
         )
         kind = params.get("kind", "message")
         recipient_is_new = False
+        # ``message_bytes`` drives the size-aware mempool estimate
+        # below.  Defaults to 0 for kinds without a meaningful payload
+        # size (e.g. transfer) — the estimator returns the floor in
+        # that case and ``min_fee`` carries the actual price.
+        message_bytes = 0
         if kind == "message":
             msg = params.get("message", "")
             if not isinstance(msg, str):
                 return {"ok": False, "error": "message must be a string"}
             if len(msg) > MAX_MESSAGE_CHARS:
                 return {"ok": False, "error": f"Message exceeds {MAX_MESSAGE_CHARS} chars"}
+            msg_bytes = msg.encode("utf-8")
+            message_bytes = len(msg_bytes)
             # Post-activation consensus prices (message + witness) bytes.
             # The server advertises the same rule clients will face at
             # submission time so estimates don't under-quote.  Pre-activation
@@ -2730,11 +2747,9 @@ class Server(SharedRuntimeMixin):
                 and isinstance(sig_bytes, int)
                 and sig_bytes > 0
             ):
-                min_fee = calculate_min_fee(
-                    msg.encode("utf-8"), signature_bytes=sig_bytes,
-                )
+                min_fee = calculate_min_fee(msg_bytes, signature_bytes=sig_bytes)
             else:
-                min_fee = calculate_min_fee(msg.encode("utf-8"))
+                min_fee = calculate_min_fee(msg_bytes)
         elif kind == "transfer":
             min_fee = MIN_FEE
             # Optional recipient_id: if provided and the recipient has no
@@ -2750,7 +2765,7 @@ class Server(SharedRuntimeMixin):
         else:
             return {"ok": False, "error": f"Unknown fee kind: {kind}"}
 
-        mempool_fee = self.mempool.get_fee_estimate()
+        mempool_fee = self.mempool.get_fee_estimate(message_bytes=message_bytes)
         result = {
             "min_fee": min_fee,
             "mempool_fee": mempool_fee,

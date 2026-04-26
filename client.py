@@ -154,11 +154,15 @@ def cmd_send_message(args):
     nonce = nonce_resp["result"]["nonce"]
 
 
-    # Get fee estimate
+    # Get fee estimate — pass our message's stored byte count so the
+    # server returns a size-aware suggested fee (median fee-per-byte ×
+    # bytes), matching the proposer's selection priority.
     fee = args.fee
     if not fee:
-        est_resp = rpc_call(args.host, args.rpc_port, "get_fee_estimate", {})
-        suggested = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 5
+        est_resp = rpc_call(args.host, args.rpc_port, "get_fee_estimate", {
+            "message_bytes": len(message.encode("utf-8")),
+        })
+        suggested = est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 1
         print(f"Suggested fee: {suggested} tokens (higher = faster inclusion)")
         fee_input = input(f"Fee [{suggested}]: ").strip()
         fee = int(fee_input) if fee_input else suggested

@@ -83,7 +83,7 @@ class TestRpcEstimateFeeSurcharge(unittest.TestCase):
         srv = MagicMock()
         srv.blockchain = chain
         srv.mempool = Mempool()
-        srv.mempool.get_fee_estimate = lambda: 1
+        srv.mempool.get_fee_estimate = lambda message_bytes=0: 1
         return srv, alice, bob
 
     def test_rpc_transfer_to_existing_recipient_no_surcharge(self):

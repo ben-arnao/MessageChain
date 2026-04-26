@@ -225,8 +225,9 @@ class TestEstimateFeeSizeValidation(unittest.TestCase):
         import server as server_module
         srv = self._make_server()
 
-        # Need mempool.get_fee_estimate to work
-        srv.mempool.get_fee_estimate = lambda: 1
+        # Need mempool.get_fee_estimate to work — accept the new
+        # message_bytes kwarg the size-aware estimator takes.
+        srv.mempool.get_fee_estimate = lambda message_bytes=0: 1
 
         result = server_module.Server._rpc_estimate_fee(
             srv, {"kind": "message", "message": "A" * 280}
