@@ -309,9 +309,25 @@ class ProofOfStake:
             chosen_ts = max(time.time(), prev_block.header.timestamp + 1)
         else:
             chosen_ts = timestamp
+        # Validator version signaling (Fork 1): blocks produced at/after
+        # VERSION_SIGNALING_HEIGHT carry CURRENT_VALIDATOR_VERSION in
+        # the header so peers (and future activation gates) can tell
+        # which release minted them.  Pre-activation blocks default the
+        # field to UNSIGNALLED so signable_data() omits it under V1
+        # wire format and the original block hash is preserved.
+        from messagechain.config import VERSION_SIGNALING_HEIGHT
+        from messagechain.consensus.validator_versions import (
+            CURRENT_VALIDATOR_VERSION,
+            UNSIGNALLED as _VV_UNSIGNALLED,
+        )
+        new_block_number = prev_block.header.block_number + 1
+        if new_block_number >= VERSION_SIGNALING_HEIGHT:
+            stamped_version = CURRENT_VALIDATOR_VERSION
+        else:
+            stamped_version = _VV_UNSIGNALLED
         header = BlockHeader(
             version=1,
-            block_number=prev_block.header.block_number + 1,
+            block_number=new_block_number,
             prev_hash=prev_block.block_hash,
             merkle_root=merkle_root,
             timestamp=chosen_ts,
@@ -319,6 +335,7 @@ class ProofOfStake:
             state_root=state_root,
             mempool_snapshot_root=snapshot_root,
             state_root_checkpoint=state_root_checkpoint,
+            validator_version=stamped_version,
         )
 
         # Guard against WOTS+ leaf reuse: if the proposer also has

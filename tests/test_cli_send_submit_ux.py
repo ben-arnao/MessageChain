@@ -109,19 +109,19 @@ class TestCmdSendThreadsCurrentHeight(unittest.TestCase):
         self.assertEqual(captured["current_height"], 432)
 
 
-class TestCmdSendNonAsciiFriendlyError(unittest.TestCase):
+class TestCmdSendOversizeFriendlyError(unittest.TestCase):
 
-    def test_em_dash_emits_diagnostic_not_traceback(self):
-        """An em-dash in the message must be caught early and surface
-        a friendly diagnostic. Pre-1.7.7 this triggered a raw Python
-        UnicodeEncodeError traceback.
+    def test_oversize_message_emits_diagnostic_not_traceback(self):
+        """A message exceeding MAX_MESSAGE_CHARS UTF-8 bytes must be
+        caught early with a friendly diagnostic.  Replaces the pre-Tier-12
+        em-dash diagnostic: post-INTL_MESSAGE_HEIGHT, em-dash and other
+        Unicode punctuation are valid input — only the byte cap is
+        client-side-rejectable without a chain round-trip.
         """
         from messagechain import cli as cli_mod
+        from messagechain.config import MAX_MESSAGE_CHARS
 
-        # The character at position 5 is U+2014 EM DASH.
-        # Constructed via chr() to keep this test source ASCII-clean
-        # (tests/test_cli_ascii_only.py).
-        message = "test " + chr(0x2014) + " probe"
+        message = "a" * (MAX_MESSAGE_CHARS + 1)
 
         with patch.object(cli_mod, "_resolve_private_key",
                           return_value=b"\x02" * 32):
@@ -132,9 +132,7 @@ class TestCmdSendNonAsciiFriendlyError(unittest.TestCase):
 
         self.assertNotEqual(cm.exception.code, 0)
         out = buf.getvalue()
-        self.assertIn("non-ASCII", out)
-        self.assertIn("U+2014", out,
-            "must name the offending codepoint so the user can find it")
+        self.assertIn(f"max {MAX_MESSAGE_CHARS}", out)
         self.assertNotIn("Traceback", out,
             "must NOT expose a Python traceback to the user")
 

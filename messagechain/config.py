@@ -260,7 +260,18 @@ def validate_sig_version(sig_version: int) -> tuple[bool, str]:
 # not upgraded produce a clear error rather than silent corruption.
 #
 # Reserved: 0 is invalid (traps uninitialized / truncated input).
-BLOCK_SERIALIZATION_VERSION = 1
+#
+# Block serialization version 2 introduces the validator_version field
+# (Fork 1, audit finding #2): a uint16 carried in every V2 block header
+# stamping the proposer's running release.  V1 (legacy) blocks have no
+# such field and decode with validator_version=UNSIGNALLED.  Both V1 and
+# V2 are accepted during the migration window so a node running new
+# code can ingest the entire pre-fork chain history.  After the network
+# has fully migrated to V2, V1 can be dropped from the accept set in a
+# follow-up fork.
+BLOCK_SERIALIZATION_VERSION_V1 = 1
+BLOCK_SERIALIZATION_VERSION_V2 = 2
+BLOCK_SERIALIZATION_VERSION = BLOCK_SERIALIZATION_VERSION_V2
 TX_SERIALIZATION_VERSION = 1
 
 # Acceptance sets, mirroring _ACCEPTED_SIG_VERSIONS above.  CLAUDE.md
@@ -273,7 +284,8 @@ TX_SERIALIZATION_VERSION = 1
 # Both validators below read these sets lazily via globals() so test
 # monkeypatching sees the mutation and import-order is flexible.
 _ACCEPTED_BLOCK_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
-    BLOCK_SERIALIZATION_VERSION,
+    BLOCK_SERIALIZATION_VERSION_V1,
+    BLOCK_SERIALIZATION_VERSION_V2,
 })
 _ACCEPTED_TX_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
     TX_SERIALIZATION_VERSION,
@@ -3134,7 +3146,60 @@ PREV_POINTER_HEIGHT = 400                # Tier 10 (bootstrap-compressed: pulled
 # v1/v2 remain valid for senders already on chain.
 FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 
-# Tier 12 — MessageTransaction signable-data length-prefix fix.
+# Tier 12: international (UTF-8) message bodies.  Pre-activation:
+# message plaintexts MUST be printable ASCII (codepoints 32-126) — the
+# legacy rule, kept so historical blocks replay deterministically.
+# Post-activation: plaintexts MUST be NFC-normalized UTF-8 whose
+# codepoints fall under General_Category L*/M*/N*/P*/Zs (letters,
+# marks, numbers, punctuation, space), plus a narrow allowlist of
+# format characters required for script shaping (U+200C ZWNJ,
+# U+200D ZWJ).  Bidi override / isolate characters
+# (U+202A-U+202E, U+2066-U+2069) are explicitly rejected as spoofing
+# vectors.  All `S*` (symbols, including emoji and currency), `C*`
+# (controls, surrogates, private-use, unassigned) outside the ZWJ/ZWNJ
+# allowlist, and Zl/Zp (line/paragraph separators) are rejected.
+#
+# Why structural categories rather than a script allowlist:
+# "Allow Latin/Cyrillic/Arabic/CJK..." is a discretionary admission
+# rule — moving the cutoff line is a political knob, and the project's
+# audience (dissidents, coerced-speech contexts) is disproportionately
+# small-population languages that a "popular scripts" cutoff would
+# strand.  The L/M/N/P/Zs whitelist has no knob: every modern living
+# language is structurally letters + marks + numbers + punctuation,
+# and any future Unicode script automatically becomes valid without
+# a config change.
+#
+# Storage: post-activation, the byte cap MAX_MESSAGE_CHARS still binds,
+# but it now caps UTF-8-encoded plaintext bytes rather than ASCII
+# characters.  The fee market already prices stored bytes via
+# FEE_PER_STORED_BYTE_POST_RAISE, so the bloat-discipline math stays
+# clean — a CJK user gets ~341 chars for the same byte budget an
+# English user gets 1024 chars; each pays per byte for the storage
+# they actually pin to permanent state.
+INTL_MESSAGE_HEIGHT = 1500              # Tier 12
+
+# Tier 13 (Fork 1, audit finding #2): validator version signaling.
+# At/after VERSION_SIGNALING_HEIGHT, blocks serialize under V2 wire
+# format (BLOCK_SERIALIZATION_VERSION_V2) which carries a uint16
+# validator_version field in the block header stamping the proposer's
+# running release.  Pre-activation blocks remain V1 (no field).
+#
+# This fork itself does NOT consume the field for any consensus rule
+# yet -- it only lays the wire-format groundwork.  The field exists so
+# Fork 2 (the active-set liveness fallback, audit finding #1) can
+# refuse to cross its own activation height until enough validators
+# have signaled support, breaking the chicken-and-egg gap where every
+# fork-coordination mechanism would itself need to be deployed via the
+# unprotected mechanism it replaces.
+#
+# Runway: ~3000 blocks above the live tip (~451 at the time this
+# constant was added).  20+ days at 10-minute blocks gives both
+# operators comfortable time to upgrade without the protection of
+# this very gate (which doesn't exist yet) -- manual coordination is
+# the mitigation for fork-1 itself; subsequent forks use the gate.
+VERSION_SIGNALING_HEIGHT = 3500          # Tier 13 (Fork 1)
+
+# Tier 14 — MessageTransaction signable-data length-prefix fix.
 # Closes a tx_hash-collision hole in the legacy v1/v2/v3 _signable_data:
 # `self.message` was concatenated raw with no length prefix, and the
 # optional prev/sender_pubkey trailers have multiple legal byte
@@ -3166,7 +3231,7 @@ FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 # RECOMMENDED creation path emits v4.  A future tier can tighten
 # this by REJECTING v3 admission; that's a separate consensus
 # change.
-MESSAGE_TX_LENGTH_PREFIX_HEIGHT = 700    # Tier 12
+MESSAGE_TX_LENGTH_PREFIX_HEIGHT = 4500   # Tier 14
 
 assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
     "MESSAGE_TX_LENGTH_PREFIX_HEIGHT must follow FIRST_SEND_PUBKEY_HEIGHT "
@@ -3174,6 +3239,11 @@ assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
     "v3 dispatch must already be live so honest senders can keep "
     "using v3 during the runway and historical v3 replay continues "
     "to work after the fork lands"
+)
+assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > VERSION_SIGNALING_HEIGHT, (
+    "MESSAGE_TX_LENGTH_PREFIX_HEIGHT must follow VERSION_SIGNALING_HEIGHT "
+    "— the wire-format gate is the foundation any future fork should "
+    "ride on top of for coordinated upgrade signaling"
 )
 
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
@@ -3203,6 +3273,13 @@ assert FIRST_SEND_PUBKEY_HEIGHT > PREV_POINTER_HEIGHT, (
     "first-send pubkey field is encoded in v3 txs that ALSO carry the "
     "prev-pointer presence-flag (in the same wire layout), so the "
     "prev-pointer dispatch must already be live before v3 is admitted"
+)
+assert INTL_MESSAGE_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
+    "INTL_MESSAGE_HEIGHT must follow FIRST_SEND_PUBKEY_HEIGHT — the "
+    "Tier 12 UTF-8 plaintext rule rides on top of the established "
+    "v3 message-tx layout; activating it before v3 would mean the "
+    "post-fork validator dispatches on a height range where the "
+    "wire format the chain expects is still v1/v2-only"
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3269,6 +3346,8 @@ for _fork_name, _fork_height in (
     ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
     ("PREV_POINTER_HEIGHT", PREV_POINTER_HEIGHT),
     ("FIRST_SEND_PUBKEY_HEIGHT", FIRST_SEND_PUBKEY_HEIGHT),
+    ("INTL_MESSAGE_HEIGHT", INTL_MESSAGE_HEIGHT),
+    ("VERSION_SIGNALING_HEIGHT", VERSION_SIGNALING_HEIGHT),
     ("MESSAGE_TX_LENGTH_PREFIX_HEIGHT", MESSAGE_TX_LENGTH_PREFIX_HEIGHT),
 ):
     assert _fork_height < _BEH, (

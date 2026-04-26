@@ -2,7 +2,11 @@
 MessageTransaction - the fundamental unit of data on MessageChain.
 
 Each transaction represents one message posted by one entity. It contains:
-- The message content (printable ASCII only, up to MAX_MESSAGE_CHARS characters)
+- The message content.  Pre-INTL_MESSAGE_HEIGHT: printable ASCII (32-126),
+  up to MAX_MESSAGE_CHARS characters.  Post-INTL_MESSAGE_HEIGHT: NFC-
+  normalized UTF-8, codepoints in General_Category L*/M*/N*/P*/Zs plus
+  the ZWJ/ZWNJ format-character allowlist, capped at MAX_MESSAGE_CHARS
+  UTF-8 bytes.  See config.INTL_MESSAGE_HEIGHT for the full rule.
 - The entity who posted it
 - A quantum-resistant signature
 - A user-set fee (BTC-style bidding: higher fee = higher block priority)
@@ -12,6 +16,7 @@ Each transaction represents one message posted by one entity. It contains:
 import hashlib
 import struct
 import time
+import unicodedata
 from dataclasses import dataclass
 from messagechain.config import (
     HASH_ALGO, MAX_MESSAGE_CHARS, MAX_MESSAGE_BYTES, MIN_FEE,
@@ -23,6 +28,7 @@ from messagechain.config import (
     BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
     PREV_POINTER_HEIGHT,
     FIRST_SEND_PUBKEY_HEIGHT,
+    INTL_MESSAGE_HEIGHT,
     MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
 )
 
@@ -49,7 +55,7 @@ TX_VERSION_FIRST_SEND_PUBKEY = 3
 # 32B pubkey).  Charged at the per-stored-byte fee basis alongside `prev`.
 SENDER_PUBKEY_STORED_BYTES = 33
 # Tx-logic version that closes the _signable_data length-prefix
-# collision (Tier 12 — MESSAGE_TX_LENGTH_PREFIX_HEIGHT).  v4
+# collision (Tier 14 — MESSAGE_TX_LENGTH_PREFIX_HEIGHT).  v4
 # `_signable_data` prepends `struct.pack(">H", len(self.message))`
 # immediately before the message bytes; everything else (entity_id,
 # compression_flag, ts/nonce/fee, prev/pubkey trailers) matches the
@@ -137,7 +143,7 @@ class MessageTransaction:
         # then displaces the victim's intended tx).  v1/v2/v3 keep
         # the legacy raw-message concatenation byte-for-byte for
         # historical replay -- the new constant gates the new shape
-        # so pre-Tier-12 blocks hash exactly as they always did.
+        # so pre-Tier-14 blocks hash exactly as they always did.
         if self.version >= TX_VERSION_LENGTH_PREFIX:
             message_block = struct.pack(">H", len(self.message)) + self.message
         else:
@@ -186,7 +192,11 @@ class MessageTransaction:
 
     @property
     def plaintext(self) -> bytes:
-        """The user's original ASCII bytes, decoded from the canonical form."""
+        """The user's original message bytes, decoded from the canonical
+        form.  Pre-INTL_MESSAGE_HEIGHT these are printable ASCII bytes;
+        post-INTL_MESSAGE_HEIGHT they are NFC UTF-8 bytes.  Both regimes
+        share this same byte representation — the height gate only
+        decides which validator the bytes had to pass through."""
         return decode_payload(self.message, self.compression_flag)
 
     def _compute_hash(self) -> bytes:
@@ -225,7 +235,12 @@ class MessageTransaction:
         d = {
             "version": self.version,
             "entity_id": self.entity_id.hex(),
-            "message": self.plaintext.decode("ascii", errors="replace"),
+            # UTF-8 decode round-trips ASCII bytes identically (ASCII is
+            # a UTF-8 subset), so this is safe both pre- and post-fork.
+            # `errors="replace"` substitutes U+FFFD for malformed bytes
+            # so a corrupted on-disk message still produces a valid
+            # JSON-serializable string instead of raising at display time.
+            "message": self.plaintext.decode("utf-8", errors="replace"),
             "compression_flag": self.compression_flag,
             "timestamp": self.timestamp,
             "nonce": self.nonce,
@@ -442,12 +457,16 @@ class MessageTransaction:
 
         Accepts dicts without `compression_flag` for backward
         compatibility with the pre-compression format: in that case the
-        `message` field is assumed to be already-raw ASCII and the flag
-        defaults to RAW_FLAG. Any non-ASCII bytes in that legacy path
-        still get caught by verify_transaction's ASCII check.
+        `message` field is assumed to be already-raw plaintext and the
+        flag defaults to RAW_FLAG.  Plaintext is encoded as UTF-8 — for
+        ASCII messages this is byte-identical to the legacy ascii-encode
+        path; for post-INTL_MESSAGE_HEIGHT messages this carries the
+        non-ASCII codepoints intact.  verify_transaction's height-gated
+        plaintext rule still catches anything outside the allowed
+        category set on the chain side.
         """
         sig = Signature.deserialize(data["signature"])
-        plaintext = data["message"].encode("ascii")
+        plaintext = data["message"].encode("utf-8")
         if "compression_flag" in data:
             # New format: canonicalize plaintext → (stored, flag).  The
             # declared flag must match the canonical choice, else the
@@ -600,8 +619,43 @@ def enforce_signature_aware_min_fee(
     return True
 
 
-def _validate_message(message: str) -> tuple[bool, str]:
-    """Check message contains only printable ASCII (32-126) and is within limits."""
+# ─── Tier 12: international message validation ──────────────────────
+# Unicode General_Category codes that the post-fork validator accepts.
+# L* = letters (every script's letters), M* = combining marks (Arabic
+# vowels, Devanagari conjuncts, Vietnamese tones, etc — NOT optional;
+# rejecting these would ban half the languages this fork is meant to
+# enable), N* = numbers, P* = punctuation (including CJK punctuation,
+# smart quotes, em-dash), Zs = the regular space separator.  Anything
+# in S* (symbols including emoji, math glyphs, currency), C* (controls,
+# format, surrogates, private-use, unassigned), or Zl/Zp (line/paragraph
+# separators) is rejected — see _ALLOWED_FORMAT_CODEPOINTS for the
+# narrow Cf exception required by Arabic/Indic shaping.
+_ALLOWED_CATEGORIES = frozenset({
+    "Lu", "Ll", "Lt", "Lm", "Lo",
+    "Mn", "Mc", "Me",
+    "Nd", "Nl", "No",
+    "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",
+    "Zs",
+})
+# Format characters (Cf) needed for correct rendering in specific
+# scripts.  ZWNJ (U+200C): Persian, Hindi, Bengali letter shaping.
+# ZWJ (U+200D): Arabic ligatures, Indic conjunct formation.  Allowing
+# ZWJ also enables emoji ZWJ sequences in principle, but the component
+# emoji codepoints are rejected by the S* category check above, so the
+# joiner alone is harmless.
+_ALLOWED_FORMAT_CODEPOINTS = frozenset({0x200C, 0x200D})
+# Bidi override / isolate characters — explicit blocklist.  These are
+# Cf-category but uniquely abusable: U+202E RIGHT-TO-LEFT OVERRIDE is
+# the standard "rename `safe.txt.exe` to render as `safe.exe.txt`"
+# spoofing vector, and the same family covers LRO/RLO/PDF/LRI/RLI/FSI/
+# PDI.  Reject by codepoint regardless of category.
+_BIDI_OVERRIDE_CODEPOINTS = frozenset(
+    set(range(0x202A, 0x202F)) | set(range(0x2066, 0x206A))
+)
+
+
+def _validate_message_ascii(message: str) -> tuple[bool, str]:
+    """Pre-INTL_MESSAGE_HEIGHT rule: printable ASCII (32-126), char-capped."""
     for ch in message:
         code = ord(ch)
         if code < 32 or code > 126:
@@ -609,6 +663,63 @@ def _validate_message(message: str) -> tuple[bool, str]:
     if len(message) > MAX_MESSAGE_CHARS:
         return False, f"Message exceeds {MAX_MESSAGE_CHARS} characters"
     return True, "OK"
+
+
+def _validate_message_intl(message: str) -> tuple[bool, str]:
+    """Post-INTL_MESSAGE_HEIGHT rule: NFC UTF-8, L/M/N/P/Zs whitelist,
+    bidi-override blocklist, byte-capped at MAX_MESSAGE_CHARS UTF-8 bytes.
+
+    NFC normalization is required (not auto-applied) so the same visible
+    string always produces the same tx_hash — without this rule "café"
+    encoded as U+00E9 vs U+0065+U+0301 would yield two distinct hashes
+    for the same visible message, breaking dedup, prev-pointer
+    references, and feed-equality checks.
+    """
+    if message != unicodedata.normalize("NFC", message):
+        return False, "Message must be NFC-normalized"
+    encoded = message.encode("utf-8")
+    if len(encoded) > MAX_MESSAGE_CHARS:
+        return False, (
+            f"Message exceeds {MAX_MESSAGE_CHARS} bytes "
+            f"({len(encoded)} bytes UTF-8)"
+        )
+    for ch in message:
+        cp = ord(ch)
+        if cp in _BIDI_OVERRIDE_CODEPOINTS:
+            return False, (
+                f"Bidi override character U+{cp:04X} not allowed"
+            )
+        cat = unicodedata.category(ch)
+        if cat in _ALLOWED_CATEGORIES:
+            continue
+        if cat == "Cf" and cp in _ALLOWED_FORMAT_CODEPOINTS:
+            continue
+        return False, (
+            f"Character U+{cp:04X} (category {cat}) not allowed"
+        )
+    return True, "OK"
+
+
+def _validate_message(
+    message: str,
+    current_height: int | None = None,
+) -> tuple[bool, str]:
+    """Validate a message plaintext under the height-appropriate rule.
+
+    Pre-INTL_MESSAGE_HEIGHT (and the legacy ``current_height=None`` path,
+    used by isolated unit tests and bare-tx contexts): printable ASCII
+    only.  At/after INTL_MESSAGE_HEIGHT: NFC UTF-8 with the structural-
+    category whitelist.  See ``_validate_message_ascii`` /
+    ``_validate_message_intl`` for the per-rule details.
+
+    The legacy ``None`` default keeps every callsite that hasn't been
+    threaded with chain context conservative — accepting a wider set
+    pre-fork would let bytes that the verify-side rejects still get
+    constructed, and pre-fork txs are required to be ASCII anyway.
+    """
+    if current_height is not None and current_height >= INTL_MESSAGE_HEIGHT:
+        return _validate_message_intl(message)
+    return _validate_message_ascii(message)
 
 
 def create_transaction(
@@ -644,11 +755,17 @@ def create_transaction(
     False.  Mirrors TransferTransaction's first-outgoing-transfer
     pubkey reveal.
     """
-    valid, reason = _validate_message(message)
+    valid, reason = _validate_message(message, current_height=current_height)
     if not valid:
         raise ValueError(reason)
 
-    plaintext = message.encode("ascii")
+    # ASCII is a strict subset of UTF-8 (every codepoint 32-126 encodes
+    # to the same single byte under either codec), so encoding pre-fork
+    # ASCII as UTF-8 produces byte-identical output to the legacy
+    # ascii-encode path — no consensus impact on pre-fork txs.  Post-
+    # fork the validator has already accepted the input as NFC UTF-8
+    # in the L/M/N/P/Zs whitelist, so the encode is lossless.
+    plaintext = message.encode("utf-8")
     # Canonicalize: store whichever is smaller of raw or compressed.
     # Fee is charged on the STORED size, which incentivizes compressible
     # content and rewards senders for efficient encoding.
@@ -689,7 +806,7 @@ def create_transaction(
     else:
         base_version = 1
         prev_overhead = 0
-    # Tier 12: post-activation, emit v4 (length-prefixed signable_data)
+    # Tier 14: post-activation, emit v4 (length-prefixed signable_data)
     # for new txs.  v4 inherits the v3 wire layout -- prev + sender_
     # pubkey presence-flag blocks are BOTH always present -- so a v4
     # tx with neither prev nor sender_pubkey carries 2 extra bytes
@@ -819,16 +936,36 @@ def verify_transaction(
         # version=1 MUST NOT carry a prev field.
         if tx.prev is not None:
             return False
-    # Decode plaintext for ASCII/char-count validation
+    # Decode plaintext for content validation.  The byte cap binds in
+    # both regimes; the per-character rule diverges at INTL_MESSAGE_HEIGHT.
     try:
         plaintext = tx.plaintext
     except Exception:
         return False
     if len(plaintext) > MAX_MESSAGE_CHARS:
         return False
-    for byte in plaintext:
-        if byte < 32 or byte > 126:
+    if (
+        current_height is not None
+        and current_height >= INTL_MESSAGE_HEIGHT
+    ):
+        # Tier 12: NFC UTF-8 with the L/M/N/P/Zs whitelist.  Decode the
+        # canonical bytes as UTF-8 (any non-UTF-8 sequence is a hard
+        # reject — pre-fork the per-byte ASCII rule made this implicit;
+        # post-fork we make it explicit) and run the structural validator.
+        try:
+            decoded = plaintext.decode("utf-8")
+        except UnicodeDecodeError:
             return False
+        ok, _ = _validate_message_intl(decoded)
+        if not ok:
+            return False
+    else:
+        # Pre-fork: every plaintext byte must be in the printable-ASCII
+        # window.  Same rule as before, just lifted out of the
+        # post-fork branch.
+        for byte in plaintext:
+            if byte < 32 or byte > 126:
+                return False
     # Canonical-form check: the stored bytes MUST equal the canonical
     # encoding of the plaintext. This rejects non-canonical encodings
     # (e.g. compressed form larger than raw, or double-compressed data)
