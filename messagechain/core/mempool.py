@@ -1,9 +1,15 @@
 """
-Transaction mempool with fee-based priority (BTC-style).
+Transaction mempool with fee-per-byte priority.
 
-Transactions with higher fees are prioritized for block inclusion.
-This creates a free market for block space — users bid what they're
-willing to pay, and validators include the most profitable transactions first.
+Block inclusion is ranked by `fee / len(message)` (fee density), not
+absolute fee.  The block byte budget (`MAX_BLOCK_MESSAGE_BYTES`) is the
+binding constraint on space, so the proposer-revenue-maximizing policy
+is greedy knapsack on fee density — a small high-density tx beats a
+large tx that pays more in absolute terms but less per byte.
+
+Selecting on absolute fee would systematically prefer larger txs just
+because they carry a bigger sticker fee, even when smaller txs offer
+the network more revenue per byte of permanent storage they pin.
 
 Now supports:
 - Maximum size with lowest-fee eviction when full
@@ -26,8 +32,19 @@ from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 
 
+def _fee_per_byte(tx: MessageTransaction) -> float:
+    """Selection priority: fee divided by stored message bytes.
+
+    The block byte budget is the binding constraint on inclusion, so
+    revenue-per-byte is the right ranking — not absolute fee.  Empty
+    messages cannot occur in practice (validator rejects len==0), but
+    we guard against div-by-zero defensively.
+    """
+    return tx.fee / max(1, len(tx.message))
+
+
 class Mempool:
-    """Pool of validated transactions, ordered by fee for block inclusion."""
+    """Pool of validated transactions, ordered by fee-per-byte for inclusion."""
 
     def __init__(self, max_size: int = MEMPOOL_MAX_SIZE, tx_ttl: int = MEMPOOL_TX_TTL,
                  per_sender_limit: int = MEMPOOL_PER_SENDER_LIMIT,
@@ -130,11 +147,12 @@ class Mempool:
             return False
 
         if len(self.pending) >= self.max_size:
-            # Find the lowest-fee transaction
-            min_tx = min(self.pending.values(), key=lambda t: t.fee)
-            if tx.fee <= min_tx.fee:
-                return False  # new tx doesn't beat the worst in pool
-            # Evict lowest-fee tx
+            # Evict the lowest fee-per-byte tx — same priority axis used
+            # for block inclusion, so a tx admitted here is one the next
+            # proposer would actually pick over what's being kicked out.
+            min_tx = min(self.pending.values(), key=_fee_per_byte)
+            if _fee_per_byte(tx) <= _fee_per_byte(min_tx):
+                return False  # new tx doesn't beat the worst density in pool
             self._remove_tx(min_tx)
 
         self.pending[tx.tx_hash] = tx
@@ -146,12 +164,15 @@ class Mempool:
 
     def get_transactions(self, max_count: int) -> list[MessageTransaction]:
         """
-        Get transactions ordered by fee (highest first) — BTC-style.
+        Get transactions ordered by fee-per-byte (highest density first).
 
-        Block proposers call this to fill blocks with the most profitable
-        transactions. Users who want faster inclusion bid higher fees.
+        Block proposers call this to fill blocks with the highest-revenue
+        density transactions under the per-block byte budget.  Users who
+        want faster inclusion bid a higher fee relative to their message
+        size — a 200-byte tx paying fee=199 beats a 1024-byte tx paying
+        fee=200 because it claims fewer bytes of the budget per unit fee.
         """
-        txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
+        txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
         return txs[:max_count]
 
     def get_transactions_with_entity_cap(
@@ -159,12 +180,12 @@ class Mempool:
     ) -> list[MessageTransaction]:
         """Get transactions respecting the per-entity cap.
 
-        Sorted by fee (highest first).  After including
+        Sorted by fee-per-byte (highest density first).  After including
         MAX_TXS_PER_ENTITY_PER_BLOCK txs from any single entity_id,
         further txs from that entity are skipped — even if they have
-        higher fees than txs from other entities.
+        higher fee density than txs from other entities.
         """
-        txs = sorted(self.pending.values(), key=lambda t: t.fee, reverse=True)
+        txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
         selected: list[MessageTransaction] = []
         entity_counts: dict[bytes, int] = {}
         for tx in txs:
@@ -180,12 +201,12 @@ class Mempool:
     def get_forced_inclusion_set(
         self, current_block_height: int,
     ) -> list[MessageTransaction]:
-        """Return the top-N highest-fee txs that have waited >= K blocks.
+        """Return the top-N highest fee-per-byte txs that have waited >= K blocks.
 
         The attester-enforced censorship-resistance rule: these are the txs
         the NEXT proposer MUST include (or provide a valid structural
         excuse for omitting).  Ranking is deterministic on a single node:
-            1. Fee descending
+            1. Fee-per-byte descending (matches normal selection priority)
             2. Arrival height ascending (earlier waiter wins tie)
             3. tx_hash ascending (final deterministic tiebreak)
 
@@ -200,7 +221,7 @@ class Mempool:
         ]
         qualifying.sort(
             key=lambda t: (
-                -t.fee,
+                -_fee_per_byte(t),
                 self.arrival_heights.get(t.tx_hash, 0),
                 t.tx_hash,
             )
@@ -264,11 +285,13 @@ class Mempool:
         public_key: bytes | None = None,
         current_height: int | None = None,
     ) -> bool:
-        """Replace an existing unconfirmed transaction with a higher-fee version.
+        """Replace an existing unconfirmed transaction with a higher fee-per-byte version.
 
-        BIP 125-style RBF: the new transaction must have the same sender and
-        nonce as an existing mempool transaction, and a strictly higher fee.
-        The replacement must also have a valid signature to prevent censorship
+        RBF: the new transaction must have the same sender and nonce as an
+        existing mempool transaction, and strictly higher fee-per-byte
+        density.  This matches the block-inclusion priority — a replacement
+        is only accepted if the proposer would actually prefer it.  The
+        replacement must also have a valid signature to prevent censorship
         attacks where an attacker evicts valid txns with unsigned replacements.
 
         ``current_height`` MUST be the current chain tip so the signature
@@ -288,8 +311,8 @@ class Mempool:
         if existing is None:
             return False  # nothing to replace
 
-        if new_tx.fee <= existing.fee:
-            return False  # new fee must be strictly higher
+        if _fee_per_byte(new_tx) <= _fee_per_byte(existing):
+            return False  # new fee-per-byte density must be strictly higher
 
         # Verify signature on the replacement (prevents censorship via
         # unsigned replacements that evict valid transactions).
