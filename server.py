@@ -4410,6 +4410,22 @@ async def run(args):
             port=args.submission_port,
             bind=args.submission_bind,
             relay_callback=_relay_tx,
+            # Wire the validator's receipt issuer through so the public
+            # HTTPS endpoint can issue SubmissionReceipt /
+            # SubmissionAck / SignedRejection on demand.  Without this
+            # the entire censorship-evidence pipeline silently
+            # disabled itself: every `if receipt_issuer is not None:`
+            # branch in submit_transaction_to_mempool fell through,
+            # so a coerced validator could admit-and-drop / lie-about-
+            # rejection / silently-TCP-drop honest submissions with
+            # zero on-chain evidence trail.  The headline structural
+            # defense against the project's primary adversary
+            # (validator collusion, per CLAUDE.md) only functions
+            # when this kwarg is passed.  KeyPair.sign carries an
+            # internal lock so concurrent ThreadingMixIn handlers
+            # cannot race the receipt subtree's _next_leaf counter
+            # into a double-leaf-consumption WOTS+ key disclosure.
+            receipt_issuer=server.receipt_issuer,
         )
         submission_server.start()
         logger.info(
