@@ -3100,6 +3100,21 @@ TARGET_BLOCK_SIZE_POST_RAISE = 22        # ~50% of new MAX_TXS_PER_BLOCK = 45 (w
 # version=2 is accepted; version=1 remains valid for prev-less txs.
 PREV_POINTER_HEIGHT = 400                # Tier 10 (bootstrap-compressed: pulled forward from 6_000 for live operator testing)
 
+# Tier 11: MessageTransaction first-send pubkey reveal.  Closes the
+# receive-to-exist asymmetry that made TransferTransaction install the
+# sender's pubkey on first outgoing tx but rejected MessageTransaction
+# from any unknown entity.  At/after FIRST_SEND_PUBKEY_HEIGHT, a v3
+# MessageTransaction may carry an optional sender_pubkey field; when
+# the sender's entity_id is not yet on chain, the field is required and
+# is installed on apply.  Mirrors TransferTransaction.sender_pubkey so
+# the cold-start path "get tokens via faucet -> send first message"
+# works in one round-trip instead of needing an explicit register-via-
+# transfer hop first.
+#
+# Pre-activation: v3 txs are rejected.  Post-activation: v3 accepted;
+# v1/v2 remain valid for senders already on chain.
+FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3121,6 +3136,12 @@ assert PREV_POINTER_HEIGHT > BLOCK_BYTES_RAISE_HEIGHT, (
     "prev-pointer feature prices the 33 extra bytes at the per-stored-"
     "byte rate, so the linear fee formula and its post-raise per-byte "
     "multiplier must already be active"
+)
+assert FIRST_SEND_PUBKEY_HEIGHT > PREV_POINTER_HEIGHT, (
+    "FIRST_SEND_PUBKEY_HEIGHT must follow PREV_POINTER_HEIGHT — the "
+    "first-send pubkey field is encoded in v3 txs that ALSO carry the "
+    "prev-pointer presence-flag (in the same wire layout), so the "
+    "prev-pointer dispatch must already be live before v3 is admitted"
 )
 
 # ─────────────────────────────────────────────────────────────────────

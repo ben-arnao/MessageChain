@@ -22,6 +22,7 @@ from messagechain.config import (
     BASE_TX_FEE, FEE_PER_STORED_BYTE, LINEAR_FEE_HEIGHT,
     BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
     PREV_POINTER_HEIGHT,
+    FIRST_SEND_PUBKEY_HEIGHT,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -33,6 +34,19 @@ TX_VERSION_PREV_POINTER = 2
 # Added to the per-stored-byte fee basis so pointer-bearing txs pay
 # uniformly for their on-chain footprint.
 PREV_POINTER_STORED_BYTES = 33
+# Tx-logic version that enables the optional sender_pubkey reveal (Tier 11).
+# v3 txs carry an additional 1-byte presence flag + 32-byte pubkey AFTER
+# the prev-pointer block.  When set, validate_transaction admits the tx
+# even if the sender's entity_id is not yet on chain (provided
+# derive_entity_id matches), and apply installs the pubkey in
+# self.public_keys.  Mirrors TransferTransaction.sender_pubkey so a fresh
+# wallet that just received funds via the cold-start faucet can post its
+# first message in one round-trip instead of needing a transfer-first
+# bootstrap.
+TX_VERSION_FIRST_SEND_PUBKEY = 3
+# Raw byte cost of the sender_pubkey field when set (1B presence flag +
+# 32B pubkey).  Charged at the per-stored-byte fee basis alongside `prev`.
+SENDER_PUBKEY_STORED_BYTES = 33
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -64,6 +78,15 @@ class MessageTransaction:
     # earlier block (same-height same-block earlier tx_index is also
     # accepted at block-validate time).
     prev: bytes | None = None
+    # `sender_pubkey` (optional, v3+): 32-byte public key of the sender.
+    # Only meaningful at version >= TX_VERSION_FIRST_SEND_PUBKEY.  When
+    # set on a tx whose entity_id is not yet in chain.public_keys, the
+    # apply path installs it; this is the messaging counterpart to
+    # TransferTransaction.sender_pubkey.  Empty (b"") for v1/v2 txs and
+    # for v3 txs from senders already on chain (the chain rejects a v3
+    # tx that re-supplies the pubkey for an already-installed entity, so
+    # the field is structurally exclusive with "already registered").
+    sender_pubkey: bytes = b""
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -117,6 +140,21 @@ class MessageTransaction:
                         f"prev must be exactly 32 bytes, got {len(self.prev)}"
                     )
                 base += b"\x01" + self.prev
+        # Version 3 appends the optional sender_pubkey block in the same
+        # presence-flag-then-bytes shape.  Same security rationale as
+        # `prev`: making the flag part of the signed payload prevents an
+        # attacker from grafting a sender_pubkey onto someone else's
+        # legitimately-signed v3 tx.
+        if self.version >= TX_VERSION_FIRST_SEND_PUBKEY:
+            if not self.sender_pubkey:
+                base += b"\x00"
+            else:
+                if len(self.sender_pubkey) != 32:
+                    raise ValueError(
+                        f"sender_pubkey must be exactly 32 bytes, "
+                        f"got {len(self.sender_pubkey)}"
+                    )
+                base += b"\x01" + self.sender_pubkey
         return base
 
     @property
@@ -174,6 +212,11 @@ class MessageTransaction:
         # deserialize() can round-trip pre-fork wire formats unchanged.
         if self.version >= TX_VERSION_PREV_POINTER and self.prev is not None:
             d["prev"] = self.prev.hex()
+        # Same omit-when-empty rule for sender_pubkey: v3 txs from
+        # already-on-chain senders carry no pubkey and the dict
+        # round-trip stays minimal.
+        if self.version >= TX_VERSION_FIRST_SEND_PUBKEY and self.sender_pubkey:
+            d["sender_pubkey"] = self.sender_pubkey.hex()
         return d
 
     def to_bytes(self, state=None) -> bytes:
@@ -238,6 +281,14 @@ class MessageTransaction:
                 parts.append(b"\x00")
             else:
                 parts.append(b"\x01" + self.prev)
+        # Version 3 wire form: same presence-flag layout, immediately
+        # after the prev block.  Placed before signature so the field
+        # is part of the signed payload (mirrors _signable_data).
+        if self.version >= TX_VERSION_FIRST_SEND_PUBKEY:
+            if not self.sender_pubkey:
+                parts.append(b"\x00")
+            else:
+                parts.append(b"\x01" + self.sender_pubkey)
         parts.extend([
             struct.pack(">I", len(sig_blob)),
             sig_blob,
@@ -299,6 +350,28 @@ class MessageTransaction:
                 raise ValueError(
                     f"MessageTransaction prev flag must be 0 or 1, got {prev_flag}"
                 )
+        # Version 3 wire form: same presence-flag-then-bytes layout for
+        # the optional sender_pubkey field.  v1/v2 blobs skip entirely.
+        sender_pubkey: bytes = b""
+        if version >= TX_VERSION_FIRST_SEND_PUBKEY:
+            if offset + 1 > len(data):
+                raise ValueError(
+                    "MessageTransaction sender_pubkey flag truncated"
+                )
+            pk_flag = data[offset]; offset += 1
+            if pk_flag == 0x00:
+                sender_pubkey = b""
+            elif pk_flag == 0x01:
+                if offset + 32 > len(data):
+                    raise ValueError(
+                        "MessageTransaction sender_pubkey truncated"
+                    )
+                sender_pubkey = bytes(data[offset:offset + 32]); offset += 32
+            else:
+                raise ValueError(
+                    f"MessageTransaction sender_pubkey flag must be "
+                    f"0 or 1, got {pk_flag}"
+                )
         sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
         if offset + sig_len > len(data):
             raise ValueError("MessageTransaction signature truncated")
@@ -319,6 +392,7 @@ class MessageTransaction:
             version=version,
             compression_flag=compression_flag,
             prev=prev,
+            sender_pubkey=sender_pubkey,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -357,6 +431,10 @@ class MessageTransaction:
             stored, flag = plaintext, RAW_FLAG
         prev_hex = data.get("prev")
         prev_bytes = bytes.fromhex(prev_hex) if prev_hex else None
+        sender_pubkey_hex = data.get("sender_pubkey")
+        sender_pubkey = (
+            bytes.fromhex(sender_pubkey_hex) if sender_pubkey_hex else b""
+        )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             message=stored,
@@ -367,6 +445,7 @@ class MessageTransaction:
             version=data.get("version", 1),
             compression_flag=flag,
             prev=prev_bytes,
+            sender_pubkey=sender_pubkey,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -512,6 +591,8 @@ def create_transaction(
     nonce: int,
     current_height: int | None = None,
     prev: bytes | None = None,
+    *,
+    include_pubkey: bool = False,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
@@ -526,6 +607,15 @@ def create_transaction(
     ≥ both the flat and linear floors, so a tx accepted here also
     passes any later height-aware verification.  Tests targeting the
     linear floor exactly must thread the height through.
+
+    ``include_pubkey``: emit a v3 MessageTransaction with the sender's
+    public key in the optional sender_pubkey field.  Use on the
+    sender's FIRST EVER outgoing message — without this, the chain
+    rejects with "Unknown entity — must register first" because the
+    pubkey was never installed.  After the first message lands, the
+    pubkey is on chain and subsequent sends should leave the flag at
+    False.  Mirrors TransferTransaction's first-outgoing-transfer
+    pubkey reveal.
     """
     valid, reason = _validate_message(message)
     if not valid:
@@ -546,7 +636,22 @@ def create_transaction(
     # prev is None if version=2 — but we only bump version when the
     # caller actually provides a pointer, so prev-less senders keep the
     # legacy version=1 bytes-for-bytes.
-    if prev is not None:
+    # `include_pubkey` bumps further to version 3 so the chain knows
+    # to read the optional sender_pubkey block.  v3 also implies the
+    # prev block is present (v3 supersedes v2 in the layout), so
+    # prev_overhead is added unconditionally for v3 txs even when
+    # prev is None — the empty presence flag still costs 1B.
+    if include_pubkey:
+        tx_version = TX_VERSION_FIRST_SEND_PUBKEY
+        # 33B for the prev block (always present at v3, presence-
+        # flag-only when prev is None) + 33B for the sender_pubkey
+        # block (presence flag + 32B pubkey since include_pubkey=True).
+        # Charged at the per-stored-byte rate so the operator pays for
+        # the bytes that pin to permanent state.
+        prev_overhead = (
+            PREV_POINTER_STORED_BYTES if prev is not None else 1
+        ) + SENDER_PUBKEY_STORED_BYTES
+    elif prev is not None:
         if len(prev) != 32:
             raise ValueError(
                 f"prev must be exactly 32 bytes, got {len(prev)}"
@@ -556,6 +661,10 @@ def create_transaction(
     else:
         tx_version = 1
         prev_overhead = 0
+    if prev is not None and len(prev) != 32:
+        raise ValueError(
+            f"prev must be exactly 32 bytes, got {len(prev)}"
+        )
     min_required = calculate_min_fee(
         stored,
         current_height=current_height,
@@ -565,7 +674,8 @@ def create_transaction(
         raise ValueError(
             f"Fee must be at least {min_required} for this message "
             f"({len(stored)} stored bytes, flag={flag}"
-            f"{', prev=set' if prev is not None else ''})"
+            f"{', prev=set' if prev is not None else ''}"
+            f"{', sender_pubkey=set' if include_pubkey else ''})"
         )
 
     tx = MessageTransaction(
@@ -578,6 +688,7 @@ def create_transaction(
         version=tx_version,
         compression_flag=flag,
         prev=prev,
+        sender_pubkey=entity.public_key if include_pubkey else b"",
     )
 
     # Sign the transaction data with quantum-resistant signature
@@ -611,16 +722,29 @@ def verify_transaction(
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
-    # ── Version gate for the Tier 10 `prev` pointer ────────────────
-    # Pre-activation: only version=1 txs are accepted.  A version>=2
-    # tx arriving before the fork point would allow its extra bytes
-    # to land in a block whose replay semantics don't know about the
-    # field, so we reject at the validation boundary.
-    # Post-activation: version=1 stays valid for prev-less messages;
-    # version=2 is accepted and may or may not carry a prev pointer.
-    # Any future version is rejected until its own activation fork.
-    if tx.version > TX_VERSION_PREV_POINTER:
+    # ── Version gate for the Tier 10 `prev` pointer + Tier 11 sender_pubkey ──
+    # Pre-activation: only version=1 txs are accepted.  A higher-
+    # version tx arriving before its fork point would allow its
+    # extra bytes to land in a block whose replay semantics don't
+    # know about the field, so we reject at the validation boundary.
+    # Post-PREV_POINTER_HEIGHT: v1 and v2 accepted; v3 still rejected
+    # until FIRST_SEND_PUBKEY_HEIGHT.  Post-FIRST_SEND_PUBKEY_HEIGHT:
+    # v1, v2, v3 all accepted; v3 may carry sender_pubkey.  Any
+    # future version is rejected until its own activation fork.
+    if tx.version > TX_VERSION_FIRST_SEND_PUBKEY:
         return False
+    if tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
+        if (
+            current_height is not None
+            and current_height < FIRST_SEND_PUBKEY_HEIGHT
+        ):
+            return False
+        if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
+            return False
+    else:
+        # v1/v2 MUST NOT carry a sender_pubkey field.
+        if tx.sender_pubkey:
+            return False
     if tx.version >= TX_VERSION_PREV_POINTER:
         if current_height is not None and current_height < PREV_POINTER_HEIGHT:
             return False
@@ -665,7 +789,17 @@ def verify_transaction(
         sig_len = len(tx.signature.to_bytes())
     else:
         sig_len = 0
-    prev_overhead = PREV_POINTER_STORED_BYTES if tx.prev is not None else 0
+    # Stored-bytes overhead from optional fields.  v3 txs always pay
+    # the prev presence flag (1B) even when prev is None, plus the
+    # sender_pubkey block (33B) when set.  Mirrors create_transaction's
+    # accounting so the fee floor a sender computed locally matches
+    # what the chain enforces here.
+    if tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
+        prev_overhead = (
+            PREV_POINTER_STORED_BYTES if tx.prev is not None else 1
+        ) + (SENDER_PUBKEY_STORED_BYTES if tx.sender_pubkey else 1)
+    else:
+        prev_overhead = PREV_POINTER_STORED_BYTES if tx.prev is not None else 0
     if tx.fee < calculate_min_fee(
         tx.message,
         signature_bytes=sig_len,

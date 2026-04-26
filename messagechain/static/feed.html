@@ -187,6 +187,12 @@
   }
   details.faucet .result.error { color: #c33; }
   details.faucet .result.success { color: var(--accent); }
+  details.faucet .progress {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
   details.faucet code {
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
     font-size: 0.8rem;
@@ -224,7 +230,15 @@
              placeholder="64-char hex entity_id"
              aria-label="Wallet address (entity_id)">
       <button id="faucetBtn" type="button">Get tokens</button>
+      <div id="faucetProgress" class="progress" hidden></div>
       <div id="faucetResult" class="result"></div>
+      <p style="margin-top:0.6rem; font-size:0.78rem; color:var(--muted);">
+        First request runs a small proof-of-work in your browser
+        (~5 sec on desktop, ~15 sec on mobile).  Costs you a few
+        seconds of CPU; costs an attacker the same per address, so
+        bulk farming is uneconomical.  No CAPTCHA, no third-party
+        scripts -- you can run this on Tor.
+      </p>
     </div>
   </details>
   <p class="status" id="status">Loading…</p>
@@ -360,6 +374,7 @@
   const faucetBtn = document.getElementById("faucetBtn");
   const faucetAddr = document.getElementById("faucetAddr");
   const faucetResult = document.getElementById("faucetResult");
+  const faucetProgress = document.getElementById("faucetProgress");
   const faucetAmount = document.getElementById("faucetAmount");
   const faucetRemaining = document.getElementById("faucetRemaining");
 
@@ -379,6 +394,155 @@
     }
   }
 
+  // PoW solver runs in a WebWorker spawned from an inline Blob URL.
+  // Inline so we don't need a separate static asset, keeping the
+  // operator deploy story to one HTML file.  The worker uses a pure-JS
+  // sha256 implementation (subtle.crypto is async-only and would
+  // serialize awkwardly inside a tight loop).  The solver reports
+  // hash counts every 250ms so the UI can show progress without
+  // burning the message-pumping path.
+  const POW_WORKER_SRC = `
+"use strict";
+// Minimal pure-JS sha256 -- 80 lines for the message-schedule + round
+// constants.  Not constant-time, but that's irrelevant for PoW.
+const K = new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+]);
+function sha256(bytes) {
+  const len = bytes.length;
+  const bitLen = BigInt(len) * 8n;
+  // Pad to 64-byte blocks.  + 1 byte 0x80 + at least 8 bytes length.
+  const padLen = (len + 9 + 63) & ~63;
+  const buf = new Uint8Array(padLen);
+  buf.set(bytes);
+  buf[len] = 0x80;
+  // 8-byte big-endian length at the tail.
+  const dv = new DataView(buf.buffer);
+  dv.setBigUint64(padLen - 8, bitLen, false);
+  let h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a;
+  let h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
+  const w = new Uint32Array(64);
+  for (let off = 0; off < padLen; off += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = dv.getUint32(off + i*4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = ((w[i-15]>>>7)|(w[i-15]<<25)) ^ ((w[i-15]>>>18)|(w[i-15]<<14)) ^ (w[i-15]>>>3);
+      const s1 = ((w[i-2]>>>17)|(w[i-2]<<15)) ^ ((w[i-2]>>>19)|(w[i-2]<<13)) ^ (w[i-2]>>>10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e>>>6)|(e<<26)) ^ ((e>>>11)|(e<<21)) ^ ((e>>>25)|(e<<7));
+      const ch = (e & f) ^ ((~e) & g);
+      const t1 = (h + S1 + ch + K[i] + w[i]) >>> 0;
+      const S0 = ((a>>>2)|(a<<30)) ^ ((a>>>13)|(a<<19)) ^ ((a>>>22)|(a<<10));
+      const mj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (S0 + mj) >>> 0;
+      h=g; g=f; f=e; e=(d + t1) >>> 0; d=c; c=b; b=a; a=(t1 + t2) >>> 0;
+    }
+    h0=(h0+a)>>>0; h1=(h1+b)>>>0; h2=(h2+c)>>>0; h3=(h3+d)>>>0;
+    h4=(h4+e)>>>0; h5=(h5+f)>>>0; h6=(h6+g)>>>0; h7=(h7+h)>>>0;
+  }
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  odv.setUint32(0,h0,false); odv.setUint32(4,h1,false);
+  odv.setUint32(8,h2,false); odv.setUint32(12,h3,false);
+  odv.setUint32(16,h4,false); odv.setUint32(20,h5,false);
+  odv.setUint32(24,h6,false); odv.setUint32(28,h7,false);
+  return out;
+}
+function leadingZeroBits(digest) {
+  let bits = 0;
+  for (const byte of digest) {
+    if (byte === 0) { bits += 8; continue; }
+    for (let s = 7; s >= 0; s--) {
+      if (byte & (1 << s)) return bits;
+      bits += 1;
+    }
+    return bits;
+  }
+  return bits;
+}
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.substr(i*2, 2), 16);
+  }
+  return out;
+}
+self.onmessage = function (e) {
+  const { seedHex, addressHex, difficulty } = e.data;
+  const seed = hexToBytes(seedHex);
+  const address = hexToBytes(addressHex);
+  // Pre-allocate input buffer: seed (16) + nonce (8) + address (32) = 56.
+  const input = new Uint8Array(seed.length + 8 + address.length);
+  input.set(seed, 0);
+  input.set(address, seed.length + 8);
+  const nonceView = new DataView(input.buffer, seed.length, 8);
+  let nonce = 0n;
+  let lastReport = Date.now();
+  let count = 0;
+  while (true) {
+    nonceView.setBigUint64(0, nonce, false);
+    const digest = sha256(input);
+    if (leadingZeroBits(digest) >= difficulty) {
+      // Nonce is BigInt -- send as decimal string so JSON.stringify
+      // survives.  The fetch wrapper parses back to a Number when
+      // it'll fit in Number.MAX_SAFE_INTEGER (always at difficulty=22).
+      self.postMessage({ done: true, nonce: nonce.toString(), tries: count });
+      return;
+    }
+    nonce += 1n;
+    count += 1;
+    const now = Date.now();
+    if (now - lastReport >= 250) {
+      self.postMessage({ done: false, tries: count });
+      lastReport = now;
+    }
+  }
+};
+`;
+
+  function spawnPowWorker() {
+    const blob = new Blob([POW_WORKER_SRC], { type: "application/javascript" });
+    const url = URL.createObjectURL(blob);
+    const worker = new Worker(url);
+    URL.revokeObjectURL(url);
+    return worker;
+  }
+
+  function solvePow(seedHex, addressHex, difficulty, onProgress) {
+    return new Promise((resolve, reject) => {
+      const worker = spawnPowWorker();
+      const started = Date.now();
+      worker.onmessage = (e) => {
+        if (e.data.done) {
+          worker.terminate();
+          resolve({ nonce: e.data.nonce, tries: e.data.tries });
+          return;
+        }
+        if (onProgress) {
+          const elapsed = (Date.now() - started) / 1000;
+          const rate = e.data.tries / Math.max(0.01, elapsed);
+          onProgress({ tries: e.data.tries, rate, elapsedSec: elapsed });
+        }
+      };
+      worker.onerror = (err) => {
+        worker.terminate();
+        reject(err);
+      };
+      worker.postMessage({ seedHex, addressHex, difficulty });
+    });
+  }
+
   async function requestDrip() {
     const addr = (faucetAddr.value || "").trim().toLowerCase();
     // Cheap client-side guard so an obviously malformed address does
@@ -390,25 +554,65 @@
     }
     faucetBtn.disabled = true;
     faucetResult.className = "result";
-    faucetResult.textContent = "Requesting drip…";
+    faucetResult.textContent = "Requesting challenge…";
+    faucetProgress.hidden = true;
     try {
-      const r = await fetch("/faucet", {
+      // Step 1: get a challenge bound to this address.
+      const cresp = await fetch(
+        "/faucet/challenge?address=" + encodeURIComponent(addr),
+        { cache: "no-store" },
+      );
+      const cdata = await cresp.json().catch(() => ({}));
+      if (!cresp.ok || !cdata.ok) {
+        faucetResult.className = "result error";
+        faucetResult.textContent =
+          "Could not get challenge: " + (cdata.error || ("HTTP " + cresp.status));
+        return;
+      }
+      // Step 2: solve the PoW in a WebWorker so the page stays
+      // responsive.  Update the progress line every ~250ms.
+      faucetResult.className = "result";
+      faucetResult.textContent =
+        "Solving proof-of-work (~" +
+        Math.round(Math.pow(2, cdata.difficulty) / 1_000_000) +
+        "M sha256 tries on average)…";
+      faucetProgress.hidden = false;
+      const sol = await solvePow(
+        cdata.seed, cdata.address, cdata.difficulty,
+        (p) => {
+          faucetProgress.textContent =
+            p.tries.toLocaleString() + " hashes (" +
+            Math.round(p.rate / 1000) + "k/s, " +
+            p.elapsedSec.toFixed(1) + "s)";
+        },
+      );
+      faucetProgress.textContent =
+        "Solved in " + sol.tries.toLocaleString() + " tries.";
+      // Step 3: POST the address + challenge_seed + nonce.  Nonce is
+      // a decimal string from the worker; parse to Number which is
+      // safe at difficulty <= 53.
+      faucetResult.textContent = "Submitting drip…";
+      const dresp = await fetch("/faucet", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: addr }),
+        body: JSON.stringify({
+          address: addr,
+          challenge_seed: cdata.seed,
+          nonce: parseInt(sol.nonce, 10),
+        }),
       });
-      const data = await r.json().catch(() => ({}));
-      if (r.ok && data.ok) {
+      const ddata = await dresp.json().catch(() => ({}));
+      if (dresp.ok && ddata.ok) {
         faucetResult.className = "result success";
         faucetResult.textContent =
-          "Sent " + data.amount + " tokens. Tx " + data.tx_hash.slice(0, 16) +
+          "Sent " + ddata.amount + " tokens. Tx " + ddata.tx_hash.slice(0, 16) +
           "… will land in the next block (~10 min). Then run " +
           "`messagechain send \"hello world\"` to post.";
       } else {
         faucetResult.className = "result error";
-        faucetResult.textContent = "Drip failed: " + (data.error || ("HTTP " + r.status));
+        faucetResult.textContent =
+          "Drip failed: " + (ddata.error || ("HTTP " + dresp.status));
       }
-      // Counter has changed (success or rate-limit-fail) — refresh.
       refreshFaucetInfo();
     } catch (e) {
       faucetResult.className = "result error";

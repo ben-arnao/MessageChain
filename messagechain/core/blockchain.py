@@ -2171,9 +2171,31 @@ class Blockchain:
         for this entity.  This allows the mempool layer to pass a
         "pending nonce" so users can submit sequential transactions
         without waiting for each to be mined.
+
+        Tier 11: when the sender's entity_id is not yet on chain,
+        accept a v3 tx that carries a sender_pubkey whose hash derives
+        back to the entity_id.  Mirrors validate_transfer_transaction's
+        first-spend reveal so messaging works for fresh wallets in
+        one round-trip (no transfer-first dance required).
         """
-        if tx.entity_id not in self.public_keys:
-            return False, "Unknown entity — must register first"
+        from messagechain.identity.identity import derive_entity_id
+        from messagechain.core.transaction import TX_VERSION_FIRST_SEND_PUBKEY
+        if tx.entity_id in self.public_keys:
+            if tx.sender_pubkey:
+                return False, (
+                    "sender_pubkey must be empty for already-registered "
+                    "entity — first-spend reveal is one-shot"
+                )
+            verifying_pubkey = self.public_keys[tx.entity_id]
+        else:
+            if tx.version < TX_VERSION_FIRST_SEND_PUBKEY or not tx.sender_pubkey:
+                return False, "Unknown entity — must register first"
+            if derive_entity_id(tx.sender_pubkey) != tx.entity_id:
+                return False, (
+                    "sender_pubkey does not derive the claimed entity_id "
+                    "(hash mismatch)"
+                )
+            verifying_pubkey = tx.sender_pubkey
 
         # Crypto-agility gate: reject unknown signature schemes up-front so
         # the reason string is a clear "sig version" and not a generic
@@ -2212,11 +2234,10 @@ class Blockchain:
                 f"(watermark {self.leaf_watermarks[tx.entity_id]}) — leaf reuse rejected"
             )
 
-        public_key = self.public_keys[tx.entity_id]
         # A mempool-admitted tx lands in the next block (height+1), so gate
         # the fee-includes-signature rule on that target height.
         if not verify_transaction(
-            tx, public_key,
+            tx, verifying_pubkey,
             current_height=self.height + 1,
             prev_lookup=(
                 self._prev_tx_lookup if self.db is not None else None
@@ -6240,8 +6261,14 @@ class Blockchain:
 
         # Validate all transactions, tracking nonce and balance increments
         # within the block to prevent duplicate-nonce / double-spend attacks.
+        # `pending_pubkey_installs` is hoisted here (was previously inside
+        # the transfer loop) so a Tier 11 v3 first-send MessageTransaction
+        # can reveal its sender's pubkey to LATER txs in the same block.
+        # Same shape used by the transfer loop below.
+        from messagechain.identity.identity import derive_entity_id
         pending_nonces: dict[bytes, int] = {}
         pending_balance_spent: dict[bytes, int] = {}
+        pending_pubkey_installs: dict[bytes, bytes] = {}
         for tx in block.transactions:
             # Check nonce against chain state + any already-seen txs in this block
             expected_nonce = pending_nonces.get(
@@ -6261,10 +6288,32 @@ class Blockchain:
                     f"Insufficient balance for fee of {tx.fee}"
                 )
 
-            # Verify entity is registered and signature is valid
-            if tx.entity_id not in self.public_keys:
-                return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Unknown entity — must register first"
-            public_key = self.public_keys[tx.entity_id]
+            # Resolve verifying pubkey — known sender vs Tier 11 first-send
+            # reveal.  Mirrors the transfer-tx logic below: an entity already
+            # on chain (or installed earlier in this block) must NOT carry
+            # sender_pubkey; an unknown entity must carry one whose hash
+            # derives back to the claimed entity_id.
+            from messagechain.core.transaction import (
+                TX_VERSION_FIRST_SEND_PUBKEY,
+            )
+            known_pk = self.public_keys.get(tx.entity_id) or pending_pubkey_installs.get(tx.entity_id)
+            if known_pk is not None:
+                if tx.sender_pubkey:
+                    return False, (
+                        f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                        f"sender_pubkey must be empty for already-registered entity"
+                    )
+                public_key = known_pk
+            else:
+                if tx.version < TX_VERSION_FIRST_SEND_PUBKEY or not tx.sender_pubkey:
+                    return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Unknown entity — must register first"
+                if derive_entity_id(tx.sender_pubkey) != tx.entity_id:
+                    return False, (
+                        f"Invalid tx {tx.tx_hash.hex()[:16]}: "
+                        f"sender_pubkey does not derive claimed entity_id"
+                    )
+                public_key = tx.sender_pubkey
+
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
             # applies to consensus verification.  prev_lookup resolves
             # Tier 10 prev pointers against the tx_locations index.
@@ -6276,6 +6325,10 @@ class Blockchain:
             ),
             ):
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
+
+            # First-send: surface this pubkey to later txs in the same block.
+            if known_pk is None:
+                pending_pubkey_installs[tx.entity_id] = tx.sender_pubkey
 
             if tx.timestamp <= 0:
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Transaction must have a valid timestamp"
@@ -6305,10 +6358,9 @@ class Blockchain:
         # the sender may also be unknown on-chain iff the tx carries a
         # valid `sender_pubkey` (first-spend reveal).  Pubkeys installed
         # earlier in the same block are visible to later txs via
-        # pending_pubkey_installs so a single block can contain "fund X
-        # + first-spend from X" without rejecting the second tx.
-        from messagechain.identity.identity import derive_entity_id
-        pending_pubkey_installs: dict[bytes, bytes] = {}
+        # pending_pubkey_installs (declared above the message-tx loop
+        # so message-first-send installs are visible to subsequent
+        # transfers in the same block, and vice versa).
         # Credits to recipients inside this block — lets a later Stake
         # from the same recipient see its same-block funding when the
         # block is of the form [fund X via Transfer, X stakes first-
@@ -7069,12 +7121,36 @@ class Blockchain:
                     f"in unstake tx {utx.tx_hash.hex()[:16]}"
                 )
 
-        # Validate transaction signatures
+        # Validate transaction signatures.  Both message + transfer txs
+        # support Tier 11 first-send pubkey reveal: when the sender
+        # entity_id is not yet on chain, the tx must carry a
+        # sender_pubkey whose hash derives back to that entity_id.
+        # `pending_pk_installs` tracks first-send installs from earlier
+        # txs in the same block so a fund+spend pattern within one
+        # block is accepted.
+        from messagechain.core.transaction import (
+            verify_transaction, TX_VERSION_FIRST_SEND_PUBKEY,
+        )
+        from messagechain.identity.identity import derive_entity_id
+        pending_pk_installs_v: dict[bytes, bytes] = {}
         for tx in block.transactions:
-            if tx.entity_id not in self.public_keys:
-                return False, f"Unknown entity in tx {tx.tx_hash.hex()[:16]}"
-            pk = self.public_keys[tx.entity_id]
-            from messagechain.core.transaction import verify_transaction
+            known_pk = self.public_keys.get(tx.entity_id) or pending_pk_installs_v.get(tx.entity_id)
+            if known_pk is not None:
+                if tx.sender_pubkey:
+                    return False, (
+                        f"sender_pubkey must be empty for already-registered "
+                        f"entity in tx {tx.tx_hash.hex()[:16]}"
+                    )
+                pk = known_pk
+            else:
+                if tx.version < TX_VERSION_FIRST_SEND_PUBKEY or not tx.sender_pubkey:
+                    return False, f"Unknown entity in tx {tx.tx_hash.hex()[:16]}"
+                if derive_entity_id(tx.sender_pubkey) != tx.entity_id:
+                    return False, (
+                        f"sender_pubkey does not derive entity_id "
+                        f"in tx {tx.tx_hash.hex()[:16]}"
+                    )
+                pk = tx.sender_pubkey
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
             # applies to consensus verification.  prev_lookup resolves
             # Tier 10 prev pointers against the tx_locations index.
@@ -7086,15 +7162,33 @@ class Blockchain:
             ),
             ):
                 return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
+            if known_pk is None:
+                pending_pk_installs_v[tx.entity_id] = tx.sender_pubkey
 
         for ttx in block.transfer_transactions:
-            if ttx.entity_id not in self.public_keys:
-                return False, f"Unknown sender in transfer {ttx.tx_hash.hex()[:16]}"
-            pk = self.public_keys[ttx.entity_id]
+            known_pk = self.public_keys.get(ttx.entity_id) or pending_pk_installs_v.get(ttx.entity_id)
+            if known_pk is not None:
+                if ttx.sender_pubkey:
+                    return False, (
+                        f"sender_pubkey must be empty for already-registered "
+                        f"entity in transfer {ttx.tx_hash.hex()[:16]}"
+                    )
+                pk = known_pk
+            else:
+                if not ttx.sender_pubkey:
+                    return False, f"Unknown sender in transfer {ttx.tx_hash.hex()[:16]}"
+                if derive_entity_id(ttx.sender_pubkey) != ttx.entity_id:
+                    return False, (
+                        f"sender_pubkey does not derive entity_id "
+                        f"in transfer {ttx.tx_hash.hex()[:16]}"
+                    )
+                pk = ttx.sender_pubkey
             if not verify_transfer_transaction(
                 ttx, pk, current_height=block.header.block_number,
             ):
                 return False, f"Invalid signature in transfer {ttx.tx_hash.hex()[:16]}"
+            if known_pk is None:
+                pending_pk_installs_v[ttx.entity_id] = ttx.sender_pubkey
 
         # Per-block new-account cap — mirrors validate_block.  Count
         # brand-new recipients with intra-block pipelining so the count
@@ -7796,6 +7890,23 @@ class Blockchain:
 
         # Apply message transaction fees (EIP-1559: burn base fee, tip to proposer)
         for tx in block.transactions:
+            # Tier 11 first-send pubkey reveal — runs BEFORE the fee
+            # debit so the supply mutation can charge against the
+            # newly-funded sender (faucet drip in an earlier block
+            # gave them balance; this is the message that turns that
+            # balance into an installed pubkey).  Mirrors
+            # apply_transfer_transaction's first-spend block exactly.
+            if (
+                getattr(tx, "sender_pubkey", b"")
+                and tx.entity_id not in self.public_keys
+            ):
+                self.public_keys[tx.entity_id] = tx.sender_pubkey
+                self._record_key_history(tx.entity_id, tx.sender_pubkey)
+                self.nonces.setdefault(tx.entity_id, 0)
+                self._assign_entity_index(tx.entity_id)
+                self._record_tree_height(tx.entity_id, tx.signature)
+                if self.db is not None:
+                    self.db.set_public_key(tx.entity_id, tx.sender_pubkey)
             if not self.supply.pay_fee_with_burn(tx.entity_id, proposer_id, tx.fee, current_base_fee):
                 logger.error(
                     f"Message tx {tx.tx_hash.hex()[:16]} fee payment failed "

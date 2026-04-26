@@ -4,6 +4,86 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] — 2026-04-26
+
+Minor release. Hard fork (Tier 11) plus an opt-in operator feature.
+Two structurally-correct fixes for the cold-start gap that the 1.8.x
+faucet exposed: the chain itself now lets fresh wallets post their
+first message in one tx, and the faucet now uses client-side
+proof-of-work instead of pure rate-limiting so Tor / privacy users
+stay first-class.
+
+### Added — Tier 11 hard fork
+
+- **`MessageTransaction.sender_pubkey` (v3 txs).**
+  At/after `FIRST_SEND_PUBKEY_HEIGHT = 500`, message txs may carry
+  an optional 32-byte `sender_pubkey` field.  When the sender's
+  entity_id is not yet on chain, the field is required and is
+  installed in `chain.public_keys` on apply.  Mirrors
+  `TransferTransaction.sender_pubkey` exactly so messaging works
+  for receive-to-exist wallets in one round-trip instead of
+  needing a transfer-first dance to install the pubkey.  Closes
+  the asymmetry where the faucet could fund a wallet but the
+  recipient still couldn't post a first message until they did
+  some other on-chain action.  Backwards-compatible: v1 / v2 txs
+  remain valid; v3 is rejected pre-activation; activation gate is
+  enforced at every validation entry point (mempool admit,
+  validate_block, validate_block_signatures).
+  (`messagechain/core/transaction.py`,
+  `messagechain/core/blockchain.py`, `messagechain/config.py`)
+- **`messagechain send` auto-attaches `sender_pubkey` on first send.**
+  Probes the chain for the sender's pubkey via `get_entity`; when
+  not registered AND past `FIRST_SEND_PUBKEY_HEIGHT`, sets
+  `include_pubkey=True` so the chain installs on apply.  User
+  experiences "get tokens, then send" as two CLI invocations
+  instead of three.
+
+### Added — Faucet PoW gate
+
+- **`GET /faucet/challenge?address=<hex>`** mints a per-address
+  challenge: 16 random seed bytes + difficulty + 10-min TTL.
+- **`POST /faucet`** now requires `{address, challenge_seed, nonce}`.
+  Server verifies that `sha256(seed || nonce_be_8 || address)` has
+  at least `FAUCET_POW_BITS = 22` leading zero bits.  Average ~5s
+  on desktop, ~15s on mobile in pure-JS sha256.  Per-/24 IP cooldown
+  and daily aggregate cap remain as defense-in-depth.  Replay-
+  protected: each challenge consumed atomically on use.  Address-
+  bound: a nonce solving the challenge for address A cannot be used
+  for address B.
+- **No CAPTCHA dependency.**  Pure-JS sha256 in a WebWorker.  Tor
+  and privacy users pay CPU, not credentials.  No third-party
+  scripts on the public feed page.
+- **Why PoW vs CAPTCHA**: the project's no-external-deps memory
+  rules out Google/hCaptcha, and CAPTCHAs are actively hostile to
+  Tor users (the censorship-resistance audience).  Per-address
+  PoW makes bulk Sybil farming uneconomical (each new address
+  costs the attacker the same CPU time as an honest user); the
+  daily cap caps the operator's worst-case daily exposure.
+  (`messagechain/network/faucet.py`,
+  `messagechain/network/public_feed_server.py`,
+  `messagechain/static/feed.html`)
+
+### Changed
+
+- **`messagechain send` "Unknown entity" hint** now points users at
+  the public faucet URL and explains the Tier 11 auto-include flow:
+  "get tokens at messagechain.org, wait one block, retry."  The
+  bootstrap step list is now 3 items, not the awkward 4-step
+  "transfer-first then message" workaround that 1.8.x described.
+- **Per-address one-shot rate limit** is unchanged but the failure
+  path is no longer reachable via cheap address-spam: the PoW
+  consumes ~5s of attacker CPU per probe.
+
+### Deployment
+
+- Activation height `FIRST_SEND_PUBKEY_HEIGHT = 500` is well above
+  the live tip (~451 at release time), giving operators ~10
+  blocks (~100 minutes) of runway to upgrade before the fork
+  point.  Validators on 1.8.x keep producing pre-Tier-11 blocks
+  through height 500; v3 txs land starting at 501.
+- The faucet PoW change is operator-side and takes effect
+  immediately on validator restart -- no fork dependency.
+
 ## [1.8.2] — 2026-04-26
 
 Patch release. Fixes the threadsafe-relay gap exposed by the 1.8.1

@@ -1,47 +1,78 @@
 """Cold-start funding faucet for the public feed server.
 
-Purpose: close the receive-to-exist cold-start gap.  MessageChain
-requires a wallet to have on-chain balance before its first send
-(the chain rejects "Unknown entity -- must register first" otherwise),
-which means a fresh user with a freshly-generated keyfile cannot
-post anything until somebody sends them tokens.  Without an
-allocation path the chain is read-only for the public.
+Purpose: close the receive-to-exist cold-start gap.  Pre-Tier-11,
+MessageChain rejected first messages from any wallet whose pubkey
+wasn't on chain yet; Tier 11 (FIRST_SEND_PUBKEY_HEIGHT) added v3
+sender_pubkey reveal so the receive-to-exist install also covers
+messaging.  But the FIRST hop -- getting any tokens at all to the
+fresh wallet -- still requires somebody to send them tokens, and
+without a public allocation path the chain stays effectively
+read-only for the general public.
 
-This module implements a Phase-1 operator-funded drip faucet:
+This module implements an operator-funded drip faucet that closes
+that hop:
 
   * Operator-controlled wallet (separate from the validator hot key)
     funded out-of-band with a one-time transfer from a token holder.
-  * `/faucet` POST endpoint on the public feed server takes
-    `{"address": "<entity_id_hex>"}` and sends a fixed `FAUCET_DRIP`
-    transfer to it.
-  * Three rate-limit layers, in order:
-      - per-/24 IP cooldown (one drip per 24h per CIDR)
-      - per-address one-time (an address can claim once, ever, while
-        the process lives -- in-memory, lost on restart)
-      - per-day aggregate cap (FAUCET_DAILY_CAP drips/day across
-        all sources)
-  * No CAPTCHA dependency -- adding a third-party captcha would
-    violate the project's no-external-deps principle.  The
-    rate-limit triple is good enough for a single-validator-set
-    bootstrap chain; if Sybil drains exceed the daily cap for a
-    sustained week, revisit.
+  * `POST /faucet` accepts `{"address", "challenge_seed", "nonce"}`
+    and sends a fixed `FAUCET_DRIP` transfer to the address after
+    verifying the proof-of-work nonce against the issued challenge.
+  * `GET /faucet/challenge?address=<hex>` issues a fresh challenge
+    bound to the address.  The client (browser WebWorker) finds a
+    nonce such that sha256(seed || nonce || address) has FAUCET_POW_BITS
+    leading zero bits; tuned for ~5s on a desktop browser, ~15s on
+    mobile.  PoW makes bulk Sybil farming uneconomical without
+    requiring a third-party CAPTCHA -- staying inside the project's
+    no-external-deps stance and keeping Tor / privacy users
+    first-class (they pay CPU, not credentials).
+  * IP rate-limit (per-/24 cooldown) is kept as defense-in-depth,
+    but treated as the cheap first filter rather than the actual
+    gate -- VPNs and CGNAT make per-IP throttling noisy.  PoW does
+    the real work; IP limits stop noise.
+  * Per-address one-shot: a given address can claim once per
+    process lifetime regardless of IP / PoW.
+  * Per-day aggregate cap: FAUCET_DAILY_CAP drips total per UTC day,
+    cap on operator's daily exposure.
 
 State is in-memory and intentionally non-durable.  A restart resets
-the per-address claim list and the per-IP cooldowns; the daily cap
-counter is reconstructed from scratch.  This keeps the surface
-small for v1; persistent state moves to Phase 2 once we see real
-abuse patterns worth defending against.
+the per-address claim list, per-IP cooldowns, and outstanding
+challenges; the daily cap counter is reconstructed from scratch.
+This keeps the surface small for v1; persistent state moves to
+Phase 2 once we see real abuse patterns worth defending against.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 logger = logging.getLogger("messagechain.faucet")
+
+
+# Proof-of-work difficulty in leading zero bits of sha256(seed || nonce
+# || address).  At ~1M sha256/s in browser JS, 22 bits requires ~4M
+# tries on average = ~4 seconds desktop / ~12s mobile.  Honest users
+# pay CPU, not credentials -- privacy/Tor users stay first-class.
+# Each unique address requires an independent PoW: bulk farming N
+# addresses costs N * average_solve_time, so daily-cap drains take
+# real wall-clock time even with parallel hardware.
+FAUCET_POW_BITS = 22
+
+# Outstanding challenge TTL.  Long enough that a slow mobile device
+# can solve, short enough that we don't accumulate millions of
+# unsolved challenges in memory.  10 minutes covers the 99th
+# percentile mobile solver.
+FAUCET_CHALLENGE_TTL_SEC = 600
+
+# Cap on outstanding challenges to bound memory.  Eviction policy
+# is FIFO-by-expiry (oldest first) when the cap is hit.  4096
+# pending challenges at ~96 bytes each = ~400 KB worst case.
+FAUCET_MAX_PENDING_CHALLENGES = 4096
 
 
 # Per-drip token amount.  Sized for ~3-4 short messages at the live
@@ -100,6 +131,61 @@ class FaucetDripResult:
 
 
 @dataclass
+class FaucetChallenge:
+    """A PoW challenge bound to a specific recipient address.
+
+    `seed` is 16 random bytes generated by os.urandom and serves as
+    the unique identifier (also the dedup key in _pending_challenges).
+    `address` binds the PoW to a specific recipient -- finding a nonce
+    for one address does not transfer to another, so an attacker
+    cannot pre-mine a nonce pool and burn it across many requests.
+    `expires_at` is the Unix timestamp after which the challenge is
+    rejected (FAUCET_CHALLENGE_TTL_SEC from issuance).
+    `difficulty` is the required leading-zero-bit count of
+    sha256(seed || nonce_be_8 || address).
+    """
+    seed: bytes
+    address: bytes
+    expires_at: float
+    difficulty: int
+
+
+def _verify_pow(
+    seed: bytes, nonce: int, address: bytes, difficulty: int,
+) -> bool:
+    """Return True iff sha256(seed || nonce_be_8 || address) has
+    `difficulty` leading zero bits.
+
+    Nonce is encoded as 8-byte big-endian so the client and server
+    agree on the canonical bytes.  The hash function is SHA-256 to
+    keep the browser implementation tiny (SubtleCrypto is async and
+    awkward inside a tight loop; we use a JS sha256 fallback instead,
+    so server-side stays sha256 too for symmetry).
+    """
+    if difficulty <= 0 or difficulty > 256:
+        return False
+    if nonce < 0 or nonce > 0xFFFFFFFFFFFFFFFF:
+        return False
+    digest = hashlib.sha256(
+        seed + nonce.to_bytes(8, "big") + address,
+    ).digest()
+    # Count leading zero bits.  Walk byte-by-byte; in the typical
+    # difficulty=22 case the loop exits within 3 bytes.
+    zero_bits = 0
+    for byte in digest:
+        if byte == 0:
+            zero_bits += 8
+            continue
+        # Count the leading zeros within this byte.
+        for shift in range(7, -1, -1):
+            if byte & (1 << shift):
+                return zero_bits >= difficulty
+            zero_bits += 1
+        return zero_bits >= difficulty
+    return zero_bits >= difficulty
+
+
+@dataclass
 class FaucetState:
     """In-memory rate-limit + drip-builder state.
 
@@ -127,12 +213,88 @@ class FaucetState:
     drip_amount: int = FAUCET_DRIP
     daily_cap: int = FAUCET_DAILY_CAP
     ip_cooldown_sec: int = FAUCET_IP_COOLDOWN_SEC
+    pow_difficulty: int = FAUCET_POW_BITS
+    challenge_ttl_sec: int = FAUCET_CHALLENGE_TTL_SEC
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _ip_last_drip: dict[str, float] = field(default_factory=dict)
     _addresses_claimed: set[bytes] = field(default_factory=set)
+    # Outstanding PoW challenges keyed by seed (16-byte random).
+    # Bounded by FAUCET_MAX_PENDING_CHALLENGES; oldest-by-expiry
+    # evicted when full.
+    _pending_challenges: dict[bytes, "FaucetChallenge"] = field(default_factory=dict)
     _day: int = 0
     _drips_today: int = 0
+
+    def issue_challenge(self, address_hex: str) -> tuple[bool, str, dict]:
+        """Mint a fresh PoW challenge for the given recipient address.
+
+        Returns (ok, error, payload) where payload is a JSON-friendly
+        dict the HTTP layer relays to the client.  Cleans up expired
+        challenges as a side effect to bound memory.
+
+        No rate limit on issuance: an attacker who spams /challenge
+        gets back challenges they cannot use without solving the PoW
+        anyway.  The per-address one-shot still applies at try_drip
+        time, so a malicious requester cannot drain by hoarding
+        challenges for an already-claimed address.
+        """
+        try:
+            address = bytes.fromhex(address_hex.strip())
+        except (ValueError, AttributeError):
+            return False, "address must be 64 hex characters (entity_id)", {}
+        if len(address) != 32:
+            return False, (
+                f"address must be 32 bytes (got {len(address)})"
+            ), {}
+
+        with self._lock:
+            self._evict_expired_challenges_locked(time.time())
+
+            # Refuse to issue more challenges than we can hold without
+            # evicting old ones FIFO.  Eviction policy: drop the
+            # oldest-by-expiry first to keep the working set fresh.
+            if len(self._pending_challenges) >= FAUCET_MAX_PENDING_CHALLENGES:
+                # Find and drop the soonest-to-expire entry.
+                oldest_seed = min(
+                    self._pending_challenges,
+                    key=lambda s: self._pending_challenges[s].expires_at,
+                )
+                del self._pending_challenges[oldest_seed]
+
+            seed = os.urandom(16)
+            now = time.time()
+            challenge = FaucetChallenge(
+                seed=seed,
+                address=address,
+                expires_at=now + self.challenge_ttl_sec,
+                difficulty=self.pow_difficulty,
+            )
+            self._pending_challenges[seed] = challenge
+
+        return True, "", {
+            "seed": seed.hex(),
+            "address": address.hex(),
+            "difficulty": self.pow_difficulty,
+            "expires_at": challenge.expires_at,
+            "ttl_sec": self.challenge_ttl_sec,
+        }
+
+    def _evict_expired_challenges_locked(self, now: float) -> int:
+        """Drop expired challenges.  Caller MUST hold _lock.
+
+        Returns number of entries dropped.  O(N) over the dict; runs
+        on every challenge issuance + every drip attempt, both of
+        which are already heavyweight ops, so the linear scan is
+        free in practice.
+        """
+        stale = [
+            seed for seed, ch in self._pending_challenges.items()
+            if ch.expires_at <= now
+        ]
+        for seed in stale:
+            del self._pending_challenges[seed]
+        return len(stale)
 
     def _reset_day_if_rolled_locked(self, now: float) -> None:
         """Roll the daily counter at UTC midnight.
@@ -153,20 +315,24 @@ class FaucetState:
         self,
         client_ip: str,
         recipient_hex: str,
+        challenge_seed_hex: str = "",
+        nonce: int | None = None,
     ) -> FaucetDripResult:
         """Attempt one drip.  Returns a result object with the outcome.
 
         Order of checks (most-likely-fail first to keep failures cheap):
           1. recipient_hex is a valid 64-char hex entity_id.
-          2. address has not already claimed (one-shot per process).
-          3. /24 IP has not drip'd in the last 24 hours.
-          4. daily cap not yet exhausted.
-          5. submit_callback succeeds.
+          2. challenge_seed + nonce are present and valid PoW for this
+             address (the actual abuse gate).
+          3. address has not already claimed (one-shot per process).
+          4. /24 IP has not drip'd in the last 24 hours (defense-in-depth).
+          5. daily cap not yet exhausted (operator's exposure ceiling).
+          6. submit_callback succeeds.
 
-        On success: state is committed (IP cooldown set, address
-        added to claimed set, daily counter incremented) BEFORE the
-        function returns, so a concurrent request cannot double-spend
-        the same slot.
+        On success: state is committed (challenge consumed, IP cooldown
+        set, address added to claimed set, daily counter incremented)
+        BEFORE the function returns, so a concurrent request cannot
+        double-spend the same slot.
         """
         # Address sanity outside the lock -- pure CPU work.
         try:
@@ -182,11 +348,75 @@ class FaucetState:
                 error=f"address must be 32 bytes (got {len(recipient_bytes)})",
             )
 
+        # Parse + validate the PoW solution outside the lock; the only
+        # state read is the challenge dict, and we re-fetch under the
+        # lock before consuming.
+        try:
+            challenge_seed = bytes.fromhex(challenge_seed_hex.strip())
+        except (ValueError, AttributeError):
+            return FaucetDripResult(
+                ok=False,
+                error="challenge_seed must be hex",
+            )
+        if len(challenge_seed) != 16:
+            return FaucetDripResult(
+                ok=False,
+                error="challenge_seed must be 16 bytes",
+            )
+        if nonce is None or not isinstance(nonce, int):
+            return FaucetDripResult(
+                ok=False,
+                error="nonce required (integer PoW solution)",
+            )
+
         cidr = _ip_cidr_24(client_ip)
 
         with self._lock:
             now = time.time()
             self._reset_day_if_rolled_locked(now)
+            self._evict_expired_challenges_locked(now)
+
+            # PoW gate -- the actual abuse defense.  Missing/expired
+            # challenge or wrong nonce both fail here BEFORE we touch
+            # any other rate-limit state, so a malformed POST does not
+            # consume the per-IP cooldown slot or the daily cap.
+            challenge = self._pending_challenges.get(challenge_seed)
+            if challenge is None:
+                return FaucetDripResult(
+                    ok=False,
+                    error=(
+                        "challenge unknown or expired -- request a fresh "
+                        "one via GET /faucet/challenge"
+                    ),
+                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                )
+            if challenge.address != recipient_bytes:
+                return FaucetDripResult(
+                    ok=False,
+                    error=(
+                        "challenge was issued for a different address -- "
+                        "request a new challenge bound to this address"
+                    ),
+                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                )
+            if not _verify_pow(
+                challenge.seed, nonce, challenge.address,
+                challenge.difficulty,
+            ):
+                return FaucetDripResult(
+                    ok=False,
+                    error=(
+                        f"nonce does not satisfy proof-of-work "
+                        f"(need {challenge.difficulty} leading zero bits)"
+                    ),
+                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                )
+            # Consume the challenge atomically so a stolen pair cannot
+            # be replayed even if it satisfies the PoW.  Drop it from
+            # the pending set BEFORE checking the other rate limits so
+            # a per-address-claimed rejection still burns the challenge
+            # (the requester needs to do new PoW for the next attempt).
+            del self._pending_challenges[challenge_seed]
 
             if recipient_bytes in self._addresses_claimed:
                 return FaucetDripResult(

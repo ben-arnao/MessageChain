@@ -1825,7 +1825,7 @@ def cmd_send(args):
         PREV_POINTER_STORED_BYTES,
     )
     from messagechain.core.compression import encode_payload
-    from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT
+    from messagechain.config import FEE_INCLUDES_SIGNATURE_HEIGHT, FIRST_SEND_PUBKEY_HEIGHT
     # Fee is charged on the canonical stored size - compute locally so
     # we never overpay and never underpay relative to what the chain
     # will enforce.
@@ -1885,6 +1885,32 @@ def cmd_send(args):
             sys.exit(1)
         print(f"Fee: {fee} tokens")
 
+    # Tier 11: auto-include the sender's pubkey on first send.  Probe
+    # the chain for whether this entity's pubkey is already installed;
+    # if not (typical for a wallet that just received tokens via the
+    # cold-start faucet), build a v3 tx with sender_pubkey set so the
+    # apply path can install it.  Skip the probe if pre-fork --
+    # v3 txs would be rejected by verify_transaction's gate.
+    include_pubkey = False
+    if target_height >= FIRST_SEND_PUBKEY_HEIGHT:
+        get_resp = rpc_call(host, port, "get_entity", {
+            "entity_id": entity.entity_id_hex,
+        })
+        if get_resp.get("ok"):
+            pubkey_registered = get_resp["result"].get(
+                "pubkey_registered", True,
+            )
+            if not pubkey_registered:
+                include_pubkey = True
+                print(
+                    "\nFirst send from this wallet -- attaching pubkey "
+                    "(Tier 11 receive-to-exist install).  Subsequent "
+                    "sends will skip this and stay on v1/v2."
+                )
+        # An ok=False from get_entity means the entity isn't on chain
+        # at all (no balance even).  In that case we can't fund the
+        # tx fee anyway, so let the chain return its own clear error.
+
     # Create, sign, submit.  Thread the live target_height so the
     # client-side fee floor matches the live (LINEAR-era) rule the
     # chain enforces -- without this, create_transaction defaults to
@@ -1896,6 +1922,7 @@ def cmd_send(args):
     tx = create_transaction(
         entity, message, fee=fee, nonce=nonce,
         current_height=target_height, prev=prev_bytes_arg,
+        include_pubkey=include_pubkey,
     )
     if prev_bytes_arg is not None:
         print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
@@ -1925,12 +1952,17 @@ def cmd_send(args):
                 "model -- a wallet only becomes an on-chain entity once\n"
                 "it has received tokens from another entity.  Your wallet\n"
                 f"  {entity.entity_id_hex}\n"
-                "has no on-chain history yet, so it cannot pay the fee\n"
+                "has no on-chain balance yet, so it cannot pay the fee\n"
                 "for its own first message.\n"
                 "\n"
-                "Bootstrap path: ask an existing token holder to send a\n"
-                "small transfer to your address.  Once that lands, your\n"
-                "next 'messagechain send' will work."
+                "Bootstrap path:\n"
+                "  1. Get tokens at https://messagechain.org/ (one click\n"
+                "     into the 'Get starter tokens' box).\n"
+                "  2. Wait ~10 minutes for the next block.\n"
+                "  3. Re-run 'messagechain send' -- the CLI auto-includes\n"
+                "     your pubkey on first send (Tier 11), so the next\n"
+                "     attempt registers your identity in the same tx that\n"
+                "     posts your message."
             )
         sys.exit(1)
 

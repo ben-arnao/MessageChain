@@ -230,8 +230,29 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if not isinstance(address, str):
             self._send_json(400, {"ok": False, "error": "address must be a string"})
             return
+        challenge_seed = payload.get("challenge_seed", "")
+        if not isinstance(challenge_seed, str):
+            self._send_json(400, {
+                "ok": False,
+                "error": "challenge_seed must be a hex string",
+            })
+            return
+        nonce_raw = payload.get("nonce")
+        if not isinstance(nonce_raw, int):
+            self._send_json(400, {
+                "ok": False,
+                "error": (
+                    "nonce must be an integer (PoW solution).  GET "
+                    "/faucet/challenge?address=<hex> first to obtain "
+                    "a challenge."
+                ),
+            })
+            return
 
-        result = ctx.faucet.try_drip(self._client_ip(), address)
+        result = ctx.faucet.try_drip(
+            self._client_ip(), address,
+            challenge_seed_hex=challenge_seed, nonce=nonce_raw,
+        )
         if result.ok:
             self._send_json(200, {
                 "ok": True,
@@ -300,8 +321,32 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             return
+        if path == "/faucet/challenge" and ctx.faucet is not None:
+            self._serve_faucet_challenge(ctx, split.query)
+            return
 
         self._send_text(404, "Not Found")
+
+    def _serve_faucet_challenge(self, ctx, query: str):
+        """GET /faucet/challenge?address=<hex>: mint a fresh PoW
+        challenge bound to the recipient address.
+
+        Returns {"ok", "seed", "address", "difficulty", "expires_at",
+        "ttl_sec"}.  The client uses (seed, address) to find a nonce
+        such that sha256(seed || nonce_be_8 || address) has at least
+        `difficulty` leading zero bits, then POSTs that to /faucet.
+        Bound to the address so an attacker cannot pre-mine a nonce
+        pool and burn it across many addresses.
+        """
+        params = parse_qs(query)
+        address = (params.get("address") or [""])[0]
+        ok, error, payload = ctx.faucet.issue_challenge(address)
+        if not ok:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        body = {"ok": True}
+        body.update(payload)
+        self._send_json(200, body)
 
     def _serve_static_feed(self):
         try:
