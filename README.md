@@ -147,15 +147,14 @@ You need 10,000 tokens to stake and an always-on Linux host (Python
 cloud firewall.
 
 ```bash
-# 1. install on the host (as root) — generates the validator's keyfile
+# 1. on the host (as root) — installs MessageChain, generates the validator's
+#    keyfile, and prints its mc1... address.  Save that address.
 curl -L https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh | sudo bash
 
-# 2. print the validator's address (its keyfile signs blocks AND owns the stake)
-sudo -u messagechain messagechain account --keyfile /etc/messagechain/keyfile
+# 2. from a wallet with tokens, fund the address printed above:
+messagechain transfer --to mc1... --amount 10000
 
-# 3. from a wallet that has tokens, send 10,000 to that address:
-#    messagechain transfer --to mc1... --amount 10000
-#    then back on the host:
+# 3. back on the host, lock the funds as stake:
 sudo -u messagechain messagechain stake --amount 10000
 
 # 4. start
@@ -163,33 +162,50 @@ systemctl enable --now messagechain-validator messagechain-upgrade.timer message
 
 # 5. verify
 messagechain status
-journalctl -u messagechain-validator -f   # follow the log if status looks off
 ```
 
 The installer's keyfile **is** the validator's identity — the same
-key signs blocks and owns the stake, so tokens have to flow to the
-address it prints, not your wallet's address. Back the keyfile up.
+key signs blocks and owns the stake. Back it up:
+`sudo cat /etc/messagechain/keyfile` and store the hex offline.
 
 Rewards = block reward + tx fees + attester pool share, pro-rata by
 stake. Unbonding takes ~15 days (2176 blocks) — slashing windows
-extend past departure.
+extend past departure, so don't shut a validator down inside the
+unbonding window.
 
 <details>
-<summary>Manual install &amp; advanced operations</summary>
+<summary>Operating a live validator (backups, migration, retirement, monitoring)</summary>
 
-**Manual run.** `messagechain generate-key`, store the hex on paper,
-then:
+**Back up the keyfile.** `sudo cat /etc/messagechain/keyfile` prints the
+hex. Store offline (paper, hardware token, encrypted USB). Lose this
+and the staked funds are gone — there is no recovery.
 
-```bash
-messagechain start --mine --rpc-bind 0.0.0.0 \
-  --data-dir /var/lib/messagechain --keyfile /etc/messagechain/keyfile
-```
+**Migrate to a new host.** Stop the validator on the old host
+(`systemctl stop messagechain-validator`), copy
+`/etc/messagechain/keyfile` to `/etc/messagechain/keyfile` on the new
+host (chmod 0600, owner `messagechain`), then run the installer on the
+new host. Init reuses the existing keyfile rather than regenerating —
+no multi-hour keygen, and no double-sign risk because only one host
+runs at a time.
 
-A systemd unit example ships at
-[`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example).
+**Drain & retire.** `messagechain unstake --amount 10000`, wait the
+full ~15-day unbonding window so the slashing window closes, *then*
+shut the host down. Bringing a validator down with stake still bonded
+risks downtime slashing.
 
-**Preflight.** `messagechain doctor` checks perms, ports, seeds, and
-disk. `messagechain status --full` confirms chain reachability.
+**What gets you slashed.** Double-signing or equivocating — signing
+two competing blocks at the same height. The unbonding window exists
+so peers can prove misbehavior committed before you left.
+
+**Health monitoring.** `messagechain validators` (your stake share +
+whether you're in the active set). `messagechain key-status` (WOTS+
+leaf consumption — auto-rotation handles this at ≥95% but check by
+hand if curious). `journalctl -u messagechain-validator -f` to follow
+the log live.
+
+**Manual upgrade.** `messagechain upgrade` installs the latest mainnet
+tag. The weekly timer does this automatically; run it by hand if you
+disabled the timer.
 
 **Toggle automation.** `messagechain config set auto_upgrade false` /
 `auto_rotate false` disables the timers.
@@ -199,8 +215,14 @@ disk. `messagechain status --full` confirms chain reachability.
 `messagechain emergency-revoke --entity-id <hex>` is the cold-signed
 kill switch.
 
-**Bare init.** The installer wraps `messagechain init`; you can run
-that directly on hosts where you don't want the curl-pipe.
+**Manual run (no installer).** `messagechain generate-key`, store the
+hex on paper, then `messagechain start --mine --rpc-bind 0.0.0.0
+--data-dir /var/lib/messagechain --keyfile /etc/messagechain/keyfile`.
+A systemd unit example ships at
+[`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example).
+`messagechain doctor` runs preflight checks. `messagechain init` is
+what the installer wraps — run it directly if you don't want the
+curl-pipe.
 
 </details>
 

@@ -115,6 +115,32 @@ def test_next_steps_skips_disabled_timers(tmp_path):
     assert "messagechain-upgrade.timer" not in text
 
 
+def test_next_steps_prints_full_address_and_stake_hint(tmp_path):
+    """The operator needs the full mc1... address so they can fund the
+    validator and the explicit stake command so they don't have to go
+    look it up.  The truncated entity_id_hex is not enough."""
+    from messagechain.identity.address import encode_address
+
+    plan = onboarding.plan_init(
+        data_dir=str(tmp_path / "d"),
+        keyfile=str(tmp_path / "k"),
+        systemd=True,
+        auto_upgrade=True,
+        auto_rotate=True,
+        onboard_config_path=str(tmp_path / "o.toml"),
+        key_override=b"\x66" * 32,
+    )
+    text = plan.next_steps_text()
+
+    expected_address = encode_address(bytes.fromhex(plan.entity_id_hex))
+    assert expected_address in text, (
+        "next_steps_text must print the full mc1... address; got:\n" + text
+    )
+    assert "stake" in text.lower(), (
+        "next_steps_text must mention the stake step:\n" + text
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Chain-identity pre-flight (probe a seed BEFORE the ~90-min keygen)
 # ─────────────────────────────────────────────────────────────────────

@@ -552,15 +552,32 @@ class InitPlan:
     def next_steps_text(self) -> str:
         au = "ON " if self.auto_upgrade else "OFF"
         ar = "ON " if self.auto_rotate else "OFF"
+        address = ""
+        if self.entity_id_hex:
+            try:
+                from messagechain.identity.address import encode_address
+                address = encode_address(bytes.fromhex(self.entity_id_hex))
+            except Exception:
+                address = ""
         lines = [
             "Done. Your validator is configured.",
             f"  Data dir:  {self.data_dir}",
             f"  Keyfile:   {self.keyfile}  (0600)",
+        ]
+        if address:
+            lines.append(f"  Address:   {address}")
+        lines += [
             f"  Entity:    {self.entity_id_hex[:16]}...",
             f"  Auto-upgrade:     {au}  (disable: messagechain config set auto_upgrade false)",
             f"  Auto key-rotate:  {ar}  (disable: messagechain config set auto_rotate false)",
             "",
-            "To start the validator:",
+            "Fund this validator (the keyfile above is its identity — back it up):",
+            "  1. From a wallet with tokens:",
+            f"       messagechain transfer --to {address or 'mc1...'} --amount 10000",
+            "  2. Back on this host, lock the funds as stake:",
+            "       sudo -u messagechain messagechain stake --amount 10000",
+            "",
+            "Then start the validator:",
             "  sudo systemctl daemon-reload",
             "  sudo systemctl enable --now messagechain-validator",
         ]
