@@ -95,6 +95,87 @@ operator runbook for the full rollout sequence.
   and V2 are in `_ACCEPTED_BLOCK_SERIALIZATION_VERSIONS` so
   old-format blocks still decode cleanly.
 
+## [1.12.0] — 2026-04-26
+
+Minor release.  Hard fork: compress the bootstrap-window fork
+schedule (Tier 1-7) from the original 50_000-98_000 height range
+into 600-2800.  Pulls SEED_DIVESTMENT_START_HEIGHT forward from
+105_192 (~2 years) to 50_000 (~1 year).  No new consensus
+mechanisms; every fork in this release is a parameter change the
+schedule had already committed to.
+
+### Why compress
+
+The original schedule's wide spacing existed to give independent
+operators 1-2 years of upgrade runway between forks.  With the
+network in its bootstrap phase (one operator running both validators,
+no external validators), that runway is artificial -- you're
+upgrade-coordinating with yourself, and every additional block of
+"future fork waiting to land" is unfinished business carried across
+releases.  Pulling Tier 1-7 to the 600-2800 window gets the chain
+into its steady-state parameters now, so future audits and validator
+onboarding land against the final rule set instead of a partially-
+activated transitional one.
+
+### Compressed heights
+
+Tier 1 (UNBONDING extension, FINALITY_VOTE cap, SEED_STAKE ceiling,
+TREASURY_CAP tightening): 50_000-56_000 -> 600-1200.
+
+Tier 2 (MIN_STAKE raise, LOTTERY_BOUNTY raise, FEE_INCLUDES_SIGNATURE):
+60_000-64_000 -> 1000-1200.
+
+Tier 3 (TREASURY_REBASE -33M burn, SEED_DIVESTMENT retune+redist):
+68_000-74_000 -> 1300, 1400, 1600.
+
+Tier 4 (ATTESTER reward split, fee funding, finality reward, cap, fix):
+78_000-86_000 -> 1700-2300.
+
+Tier 5 (DEFLATION_FLOOR v1+v2): 90_000-92_000 -> 2500-2600.
+
+Tier 6 (VALIDATOR_REGISTRATION burn): 96_000 -> 2700.
+
+Tier 7 (FLAT_FEE): 98_000 -> 2800.
+
+All existing ordering asserts in `messagechain/config.py` are
+preserved.  TREASURY_CAP_TIGHTEN_HEIGHT (1200) is placed after the
+typical GOVERNANCE_VOTING_WINDOW close (~1014) so existing
+treasury-spend tests with small treasuries don't trip the new
+0.1%-per-epoch + 5%-annual caps; ATTESTER_REWARD_CAP_HEIGHT (2000)
+and ATTESTER_CAP_FIX_HEIGHT (2300) are spaced 300 blocks apart
+(vs. the original 2000) to preserve the [CAP, FIX) test window.
+
+### Seed divestment pull-forward
+
+`SEED_DIVESTMENT_START_HEIGHT`: was 105_192 (= BOOTSTRAP_END_HEIGHT,
+~2 years from launch).  Now 50_000 (~1 year).  The 4-year bleed-
+window duration (END - START = 210_384 blocks) is preserved, so the
+per-block divestment rate is unchanged; only the start is pulled
+forward.
+
+`SEED_DIVESTMENT_END_HEIGHT`: 315_576 -> 260_384 (= 50_000 + 210_384).
+
+This is the largest economically-significant change in the release.
+By the end of the bleed (height ~260_384, ~5 years from launch), the
+founder bond drops from the genesis 95M to a 20M floor, with the
+delta burned 95% / treasury 5% / lottery (after redist fork) 45%/5%/50%
+per the existing post-redist params.  Pulling the start forward by
+one year compresses the runway to credible decentralization without
+touching the bleed mechanics.  Why one year and not less: the audit
+credibility win comes when the founder stake is no longer the
+supermajority of stake, which requires external validators to exist;
+starting the bleed before plausibly any external validator can exist
+just burns tokens into a one-operator network.
+
+### Activation runway
+
+Lowest new fork height is 600.  Current tip ~451 at release time, so
+~150 blocks (~25 hours at 600s/block) of upgrade runway.  Standard
+`messagechain upgrade` on both validators picks up the new constants
+on restart; pre-fork blocks continue to validate under the legacy
+parameters at every height below the new activation, so historical
+replay is byte-preserved.
+
 ## [1.10.0] — 2026-04-26
 
 Minor release.  Hard fork (Tier 12) opens the chain to non-English

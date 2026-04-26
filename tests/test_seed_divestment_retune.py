@@ -114,7 +114,8 @@ class TestRetuneConstants(unittest.TestCase):
 
     def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "SEED_DIVESTMENT_RETUNE_HEIGHT"))
-        self.assertEqual(config.SEED_DIVESTMENT_RETUNE_HEIGHT, 72_000)
+        # Compressed in 1.11.0 from 72_000 to 1400 — see CHANGELOG.
+        self.assertEqual(config.SEED_DIVESTMENT_RETUNE_HEIGHT, 1400)
 
     def test_activation_before_bootstrap_end(self):
         """Must activate BEFORE the first divestment block fires."""

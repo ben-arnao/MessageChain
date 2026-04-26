@@ -441,9 +441,12 @@ class TestSlashingEvidenceExpiration(unittest.TestCase):
         submitter = _make_entity()
         bc._install_pubkey_direct(submitter.entity_id, submitter.public_key,
                            submitter.keypair.sign(_hash(b"register" + submitter.entity_id)))
-        bc.supply.balances[submitter.entity_id] = 10_000
+        bc.supply.balances[submitter.entity_id] = 100_000
         from messagechain.consensus.slashing import create_slash_transaction
-        slash_tx = create_slash_transaction(submitter, evidence, fee=MIN_FEE)
+        # Generous fee so the sig-aware fee floor (active by the test
+        # height post-1.11.0 schedule compression) doesn't reject the tx
+        # before it reaches the staleness check this test is asserting on.
+        slash_tx = create_slash_transaction(submitter, evidence, fee=10_000)
         # Pretend chain is far beyond evidence height.
         # The evidence references block_number=1; chain should reject if too old.
         valid, reason = bc.validate_slash_transaction(

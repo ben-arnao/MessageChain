@@ -37,7 +37,8 @@ class TestLotteryBountyRaiseConstants(unittest.TestCase):
 
     def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "LOTTERY_BOUNTY_RAISE_HEIGHT"))
-        self.assertEqual(config.LOTTERY_BOUNTY_RAISE_HEIGHT, 62_000)
+        # Compressed in 1.11.0 from 62_000 to 1100 — see CHANGELOG.
+        self.assertEqual(config.LOTTERY_BOUNTY_RAISE_HEIGHT, 1100)
 
     def test_helper_exists(self):
         self.assertTrue(hasattr(config, "get_lottery_bounty"))
