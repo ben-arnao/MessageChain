@@ -345,6 +345,25 @@ class TestFaucetHTTPEndpoint(unittest.TestCase):
     def tearDownClass(cls):
         cls.feed.stop()
 
+    def setUp(self):
+        # FaucetState is class-scoped (so the bound TCP server can stay
+        # shared and tests run fast), but its rate-limit / cap / claimed
+        # state mutates per drip.  Without an explicit reset, test order
+        # determines outcomes -- e.g. a successful drip in one test
+        # leaves the per-/24 cooldown set, and a later "wrong nonce"
+        # test sees a cooldown-shaped 429 instead of the PoW-shaped 429
+        # it asserts on.  This used to "work" purely on xdist scheduling
+        # luck spreading tests across workers; perturbing the test count
+        # surfaced the latent ordering dependency.  Reset everything
+        # mutable here so each test starts from a clean rate-limit slate.
+        with self.state._lock:
+            self.state._ip_last_drip.clear()
+            self.state._addresses_claimed.clear()
+            self.state._pending_challenges.clear()
+            self.state._drips_today = 0
+            self.state._day = 0
+        self.submits.clear()
+
     def _get_challenge(self, address_hex: str):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         try:
@@ -407,13 +426,42 @@ class TestFaucetHTTPEndpoint(unittest.TestCase):
         self.assertIn("nonce", body["error"].lower())
 
     def test_post_with_wrong_nonce_returns_429(self):
-        # Issue a challenge, send wrong nonce.
+        # Issue a challenge, then deterministically pick a nonce that
+        # does NOT satisfy the difficulty.  At difficulty=1 (the test
+        # default) a fixed nonce like 999_999_999_999 satisfies the
+        # 1-bit threshold ~50% of the time, which made this test
+        # flaky.  Probe nonces locally and use the first one whose
+        # digest fails the threshold so the assertion is deterministic.
+        import hashlib
         cstatus, cbody = self._get_challenge("dd" * 32)
         self.assertEqual(cstatus, 200)
+        seed = bytes.fromhex(cbody["seed"])
+        addr = bytes.fromhex("dd" * 32)
+        diff = cbody["difficulty"]
+        wrong_nonce = None
+        for n in range(256):
+            digest = hashlib.sha256(seed + n.to_bytes(8, "big") + addr).digest()
+            bits = 0
+            for byte in digest:
+                if byte == 0:
+                    bits += 8
+                    continue
+                for shift in range(7, -1, -1):
+                    if byte & (1 << shift):
+                        break
+                    bits += 1
+                break
+            if bits < diff:
+                wrong_nonce = n
+                break
+        self.assertIsNotNone(
+            wrong_nonce,
+            "no failing nonce found in 256 probes -- difficulty too low",
+        )
         status, body = self._post_faucet({
             "address": "dd" * 32,
             "challenge_seed": cbody["seed"],
-            "nonce": 999_999_999_999,  # almost certainly wrong
+            "nonce": wrong_nonce,
         })
         self.assertEqual(status, 429, body)
         self.assertIn("proof-of-work", body["error"])
