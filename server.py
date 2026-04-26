@@ -1267,8 +1267,61 @@ class Server(SharedRuntimeMixin):
             if staked > 0:
                 self.consensus.stakes[entity_id] = staked
 
+    def _schedule_coro_threadsafe(self, coro, label: str):
+        """Schedule a coroutine on the main event loop from any thread.
+
+        Falls back to asyncio.create_task when called from inside the
+        main loop's thread (the typical RPC path).  Returns the
+        scheduled task/future so callers can attach exception loggers
+        if they care; most don't.
+
+        Without this, RPC handlers like _rpc_submit_transfer that fan
+        out to gossip via asyncio.create_task crash with "no running
+        event loop" the moment they are invoked from a worker thread
+        (the public-feed faucet is the canonical case).  The mempool
+        admission has already succeeded by that point, so the tx will
+        eventually propagate via passive mempool sync, but the RPC
+        return value lies as "Internal error" and the caller cannot
+        distinguish failure from success.
+        """
+        loop = getattr(self, "_main_loop", None)
+        if loop is None:
+            # start() has not run yet; can't schedule.  Drop on the
+            # floor -- this only happens during teardown / very early
+            # boot, neither of which run faucet RPCs.
+            return None
+        try:
+            in_loop_thread = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            in_loop_thread = False
+        if in_loop_thread:
+            t = asyncio.create_task(coro)
+            t.add_done_callback(
+                lambda x: self._handle_task_exception(label, x)
+            )
+            return t
+        # Cross-thread path: schedule on the main loop and let it
+        # log any exception via the same handler.
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        fut.add_done_callback(
+            lambda f: self._handle_task_exception(label, f)
+        )
+        return fut
+
     async def start(self):
         """Start P2P server, RPC server, and block production."""
+        # Capture the main event loop so RPC handlers invoked from
+        # OTHER threads (e.g. the public-feed faucet running in
+        # PublicFeedServer's worker pool) can schedule async tasks
+        # via run_coroutine_threadsafe instead of asyncio.create_task,
+        # which only works inside the loop's own thread.  Without
+        # this, threaded callers hit "no running event loop" the
+        # moment a handler tries to gossip the tx -- observed on
+        # mainnet 2026-04-26 when the 1.8.0 faucet's first drip
+        # came back as "Internal error" even though the mempool
+        # admission had already succeeded.
+        self._main_loop = asyncio.get_running_loop()
+
         # Announce the network identity loudly before any peer I/O.  If an
         # operator ever sees "NETWORK=testnet" in the logs of what they
         # thought was a mainnet validator, they spot the misconfiguration
@@ -1783,12 +1836,14 @@ class Server(SharedRuntimeMixin):
                 tx, arrival_block_height=self.blockchain.height,
             )
 
-            # Relay via inv (not full tx flood)
+            # Relay via inv (not full tx flood).  Uses the
+            # threadsafe scheduler so the same handler works whether
+            # called from the asyncio RPC dispatch (typical) or from
+            # a worker thread (faucet path).
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
-            t = asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
-            t.add_done_callback(
-                lambda x: self._handle_task_exception("relay_tx_inv", x)
+            self._schedule_coro_threadsafe(
+                self._relay_tx_inv([tx_hash_hex]), "relay_tx_inv",
             )
 
             return {
@@ -2733,9 +2788,8 @@ class Server(SharedRuntimeMixin):
 
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
-            t = asyncio.create_task(self._relay_tx_inv([tx_hash_hex]))
-            t.add_done_callback(
-                lambda x: self._handle_task_exception("relay_tx_inv", x)
+            self._schedule_coro_threadsafe(
+                self._relay_tx_inv([tx_hash_hex]), "relay_tx_inv",
             )
 
             return {

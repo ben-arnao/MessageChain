@@ -4,6 +4,33 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] — 2026-04-26
+
+Patch release. Fixes the threadsafe-relay gap exposed by the 1.8.1
+faucet drip path. No consensus changes.
+
+### Fixed
+
+- **`_rpc_submit_transfer` and `_rpc_submit_transaction` now schedule
+  their gossip-relay task safely from any thread.** The two handlers
+  previously called `asyncio.create_task(self._relay_tx_inv(...))`
+  directly, which only works inside the main event loop's thread.
+  When invoked from the public-feed faucet's worker pool (a thread
+  outside asyncio), the call raised `RuntimeError: no running event
+  loop` AFTER the mempool had already accepted the tx. The handler
+  caught the exception and returned `{"ok": false, "error": "Internal
+  error"}` -- so the faucet UI looked broken even though the drip
+  tx was sitting in mempool waiting for the next block. Worse, on
+  retry the cold-key would advance to the next leaf and a SECOND
+  conflicting tx would land in mempool. The new
+  `Server._schedule_coro_threadsafe` helper detects whether it's
+  inside the main loop and dispatches via `create_task` or
+  `run_coroutine_threadsafe` accordingly. (server.py)
+- **`Server._main_loop`** captured at `start()` so cross-thread
+  callers have a stable reference to the asyncio loop without
+  having to chase `get_event_loop()` (which is deprecated and
+  thread-local in 3.12+).
+
 ## [1.8.1] — 2026-04-25
 
 Patch release. Fixes the faucet drip fee so transfers to brand-new
