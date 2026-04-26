@@ -649,6 +649,21 @@ class Blockchain:
         # issuer has one on file.
         self.receipt_subtree_roots: dict[bytes, bytes] = {}
 
+        # Past receipt-subtree roots per entity.  When a validator
+        # rotates their receipt subtree via SetReceiptSubtreeRoot,
+        # the OLD root must remain accessible for evidence
+        # validation -- without this history, a coerced validator
+        # who has issued many receipts under root R1 can wipe ALL
+        # outstanding evidence by publishing a single rotation tx
+        # to R2.  Receipt verification (CensorshipEvidence,
+        # BogusRejection, ack registry) accepts ANY past root via
+        # `receipt_root_admissible(eid, root)`.  An attacker cannot
+        # exploit the historical-acceptance to forge anything --
+        # every entry in this set is a root the entity legitimately
+        # signed for at some point (each rotation tx is signed by
+        # the entity's cold key).
+        self.past_receipt_subtree_roots: dict[bytes, set[bytes]] = {}
+
         # Entity-index registry: bidirectional map for bloat reduction.
         # Every registered entity is assigned a monotonic integer index
         # (starting at 1; 0 reserved as the "invalid / unassigned"
@@ -893,6 +908,10 @@ class Blockchain:
                 )
         if hasattr(self.db, "get_all_receipt_subtree_roots"):
             self.receipt_subtree_roots = self.db.get_all_receipt_subtree_roots()
+        if hasattr(self.db, "get_all_past_receipt_subtree_roots"):
+            self.past_receipt_subtree_roots = (
+                self.db.get_all_past_receipt_subtree_roots()
+            )
 
         # Restore entity-index registry (bloat reduction). Indices are
         # assigned monotonically at registration time; rebuilding the
@@ -2665,13 +2684,15 @@ class Blockchain:
                 f"base_fee {self.supply.base_fee})"
             )
 
-        self.receipt_subtree_roots[tx.entity_id] = tx.root_public_key
-
-        # Persist through the chain-db so a cold restart recovers the
-        # mapping without a full replay.
-        if self.db is not None and hasattr(self.db, "set_receipt_subtree_root"):
-            self.db.set_receipt_subtree_root(tx.entity_id, tx.root_public_key)
-            # Best-effort flush — same pattern as Revoke / SetAuthorityKey.
+        # Route through `_record_receipt_subtree_root` so the rotation-
+        # history dict + chaindb mirror stay in lockstep.  Without
+        # the history, this single overwrite would invalidate every
+        # outstanding receipt issued under the old root -- a coerced
+        # validator could then wipe in-flight CensorshipEvidence /
+        # BogusRejection evidence with one cold-key tx.
+        self._record_receipt_subtree_root(tx.entity_id, tx.root_public_key)
+        # Best-effort flush — same pattern as Revoke / SetAuthorityKey.
+        if self.db is not None:
             try:
                 self.db.flush_state()
             except Exception:
@@ -2801,6 +2822,63 @@ class Blockchain:
             else:
                 break
         return active
+
+    def _record_receipt_subtree_root(
+        self, entity_id: bytes, root_public_key: bytes,
+    ) -> None:
+        """Install a new receipt-subtree root, preserving the prior
+        root in the entity's history.
+
+        Called from `apply_set_receipt_subtree_root` (the per-block
+        consensus path).  Idempotent: re-installing the SAME root is
+        a no-op for the history.  An OLD root is added to
+        `past_receipt_subtree_roots[entity_id]` BEFORE the overwrite
+        so receipt-validation can still admit receipts issued under
+        it -- without this, a coerced validator who has issued
+        many receipts under R1 wipes ALL outstanding evidence by
+        publishing a single SetReceiptSubtreeRoot(R2) tx.
+
+        Persistence: mirrors both the live-root table and the
+        history table to chaindb so a cold-restarted node sees the
+        full historical set.  An attacker cannot exploit the
+        historical-acceptance to forge -- every entry in the history
+        is a root the entity legitimately signed for at some point
+        (each rotation tx is signed by the entity's cold key).
+        """
+        old_root = self.receipt_subtree_roots.get(entity_id)
+        if old_root is not None and old_root != root_public_key:
+            self.past_receipt_subtree_roots.setdefault(
+                entity_id, set(),
+            ).add(old_root)
+            if self.db is not None and hasattr(
+                self.db, "add_past_receipt_subtree_root",
+            ):
+                self.db.add_past_receipt_subtree_root(entity_id, old_root)
+        self.receipt_subtree_roots[entity_id] = root_public_key
+        if self.db is not None and hasattr(
+            self.db, "set_receipt_subtree_root",
+        ):
+            self.db.set_receipt_subtree_root(entity_id, root_public_key)
+
+    def receipt_root_admissible(
+        self, entity_id: bytes, root_public_key: bytes,
+    ) -> bool:
+        """True iff `root_public_key` is the entity's CURRENT root OR
+        any historical root the entity ever installed.  Used by
+        evidence validation (CensorshipEvidence, BogusRejection,
+        ack registry) so a rotation does NOT silently invalidate
+        in-flight receipts.
+
+        Returns False for an entity that has never installed any
+        root (no anchor of trust exists).
+        """
+        current = self.receipt_subtree_roots.get(entity_id)
+        if current is None:
+            return False
+        if root_public_key == current:
+            return True
+        history = self.past_receipt_subtree_roots.get(entity_id, set())
+        return root_public_key in history
 
     def validate_slash_transaction(
         self, tx: SlashTransaction, chain_height: int | None = None,
@@ -3159,15 +3237,21 @@ class Blockchain:
             return False, "Receipted tx already on-chain (nonce advanced)"
 
         # Registered-root check: if the chain knows a receipt-subtree
-        # root for this issuer, the receipt's embedded root must match.
-        registered_root = self.receipt_subtree_roots.get(tx.offender_id)
+        # root for this issuer, the receipt's embedded root must match
+        # EITHER the current root OR any historical root the issuer
+        # ever installed.  Without the historical-acceptance, a
+        # coerced validator could pre-emptively wipe in-flight
+        # evidence by issuing a single SetReceiptSubtreeRoot rotation
+        # tx -- the round-5 rotation-evidence-wipe attack.
         if (
-            registered_root is not None
-            and registered_root != tx.receipt.issuer_root_public_key
+            tx.offender_id in self.receipt_subtree_roots
+            and not self.receipt_root_admissible(
+                tx.offender_id, tx.receipt.issuer_root_public_key,
+            )
         ):
             return False, (
                 "Receipt signed with a different subtree root than "
-                "the issuer's registered root"
+                "any of the issuer's registered roots (current or past)"
             )
 
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
@@ -3233,14 +3317,18 @@ class Blockchain:
             return False, "Offender already slashed"
         if self.bogus_rejection_processor.has_processed(tx.evidence_hash):
             return False, "Evidence already processed"
-        registered_root = self.receipt_subtree_roots.get(tx.offender_id)
+        # See validate_censorship_evidence_tx for the
+        # historical-roots rationale: rotation must NOT silently
+        # invalidate in-flight rejections.
         if (
-            registered_root is not None
-            and registered_root != tx.rejection.issuer_root_public_key
+            tx.offender_id in self.receipt_subtree_roots
+            and not self.receipt_root_admissible(
+                tx.offender_id, tx.rejection.issuer_root_public_key,
+            )
         ):
             return False, (
                 "Rejection signed with a different subtree root than "
-                "the issuer's registered root"
+                "any of the issuer's registered roots (current or past)"
             )
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
@@ -4436,9 +4524,18 @@ class Blockchain:
             _consumed_in_block: set[tuple[bytes, int]] = set()
             _survivors_sim = []
             _start_wm = dict(self.leaf_watermarks)
+            # Mirror the apply path's same-block-slash exclusion.
+            # If a SlashTransaction earlier in this block added the
+            # voter to slashed_validators, the apply path skips their
+            # vote -- the sim must skip identically or honest
+            # validators reject otherwise-valid blocks with a state-
+            # root mismatch.
+            _slashed_now = self.slashed_validators
             for fv in finality_votes:
                 _sid = fv.signer_entity_id
                 _leaf = fv.signature.leaf_index
+                if _sid in _slashed_now:
+                    continue
                 _chain_wm = _baseline_wm.setdefault(
                     _sid, _start_wm.get(_sid, 0),
                 )
@@ -4729,14 +4826,16 @@ class Blockchain:
             )
             if chain_nonce_sim > etx.message_tx.nonce:
                 continue
-            # Registered-root gate — use the LIVE receipt_subtree_roots.
-            # This map is only mutated by SetReceiptSubtreeRoot authority
-            # txs and the apply path re-reads the live value too; the sim
-            # does not currently model same-block mutation of the map.
-            registered_root = self.receipt_subtree_roots.get(etx.offender_id)
+            # Registered-root gate — use the LIVE
+            # receipt_root_admissible check so a rotation
+            # (SetReceiptSubtreeRoot) does NOT silently invalidate
+            # in-flight receipts.  Mirrors the validation gate in
+            # validate_censorship_evidence_tx.
             if (
-                registered_root is not None
-                and registered_root != etx.receipt.issuer_root_public_key
+                etx.offender_id in self.receipt_subtree_roots
+                and not self.receipt_root_admissible(
+                    etx.offender_id, etx.receipt.issuer_root_public_key,
+                )
             ):
                 continue
             # Fee affordability — check against sim_balances so a
@@ -4808,10 +4907,13 @@ class Blockchain:
             if etx.evidence_hash in sim_br_processed:
                 continue
             # Registered receipt-subtree root gate (mirrors validation).
-            registered_root = self.receipt_subtree_roots.get(etx.offender_id)
+            # Uses receipt_root_admissible so rotation does not silently
+            # invalidate in-flight rejections.
             if (
-                registered_root is not None
-                and registered_root != etx.rejection.issuer_root_public_key
+                etx.offender_id in self.receipt_subtree_roots
+                and not self.receipt_root_admissible(
+                    etx.offender_id, etx.rejection.issuer_root_public_key,
+                )
             ):
                 continue
             # Fee affordability.
@@ -5498,6 +5600,21 @@ class Blockchain:
                 break
             sid = v.signer_entity_id
             leaf = v.signature.leaf_index
+            # Same-block-slash exclusion.  If a SlashTransaction
+            # earlier in this block already added `sid` to
+            # `slashed_validators`, the equivocator's own vote MUST
+            # NOT count toward 2/3 finalization in the very block
+            # where consensus is burning them for that exact
+            # equivocation.  Without this skip, a coordinated
+            # proposer could push a target over 2/3 using stake that
+            # consensus has already declared malicious -- breaks the
+            # slash+finality safety coupling.  validate_block only
+            # checks `slashed_validators` against the PRE-block set
+            # (so the vote passes admission), and slash apply runs
+            # before _apply_finality_votes (so the set is current
+            # here).  Cheap membership test; runs once per vote.
+            if sid in self.slashed_validators:
+                continue
             # Use the start-of-block watermark snapshot (set by
             # _apply_block_state on entry) when available so the
             # proposer's own in-block bumps don't cause their
@@ -6738,9 +6855,26 @@ class Blockchain:
         # Empty-entries list carries no consensus signal — the leak
         # path skips it (see _apply_block_state line ~8590), and the
         # quorum verifier wasn't designed for the no-entries case.
-        # Mirror the apply path's gate so we don't reject what the
-        # apply path would silently accept.
+        # BUT the empty-entries shortcut MUST also require an empty
+        # quorum_attestation, otherwise a malicious proposer attaches
+        # an arbitrarily large `quorum_attestation` (each report's
+        # tx_hashes is a u32-prefixed list with no per-report cap)
+        # behind an empty entries list to dump permanent fee-free
+        # unverified ballast onto every node's chain.  Direct
+        # violation of the "fight bloat only via fees" principle
+        # (per CLAUDE.md).  No honest producer ever attaches reports
+        # without entries (the aggregator only emits reports for
+        # tx_hashes that actually crossed the quorum threshold and
+        # ended up in `entries`).  So requiring the symmetric empty
+        # form has zero honest-path cost.
         if not getattr(lst, "entries", None):
+            qa = getattr(lst, "quorum_attestation", None) or []
+            if qa:
+                return False, (
+                    "inclusion list with empty entries must also have "
+                    "empty quorum_attestation (no consensus signal -> "
+                    "no quorum reports allowed)"
+                )
             return True, "OK"
         block_number = getattr(block.header, "block_number", None)
         if block_number is None:
@@ -10174,6 +10308,20 @@ class Blockchain:
         self._bootstrap_ratchet = RatchetState()
         from messagechain.economics.escrow import EscrowLedger
         self._escrow = EscrowLedger()
+        # Receipt-subtree roots: SetReceiptSubtreeRoot is a per-block
+        # consensus event that overrides this map.  A reorg that
+        # rolls past a SetReceiptSubtreeRoot tx must leave the map
+        # empty so the canonical-chain replay re-installs only the
+        # roots that landed on the surviving fork.  Without this,
+        # the in-memory map keeps the losing-fork root and every
+        # CensorshipEvidenceTx / BogusRejectionEvidenceTx validation
+        # for that entity diverges across nodes (root-mismatch
+        # rejection on the reorg-survivor, accept on the fresh
+        # peer).  Also clears past_receipt_subtree_roots (the
+        # rotation-history map added for the rotation-invalidates-
+        # evidence fix) -- losing-fork rotations must not survive.
+        self.receipt_subtree_roots = {}
+        self.past_receipt_subtree_roots = {}
         # Reset in-memory attestation finality tracker — old-fork finality
         # data must not persist.  Note: finalized_checkpoints (persistent,
         # long-range-attack defense) is deliberately NOT reset.

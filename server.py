@@ -949,6 +949,26 @@ def _bootstrap_receipt_subtree(
         subtree_keypair=receipt_keypair,
         height_fn=lambda: server.blockchain.height,
     )
+
+    # Install a WitnessObservationStore on the server so the public
+    # submission endpoint's `obs_ok` gate has a real backing store.
+    # Without this, the gate short-circuits to True for any 32-byte
+    # X-MC-Witnessed-Submission header value, and a botnet (1000-IP
+    # rotation) drains the 65k-leaf receipt subtree in hours via
+    # the per-IP ack budget alone -- silently disabling the entire
+    # censorship-evidence pipeline.
+    #
+    # The store starts empty.  Until the gossip-handler wiring for
+    # SubmissionRequest publishes observations into it, the only
+    # ack-eligible request_hashes will be ones recorded by other
+    # code paths -- effectively the witnessed-submission ack flow
+    # is dormant pending that wiring.  This is the safe-by-default
+    # posture: deny ack issuance when we have no record of the
+    # request, instead of allowing it for any 32-byte string.
+    from messagechain.consensus.witness_submission import (
+        WitnessObservationStore,
+    )
+    server.witness_observation_store = WitnessObservationStore()
     logger.info(
         "Receipt issuer installed: entity=%s root=%s",
         entity.entity_id_hex[:16],
@@ -1829,27 +1849,35 @@ class Server(SharedRuntimeMixin):
             return {"ok": False, "error": f"Unknown method: {method}"}
 
     def _rpc_submit_transaction(self, params: dict) -> dict:
-        """Accept a signed transaction from a client."""
-        try:
-            tx = MessageTransaction.deserialize(params["transaction"])
-            # Compute pending nonce across ALL pools so users can submit
-            # sequential txs of any type (message, transfer, stake) without
-            # waiting for each to be mined.
-            pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
-            valid, reason = self.blockchain.validate_transaction(
-                tx, expected_nonce=pending_nonce,
-            )
-            if not valid:
-                return {"ok": False, "error": reason}
-            # Record arrival height for the forced-inclusion rule.  Without
-            # this, txs default to height 0 which makes them "always-
-            # forced" — an attester that never updates arrival heights
-            # would wrongly flag every new tx for immediate forced
-            # inclusion and vote NO on every non-draining block.
-            self.mempool.add_transaction(
-                tx, arrival_block_height=self.blockchain.height,
-            )
+        """Accept a signed transaction from a client.
 
+        Routes through `submit_transaction_to_mempool` (the same
+        helper the public HTTPS endpoint uses) so RPC submissions
+        get the SAME censorship-evidence defense as HTTPS
+        submissions.  The helper threads the validator's
+        receipt_issuer through, so the client receives a signed
+        SubmissionReceipt they can later weaponize as
+        CensorshipEvidenceTx if the receipted tx fails to land
+        on-chain within EVIDENCE_INCLUSION_WINDOW.
+
+        Pre-fix this path inlined its own validate+add and never
+        consulted the issuer -- a coerced validator that fronts
+        only RPC (or whose RPC port leaks via reverse proxy / SSH
+        tunnel) admitted-and-dropped txs with zero on-chain
+        accountability, defeating the entire censorship-evidence
+        pipeline for the RPC surface.
+        """
+        try:
+            from messagechain.network.submission_server import (
+                submit_transaction_to_mempool,
+            )
+            tx = MessageTransaction.deserialize(params["transaction"])
+            result = submit_transaction_to_mempool(
+                tx, self.blockchain, self.mempool,
+                receipt_issuer=self.receipt_issuer,
+            )
+            if not result.ok:
+                return {"ok": False, "error": result.error}
             # Relay via inv (not full tx flood).  Uses the
             # threadsafe scheduler so the same handler works whether
             # called from the asyncio RPC dispatch (typical) or from
@@ -1859,15 +1887,21 @@ class Server(SharedRuntimeMixin):
             self._schedule_coro_threadsafe(
                 self._relay_tx_inv([tx_hash_hex]), "relay_tx_inv",
             )
-
-            return {
-                "ok": True,
-                "result": {
-                    "tx_hash": tx.tx_hash.hex(),
-                    "fee": tx.fee,
-                    "message": "Transaction accepted into mempool",
-                },
+            payload = {
+                "tx_hash": tx.tx_hash.hex(),
+                "fee": tx.fee,
+                "message": (
+                    "Transaction accepted into mempool (duplicate)"
+                    if result.duplicate
+                    else "Transaction accepted into mempool"
+                ),
             }
+            # Surface the signed receipt in the response when the
+            # validator issued one, so RPC clients can weaponize it
+            # as CensorshipEvidenceTx exactly like HTTPS clients can.
+            if result.receipt_hex:
+                payload["receipt"] = result.receipt_hex
+            return {"ok": True, "result": payload}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
@@ -4426,6 +4460,21 @@ async def run(args):
             # cannot race the receipt subtree's _next_leaf counter
             # into a double-leaf-consumption WOTS+ key disclosure.
             receipt_issuer=server.receipt_issuer,
+            # Wire the WitnessObservationStore so the `obs_ok` ack-
+            # issuance gate has a real backing store.  Without this,
+            # the gate short-circuits to True for any 32-byte
+            # X-MC-Witnessed-Submission header value and a botnet
+            # drains the 65k-leaf receipt subtree in hours via the
+            # per-IP ack budget alone -- silently collapsing the
+            # censorship-evidence pipeline.  See the install site
+            # near server.py:947 for the full rationale; the store
+            # starts empty (no gossip handler is wired yet), so the
+            # safe-by-default posture denies ack issuance for any
+            # request_hash this validator hasn't observed via
+            # gossip.
+            witness_observation_store=getattr(
+                server, "witness_observation_store", None,
+            ),
         )
         submission_server.start()
         logger.info(
