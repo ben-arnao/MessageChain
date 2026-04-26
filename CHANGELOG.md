@@ -4,6 +4,82 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] — 2026-04-26
+
+Minor release. **Hard fork: Tier 17 — `ReactTransaction` (user-trust
++ message-react votes).** Activates at `REACT_TX_HEIGHT = 9000`
+(~14 days runway above Tier 16 at height 7000). Plus one CRITICAL
+security fix from the round-11 audit.
+
+### Added (consensus, gated by activation height)
+
+- **`ReactTransaction` — first-class on-chain reaction tx type**
+  (2fb5e86, aa6899b). Activates at `REACT_TX_HEIGHT = 9000`. Lets
+  any registered entity cast (a) a `react` vote on a specific
+  `MessageTransaction.tx_hash` (e.g. like / dislike / report) or
+  (b) a `trust` vote on another entity's `entity_id` (e.g.
+  trust / distrust / mute). Both vote types share the same
+  WOTS+-signed wire format and pay the standard signature-aware
+  fee floor; reactions ride the message-tx storage budget the
+  same way every other signed payload does (no special
+  per-reaction subsidy or surcharge). Pre-activation a v1
+  ReactTransaction is rejected at admission; post-activation it's
+  the canonical user-trust + message-react primitive.
+  - **State commitment.** A new `ReactionState` aggregator tracks
+    per-target reaction counts (per `tx_hash` for message reacts;
+    per `entity_id` for trust votes); apply-time mutations are
+    committed to the snapshot root via the same per-block flush
+    discipline as every other consensus-visible field.
+  - **Block-pipeline integration.** `Block.react_transactions`
+    rides alongside the existing per-type tx lists; admission gates
+    + apply ordering mirror `MessageTransaction` (fee burn + leaf
+    watermark + nonce ratchet, all routed through the round-9
+    add_block transaction wrap so apply-time mutations roll back
+    cleanly on a state-root mismatch).
+
+### Security (round-11 audit)
+
+- **`FinalityDoubleVoteEvidence` slash now uses multi-key candidate
+  verification** (cf4340c). Pre-fix the FinalityDoubleVote branch
+  of `Blockchain.validate_slash_transaction` resolved ONE pubkey at
+  `vote_a.signed_at_height` and called
+  `verify_finality_double_vote_evidence(ev, K_old)` — checking
+  BOTH votes against ONE pubkey. An equivocator who signed vote_a
+  with K_old at height N, submitted a `KeyRotationTransaction` at
+  N + `KEY_ROTATION_COOLDOWN_BLOCKS=144`, then signed vote_b with
+  K_new at N+200 (within the
+  `FINALITY_VOTE_MAX_AGE_BLOCKS=1000` window targeting the same
+  checkpoint) bypassed the slash: K_old verified vote_a but
+  vote_b's K_new signature failed → "Invalid evidence: vote_b
+  signature is invalid", slash dismissed, **equivocator keeps
+  stake**. Cooldown (144) << vote-age window (1000), so the
+  rotation comfortably fits inside the same target's vote window
+  and the bypass is trivial for any rotating validator.
+  - **Fix.** Mirror the multi-key shape of
+    `verify_attestation_slashing_evidence` (Round 6): drop the
+    single-key shortcut and enumerate the offender's full
+    `key_history` (+ current pubkey) as candidates. Verify each
+    vote independently against ANY candidate. Every candidate is
+    one the offender legitimately published on-chain (each
+    rotation step is signed by the prior key), so matching ANY
+    candidate is proof the offender produced the signature —
+    attacker cannot exploit the candidate set to forge evidence.
+  - This is **distinct** from the carried-over "multi-key resolver
+    doesn't bind to evidence_height" item — that concerns
+    *over-acceptance* in the multi-key path; this is the
+    symmetric *under-acceptance* hole in the still-single-key
+    FinalityDoubleVote branch.
+
+### Operational
+
+- Validators must upgrade to 1.19.0 within the runway window
+  (7000 → 9000) to follow the Tier 17 fork. Pre-1.19.0 nodes will
+  reject blocks at/after height 9000 that carry
+  `ReactTransaction`s.
+- The round-11 security fix is active immediately (pre-Tier-17),
+  so all mainnet operators should upgrade promptly to close the
+  finality-vote slash-evasion window.
+
 ## [1.18.0] — 2026-04-26
 
 Minor release. **Hard fork: Tier 16 — market-driven fee floor.**
