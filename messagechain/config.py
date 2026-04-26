@@ -3296,6 +3296,64 @@ assert GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT > MESSAGE_TX_LENGTH_PREFIX_HEIGHT, (
     "tx, gated behind it so the runway windows don't overlap"
 )
 
+# ─── Tier 16 — Market-driven fee floor ────────────────────────────────
+# At/after MARKET_FEE_FLOOR_HEIGHT the protocol-level fee floor for
+# MessageTransactions collapses to a flat MARKET_FEE_FLOOR=1 token,
+# regardless of message size.  The linear-in-stored-bytes formula
+# (BASE_TX_FEE + FEE_PER_STORED_BYTE × len) is retired as the *floor* —
+# it remains only for replay of pre-fork blocks under the height-gated
+# rule current at their height.
+#
+# Rationale: the linear floor was trying to do two jobs at once —
+# keep zero-fee txs out of the mempool, and discipline long-message
+# bloat by per-byte pricing.  The first is the only job a floor needs
+# to do; the second is already done by:
+#
+#   * MAX_BLOCK_MESSAGE_BYTES per block — a hard ceiling on bytes
+#     pinned per ~10-min window, regardless of fee paid.  This is the
+#     real spam ceiling: an attacker willing to pay any price still
+#     cannot pin more than 45_000 bytes/block × 144 blocks/day ≈
+#     6.5 MB/day, ≈ 2.4 GB/year.  That number is set by block timing,
+#     not by the fee floor.
+#   * EIP-1559 base fee — automatically rises 12.5% per over-target
+#     block under congestion and decays 12.5% per under-target block,
+#     pricing the marginal byte at whatever clears the queue.  The
+#     market sets the actual cost-per-byte during the only times that
+#     matter (when blocks are full); the protocol floor only sets
+#     behavior during the times that don't matter (when blocks are
+#     empty and bloat-discipline is moot).
+#
+# Setting the floor to 1 (rather than 0) preserves the no-free-tx
+# invariant — every tx still pays at least 1 token of fee, so the
+# zero-fee mempool-DoS path stays closed — without the protocol
+# trying to set the equilibrium price.
+#
+# Type-specific surcharges (NEW_ACCOUNT_FEE, GOVERNANCE_PROPOSAL_FEE,
+# KEY_ROTATION_FEE, etc.) are unaffected: they price externalities
+# specific to those tx types (permanent state entry, binding governance
+# vote, key rotation) and live above the protocol floor.
+#
+# Legacy constants (BASE_TX_FEE, FEE_PER_STORED_BYTE,
+# FEE_PER_STORED_BYTE_POST_RAISE, MIN_FEE_POST_FLAT, MIN_FEE,
+# FEE_PER_BYTE, FEE_QUADRATIC_COEFF) are retained so pre-fork blocks
+# replay deterministically under the rule current at their height.
+#
+# Activation: ride above Tier 15 (GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+# = 5000).  Runway window 5000→7000 = ~2000 blocks (~14 days at
+# 600s/block) — operators upgrade in that window.
+MARKET_FEE_FLOOR = 1            # post-Tier-16 protocol fee floor (flat, all sizes)
+MARKET_FEE_FLOOR_HEIGHT = 7000  # Tier 16
+
+assert MARKET_FEE_FLOOR >= 1, (
+    "MARKET_FEE_FLOOR must be at least 1 — a zero floor reopens the "
+    "zero-fee-mempool-DoS path the floor exists to close"
+)
+assert MARKET_FEE_FLOOR_HEIGHT > GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT, (
+    "MARKET_FEE_FLOOR_HEIGHT must follow GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT "
+    "— Tier 16 retires the linear fee floor and rides on top of the "
+    "established fork schedule"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3400,6 +3458,7 @@ for _fork_name, _fork_height in (
     ("VERSION_SIGNALING_HEIGHT", VERSION_SIGNALING_HEIGHT),
     ("MESSAGE_TX_LENGTH_PREFIX_HEIGHT", MESSAGE_TX_LENGTH_PREFIX_HEIGHT),
     ("GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT", GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT),
+    ("MARKET_FEE_FLOOR_HEIGHT", MARKET_FEE_FLOOR_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
