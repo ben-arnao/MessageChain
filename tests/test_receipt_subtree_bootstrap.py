@@ -217,6 +217,16 @@ class TestChainDBRoundtrip(unittest.TestCase):
                 chain.receipt_subtree_roots[alice.entity_id],
                 receipt_kp.public_key,
             )
+            # Round 7: chaindb mirroring of receipt_subtree_roots no
+            # longer happens eagerly inside _record_receipt_subtree_root
+            # (the eager write leaked past in-memory rollback when a
+            # block's state-root mismatched).  Writes are now deferred
+            # to _persist_state, which is called inside the per-block
+            # SQL transaction wrapper in _apply_block_state.  This test
+            # exercises the standalone apply path -- bypass the block
+            # wrapper -- so explicitly flush before closing.
+            chain._dirty_entities = None
+            chain._persist_state()
         finally:
             db.close()
 

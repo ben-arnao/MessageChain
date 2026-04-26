@@ -1132,6 +1132,19 @@ class Blockchain:
             if hasattr(self.db, "set_receipt_subtree_root"):
                 for eid, rk in self.receipt_subtree_roots.items():
                     self.db.set_receipt_subtree_root(eid, rk)
+            # Historical receipt-subtree roots -- mirrors the live
+            # roots dict above.  Idempotent at the storage layer
+            # (INSERT OR IGNORE + composite PK), so re-issuing on
+            # every flush is safe.  Routing through this transaction-
+            # wrapped flush (instead of writing eagerly inside
+            # `_record_receipt_subtree_root`) is what gives the
+            # rotation the same crash/rollback atomicity as every
+            # other block-level mutation -- see the round-7 fix
+            # comment on `_record_receipt_subtree_root`.
+            if hasattr(self.db, "add_past_receipt_subtree_root"):
+                for eid, roots in self.past_receipt_subtree_roots.items():
+                    for rk in roots:
+                        self.db.add_past_receipt_subtree_root(eid, rk)
             self.db.commit_transaction()
         except Exception:
             self.db.rollback_transaction()
@@ -1654,6 +1667,21 @@ class Blockchain:
         self.receipt_subtree_roots = dict(
             snap.get("receipt_subtree_roots", {})
         )
+        # v19+: historical roots dict. MUST be installed alongside
+        # the live-roots dict above -- without it, a state-synced
+        # node would reject any contested CensorshipEvidence /
+        # BogusRejection signed under a rotated-away root that the
+        # warm cluster admits via its past-roots set, and silently
+        # fork on the first such evidence.  The dict is committed
+        # to the snapshot root under _TAG_PAST_RECEIPT_ROOT
+        # (state_snapshot.py), so a missing install also produces a
+        # snapshot-root mismatch at install verification.
+        self.past_receipt_subtree_roots = {
+            eid: set(roots)
+            for eid, roots in snap.get(
+                "past_receipt_subtree_roots", {}
+            ).items()
+        }
 
         # Bogus-rejection processor: install processed set from snapshot.
         # No pending counterpart — apply-time decision.
@@ -2838,27 +2866,26 @@ class Blockchain:
         many receipts under R1 wipes ALL outstanding evidence by
         publishing a single SetReceiptSubtreeRoot(R2) tx.
 
-        Persistence: mirrors both the live-root table and the
-        history table to chaindb so a cold-restarted node sees the
-        full historical set.  An attacker cannot exploit the
-        historical-acceptance to forge -- every entry in the history
-        is a root the entity legitimately signed for at some point
-        (each rotation tx is signed by the entity's cold key).
+        Persistence: in-memory only here.  Chaindb mirroring of both
+        the live-root table and the history table happens later via
+        `_persist_state`, which is called inside the per-block
+        SQL transaction wrapper in `_apply_block_state`.  Earlier
+        round-7 audit found that direct chaindb writes from this
+        helper executed BEFORE the per-block transaction opened, so
+        a block whose state-root mismatched (and was rejected after
+        in-memory apply + rollback) would still leak the rotation
+        into chaindb -- a subsequent cold restart then rehydrated a
+        receipt_subtree_roots map that had silently forked off the
+        canonical chain.  Routing through `_persist_state` puts both
+        writes inside the same atomic boundary as the rest of the
+        block's state mutations.
         """
         old_root = self.receipt_subtree_roots.get(entity_id)
         if old_root is not None and old_root != root_public_key:
             self.past_receipt_subtree_roots.setdefault(
                 entity_id, set(),
             ).add(old_root)
-            if self.db is not None and hasattr(
-                self.db, "add_past_receipt_subtree_root",
-            ):
-                self.db.add_past_receipt_subtree_root(entity_id, old_root)
         self.receipt_subtree_roots[entity_id] = root_public_key
-        if self.db is not None and hasattr(
-            self.db, "set_receipt_subtree_root",
-        ):
-            self.db.set_receipt_subtree_root(entity_id, root_public_key)
 
     def receipt_root_admissible(
         self, entity_id: bytes, root_public_key: bytes,
@@ -3236,22 +3263,29 @@ class Blockchain:
         if chain_nonce > tx.message_tx.nonce:
             return False, "Receipted tx already on-chain (nonce advanced)"
 
-        # Registered-root check: if the chain knows a receipt-subtree
-        # root for this issuer, the receipt's embedded root must match
-        # EITHER the current root OR any historical root the issuer
-        # ever installed.  Without the historical-acceptance, a
-        # coerced validator could pre-emptively wipe in-flight
-        # evidence by issuing a single SetReceiptSubtreeRoot rotation
-        # tx -- the round-5 rotation-evidence-wipe attack.
-        if (
-            tx.offender_id in self.receipt_subtree_roots
-            and not self.receipt_root_admissible(
-                tx.offender_id, tx.receipt.issuer_root_public_key,
-            )
+        # Registered-root check: the receipt's embedded root must
+        # match EITHER the offender's current root OR any historical
+        # root the offender ever installed.  Without the
+        # historical-acceptance, a coerced validator could
+        # pre-emptively wipe in-flight evidence by issuing a single
+        # SetReceiptSubtreeRoot rotation tx -- the round-5 rotation-
+        # evidence-wipe attack.  An offender that has never installed
+        # a root (no anchor of trust) is rejected outright by
+        # receipt_root_admissible -- this closes the round-7
+        # forged-receipt-slashing class where an attacker could
+        # otherwise sign a "receipt" with their own root claiming to
+        # be issued by an unonboarded victim and slash the victim
+        # for the price of MIN_FEE.  Do NOT short-circuit the gate
+        # on "offender absent from receipt_subtree_roots" -- the
+        # gate must fire precisely in that case.
+        if not self.receipt_root_admissible(
+            tx.offender_id, tx.receipt.issuer_root_public_key,
         ):
             return False, (
                 "Receipt signed with a different subtree root than "
-                "any of the issuer's registered roots (current or past)"
+                "any of the offender's registered roots (current or "
+                "past), or offender has never installed a receipt-"
+                "subtree root"
             )
 
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
@@ -3319,16 +3353,18 @@ class Blockchain:
             return False, "Evidence already processed"
         # See validate_censorship_evidence_tx for the
         # historical-roots rationale: rotation must NOT silently
-        # invalidate in-flight rejections.
-        if (
-            tx.offender_id in self.receipt_subtree_roots
-            and not self.receipt_root_admissible(
-                tx.offender_id, tx.rejection.issuer_root_public_key,
-            )
+        # invalidate in-flight rejections.  Same round-7 fix: never
+        # short-circuit the gate on "offender absent from
+        # receipt_subtree_roots" -- an unonboarded offender has no
+        # anchor of trust and any rejection naming them is forged.
+        if not self.receipt_root_admissible(
+            tx.offender_id, tx.rejection.issuer_root_public_key,
         ):
             return False, (
                 "Rejection signed with a different subtree root than "
-                "any of the issuer's registered roots (current or past)"
+                "any of the offender's registered roots (current or "
+                "past), or offender has never installed a receipt-"
+                "subtree root"
             )
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
@@ -5433,6 +5469,44 @@ class Blockchain:
                     f"Finality vote too old: target #{v.target_block_number} "
                     f"is more than {FINALITY_VOTE_MAX_AGE_BLOCKS} blocks "
                     f"below tip #{current_height}"
+                )
+            # signed_at_height must be a real, plausible height.  Without
+            # bounds an equivocating signer can pick any signed_at_height
+            # they like (the field is committed in the signable data, but
+            # nothing constrained the value before round 7).  The
+            # FinalityDoubleVoteEvidence pipeline reads
+            # `vote_a.signed_at_height` as the slash-evidence height (see
+            # _evidence_block_number); the slashing-tx admission gate
+            # then computes the evidence-TTL window as
+            # `current_height - signed_at_height > UNBONDING_PERIOD or
+            # ATTESTER_ESCROW_BLOCKS`.  By picking a signed_at_height
+            # far in the past, an offender can drive the evidence TTL
+            # check past expiry the moment the vote lands -- their
+            # equivocation is no longer slashable.  The matching
+            # _public_key_at_height lookup also resolves to whatever key
+            # was active at the spoofed height, which may pre-date
+            # registration entirely (returns the genesis-mapped key or
+            # raises depending on the path) -- another verification
+            # divergence vector.
+            #
+            # Bounds:
+            #   * signed_at_height <= current_height
+            #     (vote claims to have been signed at a chain tip the
+            #     signer had seen; cannot exceed the block being
+            #     assembled, which is current_height = parent+1)
+            #   * signed_at_height >= v.target_block_number
+            #     (the vote commits to target_block_hash; the signer
+            #     could not have seen that block before it existed)
+            if v.signed_at_height > current_height:
+                return False, (
+                    f"Finality vote signed_at_height "
+                    f"{v.signed_at_height} exceeds tip #{current_height}"
+                )
+            if v.signed_at_height < v.target_block_number:
+                return False, (
+                    f"Finality vote signed_at_height "
+                    f"{v.signed_at_height} predates target "
+                    f"#{v.target_block_number}"
                 )
             # Signature verification
             pk = self.public_keys[v.signer_entity_id]
