@@ -55,6 +55,29 @@ Tier 15 at height 5000).
   blocks at/after height 7000 that carry messages priced below the
   pre-Tier-16 linear floor.
 
+### Security (round-10 audit)
+
+- **Governance-tx gossip handler now verifies signatures before
+  admitting** (b991720). Pre-fix the `kind=="governance"` branch of
+  `Server._handle_announce_pending_tx` admitted forged
+  `ProposalTransaction` / `VoteTransaction` /
+  `TreasurySpendTransaction` after checking only that
+  `signer_id in public_keys`. An unauthenticated peer could craft a
+  tx with any registered entity's id as `proposer_id` / `voter_id`
+  and the validator would admit it to `_pending_governance_txs` and
+  rebroadcast. When the validator next became proposer it packed
+  the forged tx into its block; `validate_block` then rejected the
+  entire block at `_validate_governance_tx_in_block` (sig fails) —
+  the proposer wasted its slot, produced no block, and accrued
+  inactivity-leak / archive-miss penalties. Sustained flood across
+  rotated peers prevents block production indefinitely on a
+  2-validator chain. The fix routes admission through the existing
+  in-tree `Blockchain._validate_governance_tx` helper — the same
+  verifier `_validate_governance_tx_in_block` already trusts at
+  consensus-time validation. Mirrors the verify-before-admit pattern
+  of the sibling `stake` / `unstake` / `authority` branches; this
+  was the lone gap.
+
 ## [1.17.1] — 2026-04-26
 
 Patch release. ONE CRITICAL silent-fork fix from the round-9 audit
