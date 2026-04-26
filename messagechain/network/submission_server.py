@@ -46,6 +46,8 @@ from typing import Callable, Optional
 
 from messagechain.config import (
     MAX_SUBMISSION_BODY_BYTES,
+    SUBMISSION_ACK_BURST,
+    SUBMISSION_ACK_RATE_LIMIT_PER_SEC,
     SUBMISSION_BURST,
     SUBMISSION_FEE,
     SUBMISSION_RATE_LIMIT_PER_SEC,
@@ -202,6 +204,7 @@ def submit_transaction_to_mempool(
     receipt_issuer: Optional[ReceiptIssuer] = None,
     request_rejection: bool = False,
     witnessed_request_hash: Optional[bytes] = None,
+    ack_allowed: bool = True,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
@@ -232,10 +235,25 @@ def submit_transaction_to_mempool(
     gap where a coerced validator answers honest submissions with a lie.
     """
     # Helper — issue a SubmissionAck iff the caller passed a
-    # witnessed_request_hash AND the server has a ReceiptIssuer.
+    # witnessed_request_hash AND the server has a ReceiptIssuer
+    # AND the caller-side per-IP / observation-store gate has not
+    # short-circuited via `ack_allowed=False`.
+    #
+    # The `ack_allowed` gate exists because every ack burns a one-
+    # time-use WOTS+ leaf from the receipt subtree (RECEIPT_SUBTREE_HEIGHT
+    # = 16 → 65k leaves total).  Pre-fix this helper had no rate cap
+    # and accepted any 32-byte header value (no binding to any prior
+    # gossiped SubmissionRequest), so an attacker spamming HTTP POSTs
+    # with random `X-MC-Witnessed-Submission` values from a /24 could
+    # drain the entire subtree in minutes -- collapsing the censorship-
+    # evidence pipeline silently.  The HTTP handler now precomputes
+    # `ack_allowed` from the dedicated per-IP ack bucket and (when
+    # configured) the WitnessObservationStore, and threads it through.
     # Best-effort: a broken issuer must NOT change the validation
     # outcome.  See witness_submission.SubmissionAck for semantics.
     def _maybe_issue_ack(action_code_int: int) -> str:
+        if not ack_allowed:
+            return ""
         if witnessed_request_hash is None or receipt_issuer is None:
             return ""
         if len(witnessed_request_hash) != 32:
@@ -643,10 +661,45 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             except ValueError:
                 witnessed_request_hash = None
 
+        # Compute the ack-issuance gate.  Two conditions must hold for
+        # the validator to burn a receipt-subtree leaf on behalf of a
+        # witnessed-submission ack:
+        #
+        #   1. Per-IP ack budget allows it.  Without this, an attacker
+        #      spamming the X-MC-Witnessed-Submission header from a /24
+        #      drains all 65k receipt-subtree leaves in minutes,
+        #      collapsing the censorship-evidence pipeline silently.
+        #   2. (When a WitnessObservationStore is configured) the
+        #      claimed request_hash must have been observed by THIS
+        #      validator via gossip.  The header's value is supposed
+        #      to be the request_hash bound by the client's separately
+        #      gossiped SubmissionRequest -- a header value that this
+        #      node never witnessed via gossip is, by definition, not
+        #      a real witnessed request, and ack-ing it lets an
+        #      attacker forge ack issuance for arbitrary 32-byte
+        #      strings.  When no store is configured (RPC test paths,
+        #      bare server contexts) we fall through and rely on the
+        #      budget alone.
+        #
+        # Both gates are computed BEFORE submit() so the budget token
+        # is consumed atomically with the decision to issue (mirror
+        # of _should_request_rejection).
+        ack_allowed = False
+        if witnessed_request_hash is not None:
+            budget_ok = ctx.ack_budget_check(self._client_ip())
+            obs_ok = (
+                ctx.witness_observation_store is None
+                or ctx.witness_observation_store.get_observation_height(
+                    witnessed_request_hash,
+                ) is not None
+            )
+            ack_allowed = budget_ok and obs_ok
+
         # Inject via the shared helper (same semantics as RPC ingress).
         result = ctx.submit(
             tx, request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
+            ack_allowed=ack_allowed,
         )
 
         # Defense-in-depth: if an ack was issued, fan it out to peers
@@ -867,6 +920,20 @@ class _HandlerContext:
         # bucket keeps honest slash-evidence issuance flowing at a
         # slow rate while closing the leaf-drain vector.
         self._rejection_buckets: dict[str, TokenBucket] = {}
+        # Dedicated per-IP budget for the X-MC-Witnessed-Submission
+        # opt-in path.  Every SubmissionAck consumes one WOTS+ leaf
+        # from the SAME receipt subtree as receipts and rejections.
+        # Pre-fix the ack path had no per-IP budget AND no binding
+        # to a prior gossiped SubmissionRequest -- an attacker
+        # spamming HTTP POSTs with random 32-byte header values
+        # from a /24 drained all 65k leaves in minutes, after which
+        # the entire censorship-evidence pipeline (receipts,
+        # rejections, acks) collapsed silently because every issuance
+        # path shares the subtree.  Sized so honest opt-in flows
+        # (which paid WITNESS_SURCHARGE at the gossip layer) always
+        # get an ack while any IP-flood attacker hits the ceiling
+        # within seconds.
+        self._ack_buckets: dict[str, TokenBucket] = {}
         # Cap the dict to prevent an attacker rotating IPs from
         # exhausting memory with one-shot buckets.
         self._max_tracked_ips = 4096
@@ -935,6 +1002,50 @@ class _HandlerContext:
             self._last_active[ip] = _time.time()
             return bucket.consume()
 
+    def ack_budget_check(self, ip: str) -> bool:
+        """Consume one token from `ip`'s ACK bucket; True iff allowed.
+
+        Separate from rate_limit_check and rejection_budget_check.
+        Each SubmissionAck consumes a WOTS+ leaf from the validator's
+        receipt subtree -- without a dedicated cap, an attacker
+        spamming `X-MC-Witnessed-Submission` headers from a /24 drains
+        the whole subtree in minutes.  Exhausting the ack budget
+        does NOT block the underlying submission -- it only prevents
+        an ack from being issued for that request.  The HTTP handler
+        then passes `ack_allowed=False` to submit_transaction_to_mempool
+        so the submission still processes; the witnessed-submission
+        client just doesn't get a signed ack back.
+        """
+        import time as _time
+        with self._buckets_lock:
+            bucket = self._ack_buckets.get(ip)
+            if bucket is None:
+                if len(self._ack_buckets) >= self._max_tracked_ips:
+                    # Inactive eviction.
+                    to_drop = []
+                    for _ip, _b in self._ack_buckets.items():
+                        _b._refill()
+                        if _b.tokens >= _b.max_tokens:
+                            to_drop.append(_ip)
+                    for _ip in to_drop:
+                        del self._ack_buckets[_ip]
+                    if len(self._ack_buckets) >= self._max_tracked_ips:
+                        # LRU by last_active (shared timestamps).
+                        oldest_ip = min(
+                            self._ack_buckets,
+                            key=lambda k: self._last_active.get(k, 0.0),
+                        )
+                        del self._ack_buckets[oldest_ip]
+                    if len(self._ack_buckets) >= self._max_tracked_ips:
+                        return False
+                bucket = TokenBucket(
+                    rate=SUBMISSION_ACK_RATE_LIMIT_PER_SEC,
+                    max_tokens=SUBMISSION_ACK_BURST,
+                )
+                self._ack_buckets[ip] = bucket
+            self._last_active[ip] = _time.time()
+            return bucket.consume()
+
     def _evict_inactive_locked(self):
         """Drop buckets that are fully refilled (peer hasn't posted in a while)."""
         to_drop = []
@@ -959,12 +1070,14 @@ class _HandlerContext:
         tx: MessageTransaction,
         request_rejection: bool = False,
         witnessed_request_hash: Optional[bytes] = None,
+        ack_allowed: bool = True,
     ) -> SubmissionResult:
         return submit_transaction_to_mempool(
             tx, self.blockchain, self.mempool,
             receipt_issuer=self.receipt_issuer,
             request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
+            ack_allowed=ack_allowed,
         )
 
     def submit_proof(self, proof) -> SubmissionResult:

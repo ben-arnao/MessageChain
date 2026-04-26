@@ -94,6 +94,20 @@ _ADMIN_RPC_METHODS = frozenset({
     "ban_peer",
     "unban_peer",
     "get_banned_peers",
+    # reserve_leaf advances and persists the validator's wallet
+    # keypair `_next_leaf` counter -- the WOTS+ tree has at most
+    # 2^MERKLE_TREE_HEIGHT one-time leaves and once exhausted, the
+    # validator can no longer sign blocks until an emergency cold-key
+    # rotation.  The original "no auth" rationale (tx submissions are
+    # already gated by WOTS+ sigs on the txs themselves) does NOT
+    # apply here: this RPC consumes the validator's OWN key without
+    # any ownership proof.  Any caller reaching the RPC port (default
+    # 127.0.0.1, but commonly fronted via reverse proxy / SSH tunnel /
+    # LAN exposure / container misconfiguration) can drain the tree
+    # in hours from one IP, instantly with concurrent IPs.  The local
+    # CLI must now thread the configured RPC_AUTH_TOKEN through
+    # _reserve_leaf_via_rpc.
+    "reserve_leaf",
 })
 
 
