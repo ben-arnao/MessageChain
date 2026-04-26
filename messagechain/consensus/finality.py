@@ -336,7 +336,7 @@ class FinalityDoubleVoteEvidence:
 
 def verify_finality_double_vote_evidence(
     evidence: FinalityDoubleVoteEvidence,
-    offender_public_key: bytes,
+    offender_public_keys,
 ) -> tuple[bool, str]:
     """Verify self-contained double-vote evidence.
 
@@ -344,7 +344,33 @@ def verify_finality_double_vote_evidence(
     1. Both votes name the same signer (the offender)
     2. Both votes target the same block_number
     3. The target hashes differ (actually conflicting)
-    4. Both signatures verify under the offender's public key
+    4. Each vote's signature verifies under SOME candidate pubkey
+       drawn from the offender's full on-chain key history.
+
+    `offender_public_keys` accepts EITHER a single 32-byte pubkey
+    (legacy single-key callers) OR an iterable of candidate pubkeys
+    (the round-11 multi-key path).  Each vote is verified
+    independently -- so a validator who equivocates with K_old at
+    `vote_a.signed_at_height = N`, then rotates to K_new, then signs
+    `vote_b` (same target, conflicting hash) with K_new at
+    `vote_b.signed_at_height = N + delta` is still slashable.
+
+    Pre-round-11 the function took a single pubkey resolved at
+    `vote_a.signed_at_height`; vote_b's K_new-signed signature failed
+    against that one key and the slash was dismissed -- nothing-at-
+    stake protection on the finality layer was bypassable by any
+    rotating validator (cooldown 144 blocks << vote-age window 1000
+    blocks).  Mirrors the multi-key shape of
+    `verify_attestation_slashing_evidence` and
+    `verify_slashing_evidence` (round-6 fix applied there but the
+    parallel finality-vote path was overlooked).
+
+    Attacker cannot exploit the candidate set to forge evidence:
+    every key in `offender_public_keys` comes from the offender's
+    on-chain key history (or the current pubkey), each rotation step
+    of which is itself signed by the offender's prior key -- so
+    matching ANY candidate is proof the offender produced the
+    signature.
     """
     if evidence.vote_a.signer_entity_id != evidence.offender_id:
         return False, "vote_a signer does not match offender"
@@ -354,9 +380,20 @@ def verify_finality_double_vote_evidence(
         return False, "votes are at different heights"
     if evidence.vote_a.target_block_hash == evidence.vote_b.target_block_hash:
         return False, "votes are for the same block — not conflicting"
-    if not verify_finality_vote(evidence.vote_a, offender_public_key):
+    # Normalise to an iterable so the legacy single-key callers
+    # (passing a 32-byte bytes value) keep working without touching
+    # call sites we haven't migrated.  bytes IS an iterable in
+    # Python -- iterating yields ints, not pubkeys -- so the explicit
+    # `isinstance(... bytes)` branch is required.
+    if isinstance(offender_public_keys, (bytes, bytearray, memoryview)):
+        candidates = [bytes(offender_public_keys)]
+    else:
+        candidates = [bytes(pk) for pk in offender_public_keys]
+    if not candidates:
+        return False, "no candidate pubkeys"
+    if not any(verify_finality_vote(evidence.vote_a, pk) for pk in candidates):
         return False, "vote_a signature is invalid"
-    if not verify_finality_vote(evidence.vote_b, offender_public_key):
+    if not any(verify_finality_vote(evidence.vote_b, pk) for pk in candidates):
         return False, "vote_b signature is invalid"
     return True, "Valid double-vote evidence"
 

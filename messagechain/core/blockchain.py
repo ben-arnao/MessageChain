@@ -3059,38 +3059,49 @@ class Blockchain:
         from messagechain.consensus.finality import (
             FinalityDoubleVoteEvidence, verify_finality_double_vote_evidence,
         )
+        # Multi-key candidate set: every distinct pubkey the offender
+        # ever held on-chain (full key_history) plus the current
+        # pubkey.  Round 6 introduced this for AttestationSlashing /
+        # double-proposal SlashingEvidence; round 11 extends it to
+        # FinalityDoubleVoteEvidence too -- the prior single-key
+        # path here let an equivocator escape slashing by rotating
+        # keys between vote_a (signed with K_old) and vote_b (signed
+        # with K_new): `_public_key_at_height` resolved K_old from
+        # `vote_a.signed_at_height`, and verification of vote_b
+        # under K_old failed -> slash dismissed.  Cooldown
+        # (KEY_ROTATION_COOLDOWN_BLOCKS=144) << vote-age window
+        # (FINALITY_VOTE_MAX_AGE_BLOCKS=1000), so the rotation
+        # comfortably fits inside the same target's vote window and
+        # the bypass is trivial for any rotating validator.
+        # Every candidate is a key the offender legitimately
+        # published (each rotation step is signed by the prior
+        # cold/hot key), so matching ANY candidate is proof the
+        # offender produced the signature -- attacker cannot exploit
+        # the candidate set to forge evidence.
+        candidates: list[bytes] = []
+        seen: set[bytes] = set()
+        history = self.key_history.get(tx.evidence.offender_id, [])
+        for _installed_at, pk in history:
+            if pk and pk not in seen:
+                seen.add(pk)
+                candidates.append(pk)
+        current = self.public_keys.get(tx.evidence.offender_id)
+        if current and current not in seen:
+            candidates.append(current)
+        if not candidates:
+            return False, "offender had no key at evidence height"
         if isinstance(tx.evidence, FinalityDoubleVoteEvidence):
-            # Single-key path: signed_at_height already binds the lookup.
-            offender_pk = self._public_key_at_height(
-                tx.evidence.offender_id, ev_height,
-            )
-            if offender_pk is None:
-                return False, "offender had no key at evidence height"
             valid, reason = verify_finality_double_vote_evidence(
-                tx.evidence, offender_pk,
+                tx.evidence, candidates,
+            )
+        elif isinstance(tx.evidence, AttestationSlashingEvidence):
+            valid, reason = verify_attestation_slashing_evidence(
+                tx.evidence, candidates,
             )
         else:
-            # Multi-key path: try every key the offender ever held.
-            candidates: list[bytes] = []
-            seen: set[bytes] = set()
-            history = self.key_history.get(tx.evidence.offender_id, [])
-            for _installed_at, pk in history:
-                if pk and pk not in seen:
-                    seen.add(pk)
-                    candidates.append(pk)
-            current = self.public_keys.get(tx.evidence.offender_id)
-            if current and current not in seen:
-                candidates.append(current)
-            if not candidates:
-                return False, "offender had no key at evidence height"
-            if isinstance(tx.evidence, AttestationSlashingEvidence):
-                valid, reason = verify_attestation_slashing_evidence(
-                    tx.evidence, candidates,
-                )
-            else:
-                valid, reason = verify_slashing_evidence(
-                    tx.evidence, candidates,
-                )
+            valid, reason = verify_slashing_evidence(
+                tx.evidence, candidates,
+            )
         if not valid:
             return False, f"Invalid evidence: {reason}"
 
