@@ -6562,8 +6562,70 @@ class Blockchain:
         if not valid:
             return False, reason
 
+        # Inclusion-list quorum gate.  When `block.inclusion_list` is
+        # non-None the apply path feeds it to the coverage-leak —
+        # which burns honest validators' stake when their reports
+        # don't cover the listed entries.  An unverified list is the
+        # exact lever a colluding proposer would use to grief honest
+        # attesters: claim a quorum supermajority that no one actually
+        # reported, then watch every honest counter increment toward
+        # the quadratic-burn activation.  Reject any list whose
+        # quorum_attestation doesn't actually back the entries before
+        # the apply path can act on it.
+        ok, reason = self._validate_inclusion_list_quorum(block)
+        if not ok:
+            return False, reason
+
         # Receive-to-exist: no separate registration tx type to validate.
         return True, "Valid"
+
+    def _validate_inclusion_list_quorum(self, block) -> tuple[bool, str]:
+        """Verify a block's attached inclusion_list (if any) against the
+        live stake/pubkey snapshot.
+
+        Returns (True, "OK") when the block carries no list, an empty
+        list (no consensus signal), or a list whose quorum_attestation
+        actually backs every listed entry under
+        `verify_inclusion_list_quorum`'s rules (per-report sig check,
+        wait-window bounds, >= INCLUSION_LIST_QUORUM_BPS stake support
+        per entry, canonical sort/dedupe).
+
+        Also enforces `lst.publish_height == block.header.block_number`
+        — a list MUST be published in the block carrying it.  The
+        coverage-leak's bookkeeping is keyed by block_number, and the
+        InclusionListProcessor's `register()` raises on a mismatch; we
+        catch the same condition at validation so a misaligned list is
+        a clean rejection rather than a downstream invariant violation.
+        """
+        from messagechain.consensus.inclusion_list import (
+            verify_inclusion_list_quorum,
+        )
+        lst = getattr(block, "inclusion_list", None)
+        if lst is None:
+            return True, "OK"
+        # Empty-entries list carries no consensus signal — the leak
+        # path skips it (see _apply_block_state line ~8590), and the
+        # quorum verifier wasn't designed for the no-entries case.
+        # Mirror the apply path's gate so we don't reject what the
+        # apply path would silently accept.
+        if not getattr(lst, "entries", None):
+            return True, "OK"
+        block_number = getattr(block.header, "block_number", None)
+        if block_number is None:
+            return False, "block missing header.block_number"
+        if lst.publish_height != block_number:
+            return False, (
+                f"inclusion list publish_height {lst.publish_height} "
+                f"does not match block number {block_number}"
+            )
+        ok, reason = verify_inclusion_list_quorum(
+            lst,
+            stakes=self.supply.staked,
+            public_keys=self.public_keys,
+        )
+        if not ok:
+            return False, f"inclusion list quorum invalid: {reason}"
+        return True, "OK"
 
     def _validate_stake_tx_in_block(
         self, stx,
@@ -7206,6 +7268,13 @@ class Blockchain:
                 f"exceeding MAX_NEW_ACCOUNTS_PER_BLOCK cap "
                 f"of {MAX_NEW_ACCOUNTS_PER_BLOCK} per block"
             )
+
+        # Mirror validate_block's inclusion-list quorum gate so a fork-
+        # validated block can't slip a forged list past the standalone
+        # entry point either.
+        ok, reason = self._validate_inclusion_list_quorum(block)
+        if not ok:
+            return False, reason
 
         return True, "Valid"
 
@@ -9503,15 +9572,35 @@ class Blockchain:
         # attestations (which will target this block) can consult it.
         self._record_stake_snapshot(block.header.block_number)
 
-        # Persist
+        # Persist — atomic across the four writes.  Without the
+        # wrapping transaction, each helper auto-commits independently:
+        # a SIGKILL between `add_chain_tip` and `_persist_state`
+        # leaves the chain head pointing at block N while persisted
+        # balances/nonces/supply are still as-of N-1.  On restart,
+        # `_load_from_db` then loads the inconsistent state and every
+        # subsequent block fails state_root verification with no
+        # auto-repair path (integrity-check + reindex_state are
+        # currently unwired).  The genesis path at
+        # `_apply_mainnet_genesis_state` solves this exact problem with
+        # the same wrapper — the comment there is the authoritative
+        # explanation.  Mirror it here so the steady-state apply path
+        # has the same crash-window guarantee.
         if self.db is not None:
             # Entity indices assigned by _apply_block_state above are
             # already in self.entity_id_to_index, so any RegistrationTx
             # in this block can now be referenced compactly too.
-            self.db.store_block(block, state=self)
-            self.db.remove_chain_tip(old_tip)
-            self.db.add_chain_tip(block.block_hash, block.header.block_number, new_weight)
-            self._persist_state()
+            self.db.begin_transaction()
+            try:
+                self.db.store_block(block, state=self)
+                self.db.remove_chain_tip(old_tip)
+                self.db.add_chain_tip(
+                    block.block_hash, block.header.block_number, new_weight,
+                )
+                self._persist_state()
+                self.db.commit_transaction()
+            except BaseException:
+                self.db.rollback_transaction()
+                raise
 
         # Process any orphan blocks that depend on this block
         self._process_orphans(block.block_hash)
