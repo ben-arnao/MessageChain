@@ -4,6 +4,90 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] — 2026-04-26
+
+Minor release.  Hard fork (Tier 12) opens the chain to non-English
+speech.  Closes the largest mission/mechanism mismatch in the project:
+the public framing pitches MessageChain as a censorship-resistant
+ledger for dissidents and coerced-speech contexts, but the protocol
+rejected every codepoint outside printable ASCII (32-126), shutting
+out the bulk of the world's writing systems.
+
+### Added -- Tier 12 hard fork
+
+- **`MessageTransaction` plaintext rule, post-INTL_MESSAGE_HEIGHT.**
+  At/after `INTL_MESSAGE_HEIGHT = 1500`, message plaintexts are NFC-
+  normalized UTF-8 whose codepoints fall under Unicode General_Category
+  L*/M*/N*/P*/Zs (letters, marks, numbers, punctuation, space), plus a
+  narrow allowlist of two format characters required for script
+  shaping: U+200C ZWNJ and U+200D ZWJ.  Bidi override / isolate
+  characters (U+202A-U+202E, U+2066-U+2069) are explicitly rejected
+  as spoofing vectors.  All `S*` (symbols including emoji, math glyphs,
+  currency), `C*` outside the ZWJ/ZWNJ allowlist (controls,
+  surrogates, private-use, unassigned, other format chars), and Zl/Zp
+  separators are rejected.  Pre-activation: legacy printable-ASCII rule
+  (32-126) unchanged so historical blocks replay deterministically.
+  (`messagechain/core/transaction.py`, `messagechain/config.py`)
+- **Why categories, not a script allowlist.**  The L/M/N/P/Zs
+  whitelist is structural -- "characters that are letters, marks,
+  numbers, punctuation, or space" -- and has no political knob.  A
+  "popular scripts" allowlist would force a discretionary admission
+  rule (which scripts count?  who decides when Tibetan or Burmese
+  qualifies?), and the project's audience is disproportionately
+  small-population languages in coerced-speech contexts that any such
+  cutoff would strand.  Future Unicode scripts land in L/M/N
+  automatically and become valid without a config change.
+- **Coverage, by speaker count.**  Every modern living language with
+  >=10M speakers is covered: Latin (English, Spanish, French, German,
+  Vietnamese, Polish, Turkish, Indonesian, Swahili, Filipino, ...),
+  Cyrillic (Russian, Ukrainian, Bulgarian, Serbian, Kazakh, ...),
+  Arabic (Arabic, Persian, Urdu, Pashto, Uyghur, ...), CJK (Mandarin,
+  Cantonese, Japanese, Korean), Indic (Hindi, Bengali, Tamil, Telugu,
+  Marathi, Gujarati, Kannada, Malayalam, Sinhala, Punjabi, Nepali),
+  Southeast Asian (Thai, Lao, Khmer, Burmese), plus Greek, Hebrew,
+  Armenian, Georgian, Amharic, Tigrinya, Tibetan.
+- **Storage cap unchanged in numerator, semantically shifted in
+  denominator.**  `MAX_MESSAGE_CHARS = 1024` still binds, but post-fork
+  it caps UTF-8-encoded plaintext bytes (1024 bytes) rather than ASCII
+  characters.  English users still get ~1024 chars; Cyrillic / Greek /
+  Hebrew users get ~512; CJK users get ~341.  Each pays
+  `BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE * len(stored)` -- the
+  fee market already prices stored bytes, so bloat discipline is
+  unchanged across regimes.
+- **NFC normalization required (not auto-applied).**  Without this
+  rule "café" encoded as U+00E9 vs U+0065+U+0301 would yield two
+  distinct tx_hashes for the same visible message, breaking dedup,
+  prev-pointer references, and feed-equality checks.  The chain
+  rejects non-NFC input rather than silently normalizing -- determinism
+  + replay sanity outweigh client-side convenience.
+
+### Changed
+
+- **`messagechain send` pre-flight check is now UTF-8-aware.**
+  Replaces the pre-1.10.0 ASCII-only diagnostic that named em-dash /
+  smart-quotes / ellipsis as "common culprits."  Post-fork those are
+  legitimate punctuation (P* category) and the friendly diagnostic
+  shifts to byte-cap overruns -- the only failure mode the CLI can
+  pre-empt locally without a chain round-trip.
+- **`MessageTransaction.deserialize` and `to_dict` now use UTF-8.**
+  Byte-identical to the legacy ascii-encode path for ASCII-only
+  plaintexts; correctly carries multi-byte sequences for post-fork
+  messages.
+
+### Deployment
+
+- `INTL_MESSAGE_HEIGHT = 1500` is well above the live tip (~451 at
+  release time), giving operators ~7 days of upgrade runway before
+  the fork point -- substantially longer than the ~100-minute runways
+  used for Tier 8-11.  This is a UX-visible change for every wallet
+  and reader client, not just operators, so the wider window lets
+  third-party tooling catch up.
+- No operator action beyond the standard `messagechain upgrade`.  The
+  validator binary picks up the new validation function on restart;
+  pre-fork blocks continue to validate under the legacy ASCII rule
+  through height 1499 and v1/v2 message wire formats keep working
+  unchanged at all heights.
+
 ## [1.9.0] — 2026-04-26
 
 Minor release. Hard fork (Tier 11) plus an opt-in operator feature.
