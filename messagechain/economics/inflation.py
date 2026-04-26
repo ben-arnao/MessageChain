@@ -785,6 +785,15 @@ class SupplyTracker:
         TARGET_BLOCK_SIZE=10 so pre-fork blocks and non-consensus call
         sites (e.g. isolated tests) retain their prior behavior.
 
+        At/after MARKET_FEE_FLOOR_HEIGHT (Tier 16) the lower bound on
+        base_fee drops to MARKET_FEE_FLOOR (=1) — the protocol fee
+        floor collapses to a flat 1 token, so base_fee can decay to 1
+        during quiet periods.  Pre-fork the lower bound stays at
+        MIN_FEE (=100) for replay determinism.  The upper cap stays
+        absolute (MIN_FEE × MAX_BASE_FEE_MULTIPLIER = 1_000_000) — it
+        bounds pathological pricing in absolute tokens, not as a
+        multiple of the floor.
+
         Returns the new base fee.
         """
         if current_height is not None and current_height >= BLOCK_BYTES_RAISE_HEIGHT:
@@ -795,8 +804,20 @@ class SupplyTracker:
         if parent_tx_count == target:
             return self.base_fee
 
-        from messagechain.config import MIN_FEE, MAX_BASE_FEE_MULTIPLIER
+        from messagechain.config import (
+            MIN_FEE,
+            MAX_BASE_FEE_MULTIPLIER,
+            MARKET_FEE_FLOOR,
+            MARKET_FEE_FLOOR_HEIGHT,
+        )
         max_base_fee = MIN_FEE * MAX_BASE_FEE_MULTIPLIER
+        if (
+            current_height is not None
+            and current_height >= MARKET_FEE_FLOOR_HEIGHT
+        ):
+            base_floor = MARKET_FEE_FLOOR
+        else:
+            base_floor = MIN_FEE
         if parent_tx_count > target:
             # Block was over target — increase base fee
             excess = parent_tx_count - target
@@ -814,7 +835,7 @@ class SupplyTracker:
             # Block was under target — decrease base fee
             deficit = target - parent_tx_count
             delta = self.base_fee * deficit // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
-            self.base_fee = max(MIN_FEE, self.base_fee - delta)
+            self.base_fee = max(base_floor, self.base_fee - delta)
 
         return self.base_fee
 

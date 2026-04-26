@@ -4,6 +4,57 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] — 2026-04-26
+
+Minor release. **Hard fork: Tier 16 — market-driven fee floor.**
+Activates at `MARKET_FEE_FLOOR_HEIGHT = 7000` (~14 days runway above
+Tier 15 at height 5000).
+
+### Changed (consensus, gated by activation height)
+
+- **`MARKET_FEE_FLOOR = 1` retires the linear-in-stored-bytes fee
+  floor.** At/after `MARKET_FEE_FLOOR_HEIGHT`, the protocol-level fee
+  floor for `MessageTransaction`s collapses to a flat 1 token,
+  regardless of message size, prev-pointer presence, or witness size.
+  The linear formula
+  (`BASE_TX_FEE + FEE_PER_STORED_BYTE_POST_RAISE × len`) is retained
+  only as a replay rule for blocks in `[BLOCK_BYTES_RAISE_HEIGHT,
+  MARKET_FEE_FLOOR_HEIGHT)`. Pre-fork heights replay under the rule
+  current at their height (legacy quadratic, flat
+  `MIN_FEE_POST_FLAT`, or one of the two linear variants) — historical
+  blocks validate unchanged.
+
+  Rationale: the linear floor was doing two jobs — keep zero-fee txs
+  out of the mempool, and discipline long-message bloat by per-byte
+  pricing. Only the first is the floor's job. Bloat discipline is
+  already delivered by `MAX_BLOCK_MESSAGE_BYTES` (a hard byte ceiling
+  per block, ~6.5 MB/day at full utilization regardless of fee paid)
+  and EIP-1559 base fee dynamics (which automatically price the
+  marginal byte under congestion). Setting the floor to 1 — not 0 —
+  preserves the no-free-tx invariant without the protocol trying to
+  set the equilibrium price.
+- **EIP-1559 base-fee lower bound drops from `MIN_FEE` (=100) to
+  `MARKET_FEE_FLOOR` (=1) at/after `MARKET_FEE_FLOOR_HEIGHT`.** Base
+  fee can now decay to 1 token during quiet periods, then ratchet up
+  via the existing 12.5%-per-over-target-block dynamics under
+  congestion. Upper cap stays absolute (`MIN_FEE × MAX_BASE_FEE_MULTIPLIER`
+  = 1_000_000) — it bounds pathological pricing in absolute tokens,
+  not as a multiple of the floor.
+- **`enforce_signature_aware_min_fee` protocol baseline drops to
+  `MARKET_FEE_FLOOR` for all non-message tx types at/after
+  activation.** Type-specific surcharges (`NEW_ACCOUNT_FEE`,
+  `GOVERNANCE_PROPOSAL_FEE`, `KEY_ROTATION_FEE`, etc.) are
+  unaffected — they price externalities specific to those tx types
+  (permanent state entry, binding governance vote, key rotation) and
+  remain the binding floor for those tx types in practice.
+
+### Operational
+
+- Validators must upgrade to 1.18.0 within the runway window
+  (5000 → 7000) to follow the fork. Pre-1.18.0 nodes will reject
+  blocks at/after height 7000 that carry messages priced below the
+  pre-Tier-16 linear floor.
+
 ## [1.17.1] — 2026-04-26
 
 Patch release. ONE CRITICAL silent-fork fix from the round-9 audit

@@ -30,6 +30,7 @@ from messagechain.config import (
     FIRST_SEND_PUBKEY_HEIGHT,
     INTL_MESSAGE_HEIGHT,
     MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
+    MARKET_FEE_FLOOR, MARKET_FEE_FLOOR_HEIGHT,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -512,6 +513,14 @@ def calculate_min_fee(
 ) -> int:
     """Calculate the minimum fee floor a tx must pay to be admitted.
 
+    At/after MARKET_FEE_FLOOR_HEIGHT (Tier 16): flat ``MARKET_FEE_FLOOR``
+    (=1) regardless of size.  The protocol-level floor exists only to
+    keep zero-fee txs out of the mempool — bloat discipline is
+    delivered by the per-block byte budget (MAX_BLOCK_MESSAGE_BYTES)
+    as a hard ceiling and by EIP-1559 base fee dynamics above the
+    floor.  ``signature_bytes`` and ``prev_bytes`` are ignored under
+    this rule: the market prices both via base_fee under congestion.
+
     At/after BLOCK_BYTES_RAISE_HEIGHT (Tier 9): same linear formula as
     Tier 8, but with the raised per-byte rate:
 
@@ -549,6 +558,14 @@ def calculate_min_fee(
     FEE_INCLUDES_SIGNATURE_HEIGHT rule (witness bytes priced alongside
     payload).
     """
+    # At/after MARKET_FEE_FLOOR_HEIGHT the linear floor is retired in
+    # favor of a flat per-tx admission fee.  Bloat discipline now lives
+    # in the per-block byte budget (rate ceiling) and EIP-1559 base
+    # fee (price ceiling under congestion) — see the Tier 16 rationale
+    # block in messagechain/config.py.  Pre-fork heights still replay
+    # under the rule current at their height.
+    if current_height is not None and current_height >= MARKET_FEE_FLOOR_HEIGHT:
+        return MARKET_FEE_FLOOR
     # At/after PREV_POINTER_HEIGHT the `prev` pointer adds 33 stored
     # bytes (1B presence flag + 32B hash) when set.  Charged at the
     # live per-stored-byte rate so pointer txs pay uniformly for their
@@ -595,16 +612,29 @@ def enforce_signature_aware_min_fee(
         stake, vote, revoke, etc.) could carry a ~2.7 KB signature at
         MIN_FEE and bloat permanent chain state at nearly zero cost.
 
-    ``current_height`` ≥ FLAT_FEE_HEIGHT:
+    FLAT_FEE_HEIGHT ≤ ``current_height`` < MARKET_FEE_FLOOR_HEIGHT:
       * Accept iff ``tx_fee >= max(flat_floor, MIN_FEE_POST_FLAT)``.
         Size-indexed pricing is gone — the flat floor subsumes both the
         byte and witness surcharges.  The ``flat_floor`` argument
         (e.g. GOVERNANCE_PROPOSAL_FEE, KEY_ROTATION_FEE) still applies
         for tx types whose own hardcoded minimum exceeds the protocol
         floor.
+
+    ``current_height`` ≥ MARKET_FEE_FLOOR_HEIGHT:
+      * Accept iff ``tx_fee >= max(flat_floor, MARKET_FEE_FLOOR)``.
+        Tier 16 collapses the protocol baseline to MARKET_FEE_FLOOR=1.
+        Type-specific surcharges (NEW_ACCOUNT_FEE, GOVERNANCE_PROPOSAL_FEE,
+        KEY_ROTATION_FEE, etc.) still apply via the ``flat_floor``
+        argument and remain the binding floor for those tx types in
+        practice — the protocol baseline only bites when ``flat_floor``
+        is itself ≤ MARKET_FEE_FLOOR.
     """
     if tx_fee < flat_floor:
         return False
+    if current_height is not None and current_height >= MARKET_FEE_FLOOR_HEIGHT:
+        if tx_fee < MARKET_FEE_FLOOR:
+            return False
+        return True
     if current_height is not None and current_height >= FLAT_FEE_HEIGHT:
         if tx_fee < MIN_FEE_POST_FLAT:
             return False
