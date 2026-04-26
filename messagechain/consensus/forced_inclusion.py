@@ -8,7 +8,8 @@ txs.
 
 Defense: every attester independently tracks the txs it has held in
 its local mempool for at least FORCED_INCLUSION_WAIT_BLOCKS.  From that
-set it picks the top FORCED_INCLUSION_SET_SIZE by fee.  These are the
+set it picks the top FORCED_INCLUSION_SET_SIZE by fee-per-byte (same
+density priority used for normal block selection).  These are the
 "forced" txs — the next proposer MUST include them, or justify their
 omission via a valid structural excuse.
 

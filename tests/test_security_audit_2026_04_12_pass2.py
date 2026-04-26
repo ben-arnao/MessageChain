@@ -224,10 +224,13 @@ class TestH1RBFSignatureRequired(unittest.TestCase):
         )
         pool.add_transaction(tx1)
 
-        # Attempt RBF with no public key (signature bypass)
+        # Attempt RBF with no public key (signature bypass).  Use a
+        # same-length message + higher fee so the replacement clears the
+        # fee-per-byte gate and actually reaches the public_key check —
+        # that's the security regression this test guards against.
         tx2 = MessageTransaction(
             entity_id=eid,
-            message=b"evil replacement",
+            message=b"evil",  # density (fee/len) > original (200/5 = 40)
             fee=500,
             nonce=0,
             timestamp=time.time(),
