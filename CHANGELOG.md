@@ -4,6 +4,73 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.16.0] — 2026-04-26
+
+Minor release. Four CRITICAL security fixes from the round-7 audit
+pass against the post-v1.15.0 chain state. **All mainnet operators
+should upgrade ASAP** — Fix #1 below directly exposes live validators
+to a one-tx slash for the price of `MIN_FEE` until they upgrade.
+
+### Security
+
+- **Forged-receipt slashing of unonboarded validators closed**
+  (135de3c). `validate_censorship_evidence_tx` and
+  `validate_bogus_rejection_evidence_tx` no longer short-circuit the
+  receipt-root admissibility gate when the offender has never
+  installed a `SetReceiptSubtreeRoot`. Pre-fix the gate
+  `if tx.offender_id in self.receipt_subtree_roots and not
+  receipt_root_admissible(...)` skipped entirely for unonboarded
+  victims, letting an attacker generate their own receipt subtree,
+  sign a `SubmissionReceipt` purporting to be from the victim under
+  an attacker-controlled root, wrap it in a `CensorshipEvidenceTx`,
+  and slash the victim for `CENSORSHIP_SLASH_BPS` of stake at the
+  price of `MIN_FEE`. Both live mainnet validators were exposed
+  (neither has run their initial `SetReceiptSubtreeRoot` onboarding).
+  The gate now defers to `receipt_root_admissible` unconditionally;
+  that helper already returns `False` for offenders with no anchor
+  of trust.
+- **`_record_receipt_subtree_root` chaindb-write rollback safety**
+  (135de3c). Pre-fix the helper called `db.set_receipt_subtree_root`
+  and `db.add_past_receipt_subtree_root` synchronously at apply time,
+  BEFORE the per-block SQL transaction opened in
+  `_apply_block_state`. A bad-state-root block whose apply mutated
+  the maps got rolled back in-memory by `_restore_memory_snapshot`,
+  but the chaindb mirror kept the rejected-block writes — a cold
+  restart then rehydrated the corrupted mirror and silently forked
+  off the canonical chain. Writes are now deferred to
+  `_persist_state`, which runs inside the per-block transaction
+  wrapper for crash atomicity.
+- **`_install_state_snapshot` installs `past_receipt_subtree_roots`**
+  (135de3c). v19 made the historical-roots dict load-bearing for
+  evidence admission AND committed it to the snapshot root, but the
+  install path was never updated. State-synced (checkpoint-
+  bootstrapped) nodes started with the dict empty and silently
+  forked off the warm cluster on the first contested
+  `CensorshipEvidence` under a rotated-away root. Install now
+  mirrors the same shape as the live-roots assignment.
+- **`FinalityVote.signed_at_height` bounded by
+  `[target_block_number, current_height]`** (135de3c).
+  `_validate_finality_votes` now rejects any vote whose
+  `signed_at_height` exceeds the block being assembled (signer
+  claims a tip they hadn't seen) or precedes the vote's target
+  (signer predates the block they commit to). Pre-fix the field
+  was unconstrained: the slash-evidence pipeline keys the TTL gate
+  on `signed_at_height`, so an equivocator who picked a far-past
+  value drove the TTL check past expiry the moment the votes landed
+   — their double-vote was no longer slashable.
+
+### Notes
+
+- Pure security release. No new CLI commands, no new RPC methods,
+  no `STATE_SNAPSHOT_VERSION` bump (no on-chain schema change), no
+  behavior change for honest operators.
+- The `FinalityVote.signed_at_height` bound is technically a
+  consensus-rule tightening (a previously-valid block carrying an
+  out-of-bounds vote would now be rejected). Honest validators
+  produce votes with `signed_at_height` equal to the chain tip at
+  signing time, so historical replay is unaffected. Roll both
+  validators promptly to keep the rule uniformly enforced.
+
 ## [1.15.0] — 2026-04-26
 
 Minor release. Three CRITICAL security fixes — all the same root
