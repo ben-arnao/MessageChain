@@ -429,6 +429,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt (for scripts / CI).",
     )
+    revoke.add_argument(
+        "--print-only", action="store_true",
+        help=(
+            "Build and sign the revoke locally, print the tx as hex on "
+            "stdout, and DO NOT broadcast.  Intended for the offline "
+            "pre-sign workflow: run on an air-gapped machine with the "
+            "cold key, save the printed hex offline, then broadcast "
+            "later with `messagechain broadcast-revoke --hex <bytes>`.  "
+            "Skips the RPC tip probe and the confirmation prompt so "
+            "this works fully offline."
+        ),
+    )
+
+    # --- broadcast-revoke ---
+    bcast = sub.add_parser(
+        "broadcast-revoke",
+        help="Broadcast a pre-signed revoke tx (companion to --print-only)",
+        description=(
+            "Submit a revoke tx that was previously built and signed via "
+            "`emergency-revoke --print-only`.  Reads the hex blob, parses "
+            "it as a RevokeTransaction, and submits it via the standard "
+            "emergency_revoke RPC path.  Use this when the pre-signed "
+            "kill-switch needs to fire: scan the QR / type the hex, "
+            "broadcast, the validator is disabled the next block."
+        ),
+    )
+    bcast_src = bcast.add_mutually_exclusive_group(required=True)
+    bcast_src.add_argument(
+        "--hex", dest="tx_hex", type=str, default=None,
+        help="Hex string of the serialized revoke tx (from --print-only).",
+    )
+    bcast_src.add_argument(
+        "--file", dest="tx_file", type=str, default=None,
+        help="Path to a file containing the hex blob (whitespace ignored).",
+    )
+    bcast.add_argument(
+        "--server", type=str, default=None, help="Server address host:port",
+    )
+    bcast.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt before broadcasting.",
+    )
 
     # --- propose ---
     propose = sub.add_parser(
@@ -2814,18 +2856,63 @@ def cmd_emergency_revoke(args):
     private_key = _resolve_private_key(args)
     cold = Entity.create(private_key)
 
-    host, port = _parse_server(args.server)
-    from client import rpc_call
+    print_only = bool(getattr(args, "print_only", False))
 
-    # Revoke is nonce-free - no RPC roundtrip required to sign, which is
-    # what makes the "keep a pre-signed revoke tx on paper" workflow
-    # practical. The cold key's leaf index is local to its own KeyPair.
-    # Default fee: post-flat floor is safe pre- and post-activation.
+    # Revoke is nonce-free, so signing needs no RPC roundtrip -- that
+    # is what makes the "keep a pre-signed revoke tx on paper" workflow
+    # practical.  In --print-only mode we DO NOT touch the network at
+    # all (this is meant to run on an air-gapped machine), so we
+    # don't import rpc_call or compute a `host, port` either.
+    #
+    # Fee defaults differ by mode:
+    #   * Live broadcast: MIN_FEE_POST_FLAT, the current-floor minimum.
+    #   * Pre-sign:       10 * MIN_FEE_POST_FLAT, a generous pad against
+    #                     a future fee-floor governance bump.  A
+    #                     pre-signed revoke that pays today's floor
+    #                     becomes invalid the day governance raises
+    #                     MIN_FEE_POST_FLAT past that value, which is
+    #                     the wrong failure mode for an offline kill-
+    #                     switch you only reach for under duress.  The
+    #                     extra tokens come out of the cold-key holder's
+    #                     balance only when (and if) the revoke fires.
     from messagechain.config import MIN_FEE_POST_FLAT
-    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
+    if args.fee is not None:
+        fee = args.fee
+    elif print_only:
+        fee = MIN_FEE_POST_FLAT * 10
+    else:
+        fee = MIN_FEE_POST_FLAT
     tx = create_revoke_transaction(
         cold, fee=fee, entity_id=target_entity_id,
     )
+
+    if print_only:
+        # Air-gapped pre-sign path: print the serialized tx as hex on
+        # stdout, no tip probe, no confirmation, no broadcast.  The
+        # operator is responsible for getting these bytes onto durable
+        # offline storage (paper QR + USB recommended) and for running
+        # `messagechain broadcast-revoke --hex <bytes>` if/when the
+        # kill-switch needs to fire.
+        tx_hex = tx.to_bytes().hex()
+        print("=== Pre-signed Revoke (DO NOT BROADCAST YET) ===\n")
+        print(f"  Target entity: {target_entity_id.hex()}")
+        print(f"  Fee paid on broadcast: {fee} tokens")
+        print(f"  Tx hash: {tx.tx_hash.hex()}")
+        print(f"  Bytes (length {len(tx_hex)//2}):\n")
+        print(tx_hex)
+        print()
+        print("Store the hex above OFFLINE -- paper QR + an encrypted")
+        print("USB drive in two physical locations is the recommended")
+        print("pattern. Anyone with these bytes can permanently disable")
+        print("the target validator (no funds are stolen, but block")
+        print("production stops and stake enters the unbonding queue).")
+        print()
+        print("To fire the kill-switch later:")
+        print("  messagechain broadcast-revoke --hex <paste-bytes>")
+        return
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
 
     # Probe tip height so the warning reflects the CURRENTLY active
     # unbonding fork.
@@ -2870,6 +2957,76 @@ def cmd_emergency_revoke(args):
             f"will release to your balance after the unbonding period "
             f"({_describe_unbonding_period(revoke_tip)})."
         )
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
+def cmd_broadcast_revoke(args):
+    """Broadcast a pre-signed revoke tx (companion to emergency-revoke --print-only).
+
+    Reads the saved hex blob, deserializes it as a RevokeTransaction,
+    and submits it via the same RPC path as the build-and-broadcast
+    flow.  No cold key required at this point -- the bytes are already
+    signed; the host doing the broadcast just needs network access to
+    a node.
+    """
+    from messagechain.core.emergency_revoke import RevokeTransaction
+    from client import rpc_call
+
+    if args.tx_file is not None:
+        try:
+            with open(args.tx_file, "r", encoding="utf-8") as f:
+                raw = f.read()
+        except OSError as e:
+            print(f"Error: could not read --file: {e}")
+            sys.exit(1)
+        tx_hex = "".join(raw.split())
+    else:
+        tx_hex = "".join(args.tx_hex.split())
+
+    try:
+        tx_bytes = bytes.fromhex(tx_hex)
+    except ValueError:
+        print("Error: input is not valid hex.")
+        sys.exit(1)
+
+    try:
+        tx = RevokeTransaction.from_bytes(tx_bytes)
+    except (ValueError, IndexError) as e:
+        print(f"Error: bytes do not parse as a RevokeTransaction: {e}")
+        sys.exit(1)
+
+    if not getattr(args, "yes", False):
+        tid_hex = tx.entity_id.hex()
+        tid_short = f"{tid_hex[:16]}...{tid_hex[-8:]}"
+        print("=== Broadcast Pre-signed Revoke ===\n")
+        print(f"  Target entity: {tid_short}")
+        print(f"  (full: {tid_hex})")
+        print(f"  Fee:           {tx.fee} tokens")
+        print(f"  Signed at ts:  {int(tx.timestamp)} (epoch sec)")
+        print(f"  Tx hash:       {tx.tx_hash.hex()}")
+        print()
+        print("This permanently disables the target validator. Block")
+        print("production stops immediately; staked funds release to")
+        print("the cold-key holder after the standard unbonding period.")
+        confirm = input(
+            "\nBroadcast this pre-signed revoke (type 'yes' to proceed): "
+        ).strip().lower()
+        if confirm != "yes":
+            print("Broadcast cancelled.")
+            sys.exit(0)
+
+    host, port = _parse_server(args.server)
+    print(f"Broadcasting pre-signed revoke for {tx.entity_id.hex()[:16]}...")
+    response = rpc_call(host, port, "emergency_revoke", {
+        "transaction": tx.serialize(),
+    })
+    if response.get("ok"):
+        result = response["result"]
+        print("\nRevoke applied!")
+        print(f"  Entity ID: {result['entity_id']}")
+        print(f"  TX hash:   {result['tx_hash']}")
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -4834,6 +4991,7 @@ def main():
         "set-receipt-subtree-root": cmd_set_receipt_subtree_root,
         "bootstrap-seed": cmd_bootstrap_seed,
         "emergency-revoke": cmd_emergency_revoke,
+        "broadcast-revoke": cmd_broadcast_revoke,
         "rotate-key": cmd_rotate_key,
         "key-status": cmd_key_status,
         "propose": cmd_propose,
