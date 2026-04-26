@@ -4,6 +4,30 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] — 2026-04-25
+
+Patch release. Fixes the faucet drip fee so transfers to brand-new
+recipients (which is every recipient, by design) actually land. No
+consensus changes.
+
+### Fixed
+
+- **Faucet now pays `MIN_FEE_POST_FLAT + NEW_ACCOUNT_FEE` per drip.**
+  The 1.8.0 wiring hardcoded `fee=MIN_FEE_POST_FLAT=1000`, but the
+  chain charges a `NEW_ACCOUNT_FEE=1000` surcharge on top of the
+  base floor when the recipient has no on-chain history yet.  Faucet
+  recipients are by definition brand-new wallets (a fresh user's
+  first contact with the chain), so every drip hit
+  `Transfer to brand-new recipient requires fee >= 1100; got 1000`
+  and bounced.  The chain rejection was clean (no funds moved, no
+  rate-limit slot consumed -- per the
+  test_submit_failure_does_not_consume_quota guard) but the user-
+  facing behavior was still "faucet returns an error every time."
+  Now: fee = 1000 + 1000 = 2100 per drip.  At
+  FAUCET_DRIP=1000, each drip costs the faucet 3100 tokens
+  (1000 sent + 2100 fee), so a 200,000-token reserve covers ~64
+  drips before refill -- just over a day at the daily cap.
+
 ## [1.8.0] — 2026-04-25
 
 Minor release. Closes the receive-to-exist cold-start gap with an

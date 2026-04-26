@@ -4433,7 +4433,7 @@ def _build_faucet(server, keyfile_path: str):
     from messagechain.core.transfer import create_transfer_transaction
     from messagechain.identity.identity import Entity
     from messagechain.network.faucet import FaucetState, FAUCET_DRIP
-    from messagechain.config import MIN_FEE_POST_FLAT
+    from messagechain.config import MIN_FEE_POST_FLAT, NEW_ACCOUNT_FEE
 
     # Read the daemon-format keyfile (raw 64-char hex, no checksum)
     # the same way the main --keyfile loader does at server startup.
@@ -4506,12 +4506,22 @@ def _build_faucet(server, keyfile_path: str):
         # helper so back-to-back drips inside one block window pick
         # up sequential nonces without waiting for inclusion.
         nonce = server._get_pending_nonce_all_pools(entity.entity_id)
+        # Faucet recipients are brand-new wallets BY DEFINITION (the
+        # whole point is to fund first-time-on-chain users), so every
+        # transfer pays the NEW_ACCOUNT_FEE surcharge on top of the
+        # base floor.  Without this addition, the chain rejects every
+        # drip with "Transfer to brand-new recipient requires fee >=
+        # 1100".  Pre-paying the surcharge unconditionally is correct
+        # even on the rare path where the recipient already exists --
+        # the chain just keeps the extra as additional fee paid; it
+        # does not over-debit.
+        fee = MIN_FEE_POST_FLAT + NEW_ACCOUNT_FEE
         tx = create_transfer_transaction(
             entity,
             recipient_id=recipient_bytes,
             amount=FAUCET_DRIP,
             nonce=nonce,
-            fee=MIN_FEE_POST_FLAT,
+            fee=fee,
             include_pubkey=not pubkey_installed,
         )
         # Optimistically flip the flag so two near-simultaneous
