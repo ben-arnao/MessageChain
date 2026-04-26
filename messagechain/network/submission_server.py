@@ -501,6 +501,21 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
         server._submission_context: `_HandlerContext`
     """
 
+    # Per-connection socket read timeout.  `BaseHTTPRequestHandler`
+    # defaults to None ("block forever"), which combined with
+    # ThreadingMixIn + daemon_threads + no max-thread cap is a
+    # textbook slow-loris hole: a single attacker host opening N
+    # TCP connections and dripping one byte every minute pins N
+    # validator threads (each holding a TLS session + thread stack)
+    # until memory exhausts and the asyncio main loop starves of
+    # OS scheduling.  Per-IP rate limiting is checked AFTER
+    # self.rfile.read returns, so it provides no defense against
+    # this class of attack.  30s is generous for honest clients
+    # over public internet (median POST round-trip is well under
+    # 1s) and tight enough that the per-thread holding cost stays
+    # bounded.
+    timeout = 30
+
     # Keep log output quiet; we log security-relevant events explicitly.
     def log_message(self, fmt, *args):
         return

@@ -743,6 +743,23 @@ class ChainDB:
                 root_public_key BLOB NOT NULL
             );
 
+            -- Per-validator HISTORICAL receipt-subtree roots.  When an
+            -- entity rotates their receipt subtree via
+            -- SetReceiptSubtreeRoot, the OLD root is appended here so
+            -- evidence validation (CensorshipEvidence, BogusRejection,
+            -- ack registry) can still admit receipts issued under it.
+            -- Without this history, a coerced validator who has issued
+            -- many receipts under R1 could wipe ALL outstanding
+            -- evidence by publishing a single rotation tx to R2.
+            -- Composite primary key so multiple historical roots per
+            -- entity are stored side-by-side; the rolling-history set
+            -- is rebuilt by SELECTing all rows for a given entity.
+            CREATE TABLE IF NOT EXISTS past_receipt_subtree_roots (
+                entity_id BLOB NOT NULL,
+                root_public_key BLOB NOT NULL,
+                PRIMARY KEY (entity_id, root_public_key)
+            );
+
             -- Entity-index registry (bloat reduction).  Bidirectional
             -- map entity_id <-> entity_index, assigned monotonically on
             -- registration.  Persistence lets a restart rehydrate the
@@ -1785,6 +1802,34 @@ class ChainDB:
         )
         return {bytes(row[0]): bytes(row[1]) for row in cur.fetchall()}
 
+    def add_past_receipt_subtree_root(
+        self, entity_id: bytes, root_public_key: bytes,
+    ) -> None:
+        """Append a historical receipt-subtree root for an entity.
+
+        Idempotent (composite PK + INSERT OR IGNORE): re-rotating
+        through the same prior root is a no-op at the storage layer.
+        """
+        self._conn.execute(
+            "INSERT OR IGNORE INTO past_receipt_subtree_roots "
+            "(entity_id, root_public_key) VALUES (?, ?)",
+            (entity_id, root_public_key),
+        )
+
+    def get_all_past_receipt_subtree_roots(self) -> dict:
+        """Return {entity_id -> set[root_public_key]} of all historical
+        roots ever installed for each entity.  Used at cold-restart
+        rehydration so receipt-validation can still admit receipts
+        under any past root."""
+        cur = self._conn.execute(
+            "SELECT entity_id, root_public_key "
+            "FROM past_receipt_subtree_roots"
+        )
+        out: dict[bytes, set[bytes]] = {}
+        for row in cur.fetchall():
+            out.setdefault(bytes(row[0]), set()).add(bytes(row[1]))
+        return out
+
     # ── Equivocation Watcher: Seen Signatures ───────────────────────
 
     def get_seen_signature(
@@ -2094,6 +2139,25 @@ class ChainDB:
             # mirror table that needed to join the wipe list after
             # being added.
             conn.execute("DELETE FROM key_rotation_last_height")
+            # receipt_subtree_roots mirrors the in-memory map of each
+            # validator's published receipt-issuance subtree root.
+            # CensorshipEvidenceTx + BogusRejectionEvidenceTx
+            # validation gate on `receipt_subtree_roots[offender]`,
+            # so a stale row from a losing fork (e.g. a
+            # SetReceiptSubtreeRoot that landed only on the fork
+            # we're reorging out of) leaves the cold-restarted node
+            # rejecting evidence the warm cluster accepts (or vice
+            # versa) -- silent consensus split on every evidence
+            # decision involving that entity.  Same defect class as
+            # the round-2 entity_id_to_index leak and round-4
+            # key_rotation_last_height leak; this is the third such
+            # mirror table that needed to join the wipe list.
+            # past_receipt_subtree_roots (added for the rotation-
+            # invalidates-evidence fix) is wiped alongside since it's
+            # derived from the same canonical-chain replay -- old-
+            # fork rotation history must not survive.
+            conn.execute("DELETE FROM receipt_subtree_roots")
+            conn.execute("DELETE FROM past_receipt_subtree_roots")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 

@@ -1121,10 +1121,23 @@ def verify_proposal(
     # known release.  Reject v2 admission strictly before
     # GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT -- pre-activation only v1
     # txs are accepted, so an early v2 submission can't slip past
-    # peers running pre-fork binaries.  Post-activation, v1 stays
-    # admissible for backward compatibility (the recommended creation
-    # path emits v2; a future tier may tighten this to v2-only).
+    # peers running pre-fork binaries.  Post-activation: REJECT v1
+    # admission too -- v1 and v2 of the SAME logical proposal text
+    # produce different tx_hashes (v2 commits version + length
+    # prefixes), so allowing both creates a vote-splitting attack
+    # surface (and for TreasurySpend, a double-spend attack: both
+    # can clear 2/3 independently and each debits the treasury for
+    # the same logical spend).  Closing v1 admission post-fork makes
+    # this structurally impossible.  Historical pre-fork v1 blocks
+    # still replay correctly because verify_proposal is called with
+    # the historical block's height, not the live tip.
     if tx.version > GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        return False
+    if (
+        current_height is not None
+        and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+        and tx.version < GOVERNANCE_TX_VERSION_LENGTH_PREFIX
+    ):
         return False
     if tx.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
         if (
@@ -1192,8 +1205,15 @@ def verify_treasury_spend(
     max(GOVERNANCE_PROPOSAL_FEE, sig-aware min) (R5-A).
     """
     # Tier 15 version gate.  See verify_proposal for the full
-    # rationale.
+    # rationale -- in particular the post-activation v1 rejection
+    # that closes the vote-split + treasury-double-spend attack.
     if tx.version > GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        return False
+    if (
+        current_height is not None
+        and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+        and tx.version < GOVERNANCE_TX_VERSION_LENGTH_PREFIX
+    ):
         return False
     if tx.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
         if (

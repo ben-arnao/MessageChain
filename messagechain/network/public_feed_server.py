@@ -132,6 +132,13 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         *                     → 404 / 405
     """
 
+    # Per-connection socket read timeout.  See _SubmissionHandler for
+    # the slow-loris rationale.  The feed handler also serves the
+    # /faucet POST path on this same handler when faucet is enabled,
+    # so the timeout protects both read-only feed traffic and the
+    # faucet-drip body parse.
+    timeout = 30
+
     server_version = "MessageChainFeed/1"
     sys_version = ""
 
