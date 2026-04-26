@@ -2076,6 +2076,24 @@ class ChainDB:
             # themselves so post-reorg replay repopulates pins
             # consistent with the canonical chain.
             conn.execute("DELETE FROM stake_snapshots")
+            # key_rotation_last_height mirrors the in-memory cooldown
+            # gate.  v18 added the on-disk mirror so a cold-booted
+            # node inherits the cooldown state it would otherwise
+            # lose (the `_reset_state` comment notes restart timing
+            # is not attacker-controllable, but a stale mirror IS).
+            # Must wipe alongside the rest of the canonical-chain
+            # rebuildable state -- if a rotation that landed only on
+            # the losing fork keeps its (higher) row on disk, a cold
+            # restart of any reorg-survivor node would re-hydrate the
+            # stale row and enforce a different cooldown than the
+            # warm cluster.  The snapshot root commits to
+            # `_TAG_KEY_ROTATION_LAST_HEIGHT`, so the divergence
+            # surfaces as an immediate consensus split at the next
+            # checkpoint block.  Same defect class as the
+            # entity_id_to_index reorg leak; this is the second
+            # mirror table that needed to join the wipe list after
+            # being added.
+            conn.execute("DELETE FROM key_rotation_last_height")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 

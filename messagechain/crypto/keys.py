@@ -454,6 +454,24 @@ class KeyPair:
         self._seed = seed
         self._next_leaf = start_leaf
 
+        # Serializes the read-modify-write of `_next_leaf` inside
+        # sign().  Two threads racing into sign() without this lock
+        # could each observe the same `leaf_idx = self._next_leaf`
+        # before either advances the counter, then both produce
+        # WOTS+ signatures over different message hashes under the
+        # same one-time leaf -- mathematically reveals the leaf's
+        # WOTS+ private key (per the catastrophic-reuse comment
+        # below).  The race is reachable in production via the
+        # ReceiptIssuer's subtree keypair: SubmissionServer runs
+        # under socketserver.ThreadingMixIn, so two concurrent
+        # /v1/submit POSTs that both qualify for receipt / ack /
+        # rejection issuance enter sign() on different threads.
+        # Cheap to acquire (uncontended in single-thread CLI / IBD
+        # paths); the cost of NOT holding it is one-shot key
+        # disclosure per collision.
+        import threading as _threading
+        self._sign_lock = _threading.Lock()
+
         # Optional path for persistent leaf-index tracking.  When set,
         # sign() writes the updated _next_leaf to this file BEFORE
         # returning the signature (write-ahead), preventing WOTS+ leaf
@@ -519,6 +537,12 @@ class KeyPair:
         kp.leaf_index_path = None
         kp.public_key = bytes(public_key)
         kp._node_cache = None
+        # Same threading-safety contract as __init__ — see the
+        # comment there.  `_from_trusted_root` bypasses __init__
+        # entirely, so the lock must be set up here too or
+        # subsequent sign() calls AttributeError on `_sign_lock`.
+        import threading as _threading
+        kp._sign_lock = _threading.Lock()
         return kp
 
     def advance_to_leaf(self, leaf_index: int):
@@ -540,35 +564,56 @@ class KeyPair:
         self._next_leaf = max(self._next_leaf, leaf_index)
 
     def sign(self, message_hash: bytes) -> Signature:
-        """Sign using the next available WOTS+ leaf key (derived on demand)."""
-        if self._next_leaf >= self.num_leaves:
-            raise RuntimeError("Key exhausted: all one-time keys have been used")
+        """Sign using the next available WOTS+ leaf key (derived on demand).
 
-        leaf_idx = self._next_leaf
+        Thread-safe: the leaf-index reservation (read-modify-write of
+        `_next_leaf`, plus the optional persist-before-sign disk
+        write) runs under `_sign_lock` so concurrent callers each
+        consume a distinct leaf.  Leaf-derivation + WOTS+ signing
+        runs OUTSIDE the lock -- those operations only read the
+        seed (immutable) and the reserved `leaf_idx` (local), so
+        parallel signing on different leaves is allowed.
+        """
+        # Reserve a leaf index atomically.  The whole read-modify-
+        # write -- including the disk write of the persist-before-
+        # sign path -- must complete before another thread reads
+        # `_next_leaf`, otherwise two threads could both observe
+        # the same N and produce two signatures under the same
+        # one-time leaf (catastrophic WOTS+ key disclosure, see
+        # below).
+        with self._sign_lock:
+            if self._next_leaf >= self.num_leaves:
+                raise RuntimeError(
+                    "Key exhausted: all one-time keys have been used"
+                )
+            leaf_idx = self._next_leaf
 
-        # Persist-BEFORE-sign: durably record "leaf_idx has been consumed"
-        # before wots_sign() can produce bytes that might escape this
-        # process.  If we instead signed first and persisted after, a
-        # crash between the two would leave the broadcast signature on
-        # the wire while the on-disk counter still pointed at leaf_idx —
-        # on restart we would reuse leaf_idx and sign a second message
-        # with the same one-time key, which mathematically reveals the
-        # WOTS+ private key for that leaf.  Burning a leaf without a
-        # corresponding sign is cheap; reusing one is catastrophic.
-        # If persist_leaf_index raises (disk full, I/O error), we abort
-        # the sign entirely — no signature is returned and _next_leaf
-        # stays put, so the next attempt retries the same leaf.
-        if self.leaf_index_path is not None:
-            # persist_leaf_index reads self._next_leaf, so temporarily
-            # advance it for the write then roll back on failure.
-            self._next_leaf = leaf_idx + 1
-            try:
-                self.persist_leaf_index(self.leaf_index_path)
-            except Exception:
-                self._next_leaf = leaf_idx
-                raise
-        else:
-            self._next_leaf = leaf_idx + 1
+            # Persist-BEFORE-sign: durably record "leaf_idx has been
+            # consumed" before wots_sign() can produce bytes that
+            # might escape this process.  If we instead signed first
+            # and persisted after, a crash between the two would
+            # leave the broadcast signature on the wire while the on-
+            # disk counter still pointed at leaf_idx — on restart we
+            # would reuse leaf_idx and sign a second message with the
+            # same one-time key, which mathematically reveals the
+            # WOTS+ private key for that leaf.  Burning a leaf
+            # without a corresponding sign is cheap; reusing one is
+            # catastrophic.  If persist_leaf_index raises (disk full,
+            # I/O error), we abort the sign entirely — no signature
+            # is returned and _next_leaf stays put, so the next
+            # attempt retries the same leaf.
+            if self.leaf_index_path is not None:
+                # persist_leaf_index reads self._next_leaf, so
+                # temporarily advance it for the write then roll
+                # back on failure.
+                self._next_leaf = leaf_idx + 1
+                try:
+                    self.persist_leaf_index(self.leaf_index_path)
+                except Exception:
+                    self._next_leaf = leaf_idx
+                    raise
+            else:
+                self._next_leaf = leaf_idx + 1
 
         # Derive the leaf keypair on demand — no private keys stored
         priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
