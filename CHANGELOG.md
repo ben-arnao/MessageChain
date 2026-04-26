@@ -4,6 +4,77 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.1] — 2026-04-26
+
+Patch release. ONE CRITICAL silent-fork fix from the round-9 audit
+pass against the post-v1.17.0 chain state. **All mainnet operators
+should upgrade ASAP** — every node that processed a state-root-
+rejected block since the chain went live is exposed on its next cold
+restart.
+
+### Security
+
+- **`add_block` now wraps apply + state-root verify + persist in a
+  single chaindb transaction** (f28c872). Pre-fix multiple apply-time
+  helpers eagerly committed to chaindb BEFORE the per-block
+  transaction opened — `_record_key_history` /
+  `apply_key_rotation` (set_public_key, set_leaf_watermark,
+  set_key_rotation_count, set_key_rotation_last_height, plus an
+  explicit `db.flush_state()`), `apply_revoke_transaction`
+  (set_revoked + flush_state), and the first-spend pubkey installs
+  in transfer-with-burn / message-tx apply paths (set_public_key).
+  A block whose `state_root` mismatched got rolled back in-memory by
+  `_restore_memory_snapshot`, but the disk mirror kept the
+  rejected-block writes. A subsequent cold restart rehydrated the
+  phantom rows and silently forked off the canonical chain.
+  - **Concrete exploit**: a staked proposer crafts a block carrying
+    a self-targeted `KeyRotationTransaction(new_public_key=
+    PK_attacker)` plus a deliberately wrong `state_root`. The
+    simulated-root pre-check skips slash-bearing blocks, so any
+    block including a slash tx reaches apply unconditionally. Apply
+    eagerly writes `(height, PK_attacker)` to `key_history` and
+    `PK_attacker` to `public_keys`; state-root verify fails;
+    in-memory rolls back; disk keeps the writes. Cold restart
+    on any node that processed the block then resolves PK_attacker
+    via `_public_key_at_height` for any block the entity signs and
+    rejects pre-rotation slash evidence as having an invalid
+    signature → silent fork at the slash block, plus a slashing
+    escape for any equivocator who can land such a block.
+  - **Fix shape**: in `add_block`, every chaindb write inside
+    `_apply_block_state` now rides the outer txn via the chaindb's
+    `_txn_depth` nesting (inner `begin_transaction` at depth>0 is a
+    no-op; inner `_maybe_commit` at depth>0 is a no-op; only the
+    outer commits or rolls back). On state-root mismatch we
+    `rollback_transaction` to undo all eager DB writes alongside
+    the existing `_restore_memory_snapshot`. Same defect-class fix
+    as round-7's `_record_receipt_subtree_root` deferral, but
+    applied at the apply-loop boundary so it covers ALL current
+    AND future eager writers without per-helper plumbing changes.
+- **Belt-and-suspenders cleanup** (f28c872):
+  - `_record_key_history` no longer eager-writes; `_persist_state`
+    gains a key_history flush loop after the existing past-roots
+    loop.
+  - `apply_key_rotation` no longer eager-writes; relies on
+    `_persist_state`'s pre-existing `public_keys` /
+    `leaf_watermarks` / `key_rotation_counts` /
+    `key_rotation_last_height` flush loops.
+  - `db.flush_state()` is now depth-aware (routes through
+    `_maybe_commit`) so any helper invoked inside the outer wrap
+    cannot prematurely commit the outer txn and partially defeat
+    the fix. Outside any wrap (cold-start bootstrap, standalone
+    tests) it still commits immediately.
+
+### Notes
+
+- No on-chain schema bump (no `STATE_SNAPSHOT_VERSION` change).
+- No CLI / RPC behavior change for honest operators on the
+  steady-state path.
+- Mainnet validators have restarted multiple times during the
+  recent 1.14→1.17 release sequence, so the exposure was real:
+  the next restart on a node that had ever processed a bad-state-
+  root block could have triggered the fork. Roll both validators
+  promptly.
+
 ## [1.17.0] — 2026-04-26
 
 Minor release. Two CRITICAL silent-fork fixes from the round-8 audit

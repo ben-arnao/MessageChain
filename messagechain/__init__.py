@@ -4,4 +4,4 @@
 # (see messagechain/network/node.py and server.py) and surfaced in the
 # `messagechain status` / `messagechain peers` CLI output. Keep this in
 # sync with pyproject.toml's `version` field.
-__version__ = "1.17.0"
+__version__ = "1.17.1"
