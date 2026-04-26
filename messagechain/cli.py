@@ -1911,7 +1911,12 @@ def cmd_send(args):
         )
     fee = args.fee
     if fee is None:
-        est_resp = rpc_call(host, port, "get_fee_estimate", {})
+        # Pass our stored byte count so the server returns a size-aware
+        # density-based suggestion (median fee-per-byte * stored_bytes)
+        # -- same axis the proposer's selection priority ranks on.
+        est_resp = rpc_call(host, port, "get_fee_estimate", {
+            "message_bytes": len(stored_bytes),
+        })
         server_suggested = (
             est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
         )

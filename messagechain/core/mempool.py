@@ -146,9 +146,13 @@ class Mempool:
                     and existing.signature.leaf_index == incoming_leaf):
                 return False
 
-        # M4: Enforce dynamic minimum relay fee based on mempool pressure
-        min_relay_fee = self.fee_policy.get_min_relay_fee(len(self.pending), self.max_size)
-        if tx.fee < min_relay_fee:
+        # Flat admission floor — every tx must pay at least
+        # MARKET_FEE_FLOOR (=1).  We no longer scale the relay floor
+        # with mempool pressure: the spam ceiling is delivered by block
+        # cadence + per-block byte budget, not per-tx fee inflation.
+        # See CLAUDE.md "Fee model — minimum fee is 1, never 0."
+        from messagechain.config import MARKET_FEE_FLOOR
+        if tx.fee < MARKET_FEE_FLOOR:
             return False
 
         # Per-sender ancestor limit: prevent deep unconfirmed chains (BTC-style)
@@ -345,19 +349,29 @@ class Mempool:
         self.arrival_heights[new_tx.tx_hash] = prior_arrival
         return True
 
-    def get_fee_estimate(self) -> int:
-        """Estimate fee needed to get into the next block.
+    def get_fee_estimate(self, message_bytes: int = 0) -> int:
+        """Estimate the absolute fee to bid for inclusion of a tx of given size.
 
-        Returns the median fee of pending txs, floored at MIN_FEE. Never
-        suggests a value the chain would reject. Message txs have an
-        additional size-dependent minimum (see calculate_min_fee); clients
-        should use max(this, local_min) for their actual fee.
+        Computed as `median(fee/len(message))` across pending txs (the
+        same density axis selection ranks on), multiplied by
+        ``message_bytes``, floored at ``MARKET_FEE_FLOOR``.  The shape
+        matches the original estimator (median across pending) but is
+        expressed in fee-per-byte so a wallet bidding this fee on a
+        1024-byte message pays proportionally more than on a 100-byte
+        message — matching the proposer's selection priority.
+
+        Empty mempool → returns ``MARKET_FEE_FLOOR`` (no demand signal,
+        the cheapest valid fee).  ``message_bytes <= 0`` (legacy callers
+        that don't yet pass a size) → also returns the floor; clients
+        should pass their actual stored byte count for a useful estimate.
         """
-        from messagechain.config import MIN_FEE
-        if not self.pending:
-            return MIN_FEE
-        fees = sorted([tx.fee for tx in self.pending.values()], reverse=True)
-        return max(MIN_FEE, fees[len(fees) // 2])
+        from messagechain.config import MARKET_FEE_FLOOR
+        if not self.pending or message_bytes <= 0:
+            return MARKET_FEE_FLOOR
+        densities = sorted(_fee_per_byte(tx) for tx in self.pending.values())
+        median_density = densities[len(densities) // 2]
+        estimate = int(median_density * message_bytes)
+        return max(MARKET_FEE_FLOOR, estimate)
 
     # save_to_file / load_from_file exist so operator tooling (and our
     # own test suite) can round-trip a pending-pool snapshot for debug

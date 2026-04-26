@@ -1,50 +1,44 @@
 """
-Dynamic minimum relay fee for MessageChain.
+Deprecated: dynamic relay-fee scaling is no longer the spam ceiling.
 
-Problem: A static MIN_FEE doesn't adapt to spam attacks. When the mempool
-is being flooded, the minimum fee should rise to make spam expensive.
+Historical: this module scaled the minimum relay fee linearly from a
+base to a ceiling as mempool utilization rose, on the theory that
+expensive fees under load would price out spam.
 
-Solution: Scale the minimum relay fee based on mempool utilization.
-When the mempool is nearly empty, use the base fee. As it fills up,
-increase the minimum proportionally up to a configured maximum.
+Current model (see CLAUDE.md "Fee model"): the spam ceiling is
+delivered by block cadence + per-block byte budget, not per-tx fee
+inflation.  Every tx pays a flat ``MARKET_FEE_FLOOR`` (=1); the market
+sets the price above the floor via fee-per-byte selection priority.
 
-The ceiling is set high (10,000) so that during congestion, the cost
-to spam becomes prohibitive — this is by design, since MessageChain
-prioritizes ledger compactness over cheap transactions.
+The class is retained as a no-op so existing constructor-arg callers
+(tests, older operator scripts) keep importing cleanly.  ``base_fee``
+and ``max_fee`` are accepted but ignored — ``get_min_relay_fee`` now
+always returns ``MARKET_FEE_FLOOR``.
 """
 
-from messagechain.config import MIN_FEE
+from messagechain.config import MARKET_FEE_FLOOR
 
 
 class DynamicFeePolicy:
-    """Computes a dynamic minimum relay fee based on mempool pressure.
+    """No-op shim around the flat MARKET_FEE_FLOOR admission floor.
 
-    The fee scales linearly from base_fee (empty mempool) to max_fee
-    (full mempool). Transactions below the dynamic minimum are rejected.
-
-    Args:
-        base_fee: Minimum fee when mempool has no pressure.
-        max_fee: Maximum the dynamic fee can reach.
+    Old callers passed ``base_fee`` / ``max_fee`` to tune a linear
+    pressure curve; both are now accepted-and-ignored.  The relay
+    floor is the same flat ``MARKET_FEE_FLOOR`` consensus enforces
+    post-Tier-16, regardless of mempool utilization.
     """
 
-    def __init__(self, base_fee: int = MIN_FEE, max_fee: int = 10_000):
+    def __init__(self, base_fee: int = MARKET_FEE_FLOOR, max_fee: int = MARKET_FEE_FLOOR):
+        # Retained as instance attrs only because some test asserts
+        # introspect them.  They have no effect on fee logic.
         self.base_fee = base_fee
         self.max_fee = max_fee
 
     def get_min_relay_fee(self, mempool_size: int, mempool_max: int) -> int:
-        """Calculate the current minimum relay fee.
+        """Always returns the flat ``MARKET_FEE_FLOOR``.
 
-        Args:
-            mempool_size: Current number of transactions in mempool.
-            mempool_max: Maximum mempool capacity.
-
-        Returns:
-            The minimum fee required for relay at current pressure.
+        ``mempool_size`` and ``mempool_max`` are accepted for
+        signature stability but no longer influence the floor —
+        spam discipline is delivered by block cadence + byte budget.
         """
-        if mempool_max <= 0 or mempool_size <= 0:
-            return self.base_fee
-
-        # Linear scale: base_fee at 0% full, max_fee at 100% full
-        utilization = min(mempool_size / mempool_max, 1.0)
-        fee = self.base_fee + int(utilization * (self.max_fee - self.base_fee))
-        return min(fee, self.max_fee)
+        return MARKET_FEE_FLOOR
