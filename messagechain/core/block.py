@@ -477,7 +477,7 @@ class BlockHeader:
             f64  timestamp
             32   proposer_id
             32   randao_mix
-            32   mempool_snapshot_root   <- inclusion attestation
+            32   mempool_snapshot_root   <- retired (always zero on new blocks; retained for historical block compat)
             32   state_root_checkpoint   <- periodic snapshot commitment
             u32  sig_blob_len  (0 = no proposer signature)
             N    sig_blob

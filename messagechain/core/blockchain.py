@@ -4878,7 +4878,6 @@ class Blockchain:
         custody_proofs: list | None = None,
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
-        mempool_tx_hashes: list[bytes] | None = None,
         acks_observed_this_block: list | None = None,
     ) -> Block:
         """Create a block with the correct post-state root.
@@ -5019,7 +5018,6 @@ class Blockchain:
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
             timestamp=timestamp,
-            mempool_tx_hashes=mempool_tx_hashes,
             state_root_checkpoint=state_root_checkpoint,
             acks_observed_this_block=acks_observed_this_block,
         )

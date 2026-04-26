@@ -230,7 +230,6 @@ class ProofOfStake:
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
         timestamp: float | None = None,
-        mempool_tx_hashes: list[bytes] | None = None,
         state_root_checkpoint: bytes = b"\x00" * 32,
         acks_observed_this_block: list[bytes] | None = None,
     ) -> Block:
@@ -290,14 +289,11 @@ class ProofOfStake:
         tx_hashes = canonical_block_tx_hashes(_block_like)
         merkle_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
 
-        # Inclusion attestation: commit to mempool state at proposal time.
-        if mempool_tx_hashes:
-            from messagechain.consensus.inclusion_attestation import (
-                compute_mempool_snapshot_root,
-            )
-            snapshot_root = compute_mempool_snapshot_root(mempool_tx_hashes)
-        else:
-            snapshot_root = b"\x00" * 32
+        # mempool_snapshot_root is retired (was the inclusion-attestation
+        # audit layer, superseded by inclusion_list's consensus-objective
+        # slashing).  Field retained in the header for historical block
+        # compat; new blocks always set zeros.
+        snapshot_root = b"\x00" * 32
 
         # Clamp against parent.timestamp so an honest proposer with a
         # wall clock that trails the parent's header (e.g., the previous
