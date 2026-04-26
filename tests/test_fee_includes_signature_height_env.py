@@ -53,20 +53,22 @@ class TestFeeIncludesSigHeightEnvSet(unittest.TestCase):
 
     def test_env_var_override_applied(self):
         out = _run_config_probe(
-            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "75000"},
+            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "1500"},
             _PROBE,
         )
-        # Must be < FLAT_FEE_HEIGHT (98000) per config.py's invariant
-        # assertion that the signature-gate precedes the flat-fee fork.
-        self.assertEqual(out, "75000")
+        # Must be < FLAT_FEE_HEIGHT (2500 post-1.11.0 compression) per
+        # config.py's invariant assertion that the signature-gate
+        # precedes the flat-fee fork.
+        self.assertEqual(out, "1500")
 
 
 class TestFeeIncludesSigHeightDefault(unittest.TestCase):
-    """Test B: env-var unset → hardcoded canonical default (64_000, Tier 2)."""
+    """Test B: env-var unset → hardcoded canonical default
+    (compressed in 1.11.0 from 64_000 to 875, Tier 2)."""
 
     def test_default_when_unset(self):
         out = _run_config_probe({}, _PROBE)
-        self.assertEqual(out, "64000")
+        self.assertEqual(out, "1200")
 
 
 class TestFeeIncludesSigHeightInvalidInt(unittest.TestCase):

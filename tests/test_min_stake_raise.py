@@ -56,7 +56,8 @@ class TestMinStakeRaiseConstants(unittest.TestCase):
 
     def test_activation_height_canonical(self):
         self.assertTrue(hasattr(config, "MIN_STAKE_RAISE_HEIGHT"))
-        self.assertEqual(config.MIN_STAKE_RAISE_HEIGHT, 60_000)
+        # Compressed in 1.11.0 from 60_000 to 1000 — see CHANGELOG.
+        self.assertEqual(config.MIN_STAKE_RAISE_HEIGHT, 1000)
 
     def test_helper_exists(self):
         self.assertTrue(hasattr(config, "get_validator_min_stake"))

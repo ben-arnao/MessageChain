@@ -757,7 +757,7 @@ LEAF_INDEX_FILENAME = "leaf_index.json"
 # convention shared with the other pending forks.
 VALIDATOR_MIN_STAKE = 100                # LEGACY — see get_validator_min_stake
 VALIDATOR_MIN_STAKE_POST_RAISE = 10_000  # 0.007% of 140M supply
-MIN_STAKE_RAISE_HEIGHT = 60_000  # Tier 2
+MIN_STAKE_RAISE_HEIGHT = 1000  # Tier 2 (compressed: was 60_000)
 
 
 def get_validator_min_stake(block_height: int) -> int:
@@ -848,7 +848,7 @@ LOTTERY_INTERVAL = 144       # blocks (~1 day at 600s)
 # to mainnet.
 LOTTERY_BOUNTY = 100                 # LEGACY — see get_lottery_bounty
 LOTTERY_BOUNTY_POST_RAISE = 5_000
-LOTTERY_BOUNTY_RAISE_HEIGHT = 62_000  # Tier 2
+LOTTERY_BOUNTY_RAISE_HEIGHT = 1100  # Tier 2 (compressed: was 62_000)
 
 
 def get_lottery_bounty(block_height: int) -> int:
@@ -1578,8 +1578,14 @@ OUTBOUND_BLOCK_RELAY_ONLY_SLOTS = 2
 # of truth for BOOTSTRAP_END_HEIGHT.  Window length is fixed at 210,384
 # blocks (~4 years) to match the existing halving cadence.
 from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT as _BEH  # noqa: E402
-SEED_DIVESTMENT_START_HEIGHT = _BEH                                    # 105_192
-SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 315_576
+# Compressed from _BEH (105_192) to 50_000 — ~1 year of runway at
+# 600s blocks instead of the original ~2 years.  The bleed window
+# duration (END - START = 210_384 blocks ≈ 4 years) is preserved so
+# the per-block divestment rate stays sane; only the start is pulled
+# forward.  See CHANGELOG 1.11.0 rationale: with one operator and no
+# external validators, the original 2-year timer was buying nothing.
+SEED_DIVESTMENT_START_HEIGHT = 50_000                                  # was _BEH (105_192)
+SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 260_384
 SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
 SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
 assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
@@ -1623,7 +1629,7 @@ assert (
 # first divestment block fires under old-schedule terms and the
 # network cannot uniformly transition.  Placeholder matches the
 # convention used by the three prior forks (50_000).
-SEED_DIVESTMENT_RETUNE_HEIGHT = 72_000  # Tier 3
+SEED_DIVESTMENT_RETUNE_HEIGHT = 1400  # Tier 3 (compressed: was 72_000)
 
 # Seed-divestment lottery-redistribution hard fork.
 #
@@ -1658,7 +1664,7 @@ assert (
     == 10_000
 )
 
-SEED_DIVESTMENT_REDIST_HEIGHT = 74_000            # Tier 3
+SEED_DIVESTMENT_REDIST_HEIGHT = 1600              # Tier 3 (compressed: was 74_000)
 
 # Operators MUST coordinate REDIST at or after RETUNE — REDIST is a
 # LATER fork that extends the retune policy.  Activating REDIST before
@@ -2391,7 +2397,7 @@ UNBONDING_PERIOD_POST_EXTENSION = (
 # Per the FORK SCHEDULE above: Tier 1, target 50,000.  Current
 # value is a placeholder — operators MUST replace with a concrete
 # coordinated-fork height before deploying to mainnet.
-UNBONDING_PERIOD_EXTENSION_HEIGHT = 50_000  # Tier 1
+UNBONDING_PERIOD_EXTENSION_HEIGHT = 600  # Tier 1 (compressed: was 50_000)
 
 # Module-level alias: the SAFE value.  Callers that read
 # ``UNBONDING_PERIOD`` without threading block height get the
@@ -2467,7 +2473,7 @@ MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
     "MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT",
     "FEE_INCLUDES_SIGNATURE_HEIGHT",
-    64_000,  # Tier 2 of canonical fork schedule (see CLAUDE.md)
+    1200,  # Tier 2 (compressed: was 64_000) — see CHANGELOG 1.11.0
 )
 
 # Activation height for decoupling attester committee size from the
@@ -2484,7 +2490,7 @@ FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
 # finality-weight credit, the reward is a bonus not a gate on
 # participation.  Operators MUST replace this placeholder with a
 # concrete coordinated-fork height before deploying to mainnet.
-ATTESTER_REWARD_SPLIT_HEIGHT = 78_000  # Tier 4
+ATTESTER_REWARD_SPLIT_HEIGHT = 1700  # Tier 4 (compressed: was 78_000)
 
 # Target attester committee size post-activation.  Decoupled from the
 # per-block reward pool so a floor-era reward budget (3 tokens/block
@@ -2527,7 +2533,7 @@ ATTESTER_COMMITTEE_TARGET_SIZE = 128
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-TREASURY_REBASE_HEIGHT = 68_000  # Tier 3
+TREASURY_REBASE_HEIGHT = 1300  # Tier 3 (compressed: was 68_000)
 TREASURY_REBASE_BURN_AMOUNT = 33_000_000  # 40M - 33M = 7M ≈ 5% of 140M
 TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # LEGACY — see get_treasury_max_spend_bps_per_epoch
 TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
@@ -2573,7 +2579,16 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 TREASURY_MAX_SPEND_BPS_PER_EPOCH_POST_TIGHTEN = 10    # 0.1% per 100-block epoch
 TREASURY_MAX_SPEND_BPS_PER_YEAR = 500                 # 5% per rolling-year window
 TREASURY_SPEND_CAP_YEAR_BLOCKS = 52_560               # 365 days at 600s (≈1yr)
-TREASURY_CAP_TIGHTEN_HEIGHT = 52_000                  # Tier 1
+TREASURY_CAP_TIGHTEN_HEIGHT = 1200                    # Tier 1 semantically.  Constraints:
+                                                      # (1) > GOVERNANCE_VOTING_WINDOW (1008) so
+                                                      # existing treasury-spend tests with ~1014
+                                                      # close-blocks don't trip the new 5%-annual
+                                                      # cap on small test treasuries; (2) <=
+                                                      # TREASURY_REBASE_HEIGHT (1300) so the per-
+                                                      # epoch cap is already tightened to 0.1% by
+                                                      # the time the rebase fork's per-epoch logic
+                                                      # activates -- treasury-cap-tightening tests
+                                                      # rely on this ordering.  (compressed: was 52_000)
 
 
 def get_treasury_max_spend_bps_per_epoch(block_height: int) -> int:
@@ -2644,7 +2659,7 @@ assert TREASURY_SPEND_CAP_YEAR_BLOCKS > TREASURY_SPEND_CAP_EPOCH_BLOCKS, (
 # is independent of other *_HEIGHT forks even though it shares the
 # same placeholder value.
 ATTESTER_FEE_SHARE_BPS = 5000           # 50% of base-fee burn → attester pool
-ATTESTER_FEE_FUNDING_HEIGHT = 80_000  # Tier 4
+ATTESTER_FEE_FUNDING_HEIGHT = 1800  # Tier 4 (compressed: was 80_000)
 
 # ─────────────────────────────────────────────────────────────────────
 # Per-entity attester-reward cap per epoch (hard fork)
@@ -2688,7 +2703,7 @@ PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH = 100  # 1% of epoch pool
 # Tier 4.  Activates after ATTESTER_REWARD_SPLIT_HEIGHT (78,000) and
 # ATTESTER_FEE_FUNDING_HEIGHT (80,000) so the cap operates on the
 # post-split, fee-funded pool.
-ATTESTER_REWARD_CAP_HEIGHT = 84_000
+ATTESTER_REWARD_CAP_HEIGHT = 2000  # Tier 4 (compressed: was 84_000)
 
 assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
     "cap must be a positive basis-point fraction <= 100%"
@@ -2725,7 +2740,7 @@ assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
 # coordinated-fork height before deploying to mainnet.  The height
 # is independent of ATTESTER_FEE_FUNDING_HEIGHT even though it
 # shares the same placeholder value.
-FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 82_000  # Tier 4 (must follow FINALITY_VOTE_CAP_HEIGHT)
+FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 1900  # Tier 4 (compressed: was 82_000; must follow FINALITY_VOTE_CAP_HEIGHT)
 
 # ─────────────────────────────────────────────────────────────────────
 # Finality-vote apply-path clamp (defense-in-depth, hard fork)
@@ -2747,7 +2762,7 @@ FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 82_000  # Tier 4 (must follow FINALITY_VO
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-FINALITY_VOTE_CAP_HEIGHT = 54_000  # Tier 1 (defensive cap — MUST activate before direct-mint)
+FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap MUST activate before direct-mint)
 
 # ─────────────────────────────────────────────────────────────────────
 # Seed-validator stake ceiling (founder re-stake defense, hard fork)
@@ -2774,7 +2789,7 @@ FINALITY_VOTE_CAP_HEIGHT = 54_000  # Tier 1 (defensive cap — MUST activate bef
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
 SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 20_000_000
-SEED_STAKE_CEILING_HEIGHT = 56_000  # Tier 1
+SEED_STAKE_CEILING_HEIGHT = 900  # Tier 1 (compressed: was 56_000)
 
 # ─────────────────────────────────────────────────────────────────────
 # Supply-responsive issuance floor (deflation anchor, hard fork)
@@ -2841,7 +2856,7 @@ DEFLATION_ISSUANCE_MULTIPLIER = 2
 
 # Activation — operators must replace with a concrete coordinated
 # height before deploy.
-DEFLATION_FLOOR_HEIGHT = 90_000  # Tier 5 (legacy v1; superseded by v2)
+DEFLATION_FLOOR_HEIGHT = 2500  # Tier 5 (compressed: was 90_000; legacy v1; superseded by v2)
 
 # ─────────────────────────────────────────────────────────────────────
 # Fee-responsive deflation floor (v2 hard fork)
@@ -2882,7 +2897,7 @@ DEFLATION_FLOOR_HEIGHT = 90_000  # Tier 5 (legacy v1; superseded by v2)
 # coordinated-fork height before deploy.
 DEFLATION_REBATE_BPS = 7000                 # 70% rebate share
 DEFLATION_REBATE_WINDOW_BLOCKS = 1000       # ~1 week at 600s/block
-DEFLATION_FLOOR_V2_HEIGHT = 92_000          # Tier 5 (must follow DEFLATION_FLOOR_HEIGHT)
+DEFLATION_FLOOR_V2_HEIGHT = 2600            # Tier 5 (compressed: was 92_000; must follow DEFLATION_FLOOR_HEIGHT)
 
 assert 0 < DEFLATION_REBATE_BPS <= 10_000, (
     "DEFLATION_REBATE_BPS must be a non-empty fraction <= 100%"
@@ -2922,7 +2937,7 @@ assert DEFLATION_REBATE_WINDOW_BLOCKS > 0, (
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploy.
-ATTESTER_CAP_FIX_HEIGHT = 86_000            # Tier 4 (must follow ATTESTER_REWARD_CAP_HEIGHT)
+ATTESTER_CAP_FIX_HEIGHT = 2300              # Tier 4 (compressed: was 86_000; must follow ATTESTER_REWARD_CAP_HEIGHT with 300-block gap so pre-fix-window tests have room)
 
 # ─────────────────────────────────────────────────────────────────────
 # Validator registration burn (hard fork)
@@ -2962,7 +2977,7 @@ ATTESTER_CAP_FIX_HEIGHT = 86_000            # Tier 4 (must follow ATTESTER_REWAR
 # independent of other *_HEIGHT forks even though it shares the
 # placeholder spacing convention (current_height + 50_000).
 VALIDATOR_REGISTRATION_BURN = 10_000
-VALIDATOR_REGISTRATION_BURN_HEIGHT = 96_000  # Tier 6 (must follow MIN_STAKE_RAISE_HEIGHT)
+VALIDATOR_REGISTRATION_BURN_HEIGHT = 2700  # Tier 6 (compressed: was 96_000; must follow MIN_STAKE_RAISE_HEIGHT)
 
 assert VALIDATOR_REGISTRATION_BURN > 0, (
     "registration burn must be positive — zero disables sybil defense"
@@ -2992,7 +3007,7 @@ assert VALIDATOR_REGISTRATION_BURN > 0, (
 # coordinated-fork height before deploying to mainnet.  Per the FORK
 # SCHEDULE: Tier 7, target 98,000 — after the last Tier 6 fork
 # (VALIDATOR_REGISTRATION_BURN_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
-FLAT_FEE_HEIGHT = 98_000
+FLAT_FEE_HEIGHT = 2800  # Tier 7 (compressed: was 98_000)
 
 assert MIN_FEE_POST_FLAT > MIN_FEE, (
     "MIN_FEE_POST_FLAT must exceed the legacy floor — otherwise the fork "
