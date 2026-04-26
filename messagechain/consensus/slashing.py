@@ -259,7 +259,7 @@ class AttestationSlashingEvidence:
 
 def verify_attestation_slashing_evidence(
     evidence: AttestationSlashingEvidence,
-    offender_public_key: bytes,
+    offender_public_key,
 ) -> tuple[bool, str]:
     """
     Verify that attestation slashing evidence is valid.
@@ -268,7 +268,32 @@ def verify_attestation_slashing_evidence(
     1. Both attestations name the same validator (the offender)
     2. Both attestations are at the same block height
     3. The attestations are for different blocks (actually conflicting)
-    4. Both signatures are valid under the offender's public key
+    4. Each attestation's signature is valid under SOME candidate
+       public key for the offender.
+
+    `offender_public_key` accepts either a single ``bytes`` (legacy
+    single-key call sites: tests, ad-hoc scripts) or a list/iterable
+    of ``bytes`` (the canonical post-fix call shape from
+    ``Blockchain.validate_slash_transaction``, which assembles
+    candidates from the offender's full key_history + their current
+    pubkey).
+
+    The multi-key form closes a slash-evasion attack: an equivocator
+    can rotate keys between conflicting attestations -- att_a signed
+    with K1, att_b signed with K2 -- and the pre-fix single-key call
+    that resolved the offender's pubkey at the TARGET height would
+    only see K1.  ``verify_attestation(att_b, K1)`` then fails and the
+    evidence is dismissed.  The multi-key form accepts the evidence
+    iff each attestation matches ANY of the offender's historical
+    keys, defeating the rotation laundering.
+
+    An attacker cannot exploit the multi-key acceptance to forge
+    evidence: every candidate key in the list MUST come from the
+    offender's on-chain key_history (or current public_keys).  The
+    attacker would need to install a fake KeyRotation tx to plant a
+    candidate, which is itself signed by the offender's prior key --
+    so the candidate set only contains keys the offender has
+    legitimately controlled at some point.
     """
     # Same validator
     if evidence.attestation_a.validator_id != evidence.offender_id:
@@ -284,11 +309,26 @@ def verify_attestation_slashing_evidence(
     if evidence.attestation_a.block_hash == evidence.attestation_b.block_hash:
         return False, "attestations are for the same block — not conflicting"
 
-    # Verify both signatures
-    if not verify_attestation(evidence.attestation_a, offender_public_key):
+    # Normalise candidates to a list.  bytes -> [bytes].  Iterable[bytes]
+    # passed through.  Filter out None / empty so a missing history
+    # entry doesn't waste a verify call.
+    if isinstance(offender_public_key, (bytes, bytearray)):
+        candidates = [bytes(offender_public_key)]
+    else:
+        candidates = [bytes(pk) for pk in offender_public_key if pk]
+
+    if not candidates:
+        return False, "no candidate offender public keys"
+
+    # Verify both signatures against ANY candidate.
+    if not any(
+        verify_attestation(evidence.attestation_a, pk) for pk in candidates
+    ):
         return False, "attestation_a signature is invalid"
 
-    if not verify_attestation(evidence.attestation_b, offender_public_key):
+    if not any(
+        verify_attestation(evidence.attestation_b, pk) for pk in candidates
+    ):
         return False, "attestation_b signature is invalid"
 
     return True, "Valid double-attestation evidence"
@@ -447,16 +487,18 @@ class SlashTransaction:
 
 def verify_slashing_evidence(
     evidence: SlashingEvidence,
-    offender_public_key: bytes,
+    offender_public_key,
 ) -> tuple[bool, str]:
     """
-    Verify that slashing evidence is valid.
+    Verify that double-proposal slashing evidence is valid.
 
-    Checks:
-    1. Both headers name the same proposer (the offender)
-    2. Both headers are at the same block height
-    3. The headers are actually different (conflicting)
-    4. Both signatures are valid under the offender's public key
+    Same multi-key candidate semantics as
+    ``verify_attestation_slashing_evidence`` -- accepts either a
+    single ``bytes`` key (legacy) or an iterable of candidate keys
+    drawn from the offender's full key_history.  Closes the same
+    rotation-evasion attack: an equivocator who rotates between
+    signing two conflicting block headers escapes the slash if only
+    a single (target-height) key is consulted.
     """
     # Same proposer
     if evidence.header_a.proposer_id != evidence.offender_id:
@@ -478,14 +520,29 @@ def verify_slashing_evidence(
     if evidence.header_b.proposer_signature is None:
         return False, "header_b has no signature"
 
-    # Verify signature A
+    # Normalise candidates (see verify_attestation_slashing_evidence
+    # for the full rationale on multi-key acceptance).
+    if isinstance(offender_public_key, (bytes, bytearray)):
+        candidates = [bytes(offender_public_key)]
+    else:
+        candidates = [bytes(pk) for pk in offender_public_key if pk]
+    if not candidates:
+        return False, "no candidate offender public keys"
+
+    # Verify signature A against any candidate
     hash_a = _hash(evidence.header_a.signable_data())
-    if not verify_signature(hash_a, evidence.header_a.proposer_signature, offender_public_key):
+    if not any(
+        verify_signature(hash_a, evidence.header_a.proposer_signature, pk)
+        for pk in candidates
+    ):
         return False, "header_a signature is invalid"
 
-    # Verify signature B
+    # Verify signature B against any candidate
     hash_b = _hash(evidence.header_b.signable_data())
-    if not verify_signature(hash_b, evidence.header_b.proposer_signature, offender_public_key):
+    if not any(
+        verify_signature(hash_b, evidence.header_b.proposer_signature, pk)
+        for pk in candidates
+    ):
         return False, "header_b signature is invalid"
 
     return True, "Valid double-sign evidence"

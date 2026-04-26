@@ -71,6 +71,21 @@ def _hash(data: bytes) -> bytes:
     return default_hash(data)
 
 
+# Governance-tx logic versions.
+# v1: legacy form -- title/description/reference_hash concatenated raw
+# in `_signable_data` (no length prefixes).  Allows two parses of the
+# same signed bytes to yield different (title, description, reference_hash)
+# tuples -- a relay can rewrite the on-chain text of an approved
+# proposal without breaking the signature.  Pre-Tier-15 chain history
+# uses this form; never change it (replay-determinism).
+# v2: GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT (Tier 15) length-prefixes
+# every variable-length field in `_signable_data` so the parsed tuple
+# is uniquely committed.  Same defect class + fix shape as v4
+# message tx (TX_VERSION_LENGTH_PREFIX).
+GOVERNANCE_TX_VERSION_V1 = 1
+GOVERNANCE_TX_VERSION_LENGTH_PREFIX = 2
+
+
 # --- Transaction types ---
 
 
@@ -95,6 +110,13 @@ class ProposalTransaction:
     signature: Signature
     reference_hash: bytes = b""
     tx_hash: bytes = b""
+    # Governance-tx version.  v1 = legacy (no length prefixes in
+    # signable_data; vulnerable to text-rewrite collision).  v2 =
+    # length-prefixed (Tier 15 hard fork, GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT).
+    # Default 1 keeps existing test fixtures and historical replay
+    # working byte-for-byte; production creation post-activation
+    # emits v2 explicitly.
+    version: int = GOVERNANCE_TX_VERSION_V1
 
     def __post_init__(self):
         if not self.tx_hash:
@@ -104,14 +126,32 @@ class ProposalTransaction:
         # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
         # keeps None-signature test fixtures working.
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        # v2 (GOVERNANCE_TX_VERSION_LENGTH_PREFIX) closes the legacy
+        # length-prefix collision: title (>H), description (>I), and
+        # reference_hash (>B) each carry their length.  v1 keeps the
+        # legacy raw concatenation byte-for-byte for historical replay.
+        title_b = self.title.encode("utf-8")
+        desc_b = self.description.encode("utf-8")
+        if self.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+            # v2: length-prefixed body + version byte committed
+            # (so a v2 tx_hash is structurally distinct from any v1
+            # tx_hash even when title/description happen to coincide).
+            body = (
+                struct.pack(">B", self.version)
+                + struct.pack(">H", len(title_b)) + title_b
+                + struct.pack(">I", len(desc_b)) + desc_b
+                + struct.pack(">B", len(self.reference_hash)) + self.reference_hash
+            )
+        else:
+            # v1: legacy form -- raw concatenation, NO version byte,
+            # preserved byte-for-byte for historical replay.
+            body = title_b + desc_b + self.reference_hash
         return (
             config.CHAIN_ID
             + b"governance_proposal"
             + struct.pack(">B", sig_version)
             + self.proposer_id
-            + self.title.encode("utf-8")
-            + self.description.encode("utf-8")
-            + self.reference_hash
+            + body
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.fee)
         )
@@ -135,12 +175,20 @@ class ProposalTransaction:
             "fee": self.fee,
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
+            "version": self.version,
         }
 
     def to_bytes(self, state=None) -> bytes:
-        """Binary: ENT proposer_ref | u16 title_len | title utf8 | u32 desc_len |
-        desc utf8 | u8 ref_len | ref_hash | f64 timestamp | u64 fee |
+        """Binary: [SENTINEL 0xC1 | version u8] ENT proposer_ref |
+        u16 title_len | title utf8 | u32 desc_len | desc utf8 |
+        u8 ref_len | ref_hash | f64 timestamp | u64 fee |
         u32 sig_len | sig | 32 tx_hash.
+
+        v1 wire form OMITS the leading sentinel + version pair (legacy
+        layout, byte-for-byte unchanged).  v2+ wire form prepends
+        ``0xC1 || version`` so the decoder can distinguish.  The
+        sentinel is unambiguous because the legacy first byte is the
+        entity_ref tag (0x00 or 0x01); 0xC1 cannot collide.
 
         title uses u16 (bounded by MAX_PROPOSAL_TITLE_LENGTH = 200).
         description uses u32 (bounded by MAX_PROPOSAL_DESCRIPTION_LENGTH = 10k).
@@ -150,7 +198,11 @@ class ProposalTransaction:
         title_b = self.title.encode("utf-8")
         desc_b = self.description.encode("utf-8")
         sig_blob = self.signature.to_bytes()
-        return b"".join([
+        prefix: list[bytes] = []
+        if self.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+            prefix.append(b"\xc1")
+            prefix.append(struct.pack(">B", self.version))
+        return b"".join(prefix + [
             encode_entity_ref(self.proposer_id, state=state),
             struct.pack(">H", len(title_b)),
             title_b,
@@ -171,6 +223,15 @@ class ProposalTransaction:
         off = 0
         if len(data) < 1 + 2:
             raise ValueError("Proposal blob too short")
+        # v2+ blobs begin with the 0xC1 sentinel followed by a version
+        # byte.  Legacy v1 blobs begin with the entity_ref tag (0x00 or
+        # 0x01) and have no leading sentinel.  Peek the first byte.
+        version = GOVERNANCE_TX_VERSION_V1
+        if data[0] == 0xC1:
+            if len(data) < 2:
+                raise ValueError("Proposal blob truncated at version sentinel")
+            version = data[1]
+            off = 2
         proposer_id, n = decode_entity_ref(data, off, state=state); off += n
         title_len = struct.unpack_from(">H", data, off)[0]; off += 2
         if off + title_len + 4 > len(data):
@@ -197,6 +258,7 @@ class ProposalTransaction:
             proposer_id=proposer_id, title=title, description=desc,
             timestamp=timestamp, fee=fee, signature=sig,
             reference_hash=ref_hash,
+            version=version,
         )
         expected = tx._compute_hash()
         if expected != declared:
@@ -208,6 +270,9 @@ class ProposalTransaction:
         sig = Signature.deserialize(data["signature"])
         ref_hash_hex = data.get("reference_hash", "")
         ref_hash = bytes.fromhex(ref_hash_hex) if ref_hash_hex else b""
+        # Default v1 if absent so pre-fix snapshots/JSON dumps deserialize
+        # cleanly; v2+ JSON producers MUST emit the field explicitly.
+        version = int(data.get("version", GOVERNANCE_TX_VERSION_V1))
         tx = cls(
             proposer_id=bytes.fromhex(data["proposer_id"]),
             title=data["title"],
@@ -216,6 +281,7 @@ class ProposalTransaction:
             fee=data["fee"],
             signature=sig,
             reference_hash=ref_hash,
+            version=version,
         )
         expected_hash = tx._compute_hash()
         declared_hash = bytes.fromhex(data["tx_hash"])
@@ -367,6 +433,8 @@ class TreasurySpendTransaction:
     fee: int
     signature: Signature
     tx_hash: bytes = b""
+    # See ProposalTransaction.version for the full rationale.
+    version: int = GOVERNANCE_TX_VERSION_V1
 
     def __post_init__(self):
         if not self.tx_hash:
@@ -376,6 +444,24 @@ class TreasurySpendTransaction:
         # Crypto-agility: commit sig_version into tx_hash.  getattr fallback
         # keeps None-signature test fixtures working.
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        # v2 (GOVERNANCE_TX_VERSION_LENGTH_PREFIX) closes the legacy
+        # length-prefix collision: title (>H) and description (>I)
+        # each carry their length, plus the version byte is committed
+        # so a v2 tx_hash is structurally distinct from v1 even when
+        # the human-readable text coincides.  recipient_id and amount
+        # are fixed-width binary -- they couldn't be shifted under v1
+        # either, so they don't need a length tag.  v1 keeps the
+        # legacy raw concatenation byte-for-byte for historical replay.
+        title_b = self.title.encode("utf-8")
+        desc_b = self.description.encode("utf-8")
+        if self.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+            body = (
+                struct.pack(">B", self.version)
+                + struct.pack(">H", len(title_b)) + title_b
+                + struct.pack(">I", len(desc_b)) + desc_b
+            )
+        else:
+            body = title_b + desc_b
         return (
             config.CHAIN_ID
             + b"treasury_spend"
@@ -383,8 +469,7 @@ class TreasurySpendTransaction:
             + self.proposer_id
             + self.recipient_id
             + struct.pack(">Q", self.amount)
-            + self.title.encode("utf-8")
-            + self.description.encode("utf-8")
+            + body
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.fee)
         )
@@ -408,18 +493,29 @@ class TreasurySpendTransaction:
             "fee": self.fee,
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
+            "version": self.version,
         }
 
     def to_bytes(self, state=None) -> bytes:
-        """Binary: ENT proposer_ref | ENT recipient_ref | u64 amount |
-        u16 title_len | title | u32 desc_len | desc | f64 timestamp |
-        u64 fee | u32 sig_len | sig | 32 tx_hash.
+        """Binary: [SENTINEL 0xC1 | version u8] ENT proposer_ref |
+        ENT recipient_ref | u64 amount | u16 title_len | title |
+        u32 desc_len | desc | f64 timestamp | u64 fee | u32 sig_len |
+        sig | 32 tx_hash.
+
+        v1 wire form OMITS the leading sentinel + version pair (legacy
+        layout, byte-for-byte unchanged).  v2+ wire form prepends
+        ``0xC1 || version`` (sentinel cannot collide with the legacy
+        first byte, which is the entity_ref tag 0x00 or 0x01).
         """
         from messagechain.core.entity_ref import encode_entity_ref
         title_b = self.title.encode("utf-8")
         desc_b = self.description.encode("utf-8")
         sig_blob = self.signature.to_bytes()
-        return b"".join([
+        prefix: list[bytes] = []
+        if self.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+            prefix.append(b"\xc1")
+            prefix.append(struct.pack(">B", self.version))
+        return b"".join(prefix + [
             encode_entity_ref(self.proposer_id, state=state),
             encode_entity_ref(self.recipient_id, state=state),
             struct.pack(">Q", self.amount),
@@ -440,6 +536,15 @@ class TreasurySpendTransaction:
         off = 0
         if len(data) < 1 + 1 + 8 + 2:
             raise ValueError("TreasurySpend blob too short")
+        # v2+ blobs prepend 0xC1 sentinel + version byte; v1 has neither.
+        version = GOVERNANCE_TX_VERSION_V1
+        if data[0] == 0xC1:
+            if len(data) < 2:
+                raise ValueError(
+                    "TreasurySpend blob truncated at version sentinel"
+                )
+            version = data[1]
+            off = 2
         proposer_id, n = decode_entity_ref(data, off, state=state); off += n
         recipient_id, n = decode_entity_ref(data, off, state=state); off += n
         amount = struct.unpack_from(">Q", data, off)[0]; off += 8
@@ -464,6 +569,7 @@ class TreasurySpendTransaction:
             proposer_id=proposer_id, recipient_id=recipient_id,
             amount=amount, title=title, description=desc,
             timestamp=timestamp, fee=fee, signature=sig,
+            version=version,
         )
         expected = tx._compute_hash()
         if expected != declared:
@@ -473,6 +579,7 @@ class TreasurySpendTransaction:
     @classmethod
     def deserialize(cls, data: dict) -> "TreasurySpendTransaction":
         sig = Signature.deserialize(data["signature"])
+        version = int(data.get("version", GOVERNANCE_TX_VERSION_V1))
         tx = cls(
             proposer_id=bytes.fromhex(data["proposer_id"]),
             recipient_id=bytes.fromhex(data["recipient_id"]),
@@ -482,6 +589,7 @@ class TreasurySpendTransaction:
             timestamp=data["timestamp"],
             fee=data["fee"],
             signature=sig,
+            version=version,
         )
         expected_hash = tx._compute_hash()
         declared_hash = bytes.fromhex(data["tx_hash"])
@@ -499,8 +607,24 @@ def create_proposal(
     description: str,
     reference_hash: bytes = b"",
     fee: int = GOVERNANCE_PROPOSAL_FEE,
+    current_height: int | None = None,
 ) -> ProposalTransaction:
-    """Create and sign a governance proposal."""
+    """Create and sign a governance proposal.
+
+    `current_height`: when supplied and at/after
+    GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT (Tier 15), the recommended v2
+    form is emitted -- length-prefixed signable_data closes the
+    text-rewrite collision.  Pre-activation (or current_height=None
+    for legacy callers / isolated unit tests), v1 is emitted to
+    preserve byte-for-byte signing compatibility with the existing
+    chain.
+    """
+    version = GOVERNANCE_TX_VERSION_V1
+    if (
+        current_height is not None
+        and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+    ):
+        version = GOVERNANCE_TX_VERSION_LENGTH_PREFIX
     tx = ProposalTransaction(
         proposer_id=proposer_entity.entity_id,
         title=title,
@@ -509,6 +633,7 @@ def create_proposal(
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
         reference_hash=reference_hash,
+        version=version,
     )
     msg_hash = _hash(tx._signable_data())
     tx.signature = proposer_entity.keypair.sign(msg_hash)
@@ -544,8 +669,16 @@ def create_treasury_spend_proposal(
     title: str,
     description: str,
     fee: int = GOVERNANCE_PROPOSAL_FEE,
+    current_height: int | None = None,
 ) -> TreasurySpendTransaction:
-    """Create and sign a treasury spend proposal."""
+    """Create and sign a treasury spend proposal.  See `create_proposal`
+    for the version-gating rationale."""
+    version = GOVERNANCE_TX_VERSION_V1
+    if (
+        current_height is not None
+        and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+    ):
+        version = GOVERNANCE_TX_VERSION_LENGTH_PREFIX
     tx = TreasurySpendTransaction(
         proposer_id=proposer_entity.entity_id,
         recipient_id=recipient_id,
@@ -555,6 +688,7 @@ def create_treasury_spend_proposal(
         timestamp=int(time.time()),
         fee=fee,
         signature=Signature([], 0, [], b"", b""),  # placeholder
+        version=version,
     )
     msg_hash = _hash(tx._signable_data())
     tx.signature = proposer_entity.keypair.sign(msg_hash)
@@ -983,6 +1117,21 @@ def verify_proposal(
     governance floor remains an absolute lower bound pre- and
     post-activation (R5-A).
     """
+    # Tier 15 version gate.  Reject any version above the highest
+    # known release.  Reject v2 admission strictly before
+    # GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT -- pre-activation only v1
+    # txs are accepted, so an early v2 submission can't slip past
+    # peers running pre-fork binaries.  Post-activation, v1 stays
+    # admissible for backward compatibility (the recommended creation
+    # path emits v2; a future tier may tighten this to v2-only).
+    if tx.version > GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        return False
+    if tx.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        if (
+            current_height is not None
+            and current_height < config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+        ):
+            return False
     from messagechain.core.transaction import enforce_signature_aware_min_fee
     if not enforce_signature_aware_min_fee(
         tx.fee,
@@ -1042,6 +1191,16 @@ def verify_treasury_spend(
     Post FEE_INCLUDES_SIGNATURE_HEIGHT the floor is
     max(GOVERNANCE_PROPOSAL_FEE, sig-aware min) (R5-A).
     """
+    # Tier 15 version gate.  See verify_proposal for the full
+    # rationale.
+    if tx.version > GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        return False
+    if tx.version >= GOVERNANCE_TX_VERSION_LENGTH_PREFIX:
+        if (
+            current_height is not None
+            and current_height < config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
+        ):
+            return False
     from messagechain.core.transaction import enforce_signature_aware_min_fee
     if not enforce_signature_aware_min_fee(
         tx.fee,
