@@ -167,6 +167,12 @@ messagechain status
 The installer's keyfile **is** the validator's identity — the same
 key signs blocks and owns the stake. Back it up:
 `sudo cat /etc/messagechain/keyfile` and store the hex offline.
+**Important:** the keyfile alone is not a complete backup. See
+*Operating a live validator → Back up the keyfile* below for the
+WOTS+ leaf-state files that must be preserved alongside it; restoring
+a keyfile without the matching leaf state will cause one-time WOTS+
+leaves to be re-used and the chain will slash 100% of your stake on
+detection.
 
 Rewards = block reward + tx fees + attester pool share, pro-rata by
 stake. Unbonding takes ~15 days (2176 blocks) — slashing windows
@@ -176,17 +182,59 @@ unbonding window.
 <details>
 <summary>Operating a live validator (backups, migration, retirement, monitoring)</summary>
 
-**Back up the keyfile.** `sudo cat /etc/messagechain/keyfile` prints the
-hex. Store offline (paper, hardware token, encrypted USB). Lose this
-and the staked funds are gone — there is no recovery.
+**Back up the keyfile AND the leaf-index files.** Three files together
+make up a complete validator backup:
+
+1. `/etc/messagechain/keyfile` — the hex secret. `sudo cat` it and
+   store offline (paper, hardware token, encrypted USB). Lose this
+   and the staked funds are gone with no recovery.
+2. `/var/lib/messagechain/leaf_index.json` — the WOTS+ next-leaf
+   counter for block signing.
+3. `/var/lib/messagechain/receipt_leaf_index.json` — the WOTS+
+   next-leaf counter for the submission-receipt key (only present on
+   validators that issue receipts).
+
+The leaf-index files record which one-time WOTS+ leaves the keyfile
+has already burned. **Restoring the keyfile without the matching
+leaf-index files re-signs already-used leaves**, which mathematically
+discloses the WOTS+ private key for those leaves and produces
+equivocation evidence on chain. The protocol slashes 100% of stake
+on detection (`SLASH_PENALTY_PCT = 100`); there is no operator
+recovery path. Treat the leaf-index files as security-critical
+state, not as a regenerable cache. Snapshot them whenever you
+snapshot the keyfile, and never restore one without the other.
 
 **Migrate to a new host.** Stop the validator on the old host
-(`systemctl stop messagechain-validator`), copy
-`/etc/messagechain/keyfile` to `/etc/messagechain/keyfile` on the new
-host (chmod 0600, owner `messagechain`), then run the installer on the
-new host. Init reuses the existing keyfile rather than regenerating —
-no multi-hour keygen, and no double-sign risk because only one host
-runs at a time.
+(`systemctl stop messagechain-validator`), then copy **both** the
+keyfile and the leaf-index files to the new host:
+
+```bash
+# on the OLD host — capture keyfile + leaf state atomically
+# (after systemctl stop, so leaf_index.json is no longer being written).
+sudo tar czf /tmp/mc-validator-backup.tgz \
+    -C / etc/messagechain/keyfile \
+    var/lib/messagechain/leaf_index.json \
+    var/lib/messagechain/receipt_leaf_index.json
+# transfer /tmp/mc-validator-backup.tgz to the new host (scp, etc.)
+
+# on the NEW host — extract, fix ownership, then run the installer
+sudo tar xzf /tmp/mc-validator-backup.tgz -C /
+sudo chown messagechain:messagechain /etc/messagechain/keyfile \
+    /var/lib/messagechain/leaf_index.json \
+    /var/lib/messagechain/receipt_leaf_index.json
+sudo chmod 0600 /etc/messagechain/keyfile
+```
+
+Then run the installer on the new host. Init reuses the existing
+keyfile rather than regenerating — no multi-hour keygen, and no
+double-sign risk because only one host runs at a time. Skipping the
+leaf-index files (e.g. copying just the keyfile, or restoring from a
+keyfile-only paper backup after a disk-loss event) **will cause leaf
+reuse and a 100% slash** the first time the new validator signs.
+If you ever find yourself with a keyfile but no leaf-index, do NOT
+start the validator — instead, reach out to a peer for a chain-state
+inspection of your entity's existing on-chain signatures so you can
+recover the high-water-mark leaf index before signing again.
 
 **Drain & retire.** `messagechain unstake --amount 10000`, wait the
 full ~15-day unbonding window so the slashing window closes, *then*
@@ -194,8 +242,12 @@ shut the host down. Bringing a validator down with stake still bonded
 risks downtime slashing.
 
 **What gets you slashed.** Double-signing or equivocating — signing
-two competing blocks at the same height. The unbonding window exists
-so peers can prove misbehavior committed before you left.
+two competing blocks at the same height — or WOTS+ leaf reuse, which
+is detected as equivocation under the same rule. Leaf reuse is most
+commonly caused by restoring a keyfile from backup without the
+matching `leaf_index.json` (see *Back up the keyfile AND the
+leaf-index files* above). The unbonding window exists so peers can
+prove misbehavior committed before you left.
 
 **Health monitoring.** `messagechain validators` (your stake share +
 whether you're in the active set). `messagechain key-status` (WOTS+
