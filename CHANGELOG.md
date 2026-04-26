@@ -4,6 +4,45 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.1] — 2026-04-26
+
+Patch release. **CRITICAL upgrade-blocking fix.** 1.19.0 shipped
+with a wire-format regression that crashed any node attempting to
+load existing on-disk blocks: Tier 17 added `react_transactions` to
+`Block.from_bytes` UNCONDITIONALLY, but every block already on disk
+pre-1.19.0 was serialized without that field. The decoder ran off
+the end of the blob inside `_load_from_db` on first startup,
+systemd entered a crash-loop, and the upgrade CLI's auto-rollback
+could not recover (the stale-import path predates the deeper
+crash, so the verifier never noticed). validator-1 was taken down
+mid-roll on 2026-04-26 and required manual rollback to the
+pre-1.19.0 backup; validator-2 was untouched per the runbook
+"never both at once" rule. **No node should run 1.19.0.**
+
+### Fixed
+
+- **`Block.from_bytes` end-of-blob shim for pre-Tier-17 blobs**
+  (2864118). Detect `len(data) - off == 32` (only the trailing
+  `declared_hash` remaining) and treat `react_transactions` as
+  `[]` without consuming bytes. Pre-Tier-17 blobs are a strict
+  prefix of post-Tier-17 blobs up to the new field, so the shim
+  cleanly distinguishes the two cases. Post-Tier-17 blobs (which
+  carry at least 4 bytes for the u32 count + 32 bytes for the
+  hash) decode normally.
+- Includes regression test
+  (`tests/test_react_tx_block_backward_compat.py`) that builds a
+  real Block, strips the empty-react u32 to simulate a pre-Tier-17
+  on-disk blob, and asserts decode succeeds.
+
+### Upgrade path
+
+- Validators that already hit the 1.19.0 crash and rolled back to
+  1.18.0 (or earlier) should upgrade directly to 1.19.1 — the
+  pre-Tier-17 blob shim makes the upgrade safe regardless of
+  starting version.
+- The 1.19.0 tag remains in git history (signed and immutable, per
+  release policy) but should NOT be installed by anyone.
+
 ## [1.19.0] — 2026-04-26
 
 Minor release. **Hard fork: Tier 17 — `ReactTransaction` (user-trust
