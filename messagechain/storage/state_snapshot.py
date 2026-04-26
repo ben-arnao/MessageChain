@@ -249,7 +249,33 @@ from messagechain.crypto.hashing import default_hash
 #      layout: appended strictly after v16's registered_validators
 #      set as a single u8 flag (0 = False, 1 = True) for a compact
 #      encoding — simpler than widening the _TAG_GLOBAL scheme.
-STATE_SNAPSHOT_VERSION = 19  # wire format version for encode/decode
+#  v20 — key_history added.  bytes->list[(height, pubkey)] dict, sorted
+#      ascending by height.  Records the FULL on-chain rotation history
+#      for every entity that has ever installed/rotated a public key.
+#      Consensus-critical: the slash-evidence pipeline calls
+#      `_public_key_at_height(entity, h)` to resolve which key was
+#      active at evidence height h.  Pre-v20 the snapshot did not
+#      include this map at all -- a state-synced node started with
+#      key_history = {} and `_public_key_at_height` fell back to the
+#      CURRENT pubkey.  For any entity that had rotated keys before
+#      the snapshot, slash evidence whose signing height predated the
+#      rotation could not be verified on the synced node (signature
+#      check against post-rotation key fails) while warm nodes admitted
+#      the slash -- silent fork at the slash block.  The map MUST live
+#      in the state-root commitment (state-synced nodes that disagreed
+#      on a rotation history would compute different verification
+#      outcomes for the same evidence).  Round-8 fix.
+#      Wire layout (appended strictly after v19's
+#      past_receipt_subtree_roots): bytes->list[(u64 height, bytes pk)]
+#      dict, with a custom encoder that writes
+#          u32 entry_count
+#          for each entity (sorted by eid):
+#              u32 eid_len || eid || u32 hist_len ||
+#              for each (height, pk) (sorted by height):
+#                  u64 height || u32 pk_len || pk
+#      The Merkle leaf builder hashes one leaf per (eid, height, pk)
+#      tuple under _TAG_KEY_HISTORY for state-root commitment.
+STATE_SNAPSHOT_VERSION = 20  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -322,6 +348,16 @@ _TAG_RECEIPT_ROOT = b"rrk"
 # is omitted, but disagree on `receipt_root_admissible(eid, root)`
 # at the next contested CensorshipEvidence -- silent fork.
 _TAG_PAST_RECEIPT_ROOT = b"prrk"
+# v20: key_history -- dict[entity_id, list[(height, pubkey)]] capturing
+# every key install / rotation an entity has performed on chain.  The
+# slash-evidence pipeline reads `_public_key_at_height(entity, h)` for
+# both single-key (FinalityDoubleVote, signed_at_height) and multi-key
+# (Attestation/double-proposal candidate set) verification.  Without
+# this in the snapshot, state-synced nodes start with an empty map and
+# verify pre-rotation evidence against the post-rotation key -- silent
+# fork when a slash for a rotated equivocator lands.  See the
+# STATE_SNAPSHOT_VERSION header comment on v20 for the exploit chain.
+_TAG_KEY_HISTORY = b"khist"
 # Processed bogus-rejection-evidence set: every evidence_hash that has
 # ever been applied (slashed OR admitted-no-slash).  One-phase, no
 # pending counterpart — bogusness is decided at apply-time so there
@@ -680,6 +716,21 @@ def serialize_state(blockchain) -> dict:
         "rolling_fee_burn_seeded": bool(
             getattr(blockchain.supply, "rolling_fee_burn_seeded", False)
         ),
+        # v20: per-entity key-rotation history.  bytes -> list[(int
+        # height, bytes pubkey)], ascending by height.  Drives
+        # `_public_key_at_height` lookups in slash-evidence
+        # verification; without this section state-synced nodes
+        # cannot verify evidence whose signing height predates a
+        # rotation -- silent fork on the next slash for a rotated
+        # validator.  Round-8 fix.  Tuples are normalised to int +
+        # bytes so a binary round-trip and a hand-built dict compare
+        # equal.
+        "key_history": {
+            eid: [(int(h), bytes(pk)) for (h, pk) in entries]
+            for eid, entries in getattr(
+                blockchain, "key_history", {},
+            ).items()
+        },
     }
 
 
@@ -936,6 +987,17 @@ def deserialize_state(snapshot: dict) -> dict:
     # empty map, and the worst case is one extra rotation immediately
     # post-migration (bounded by the cooldown, not a consensus fault).
     out.setdefault("key_rotation_last_height", {})
+    # Pre-v20 snapshots lack the key_history map.  A migrating chain
+    # starts with an empty history -- any pre-snapshot rotations the
+    # chain experienced are then unrecoverable for slash-evidence
+    # purposes on the synced node, but a brand-new chain (the migration
+    # default) has no rotations to lose.  Live upgrades from v19 to v20
+    # at the snapshot layer should re-bake snapshots so historical
+    # rotations carry forward; in-place upgrades that re-decode a
+    # historical v19 blob will lose the field.  Binary decode populates
+    # this strictly so the default only affects hand-built snapshot
+    # dicts.
+    out.setdefault("key_history", {})
     return out
 
 
@@ -1030,6 +1092,47 @@ def _bytes_set_dict_leaves(tag: bytes, items) -> list[bytes]:
                 tag
                 + struct.pack(">I", len(eid)) + eid
                 + struct.pack(">I", len(root)) + root
+            ))
+    return leaves
+
+
+def _key_history_leaves(tag: bytes, items) -> list[bytes]:
+    """Build sorted leaves for the key_history section
+    (dict[entity_id, list[(height, pubkey)]]).  Each leaf hashes
+        HASH( tag || u32_be(len(eid)) || eid ||
+              u64_be(height) || u32_be(len(pk)) || pk )
+    -- one leaf per (entity_id, height, pubkey) triple, sorted
+    lexicographically by (eid, height, pk).  Two nodes with the same
+    rotation history compute the same root regardless of insertion
+    order or per-entity ordering.
+
+    A duplicate (same height + same pubkey) within an entity's history
+    collapses to a single leaf -- which is fine because the chain's
+    record path is set-once-per-rotation (idempotent).
+    """
+    leaves: list[bytes] = []
+    if not isinstance(items, dict):
+        raise TypeError(
+            f"_key_history_leaves expected dict, got {type(items).__name__}"
+        )
+    for eid in sorted(items.keys()):
+        if not isinstance(eid, bytes):
+            raise TypeError(
+                f"_key_history_leaves expected bytes key, got "
+                f"{type(eid).__name__}"
+            )
+        # Sort entries lexicographically by (height, pk_bytes) for a
+        # canonical encoding independent of insertion order.
+        entries = sorted(
+            ((int(h), bytes(pk)) for (h, pk) in items[eid]),
+            key=lambda hp: (hp[0], hp[1]),
+        )
+        for (h, pk) in entries:
+            leaves.append(_h(
+                tag
+                + struct.pack(">I", len(eid)) + eid
+                + struct.pack(">Q", int(h))
+                + struct.pack(">I", len(pk)) + pk
             ))
     return leaves
 
@@ -1146,6 +1249,14 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_PAST_RECEIPT_ROOT: _merkle(_bytes_set_dict_leaves(
             _TAG_PAST_RECEIPT_ROOT,
             snap.get("past_receipt_subtree_roots", {}))),
+        # v20: per-entity key-rotation history.  Drives
+        # `_public_key_at_height` -- two state-synced nodes that
+        # disagreed on this map verify the same slash evidence
+        # differently and silently fork at the slash block.  See
+        # _TAG_KEY_HISTORY docstring.
+        _TAG_KEY_HISTORY: _merkle(_key_history_leaves(
+            _TAG_KEY_HISTORY,
+            snap.get("key_history", {}))),
         # Bogus-rejection processed set — the double-slash defense.
         # One section, no pending counterpart (apply-time decision).
         _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
@@ -1497,6 +1608,74 @@ def _decode_bytes_set_dict(blob: bytes, off: int) -> tuple[dict, int]:
     return out, off
 
 
+def _encode_key_history(d: dict) -> bytes:
+    """Encode a dict[bytes, list[(int height, bytes pubkey)]] for the
+    v20 key_history section.
+
+    Wire layout:
+        u32 entry_count
+        for each entity (sorted by eid):
+            u32 eid_len || eid
+            u32 hist_len
+            for each (height, pk) (sorted by (height, pk_bytes)):
+                u64 height || u32 pk_len || pk
+
+    Sorting both at the outer (entity_id) and inner (height, pk) layers
+    matches the leaf builder so encode/decode/state-root all see the
+    same ordering.  Mirrors the
+    `_encode_bytes_set_dict` shape with a richer inner element.
+    """
+    out = bytearray()
+    out += struct.pack(">I", len(d))
+    for eid in sorted(d.keys()):
+        if not isinstance(eid, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot key_history expected bytes key, "
+                f"got {type(eid).__name__}"
+            )
+        entries = sorted(
+            ((int(h), bytes(pk)) for (h, pk) in d[eid]),
+            key=lambda hp: (hp[0], hp[1]),
+        )
+        out += struct.pack(">I", len(eid)) + eid
+        out += struct.pack(">I", len(entries))
+        for (h, pk) in entries:
+            out += struct.pack(">Q", int(h))
+            out += struct.pack(">I", len(pk)) + pk
+    return bytes(out)
+
+
+def _decode_key_history(blob: bytes, off: int) -> tuple[dict, int]:
+    """Inverse of _encode_key_history.  Returns
+    dict[bytes, list[(int height, bytes pubkey)]].
+
+    Strict: reads the exact byte count written by the encoder; raises
+    on truncation via struct.error / negative offset arithmetic from
+    the caller's bounds.
+    """
+    (n,) = struct.unpack_from(">I", blob, off)
+    off += 4
+    out: dict[bytes, list[tuple[int, bytes]]] = {}
+    for _ in range(n):
+        (klen,) = struct.unpack_from(">I", blob, off)
+        off += 4
+        eid = bytes(blob[off:off + klen])
+        off += klen
+        (m,) = struct.unpack_from(">I", blob, off)
+        off += 4
+        entries: list[tuple[int, bytes]] = []
+        for _ in range(m):
+            (h,) = struct.unpack_from(">Q", blob, off)
+            off += 8
+            (pk_len,) = struct.unpack_from(">I", blob, off)
+            off += 4
+            pk = bytes(blob[off:off + pk_len])
+            off += pk_len
+            entries.append((int(h), pk))
+        out[eid] = entries
+    return out, off
+
+
 def _encode_int_bytes_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
@@ -1740,6 +1919,14 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_set_dict(
         snap.get("past_receipt_subtree_roots", {}),
     )
+    # v20: key_history (bytes -> list[(u64 height, bytes pk)] dict).
+    # Strictly appended after v19's past_receipt_subtree_roots so a
+    # v19 blob is a strict prefix of a v20 blob through the end of
+    # v19's final field.  See _TAG_KEY_HISTORY for why this must live
+    # in the state-root commitment -- without it, a state-synced node
+    # cannot verify slash evidence whose signing height predates a
+    # rotation, silently forking at the slash block.
+    out += _encode_key_history(snap.get("key_history", {}))
     return bytes(out)
 
 
@@ -1870,6 +2057,9 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # Always present on v19+ blobs; pre-v19 blobs are rejected by
     # the strict version check above.
     past_receipt_subtree_roots, off = _decode_bytes_set_dict(blob, off)
+    # v20+: key_history (bytes -> list[(int, bytes)] dict).
+    # Always present on v20+ blobs.
+    key_history, off = _decode_key_history(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1923,4 +2113,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "rolling_fee_burn_seeded": rolling_fee_burn_seeded,
         "key_rotation_last_height": key_rotation_last_height,
         "past_receipt_subtree_roots": past_receipt_subtree_roots,
+        "key_history": key_history,
     }

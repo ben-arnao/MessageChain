@@ -2078,6 +2078,38 @@ class ChainDB:
             # pool's value at the fork point must be restored on
             # reorg rollback.
             "lottery_prize_pool": self.get_lottery_prize_pool(),
+            # Receipt-subtree mirror tables: round-8 fix.  Pre-fix
+            # `restore_state_snapshot` DELETEd these tables (correctly,
+            # to flush losing-fork rotations) but the snapshot dict
+            # didn't carry them, so the post-restore DB had empty
+            # mirrors.  In-memory state was correct, but a process
+            # exit before the next `_persist_state` flushed left a
+            # cold-restart node rehydrating from empty maps -> silent
+            # fork on the next contested CensorshipEvidence /
+            # BogusRejection (cold-restart node rejected evidence the
+            # warm cluster admitted under the issuer's registered
+            # root).  Same defect class as the round-2
+            # entity_id_to_index and round-4 key_rotation_last_height
+            # leaks; the round-7 fix moved the WRITE path inside
+            # `_persist_state` but did not close the save/restore
+            # asymmetry.
+            "receipt_subtree_roots": self.get_all_receipt_subtree_roots(),
+            "past_receipt_subtree_roots": (
+                self.get_all_past_receipt_subtree_roots()
+            ),
+            # key_rotation_last_height mirror table: same round-8 fix.
+            # `restore_state_snapshot` DELETEs the table (to roll back
+            # losing-fork rotations) but the snapshot dict didn't
+            # carry it.  Cold restart in the post-restore window
+            # rehydrated an empty map -> rotation-cooldown gate
+            # (KEY_ROTATION_COOLDOWN_BLOCKS) silently bypassed on the
+            # restarted node, while warm nodes still enforce.  The
+            # round-4 fix added the chaindb mirror to defeat the
+            # cold-boot inheritance gap; this round-8 fix closes the
+            # remaining save/restore asymmetry.
+            "key_rotation_last_height": (
+                self.get_all_key_rotation_last_height()
+            ),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -2210,6 +2242,46 @@ class ChainDB:
                         "VALUES (?, ?, ?)",
                         (int(block_number), entity_id, int(amount)),
                     )
+            # Round-8 fix: re-insert the receipt-subtree mirror tables
+            # the DELETE above just wiped.  Without this restore, the
+            # post-restore window between
+            # `restore_state_snapshot` and the next `_persist_state`
+            # leaves the DB with empty mirrors -- a process exit in
+            # that window cold-restarts the node into a state where
+            # CensorshipEvidence / BogusRejection are rejected because
+            # the issuer's registered root reads back as None.  The
+            # snapshot dict NOW carries these maps (see
+            # save_state_snapshot above), so the symmetry holds in a
+            # single SQL transaction.
+            for eid, root in snapshot.get(
+                "receipt_subtree_roots", {},
+            ).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO receipt_subtree_roots "
+                    "(entity_id, root_public_key) VALUES (?, ?)",
+                    (eid, root),
+                )
+            for eid, roots in snapshot.get(
+                "past_receipt_subtree_roots", {},
+            ).items():
+                for root in roots:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO past_receipt_subtree_roots "
+                        "(entity_id, root_public_key) VALUES (?, ?)",
+                        (eid, root),
+                    )
+            # Round-8 fix: re-insert key_rotation_last_height the
+            # DELETE above just wiped.  Same defect class as the
+            # receipt-subtree mirror leak above; matches the round-4
+            # in-memory cooldown gate semantics.
+            for eid, h in snapshot.get(
+                "key_rotation_last_height", {},
+            ).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO key_rotation_last_height "
+                    "(entity_id, block_height) VALUES (?, ?)",
+                    (eid, int(h)),
+                )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_minted'", (snapshot["total_minted"],))
