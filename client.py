@@ -22,9 +22,27 @@ from messagechain.core.transaction import create_transaction
 from messagechain.validation import safe_json_loads
 
 
-def rpc_call(host: str, port: int, method: str, params: dict) -> dict:
-    """Send an RPC request to the server and return the response."""
-    request = json.dumps({"method": method, "params": params}).encode("utf-8")
+def rpc_call(
+    host: str, port: int, method: str, params: dict,
+    auth: str | None = None,
+) -> dict:
+    """Send an RPC request to the server and return the response.
+
+    `auth`: optional admin-method auth token.  When omitted, the
+    `MESSAGECHAIN_RPC_AUTH_TOKEN` env var is consulted -- this lets a
+    co-resident CLI invocation (operator on the same host as the
+    daemon) inherit the same secret the daemon was started with
+    without forcing every call site to thread it through.  The
+    server only checks the token for methods in `_ADMIN_RPC_METHODS`,
+    so an unset token only matters when calling those methods.
+    """
+    import os as _os
+    if auth is None:
+        auth = _os.environ.get("MESSAGECHAIN_RPC_AUTH_TOKEN") or None
+    payload = {"method": method, "params": params}
+    if auth is not None:
+        payload["auth"] = auth
+    request = json.dumps(payload).encode("utf-8")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(10)

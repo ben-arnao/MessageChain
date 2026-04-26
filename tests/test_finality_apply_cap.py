@@ -31,19 +31,28 @@ from messagechain.crypto.keys import Signature
 from messagechain.identity.identity import Entity
 
 
-def _fake_vote(signer_id: bytes, target_hash: bytes, target_num: int) -> FinalityVote:
+def _fake_vote(
+    signer_id: bytes, target_hash: bytes, target_num: int,
+    leaf_index: int = 0,
+) -> FinalityVote:
     """Build a placeholder FinalityVote for apply-path clamp tests.
 
     Apply-side logic reads signer_entity_id, target_block_hash,
     target_block_number, and signature.leaf_index only.  No signature
     verification runs here — that's already done at validation time.
+
+    `leaf_index` defaults to 0, but tests that stuff multiple votes
+    into a single block MUST pass distinct values: post-2026-04-25
+    the apply path enforces chain-historic leaf-watermark dedup
+    (closes the FinalityVote replay-mint vulnerability), so two votes
+    from the same signer at the same leaf collapse to one mint.
     """
     return FinalityVote(
         signer_entity_id=signer_id,
         target_block_hash=target_hash,
         target_block_number=target_num,
         signed_at_height=target_num,
-        signature=Signature([], 0, [], b"", b""),
+        signature=Signature([], leaf_index, [], b"", b""),
     )
 
 
@@ -64,16 +73,21 @@ class TestApplyPathClamp(unittest.TestCase):
         self.target_num = 1
 
     def _make_fake_block(self, num_votes: int, block_height: int):
-        """Build a SimpleNamespace block with `num_votes` identical votes.
+        """Build a SimpleNamespace block with `num_votes` votes.
 
-        Apply-path clamp test: identical votes are fine because
-        validation is bypassed.  Real production use is guarded by
-        _validate_finality_votes — we're testing the apply layer's
-        OWN independent ceiling.
+        Each vote uses a DISTINCT leaf_index so the apply path's
+        chain-historic leaf-reuse dedup (closes the FinalityVote
+        replay-mint vulnerability) doesn't collapse them.  Real
+        production proposers always assemble votes from distinct
+        signer/leaf pairs; the cap clamp under test is independent
+        of the dedup.
         """
         votes = [
-            _fake_vote(self.bob.entity_id, self.target_hash, self.target_num)
-            for _ in range(num_votes)
+            _fake_vote(
+                self.bob.entity_id, self.target_hash, self.target_num,
+                leaf_index=i,
+            )
+            for i in range(num_votes)
         ]
         return SimpleNamespace(
             finality_votes=votes,

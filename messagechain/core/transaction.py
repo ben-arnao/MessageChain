@@ -23,6 +23,7 @@ from messagechain.config import (
     BLOCK_BYTES_RAISE_HEIGHT, FEE_PER_STORED_BYTE_POST_RAISE,
     PREV_POINTER_HEIGHT,
     FIRST_SEND_PUBKEY_HEIGHT,
+    MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -47,6 +48,17 @@ TX_VERSION_FIRST_SEND_PUBKEY = 3
 # Raw byte cost of the sender_pubkey field when set (1B presence flag +
 # 32B pubkey).  Charged at the per-stored-byte fee basis alongside `prev`.
 SENDER_PUBKEY_STORED_BYTES = 33
+# Tx-logic version that closes the _signable_data length-prefix
+# collision (Tier 12 — MESSAGE_TX_LENGTH_PREFIX_HEIGHT).  v4
+# `_signable_data` prepends `struct.pack(">H", len(self.message))`
+# immediately before the message bytes; everything else (entity_id,
+# compression_flag, ts/nonce/fee, prev/pubkey trailers) matches the
+# v3 layout byte-for-byte.  The 2-byte prefix binds the message
+# length into the signed commitment so two parses of the same byte
+# string with different message lengths can no longer produce the
+# same tx_hash.  Pre-activation v4 admission is rejected; historical
+# v1/v2/v3 replay continues unchanged.
+TX_VERSION_LENGTH_PREFIX = 4
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -115,6 +127,21 @@ class MessageTransaction:
         ever checked.
         """
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
+        # v4 (TX_VERSION_LENGTH_PREFIX) closes the legacy length-prefix
+        # collision: prepend `struct.pack(">H", len(self.message))`
+        # immediately before the message bytes so the parsed message
+        # length is committed into the signed payload.  Without this,
+        # two byte-strings that parse to different (message, ts/nonce/
+        # fee/prev/pk) tuples can collide on tx_hash and a single
+        # WOTS+ signature verifies under both parses (mempool dedup
+        # then displaces the victim's intended tx).  v1/v2/v3 keep
+        # the legacy raw-message concatenation byte-for-byte for
+        # historical replay -- the new constant gates the new shape
+        # so pre-Tier-12 blocks hash exactly as they always did.
+        if self.version >= TX_VERSION_LENGTH_PREFIX:
+            message_block = struct.pack(">H", len(self.message)) + self.message
+        else:
+            message_block = self.message
         base = (
             CHAIN_ID
             + b"message"  # domain-separation tag: prevents cross-type sig replay
@@ -122,7 +149,7 @@ class MessageTransaction:
             + struct.pack(">B", sig_version)
             + self.entity_id
             + struct.pack(">B", self.compression_flag)
-            + self.message
+            + message_block
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.nonce)
             + struct.pack(">Q", self.fee)
@@ -641,8 +668,9 @@ def create_transaction(
     # prev block is present (v3 supersedes v2 in the layout), so
     # prev_overhead is added unconditionally for v3 txs even when
     # prev is None — the empty presence flag still costs 1B.
+    # Caller-intent → baseline version + per-stored-byte overhead.
     if include_pubkey:
-        tx_version = TX_VERSION_FIRST_SEND_PUBKEY
+        base_version = TX_VERSION_FIRST_SEND_PUBKEY
         # 33B for the prev block (always present at v3, presence-
         # flag-only when prev is None) + 33B for the sender_pubkey
         # block (presence flag + 32B pubkey since include_pubkey=True).
@@ -656,11 +684,33 @@ def create_transaction(
             raise ValueError(
                 f"prev must be exactly 32 bytes, got {len(prev)}"
             )
-        tx_version = TX_VERSION_PREV_POINTER
+        base_version = TX_VERSION_PREV_POINTER
         prev_overhead = PREV_POINTER_STORED_BYTES
     else:
-        tx_version = 1
+        base_version = 1
         prev_overhead = 0
+    # Tier 12: post-activation, emit v4 (length-prefixed signable_data)
+    # for new txs.  v4 inherits the v3 wire layout -- prev + sender_
+    # pubkey presence-flag blocks are BOTH always present -- so a v4
+    # tx with neither prev nor sender_pubkey carries 2 extra bytes
+    # vs v1.  Charge those bytes at the per-stored-byte rate so the
+    # fee floor reflects the new on-chain footprint.  Pre-activation
+    # falls through to the baseline version (legacy behavior preserved
+    # byte-for-byte for historical replay and current-height-None
+    # callers like isolated unit tests).
+    if (
+        current_height is not None
+        and current_height >= MESSAGE_TX_LENGTH_PREFIX_HEIGHT
+    ):
+        tx_version = TX_VERSION_LENGTH_PREFIX
+        if not include_pubkey:
+            # base_version was 1 or 2 -- v4 wire emits BOTH
+            # presence flags, so add the absent ones now.
+            if prev is None:
+                prev_overhead += 1  # prev presence flag (was 0 for v1/v2-no-prev)
+            prev_overhead += 1      # sender_pubkey presence flag (always under v4)
+    else:
+        tx_version = base_version
     if prev is not None and len(prev) != 32:
         raise ValueError(
             f"prev must be exactly 32 bytes, got {len(prev)}"
@@ -722,18 +772,33 @@ def verify_transaction(
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
-    # ── Version gate for the Tier 10 `prev` pointer + Tier 11 sender_pubkey ──
+    # ── Version gate for tiers 10 / 11 / 12 ──
     # Pre-activation: only version=1 txs are accepted.  A higher-
     # version tx arriving before its fork point would allow its
-    # extra bytes to land in a block whose replay semantics don't
-    # know about the field, so we reject at the validation boundary.
-    # Post-PREV_POINTER_HEIGHT: v1 and v2 accepted; v3 still rejected
-    # until FIRST_SEND_PUBKEY_HEIGHT.  Post-FIRST_SEND_PUBKEY_HEIGHT:
-    # v1, v2, v3 all accepted; v3 may carry sender_pubkey.  Any
-    # future version is rejected until its own activation fork.
-    if tx.version > TX_VERSION_FIRST_SEND_PUBKEY:
+    # extra bytes (or, for v4, the new length-prefixed signable
+    # commitment) to land in a block whose replay semantics don't
+    # know about the change, so we reject at the validation
+    # boundary.  Post-PREV_POINTER_HEIGHT: v1, v2 accepted.
+    # Post-FIRST_SEND_PUBKEY_HEIGHT: v3 also accepted.
+    # Post-MESSAGE_TX_LENGTH_PREFIX_HEIGHT: v4 also accepted (and is
+    # the recommended creation path for new txs; v1/v2/v3 remain
+    # admissible for backward compatibility).  Any version above
+    # v4 is rejected until its own activation fork.
+    if tx.version > TX_VERSION_LENGTH_PREFIX:
         return False
-    if tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
+    if tx.version >= TX_VERSION_LENGTH_PREFIX:
+        if (
+            current_height is not None
+            and current_height < MESSAGE_TX_LENGTH_PREFIX_HEIGHT
+        ):
+            return False
+        # v4 inherits the full v3 trailer layout (prev + sender_pubkey
+        # presence-flag blocks), so the sender_pubkey shape rule below
+        # applies identically.  The ONLY semantic delta vs v3 is the
+        # >H length prefix on `message` inside `_signable_data`.
+        if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
+            return False
+    elif tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
         if (
             current_height is not None
             and current_height < FIRST_SEND_PUBKEY_HEIGHT

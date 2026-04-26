@@ -4375,7 +4375,32 @@ class Blockchain:
                 FINALITY_REWARD_FROM_ISSUANCE_HEIGHT as _FRFIH,
             )
             _finality_fork_active = block_height >= _FRFIH
+            # Pre-filter survivors against the START-OF-BLOCK watermark
+            # snapshot (the chain-state map BEFORE any in-block bumps
+            # for the proposer block-sig, attestations, or txs).  This
+            # mirrors _apply_finality_votes' approach so a proposer's
+            # own legitimate in-block finality vote is NOT misclassified
+            # as a replay just because their block-sig leaf was
+            # consumed earlier in the same apply pass.  Replays from
+            # earlier blocks are still skipped (vote.leaf < pre-block
+            # watermark), but in-block fresh votes pass.
+            _baseline_wm: dict[bytes, int] = {}
+            _consumed_in_block: set[tuple[bytes, int]] = set()
+            _survivors_sim = []
+            _start_wm = dict(self.leaf_watermarks)
             for fv in finality_votes:
+                _sid = fv.signer_entity_id
+                _leaf = fv.signature.leaf_index
+                _chain_wm = _baseline_wm.setdefault(
+                    _sid, _start_wm.get(_sid, 0),
+                )
+                if _leaf < _chain_wm:
+                    continue
+                if (_sid, _leaf) in _consumed_in_block:
+                    continue
+                _consumed_in_block.add((_sid, _leaf))
+                _survivors_sim.append(fv)
+            for fv in _survivors_sim:
                 _bump_wm(fv.signer_entity_id, fv.signature.leaf_index)
                 if _FVR <= 0:
                     continue
@@ -5385,13 +5410,70 @@ class Blockchain:
         # Pre-activation the legacy uncapped loop is preserved byte-
         # for-byte for historical replay.
         apply_cap_active = block_height >= FINALITY_VOTE_CAP_HEIGHT
-        # 1+2: per-vote bounty and watermark
+        # Pre-filter survivors against the chain-historic leaf-reuse
+        # rule, snapshotting the watermark BEFORE either loop runs.
+        # Without snapshot-then-filter, the mint loop's _bump_watermark
+        # for survivor #1 would push the watermark past survivor #2's
+        # leaf, causing the checkpoint loop to falsely classify #2 as
+        # a replay and skip its add_vote -- corrupting the 2/3
+        # finality tally.
+        #
+        # Closes the FinalityVote replay-mint vulnerability: a vote
+        # whose leaf was consumed by an earlier block (or earlier
+        # entry in this block's `votes` list) silently produces no
+        # mint, no watermark bump, and no checkpoint contribution.
+        # Without this guard, a proposer could pull already-applied
+        # finality votes from gossip and re-include them every block
+        # for FINALITY_VOTE_MAX_AGE_BLOCKS = 1000 blocks, harvesting
+        # FINALITY_VOTE_INCLUSION_REWARD per replay -- the protocol's
+        # first uncapped-mint primitive if left open.
+        #
+        # Soft-skip (not block-reject) because:
+        #  * Older blocks on disk may contain naively-re-included
+        #    votes; rejecting at re-apply time would break IBD /
+        #    reorg-replay of historical chain state.
+        #  * The mint pathway is the consensus-critical part; a silent
+        #    no-op at apply time is byte-for-byte identical to "vote
+        #    was never there" for state-root purposes, so any node
+        #    replaying the same chain reaches the same state.
+        baseline_watermarks: dict[bytes, int] = {}
+        # Track in-block-earlier-leaf consumption so two votes from
+        # the same signer at the same leaf inside ONE block (caught
+        # at validation, but defense-in-depth here) collapse to one.
+        in_block_consumed: set[tuple[bytes, int]] = set()
+        survivors: list[tuple[int, "FinalityVote"]] = []
         for vote_idx, v in enumerate(votes):
             if apply_cap_active and vote_idx >= MAX_FINALITY_VOTES_PER_BLOCK:
                 # Extras dropped on the apply side.  Honest operators
                 # never reach here — validation rejected the block
                 # first.  This branch only fires on validation drift.
                 break
+            sid = v.signer_entity_id
+            leaf = v.signature.leaf_index
+            # Use the start-of-block watermark snapshot (set by
+            # _apply_block_state on entry) when available so the
+            # proposer's own in-block bumps don't cause their
+            # legitimate vote to be misclassified as a replay.  Falls
+            # back to the live watermarks dict for direct callers
+            # that bypass _apply_block_state (test fixtures that
+            # invoke _apply_finality_votes via SimpleNamespace blocks).
+            _start_wm_dict = getattr(
+                self, "_block_start_leaf_watermarks", None,
+            )
+            if _start_wm_dict is None:
+                _start_wm_dict = self.leaf_watermarks
+            chain_wm = baseline_watermarks.setdefault(
+                sid, _start_wm_dict.get(sid, 0),
+            )
+            if leaf < chain_wm:
+                continue
+            if (sid, leaf) in in_block_consumed:
+                continue
+            in_block_consumed.add((sid, leaf))
+            survivors.append((vote_idx, v))
+
+        # 1+2: per-vote bounty and watermark (over survivors only)
+        for vote_idx, v in survivors:
             self._bump_watermark(v.signer_entity_id, v.signature.leaf_index)
             if FINALITY_VOTE_INCLUSION_REWARD <= 0:
                 continue
@@ -5430,9 +5512,13 @@ class Blockchain:
         # snapshot was pruned.  Apply-path clamp (FINALITY_VOTE_CAP_HEIGHT
         # fork) also truncates this loop so a block that slipped past
         # validation cannot inflate the checkpoint-vote tally either.
-        for vote_idx, v in enumerate(votes):
-            if apply_cap_active and vote_idx >= MAX_FINALITY_VOTES_PER_BLOCK:
-                break
+        # 3: checkpoint update over the SAME survivors -- the
+        # pre-filter above already excluded replays (and the
+        # MAX_FINALITY_VOTES_PER_BLOCK overflow), so iterate the
+        # survivors list directly.  This guarantees the mint loop and
+        # the checkpoint loop stay in lockstep (each survivor mints
+        # iff and only iff it contributes to the 2/3 tally).
+        for vote_idx, v in survivors:
             pinned = self._stake_snapshots.get(v.target_block_number)
             stake_map = pinned if pinned is not None else dict(self.supply.staked)
             signer_stake = stake_map.get(v.signer_entity_id, 0)
@@ -7915,6 +8001,21 @@ class Blockchain:
         """Apply a block's state changes (fees, nonces, rewards) without validation."""
         proposer_id = block.header.proposer_id
         current_base_fee = self.supply.base_fee
+        # Capture leaf_watermarks AT THE START of this block's apply.
+        # Threaded into _apply_finality_votes as the dedup baseline so
+        # in-block bumps (proposer block-sig, attestations, txs) don't
+        # cause the proposer's OWN finality vote to be misclassified
+        # as a replay.  A finality vote in the same block as its
+        # signer's block-sig consumes a separate, lower leaf -- the
+        # vote was signed BEFORE the block, so its leaf_index < the
+        # block-sig's leaf.  Comparing against post-block-sig
+        # watermarks would falsely skip every honest in-block vote
+        # from the proposer.  Comparing against the START-OF-BLOCK
+        # watermark correctly accepts fresh in-block votes while
+        # still rejecting replays of votes consumed in EARLIER blocks.
+        self._block_start_leaf_watermarks: dict[bytes, int] = dict(
+            self.leaf_watermarks,
+        )
 
         # Reset the per-block fee-burn ticker so this block's
         # pay_fee_with_burn calls accumulate cleanly.  Read back at

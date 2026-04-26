@@ -2124,6 +2124,25 @@ MAX_SUBMISSION_BODY_BYTES = 16384
 SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC = 0.05  # 1 per 20 seconds steady
 SUBMISSION_REJECTION_BURST = 3                   # up to 3 rejection proofs immediately
 
+# Dedicated per-IP budget for SubmissionAck issuance on the
+# `X-MC-Witnessed-Submission` opt-in path.  Each ack consumes one
+# WOTS+ leaf from the receipt subtree (same finite 2^RECEIPT_SUBTREE_HEIGHT
+# pool as receipts and rejections).  Without a dedicated budget, an
+# attacker spamming the witnessed-submission header with random
+# 32-byte values from a /24 drains all 65k leaves in minutes -- and
+# once drained, the entire censorship-evidence pipeline (receipts,
+# rejections, acks) collapses silently because every issuance path
+# shares the same subtree.
+#
+# Witnessed-submission is the OPT-IN slow path (client paid
+# WITNESS_SURCHARGE on top of the normal fee at the gossip layer);
+# legitimate volume is bounded by that surcharge cost, not by HTTP
+# request rate.  The budget is sized so honest opt-in flows always
+# get an ack while any IP-flood attacker hits the ceiling within a
+# few seconds.
+SUBMISSION_ACK_RATE_LIMIT_PER_SEC = 0.1   # 1 per 10 seconds steady
+SUBMISSION_ACK_BURST = 5                   # up to 5 acks immediately
+
 # ─────────────────────────────────────────────────────────────────────
 # Public read-only feed (messagechain.network.public_feed_server)
 # ─────────────────────────────────────────────────────────────────────
@@ -3115,6 +3134,48 @@ PREV_POINTER_HEIGHT = 400                # Tier 10 (bootstrap-compressed: pulled
 # v1/v2 remain valid for senders already on chain.
 FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 
+# Tier 12 — MessageTransaction signable-data length-prefix fix.
+# Closes a tx_hash-collision hole in the legacy v1/v2/v3 _signable_data:
+# `self.message` was concatenated raw with no length prefix, and the
+# optional prev/sender_pubkey trailers have multiple legal byte
+# lengths.  An attacker who induces a victim to sign carefully-
+# structured bytes (or who controls part of the message content) can
+# re-encode the same SIGNED bytes into a *different* parsed
+# MessageTransaction (alt message length, alt ts/nonce/fee/prev,
+# alt sender_pubkey).  Both wire forms hash to the same tx_hash;
+# the WOTS+ signature verifies under both parses.  Mempool dedup
+# then displaces the victim's intended tx with the attacker's
+# alternate content.  Defect class: same length-prefix omission
+# already fixed in M23 for Signature.canonical_bytes and the
+# binary-hashes blob -- MessageTransaction was missed.
+#
+# Fix: TX_VERSION_LENGTH_PREFIX (v=4).  v4 _signable_data prepends
+# `struct.pack(">H", len(self.message))` immediately before the
+# message bytes, binding the length into the signed commitment so
+# any alt parse necessarily produces a different signable-data byte
+# string and a different tx_hash.
+#
+# Pre-activation: v4 admission is rejected (only v1/v2/v3 accepted
+# under their own activation gates).  Historical replay of pre-v4
+# blocks runs the legacy _signable_data path byte-for-byte
+# unchanged.  At/after activation: v4 is the canonical version for
+# new MessageTransactions; v1/v2/v3 remain ADMISSIBLE for backward
+# compatibility (the chain has never gated v3 outbound to honest
+# senders, and an attacker who can collide a v3 tx_hash with another
+# v3 tx_hash gains nothing more than they could already), but the
+# RECOMMENDED creation path emits v4.  A future tier can tighten
+# this by REJECTING v3 admission; that's a separate consensus
+# change.
+MESSAGE_TX_LENGTH_PREFIX_HEIGHT = 700    # Tier 12
+
+assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
+    "MESSAGE_TX_LENGTH_PREFIX_HEIGHT must follow FIRST_SEND_PUBKEY_HEIGHT "
+    "— v4 supersedes v3 as the canonical message tx version, but the "
+    "v3 dispatch must already be live so honest senders can keep "
+    "using v3 during the runway and historical v3 replay continues "
+    "to work after the fork lands"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3207,6 +3268,8 @@ for _fork_name, _fork_height in (
     ("LINEAR_FEE_HEIGHT", LINEAR_FEE_HEIGHT),
     ("BLOCK_BYTES_RAISE_HEIGHT", BLOCK_BYTES_RAISE_HEIGHT),
     ("PREV_POINTER_HEIGHT", PREV_POINTER_HEIGHT),
+    ("FIRST_SEND_PUBKEY_HEIGHT", FIRST_SEND_PUBKEY_HEIGHT),
+    ("MESSAGE_TX_LENGTH_PREFIX_HEIGHT", MESSAGE_TX_LENGTH_PREFIX_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
