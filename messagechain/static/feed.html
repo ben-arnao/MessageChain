@@ -47,6 +47,54 @@
     font-size: 0.9rem;
   }
   header .sub a { color: var(--accent); }
+  .hero {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1.4rem 1rem 0.4rem;
+  }
+  .hero h2 {
+    margin: 0 0 0.4rem;
+    font-size: 1.55rem;
+    line-height: 1.25;
+    letter-spacing: -0.01em;
+  }
+  .hero p {
+    margin: 0 0 0.6rem;
+    color: var(--muted);
+    font-size: 0.95rem;
+  }
+  .hero ul {
+    margin: 0.4rem 0 0.8rem;
+    padding-left: 1.1rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .hero ul li { margin: 0.2rem 0; }
+  .hero .post-cta {
+    display: inline-block;
+    margin-top: 0.2rem;
+    padding: 0.5rem 0.9rem;
+    background: var(--accent);
+    color: var(--bg);
+    border-radius: 4px;
+    font-weight: 600;
+    text-decoration: none;
+    font-size: 0.9rem;
+  }
+  .hero .post-cta + .post-hint {
+    display: block;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  .hero .post-hint code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    background: var(--card);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+  }
   main {
     max-width: 720px;
     margin: 0 auto;
@@ -207,11 +255,32 @@
 </head>
 <body>
 <header>
-  <h1>MessageChain — live feed</h1>
+  <h1>MessageChain</h1>
   <p class="sub">
+    a permanent, decentralized ledger for human speech ·
     <a href="/gh">github</a>
   </p>
 </header>
+<section class="hero">
+  <h2>Your message can never be deleted.</h2>
+  <p>
+    MessageChain is a quantum-resistant, proof-of-stake blockchain
+    purpose-built for short messages. No platform, government, or
+    ISP can hide, filter, or silently remove what you post — once a
+    message is on-chain, it is there forever, replicated across every
+    validator on the network.
+  </p>
+  <ul>
+    <li><strong>Censorship-resistant</strong> — no relay, no admin, no takedown button.</li>
+    <li><strong>Built to last centuries</strong> — post-quantum signatures, perpetual validator rewards.</li>
+    <li><strong>Costly to spam</strong> — every message pays a real fee, so AI-generated noise has a floor.</li>
+  </ul>
+  <a class="post-cta" href="/gh">Post your first message →</a>
+  <span class="post-hint">
+    Install the CLI, generate a key offline, get starter tokens below, then
+    <code>messagechain send "hello world"</code>.
+  </span>
+</section>
 <main>
   <details class="faucet" id="faucetBox" hidden>
     <summary>First time? Get starter tokens (<span id="faucetRemaining">…</span> left today)</summary>
