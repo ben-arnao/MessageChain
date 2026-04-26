@@ -4,6 +4,85 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] — 2026-04-26
+
+Minor release. Eleven critical security audit fixes across rounds 4
+and 5. Closes the censorship-evidence pipeline end-to-end on both
+HTTPS and RPC ingress, defeats a coerced-validator evidence-wipe via
+`SetReceiptSubtreeRoot` rotation, plus several consensus-safety + DoS
+holes. **All mainnet operators should upgrade ASAP** — five of these
+issues directly target the headline structural defense against
+validator collusion.
+
+### Security
+
+- **Wire `receipt_issuer` into `SubmissionServer`** (a6fd35e, fdcf83e).
+  Pre-fix the public HTTPS submission endpoint never issued
+  SubmissionReceipts / Acks / Rejections — the entire censorship-
+  evidence pipeline was silently dead since the endpoint shipped. A
+  coerced validator could admit-and-drop honest user submissions
+  with zero on-chain accountability.
+- **Wire `WitnessObservationStore` into `SubmissionServer`** (a6fd35e).
+  Without it, the `obs_ok` ack-issuance gate short-circuits to True
+  for any 32-byte `X-MC-Witnessed-Submission` header, letting a
+  botnet drain the 65k-leaf receipt subtree in hours via the per-IP
+  ack budget alone.
+- **Route `_rpc_submit_transaction` through the receipt-issuer
+  helper** (a6fd35e). Pre-fix the RPC submission path bypassed
+  receipt issuance entirely. RPC submissions now return a `receipt`
+  field clients can weaponize as `CensorshipEvidenceTx`.
+- **`receipt_subtree_roots` reorg leak** (a6fd35e). Same defect class
+  as the round-2 `entity_id_to_index` and round-4
+  `key_rotation_last_height` leaks. `_reset_state` now clears the
+  in-memory map; `restore_state_snapshot` `DELETE`s the chaindb
+  mirror.
+- **Receipt-subtree-root rotation no longer wipes outstanding
+  evidence** (a6fd35e). New `past_receipt_subtree_roots` history per
+  entity — receipt validation accepts the current root OR any
+  historical root the entity ever installed. Pre-fix a coerced
+  validator could pre-emptively erase every in-flight evidence
+  receipt with one cold-key `SetReceiptSubtreeRoot` tx. New
+  `past_receipt_subtree_roots` chaindb table mirrors the history.
+- **Slashed-this-block validators excluded from finality**
+  (a6fd35e). Pre-fix a coordinated proposer could push a target
+  block over 2/3 finalization using stake that consensus had already
+  declared malicious in the same block. `_apply_finality_votes` and
+  the matching `compute_post_state_root` sim path now pre-filter
+  survivors against `slashed_validators`.
+- **Empty-entries inclusion list rejects non-empty
+  `quorum_attestation`** (a6fd35e). Pre-fix the empty-entries
+  shortcut returned OK before signature-verifying any quorum-
+  attestation report — a proposer could attach arbitrarily large
+  unverified garbage at zero fee.
+- **Governance v1 admission rejected post-Tier-15 activation**
+  (a6fd35e). Pre-fix both v1 and v2 of the SAME logical proposal
+  text could exist concurrently (different tx_hashes → different
+  proposal_ids), splitting honest votes; for `TreasurySpend`, both
+  could clear 2/3 and double-debit the treasury. Post-fork
+  (height ≥ `GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT=5000`), v1 admission
+  is rejected. Historical v1 blocks still replay.
+- **`KeyPair.sign` thread-safety** (fdcf83e). Concurrent calls
+  could both observe the same `_next_leaf` before either advanced
+  it, producing two WOTS+ signatures over different message hashes
+  under the same one-time leaf — mathematically reveals the leaf's
+  WOTS+ private key. New `_sign_lock` (threading.Lock) wraps the
+  read-modify-write of `_next_leaf` (including persist-before-sign
+  disk write).
+- **`key_rotation_last_height` reorg leak** (fdcf83e).
+  `restore_state_snapshot` now `DELETE FROM key_rotation_last_height`.
+- **30-second socket read timeout on `_SubmissionHandler` and
+  `_FeedHandler`** (a6fd35e). Closes a slow-loris vector — pre-fix
+  a single attacker could pin thousands of validator threads.
+
+### Notes
+
+- The `past_receipt_subtree_roots` table is added by
+  `CREATE TABLE IF NOT EXISTS` so a downgrade-then-upgrade cycle is
+  safe.
+- Validators on this version expose a new `receipt` field in the
+  `submit_transaction` RPC response; older clients ignore unknown
+  JSON keys, so this is a forward-compatible additive change.
+
 ## [1.13.0] — 2026-04-26
 
 Minor release. Adds an engagement-signal beacon to the public feed
