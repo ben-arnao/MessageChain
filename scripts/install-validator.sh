@@ -87,4 +87,17 @@ Next steps (run these as root):
 Check status with:
   messagechain status
   messagechain doctor
+
+Back up the following BEFORE staking — losing them after stake lands is
+unrecoverable, and a keyfile-only restore on a fresh disk WILL trigger
+a 100% slash for WOTS+ leaf reuse:
+
+  /etc/messagechain/keyfile             (validator identity, hex secret)
+  /var/lib/messagechain/leaf_index.json (block-signing leaf watermark)
+  /var/lib/messagechain/receipt_leaf_index.json (receipt-signing watermark)
+
+The leaf-index files record which one-time WOTS+ leaves the keyfile has
+already burned.  Restore them together or not at all.  See README.md
+"Operating a live validator -> Back up the keyfile AND the leaf-index
+files" for the full backup/migration recipe.
 EOF

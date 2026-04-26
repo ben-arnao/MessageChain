@@ -133,6 +133,20 @@ WantedBy=multi-user.target
 # 7. Verify from another machine:
 #      messagechain status --server <your-host>:9334
 #
+# 8. Back up the keyfile AND the leaf-index files BEFORE staking.  All
+#    three together make a complete validator backup:
+#      /etc/messagechain/keyfile
+#      /var/lib/messagechain/leaf_index.json
+#      /var/lib/messagechain/receipt_leaf_index.json
+#    The leaf-index files record which one-time WOTS+ leaves the keyfile
+#    has already burned.  A keyfile-only restore (after disk loss,
+#    ransomware, hardware migration) silently re-signs already-used
+#    leaves, which the chain detects as equivocation and slashes 100% of
+#    stake on detection.  Snapshot the three files together; restore
+#    them together or not at all.  See README.md "Operating a live
+#    validator -> Back up the keyfile AND the leaf-index files" for the
+#    tar/scp recipe.
+#
 # You earn block rewards and attestation rewards once your stake lands
 # on chain.  See README.md "Validator operations" for `stake` / `unstake`.
 #
