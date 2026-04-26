@@ -4,6 +4,23 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] — 2026-04-26
+
+Minor release. Adds an engagement-signal beacon to the public feed
+viewer: a one-shot `GET /beacon/scroll` the homepage's JS fires the
+first time a visitor scrolls past the initial fold. Pairs visitor
+IPs with reader-depth in the access log so operators can tell who
+actually read past the first screen of messages. Cosmetic; no
+protocol or consensus impact.
+
+### Added
+
+- **`GET /beacon/scroll` on `PublicFeedServer`** — 204 response, no
+  body, `Cache-Control: no-store`. The homepage now ships a small
+  scroll listener that fires this exactly once per page load when
+  `window.scrollY` exceeds one viewport. The listener detaches
+  itself after firing.
+
 ## [1.12.0] — 2026-04-25
 
 Minor release.  Hard fork: compress the bootstrap-window fork
