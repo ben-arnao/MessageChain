@@ -251,6 +251,50 @@
   }
   details.faucet ol { padding-left: 1.2rem; }
   details.faucet ol li { margin: 0.25rem 0; }
+  /* Structured "drip succeeded, here's what to do next" block.
+     Replaces the ad-hoc one-line success string so the user can
+     actually see the tx hash and the exact CLI command on separate
+     rows.  Hidden by default; revealed on a successful drip. */
+  details.faucet .success-block {
+    margin-top: 0.6rem;
+    padding: 0.6rem 0.7rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--accent) 8%, var(--card));
+    font-size: 0.85rem;
+  }
+  details.faucet .success-block .row {
+    margin: 0.25rem 0;
+  }
+  details.faucet .success-block .label {
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+  details.faucet .success-block .tx {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    word-break: break-all;
+    font-size: 0.82rem;
+  }
+  details.faucet .success-block ol {
+    margin: 0.4rem 0 0;
+    padding-left: 1.2rem;
+  }
+  details.faucet .success-block ol li {
+    margin: 0.3rem 0;
+  }
+  details.faucet .success-block .cmd {
+    display: block;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--bg);
+    padding: 0.35rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    margin-top: 0.25rem;
+    font-size: 0.82rem;
+    word-break: break-word;
+  }
 </style>
 </head>
 <body>
@@ -275,7 +319,7 @@
     <li><strong>Built to last centuries</strong> — post-quantum signatures, perpetual validator rewards.</li>
     <li><strong>Costly to spam</strong> — every message pays a real fee, so AI-generated noise has a floor.</li>
   </ul>
-  <a class="post-cta" href="/gh">Post your first message →</a>
+  <a class="post-cta" href="/gh/start">Post your first message →</a>
   <span class="post-hint">
     Install the CLI, generate a key offline, get starter tokens below, then
     <code>messagechain send "hello world"</code>.
@@ -292,8 +336,16 @@
         messages). One drip per address, one drip per network per 24h.
       </p>
       <ol>
-        <li>Generate a key offline: <code>messagechain generate-key</code></li>
-        <li>Paste the printed entity ID here:</li>
+        <li>
+          Install the CLI — see
+          <a href="/gh/start">getting started</a>
+          (Python 3.10+, no third-party deps).
+        </li>
+        <li>
+          Generate a key offline: <code>messagechain generate-key</code> —
+          write the printed hex on paper.
+        </li>
+        <li>Paste your printed <code>entity_id</code> below:</li>
       </ol>
       <input id="faucetAddr" type="text" autocomplete="off"
              placeholder="64-char hex entity_id"
@@ -301,6 +353,28 @@
       <button id="faucetBtn" type="button">Get tokens</button>
       <div id="faucetProgress" class="progress" hidden></div>
       <div id="faucetResult" class="result"></div>
+      <div id="faucetSuccess" class="success-block" hidden>
+        <div class="row">
+          <div class="label">Faucet tx</div>
+          <div class="tx" id="faucetSuccessTx"></div>
+        </div>
+        <div class="row">
+          <div class="label">Now post your first message</div>
+          <ol>
+            <li>
+              Wait one block (~10 minutes) for the drip to confirm.
+            </li>
+            <li>
+              On the machine with your private key, run:
+              <code class="cmd" id="faucetSuccessCmd">messagechain send "hello world"</code>
+            </li>
+            <li>
+              Wait one more block, then refresh this page — your
+              message will appear in the feed below.
+            </li>
+          </ol>
+        </div>
+      </div>
       <p style="margin-top:0.6rem; font-size:0.78rem; color:var(--muted);">
         First request runs a small proof-of-work in your browser
         (~5 sec on desktop, ~15 sec on mobile).  Costs you a few
@@ -446,6 +520,8 @@
   const faucetProgress = document.getElementById("faucetProgress");
   const faucetAmount = document.getElementById("faucetAmount");
   const faucetRemaining = document.getElementById("faucetRemaining");
+  const faucetSuccess = document.getElementById("faucetSuccess");
+  const faucetSuccessTx = document.getElementById("faucetSuccessTx");
 
   async function refreshFaucetInfo() {
     try {
@@ -625,6 +701,9 @@ self.onmessage = function (e) {
     faucetResult.className = "result";
     faucetResult.textContent = "Requesting challenge…";
     faucetProgress.hidden = true;
+    // Clear any prior success block — a retry from the same page load
+    // (e.g. after a 429) shouldn't show stale "you got tokens" UI.
+    faucetSuccess.hidden = true;
     try {
       // Step 1: get a challenge bound to this address.
       const cresp = await fetch(
@@ -672,15 +751,20 @@ self.onmessage = function (e) {
       });
       const ddata = await dresp.json().catch(() => ({}));
       if (dresp.ok && ddata.ok) {
+        // Success path: populate the structured success block instead
+        // of cramming tx hash + amount + next-step CLI command into a
+        // single sentence the user can't easily parse.
         faucetResult.className = "result success";
         faucetResult.textContent =
-          "Sent " + ddata.amount + " tokens. Tx " + ddata.tx_hash.slice(0, 16) +
-          "… will land in the next block (~10 min). Then run " +
-          "`messagechain send \"hello world\"` to post.";
+          "Sent " + ddata.amount + " tokens — drip lands in the next block.";
+        faucetSuccessTx.textContent = ddata.tx_hash;
+        faucetSuccess.hidden = false;
+        faucetProgress.hidden = true;
       } else {
         faucetResult.className = "result error";
         faucetResult.textContent =
           "Drip failed: " + (ddata.error || ("HTTP " + dresp.status));
+        faucetSuccess.hidden = true;
       }
       refreshFaucetInfo();
     } catch (e) {

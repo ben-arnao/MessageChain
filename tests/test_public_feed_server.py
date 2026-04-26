@@ -303,6 +303,22 @@ class TestGitHubRedirect(PublicFeedTestBase):
         self.assertIn('href="/gh"', src)
         self.assertNotIn('href="https://github.com/ben-arnao', src)
 
+    def test_gh_start_returns_302_to_getting_started(self):
+        """`/gh/start` deep-links to the README's getting-started anchor
+        instead of the repo top, so the hero CTA on the landing page
+        drops casual visitors at the install + first-message walkthrough
+        rather than the install-from-source weeds."""
+        status, headers, _ = self._get("/gh/start")
+        self.assertEqual(status, 302)
+        self.assertEqual(
+            headers.get("Location"),
+            self.GITHUB_URL + "#getting-started--your-first-message",
+        )
+
+    def test_gh_start_post_returns_405(self):
+        status, _, _ = self._get("/gh/start", method="POST")
+        self.assertEqual(status, 405)
+
 
 if __name__ == "__main__":
     unittest.main()

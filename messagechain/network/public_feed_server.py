@@ -65,6 +65,15 @@ _FEED_HTML_PATH = os.path.join(_STATIC_DIR, "feed.html")
 # Outbound link target for the `/gh` redirect (the public repo).
 _GITHUB_REPO_URL = "https://github.com/ben-arnao/MessageChain"
 
+# Deeper link for `/gh/start` — drops the visitor straight at the
+# README's "Getting started — your first message" anchor, skipping the
+# install-from-source weeds at the top.  Tracked the same way as `/gh`
+# so we still see the click in the access log.
+_GITHUB_GETTING_STARTED_URL = (
+    "https://github.com/ben-arnao/MessageChain"
+    "#getting-started--your-first-message"
+)
+
 
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
@@ -311,12 +320,19 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/latest":
             self._serve_latest(ctx, split.query)
             return
-        if path == "/gh":
+        if path == "/gh" or path == "/gh/start":
             # 302 to the public repo so outbound clicks land in the
             # access log (a bare anchor href would let the browser
-            # navigate away with no record on our side).
+            # navigate away with no record on our side).  `/gh/start`
+            # deep-links to the README's "Getting started" anchor for
+            # visitors landing from the hero CTA.
+            target = (
+                _GITHUB_GETTING_STARTED_URL
+                if path == "/gh/start"
+                else _GITHUB_REPO_URL
+            )
             self.send_response(302)
-            self.send_header("Location", _GITHUB_REPO_URL)
+            self.send_header("Location", target)
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
