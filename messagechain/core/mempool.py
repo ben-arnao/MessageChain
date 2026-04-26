@@ -96,6 +96,15 @@ class Mempool:
         # the next block's censorship_evidence_txs slot.
         self.censorship_evidence_pool: dict[bytes, object] = {}
         self.censorship_evidence_pool_max_size: int = 1000
+        # Tier 17 ReactTransaction pool: keyed by tx_hash so identical
+        # (voter, target, choice, nonce, timestamp) txs dedupe at the
+        # mempool boundary.  Shape mirrors slash_pool — strict FIFO,
+        # no fee-density eviction (the per-tx byte payload is tiny
+        # and uniform across votes; ranking by fee/byte adds little).
+        # Drained by the proposer into the next block's
+        # react_transactions slot via `get_react_transactions`.
+        self.react_pool: dict[bytes, object] = {}
+        self.react_pool_max_size: int = 10_000
 
     def add_transaction(
         self,
@@ -561,6 +570,43 @@ class Mempool:
     def remove_censorship_evidence_txs(self, tx_hashes: list[bytes]):
         for h in tx_hashes:
             self.censorship_evidence_pool.pop(h, None)
+
+    # ── Tier 17 ReactTransaction pool ────────────────────────────
+
+    def add_react_transaction(self, tx) -> bool:
+        """Admit a ReactTransaction into the pool.
+
+        Returns True on insertion, False if the tx is already present
+        or the pool is full.  Strict FIFO — no fee-density eviction.
+
+        The caller must run signature / target-existence / activation-
+        gate checks before this call (see `verify_react_transaction`
+        + the chain-side checks in `validate_block`); the mempool only
+        enforces dedup, the protocol fee floor, and the cap.  This
+        mirrors how the message-tx pool admits a tx after the RPC
+        validate has succeeded — the mempool itself isn't a second
+        verifier.
+        """
+        if tx.tx_hash in self.react_pool:
+            return False
+        if len(self.react_pool) >= self.react_pool_max_size:
+            return False
+        if tx.fee < MIN_FEE:
+            return False
+        self.react_pool[tx.tx_hash] = tx
+        return True
+
+    def get_react_transactions(self, max_count: int | None = None) -> list:
+        """Return pending ReactTransactions for inclusion in a new block."""
+        items = list(self.react_pool.values())
+        if max_count is not None:
+            items = items[:max_count]
+        return items
+
+    def remove_react_transactions(self, tx_hashes: list[bytes]):
+        """Remove react txs after inclusion in a block."""
+        for h in tx_hashes:
+            self.react_pool.pop(h, None)
 
     @property
     def size(self) -> int:

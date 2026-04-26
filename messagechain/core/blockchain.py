@@ -770,6 +770,44 @@ class Blockchain:
         # under the new binary.
         if hasattr(self.db, "get_all_key_history"):
             self.key_history = self.db.get_all_key_history()
+        # Tier 17 ReactionState: rebuild the (voter, target,
+        # target_is_user) -> latest_choice ground truth from the
+        # `reaction_choices` table, then derive per-target aggregates
+        # (user_trust_score, message_score) by replaying every entry.
+        # Storing only the choices map enforces the invariant
+        # ``aggregate == sum_of_pairs(choices)`` at load — a hand-edit
+        # to one half of the pair would surface here as a derived
+        # aggregate that disagrees with the on-disk row.  `hasattr`
+        # gate keeps legacy chain.db files (pre-Tier-17 schema)
+        # loadable under the new binary.
+        if hasattr(self.db, "get_all_reaction_choices"):
+            from messagechain.core.reaction import (
+                ReactionState as _ReactionState,
+                _score_value as _react_score,
+                REACT_CHOICE_CLEAR as _RCC,
+            )
+            persisted = self.db.get_all_reaction_choices()
+            rs = _ReactionState()
+            for (voter, target, tu), choice in persisted.items():
+                if choice == _RCC:
+                    # CLEAR rows should never have been persisted; skip
+                    # so the rebuild matches the in-memory invariant.
+                    continue
+                rs.choices[(voter, target, tu)] = choice
+                delta = _react_score(choice)
+                if tu:
+                    rs._user_trust_score[target] = (
+                        rs._user_trust_score.get(target, 0) + delta
+                    )
+                    if rs._user_trust_score[target] == 0:
+                        rs._user_trust_score.pop(target, None)
+                else:
+                    rs._message_score[target] = (
+                        rs._message_score.get(target, 0) + delta
+                    )
+                    if rs._message_score[target] == 0:
+                        rs._message_score.pop(target, None)
+            self.reaction_state = rs
         # Rehydrate the per-validator reputation (accepted-attestation)
         # counter.  Consensus-visible: drives `select_lottery_winner`
         # at every LOTTERY_INTERVAL block during bootstrap; the
@@ -1192,7 +1230,26 @@ class Blockchain:
                 for eid, entries in self.key_history.items():
                     for (h, pk) in entries:
                         self.db.add_key_history_entry(eid, int(h), pk)
+            # Tier 17 ReactionState: flush every (voter, target,
+            # target_is_user) key marked dirty since the last
+            # _persist_state.  An entry that left `choices` (CLEAR
+            # vote retracting a prior UP/DOWN) deletes its row;
+            # otherwise the row is upserted.  Wrapped in the same
+            # SQL transaction as everything above so the round-9
+            # save/restore-symmetry rule holds: either the whole
+            # block's state lands on disk or none of it does.
+            if hasattr(self.db, "set_reaction_choice"):
+                for key in self.reaction_state._dirty_keys:
+                    voter, target, tu = key
+                    if key in self.reaction_state.choices:
+                        self.db.set_reaction_choice(
+                            voter, target, tu,
+                            self.reaction_state.choices[key],
+                        )
+                    else:
+                        self.db.clear_reaction_choice(voter, target, tu)
             self.db.commit_transaction()
+            self.reaction_state.mark_persisted()
         except Exception:
             self.db.rollback_transaction()
             raise

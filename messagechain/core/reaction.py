@@ -434,6 +434,14 @@ class ReactionState:
     choices: dict[tuple[bytes, bytes, bool], int] = field(default_factory=dict)
     _user_trust_score: dict[bytes, int] = field(default_factory=dict)
     _message_score: dict[bytes, int] = field(default_factory=dict)
+    # Dirty-key tracker for the chaindb persistence path: keys whose
+    # row in the on-disk `reaction_choices` table needs an UPSERT or
+    # DELETE on the next `_persist_state` flush.  Every `apply` call
+    # adds the touched key here.  Cleared by `mark_persisted` after
+    # the flush succeeds.  Mirrors the per-entity `_dirty_entities`
+    # pattern Blockchain uses for its other state dicts — keeps the
+    # steady-state flush cost O(K_touched) instead of O(N_total).
+    _dirty_keys: set[tuple[bytes, bytes, bool]] = field(default_factory=set)
 
     # ── Read API ────────────────────────────────────────────────────
 
@@ -487,6 +495,20 @@ class ReactionState:
             self.choices.pop(key, None)
         else:
             self.choices[key] = tx.choice
+
+        # Mark this key dirty so the next chaindb flush either
+        # UPSERTs the new choice or DELETEs the row (CLEAR retracts).
+        self._dirty_keys.add(key)
+
+    def mark_persisted(self) -> None:
+        """Clear the dirty-key set after a successful chaindb flush.
+
+        Called by `Blockchain._persist_state` once the SQL transaction
+        commits.  Behaves like the per-entity `self._dirty_entities`
+        clear in `_persist_state` — keeps the next flush bounded to
+        keys touched since this call.
+        """
+        self._dirty_keys.clear()
 
     # ── Serialise / deserialise (chaindb save/restore) ──────────────
 

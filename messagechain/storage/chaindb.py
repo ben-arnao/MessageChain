@@ -883,6 +883,27 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_tx_locations_hash
                 ON tx_locations(tx_hash);
+
+            -- Tier 17 ReactTransaction state: ground-truth per-pair
+            -- (voter, target, target_is_user) -> latest_choice map.
+            -- Per-target aggregates (user_trust_score, message_score)
+            -- are NOT persisted; they're rebuilt from this map at
+            -- restore time so the invariant
+            --   aggregate == sum_of_pairs(choices)
+            -- is enforced at load and cannot drift through hand-edits
+            -- to one half of the pair.  Composite PK keeps user-trust
+            -- and message-react votes in distinct rows even when the
+            -- 32-byte target value coincides between an entity_id and
+            -- a tx_hash.  CLEAR entries (choice == 0) are never stored
+            -- — absent ≡ CLEAR — so the table only carries non-zero
+            -- contributions.
+            CREATE TABLE IF NOT EXISTS reaction_choices (
+                voter_id BLOB NOT NULL,
+                target BLOB NOT NULL,
+                target_is_user INTEGER NOT NULL,
+                choice INTEGER NOT NULL,
+                PRIMARY KEY (voter_id, target, target_is_user)
+            );
         """)
         conn.commit()
 
@@ -1267,6 +1288,65 @@ class ChainDB:
     def get_all_nonces(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, nonce FROM nonces")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Reaction Choices (Tier 17) ────────────────────────
+    # The (voter, target, target_is_user) -> choice ground truth.
+    # Aggregates are derived at restore time, not persisted.
+
+    def set_reaction_choice(
+        self,
+        voter_id: bytes,
+        target: bytes,
+        target_is_user: bool,
+        choice: int,
+    ) -> None:
+        """Upsert one (voter, target, target_is_user) -> choice row.
+
+        ``choice`` must be one of REACT_CHOICE_UP / REACT_CHOICE_DOWN.
+        CLEAR entries are NEVER persisted — call ``clear_reaction_choice``
+        to remove a row instead.  Mirrors the in-memory rule
+        ``absent ≡ CLEAR``.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO reaction_choices "
+            "(voter_id, target, target_is_user, choice) "
+            "VALUES (?, ?, ?, ?)",
+            (voter_id, target, 1 if target_is_user else 0, int(choice)),
+        )
+
+    def clear_reaction_choice(
+        self,
+        voter_id: bytes,
+        target: bytes,
+        target_is_user: bool,
+    ) -> None:
+        """Delete one row — used when a CLEAR vote retracts a prior UP/DOWN."""
+        self._conn.execute(
+            "DELETE FROM reaction_choices "
+            "WHERE voter_id = ? AND target = ? AND target_is_user = ?",
+            (voter_id, target, 1 if target_is_user else 0),
+        )
+
+    def get_all_reaction_choices(
+        self,
+    ) -> dict[tuple[bytes, bytes, bool], int]:
+        """Rehydrate the full reaction-choices map on cold start.
+
+        Returns ``{(voter_id, target, target_is_user): choice, ...}`` —
+        the exact shape `ReactionState.choices` holds in memory.  The
+        aggregates (`user_trust_score`, `message_score`) are rebuilt
+        from this map at load time via
+        `ReactionState.deserialize`-style replay, so the on-disk
+        representation cannot drift from the in-memory derived state.
+        """
+        cur = self._conn.execute(
+            "SELECT voter_id, target, target_is_user, choice "
+            "FROM reaction_choices"
+        )
+        out: dict[tuple[bytes, bytes, bool], int] = {}
+        for voter_id, target, target_is_user, choice in cur.fetchall():
+            out[(bytes(voter_id), bytes(target), bool(target_is_user))] = int(choice)
+        return out
 
     # ── State: Public Keys ───────────────────────────────────────
 
