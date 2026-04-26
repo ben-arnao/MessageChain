@@ -1086,6 +1086,15 @@ class Blockchain:
                 # The full set is written each flush; REPLACE
                 # semantics make re-persisting unchanged entries a
                 # no-op at the storage layer.
+                #
+                # `staked_at_admission` MUST be passed -- the chaindb
+                # signature accepts it as a kwarg defaulting to 0, so
+                # an omitted positional silently writes zero on every
+                # flush.  After ANY cold restart, mature() reads back
+                # zero and the slash penalty is computed against zero
+                # stake -- the slash is silently nullified.  This was
+                # the exact failure mode the snapshot-stake-at-admission
+                # hardening was designed to prevent.
                 for ev_hash, entry in self.censorship_processor.pending.items():
                     self.db.set_pending_censorship_evidence(
                         ev_hash,
@@ -1093,6 +1102,7 @@ class Blockchain:
                         entry.tx_hash,
                         entry.admitted_height,
                         entry.evidence_tx_hash,
+                        entry.staked_at_admission,
                     )
                 # Persist processed censorship-evidence hashes into the
                 # shared processed_evidence table (single source of
@@ -2863,29 +2873,67 @@ class Blockchain:
             )
 
         # Verify the evidence itself (two valid conflicting signatures).
-        # R6-A: Use the key that was ACTIVE at the evidence height, not
-        # the current public key.  An offender who equivocated at height
-        # H and then rotated keys at H+1 must still be slashable with
-        # evidence from H; the old key verifies the old signatures, the
-        # new key does not.  Without this lookup the rotation silently
-        # defeats the 100% stake burn.
+        #
+        # R6-A: Use the key that was ACTIVE at the evidence height for
+        # FinalityDoubleVote (the FinalityVote.signed_at_height field
+        # binds the signing height into the evidence, so the lookup
+        # is unambiguous).
+        #
+        # For AttestationSlashingEvidence and SlashingEvidence (double-
+        # proposal), the evidence does NOT carry a signing-height
+        # field -- attestation.signable_data and BlockHeader.signable_data
+        # commit to (validator_id, block_hash, block_number) only.  An
+        # equivocator who rotates keys between conflicting attestations
+        # / proposals would escape the slash if we resolved a single
+        # key at the target height (only the pre-rotation K1 would
+        # appear; verify of the K2-signed half would fail).
+        #
+        # Fix: assemble the offender's FULL set of historical keys
+        # (key_history + current pubkey) and pass the list to the
+        # verifiers.  The verifiers then accept iff each signed
+        # artifact validates under SOME candidate.  An attacker
+        # cannot exploit this to forge evidence: every key in the
+        # candidate set comes from the offender's on-chain rotation
+        # history, which is itself protected by the offender's own
+        # signatures at each rotation step.
         ev_height = self._evidence_block_number(tx.evidence)
         if ev_height is None:
             return False, "cannot determine evidence block height"
-        offender_pk = self._public_key_at_height(
-            tx.evidence.offender_id, ev_height,
-        )
-        if offender_pk is None:
-            return False, "offender had no key at evidence height"
         from messagechain.consensus.finality import (
             FinalityDoubleVoteEvidence, verify_finality_double_vote_evidence,
         )
-        if isinstance(tx.evidence, AttestationSlashingEvidence):
-            valid, reason = verify_attestation_slashing_evidence(tx.evidence, offender_pk)
-        elif isinstance(tx.evidence, FinalityDoubleVoteEvidence):
-            valid, reason = verify_finality_double_vote_evidence(tx.evidence, offender_pk)
+        if isinstance(tx.evidence, FinalityDoubleVoteEvidence):
+            # Single-key path: signed_at_height already binds the lookup.
+            offender_pk = self._public_key_at_height(
+                tx.evidence.offender_id, ev_height,
+            )
+            if offender_pk is None:
+                return False, "offender had no key at evidence height"
+            valid, reason = verify_finality_double_vote_evidence(
+                tx.evidence, offender_pk,
+            )
         else:
-            valid, reason = verify_slashing_evidence(tx.evidence, offender_pk)
+            # Multi-key path: try every key the offender ever held.
+            candidates: list[bytes] = []
+            seen: set[bytes] = set()
+            history = self.key_history.get(tx.evidence.offender_id, [])
+            for _installed_at, pk in history:
+                if pk and pk not in seen:
+                    seen.add(pk)
+                    candidates.append(pk)
+            current = self.public_keys.get(tx.evidence.offender_id)
+            if current and current not in seen:
+                candidates.append(current)
+            if not candidates:
+                return False, "offender had no key at evidence height"
+            if isinstance(tx.evidence, AttestationSlashingEvidence):
+                valid, reason = verify_attestation_slashing_evidence(
+                    tx.evidence, candidates,
+                )
+            else:
+                valid, reason = verify_slashing_evidence(
+                    tx.evidence, candidates,
+                )
         if not valid:
             return False, f"Invalid evidence: {reason}"
 

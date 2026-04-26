@@ -3261,6 +3261,41 @@ assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > VERSION_SIGNALING_HEIGHT, (
     "ride on top of for coordinated upgrade signaling"
 )
 
+# Tier 15 — governance signable-data length-prefix fix.
+# ProposalTransaction and TreasurySpendTransaction `_signable_data`
+# concatenated variable-length `title` / `description` /
+# `reference_hash` raw, with no length prefixes.  Two parses of the
+# same signed bytes can therefore yield different (title, description,
+# reference_hash) tuples while sharing the same tx_hash and signature.
+# A relay that controls a propagation path can rewrite the on-chain
+# text of any approved governance proposal -- voters approve one set
+# of words, the chain stores another.  For binding TreasurySpend
+# proposals (which auto-execute fund movement), a victim can be
+# tricked into voting yes on a proposal whose displayed justification
+# differs from any other validator's view of the same proposal_id,
+# while the binding recipient_id and amount fields (fixed-width) stay
+# the same.
+#
+# Same defect class as the v4 message-tx fix
+# (MESSAGE_TX_LENGTH_PREFIX_HEIGHT).
+#
+# Fix: GOVERNANCE_TX_VERSION_LENGTH_PREFIX (v=2) hard fork.  v2
+# `_signable_data` length-prefixes title (>H), description (>I), and
+# reference_hash (>B) so the parsed tuple is uniquely committed.
+# Pre-activation: v2 admission is rejected; only v=1 governance txs
+# are accepted under their existing rules.  At/after activation: v2
+# is the canonical version for new proposals; v1 remains admissible
+# for backward compatibility but the recommended creation path emits
+# v2 (and the founder-led governance regime should use only v2 for
+# any treasury spend during the bootstrap window).
+GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT = 5000   # Tier 15
+
+assert GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT > MESSAGE_TX_LENGTH_PREFIX_HEIGHT, (
+    "GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT must follow "
+    "MESSAGE_TX_LENGTH_PREFIX_HEIGHT — same defect class as v4 message "
+    "tx, gated behind it so the runway windows don't overlap"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3364,6 +3399,7 @@ for _fork_name, _fork_height in (
     ("INTL_MESSAGE_HEIGHT", INTL_MESSAGE_HEIGHT),
     ("VERSION_SIGNALING_HEIGHT", VERSION_SIGNALING_HEIGHT),
     ("MESSAGE_TX_LENGTH_PREFIX_HEIGHT", MESSAGE_TX_LENGTH_PREFIX_HEIGHT),
+    ("GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT", GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
