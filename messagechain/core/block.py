@@ -13,7 +13,14 @@ import json
 from dataclasses import dataclass, field
 from messagechain.config import (
     HASH_ALGO, HASH_VERSION_CURRENT,
-    BLOCK_SERIALIZATION_VERSION, validate_block_serialization_version,
+    BLOCK_SERIALIZATION_VERSION,
+    BLOCK_SERIALIZATION_VERSION_V1,
+    BLOCK_SERIALIZATION_VERSION_V2,
+    validate_block_serialization_version,
+)
+from messagechain.consensus.validator_versions import (
+    CURRENT_VALIDATOR_VERSION,
+    UNSIGNALLED as VALIDATOR_VERSION_UNSIGNALLED,
 )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.crypto.hashing import default_hash
@@ -415,8 +422,39 @@ class BlockHeader:
     # Archive operators still retain every block — this is purely a
     # sync UX affordance.
     state_root_checkpoint: bytes = b"\x00" * 32
+    # Validator version signalling (Fork 1, audit finding #2): a uint16
+    # stamping the proposer's running release.  Carried only in V2
+    # block serialization; V1 blocks decode with this field set to
+    # UNSIGNALLED (0).  Future forks (Fork 2 = the active-set liveness
+    # fallback) consume this field as their activation gate.  Default
+    # to UNSIGNALLED so test fixtures and pre-Fork-1 historical blocks
+    # round-trip cleanly; the block producer overrides to
+    # CURRENT_VALIDATOR_VERSION on every freshly-built block.
+    validator_version: int = VALIDATOR_VERSION_UNSIGNALLED
 
-    def signable_data(self) -> bytes:
+    def _ser_version_for_height(self) -> int:
+        """Pick the wire-format version for a block at this height.
+
+        Pre-VERSION_SIGNALING_HEIGHT blocks were originally serialized
+        and signed under V1.  Re-hashing them under V2 (which would
+        append a 2-byte validator_version field to signable_data) would
+        give a different block_hash than the network agreed on, which
+        breaks the prev-hash chain and the proposer signature stored on
+        disk.  So this header self-selects V1 for any height below the
+        fork activation; post-activation, V2.
+
+        The block envelope (Block.to_bytes/from_bytes) carries the
+        ser_version explicitly in its leading byte so re-encoded historic
+        blocks emit the same V1 they were originally produced under.
+        Same for the proposer signature: signable_data() must commit to
+        the SAME bytes the proposer originally signed.
+        """
+        from messagechain.config import VERSION_SIGNALING_HEIGHT
+        if self.block_number >= VERSION_SIGNALING_HEIGHT:
+            return BLOCK_SERIALIZATION_VERSION_V2
+        return BLOCK_SERIALIZATION_VERSION_V1
+
+    def signable_data(self, ser_version: int | None = None) -> bytes:
         # NOTE: randao_mix is intentionally NOT included here. It is derived
         # from the proposer signature (which is itself over signable_data),
         # so including it would create a circular dependency. The randao_mix
@@ -432,7 +470,16 @@ class BlockHeader:
         # heights (the common case), so the field contributes no
         # entropy there and the hash stays identical to a checkpoint-
         # field-less legacy header whose trailing bytes were 32 zeros.
-        return (
+        # validator_version is committed into signable_data only on
+        # V2 wire format so V1 blocks (the entire pre-Fork-1 chain
+        # history) keep their existing hash and the proposer signature
+        # over them remains valid.  At V2, the field is appended to
+        # the end so the prefix is byte-identical to V1 -- this is
+        # not a load-bearing property (the ser_version is committed by
+        # the block envelope) but it keeps the diff minimal.
+        if ser_version is None:
+            ser_version = self._ser_version_for_height()
+        base = (
             struct.pack(">I", self.version)
             + struct.pack(">B", self.hash_version)
             + struct.pack(">Q", self.block_number)
@@ -445,6 +492,9 @@ class BlockHeader:
             + self.mempool_snapshot_root
             + self.state_root_checkpoint
         )
+        if ser_version == BLOCK_SERIALIZATION_VERSION_V2:
+            return base + struct.pack(">H", self.validator_version)
+        return base
 
     def serialize(self) -> dict:
         return {
@@ -460,13 +510,14 @@ class BlockHeader:
             "randao_mix": self.randao_mix.hex(),
             "mempool_snapshot_root": self.mempool_snapshot_root.hex(),
             "state_root_checkpoint": self.state_root_checkpoint.hex(),
+            "validator_version": self.validator_version,
             "proposer_signature": self.proposer_signature.serialize() if self.proposer_signature else None,
         }
 
-    def to_bytes(self) -> bytes:
+    def to_bytes(self, ser_version: int | None = None) -> bytes:
         """Compact binary encoding for storage/wire.
 
-        Layout:
+        Layout (V2; V1 omits the trailing validator_version field):
             u32  version
             u8   hash_version        <- crypto-agility register
             u64  block_number
@@ -479,23 +530,33 @@ class BlockHeader:
             32   randao_mix
             32   mempool_snapshot_root   <- retired (always zero on new blocks; retained for historical block compat)
             32   state_root_checkpoint   <- periodic snapshot commitment
+            u16  validator_version       <- V2 ONLY (Fork 1 -- audit finding #2)
             u32  sig_blob_len  (0 = no proposer signature)
             N    sig_blob
 
         hash_version sits right after `version` so a header blob is
-        unambiguously one flavor of hash commitment end-to-end — a
+        unambiguously one flavor of hash commitment end-to-end -- a
         validator's decoder reads the version before any 32-byte hash
         field and can dispatch when multiple schemes are active.
 
         state_root_checkpoint trails mempool_snapshot_root so the field
         order here matches the signable_data() layout exactly, keeping
         the wire-format and the signed-payload layout aligned.
+
+        validator_version is appended only when ser_version is V2.  The
+        block envelope (Block.to_bytes) carries the ser_version in its
+        leading byte and threads it down here, so the same BlockHeader
+        instance can serialize cleanly under either format -- which is
+        what lets a node running new code re-emit the entire pre-Fork-1
+        chain history under V1 if it ever needs to.
         """
+        if ser_version is None:
+            ser_version = self._ser_version_for_height()
         if self.proposer_signature is None:
             sig_blob = b""
         else:
             sig_blob = self.proposer_signature.to_bytes()
-        return b"".join([
+        parts = [
             struct.pack(">I", self.version),
             struct.pack(">B", self.hash_version),
             struct.pack(">Q", self.block_number),
@@ -508,21 +569,50 @@ class BlockHeader:
             self.randao_mix,
             self.mempool_snapshot_root,
             self.state_root_checkpoint,
-            struct.pack(">I", len(sig_blob)),
-            sig_blob,
-        ])
+        ]
+        if ser_version == BLOCK_SERIALIZATION_VERSION_V2:
+            parts.append(struct.pack(">H", self.validator_version))
+        parts.append(struct.pack(">I", len(sig_blob)))
+        parts.append(sig_blob)
+        return b"".join(parts)
 
     @classmethod
-    def from_bytes(cls, data: bytes) -> "BlockHeader":
+    def from_bytes(
+        cls,
+        data: bytes,
+        ser_version: int | None = None,
+    ) -> "BlockHeader":
         off = 0
+        # When the caller hasn't pinned a ser_version (e.g. tests calling
+        # BlockHeader.from_bytes(blob) directly without going through the
+        # Block envelope), peek at the block_number to decide V1 vs V2.
+        # Layout puts block_number at offset 4+1=5: after u32 version and
+        # u8 hash_version.  Self-describing via block_number is safe
+        # because block_number is committed inside signable_data() and
+        # any forgery breaks the proposer signature.
+        if ser_version is None:
+            from messagechain.config import VERSION_SIGNALING_HEIGHT
+            if len(data) < 4 + 1 + 8:
+                # Not enough bytes to even peek; fall through to V1
+                # so the regular truncation error fires below.
+                ser_version = BLOCK_SERIALIZATION_VERSION_V1
+            else:
+                peeked_block_number = struct.unpack_from(">Q", data, 4 + 1)[0]
+                if peeked_block_number >= VERSION_SIGNALING_HEIGHT:
+                    ser_version = BLOCK_SERIALIZATION_VERSION_V2
+                else:
+                    ser_version = BLOCK_SERIALIZATION_VERSION_V1
         # +1 byte for the u8 hash_version field (crypto agility).
         # +32 bytes for the witness_root field.
         # +32 bytes for the mempool_snapshot_root field.
         # +32 bytes for the state_root_checkpoint field (see
-        # config.CHECKPOINT_INTERVAL) — zero on non-checkpoint heights
+        # config.CHECKPOINT_INTERVAL) -- zero on non-checkpoint heights
         # so the minimum stays 32 bytes regardless of whether the block
         # is a checkpoint.
+        # +2 bytes for the V2-only validator_version field (Fork 1).
         expected_min = 4 + 1 + 8 + 32 + 32 + 32 + 32 + 8 + 32 + 32 + 32 + 32 + 4
+        if ser_version == BLOCK_SERIALIZATION_VERSION_V2:
+            expected_min += 2
         if len(data) < expected_min:
             raise ValueError("BlockHeader blob too short")
         version = struct.unpack_from(">I", data, off)[0]; off += 4
@@ -544,6 +634,15 @@ class BlockHeader:
         randao_mix = bytes(data[off:off + 32]); off += 32
         mempool_snapshot_root = bytes(data[off:off + 32]); off += 32
         state_root_checkpoint = bytes(data[off:off + 32]); off += 32
+        if ser_version == BLOCK_SERIALIZATION_VERSION_V2:
+            validator_version = struct.unpack_from(">H", data, off)[0]; off += 2
+        else:
+            # V1 (legacy): no validator_version on the wire.  Default to
+            # UNSIGNALLED so future gates that read this field can
+            # distinguish "pre-Fork-1 historical block" (no signal) from
+            # "modern block whose proposer chose not to signal" (which
+            # can't happen -- the producer always stamps a real value).
+            validator_version = VALIDATOR_VERSION_UNSIGNALLED
         sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
         if off + sig_len > len(data):
             raise ValueError("BlockHeader truncated at signature")
@@ -564,6 +663,7 @@ class BlockHeader:
             hash_version=hash_version,
             mempool_snapshot_root=mempool_snapshot_root,
             state_root_checkpoint=state_root_checkpoint,
+            validator_version=validator_version,
         )
 
     @classmethod
@@ -592,6 +692,11 @@ class BlockHeader:
             hash_version=data.get("hash_version", HASH_VERSION_CURRENT),
             mempool_snapshot_root=bytes.fromhex(data["mempool_snapshot_root"]) if data.get("mempool_snapshot_root") else b"\x00" * 32,
             state_root_checkpoint=bytes.fromhex(data["state_root_checkpoint"]) if data.get("state_root_checkpoint") else b"\x00" * 32,
+            # Pre-Fork-1 dicts have no validator_version key; default to
+            # UNSIGNALLED so existing on-disk JSON round-trips cleanly.
+            validator_version=data.get(
+                "validator_version", VALIDATOR_VERSION_UNSIGNALLED,
+            ),
         )
 
 
@@ -940,7 +1045,16 @@ class Block:
                 parts.append(b)
             return b"".join(parts)
 
-        header_blob = self.header.to_bytes()
+        # Block envelope and header agree on the wire format: the
+        # leading byte below stamps the SAME ser_version the header
+        # self-selected from its block_number (V1 below
+        # VERSION_SIGNALING_HEIGHT, V2 at/above), so the validator_version
+        # field appears (V2) or is omitted (V1) consistently end-to-end.
+        # Re-serializing a historical V1 block remains lossless because
+        # the header self-selects V1 for those heights and V1 codec
+        # writes no validator_version field.
+        block_ser_version = self.header._ser_version_for_height()
+        header_blob = self.header.to_bytes(block_ser_version)
         return b"".join([
             # Leading u8 wire-format version — see
             # config.BLOCK_SERIALIZATION_VERSION.  Lets a future
@@ -949,7 +1063,7 @@ class Block:
             # rejects unknown values at parse time with a clear
             # error rather than letting a layout change surface as
             # a cryptic hash mismatch further down the pipeline.
-            struct.pack(">B", BLOCK_SERIALIZATION_VERSION),
+            struct.pack(">B", block_ser_version),
             struct.pack(">I", len(header_blob)),
             header_blob,
             enc_list(self.transactions),
@@ -1080,7 +1194,9 @@ class Block:
             raise ValueError(f"Block: {reason}")
 
         header_len = take_u32()
-        header = BlockHeader.from_bytes(take(header_len))
+        # Pass the envelope's ser_version down so the header decoder
+        # knows whether to expect the trailing validator_version field.
+        header = BlockHeader.from_bytes(take(header_len), ser_version=ser_version)
 
         txs = dec_list(MessageTransaction)
 

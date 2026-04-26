@@ -260,7 +260,18 @@ def validate_sig_version(sig_version: int) -> tuple[bool, str]:
 # not upgraded produce a clear error rather than silent corruption.
 #
 # Reserved: 0 is invalid (traps uninitialized / truncated input).
-BLOCK_SERIALIZATION_VERSION = 1
+#
+# Block serialization version 2 introduces the validator_version field
+# (Fork 1, audit finding #2): a uint16 carried in every V2 block header
+# stamping the proposer's running release.  V1 (legacy) blocks have no
+# such field and decode with validator_version=UNSIGNALLED.  Both V1 and
+# V2 are accepted during the migration window so a node running new
+# code can ingest the entire pre-fork chain history.  After the network
+# has fully migrated to V2, V1 can be dropped from the accept set in a
+# follow-up fork.
+BLOCK_SERIALIZATION_VERSION_V1 = 1
+BLOCK_SERIALIZATION_VERSION_V2 = 2
+BLOCK_SERIALIZATION_VERSION = BLOCK_SERIALIZATION_VERSION_V2
 TX_SERIALIZATION_VERSION = 1
 
 # Acceptance sets, mirroring _ACCEPTED_SIG_VERSIONS above.  CLAUDE.md
@@ -273,7 +284,8 @@ TX_SERIALIZATION_VERSION = 1
 # Both validators below read these sets lazily via globals() so test
 # monkeypatching sees the mutation and import-order is flexible.
 _ACCEPTED_BLOCK_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
-    BLOCK_SERIALIZATION_VERSION,
+    BLOCK_SERIALIZATION_VERSION_V1,
+    BLOCK_SERIALIZATION_VERSION_V2,
 })
 _ACCEPTED_TX_SERIALIZATION_VERSIONS: frozenset[int] = frozenset({
     TX_SERIALIZATION_VERSION,
@@ -3146,6 +3158,27 @@ FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 # English user gets 1024 chars; each pays per byte for the storage
 # they actually pin to permanent state.
 INTL_MESSAGE_HEIGHT = 1500              # Tier 12
+
+# Tier 13 (Fork 1, audit finding #2): validator version signaling.
+# At/after VERSION_SIGNALING_HEIGHT, blocks serialize under V2 wire
+# format (BLOCK_SERIALIZATION_VERSION_V2) which carries a uint16
+# validator_version field in the block header stamping the proposer's
+# running release.  Pre-activation blocks remain V1 (no field).
+#
+# This fork itself does NOT consume the field for any consensus rule
+# yet -- it only lays the wire-format groundwork.  The field exists so
+# Fork 2 (the active-set liveness fallback, audit finding #1) can
+# refuse to cross its own activation height until enough validators
+# have signaled support, breaking the chicken-and-egg gap where every
+# fork-coordination mechanism would itself need to be deployed via the
+# unprotected mechanism it replaces.
+#
+# Runway: ~3000 blocks above the live tip (~451 at the time this
+# constant was added).  20+ days at 10-minute blocks gives both
+# operators comfortable time to upgrade without the protection of
+# this very gate (which doesn't exist yet) -- manual coordination is
+# the mitigation for fork-1 itself; subsequent forks use the gate.
+VERSION_SIGNALING_HEIGHT = 3500          # Tier 13 (Fork 1)
 
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
