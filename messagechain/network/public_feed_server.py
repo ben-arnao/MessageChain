@@ -340,6 +340,17 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/faucet/challenge" and ctx.faucet is not None:
             self._serve_faucet_challenge(ctx, split.query)
             return
+        if path == "/beacon/scroll":
+            # One-shot engagement beacon the homepage's JS fires when
+            # the visitor scrolls past the initial fold. 204 + empty
+            # body keeps the response tiny — the only signal we need
+            # is the request itself landing in the access log paired
+            # with the visitor IP.
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
         self._send_text(404, "Not Found")
 

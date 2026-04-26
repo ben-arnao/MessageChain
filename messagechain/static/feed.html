@@ -779,6 +779,21 @@ self.onmessage = function (e) {
 
   poll();
   setInterval(poll, POLL_MS);
+
+  // One-shot engagement beacon: fires the first time the visitor
+  // scrolls more than a screen down from the top, so the operator
+  // can tell which viewers actually read past the initial fold.
+  // Listener detaches itself after firing — never fires more than
+  // once per page load.
+  let scrollBeaconFired = false;
+  function maybeFireScrollBeacon() {
+    if (scrollBeaconFired) return;
+    if (window.scrollY < window.innerHeight) return;
+    scrollBeaconFired = true;
+    window.removeEventListener("scroll", maybeFireScrollBeacon);
+    fetch("/beacon/scroll", { method: "GET", keepalive: true }).catch(() => {});
+  }
+  window.addEventListener("scroll", maybeFireScrollBeacon, { passive: true });
 })();
 </script>
 </body>

@@ -320,5 +320,35 @@ class TestGitHubRedirect(PublicFeedTestBase):
         self.assertEqual(status, 405)
 
 
+class TestScrollBeacon(PublicFeedTestBase):
+    """`/beacon/scroll` is a tiny 204 endpoint the homepage's JS hits
+    once when the visitor has scrolled past the initial fold.  The
+    response carries no body — the only signal operators need is the
+    request landing in the access log, paired with the visitor IP."""
+
+    def test_beacon_scroll_returns_204(self):
+        status, _, body = self._get("/beacon/scroll")
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
+
+    def test_beacon_scroll_no_store(self):
+        """The beacon must not be cached anywhere — Caddy/CDN/browser.
+        A cached 204 would hide repeat visits and skew the engagement
+        signal."""
+        _, headers, _ = self._get("/beacon/scroll")
+        self.assertEqual(headers.get("Cache-Control"), "no-store")
+
+    def test_beacon_scroll_post_returns_405(self):
+        status, _, _ = self._get("/beacon/scroll", method="POST")
+        self.assertEqual(status, 405)
+
+    def test_feed_page_includes_scroll_beacon_js(self):
+        """The HTML page must wire the beacon — without the JS the
+        endpoint exists but never fires."""
+        _, _, body = self._get("/")
+        src = body.decode("utf-8")
+        self.assertIn("/beacon/scroll", src)
+
+
 if __name__ == "__main__":
     unittest.main()
