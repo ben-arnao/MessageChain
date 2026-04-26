@@ -4,6 +4,97 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] — 2026-04-25
+
+Minor release.  Hard fork (Tier 12, audit finding #2) plus an
+operator feature.  Lays the wire-format groundwork for upgrade
+signaling so future forks can refuse to cross their activation
+height until enough validators have upgraded -- without that, a
+single missed upgrade silently partitions the chain.  Also adds an
+offline pre-sign workflow for the existing emergency-revoke
+kill-switch.
+
+### Added — Tier 12 hard fork (validator version signaling)
+
+- **`BlockHeader.validator_version` (V2 wire format).**
+  At/after `VERSION_SIGNALING_HEIGHT = 3500`, blocks serialize
+  under `BLOCK_SERIALIZATION_VERSION_V2` carrying a uint16
+  `validator_version` field stamping the proposer's running
+  release.  Pre-activation blocks remain V1 (no field), and the
+  V1 codec is preserved end-to-end so the entire pre-fork chain
+  history hashes byte-for-byte identically under new code -- no
+  migration step, no re-hashing, no surprise prev-hash drift.
+  V1 and V2 are both accepted indefinitely so historical blocks
+  always replay cleanly.  (`messagechain/core/block.py`,
+  `messagechain/config.py`)
+- **`messagechain/consensus/validator_versions.py` registry.**
+  Append-only mapping from uint16 -> (release_tag, notes).
+  `CURRENT_VALIDATOR_VERSION = 1` for this release; future
+  releases bump and append.  Reserved value 0 = UNSIGNALLED, used
+  for pre-Fork-1 historical blocks; consumers MUST treat it as
+  "no signal" and never as "matches any version" so a downgrade
+  attack can't bypass future activation gates by zeroing the
+  field.
+- **Block producer stamps `CURRENT_VALIDATOR_VERSION` post-
+  activation.**  Pre-activation blocks default to UNSIGNALLED so
+  the V1 layout is preserved.  `BlockHeader._ser_version_for_height`
+  is the single point of truth: every codec path
+  (signable_data, to_bytes, from_bytes, the Block envelope's
+  leading-byte stamp) reads from it, so the in-memory
+  representation can serialize cleanly under either format.
+  (`messagechain/consensus/pos.py`)
+
+This fork ITSELF has no consensus-rule consumer of the new field
+-- it only makes the field appear on the wire.  Fork 2 (the
+active-set liveness fallback, audit finding #1) will land in a
+follow-up release and consume it as its activation gate.  Two
+separate forks is the deliberate sequencing: activating a
+liveness-recovery fork using the same heights-only deployment
+mechanism that put liveness at risk would be reckless; fork-1
+ships first, fork-2 ships behind the gate.
+
+### Added — Offline emergency-revoke pre-sign workflow
+
+- **`messagechain emergency-revoke --print-only`.** Builds and
+  signs a revoke locally with the cold key, prints serialized
+  hex on stdout, makes ZERO RPC calls.  Intended for an
+  air-gapped machine: pre-sign once while the cold key is
+  available, store the bytes offline (paper QR + encrypted USB
+  in two physical locations), broadcast later under duress.
+  Default fee in this mode is 10x `MIN_FEE_POST_FLAT` so a
+  single fork worth of governance fee inflation does not strand
+  the saved bytes.  `--fee` overrides.
+- **`messagechain broadcast-revoke --hex <bytes> | --file <path>`.**
+  Companion on the network-attached side.  Parses the saved
+  hex (whitespace-tolerant, so a printed page with newlines
+  works), confirms target entity + fee + tx hash, then submits
+  via the existing `emergency_revoke` RPC.  No cold key
+  required at broadcast time -- the bytes are already signed.
+
+The protocol's `RevokeTransaction` was designed for this
+workflow from day one (nonce-free, no expiration; see the
+module docstring) -- only the CLI was missing.  Now closed.
+
+### Deployment
+
+Activation height `VERSION_SIGNALING_HEIGHT = 3500` sits well
+above the live tip (~451 at release time), giving operators
+~20 days of runway to upgrade without protection from this very
+gate (which doesn't exist yet).  Manual coordination is the
+mitigation for fork-1 itself; future forks use the gate.
+
+Both validators MUST be on 1.10.0 before block 3500 or they
+will silently diverge there: blocks produced post-activation
+under V2 wire format are rejected by 1.9.x as "trailing bytes,"
+which presents as a fork to the new code.  See the design doc
+in the operator runbook for the full rollout sequence.
+
+### Changed
+
+- `BLOCK_SERIALIZATION_VERSION` is now `2` (was `1`); both V1
+  and V2 are in `_ACCEPTED_BLOCK_SERIALIZATION_VERSIONS` so
+  old-format blocks still decode cleanly.
+
 ## [1.9.0] — 2026-04-26
 
 Minor release. Hard fork (Tier 11) plus an opt-in operator feature.

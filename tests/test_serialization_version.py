@@ -46,10 +46,18 @@ from messagechain.identity.identity import Entity
 
 
 class TestSerializationVersionConstants(unittest.TestCase):
-    """The constants exist and are 1 — the initial wire format."""
+    """The constants exist and reflect the active wire format.
 
-    def test_block_serialization_version_is_one(self):
-        self.assertEqual(BLOCK_SERIALIZATION_VERSION, 1)
+    V1 was the initial wire format.  Fork 1 (audit finding #2) added
+    a uint16 validator_version field to block headers, bumping the
+    active block-serialization version to V2 (= 2).  V1 is still
+    accepted for the entire pre-Fork-1 chain history -- new code can
+    re-emit historical blocks under V1 -- but new blocks are stamped
+    V2 from the activation height onward.
+    """
+
+    def test_block_serialization_version_is_v2(self):
+        self.assertEqual(BLOCK_SERIALIZATION_VERSION, 2)
 
     def test_tx_serialization_version_is_one(self):
         self.assertEqual(TX_SERIALIZATION_VERSION, 1)
@@ -212,10 +220,25 @@ class TestBlockSerializationVersion(unittest.TestCase):
         return block
 
     def test_block_blob_starts_with_version_byte(self):
+        """The leading byte stamps which wire format the body uses.
+
+        Fork 1 made blocks self-select: pre-VERSION_SIGNALING_HEIGHT
+        blocks stamp V1 (= 1) so the original chain history's
+        block-hashes are preserved; post-activation blocks stamp V2
+        (= 2) so the new validator_version field is committed.  The
+        block built here uses block_number=0, well below activation,
+        so the stamp must be V1 -- both to assert the auto-selection
+        is wired correctly AND to guarantee genesis hashes never
+        drift under the new code.
+        """
         block = self._make_block()
         blob = block.to_bytes()
         self.assertGreaterEqual(len(blob), 1)
-        self.assertEqual(blob[0], BLOCK_SERIALIZATION_VERSION)
+        from messagechain.config import (
+            BLOCK_SERIALIZATION_VERSION_V1, VERSION_SIGNALING_HEIGHT,
+        )
+        self.assertLess(block.header.block_number, VERSION_SIGNALING_HEIGHT)
+        self.assertEqual(blob[0], BLOCK_SERIALIZATION_VERSION_V1)
 
     def test_block_roundtrip_at_current_version(self):
         block = self._make_block()
