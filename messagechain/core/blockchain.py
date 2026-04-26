@@ -1682,6 +1682,30 @@ class Blockchain:
                 "past_receipt_subtree_roots", {}
             ).items()
         }
+        # v20: key_history -- per-entity rotation history.  MUST be
+        # installed or `_public_key_at_height` falls back to the
+        # CURRENT pubkey for every entity; slash-evidence whose
+        # signing height predates a rotation then verifies against
+        # the wrong key on the synced node, while warm nodes admit
+        # the slash -- silent fork at the slash block.  The dict is
+        # also mirrored into chaindb's `key_history` table so a
+        # subsequent cold restart on this node rehydrates from disk
+        # rather than re-installing through the snapshot path.
+        # Sorting by ascending height matches `_record_key_history`'s
+        # append discipline so `_public_key_at_height`'s linear walk
+        # resolves correctly.  Round-8 fix.
+        self.key_history = {}
+        for eid, entries in snap.get("key_history", {}).items():
+            entries_sorted = sorted(
+                ((int(h), bytes(pk)) for (h, pk) in entries),
+                key=lambda hp: hp[0],
+            )
+            self.key_history[eid] = list(entries_sorted)
+            if self.db is not None and hasattr(
+                self.db, "add_key_history_entry",
+            ):
+                for (h, pk) in entries_sorted:
+                    self.db.add_key_history_entry(eid, h, pk)
 
         # Bogus-rejection processor: install processed set from snapshot.
         # No pending counterpart — apply-time decision.
@@ -10302,6 +10326,18 @@ class Blockchain:
                     for b in self.chain:
                         if b.header.block_number > 0:
                             self._apply_block_state(b)
+                    # Round-8 belt-and-suspenders: flush the in-memory
+                    # state we just rebuilt back to the DB.  The
+                    # save/restore symmetry fix in `chaindb.py` already
+                    # writes the correct mirror values inside the
+                    # restore transaction, but this extra flush handles
+                    # the edge where any chaindb table the snapshot
+                    # doesn't carry still ends up resynchronised before
+                    # the next block (defensive against a future field
+                    # being added to one side without the other).
+                    if self.db is not None:
+                        self._dirty_entities = None
+                        self._persist_state()
                     return False, f"Reorg aborted — new chain invalid at block #{blk.header.block_number}"
 
             self._apply_block_state(blk)
