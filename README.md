@@ -149,7 +149,15 @@ cloud firewall.
 ```bash
 # 1. on the host (as root) — installs MessageChain, generates the validator's
 #    keyfile, and prints its mc1... address.  Save that address.
-curl -L https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh | sudo bash
+#
+# Pull the script down and read it before running.  The installer pins
+# the install to the latest signed `vX.Y.Z-mainnet` tag and refuses to
+# proceed if the tag isn't signed by a release signer baked into the
+# script — but the script itself is the trust root, so eyeball it.
+curl -fsSL -o install-validator.sh \
+    https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh
+less install-validator.sh                  # review before running as root
+sudo bash install-validator.sh
 
 # 2. from a wallet with tokens, fund the address printed above:
 messagechain transfer --to mc1... --amount 10000
