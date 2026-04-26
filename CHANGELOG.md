@@ -4,6 +4,64 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] — 2026-04-26
+
+Minor release. Three CRITICAL security fixes — all the same root
+cause: the v1.14.0 `past_receipt_subtree_roots` defense (rotation
+no longer wipes outstanding evidence) had three integration gaps
+that effectively disabled the fix in production. **All mainnet
+operators should upgrade ASAP** — the v1.14.0 release notes told
+operators that rotation no longer wipes evidence; this release is
+what actually makes that true.
+
+Hard fork: `STATE_SNAPSHOT_VERSION 18 → 19`. Adds the new
+`past_receipt_subtree_roots` section to the state-snapshot root
+commitment. Pre-v19 snapshots are upgraded via a `setdefault` to an
+empty history (no prior rotations to preserve), so a v18→v19
+upgrade is seamless. Two state-synced nodes that observed different
+rotation histories now correctly produce different state roots
+instead of agreeing on root but disagreeing on which receipts are
+admissible.
+
+### Security
+
+- **Block-apply path now routes through `_record_receipt_subtree_root`**
+  (cd80604). Pre-fix `_apply_authority_tx` inlined the live-root
+  overwrite and bypassed the helper that appends the OLD root to
+  `past_receipt_subtree_roots`. The standalone
+  `apply_set_receipt_subtree_root` method (which DOES use the
+  helper) was dead production code — only tests called it. Net
+  result: the v1.14.0 rotation-evidence-wipe defense was a no-op
+  on mainnet. A coerced validator who issued thousands of receipts
+  under R1 could publish ONE cold-key `SetReceiptSubtreeRoot(R2)`
+  in a block; on every honest peer replaying that block, R1
+  receipts became permanently inadmissible.
+- **`_snapshot_memory_state` / `_restore_memory_snapshot` now
+  capture `receipt_subtree_roots` + `past_receipt_subtree_roots`**
+  (cd80604). Pre-fix a bad-state-root block whose apply path
+  mutated the live map got caught by the post-apply state_root
+  check and rolled back, but the snapshot didn't include these
+  fields → in-memory map kept the rejected-block mutations.
+  Combined with the chaindb mirror write that already landed
+  during apply, the corruption persisted across restart.
+- **`past_receipt_subtree_roots` now committed to the state-
+  snapshot root** (cd80604). New `_TAG_PAST_RECEIPT_ROOT` section
+  with deterministic `(eid, root)` leaf builder, encoder/decoder
+  pair, and `serialize_state` extraction. Two state-synced nodes
+  that observed different rotation histories now produce different
+  state roots — closes the silent-fork window where they agreed on
+  root but disagreed on `receipt_root_admissible`.
+
+### Notes
+
+- The `STATE_SNAPSHOT_VERSION` bump means a v1.15+ node MUST be
+  used to validate v19 snapshots. v18 snapshots remain readable
+  on v1.15+ via the upgrade-path `setdefault` to an empty
+  `past_receipt_subtree_roots` map.
+- No new CLI commands, no new RPC methods, no behavior change for
+  honest operators. The fix is purely "make the v1.14.0 defense
+  actually run."
+
 ## [1.14.0] — 2026-04-26
 
 Minor release. Eleven critical security audit fixes across rounds 4
