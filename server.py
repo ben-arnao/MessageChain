@@ -151,6 +151,9 @@ _RPC_METHOD_COST: dict[str, int] = {
     "set_authority_key": RPC_COST_EXPENSIVE,
     "emergency_revoke": RPC_COST_EXPENSIVE,
     "set_receipt_subtree_root": RPC_COST_EXPENSIVE,
+    # Tier 17 ReactTransaction: deserialize + WOTS+ verify on submit;
+    # the get_* reads are cheap and use the dispatch default.
+    "submit_react": RPC_COST_EXPENSIVE,
 }
 
 
@@ -1779,6 +1782,15 @@ class Server(SharedRuntimeMixin):
         elif method == "submit_transfer":
             return self._rpc_submit_transfer(request["params"])
 
+        elif method == "submit_react":
+            return self._rpc_submit_react(request["params"])
+
+        elif method == "get_user_trust":
+            return self._rpc_get_user_trust(request["params"])
+
+        elif method == "get_message_score":
+            return self._rpc_get_message_score(request["params"])
+
         elif method == "reserve_leaf":
             return self._rpc_reserve_leaf(request["params"])
 
@@ -2144,6 +2156,18 @@ class Server(SharedRuntimeMixin):
                 if eid == entity_id and tx_nonce is not None and tx_nonce >= on_chain_nonce:
                     if tx_nonce + 1 > best:
                         best = tx_nonce + 1
+        # Tier 17 react pool — keyed on tx_hash with `voter_id`/`nonce`
+        # fields, not entity_id.  Without this scan a user submitting
+        # back-to-back ReactTxs would reuse a nonce and the second
+        # one would be rejected at admission.
+        react_pool = getattr(self.mempool, "react_pool", None) or {}
+        for rtx in react_pool.values():
+            if (
+                getattr(rtx, "voter_id", None) == entity_id
+                and rtx.nonce >= on_chain_nonce
+                and rtx.nonce + 1 > best
+            ):
+                best = rtx.nonce + 1
         return best
 
     def _admit_to_pool(self, pool_attr: str, tx) -> bool:
@@ -2852,6 +2876,142 @@ class Server(SharedRuntimeMixin):
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
+    def _rpc_submit_react(self, params: dict) -> dict:
+        """Accept a signed ReactTransaction (Tier 17) into the mempool.
+
+        Validates the activation gate, signature, fee floor, target
+        existence, and nonce monotonicity before admission.  Mirrors
+        the shape of `_rpc_submit_transfer` so wallet code can treat
+        every tx-submission endpoint uniformly.
+        """
+        try:
+            from messagechain.core.reaction import (
+                ReactTransaction,
+                verify_react_transaction,
+                REACT_CHOICE_CLEAR,
+                REACT_TX_HEIGHT,
+            )
+            tx = ReactTransaction.deserialize(params["transaction"])
+            # Activation gate — refuse pre-fork submissions outright so
+            # wallets get a clean error rather than "your tx silently
+            # never made it into a block."  Uses `chain.height + 1`
+            # because the next block, not the current tip, is what
+            # decides admission.
+            next_height = self.blockchain.height + 1
+            if next_height < REACT_TX_HEIGHT:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"ReactTransaction submissions are not yet active — "
+                        f"REACT_TX_HEIGHT={REACT_TX_HEIGHT}, current height "
+                        f"{self.blockchain.height}"
+                    ),
+                }
+            voter_pk = self.blockchain.public_keys.get(tx.voter_id)
+            if voter_pk is None:
+                return {
+                    "ok": False,
+                    "error": "voter is not a registered entity",
+                }
+            if not verify_react_transaction(
+                tx, voter_pk, current_height=next_height,
+            ):
+                return {
+                    "ok": False,
+                    "error": (
+                        "react tx signature/fee/canon-form/activation/"
+                        "self-trust check failed"
+                    ),
+                }
+            # Strict target existence — same rule the block-validate
+            # path enforces, surfaced at admission so a wallet can't
+            # submit a vote pointing at nothing.
+            if tx.target_is_user:
+                if tx.target not in self.blockchain.public_keys:
+                    return {
+                        "ok": False,
+                        "error": "user-trust target is not a registered entity",
+                    }
+            else:
+                if (
+                    self.blockchain.db is None
+                    or self.blockchain.db.get_tx_location(tx.target) is None
+                ):
+                    return {
+                        "ok": False,
+                        "error": "message-react target tx_hash not found in chain",
+                    }
+            # Nonce — share the same monotonic space as every other
+            # tx kind from this voter so a wallet can interleave
+            # transfers, messages, and react votes under one cursor.
+            expected_nonce = self._get_pending_nonce_all_pools(tx.voter_id)
+            if tx.nonce != expected_nonce:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Invalid nonce: expected {expected_nonce}, "
+                        f"got {tx.nonce}"
+                    ),
+                }
+            if not self.mempool.add_react_transaction(tx):
+                return {"ok": False, "error": "react pool full or duplicate"}
+            return {
+                "ok": True,
+                "result": {
+                    "tx_hash": tx.tx_hash.hex(),
+                    "voter_id": tx.voter_id.hex(),
+                    "target": tx.target.hex(),
+                    "target_is_user": tx.target_is_user,
+                    "choice": tx.choice,
+                    "fee": tx.fee,
+                    "message": "ReactTransaction accepted into mempool",
+                },
+            }
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_get_user_trust(self, params: dict) -> dict:
+        """Return the on-chain user-trust score for a target entity.
+
+        Score is the sum of UP (+1) and DOWN (-1) votes from every
+        voter at the current chain tip.  Cheap read against
+        `Blockchain.reaction_state` — no signature work, no replay.
+        Light clients can verify the answer against the chain state
+        root post-Tier-17 (the score is committed via
+        `_mix_state_roots`).
+        """
+        entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
+        if entity_id is None:
+            return {
+                "ok": False,
+                "error": "Invalid entity_id (must be 32 bytes hex)",
+            }
+        score = self.blockchain.reaction_state.user_trust_score(entity_id)
+        return {
+            "ok": True,
+            "result": {
+                "entity_id": entity_id.hex(),
+                "trust_score": score,
+            },
+        }
+
+    def _rpc_get_message_score(self, params: dict) -> dict:
+        """Return the on-chain net reaction score for a message tx_hash."""
+        tx_hash = parse_hex(params.get("tx_hash", ""), expected_len=32)
+        if tx_hash is None:
+            return {
+                "ok": False,
+                "error": "Invalid tx_hash (must be 32 bytes hex)",
+            }
+        score = self.blockchain.reaction_state.message_score(tx_hash)
+        return {
+            "ok": True,
+            "result": {
+                "tx_hash": tx_hash.hex(),
+                "score": score,
+            },
+        }
+
     def _rpc_get_entity(self, params: dict) -> dict:
         entity_id = parse_hex(params.get("entity_id", ""), expected_len=32)
         if entity_id is None:
@@ -3096,6 +3256,16 @@ class Server(SharedRuntimeMixin):
         txs = [t for t in all_pending if isinstance(t, MessageTransaction)]
         transfer_txs = [t for t in all_pending if isinstance(t, TransferTransaction)]
         slash_txs = self.mempool.get_slash_transactions()
+        # Tier 17: drain react pool only at/after activation height.
+        # Pre-activation a populated react slot would be rejected by
+        # validate_block, so don't even ask the mempool for entries.
+        from messagechain.config import REACT_TX_HEIGHT as _REACT_H
+        if self.blockchain.height + 1 >= _REACT_H:
+            react_txs = self.mempool.get_react_transactions(
+                max_count=MAX_TXS_PER_BLOCK,
+            )
+        else:
+            react_txs = []
         # Drain pending authority txs (SetAuthorityKey / Revoke / KeyRotation)
         # into this block.  Queued by their respective RPC handlers; applied
         # through _apply_block_state so every peer processing the block
@@ -3136,6 +3306,7 @@ class Server(SharedRuntimeMixin):
                 stake_transactions=stake_txs,
                 unstake_transactions=unstake_txs,
                 governance_txs=governance_txs,
+                react_transactions=react_txs,
             )
 
         success, reason = self.blockchain.add_block(block)
@@ -3145,6 +3316,10 @@ class Server(SharedRuntimeMixin):
             if slash_txs:
                 self.mempool.remove_slash_transactions(
                     [s.tx_hash for s in slash_txs]
+                )
+            if react_txs:
+                self.mempool.remove_react_transactions(
+                    [r.tx_hash for r in react_txs]
                 )
             if authority_txs:
                 for ah in [a.tx_hash for a in authority_txs]:
