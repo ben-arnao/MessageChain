@@ -249,7 +249,7 @@ from messagechain.crypto.hashing import default_hash
 #      layout: appended strictly after v16's registered_validators
 #      set as a single u8 flag (0 = False, 1 = True) for a compact
 #      encoding — simpler than widening the _TAG_GLOBAL scheme.
-STATE_SNAPSHOT_VERSION = 18  # wire format version for encode/decode
+STATE_SNAPSHOT_VERSION = 19  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -312,6 +312,16 @@ _TAG_CENSORSHIP_PROCESSED = b"cproc"
 # participate in the state root because two nodes that disagreed on
 # an issuer's root would accept/reject the same evidence differently.
 _TAG_RECEIPT_ROOT = b"rrk"
+# Per-validator HISTORICAL receipt-subtree roots.  When a
+# SetReceiptSubtreeRoot tx rotates an entity's root, the OLD root is
+# appended to this set so subsequent CensorshipEvidence /
+# BogusRejection / ack-registry validation can still admit receipts
+# issued under the old root.  MUST participate in the snapshot root
+# (v19 hard fork): two state-synced nodes that observed different
+# rotation histories produce the same `state_root` if this section
+# is omitted, but disagree on `receipt_root_admissible(eid, root)`
+# at the next contested CensorshipEvidence -- silent fork.
+_TAG_PAST_RECEIPT_ROOT = b"prrk"
 # Processed bogus-rejection-evidence set: every evidence_hash that has
 # ever been applied (slashed OR admitted-no-slash).  One-phase, no
 # pending counterpart — bogusness is decided at apply-time so there
@@ -523,6 +533,20 @@ def serialize_state(blockchain) -> dict:
         "receipt_subtree_roots": dict(
             getattr(blockchain, "receipt_subtree_roots", {})
         ),
+        # Per-validator HISTORICAL receipt-subtree roots (v19 hard
+        # fork).  entity_id -> set[32-byte root pubkey].  Receipts
+        # issued under any past root remain admissible after a
+        # SetReceiptSubtreeRoot rotation -- closes the v1.14.0
+        # rotation-evidence-wipe attack at the state-sync layer.
+        # Without this section a state-synced node installs only
+        # the current root and rejects pre-rotation receipts that
+        # the warm cluster still admits.
+        "past_receipt_subtree_roots": {
+            eid: set(roots)
+            for eid, roots in getattr(
+                blockchain, "past_receipt_subtree_roots", {},
+            ).items()
+        },
         # Bogus-rejection processor — set of evidence_hashes that have
         # ever been applied (slashed OR admitted-no-slash).  No pending
         # counterpart: bogusness is decided immediately at apply-time.
@@ -823,6 +847,13 @@ def deserialize_state(snapshot: dict) -> dict:
     out.setdefault("censorship_pending", {})
     out.setdefault("censorship_processed", set())
     out.setdefault("receipt_subtree_roots", {})
+    # Pre-v19 snapshots lack the past_receipt_subtree_roots map.  A
+    # migrating chain starts with an empty history -- acceptable
+    # because the rotation-evidence-wipe defense was introduced
+    # specifically at v1.14.0 and no historical block carries
+    # rotation events whose old roots need preserving for evidence
+    # validation that already passed pre-fork.
+    out.setdefault("past_receipt_subtree_roots", {})
     # Pre-v5 snapshots lack the bogus-rejection processed set.  A
     # migrating chain starts with an empty processed set — acceptable
     # because the slashing path was introduced specifically at this
@@ -969,6 +1000,40 @@ def _merkle(leaves: list[bytes]) -> bytes:
     return layer[0]
 
 
+def _bytes_set_dict_leaves(tag: bytes, items) -> list[bytes]:
+    """Build sorted leaves for a dict[bytes, set[bytes]] section
+    (e.g., past_receipt_subtree_roots).  Each leaf hashes
+        HASH( tag || u32_be(len(eid)) || eid ||
+              u32_be(len(root)) || root )
+    -- one leaf per (entity_id, root) pair.  Sorted lexicographically
+    by (eid, root) so two nodes with the same multiset compute the
+    same root regardless of insertion order.
+    """
+    leaves: list[bytes] = []
+    if not isinstance(items, dict):
+        raise TypeError(
+            f"_bytes_set_dict_leaves expected dict, got {type(items).__name__}"
+        )
+    for eid in sorted(items.keys()):
+        if not isinstance(eid, bytes):
+            raise TypeError(
+                f"_bytes_set_dict_leaves expected bytes key, "
+                f"got {type(eid).__name__}"
+            )
+        for root in sorted(items[eid]):
+            if not isinstance(root, bytes):
+                raise TypeError(
+                    f"_bytes_set_dict_leaves expected bytes inner element, "
+                    f"got {type(root).__name__}"
+                )
+            leaves.append(_h(
+                tag
+                + struct.pack(">I", len(eid)) + eid
+                + struct.pack(">I", len(root)) + root
+            ))
+    return leaves
+
+
 def _treasury_rolling_leaves(tag: bytes, entries) -> list[bytes]:
     """Build sorted leaves for the treasury rolling-debit section.
 
@@ -1071,6 +1136,16 @@ def compute_state_root(snapshot: dict) -> bytes:
         # here forks on admission.
         _TAG_RECEIPT_ROOT: _merkle(_entries_for_section(
             _TAG_RECEIPT_ROOT, snap["receipt_subtree_roots"])),
+        # Per-validator HISTORICAL receipt-subtree roots (v19 hard
+        # fork).  Two state-synced nodes that observed different
+        # rotation histories produce the same `state_root` if this
+        # section is omitted but disagree on `receipt_root_admissible`
+        # at the next contested CensorshipEvidence -> silent fork.
+        # Uses the custom (eid, root) leaf builder because the inner
+        # set must hash deterministically alongside the outer key.
+        _TAG_PAST_RECEIPT_ROOT: _merkle(_bytes_set_dict_leaves(
+            _TAG_PAST_RECEIPT_ROOT,
+            snap.get("past_receipt_subtree_roots", {}))),
         # Bogus-rejection processed set — the double-slash defense.
         # One section, no pending counterpart (apply-time decision).
         _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
@@ -1387,6 +1462,41 @@ def _decode_bytes_set(blob: bytes, off: int) -> tuple[set, int]:
     return out, off
 
 
+def _encode_bytes_set_dict(d: dict) -> bytes:
+    """Encode a dict[bytes, set[bytes]] -- e.g. past_receipt_subtree_roots
+    (entity_id -> set of past 32-byte root pubkeys).
+
+    Outer keys (entity_ids) are sorted; inner sets are sorted by
+    `_encode_bytes_set`.  Round-trip determinism mirrors the other
+    bytes-keyed encoders.
+    """
+    out = bytearray()
+    out += struct.pack(">I", len(d))
+    for key in sorted(d.keys()):
+        if not isinstance(key, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot set-dict expected bytes key, "
+                f"got {type(key).__name__}"
+            )
+        out += struct.pack(">I", len(key)) + key
+        out += _encode_bytes_set(d[key])
+    return bytes(out)
+
+
+def _decode_bytes_set_dict(blob: bytes, off: int) -> tuple[dict, int]:
+    (n,) = struct.unpack_from(">I", blob, off)
+    off += 4
+    out: dict = {}
+    for _ in range(n):
+        (klen,) = struct.unpack_from(">I", blob, off)
+        off += 4
+        key = bytes(blob[off:off + klen])
+        off += klen
+        inner, off = _decode_bytes_set(blob, off)
+        out[key] = inner
+    return out, off
+
+
 def _encode_int_bytes_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
@@ -1619,6 +1729,17 @@ def encode_snapshot(snap: dict) -> bytes:
     # prefix of a v18 blob.  See _TAG_KEY_ROTATION_LAST_HEIGHT for why
     # this must live in the state-root commitment.
     out += _encode_bytes_int_dict(snap.get("key_rotation_last_height", {}))
+    # v19: past_receipt_subtree_roots (bytes->set[bytes] dict).
+    # Strictly appended after v18's key_rotation_last_height so a
+    # v18 blob is a strict prefix of a v19 blob.  See
+    # _TAG_PAST_RECEIPT_ROOT for why this must live in the state-
+    # root commitment -- without it, two state-synced nodes with
+    # different rotation histories produce the same `state_root` but
+    # disagree on `receipt_root_admissible`, forking on the next
+    # contested CensorshipEvidence.
+    out += _encode_bytes_set_dict(
+        snap.get("past_receipt_subtree_roots", {}),
+    )
     return bytes(out)
 
 
@@ -1745,6 +1866,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # present on v18+ blobs; the strict version check above rejects
     # earlier versions.
     key_rotation_last_height, off = _decode_bytes_int_dict(blob, off)
+    # v19+: past_receipt_subtree_roots (bytes->set[bytes] dict).
+    # Always present on v19+ blobs; pre-v19 blobs are rejected by
+    # the strict version check above.
+    past_receipt_subtree_roots, off = _decode_bytes_set_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -1797,4 +1922,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "registered_validators": registered_validators,
         "rolling_fee_burn_seeded": rolling_fee_burn_seeded,
         "key_rotation_last_height": key_rotation_last_height,
+        "past_receipt_subtree_roots": past_receipt_subtree_roots,
     }

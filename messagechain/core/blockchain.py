@@ -7650,13 +7650,23 @@ class Blockchain:
                     f"{atx.fee} vs base_fee {base_fee}) — skipping"
                 )
                 return
-            self.receipt_subtree_roots[atx.entity_id] = atx.root_public_key
-            if self.db is not None and hasattr(
-                self.db, "set_receipt_subtree_root",
-            ):
-                self.db.set_receipt_subtree_root(
-                    atx.entity_id, atx.root_public_key,
-                )
+            # Route through `_record_receipt_subtree_root` so the
+            # rotation-history map (`past_receipt_subtree_roots`)
+            # stays populated.  Without this, the v1.14.0 round-5
+            # defense was completely non-functional in production:
+            # every block-applied SetReceiptSubtreeRoot inlined the
+            # live-root overwrite directly and bypassed the helper,
+            # so a coerced validator could wipe ALL outstanding
+            # CensorshipEvidence + BogusRejection evidence with a
+            # single cold-key rotation tx -- the exact attack the
+            # past_receipt_subtree_roots history was meant to defeat.
+            # The `apply_set_receipt_subtree_root` standalone method
+            # at line ~2663 (which DOES use the helper) is dead
+            # production code; only tests called it.  This fix
+            # consolidates both call sites onto the helper.
+            self._record_receipt_subtree_root(
+                atx.entity_id, atx.root_public_key,
+            )
             # Nonce-free; signature consumed a leaf in the COLD tree —
             # deliberately do NOT bump the hot-key watermark, matching
             # Revoke.
@@ -10535,6 +10545,21 @@ class Blockchain:
             # for any tx that references the affected entities.
             "entity_id_to_index": dict(self.entity_id_to_index),
             "next_entity_index": self._next_entity_index,
+            # Receipt-subtree roots (current + history).  Both are
+            # mutated by the SetReceiptSubtreeRoot apply path; a bad-
+            # state-root block whose apply mutated them gets caught
+            # by the post-apply state_root check and rolled back via
+            # _restore_memory_snapshot -- without these fields the
+            # rollback leaves attacker-injected roots in memory,
+            # forking the node off honest peers on every subsequent
+            # CensorshipEvidence / BogusRejection slash decision.
+            # past_receipt_subtree_roots is dict[bytes, set[bytes]]
+            # so we deep-copy the inner sets to avoid aliasing.
+            "receipt_subtree_roots": dict(self.receipt_subtree_roots),
+            "past_receipt_subtree_roots": {
+                eid: set(roots)
+                for eid, roots in self.past_receipt_subtree_roots.items()
+            },
             # Attestation-layer finality + escrow are also mutated by
             # _apply_block_state.  If a block passes structural validation
             # but its declared state_root disagrees with ours, add_block
@@ -10720,6 +10745,26 @@ class Blockchain:
             self._next_entity_index = int(snapshot.get(
                 "next_entity_index", max(self.entity_id_to_index.values(), default=0) + 1,
             ))
+        # Receipt-subtree roots (current + history).  See the
+        # snapshot-side comment for why both must rewind.  Default
+        # to empty dicts when absent (pre-field snapshot) to match
+        # a freshly-initialised Blockchain.  The chaindb mirror is
+        # a separate path -- a failed-state-root rollback within a
+        # single process restores in-memory only; the on-disk row
+        # written during _apply_authority_tx persists and is the
+        # subject of the round-3 known HIGH "DB-mirrored mutations
+        # leak" finding (out of scope for this fix; addressed there).
+        if "receipt_subtree_roots" in snapshot:
+            self.receipt_subtree_roots = dict(
+                snapshot["receipt_subtree_roots"],
+            )
+        if "past_receipt_subtree_roots" in snapshot:
+            self.past_receipt_subtree_roots = {
+                eid: set(roots)
+                for eid, roots in snapshot[
+                    "past_receipt_subtree_roots"
+                ].items()
+            }
         # Finality tracker + escrow carry same-block-only mutations that
         # must be reverted when the containing block's state_root fails
         # validation.  Default to fresh instances when absent (pre-field
