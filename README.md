@@ -131,87 +131,78 @@ messagechain proposals                          # open proposals + tallies
 
 ### Validator operations
 
-Quick start: stake tokens, then run `start --mine` on a host with
-TCP 9333/9334 open. `key-status` warns you when to rotate your
-WOTS+ signing key before it exhausts.
-
 ```bash
-messagechain init                               # one-shot: keyfile, data-dir, systemd units
-messagechain doctor                             # preflight: perms, ports, seeds, disk
-messagechain config set auto_upgrade false      # toggle onboard.toml flags
-messagechain start --mine                       # run a validator
 messagechain stake --amount 10000               # lock as validator stake
-messagechain unstake --amount 5000              # ~15-day unbonding (was 7d pre block 50,000)
-messagechain key-status                         # WOTS+ leaf usage; when to rotate
+messagechain unstake --amount 5000              # ~15-day unbonding
+messagechain start --mine                       # run a validator
+messagechain key-status                         # WOTS+ leaf usage
 messagechain rotate-key                         # fresh keypair, old key retired
-messagechain rotate-key-if-needed               # daily watchdog; rotates at >=95% consumed
 messagechain upgrade                            # install the latest mainnet tag
-messagechain set-authority-key --authority-pubkey <cold_hex>
-messagechain emergency-revoke --entity-id <hex> # cold-signed kill switch
 ```
 
-## Running a validator
+## Run a validator
 
-Minimum to participate in consensus:
-
-- **Stake:** 10,000 tokens locked via `messagechain stake`. Unbonding
-  takes ~15 days (2176 blocks) so you can be slashed for misbehavior
-  discovered after you leave.
-- **Host:** any always-on Linux box with Python 3.10+, ~2 GB RAM,
-  and outbound+inbound TCP 9333 (P2P) and 9334 (RPC). Validator-1
-  currently runs on a GCP `e2-small`.
-
-### Fast path: scripted install
-
-On a fresh Linux host (as root):
+You need 10,000 tokens to stake and an always-on Linux host (Python
+3.10+, ~2 GB RAM) with inbound TCP **9333 + 9334** open in your
+cloud firewall.
 
 ```bash
-curl -L https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh \
-  | sudo bash -s -- --from-git https://github.com/ben-arnao/MessageChain.git
+# 1. install on the host (as root) — generates the validator's keyfile
+curl -L https://raw.githubusercontent.com/ben-arnao/MessageChain/main/scripts/install-validator.sh | sudo bash
+
+# 2. print the validator's address (its keyfile signs blocks AND owns the stake)
+sudo -u messagechain messagechain account --keyfile /etc/messagechain/keyfile
+
+# 3. from a wallet that has tokens, send 10,000 to that address:
+#    messagechain transfer --to mc1... --amount 10000
+#    then back on the host:
+sudo -u messagechain messagechain stake --amount 10000
+
+# 4. start
+systemctl enable --now messagechain-validator messagechain-upgrade.timer messagechain-rotate-key.timer
+
+# 5. verify
+messagechain status
+journalctl -u messagechain-validator -f   # follow the log if status looks off
 ```
 
-That runs `messagechain init` which lays out `/var/lib/messagechain`,
-generates a hot keyfile at `/etc/messagechain/keyfile` (0600), writes
-`/etc/messagechain/onboard.toml`, and drops systemd unit files for
-the validator + the weekly auto-upgrade timer + the daily auto
-key-rotation watchdog. Both timers are enabled by default; toggle
-with `messagechain config set auto_upgrade false` /
-`config set auto_rotate false`.
+The installer's keyfile **is** the validator's identity — the same
+key signs blocks and owns the stake, so tokens have to flow to the
+address it prints, not your wallet's address. Back the keyfile up.
 
-Verify before enabling the service:
+Rewards = block reward + tx fees + attester pool share, pro-rata by
+stake. Unbonding takes ~15 days (2176 blocks) — slashing windows
+extend past departure.
+
+<details>
+<summary>Manual install &amp; advanced operations</summary>
+
+**Manual run.** `messagechain generate-key`, store the hex on paper,
+then:
 
 ```bash
-messagechain doctor         # preflight: perms, ports, seeds, disk
-messagechain status --full  # chain reachable, top validators, peers
+messagechain start --mine --rpc-bind 0.0.0.0 \
+  --data-dir /var/lib/messagechain --keyfile /etc/messagechain/keyfile
 ```
 
-Then enable + start:
+A systemd unit example ships at
+[`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example).
 
-```bash
-systemctl enable --now messagechain-validator
-systemctl enable --now messagechain-upgrade.timer       # weekly binary upgrades
-systemctl enable --now messagechain-rotate-key.timer    # daily leaf-watermark watchdog
-```
+**Preflight.** `messagechain doctor` checks perms, ports, seeds, and
+disk. `messagechain status --full` confirms chain reachability.
 
-### Manual path
+**Toggle automation.** `messagechain config set auto_upgrade false` /
+`auto_rotate false` disables the timers.
 
-- **Keys:** `messagechain generate-key` and store the printed hex on
-  paper. Optionally set a cold authority key with `set-authority-key`
-  so key rotations require the cold key.
-- **Run:** `messagechain start --mine --rpc-bind 0.0.0.0 --data-dir
-  /var/lib/messagechain --keyfile /etc/messagechain/keyfile`. A
-  systemd unit example ships as
-  [`examples/messagechain-validator.service.example`](./examples/messagechain-validator.service.example)
-  — copy to `/etc/systemd/system/messagechain-validator.service`,
-  edit the paths, then `systemctl daemon-reload && systemctl enable
-  --now messagechain-validator`.
-- **Upkeep:** `key-status` and `rotate-key` by hand, or enable the
-  `messagechain-rotate-key.timer` unit for automatic rotation at
-  ≥95% WOTS+ leaf consumption.
+**Cold authority.** `messagechain set-authority-key --authority-pubkey
+<cold_hex>` requires a cold-signed key for future rotations.
+`messagechain emergency-revoke --entity-id <hex>` is the cold-signed
+kill switch.
 
-Rewards are a mix of block reward + transaction fees + attester
-pool share, split pro-rata by stake. Expect economics to tighten as
-the validator set grows.
+**Bare init.** The installer wraps `messagechain init`; you can run
+that directly on hosts where you don't want the curl-pipe.
+
+</details>
 
 ## Security & changelog
 
