@@ -331,6 +331,15 @@ class Blockchain:
         self.latest_release_manifest = None
         self.slashed_validators: set[bytes] = set()  # entity IDs that have been slashed
         self._processed_evidence: set[bytes] = set()  # evidence hashes already applied
+        # Per-validator count of successfully-applied slashes.  Tier 23
+        # (HONESTY_CURVE_HEIGHT) reads this to grade severity for the
+        # next offense — a repeat offender is slashed harder than a
+        # first-timer.  Derived state: rebuildable from the on-chain
+        # slash-tx stream (every successful apply_slash_transaction
+        # bumps the offender's count by 1).  Pre-fork the counter is
+        # still maintained so post-fork severity has a populated
+        # history to read from at activation height.
+        self.slash_offense_counts: dict[bytes, int] = {}
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
         # Long-range-attack defense — persistent finality checkpoints.
@@ -3329,6 +3338,58 @@ class Blockchain:
             return evidence.vote_a.signed_at_height
         return None
 
+    def _compute_slash_pct(self, tx, current_height: int) -> int:
+        """Tier 23 — grade slash severity for one slash tx.
+
+        Pure function of (tx.evidence, chain state at current_height).
+        Routed through the ``slashing_severity`` function so every node
+        replaying the same chain reaches the same percent.
+
+        Determines the offense kind from the evidence type, classifies
+        block-double-proposal evidence as AMBIGUOUS / UNAMBIGUOUS via
+        the header-shape rules, then dispatches to the curve.
+
+        Caller MUST guard with ``get_honesty_curve_active(height)``
+        before calling — pre-fork the legacy ``get_slash_pct`` is the
+        right answer and this helper would diverge.
+        """
+        from messagechain.consensus.honesty_curve import (
+            OffenseKind,
+            Unambiguity,
+            classify_block_evidence,
+            slashing_severity,
+        )
+        from messagechain.consensus.slashing import (
+            AttestationSlashingEvidence,
+            SlashingEvidence,
+        )
+        from messagechain.consensus.finality import FinalityDoubleVoteEvidence
+
+        ev = tx.evidence
+        if isinstance(ev, SlashingEvidence):
+            kind = OffenseKind.BLOCK_DOUBLE_PROPOSAL
+            amb = classify_block_evidence(ev.header_a, ev.header_b)
+        elif isinstance(ev, AttestationSlashingEvidence):
+            kind = OffenseKind.ATTESTATION_DOUBLE_VOTE
+            # Attestations have no wall-clock-driftable field — distinct
+            # block_hash at same height is always intentional.
+            amb = Unambiguity.UNAMBIGUOUS
+        elif isinstance(ev, FinalityDoubleVoteEvidence):
+            kind = OffenseKind.FINALITY_DOUBLE_VOTE
+            amb = Unambiguity.UNAMBIGUOUS
+        else:
+            # Unknown evidence type — fall back to the legacy
+            # block-wide slash_pct.  Reachable only if a future fork
+            # adds a new evidence type and forgets to extend this
+            # dispatch; the test suite catches that via the explicit
+            # branch coverage.
+            from messagechain.config import get_slash_pct
+            return get_slash_pct(current_height)
+
+        return slashing_severity(
+            ev.offender_id, kind, amb, blockchain=self,
+        )
+
     def apply_slash_transaction(self, tx: SlashTransaction, proposer_id: bytes) -> tuple[bool, str]:
         """Validate and apply a slash transaction."""
         valid, reason = self.validate_slash_transaction(tx)
@@ -3354,8 +3415,22 @@ class Blockchain:
         # validator set — only `_processed_evidence` dedupes so the
         # SAME piece of evidence cannot land twice.  See config.py
         # Tier 20 block for the operator-mistake-survivability rationale.
-        from messagechain.config import get_slash_pct
-        slash_pct = get_slash_pct(self.height)
+        #
+        # Tier 23 honesty-curve gate (rides above Tier 20): once active,
+        # ``slashing_severity`` reads the offender's track record AND
+        # the unambiguity of the evidence and grades the per-offense
+        # percent.  Restart-shape evidence (close-timestamp +
+        # only-merkle-root delta) hits a small fraction; deliberate
+        # double-state-root or double-attestation evidence still hits
+        # 100% on any repeat.  Pre-fork the get_slash_pct value is used
+        # byte-for-byte so historical replay is unchanged.
+        from messagechain.config import (
+            get_honesty_curve_active,
+            get_slash_pct,
+        )
+        slash_pct = self._compute_slash_pct(tx, self.height) if (
+            get_honesty_curve_active(self.height)
+        ) else get_slash_pct(self.height)
         escrow_burned = self._escrow.slash_all(
             tx.evidence.offender_id, slash_pct=slash_pct,
         )
@@ -3377,6 +3452,13 @@ class Blockchain:
             tx.evidence.offender_id, tx.submitter_id, slash_pct=slash_pct,
         )
         self._processed_evidence.add(tx.evidence.evidence_hash)
+        # Tier 23: bump the per-offender repeat counter so the NEXT
+        # slash against this offender grades higher on the curve.
+        # Bumped regardless of fork height — pre-fork the counter is
+        # populated as derived state, post-fork it shapes severity.
+        self.slash_offense_counts[tx.evidence.offender_id] = (
+            self.slash_offense_counts.get(tx.evidence.offender_id, 0) + 1
+        )
         if slash_pct == 100:
             # Pre-Tier 19 path: full burn + permanent ban.  The slashed
             # validator set is consensus state — adding the offender
@@ -9057,7 +9139,16 @@ class Blockchain:
         # semantically identical to apply_slash_transaction — any drift
         # here vs. there means a slash applied via direct call diverges
         # from a slash applied via block inclusion, breaking determinism.
-        from messagechain.config import get_slash_pct
+        # Tier 23 honesty-curve gate: when active, severity is graded
+        # per-offender by `_compute_slash_pct` (reads chain state) so
+        # each slash tx in the block can land at a different percent.
+        # Pre-Tier-23 this collapses back to a single block-wide
+        # `slash_pct_for_block` from get_slash_pct.
+        from messagechain.config import (
+            get_honesty_curve_active,
+            get_slash_pct,
+        )
+        curve_active = get_honesty_curve_active(block.header.block_number)
         slash_pct_for_block = get_slash_pct(block.header.block_number)
         for stx in block.slash_transactions:
             if not self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee):
@@ -9065,8 +9156,13 @@ class Blockchain:
                     f"Slash tx {stx.tx_hash.hex()[:16]} fee payment failed — skipping"
                 )
                 continue
+            stx_slash_pct = (
+                self._compute_slash_pct(stx, block.header.block_number)
+                if curve_active
+                else slash_pct_for_block
+            )
             escrow_burned = self._escrow.slash_all(
-                stx.evidence.offender_id, slash_pct=slash_pct_for_block,
+                stx.evidence.offender_id, slash_pct=stx_slash_pct,
             )
             if escrow_burned > 0:
                 cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
@@ -9078,9 +9174,12 @@ class Blockchain:
             self.supply.slash_validator(
                 stx.evidence.offender_id,
                 stx.submitter_id,
-                slash_pct=slash_pct_for_block,
+                slash_pct=stx_slash_pct,
             )
-            if slash_pct_for_block == 100:
+            self.slash_offense_counts[stx.evidence.offender_id] = (
+                self.slash_offense_counts.get(stx.evidence.offender_id, 0) + 1
+            )
+            if stx_slash_pct == 100:
                 self.slashed_validators.add(stx.evidence.offender_id)
                 # Reputation reset: same policy as
                 # apply_slash_transaction; a slashed validator
@@ -11144,6 +11243,11 @@ class Blockchain:
         self.proposer_sig_counts = {}
         self.attestation_sig_counts = {}
         self.slash_sig_counts = {}
+        # Tier 23 honesty-curve repeat-offense tracker.  Reset on
+        # replay just like proposer_sig_counts / reputation — derived
+        # from the on-chain slash-tx stream, rebuilds via
+        # apply_slash_transaction increments during forward replay.
+        self.slash_offense_counts = {}
         self.key_rotation_counts = {}
         # Cooldown tracking for KEY_ROTATION_COOLDOWN_BLOCKS enforcement
         # (iter 6 H2).  In-memory only; resets to empty on restart,

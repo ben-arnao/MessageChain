@@ -3716,6 +3716,157 @@ GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 = 50
 MAX_PROPOSAL_TITLE_BYTES_TIER19 = 200
 MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19 = 2_000
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 23 — Honesty curve slashing
+# ─────────────────────────────────────────────────────────────────────
+#
+# Tier 20 (SOFT_SLASH) flattened the catastrophic 100% burn down to a
+# fixed 5% per offense and let geometric decay handle repeat offenders.
+# That softened the headline accident — operator dual-node misconfig —
+# but left two design gaps that the audit on this branch surfaced:
+#
+#   1. Severity is INDIFFERENT to evidence quality.  A genuine
+#      double-sign attack (two headers with distinct ``state_root`` —
+#      the proposer chose two parallel post-states for the same height,
+#      a clear deliberate violation) is slashed at the same 5% as a
+#      crash-restart artifact (two headers that differ only in
+#      ``merkle_root`` because the rebuilt mempool snapshot moved
+#      between the partial-propagation and the restart-resign).  Tier 20
+#      treats accident and attack identically.
+#
+#   2. Severity is INDIFFERENT to the offender's track record.  A
+#      validator who has correctly proposed 100,000 blocks and attested
+#      to 1,000,000 over years pays the same 5% on a single accident as
+#      a validator who staked yesterday and started misbehaving
+#      immediately.  The CLAUDE.md anchor ("honest operators are
+#      insured against accidents… severity should be informed by track
+#      record, not just the single offense") is not realized.
+#
+# Tier 23 closes both gaps with an honesty curve.  ``slashing_severity``
+# (in ``messagechain.consensus.honesty_curve``) computes a per-offense
+# slash percentage from:
+#
+#   * ``proposer_sig_counts[validator_id]`` — accepted block proposals.
+#     A proxy for "this operator has been doing block production
+#     correctly for a long time."  Already maintained on chain by
+#     ``Blockchain._apply_block_state``.
+#   * ``reputation[validator_id]`` — accepted attestations.  Same
+#     intuition, finer-grained (validators attest more than they
+#     propose).  Already maintained on chain by
+#     ``_process_attestations``.
+#   * ``slash_offense_counts[validator_id]`` — count of slashes
+#     successfully applied to this offender across chain history.  New
+#     in this fork; rebuildable from the slash-tx stream so it is not
+#     opaque persisted state.
+#   * Evidence unambiguity — block double-proposal where the only diff
+#     is ``merkle_root`` + a small ``timestamp`` drift is classified
+#     AMBIGUOUS (single-restart artifact).  Anything else (different
+#     ``state_root`` / different ``prev_hash`` / large timestamp gap /
+#     attestation double-vote / finality double-vote) is UNAMBIGUOUS
+#     and slashes hard regardless of history.
+#
+# The severity function is BACKWARD-COMPAT-ABLE behind this fork
+# height: below ``HONESTY_CURVE_HEIGHT`` the slash policy is the
+# byte-identical Tier 20 (or pre-Tier 20) path.  Above, the curve
+# computes the slash percent and ``slash_validator`` applies it.
+#
+# Persistent same-height sign guard.  In the same release, the
+# proposer / attester / finality-voter persist their last-signed height
+# to disk before the signature leaves the process — same persist-
+# before-sign ratchet pattern that ``messagechain.crypto.keys`` uses
+# for WOTS+ leaf indexes.  An honest crash-restart that would have
+# produced byte-different conflicting headers (because timestamp ticks
+# and the rebuilt mempool snapshot has shifted) is now refused at the
+# guard layer instead of producing slashable evidence.
+#
+# Activation: HONESTY_CURVE_HEIGHT = 21000, riding above Tier 22
+# (VOTER_REWARD_HEIGHT = 19000) with the standard ~2000-block runway.
+HONESTY_CURVE_HEIGHT = 21_000  # Tier 23
+
+# Severity-curve tuning knobs.  Anchored *shape* is "small AMBIGUOUS
+# baseline + escalation per repeat + relief from honest history",
+# numbers are tunable via fork.
+
+# Floor — no slash that lands ever rounds below this percent.  Paired
+# with the universal slash_pct > 0 invariant in slash_validator().
+HONESTY_CURVE_MIN_PCT = 1
+
+# Baseline percent for an AMBIGUOUS first offense from a fresh
+# validator (no track record).  Intentionally matches SOFT_SLASH_PCT
+# so the curve degrades gracefully toward Tier 20 semantics in the
+# absence of any tilting input.
+HONESTY_CURVE_AMBIGUOUS_BASE_PCT = 5
+
+# Each prior recorded offense scales the AMBIGUOUS base by
+# (1 + AMBIGUOUS_REPEAT_MULTIPLIER * prior_offenses).  At
+# multiplier=2.0, prior=5 → base × 11; rapid escalation but the floor
+# at 1% and ceiling at 100% bound it.
+HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER = 2
+
+# Honest-history relief: at HONEST_TRACK_THRESHOLD signs (good_blocks
+# weighted × 4 + good_attestations) and above, the AMBIGUOUS slash is
+# scaled by max(HONEST_TRACK_FLOOR, threshold / track_record).  Below
+# the threshold, full base percent applies (no relief — fresh
+# validator is already at the soft-slash baseline).
+HONESTY_CURVE_HONEST_TRACK_THRESHOLD = 100
+HONESTY_CURVE_HONEST_TRACK_FLOOR = 0.2  # never relieve below 1/5 of base
+
+# Weight on accepted block proposals when computing track_record.
+# A successful block proposal is a stronger signal of operator quality
+# than a successful attestation (proposer chose every byte; attester
+# only voted on someone else's bytes), so we weight it heavier.
+HONESTY_CURVE_BLOCK_WEIGHT = 4
+HONESTY_CURVE_ATTEST_WEIGHT = 1
+
+# UNAMBIGUOUS first offense for a long-history validator: cannot drop
+# below HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT.  This is the deliberate-
+# Byzantine band; even a perfect track record cannot soften it below
+# half-stake.
+HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT = 50
+
+# Restart-drift tolerance: two block headers whose timestamps differ
+# by ≤ this many seconds and whose only signable_data difference is
+# merkle_root (and timestamp) are classified AMBIGUOUS.  Beyond this,
+# the gap is too large for a single crash-restart cycle on commodity
+# hardware and the headers are treated as a deliberate double-sign.
+HONESTY_CURVE_RESTART_DRIFT_SECS = 120
+
+assert HONESTY_CURVE_MIN_PCT >= 1, (
+    "HONESTY_CURVE_MIN_PCT must be ≥ 1 — slash_validator's universal "
+    "slash_pct > 0 invariant means a 0% slash silently no-ops"
+)
+assert HONESTY_CURVE_AMBIGUOUS_BASE_PCT > 0, (
+    "Ambiguous base must be positive — a 0% baseline turns the curve "
+    "into a no-op for the most common (honest accident) path"
+)
+assert 0 < HONESTY_CURVE_HONEST_TRACK_FLOOR <= 1.0, (
+    "HONEST_TRACK_FLOOR must be in (0, 1.0] — at 0 the relief is "
+    "unbounded (a long-history validator could escape any slash); at "
+    "1.0 there is no relief at all and the fork is pointless"
+)
+assert HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT >= HONESTY_CURVE_AMBIGUOUS_BASE_PCT, (
+    "UNAMBIGUOUS_FIRST_PCT must be ≥ AMBIGUOUS_BASE_PCT — deliberate "
+    "Byzantine evidence cannot be slashed *less* than an accidental "
+    "one for the same offender"
+)
+assert HONESTY_CURVE_RESTART_DRIFT_SECS > 0, (
+    "Restart-drift tolerance must be positive — at 0 every byte-"
+    "different header pair is treated as deliberate, defeating the "
+    "anchored honest-restart insurance"
+)
+
+
+def get_honesty_curve_active(current_block: int) -> bool:
+    """Return True if the honesty curve has activated at this height.
+
+    Dynamic config lookup (re-read each call) lets the test suite
+    monkey-patch ``HONESTY_CURVE_HEIGHT`` to exercise both regimes
+    without spinning the chain forward 21k blocks.
+    """
+    from messagechain import config as _cfg
+    return current_block >= _cfg.HONESTY_CURVE_HEIGHT
+
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
     "rides on top of the established post-Tier-18 schedule; activating "
@@ -3851,6 +4002,7 @@ for _fork_name, _fork_height in (
     ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
     ("PROPOSER_CAP_HALVING_HEIGHT", PROPOSER_CAP_HALVING_HEIGHT),
     ("VOTER_REWARD_HEIGHT", VOTER_REWARD_HEIGHT),
+    ("HONESTY_CURVE_HEIGHT", HONESTY_CURVE_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
@@ -3868,6 +4020,17 @@ assert SOFT_SLASH_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
     "SOFT_SLASH_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier 20 "
     "soft slashing rides above the latest established fork (Tier 19 "
     "proposal fee tightening)"
+)
+# Tier 23 (honesty curve) supersedes Tier 20's flat soft-slash with a
+# per-offender curve.  Curve must activate AFTER soft-slash so the
+# graceful-degrade case (no track record, ambiguous evidence) lands
+# at the same 5% baseline Tier 20 already established.
+assert HONESTY_CURVE_HEIGHT > SOFT_SLASH_HEIGHT, (
+    "HONESTY_CURVE_HEIGHT must follow SOFT_SLASH_HEIGHT — Tier 23 "
+    "supersedes Tier 20's flat 5% with a track-record-aware curve; "
+    "the curve's AMBIGUOUS first-offense baseline equals Tier 20's "
+    "SOFT_SLASH_PCT, so the soft-slash regime must already be the "
+    "active default at curve activation"
 )
 
 

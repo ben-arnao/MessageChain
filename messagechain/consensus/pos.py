@@ -417,6 +417,21 @@ class ProofOfStake:
                     if sig is not None and hasattr(sig, "leaf_index"):
                         proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
 
+        # Tier 23 same-height sign guard.  If the proposer entity has a
+        # ``height_sign_guard`` attached (production validators wire one
+        # in at startup; tests omit it), reserve the proposer-signing
+        # slot at this height BEFORE signing.  If the guard refuses
+        # (HeightAlreadySignedError) we propagate the exception — the
+        # caller's "we already produced a block at this height" recovery
+        # is the right response (skip this slot, log loudly), which is
+        # exactly what the audit anchor demands: an honest crash-restart
+        # must NOT produce two byte-different headers at the same
+        # height.  See messagechain.consensus.height_guard for the
+        # persist-before-sign ratchet rationale.
+        guard = getattr(proposer_entity, "height_sign_guard", None)
+        if guard is not None:
+            guard.record_block_sign(new_block_number)
+
         # Proposer signs the block header. randao_mix is excluded from
         # signable_data to break a circular dependency (the mix is derived
         # from this very signature) but is bound to the block via _compute_hash.
