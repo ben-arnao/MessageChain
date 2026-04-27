@@ -42,7 +42,54 @@ from messagechain.config import (
     DEFLATION_FLOOR_V2_HEIGHT,
     DEFLATION_REBATE_BPS,
     DEFLATION_REBATE_WINDOW_BLOCKS,
+    REWARD_CURVE_SMALL_THRESHOLD_BPS,
+    REWARD_CURVE_MID_THRESHOLD_BPS,
+    REWARD_CURVE_SMALL_NUMERATOR,
+    REWARD_CURVE_SMALL_DENOMINATOR,
+    REWARD_CURVE_MID_NUMERATOR,
+    REWARD_CURVE_MID_DENOMINATOR,
 )
+
+
+def reward_curve_multiplier(stake_bps: int) -> tuple[int, int]:
+    """Return (numerator, denominator) for a validator's Tier 20 reward
+    multiplier given their stake share of total active stake.
+
+    Implements the three-band piecewise-constant curve anchored in
+    CLAUDE.md (small < mid > large, large = baseline):
+        bps <  SMALL_THRESHOLD                → SMALL_NUM/SMALL_DEN  (<1.0)
+        SMALL_THRESHOLD ≤ bps < MID_THRESHOLD → MID_NUM/MID_DEN      (>1.0)
+        bps ≥ MID_THRESHOLD                   → 1/1                  (baseline)
+
+    Caller is responsible for height-gating: this helper is pure and
+    has no notion of activation height.  Pre-Tier-20 callers must NOT
+    invoke it; the legacy reward distribution is byte-for-byte
+    preserved by skipping the multiplier entirely below
+    REWARD_CURVE_HEIGHT.
+
+    `stake_bps` is in basis points (1 bp = 0.01%) of total active
+    stake.  Caller computes it as
+        stake_bps = validator_stake * 10_000 // total_active_stake
+    Defensive note: if total_active_stake is 0 (early bootstrap, all-
+    unstaked edge cases), the caller MUST short-circuit to the baseline
+    multiplier (1/1) BEFORE invoking this helper — division-by-zero
+    avoidance is a caller responsibility, kept here so the helper stays
+    pure-int and has a single behavior contract.
+
+    Returns integer (num, den) so the consensus path stays float-free:
+    the eventual reward computation is `reward * num // den`.
+    """
+    if stake_bps < REWARD_CURVE_SMALL_THRESHOLD_BPS:
+        return (
+            REWARD_CURVE_SMALL_NUMERATOR,
+            REWARD_CURVE_SMALL_DENOMINATOR,
+        )
+    if stake_bps < REWARD_CURVE_MID_THRESHOLD_BPS:
+        return (
+            REWARD_CURVE_MID_NUMERATOR,
+            REWARD_CURVE_MID_DENOMINATOR,
+        )
+    return (1, 1)
 
 
 class SupplyTracker:
