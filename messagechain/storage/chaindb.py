@@ -2190,6 +2190,21 @@ class ChainDB:
             "key_rotation_last_height": (
                 self.get_all_key_rotation_last_height()
             ),
+            # Round-12 fix: reaction_choices mirror table (Tier 17).
+            # Pre-fix `restore_state_snapshot` did NOT wipe this table
+            # at all -- a successful reorg across a block carrying
+            # a ReactTransaction left the losing-fork vote permanently
+            # on disk.  Cold restart of any node that processed the
+            # losing fork rehydrates the orphan choice, which mixes
+            # into `state_root_contribution()` and produces a
+            # divergent state root vs. the warm cluster -> silent
+            # consensus fork on the next block.  Same defect class as
+            # the round-2 entity_id_to_index, round-4
+            # key_rotation_last_height, and round-7
+            # receipt_subtree_roots leaks.  Snapshot now carries the
+            # full reaction_choices map AND restore wipes+re-inserts
+            # the table inside the same SQL transaction.
+            "reaction_choices": self.get_all_reaction_choices(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -2270,6 +2285,21 @@ class ChainDB:
             # fork rotation history must not survive.
             conn.execute("DELETE FROM receipt_subtree_roots")
             conn.execute("DELETE FROM past_receipt_subtree_roots")
+            # Round-12 fix: reaction_choices mirror table (Tier 17)
+            # joins the wipe list.  Each ReactTransaction landed on
+            # the losing fork mutates `reaction_choices` rows; on
+            # successful reorg the in-memory `reaction_state` is
+            # rebuilt from canonical replay but the disk rows for the
+            # losing-fork votes survive without this DELETE.  The
+            # next cold restart rehydrates the orphan choices
+            # (`_load_from_db` calls `get_all_reaction_choices`),
+            # `state_root_contribution()` then mixes them, and the
+            # restarted node silently forks at the next block whose
+            # state root the warm cluster computes WITHOUT those
+            # entries.  Same defect class as the four mirror tables
+            # already wiped above.  Re-inserts happen after the
+            # canonical replays restore the supply state below.
+            conn.execute("DELETE FROM reaction_choices")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -2350,6 +2380,29 @@ class ChainDB:
                         "(entity_id, root_public_key) VALUES (?, ?)",
                         (eid, root),
                     )
+            # Round-12: re-insert reaction_choices that the DELETE
+            # above just wiped.  Snapshot key is
+            # `(voter_id, target, target_is_user)` -> choice; the
+            # ReactionState round-trip rebuild reads back via
+            # `get_all_reaction_choices` so the on-disk shape and
+            # the in-memory dict stay in lockstep.  CLEAR entries
+            # are never persisted (in-memory absent ≡ CLEAR), so any
+            # snapshot dict carrying CLEAR is treated as a no-op
+            # (the upstream `apply` path won't have stored them).
+            for (voter, target, tu), choice in snapshot.get(
+                "reaction_choices", {},
+            ).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO reaction_choices "
+                    "(voter_id, target, target_is_user, choice) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        voter,
+                        target,
+                        1 if tu else 0,
+                        int(choice),
+                    ),
+                )
             # Round-8 fix: re-insert key_rotation_last_height the
             # DELETE above just wiped.  Same defect class as the
             # receipt-subtree mirror leak above; matches the round-4

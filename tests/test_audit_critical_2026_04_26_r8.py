@@ -64,8 +64,12 @@ class TestStateSnapshotIncludesKeyHistory(unittest.TestCase):
     populates the in-memory dict + chaindb mirror.
     """
 
-    def test_version_bumped_to_20(self):
-        self.assertEqual(
+    def test_version_bumped_to_at_least_20(self):
+        # Round-8 originally bumped 19 -> 20.  Subsequent rounds may
+        # bump further (e.g. round-12 added reaction_choices at v21).
+        # The invariant we care about for round-8 is that the floor
+        # held -- never regressed below 20.
+        self.assertGreaterEqual(
             STATE_SNAPSHOT_VERSION, 20,
             "Round-8 fix bumps STATE_SNAPSHOT_VERSION 19 -> 20 to "
             "carry key_history in the wire format and snapshot root.",

@@ -1811,6 +1811,64 @@ class Blockchain:
                 for (h, pk) in entries_sorted:
                     self.db.add_key_history_entry(eid, h, pk)
 
+        # v21 (Tier 17): install ReactionState's ground-truth
+        # `reaction_choices` map.  MUST be installed -- pre-fix
+        # `_install_state_snapshot` left `self.reaction_state` as
+        # the default empty `ReactionState()`, so a state-synced
+        # node post-REACT_TX_HEIGHT computed
+        # `state_root_contribution()` over zero entries while the
+        # canonical chain header committed a root over real votes
+        # -- install-time root-equality check would fail and
+        # state-sync becomes impossible.  Mirrors the v20 key_history
+        # install pattern.  Aggregates (`_user_trust_score`,
+        # `_message_score`) are rebuilt from the choices via
+        # `ReactionState.deserialize`-style replay so the invariant
+        # `aggregate == sum_of_pairs(choices)` holds at install
+        # time.  Each choice is also written to chaindb's
+        # `reaction_choices` table so cold restart rehydrates from
+        # disk (no second install pass needed).  Round-12 fix.
+        from messagechain.core.reaction import (
+            ReactionState as _ReactionState,
+            _score_value as _react_score_value,
+            REACT_CHOICE_CLEAR as _REACT_CHOICE_CLEAR,
+            _VALID_CHOICES as _REACT_VALID_CHOICES,
+        )
+        self.reaction_state = _ReactionState()
+        for (voter, target, tu), choice in snap.get(
+            "reaction_choices", {},
+        ).items():
+            choice = int(choice)
+            if (
+                choice == _REACT_CHOICE_CLEAR
+                or choice not in _REACT_VALID_CHOICES
+            ):
+                # CLEAR / unknown entries should never have been
+                # persisted (in-memory rule: absent ≡ CLEAR).  Skip
+                # rather than corrupt the rebuild.
+                continue
+            self.reaction_state.choices[(voter, target, bool(tu))] = choice
+            score_delta = _react_score_value(choice)
+            if tu:
+                cur = self.reaction_state._user_trust_score.get(target, 0)
+                new = cur + score_delta
+                if new == 0:
+                    self.reaction_state._user_trust_score.pop(target, None)
+                else:
+                    self.reaction_state._user_trust_score[target] = new
+            else:
+                cur = self.reaction_state._message_score.get(target, 0)
+                new = cur + score_delta
+                if new == 0:
+                    self.reaction_state._message_score.pop(target, None)
+                else:
+                    self.reaction_state._message_score[target] = new
+            if self.db is not None and hasattr(
+                self.db, "set_reaction_choice",
+            ):
+                self.db.set_reaction_choice(
+                    voter, target, bool(tu), choice,
+                )
+
         # Bogus-rejection processor: install processed set from snapshot.
         # No pending counterpart — apply-time decision.
         self.bogus_rejection_processor.processed = set(
@@ -6605,6 +6663,22 @@ class Blockchain:
             )
             if not ok:
                 return False, reason
+        # Round-12: react_transactions (Tier 17) MUST also participate
+        # in the in-block WOTS+ leaf-collision sweep.  Pre-fix two
+        # signed payloads from the same voter at the same leaf could
+        # ride a single block (e.g. a Transfer at leaf N + a React at
+        # leaf N) -- both validated, both applied, the WOTS+ secret
+        # for that leaf publicly leaked, and any observer could forge
+        # a third tx at that leaf draining the voter.  See the
+        # function-level comment above ("Reusing a WOTS+ leaf leaks
+        # the private key, so this MUST be impossible") -- React was
+        # the lone tx kind missing from the sweep.
+        for rtx in getattr(block, "react_transactions", []) or []:
+            ok, reason = _check_leaf(
+                rtx.voter_id, rtx.signature.leaf_index, "react tx",
+            )
+            if not ok:
+                return False, reason
         if block.header.proposer_signature is not None:
             ok, reason = _check_leaf(
                 block.header.proposer_id,
@@ -7142,6 +7216,29 @@ class Blockchain:
                     return False, (
                         f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
                         f"voter {rtx.voter_id.hex()[:16]} not registered"
+                    )
+                # WOTS+ leaf-reuse gate -- mirrors the per-type checks
+                # for message / transfer / stake / governance / etc.
+                # Round-12 fix: pre-fix the react path admitted any
+                # leaf_index, including one already past the voter's
+                # watermark.  Reusing a WOTS+ leaf across two distinct
+                # signed payloads (e.g. a Transfer at leaf N then a
+                # React at leaf N) leaks enough one-time-key material
+                # for any observer to forge arbitrary signatures under
+                # that leaf -- including a TransferTransaction draining
+                # the voter's full balance and stake.  Rejecting at
+                # validation matches every other tx kind's
+                # leaf_watermark gate (see message:1923,
+                # transfer:2416, stake:2571, governance:7683).
+                if rtx.signature.leaf_index < self.leaf_watermarks.get(
+                    rtx.voter_id, 0,
+                ):
+                    return False, (
+                        f"Invalid react tx {rtx.tx_hash.hex()[:16]}: "
+                        f"WOTS+ leaf {rtx.signature.leaf_index} "
+                        f"already consumed (watermark "
+                        f"{self.leaf_watermarks[rtx.voter_id]}) -- "
+                        f"leaf reuse rejected"
                     )
                 # Base-fee gate (mirrors the per-type checks above).
                 if rtx.fee < current_base_fee:

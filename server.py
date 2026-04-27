@@ -2433,6 +2433,27 @@ class Server(SharedRuntimeMixin):
                     and sig.leaf_index == incoming_leaf
                 ):
                     return False
+        # Round-12: scan the react pool too.  Pre-fix the cross-pool
+        # dedupe didn't include react_pool, so a wallet bug or attacker
+        # could land a Transfer-then-React (or Message-then-React) at
+        # the same WOTS+ leaf -- the second sig leaks the one-time-key
+        # secret for that leaf, letting any observer forge arbitrary
+        # signatures.  Mirrors the in-block sweep added in
+        # blockchain.py and the per-tx watermark gate added to
+        # _validate_react_tx_in_block.
+        react_pool = getattr(self.mempool, "react_pool", None) or {}
+        for existing in react_pool.values():
+            sig = getattr(existing, "signature", None)
+            if sig is None:
+                continue
+            existing_signer = self._tx_signer_pubkey(existing)
+            if existing_signer is None:
+                continue
+            if (
+                existing_signer == incoming_signer
+                and sig.leaf_index == incoming_leaf
+            ):
+                return False
         # Mempool's internal guard covers message and transfer txs and
         # is already signer-agnostic (same-entity hot-only).
         return True
@@ -2461,7 +2482,17 @@ class Server(SharedRuntimeMixin):
                     continue
                 if eid == entity_id and sig.leaf_index == leaf_index:
                     return False
-        return True
+        # Round-12: include the react pool in the legacy
+        # entity-id-keyed sweep too -- same defect class as the
+        # signer-keyed path above.
+        react_pool = getattr(self.mempool, "react_pool", None) or {}
+        for existing in react_pool.values():
+            sig = getattr(existing, "signature", None)
+            eid = getattr(existing, "voter_id", None)
+            if sig is None or eid is None:
+                continue
+            if eid == entity_id and sig.leaf_index == leaf_index:
+                return False
         return True
 
     def _queue_authority_tx(self, tx, *, validate_fn) -> tuple[bool, str]:
@@ -2966,6 +2997,37 @@ class Server(SharedRuntimeMixin):
                     "error": (
                         f"Invalid nonce: expected {expected_nonce}, "
                         f"got {tx.nonce}"
+                    ),
+                }
+            # Round-12: cross-pool WOTS+ leaf dedupe, mirroring every
+            # other RPC submit endpoint.  Without this an attacker (or
+            # buggy wallet) could submit a Transfer at leaf N then a
+            # React at leaf N -- both pass, both apply in the same
+            # block, the WOTS+ leaf secret is publicly leaked from the
+            # two signatures, and any observer can forge a third tx
+            # under that leaf to drain the voter.
+            if not self._check_leaf_across_all_pools(tx):
+                return {
+                    "ok": False,
+                    "error": (
+                        "WOTS+ leaf already used by another pending tx "
+                        "-- leaf reuse rejected"
+                    ),
+                }
+            # Per-entity hot-key watermark gate -- mirrors the chain-
+            # level check added in _validate_react_tx_in_block.  Every
+            # other RPC submit path applies this gate; React was the
+            # lone gap.
+            if tx.signature.leaf_index < self.blockchain.leaf_watermarks.get(
+                tx.voter_id, 0,
+            ):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"WOTS+ leaf {tx.signature.leaf_index} already "
+                        f"consumed (watermark "
+                        f"{self.blockchain.leaf_watermarks[tx.voter_id]}) "
+                        f"-- leaf reuse rejected"
                     ),
                 }
             if not self.mempool.add_react_transaction(tx):
