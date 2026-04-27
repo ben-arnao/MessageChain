@@ -4,6 +4,117 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.0] — 2026-04-27
+
+Minor release. **Hard fork: Tier 24 — track-record-aware slashing**
+(activates at `HONESTY_CURVE_RATE_HEIGHT = 5000`) and **witness
+auto-separation default-on** (activates at
+`WITNESS_AUTO_SEPARATION_HEIGHT = 3000`). Plus a CRITICAL crypto
+safety fix (active immediately, not gated): cross-process advisory
+lock around the WOTS+ leaf-cursor advance to prevent concurrent
+CLI invocations from reusing the same one-time leaf. Plus operator
+UX: the long-defined post-block notify hook is now actually invoked,
+and a node stuck on a same-height minority fork now auto-resyncs.
+
+### Security (active immediately, not fork-gated)
+
+- **WOTS+ leaf-cursor cross-process advisory file lock** (f41dfa2).
+  Two concurrent CLI invocations on the same wallet (shell loop,
+  retry-while-pending, two terminal panes) could each observe
+  leaf=N on the on-disk cursor, both pass the per-process
+  `_sign_lock`, both persist N+1, and both sign at leaf N — WOTS+
+  leaf reuse mathematically reveals the leaf's private key,
+  letting an attacker forge txs at that leaf (spend balance,
+  rotate key, impersonate identity). Fix wraps the load → advance
+  → persist sequence in `KeyPair.sign` with an exclusive advisory
+  lock on a sibling `<leaf_index_path>.lock` file (`fcntl.flock`
+  on POSIX, `msvcrt.locking` on Windows), released in `finally`
+  even on persist failure / signature exception / KeyboardInterrupt.
+  Acquire blocks up to 30s and then raises a clear
+  `LeafCursorLockTimeoutError` naming the lock path.
+
+### Added (consensus, gated by activation height)
+
+- **Tier 24 — track-record-aware slashing severity** (878d07e).
+  At `HONESTY_CURVE_RATE_HEIGHT=5000`:
+  - **Honesty-curve RATE factor.** Tier 23 read `track_record` as
+    pure VOLUME (good_blocks + good_attestations); Tier 24 reduces
+    it by `BAD_PENALTY_WEIGHT × prior_offenses` (clamped ≥ 0).
+    Long-tenured validators with many priors lose relief in
+    proportion to bad volume; long-tenured + clean keeps full relief.
+  - **Perfect-record AMNESTY** (the "low chance of getting penalized"
+    anchor). AMBIGUOUS evidence + `track_record ≥ AMNESTY_TRACK_
+    THRESHOLD` (default 1000) + zero priors → severity = 0, slash
+    skipped entirely. Single-shot: `slash_offense_counts` is bumped
+    even on the 0-severity outcome, so the next AMBIGUOUS incident
+    sees prior=1 and falls back to standard small severity.
+    UNAMBIGUOUS evidence is never amnestied.
+  - **Inclusion-list slash routes through the honesty curve.**
+    Pre-Tier-24, `process_inclusion_list_violation` bypassed
+    `slashing_severity` and used a flat
+    `INCLUSION_VIOLATION_SLASH_BPS` rate, contradicting the
+    track-record-aware severity anchor for this evidence type.
+    Post-Tier-24: routed through `slashing_severity` with
+    `OffenseKind.INCLUSION_LIST_VIOLATION` +
+    `Unambiguity.UNAMBIGUOUS`, so a long-tenured first offender
+    hits `UNAMBIGUOUS_FIRST_PCT` (50%) instead of the flat rate,
+    and repeat offenders hit 100%.
+
+### Changed (consensus, gated by activation height)
+
+- **Witness auto-separation default-on** (69cf7ca). At
+  `WITNESS_AUTO_SEPARATION_HEIGHT=3000`, post-fork blocks past
+  `WITNESS_RETENTION_BLOCKS` (200) of the finality horizon get
+  their inline WOTS+ signatures stripped to the
+  `block_witnesses.witness_data` side-table on each sweep. WOTS+
+  signatures are ~73% of full-node block storage at saturation
+  but only serve auditability after finalization — moving them
+  off the hot block table keeps full-node storage broadly
+  accessible (CLAUDE.md anchor) without changing any consensus
+  output. Pre-fork blocks (`block_number <
+  WITNESS_AUTO_SEPARATION_HEIGHT`) are NEVER stripped, even after
+  the fork activates — replay determinism requires inline
+  witnesses for blocks the chain committed to inline. Reassembly
+  via `get_block_by_hash(..., include_witnesses=True)` remains
+  available; nothing is deleted.
+
+### Operational
+
+- **Auto-resync from minority fork** (878d07e, network-only, no
+  consensus impact). Pre-fix, the sync trigger fired only when
+  `peer_height > our_height` — a node stuck on a same-height
+  different-tip fork would never auto-recover. Adds
+  `Node._minority_fork_likely()`: counts at-or-above peers
+  reporting strictly-higher cumulative_weight; if a strict
+  majority disagrees with us, kicks `start_sync` so ForkChoice
+  picks the heavier chain on apply. Outlier defense: requires ≥ 2
+  corroborating peers.
+- **Post-block notify hook actually wired** (878d07e). The
+  `runtime.notify` per-block hook was DEFINED but never CALLED.
+  `Node._after_block_added()` is now invoked from each successful
+  `add_block` site (3 sites in `node.py`); short-circuits
+  cheaply when notify is disabled in `onboard.toml`; swallows all
+  exceptions so SMTP failures cannot affect consensus. Lazy
+  import keeps stripped-down builds free of the notify dependency.
+
+### Docs
+
+- **README leads with permanence + slashable censorship resistance**
+  (e67767f). Pulled the differentiator above the fold so a reader
+  who skims only the first paragraph still gets the headline
+  promise.
+
+### Operator notes
+
+- Validators must upgrade to 1.27.0 within the runway window
+  (current tip → 3000 → 5000) to follow the witness-separation
+  and Tier 24 hard forks. Pre-1.27.0 nodes will reject post-fork
+  blocks they synchronize from upgraded peers (different witness
+  layout / different slashing-severity output on inclusion-list
+  violations).
+- The crypto safety fix is active immediately; restart wallet
+  processes after upgrading so the lock is honored.
+
 ## [1.26.1] — 2026-04-27
 
 Hotfix.  `mempool._fee_per_byte` did `len(tx.message)` on every entry
