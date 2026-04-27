@@ -3408,6 +3408,63 @@ assert REACT_TX_HEIGHT > MARKET_FEE_FLOOR_HEIGHT, (
     "rule, diverging from the floor the rest of the chain has settled on"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 18: unified fee market across Message + Transfer + React
+# ─────────────────────────────────────────────────────────────────────
+# Three coordinated changes that close the cross-kind market gap left
+# by Tier 17.  Goal: every fee-bearing tx kind competes in ONE market,
+# under ONE per-block scarcity, with ONE shared EIP-1559 signal —
+# wallets bid honestly against each other regardless of tx kind, and
+# the fee market is the only inclusion-priority signal.
+#
+# (1) Unified per-block byte budget
+#     `MAX_BLOCK_TOTAL_BYTES` caps the SUM of serialized bytes across
+#     every Message, Transfer, and React tx in a block.  Pre-Tier-18
+#     blocks keep the per-kind caps (`MAX_BLOCK_MESSAGE_BYTES` for
+#     messages, `MAX_TXS_PER_BLOCK` count for transfers/react).
+#     Post-Tier-18 the per-kind rules still apply structurally, but
+#     the binding scarcity is the unified byte ceiling — a hot lane
+#     squeezes the others, forcing fungible auction behaviour.
+#
+# (2) EIP-1559 controller measures all three kinds
+#     The base-fee controller's "block fullness" signal at and after
+#     TIER_18_HEIGHT counts Message + Transfer + React tx counts
+#     against `TARGET_BLOCK_SIZE_POST_RAISE`.  Pre-fork it stays
+#     Message + Transfer (replay determinism on historical blocks).
+#
+# (3) REACT_FEE_FLOOR retires
+#     At and after TIER_18_HEIGHT, ReactTx admission is gated by
+#     `MARKET_FEE_FLOOR=1` (the same floor every other kind sees).
+#     The legacy `REACT_FEE_FLOOR=10` constant is preserved for
+#     pre-fork replay determinism only.  Type-specific surcharges
+#     with real externalities (`NEW_ACCOUNT_FEE`, `KEY_ROTATION_FEE`,
+#     `GOVERNANCE_PROPOSAL_FEE`) remain — those price actual costs
+#     the market doesn't see.
+#
+# Activation: rides above Tier 17 (REACT_TX_HEIGHT = 9000) with a
+# ~2000-block runway (~14 days at 600 s/block).
+TIER_18_HEIGHT = 11000
+
+# Unified per-block byte ceiling for the fee-bearing tx kinds.  Sized
+# so that a block at-or-near each per-kind structural cap (45 message
+# txs × ~3 KB witness + 45 transfer/react txs × ~2.7 KB witness)
+# would be over the unified ceiling — making the budget the binding
+# scarcity under all-lanes-full congestion, while leaving normal
+# operation comfortably under the cap.
+MAX_BLOCK_TOTAL_BYTES = 300_000
+
+assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
+    "TIER_18_HEIGHT must follow REACT_TX_HEIGHT — Tier 18 unifies the "
+    "fee market across Message + Transfer + React, so React must be a "
+    "first-class tx kind on chain before the unified budget bites"
+)
+assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
+    "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
+    "message-byte budget — otherwise a block of pure messages valid "
+    "under the per-kind cap would be invalid under the unified one, "
+    "creating a backward-incompatible activation surprise"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

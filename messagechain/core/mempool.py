@@ -587,32 +587,78 @@ class Mempool:
 
     # ── Tier 17 ReactTransaction pool ────────────────────────────
 
+    @staticmethod
+    def _react_fee_density(tx) -> float:
+        """Tier 18 selection priority for ReactTx: fee divided by
+        serialized byte cost (payload + WOTS+ witness).
+
+        Witness bytes dominate (~2.7 KB) and are uniform across react
+        txs, so the density collapses to absolute-fee bidding within
+        the kind — but expressing it on the same axis the message-tx
+        pool ranks on lets a future unified-mempool merge sort across
+        kinds with one comparator.
+        """
+        try:
+            return tx.fee / max(1, len(tx.to_bytes()))
+        except Exception:
+            # Defensive: a tx whose to_bytes() raises shouldn't crash
+            # admission ranking — fall back to absolute fee so it
+            # ranks correctly relative to its peers.
+            return float(tx.fee)
+
     def add_react_transaction(self, tx) -> bool:
-        """Admit a ReactTransaction into the pool.
+        """Admit a ReactTransaction into the pool with fee-density eviction.
+
+        At capacity, accepts the incoming tx iff its fee density
+        exceeds that of the lowest-density pending entry (which is
+        evicted to make room).  Mirrors the `MessageTransaction`
+        admission policy so the same auction dynamics apply to
+        ReactTx — wallets that want priority bid a higher fee, the
+        proposer always sees the highest-density set when assembling
+        the next block.
 
         Returns True on insertion, False if the tx is already present
-        or the pool is full.  Strict FIFO — no fee-density eviction.
+        OR the pool is full and the incoming tx does not beat the
+        lowest-density pending entry.
 
         The caller must run signature / target-existence / activation-
         gate checks before this call (see `verify_react_transaction`
-        + the chain-side checks in `validate_block`); the mempool only
-        enforces dedup, the protocol fee floor, and the cap.  This
-        mirrors how the message-tx pool admits a tx after the RPC
-        validate has succeeded — the mempool itself isn't a second
-        verifier.
+        + the chain-side checks in `validate_block`); the mempool
+        enforces dedup, the protocol fee floor, and the cap.
         """
         if tx.tx_hash in self.react_pool:
             return False
-        if len(self.react_pool) >= self.react_pool_max_size:
-            return False
         if tx.fee < MIN_FEE:
             return False
+        if len(self.react_pool) < self.react_pool_max_size:
+            self.react_pool[tx.tx_hash] = tx
+            return True
+        # Pool is full — fee-density eviction.  Find the lowest-density
+        # pending entry; admit the incoming tx only if it beats it.
+        incoming_density = self._react_fee_density(tx)
+        worst_hash = min(
+            self.react_pool,
+            key=lambda h: self._react_fee_density(self.react_pool[h]),
+        )
+        worst_density = self._react_fee_density(self.react_pool[worst_hash])
+        if incoming_density <= worst_density:
+            return False
+        del self.react_pool[worst_hash]
         self.react_pool[tx.tx_hash] = tx
         return True
 
     def get_react_transactions(self, max_count: int | None = None) -> list:
-        """Return pending ReactTransactions for inclusion in a new block."""
-        items = list(self.react_pool.values())
+        """Return pending ReactTransactions ordered by fee density (highest first).
+
+        Same ranking the message-tx selector uses, so the proposer
+        consistently picks the highest-revenue set under any per-block
+        scarcity (count cap or unified byte budget).
+        """
+        items = sorted(
+            self.react_pool.values(),
+            key=self._react_fee_density,
+            reverse=True,
+        )
         if max_count is not None:
             items = items[:max_count]
         return items
