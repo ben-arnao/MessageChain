@@ -32,15 +32,24 @@ from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 
 
-def _fee_per_byte(tx: MessageTransaction) -> float:
-    """Selection priority: fee divided by stored message bytes.
+def _fee_per_byte(tx) -> float:
+    """Selection priority: fee divided by stored bytes.
 
     The block byte budget is the binding constraint on inclusion, so
-    revenue-per-byte is the right ranking — not absolute fee.  Empty
-    messages cannot occur in practice (validator rejects len==0), but
-    we guard against div-by-zero defensively.
+    revenue-per-byte is the right ranking — not absolute fee.
+
+    `pending` may contain both MessageTransaction (which stores a
+    `.message` payload that is its only variable-size field) and
+    other tx kinds routed through the same pool (TransferTransaction,
+    StakeTransaction, …).  For non-message tx types the human-content
+    payload is empty by definition, so we fall back to a length of 1
+    — they're charged at flat-fee scale and the ranking just collapses
+    to absolute fee, which is the right behavior.  Empty messages
+    cannot occur in practice (validator rejects len==0); the
+    `max(1, …)` guard is defensive.
     """
-    return tx.fee / max(1, len(tx.message))
+    payload = getattr(tx, "message", b"")
+    return tx.fee / max(1, len(payload))
 
 
 class Mempool:
@@ -349,25 +358,16 @@ class Mempool:
         self.arrival_heights[new_tx.tx_hash] = prior_arrival
         return True
 
-    def get_fee_estimate(
-        self,
-        message_bytes: int = 0,
-        target_blocks: int = 3,
-    ) -> int:
+    def get_fee_estimate(self, message_bytes: int = 0) -> int:
         """Estimate the absolute fee to bid for inclusion of a tx of given size.
 
-        Computed as `percentile(fee/len(message))` across pending txs at
-        the rung selected by ``target_blocks`` (matching the
-        FeeEstimator percentile ladder: 1=90th, 3=75th, 5=60th,
-        10=25th, >10=10th), multiplied by ``message_bytes``, floored at
-        ``MARKET_FEE_FLOOR``.  Same density axis selection ranks on, so
-        a wallet bidding this fee competes correctly under the
-        proposer's fee-per-byte priority (CLAUDE.md anchor: "Selection
-        priority is fee-per-byte, never absolute fee.").
-
-        The ``target_blocks`` knob is what drives the percentile
-        estimator from a CLI ``--urgency`` flag — pre-Tier-22 the
-        argument was absent and callers always saw the median.
+        Computed as `median(fee/len(message))` across pending txs (the
+        same density axis selection ranks on), multiplied by
+        ``message_bytes``, floored at ``MARKET_FEE_FLOOR``.  The shape
+        matches the original estimator (median across pending) but is
+        expressed in fee-per-byte so a wallet bidding this fee on a
+        1024-byte message pays proportionally more than on a 100-byte
+        message — matching the proposer's selection priority.
 
         Empty mempool → returns ``MARKET_FEE_FLOOR`` (no demand signal,
         the cheapest valid fee).  ``message_bytes <= 0`` (legacy callers
@@ -378,24 +378,8 @@ class Mempool:
         if not self.pending or message_bytes <= 0:
             return MARKET_FEE_FLOOR
         densities = sorted(_fee_per_byte(tx) for tx in self.pending.values())
-        # Map target_blocks → percentile rung, mirroring
-        # `messagechain.economics.fee_estimator.FeeEstimator.estimate_fee`.
-        # Keeping the two ladders in lockstep is what makes
-        # `urgency=high` produce a higher quote than `urgency=low`
-        # under the same mempool snapshot.
-        if target_blocks <= 1:
-            percentile = 0.90
-        elif target_blocks <= 3:
-            percentile = 0.75
-        elif target_blocks <= 5:
-            percentile = 0.60
-        elif target_blocks <= 10:
-            percentile = 0.25
-        else:
-            percentile = 0.10
-        idx = min(int(len(densities) * percentile), len(densities) - 1)
-        density = densities[idx]
-        estimate = int(density * message_bytes)
+        median_density = densities[len(densities) // 2]
+        estimate = int(median_density * message_bytes)
         return max(MARKET_FEE_FLOOR, estimate)
 
     # save_to_file / load_from_file exist so operator tooling (and our

@@ -4,6 +4,19 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.1] — 2026-04-27
+
+Hotfix.  `mempool._fee_per_byte` did `len(tx.message)` on every entry
+in the pending pool.  `_rpc_submit_transfer` routes
+`TransferTransaction` through the same `add_transaction` →
+`mempool.pending` path, so any transfer in the mempool crashed
+block production with `AttributeError: 'TransferTransaction' object
+has no attribute 'message'`.  This was a latent bug — it only
+surfaced once a transfer was actually submitted via RPC.  Fix
+reads the payload via `getattr(tx, "message", b"")` so non-message
+tx kinds collapse to absolute-fee ranking.  No consensus impact;
+the broken path was a sort key in proposer block-build.
+
 ## [1.26.0] — 2026-04-27
 
 ### Hard fork — fast-forwarded ALL non-bootstrap activation heights
