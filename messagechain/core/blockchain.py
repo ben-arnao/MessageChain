@@ -11300,6 +11300,43 @@ class Blockchain:
             # in-memory snapshot AND the chaindb transaction.
             expected_state_root = self.compute_current_state_root()
             if block.header.state_root != expected_state_root:
+                # Diagnostic: dump per-leaf state for the entities a
+                # block of this shape would touch, so the next
+                # mismatch logs exactly which mutation the sim is
+                # missing without forcing another bisection.
+                try:
+                    diffs = []
+                    react_txs = getattr(block, "react_transactions", []) or []
+                    for rtx in react_txs:
+                        eid = rtx.voter_id
+                        live = self.state_tree.get(eid)
+                        diffs.append(
+                            f"react voter {eid.hex()[:16]}: tree={live} "
+                            f"bal={self.supply.balances.get(eid, 0)} "
+                            f"nonce={self.nonces.get(eid, 0)} "
+                            f"wm={self.leaf_watermarks.get(eid, 0)}"
+                        )
+                    proposer_id = block.header.proposer_id
+                    diffs.append(
+                        f"proposer {proposer_id.hex()[:16]}: "
+                        f"tree={self.state_tree.get(proposer_id)} "
+                        f"bal={self.supply.balances.get(proposer_id, 0)} "
+                        f"wm={self.leaf_watermarks.get(proposer_id, 0)}"
+                    )
+                    diffs.append(
+                        f"reaction_state choices={len(self.reaction_state.choices)} "
+                        f"contrib={self.reaction_state.state_root_contribution().hex()[:16]}"
+                    )
+                    diffs.append(
+                        f"block.state_root={block.header.state_root.hex()[:16]} "
+                        f"expected={expected_state_root.hex()[:16]}"
+                    )
+                    logger.warning(
+                        "state_root diagnostic: %s",
+                        " | ".join(diffs[:8]),
+                    )
+                except Exception:
+                    logger.exception("state_root diagnostic failed")
                 self._restore_memory_snapshot(snapshot)
                 self._rebuild_state_tree()
                 if self.db is not None:

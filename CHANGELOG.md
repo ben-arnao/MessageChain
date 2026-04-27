@@ -4,6 +4,15 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.29.1] — 2026-04-27
+
+Diagnostic-only release.  Adds a per-leaf state diagnostic at the
+`Invalid state_root — state commitment mismatch` rejection path so
+the next mismatch logs the react voters' state_tree rows, balance,
+nonce, leaf-watermarks, the proposer's row, and the reaction-state
+contribution hash — pinpointing which sim/apply mutation is missing
+without forcing another bisection.  No consensus-rule changes.
+
 ## [1.29.0] — 2026-04-27
 
 Tier 27 hard fork — symmetric no-self-react rule.
