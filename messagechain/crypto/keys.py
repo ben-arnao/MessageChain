@@ -46,6 +46,171 @@ class LeafIndexPersistError(RuntimeError):
     """
 
 
+class LeafCursorLockTimeoutError(RuntimeError):
+    """Raised when the cross-process leaf-cursor advisory lock cannot
+    be acquired within the timeout window.
+
+    The lock guards the read-modify-persist sequence on the on-disk
+    leaf-index cursor: two concurrent CLI invocations on the same
+    wallet (shell loop, retry-while-pending, two terminal panes, GUI
+    shim dispatching twice) could otherwise both observe leaf=N, both
+    pass the in-process ``_sign_lock`` (which is a per-process
+    ``threading.Lock``), both persist N+1, and both sign at leaf N.
+    WOTS+ leaf reuse mathematically reveals the leaf's private key.
+
+    A timeout here means another ``messagechain`` process holds the
+    lock — either still actively signing, or stuck.  The error message
+    names the lock path so operators can identify the cursor file and
+    investigate (typically: another shell, a hung CLI, or a stale lock
+    on a crashed process whose fd was closed by the OS — in which
+    case retrying is enough).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Cross-process advisory file lock for the WOTS+ leaf cursor.
+#
+# The lock is held on a sibling file (``<leaf_index_path>.lock``) rather
+# than on the cursor file itself: locking the cursor would fight with
+# its atomic tmp+rename persist path (a flock on the *old* inode
+# silently goes away when ``os.replace`` swaps the inode).  The sibling
+# pattern keeps the lock fd stable across the persist.
+#
+# POSIX uses ``fcntl.flock`` (advisory, fd-bound, automatically
+# released when the fd closes — including on process crash, which is
+# exactly what we want for stuck-process recovery).  Windows uses
+# ``msvcrt.locking`` with ``LK_LOCK`` for the blocking acquire and
+# ``LK_NBLCK`` for the polled timeout-bounded acquire.
+#
+# A 30-second default timeout is the operator-friendly upper bound:
+# long enough that healthy contention (two near-simultaneous CLI
+# invocations) resolves without an error, short enough that a stuck
+# lock surfaces a clear message instead of hanging indefinitely.
+# ---------------------------------------------------------------------------
+_LEAF_CURSOR_LOCK_TIMEOUT_S = 30.0
+
+
+def _acquire_leaf_cursor_lock(lock_path: str, timeout_s: float | None = None):
+    """Acquire an exclusive advisory lock on ``lock_path`` (a sibling
+    file next to the leaf-index cursor).
+
+    Returns the open file handle the caller MUST keep alive — the
+    advisory lock is bound to the fd's lifetime, so letting the fd be
+    garbage-collected releases the lock.  The handle is opaque to
+    callers; pass it to ``_release_leaf_cursor_lock`` when done.
+
+    Raises ``LeafCursorLockTimeoutError`` if the lock cannot be
+    acquired within ``timeout_s`` seconds.
+    """
+    # Read the timeout at call time so test-only patches of
+    # ``_LEAF_CURSOR_LOCK_TIMEOUT_S`` (and any future runtime
+    # reconfiguration) take effect.  An explicit positional argument
+    # overrides the module-level default.
+    if timeout_s is None:
+        # Late binding — pick up the current module-level value.
+        import messagechain.crypto.keys as _self
+        timeout_s = _self._LEAF_CURSOR_LOCK_TIMEOUT_S
+
+    # Make sure the parent directory exists; the cursor file may not
+    # have been created yet on first sign of a fresh wallet.
+    parent = os.path.dirname(os.path.abspath(lock_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    # Open with append mode so the file is created on first acquire
+    # and not truncated on subsequent ones.  We never write content to
+    # the lock file; flock on the fd is the entire payload.
+    handle = open(lock_path, "a+")
+
+    deadline = _time_monotonic() + max(0.0, float(timeout_s))
+
+    if os.name == "nt":
+        # Windows: msvcrt.locking is byte-range; we lock byte 0.
+        # LK_NBLCK fails immediately if held; we poll until the
+        # deadline.  msvcrt requires a non-zero length.
+        import msvcrt as _msvcrt
+        while True:
+            try:
+                # Position to byte 0 then attempt to lock 1 byte.
+                handle.seek(0)
+                _msvcrt.locking(handle.fileno(), _msvcrt.LK_NBLCK, 1)
+                return handle
+            except OSError:
+                if _time_monotonic() >= deadline:
+                    handle.close()
+                    raise LeafCursorLockTimeoutError(
+                        f"another messagechain process holds the "
+                        f"leaf-index lock at {lock_path}; wait for "
+                        f"it to finish or check for a stuck process."
+                    )
+                _time_sleep(0.05)
+    else:
+        # POSIX: fcntl.flock with non-blocking + sleep loop gives us a
+        # bounded wait.  A blocking flock has no portable timeout, and
+        # signal-based watchdogs interact badly with pytest-timeout's
+        # thread-method.  Polling at 50ms is cheap and bounded.
+        try:
+            import fcntl as _fcntl
+        except ImportError:
+            # Platform without fcntl AND without msvcrt: fall through
+            # without a real lock.  The in-process _sign_lock still
+            # serializes within the process; cross-process safety is
+            # genuinely not enforceable on such a platform.  This is
+            # a no-op only on niche/unsupported targets.
+            return handle
+
+        while True:
+            try:
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                return handle
+            except (OSError, IOError):
+                if _time_monotonic() >= deadline:
+                    handle.close()
+                    raise LeafCursorLockTimeoutError(
+                        f"another messagechain process holds the "
+                        f"leaf-index lock at {lock_path}; wait for "
+                        f"it to finish or check for a stuck process."
+                    )
+                _time_sleep(0.05)
+
+
+def _release_leaf_cursor_lock(handle) -> None:
+    """Release the advisory lock and close the handle.
+
+    Safe to call with a None handle (no-op).  Best-effort: any error
+    on release is logged but not raised — the lock is already released
+    when the fd closes regardless of explicit unlock.
+    """
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt as _msvcrt
+            try:
+                handle.seek(0)
+                _msvcrt.locking(handle.fileno(), _msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            try:
+                import fcntl as _fcntl
+                _fcntl.flock(handle.fileno(), _fcntl.LOCK_UN)
+            except (OSError, IOError, ImportError):
+                pass
+    finally:
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+# Module-level imports for the lock helpers.  Done here so the lock
+# path is hot-path friendly (no per-call import overhead).
+import time as _time_module
+_time_monotonic = _time_module.monotonic
+_time_sleep = _time_module.sleep
+
+
 def _fsync_parent_dir(dir_path: str) -> None:
     """Fsync a directory so its recent rename entries are durable.
 
@@ -566,91 +731,146 @@ class KeyPair:
     def sign(self, message_hash: bytes) -> Signature:
         """Sign using the next available WOTS+ leaf key (derived on demand).
 
-        Thread-safe: the leaf-index reservation (read-modify-write of
-        `_next_leaf`, plus the optional persist-before-sign disk
-        write) runs under `_sign_lock` so concurrent callers each
-        consume a distinct leaf.  Leaf-derivation + WOTS+ signing
-        runs OUTSIDE the lock -- those operations only read the
-        seed (immutable) and the reserved `leaf_idx` (local), so
-        parallel signing on different leaves is allowed.
+        Thread-safe AND process-safe: the leaf-index reservation (read-
+        modify-write of `_next_leaf`, plus the optional persist-before-
+        sign disk write) runs under both `_sign_lock` (in-process,
+        serializes threads in this interpreter) AND a cross-process
+        advisory file lock on a sibling of `leaf_index_path` (when
+        `leaf_index_path` is set).  The cross-process lock protects
+        against two CLI invocations on the same wallet observing the
+        same on-disk cursor and signing under the same one-time
+        WOTS+ leaf — a race that mathematically reveals the leaf's
+        private key.  Leaf-derivation + WOTS+ signing runs OUTSIDE
+        the lock -- those operations only read the seed (immutable)
+        and the reserved `leaf_idx` (local), so parallel signing on
+        different leaves is allowed.
+
+        The cursor file is machine-local; restoring the same key on a
+        second host requires `rotate-key` first.  The advisory lock
+        only prevents same-host races; a second machine has no fd-
+        bound lock to coordinate against.
         """
-        # Reserve a leaf index atomically.  The whole read-modify-
-        # write -- including the disk write of the persist-before-
-        # sign path -- must complete before another thread reads
-        # `_next_leaf`, otherwise two threads could both observe
-        # the same N and produce two signatures under the same
-        # one-time leaf (catastrophic WOTS+ key disclosure, see
-        # below).
-        with self._sign_lock:
-            if self._next_leaf >= self.num_leaves:
-                raise RuntimeError(
-                    "Key exhausted: all one-time keys have been used"
-                )
-            leaf_idx = self._next_leaf
+        # Cross-process advisory lock on a sibling .lock file.  Held
+        # across the load-from-disk → advance → persist-to-disk
+        # critical section so a concurrent process cannot observe a
+        # stale cursor.  In-memory _sign_lock is still held inside
+        # the file lock to keep thread-level race coverage intact.
+        file_lock_handle = None
+        if self.leaf_index_path is not None:
+            lock_path = self.leaf_index_path + ".lock"
+            file_lock_handle = _acquire_leaf_cursor_lock(lock_path)
 
-            # Persist-BEFORE-sign: durably record "leaf_idx has been
-            # consumed" before wots_sign() can produce bytes that
-            # might escape this process.  If we instead signed first
-            # and persisted after, a crash between the two would
-            # leave the broadcast signature on the wire while the on-
-            # disk counter still pointed at leaf_idx — on restart we
-            # would reuse leaf_idx and sign a second message with the
-            # same one-time key, which mathematically reveals the
-            # WOTS+ private key for that leaf.  Burning a leaf
-            # without a corresponding sign is cheap; reusing one is
-            # catastrophic.  If persist_leaf_index raises (disk full,
-            # I/O error), we abort the sign entirely — no signature
-            # is returned and _next_leaf stays put, so the next
-            # attempt retries the same leaf.
-            if self.leaf_index_path is not None:
-                # persist_leaf_index reads self._next_leaf, so
-                # temporarily advance it for the write then roll
-                # back on failure.
-                self._next_leaf = leaf_idx + 1
-                try:
-                    self.persist_leaf_index(self.leaf_index_path)
-                except Exception:
-                    self._next_leaf = leaf_idx
-                    raise
-            else:
-                self._next_leaf = leaf_idx + 1
-
-        # Derive the leaf keypair on demand — no private keys stored
-        priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
         try:
-            wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
-            if self._node_cache is not None:
-                # Cached path: O(height) slice reads rather than O(2^height)
-                # seed-based recomputation.  The cache is HMAC-authenticated
-                # on disk and its root is cross-checked against
-                # self.public_key at load time, so trusting it here does not
-                # introduce a new attack surface.
-                auth_path = self._node_cache.auth_path(leaf_idx)
-            else:
-                auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
+            with self._sign_lock:
+                # Re-load the on-disk cursor INSIDE the file lock so a
+                # concurrent process's persist (which finished before
+                # we acquired the lock) is observed.  load_leaf_index
+                # is monotonic — it never moves _next_leaf backwards —
+                # so the in-memory state may already be ahead of disk
+                # (e.g. an in-process advance_to_leaf from chain
+                # watermark, or a prior sign in this same process); in
+                # that case the load is a no-op.
+                if self.leaf_index_path is not None:
+                    try:
+                        self.load_leaf_index(self.leaf_index_path)
+                    except ValueError:
+                        # Corrupt cursor (next_leaf >= num_leaves).
+                        # Re-raise: signing further would risk reuse.
+                        raise
+                    except Exception:
+                        # Missing / unreadable file: load_leaf_index
+                        # already swallows FileNotFoundError +
+                        # JSONDecodeError + OSError, so anything that
+                        # bubbles up here is unexpected.  Don't crash
+                        # the sign on a transient read error -- the
+                        # in-memory _next_leaf is the safety floor.
+                        pass
+
+                if self._next_leaf >= self.num_leaves:
+                    raise RuntimeError(
+                        "Key exhausted: all one-time keys have been used"
+                    )
+                leaf_idx = self._next_leaf
+
+                # Persist-BEFORE-sign: durably record "leaf_idx has been
+                # consumed" before wots_sign() can produce bytes that
+                # might escape this process.  If we instead signed first
+                # and persisted after, a crash between the two would
+                # leave the broadcast signature on the wire while the on-
+                # disk counter still pointed at leaf_idx — on restart we
+                # would reuse leaf_idx and sign a second message with the
+                # same one-time key, which mathematically reveals the
+                # WOTS+ private key for that leaf.  Burning a leaf
+                # without a corresponding sign is cheap; reusing one is
+                # catastrophic.  If persist_leaf_index raises (disk full,
+                # I/O error), we abort the sign entirely — no signature
+                # is returned and _next_leaf stays put, so the next
+                # attempt retries the same leaf.
+                if self.leaf_index_path is not None:
+                    # persist_leaf_index reads self._next_leaf, so
+                    # temporarily advance it for the write then roll
+                    # back on failure.
+                    self._next_leaf = leaf_idx + 1
+                    try:
+                        self.persist_leaf_index(self.leaf_index_path)
+                    except Exception:
+                        self._next_leaf = leaf_idx
+                        raise
+                else:
+                    self._next_leaf = leaf_idx + 1
+
+            # Derive the leaf keypair on demand — no private keys stored.
+            # Outside the in-memory _sign_lock (leaf_idx is reserved &
+            # disk-recorded; parallel signers on different leaves are
+            # safe), but still inside the cross-process file lock.  We
+            # could in principle release the file lock here too, but
+            # holding it across wots_sign costs only a few ms and keeps
+            # the contention model simple: one signer per process at a
+            # time, full stop.
+            priv_keys, pub_key, pub_seed = _derive_leaf(self._seed, leaf_idx)
+            try:
+                wots_sig = wots_sign(message_hash, priv_keys, pub_seed)
+                if self._node_cache is not None:
+                    # Cached path: O(height) slice reads rather than O(2^height)
+                    # seed-based recomputation.  The cache is HMAC-authenticated
+                    # on disk and its root is cross-checked against
+                    # self.public_key at load time, so trusting it here does not
+                    # introduce a new attack surface.
+                    auth_path = self._node_cache.auth_path(leaf_idx)
+                else:
+                    auth_path = _compute_auth_path(self._seed, self.height, leaf_idx)
+            finally:
+                # Best-effort private key zeroing.  priv_keys are bytearray
+                # (mutable), so we can overwrite the buffer contents in-place.
+                # This limits the window in which key material sits in memory.
+                for pk in priv_keys:
+                    if isinstance(pk, bytearray):
+                        for j in range(len(pk)):
+                            pk[j] = 0
+
+            # Exhaustion-visibility warnings.  Emit at 80% and 95% usage so
+            # operators notice in their normal log pipeline long before the
+            # hard wall at 100% (after which funds are locked unless the
+            # user previously submitted a KeyRotationTransaction).  Deduped
+            # per (root, threshold) to avoid flooding logs on every slot.
+            self._maybe_warn_exhaustion()
+
+            return Signature(
+                wots_signature=wots_sig,
+                leaf_index=leaf_idx,
+                auth_path=auth_path,
+                wots_public_key=pub_key,
+                wots_public_seed=pub_seed,
+            )
         finally:
-            # Best-effort private key zeroing.  priv_keys are bytearray
-            # (mutable), so we can overwrite the buffer contents in-place.
-            # This limits the window in which key material sits in memory.
-            for pk in priv_keys:
-                if isinstance(pk, bytearray):
-                    for j in range(len(pk)):
-                        pk[j] = 0
-
-        # Exhaustion-visibility warnings.  Emit at 80% and 95% usage so
-        # operators notice in their normal log pipeline long before the
-        # hard wall at 100% (after which funds are locked unless the
-        # user previously submitted a KeyRotationTransaction).  Deduped
-        # per (root, threshold) to avoid flooding logs on every slot.
-        self._maybe_warn_exhaustion()
-
-        return Signature(
-            wots_signature=wots_sig,
-            leaf_index=leaf_idx,
-            auth_path=auth_path,
-            wots_public_key=pub_key,
-            wots_public_seed=pub_seed,
-        )
+            # Release the cross-process advisory lock no matter how the
+            # body exits — successful sign, persist failure, exhaustion,
+            # corrupt-cursor ValueError, KeyboardInterrupt, anything.
+            # Without this, a sign that throws after acquire would leak
+            # the lock until process exit, blocking all subsequent CLI
+            # invocations on the same wallet for `_LEAF_CURSOR_LOCK_TIMEOUT_S`
+            # seconds.
+            _release_leaf_cursor_lock(file_lock_handle)
 
     def _maybe_warn_exhaustion(self) -> None:
         """Emit a WARNING log when leaf usage first crosses 80% and 95%.
