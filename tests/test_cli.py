@@ -92,9 +92,19 @@ class TestCLIParser(unittest.TestCase):
         self.assertTrue(args.transfer)
 
     def test_estimate_fee_requires_mode(self):
-        """'estimate-fee' with no --message or --transfer fails."""
+        """'estimate-fee' with no --message / --transfer / --tx-type fails.
+
+        Argparse-level enforcement was retired when --tx-type joined
+        --message and --transfer (a single mutually-exclusive group
+        couldn't model "any one of these three" while still letting
+        --tx-type message coexist with --message TEXT).  The check now
+        lives in cmd_estimate_fee itself: parsing succeeds with no
+        mode, but invocation exits with code 2.
+        """
+        from messagechain.cli import cmd_estimate_fee
+        args = self.parser.parse_args(["estimate-fee"])
         with self.assertRaises(SystemExit):
-            self.parser.parse_args(["estimate-fee"])
+            cmd_estimate_fee(args)
 
 
 class TestResolveDefaults(unittest.TestCase):
