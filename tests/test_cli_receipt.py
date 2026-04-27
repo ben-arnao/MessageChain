@@ -48,11 +48,65 @@ def _evidence_args(tx_hash: str, **overrides) -> argparse.Namespace:
 _FAKE_TX_HASH = "ab" * 32
 
 
+def _real_proof_for(_tx_hash_hex: str | None = None):
+    """Build a (tx_hash_hex, merkle_root_hex, proof_dict) tuple where
+    the proof actually verifies against the root.
+
+    Mirrors core/spv.generate_merkle_proof + core/block.compute_merkle_root.
+    The receipt CLI now verifies the proof before printing the
+    permanence text, so tests that exercise the included path MUST
+    feed it a proof that actually verifies.
+    """
+    from messagechain.crypto.hashing import default_hash
+
+    def h(b):
+        return default_hash(b)
+
+    tx_hashes = [
+        b"\x10" * 32, b"\x11" * 32, b"\x12" * 32, b"\x13" * 32,
+    ]
+    target_index = 3  # match the existing test's tx_index = 3
+    target_hash = tx_hashes[target_index]
+    siblings = []
+    directions = []
+    layer = [h(b"\x00" + t) for t in tx_hashes]
+    idx = target_index
+    while len(layer) > 1:
+        if len(layer) % 2 == 1:
+            layer.append(h(b"\x02sentinel"))
+        if idx % 2 == 0:
+            sibling_idx = idx + 1
+            directions.append(False)
+        else:
+            sibling_idx = idx - 1
+            directions.append(True)
+        siblings.append(layer[sibling_idx])
+        next_layer = []
+        for i in range(0, len(layer), 2):
+            next_layer.append(h(b"\x01" + layer[i] + layer[i + 1]))
+        layer = next_layer
+        idx //= 2
+    root = layer[0]
+    proof_dict = {
+        "tx_hash": target_hash.hex(),
+        "tx_index": target_index,
+        "siblings": [s.hex() for s in siblings],
+        "directions": directions,
+    }
+    return target_hash.hex(), root.hex(), proof_dict
+
+
 class TestReceiptIncludedPath(unittest.TestCase):
     """A tx that has been included on-chain prints the permanence guarantee."""
 
     def test_included_tx_prints_block_height_attesters_and_permanence(self):
         from messagechain import cli as cli_mod
+
+        # Build a REAL proof so the receipt's verification gate
+        # passes -- otherwise the post-fix receipt suppresses the
+        # permanence text behind a WARNING (which is the whole point
+        # of test_cli_receipt_proof_verification.py).
+        tx_hash_hex, merkle_root_hex, proof_dict = _real_proof_for()
 
         def rpc_side(host, port, method, params):
             if method == "get_chain_info":
@@ -60,13 +114,13 @@ class TestReceiptIncludedPath(unittest.TestCase):
                     "height": 14600, "latest_block_hash": "ee" * 32,
                 }}
             if method == "get_tx_status":
-                self.assertEqual(params["tx_hash"], _FAKE_TX_HASH)
+                self.assertEqual(params["tx_hash"], tx_hash_hex)
                 return {"ok": True, "result": {
                     "status": "included",
                     "block_height": 14523,
                     "block_hash": "cd" * 32,
                     "tx_index": 3,
-                    "merkle_root": "ff" * 32,
+                    "merkle_root": merkle_root_hex,
                     "attesters": 12,
                     "total_validators": 14,
                     "attesting_stake": 800_000,
@@ -74,12 +128,7 @@ class TestReceiptIncludedPath(unittest.TestCase):
                     "finality_threshold_met": True,
                     "finality_numerator": 2,
                     "finality_denominator": 3,
-                    "merkle_proof": {
-                        "tx_hash": _FAKE_TX_HASH,
-                        "tx_index": 3,
-                        "siblings": ["aa" * 32, "bb" * 32],
-                        "directions": [False, True],
-                    },
+                    "merkle_proof": proof_dict,
                     "submission_validators": ["v1abc", "v2def", "v3ghi"],
                     "seconds_since_submission": 552,  # 9m12s
                 }}
@@ -90,7 +139,7 @@ class TestReceiptIncludedPath(unittest.TestCase):
                           return_value=("127.0.0.1", 9334)):
             buf = io.StringIO()
             with redirect_stdout(buf):
-                rc = cli_mod.cmd_receipt(_receipt_args(_FAKE_TX_HASH))
+                rc = cli_mod.cmd_receipt(_receipt_args(tx_hash_hex))
 
         out = buf.getvalue()
         # The defining-property language is required.
@@ -106,7 +155,8 @@ class TestReceiptIncludedPath(unittest.TestCase):
         self.assertIn("12", out)
         self.assertIn("14", out)
         # Inclusion proof is surfaced (hex form).
-        self.assertIn("ff" * 16, out, "merkle root prefix should appear")
+        self.assertIn(merkle_root_hex[:32], out,
+            "merkle root prefix should appear")
         # Successful exit.
         self.assertEqual(rc, 0)
 

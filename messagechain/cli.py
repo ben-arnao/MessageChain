@@ -681,6 +681,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--server", type=str, default=None,
         help="Server address host:port",
     )
+    # --cross-check-server is the second-source defense against a
+    # colluding primary RPC server: by default the CLI will verify
+    # the merkle proof returned by --server against that same
+    # server's claimed merkle_root, which leaves a residual
+    # "fabricated block" trust gap.  Pinning a second validator
+    # here closes that gap -- both servers' merkle_root for the
+    # same block_hash MUST agree before the permanence text is
+    # printed.  Disagreement surfaces a WARNING.
+    receipt_p.add_argument(
+        "--cross-check-server", dest="cross_check_server",
+        type=str, default=None,
+        help="Second validator host:port to cross-check the inclusion "
+             "merkle_root against.  When set, both servers must agree on "
+             "the merkle_root for the receipt to print the permanence "
+             "guarantee.  Without it, the receipt prints a softer "
+             "caveat naming this flag as the way to confirm independently.",
+    )
 
     # --- submit-evidence ---
     # The natural next step from a `receipt` that turned up NOT FOUND
@@ -1607,6 +1624,106 @@ def _load_cached_entity(private_key, data_dir):
     return None
 
 
+def _resolve_leaf_index_path(entity_id_hex: str, *, data_dir: str | None = None):
+    """Return the on-disk path for this signer's WOTS+ leaf cursor.
+
+    Two paths:
+      * ``data_dir`` set (operator/co-resident path): return the
+        canonical ``<data_dir>/leaf_index.json`` -- byte-for-byte
+        identical to the daemon's leaf-index location.
+      * ``data_dir`` unset (end-user CLI): return
+        ``~/.messagechain/leaves/<entity_id_hex>.idx``.  Per-entity
+        keying lets a single host wallet-juggle without one entity's
+        cursor stomping another's.
+
+    Returns a ``pathlib.Path``.  Caller is responsible for ensuring
+    the parent directory exists before persistence runs.
+    """
+    from pathlib import Path
+    from messagechain.config import LEAF_INDEX_FILENAME
+
+    if data_dir:
+        return Path(data_dir) / LEAF_INDEX_FILENAME
+    return Path.home() / ".messagechain" / "leaves" / f"{entity_id_hex}.idx"
+
+
+def _bind_persistent_leaf_index(
+    entity, *, chain_leaf: int, data_dir: str | None,
+):
+    """Attach a per-wallet leaf-index file and advance to the safe floor.
+
+    The "safe floor" is ``max(on_disk_cursor, chain_leaf)``:
+
+      * If the on-disk cursor is AHEAD of the chain watermark
+        (recent same-machine sign that hasn't been gossiped yet), the
+        on-disk value wins -- signing at the chain watermark would
+        REUSE the leaf we just burned locally.
+      * If the chain watermark is AHEAD of the on-disk cursor (this
+        machine's file is fresh / lost / new wallet), advance to the
+        chain watermark; ``KeyPair.sign``'s persist-before-sign
+        ratchet writes the advanced value back to disk before the
+        signature escapes the process.
+
+    Once bound, ``entity.keypair.leaf_index_path`` is set so that the
+    persist-before-sign hook in ``KeyPair.sign`` writes the post-sign
+    cursor back atomically (tmp + rename + parent-dir fsync).
+
+    Returns the resolved path (str-able pathlib.Path) the cursor is
+    bound to -- callers don't need it for signing, but tests assert
+    on it.
+
+    Note: every CLI signing surface (``cmd_send``, ``cmd_transfer``,
+    ``cmd_stake``, ``cmd_unstake``, ``cmd_propose``, ``cmd_vote``,
+    ``cmd_rotate_key``, ``cmd_set_authority_key``,
+    ``cmd_emergency_revoke``, ``cmd_set_receipt_subtree_root``,
+    ``cmd_bootstrap_seed``) MUST route through this helper after
+    fetching the chain watermark and BEFORE calling
+    ``entity.keypair.sign``.  Skipping it for any of them re-opens
+    the cross-process WOTS+ leaf-reuse window the audit closed.
+    """
+    path = _resolve_leaf_index_path(entity.entity_id_hex, data_dir=data_dir)
+    parent = path.parent
+    try:
+        os.makedirs(parent, exist_ok=True)
+    except OSError:
+        # Best-effort: if we can't create the parent (read-only fs,
+        # permission error), fall back to in-memory-only signing
+        # rather than wedging the command.  The daemon's own
+        # persistence path remains the safety net for production
+        # validators; this guard exists for offline/portable wallet
+        # use cases.
+        return None
+
+    path_str = str(path)
+    try:
+        entity.keypair.leaf_index_path = path_str
+    except Exception:
+        # Non-KeyPair stand-in.  Caller is responsible for re-binding
+        # if it cares; tests use a duck-typed shim.
+        pass
+
+    # 1. Load the persisted cursor if any.  load_leaf_index never
+    #    moves _next_leaf backwards, so this is safe even if the
+    #    cursor is already ahead from a previous step.
+    try:
+        entity.keypair.load_leaf_index(path_str)
+    except Exception:
+        # A corrupt cursor file is recoverable: the next sign() will
+        # rewrite it post-advance.  Don't crash the command.
+        pass
+
+    # 2. Advance to the chain watermark.  advance_to_leaf is also
+    #    monotonic (max(_next_leaf, leaf_index)) so the higher of the
+    #    two floors wins.
+    if int(chain_leaf) > 0:
+        try:
+            entity.keypair.advance_to_leaf(int(chain_leaf))
+        except Exception:
+            pass
+
+    return path
+
+
 def _reserve_leaf_via_rpc(host, port, entity_id_hex):
     """Ask the server to atomically reserve a leaf for the given entity.
 
@@ -2043,7 +2160,13 @@ def cmd_send(args):
     leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
     if leaf is None:
         leaf = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(leaf)
+    # Bind the persistent on-disk leaf cursor BEFORE advancing.  This
+    # is the cross-process WOTS+ leaf-reuse defense: the cursor is
+    # keyed per-entity under ~/.messagechain/leaves/<id>.idx (default)
+    # or <data_dir>/leaf_index.json (operator path).  The helper
+    # max(disk_cursor, chain_leaf)'s the floor; KeyPair.sign's
+    # persist-before-sign hook writes the post-sign cursor back.
+    _bind_persistent_leaf_index(entity, chain_leaf=leaf, data_dir=data_dir)
 
     # Parse the optional --prev pointer before we burn a WOTS+ leaf on
     # signing.  Server will re-validate strict-prev against chain state;
@@ -2304,7 +2427,16 @@ def cmd_send_multi_submit(args) -> int:
     leaf_index = getattr(args, "leaf_index", None)
     if leaf_index is None:
         leaf_index = nonce
-    entity.keypair.advance_to_leaf(int(leaf_index))
+    # Cross-process WOTS+ leaf-reuse defense.  Multi-submit fans out
+    # to N>=3 validators, but the leaf is still ONE WOTS+ leaf -- two
+    # consecutive multi-submit runs at the same --leaf-index would
+    # double-sign and disclose the leaf private key.  The on-disk
+    # cursor closes that window even when the operator forgot to
+    # advance --leaf-index between runs.
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=int(leaf_index),
+        data_dir=getattr(args, "data_dir", None),
+    )
 
     tx = create_transaction(
         entity, args.message, fee=int(args.fee), nonce=nonce,
@@ -2478,7 +2610,10 @@ def cmd_transfer(args):
     leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
     if leaf is None:
         leaf = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(leaf)
+    # See cmd_send for why this binding runs BEFORE advance: prevents
+    # cross-process WOTS+ leaf-reuse by max()ing the disk cursor and
+    # the chain watermark.
+    _bind_persistent_leaf_index(entity, chain_leaf=leaf, data_dir=data_dir)
 
     # Receive-to-exist: determine whether this is a first-spend tx
     # (server has no pubkey for this entity yet).  If so we include
@@ -2639,7 +2774,8 @@ def cmd_stake(args):
     leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
     if leaf is None:
         leaf = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(leaf)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(entity, chain_leaf=leaf, data_dir=data_dir)
 
     # Default fee: drive through the unified auto-fee helper so the
     # "stake" picker matches every other tx-submitting command
@@ -2741,7 +2877,8 @@ def cmd_unstake(args):
     nonce = nonce_resp["result"]["nonce"]
 
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
     # Default fee: route through the unified auto-fee helper.  Mirrors
     # cmd_stake; the type-specific floor (MIN_FEE) binds and the
@@ -2876,13 +3013,24 @@ def cmd_bootstrap_seed(args):
         return bytes.fromhex(ak) if ak else None
 
     def _refresh_nonce_and_leaf():
-        """Re-fetch nonce + leaf watermark and advance the keypair."""
+        """Re-fetch nonce + leaf watermark and advance the keypair.
+
+        Cross-process WOTS+ leaf-reuse defense -- routes through
+        ``_bind_persistent_leaf_index`` so the on-disk cursor is the
+        floor (not just the chain watermark).  Without this, two
+        consecutive ``bootstrap-seed`` runs (or a partial first run +
+        retry) would sign at the same leaf and produce slashable
+        equivocation evidence.
+        """
         resp = rpc_call(host, port, "get_nonce", {"entity_id": entity.entity_id_hex})
         if not resp.get("ok"):
             return None, None
         n = resp["result"]["nonce"]
         w = resp["result"].get("leaf_watermark", n)
-        entity.keypair.advance_to_leaf(w)
+        _bind_persistent_leaf_index(
+            entity, chain_leaf=w,
+            data_dir=getattr(args, "data_dir", None),
+        )
         return n, w
 
     # -- Step 1: verify the seed is already known on chain -----------
@@ -2996,7 +3144,8 @@ def cmd_set_authority_key(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
     # Default fee: post-flat floor is safe pre- and post-activation.
     from messagechain.config import MIN_FEE_POST_FLAT
@@ -3079,7 +3228,8 @@ def cmd_rotate_key(args):
         sys.exit(1)
     current_rotation = status["result"]["rotation_number"]
     watermark = status["result"]["leaf_watermark"]
-    entity.keypair.advance_to_leaf(watermark)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
     print(f"Current rotation number: {current_rotation}")
     print(f"Current leaf watermark:  {watermark} / {1 << MERKLE_TREE_HEIGHT}")
@@ -3218,6 +3368,17 @@ def cmd_emergency_revoke(args):
 
     private_key = _resolve_private_key(args)
     cold = Entity.create(private_key)
+
+    # Cold-key cross-process leaf-reuse defense.  The cold key has no
+    # chain-side leaf watermark RPC (revoke is nonce-free), so the
+    # on-disk cursor is the ONLY barrier between two consecutive
+    # emergency-revoke runs both signing at leaf 0.  Bind the cursor
+    # here -- the print-only / air-gapped path also benefits, since
+    # the operator may pre-sign multiple staged revokes from one
+    # cold-key host.
+    _bind_persistent_leaf_index(
+        cold, chain_leaf=0, data_dir=getattr(args, "data_dir", None),
+    )
 
     print_only = bool(getattr(args, "print_only", False))
 
@@ -3420,8 +3581,15 @@ def cmd_set_receipt_subtree_root(args):
     # Operators must self-track; we surface the leaf used after
     # signing so the next invocation is N+1.
     cold_leaf = max(0, int(getattr(args, "cold_leaf", 0)))
-    if cold_leaf > 0:
-        cold.keypair.advance_to_leaf(cold_leaf)
+    # Cold-key cross-process leaf-reuse defense.  The on-disk cursor
+    # closes the "operator forgot --cold-leaf and signs at leaf 0
+    # twice" failure mode: even if --cold-leaf is omitted, the
+    # persistent cursor advances the floor past the last consumed
+    # leaf so a second invocation never reuses one.
+    _bind_persistent_leaf_index(
+        cold, chain_leaf=cold_leaf,
+        data_dir=getattr(args, "data_dir", None),
+    )
 
     host, port = _parse_server(args.server)
     from client import rpc_call
@@ -3592,7 +3760,13 @@ def cmd_propose(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.  cmd_propose
+    # has no --data-dir surface today, so this routes to the home-dir
+    # default unconditionally.
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=watermark,
+        data_dir=getattr(args, "data_dir", None),
+    )
 
     # Query the live chain tip so the auto-fee picks the right floor
     # rule.  Pre-Tier-19: flat GOVERNANCE_PROPOSAL_FEE.  Post-Tier-19:
@@ -3679,7 +3853,11 @@ def cmd_vote(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    entity.keypair.advance_to_leaf(watermark)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=watermark,
+        data_dir=getattr(args, "data_dir", None),
+    )
 
     from messagechain.validation import parse_hex
     proposal_id = parse_hex(args.proposal, expected_len=32)
@@ -4286,7 +4464,11 @@ def cmd_receipt(args) -> int:
     print(f"=== MessageChain receipt for {tx_hash_hex[:16]}... ===\n")
 
     if status == "included":
-        return _print_included_receipt(result, tx_hash_hex)
+        return _print_included_receipt(
+            result, tx_hash_hex,
+            primary_server=args.server,
+            cross_check_server=getattr(args, "cross_check_server", None),
+        )
     if status == "pending":
         return _print_pending_receipt(result, tx_hash_hex, host, port)
     if status == "not_found":
@@ -4298,12 +4480,128 @@ def cmd_receipt(args) -> int:
     return 1
 
 
-def _print_included_receipt(result: dict, tx_hash_hex: str) -> int:
+def _verify_included_proof(result: dict, tx_hash_hex: str) -> tuple[bool, str | None]:
+    """Verify the merkle proof carried in a get_tx_status result.
+
+    Returns ``(ok, error_message)``: ``ok=True`` means the proof
+    deserializes cleanly AND verifies against the result's
+    ``merkle_root``.  ``ok=False`` returns a human-readable
+    error_message naming WHY -- missing proof, tampered sibling,
+    root mismatch, malformed structure -- so the caller surfaces a
+    specific WARNING instead of a generic "not verified".
+
+    No I/O, no RPC -- this is pure structural / cryptographic
+    verification of bytes the caller has already received.  Routes
+    through the existing ``messagechain.core.spv.verify_merkle_proof``
+    so the receipt CLI cannot drift away from the SPV verification
+    every other light client uses.
+    """
+    proof_dict = result.get("merkle_proof")
+    if not proof_dict:
+        return False, "server returned no merkle_proof"
+    merkle_root_hex = result.get("merkle_root", "")
+    if not merkle_root_hex:
+        return False, "server returned no merkle_root"
+    try:
+        merkle_root = bytes.fromhex(merkle_root_hex)
+    except ValueError:
+        return False, f"server's merkle_root is not valid hex: {merkle_root_hex!r}"
+    try:
+        tx_hash = bytes.fromhex(tx_hash_hex)
+    except ValueError:
+        return False, f"tx_hash_hex is not valid hex: {tx_hash_hex!r}"
+
+    from messagechain.core.spv import MerkleProof, verify_merkle_proof
+    try:
+        proof = MerkleProof.deserialize(proof_dict)
+    except (ValueError, KeyError, TypeError) as e:
+        return False, f"merkle_proof is malformed: {e}"
+
+    if not verify_merkle_proof(tx_hash, proof, merkle_root):
+        return False, (
+            "merkle_proof does NOT verify against the server's claimed "
+            "merkle_root -- the server is either misconfigured or lying"
+        )
+    return True, None
+
+
+def _cross_check_merkle_root(
+    tx_hash_hex: str, primary_root_hex: str,
+    cross_check_server: str,
+) -> tuple[bool, str | None, str | None]:
+    """Cross-check the inclusion merkle_root via a second RPC server.
+
+    Calls ``get_tx_status`` on the cross-check server for the same
+    tx_hash and compares its ``merkle_root`` to ``primary_root_hex``.
+    Returns ``(agree, error, peer_root_hex)``:
+
+      * agree=True  when the second server's root matches the primary's.
+      * agree=False when they diverge OR when the cross-check call
+        fails for any reason -- a non-responsive cross-check is NOT a
+        permission slip to print the permanence guarantee.
+
+    The ``error`` string names what went wrong so the caller can
+    surface a specific WARNING; ``peer_root_hex`` is the cross-
+    check server's reported root (or "" if unavailable) so the
+    confidence/warning lines can name it.
+    """
+    try:
+        peer_host, peer_port = _parse_server(cross_check_server)
+    except Exception as e:
+        return False, f"cross-check server address invalid: {e}", None
+    from client import rpc_call
+    try:
+        resp = rpc_call(peer_host, peer_port, "get_tx_status", {
+            "tx_hash": tx_hash_hex,
+        })
+    except Exception as e:
+        return False, f"cross-check server unreachable: {e}", None
+    if not resp.get("ok"):
+        return False, (
+            f"cross-check server returned error: {resp.get('error', '?')}"
+        ), None
+    peer_result = resp.get("result", {}) or {}
+    peer_status = peer_result.get("status", "?")
+    if peer_status != "included":
+        return False, (
+            f"cross-check server reports status={peer_status!r}, NOT 'included' "
+            "-- the two servers disagree on whether the tx is on chain"
+        ), None
+    peer_root = peer_result.get("merkle_root", "") or ""
+    if peer_root != primary_root_hex:
+        return False, (
+            "cross-check server's merkle_root differs from the primary's"
+        ), peer_root
+    return True, None, peer_root
+
+
+def _print_included_receipt(
+    result: dict, tx_hash_hex: str, *,
+    primary_server: str | None = None,
+    cross_check_server: str | None = None,
+) -> int:
     """Format the INCLUDED-status receipt.
 
-    Names the permanence guarantee + slashing-backed enforcement in
-    plain language.  Surfaces the inclusion proof as a hex blob the
-    user can save or paste -- same shape SPV clients consume.
+    The permanence guarantee ("This message is permanent.  It can
+    never be deleted.") is the protocol's defining property and the
+    receipt CLI is the user-visible surface that names it.  Before
+    this fix the line was printed unconditionally on a
+    ``status:"included"`` response, which let a colluding RPC
+    server return a forged proof against a fabricated merkle_root
+    and watch the CLI print full conviction.
+
+    Verification gates (all must pass for the permanence text):
+      1. The merkle_proof returned by the primary server MUST
+         verify against the merkle_root the same response carries
+         (closes "fabricated proof" attack).
+      2. If --cross-check-server is set, both servers' merkle_root
+         for this tx MUST agree (closes "fabricated block" attack).
+      3. If --cross-check-server is unset, the receipt prints a
+         softer caveat that names the flag the user could pass to
+         confirm independently.
+
+    On any verification failure the WARNING line is the dominant
+    output and the permanence text is suppressed.
     """
     block_height = result.get("block_height", "?")
     block_hash = result.get("block_hash", "")
@@ -4338,24 +4636,84 @@ def _print_included_receipt(result: dict, tx_hash_hex: str) -> int:
     else:
         print(f"  Finality:      pending -- {num}/{den} threshold not yet met")
 
-    # The mission of this command: name the guarantee.
+    # -- Verification gate 1: proof verifies against primary's root --
+    proof_ok, proof_err = _verify_included_proof(result, tx_hash_hex)
+
+    # -- Verification gate 2: cross-check (when supplied) --
+    cross_check_agree = None
+    cross_check_err = None
+    cross_check_peer_root = None
+    if proof_ok and cross_check_server:
+        cross_check_agree, cross_check_err, cross_check_peer_root = (
+            _cross_check_merkle_root(
+                tx_hash_hex, merkle_root, cross_check_server,
+            )
+        )
+
+    # -- Headline output: permanence text ONLY if verified --
     print()
-    if threshold_met:
+    if not proof_ok:
+        # Gate 1 failed.  Permanence text is suppressed; surface a
+        # specific WARNING so the user knows what to do next.
         print(
-            "  This message is permanent.  It can never be deleted."
+            f"  WARNING: server returned an inclusion claim with a missing "
+            f"or invalid merkle proof -- cannot verify permanence.\n"
+            f"           Reason: {proof_err}.\n"
+            f"           Try a different --server or run a local node "
+            f"to verify."
+        )
+    elif cross_check_agree is False:
+        # Gate 2 failed.  Permanence text is suppressed; the two
+        # servers disagree on chain state for this tx.
+        peer_str = (
+            f" (peer reported merkle_root: {cross_check_peer_root})"
+            if cross_check_peer_root else ""
+        )
+        print(
+            f"  WARNING: cross-check server {cross_check_server!r} disagrees "
+            f"with the primary on this tx's merkle_root{peer_str}.\n"
+            f"           Reason: {cross_check_err}.\n"
+            f"           Cannot verify permanence -- one of the two servers "
+            f"is lying or stale."
         )
     else:
+        # Both gates passed (or only gate 1 + no cross-check).  The
+        # mission of this command: name the guarantee.
+        if threshold_met:
+            print(
+                "  This message is permanent.  It can never be deleted."
+            )
+        else:
+            print(
+                "  This message is on-chain.  Once the 2/3 attestation\n"
+                "  threshold is met, it is permanent and can never be deleted."
+            )
         print(
-            "  This message is on-chain.  Once the 2/3 attestation\n"
-            "  threshold is met, it is permanent and can never be deleted."
+            "  Any validator that suppresses or rejects a future copy of\n"
+            "  this transaction produces slashable evidence on chain (see\n"
+            "  messagechain submit-evidence)."
         )
-    print(
-        "  Any validator that suppresses or rejects a future copy of\n"
-        "  this transaction produces slashable evidence on chain (see\n"
-        "  messagechain submit-evidence)."
-    )
+        # Confidence / caveat trailer naming the verification source.
+        if cross_check_agree is True:
+            print()
+            print(
+                f"  Independently verified against {cross_check_server} -- "
+                f"merkle roots agree."
+            )
+        else:
+            # cross_check_agree is None (no --cross-check-server passed).
+            # Print the softer caveat naming the flag.
+            print()
+            srv_name = primary_server or "the server above"
+            print(
+                f"  Inclusion proof verified against the merkle_root "
+                f"reported by {srv_name}.\n"
+                f"  To independently confirm, pass "
+                f"--cross-check-server <other_validator>."
+            )
 
-    # Inclusion proof -- give the user something they can save.
+    # -- Inclusion proof: always print (it's data the user might want
+    # to save).  Suppression only applies to the permanence headline.
     print()
     if merkle_root:
         print(f"  Inclusion proof:")

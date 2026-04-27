@@ -454,6 +454,39 @@ def _bind_leaf_index_path(entity: Entity, data_dir: str | None) -> None:
     entity.keypair.load_leaf_index(path)
 
 
+def attach_height_sign_guard(entity: Entity, data_dir: str | None) -> None:
+    """Attach a persistent same-height-sign guard to *entity*.
+
+    The guard is the disk-durable "I have already signed at height
+    N" ratchet that ``messagechain/consensus/{pos,attestation,
+    finality}.py`` consult via
+    ``getattr(entity, "height_sign_guard", None)``.  Without it, an
+    honest validator that crashes mid-propagate -- signs block N,
+    partially gossips, restarts -- builds a byte-different second
+    header (``timestamp`` and ``merkle_root`` move with mempool
+    churn) and signs N a SECOND time.  Two valid signatures on
+    byte-different headers at the same height = slashable
+    equivocation evidence, full stake wipe.  The guard refuses the
+    second sign before the signature is produced, so no slashable
+    bytes ever escape the process.
+
+    State file: ``<data_dir>/height_guard.json``.  When *data_dir*
+    is None (ephemeral / test fixture), the guard is skipped and
+    the consensus-layer ``getattr`` falls through to None -- same
+    behavior as before this fix, which is correct for code paths
+    that don't run a real validator (relay-only nodes, faucets,
+    receipt-subtree bootstrap).
+
+    Idempotent: re-calling on an entity that already has a guard
+    re-loads from disk (safe -- guards never move backwards).
+    """
+    if data_dir is None:
+        return
+    from messagechain.consensus.height_guard import HeightSignGuard
+    guard_path = os.path.join(data_dir, "height_guard.json")
+    entity.height_sign_guard = HeightSignGuard.load_or_create(guard_path)
+
+
 def _load_or_create_entity(
     private_key: bytes,
     tree_height: int,
@@ -492,6 +525,7 @@ def _load_or_create_entity(
             if entity is not None:
                 logger.info("Loaded keypair from cache %s", cache_file)
                 _bind_leaf_index_path(entity, data_dir)
+                attach_height_sign_guard(entity, data_dir)
                 _attach_merkle_node_cache(
                     entity, private_key, tree_height, data_dir, no_cache,
                 )
@@ -534,6 +568,7 @@ def _load_or_create_entity(
             logger.warning("Could not write keypair cache to %s", cache_file)
 
     _bind_leaf_index_path(entity, data_dir)
+    attach_height_sign_guard(entity, data_dir)
     _attach_merkle_node_cache(entity, private_key, tree_height, data_dir, no_cache)
     return entity
 
