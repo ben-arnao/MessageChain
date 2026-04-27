@@ -9132,6 +9132,24 @@ class Blockchain:
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
 
+        # Witness-root commitment (Tier 19, B-2 of the witness-tier fork).
+        # Post-activation blocks must carry header.witness_root ==
+        # compute_block_witness_root(block) — a domain-separated Merkle
+        # commitment over every signature in every signed body slot.
+        # This is how the proposer's signed header pins every witness
+        # byte; without it, a relayer could swap signatures within or
+        # between slots after the proposer signs and the block_hash
+        # would still verify (because pre-fork signable_data reads the
+        # all-zero default).  Pre-activation blocks pass through with
+        # the legacy zero default — the field is in signable_data, but
+        # the value isn't checked against anything.
+        from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
+        if block.header.block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT:
+            from messagechain.core.witness import compute_block_witness_root
+            expected_witness_root = compute_block_witness_root(block)
+            if block.header.witness_root != expected_witness_root:
+                return False, "Invalid witness_root"
+
         # Receive-to-exist: no RegistrationTransaction type.  New
         # entities enter chain state implicitly on their first Transfer
         # (either as a recipient — balance only — or as a first-spend
@@ -10314,6 +10332,18 @@ class Blockchain:
         expected_root = compute_merkle_root(tx_hashes) if tx_hashes else _hash(b"empty")
         if block.header.merkle_root != expected_root:
             return False, "Invalid merkle root"
+
+        # Witness-root commitment (mirrors validate_block at the
+        # primary path).  Fork-path validation must enforce the same
+        # rule or a fork-path replay accepts blocks the primary path
+        # would reject — that drift is exactly what the canonical
+        # tx-hash builder above was added to close.
+        from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
+        if block.header.block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT:
+            from messagechain.core.witness import compute_block_witness_root
+            expected_witness_root = compute_block_witness_root(block)
+            if block.header.witness_root != expected_witness_root:
+                return False, "Invalid witness_root"
 
         # Receive-to-exist: no RegistrationTransaction type to validate.
 

@@ -5700,6 +5700,56 @@ assert HONESTY_CURVE_HEIGHT > SOFT_SLASH_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 48 — witness-root activation (B-2 of the witness-tier fork)
+# ─────────────────────────────────────────────────────────────────────
+# At and after WITNESS_ROOT_ACTIVATION_HEIGHT, every block header MUST
+# carry header.witness_root == compute_block_witness_root(block) — a
+# Merkle commitment to every signature byte across all signed body
+# slots (see messagechain.core.witness.SLOT_*).  Pre-activation blocks
+# pass the field through unchecked (legacy default b"\x00" * 32).
+#
+# Why this matters: witness separation already runs in production
+# (strip_block_witnesses + attach_block_witnesses in chaindb.py) but
+# the existing single-slot compute_witness_root is never called from
+# production code, so today's separated witnesses have no header
+# commitment to verify against.  Tier 48 closes that gap by binding
+# every signed body slot's signatures into a single Merkle root that
+# the proposer signs and validators check on receipt.  Pre-activation
+# behavior is unchanged; activation makes the existing strip/attach
+# flow cryptographically safe.
+#
+# Activation height: 15_000.  Mainnet tip is ~1_500 (live since
+# 2026-04-20); 15_000 leaves ~95 days of runway at 600s blocks for
+# operators to upgrade past Tier 47 (dormancy controller, height
+# 5_934) before the new check engages.  Don't compress this — the
+# only way to test the activation gate without a network split is to
+# have every operator on a binary that knows about the new rule
+# before the cutover.
+WITNESS_ROOT_ACTIVATION_HEIGHT = 15_000  # Tier 48
+
+# Witness-root must activate after the most recent body-slot addition
+# (Tier 35 added non_response_evidence_txs).  Activating before that
+# slot exists would commit witness_root to a body shape the chain
+# hasn't reached, making historical re-validation impossible.
+assert WITNESS_ROOT_ACTIVATION_HEIGHT > NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT, (
+    "WITNESS_ROOT_ACTIVATION_HEIGHT must follow "
+    "NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT — Tier 48 commits to every "
+    "signed body slot, so the latest body-slot addition (Tier 35 NRE) "
+    "must already be active before the commitment locks in"
+)
+
+# Witness-root activation also rides above the dormancy controller
+# (Tier 47), since both touch consensus-binding header fields and
+# operators benefit from a clean cutover window between them.
+assert WITNESS_ROOT_ACTIVATION_HEIGHT > DORMANCY_CONTROLLER_HEIGHT, (
+    "WITNESS_ROOT_ACTIVATION_HEIGHT must follow DORMANCY_CONTROLLER_HEIGHT "
+    "— Tier 48 rides above Tier 47 (dormancy controller); spacing keeps "
+    "the consensus-header-field changes from collapsing into a single "
+    "activation window"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

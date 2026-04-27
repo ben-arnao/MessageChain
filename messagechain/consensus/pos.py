@@ -479,6 +479,12 @@ class ProofOfStake:
             inclusion_list_violation_evidence_txs=il_violation_txs,
             inclusion_list=included_inclusion_list,
             non_response_evidence_txs=nre_txs,
+            # attestations: passed-in via parameter; fold into the
+            # block-like namespace so witness_root computation (below)
+            # commits to attestation signatures the proposer is
+            # including.  canonical_block_tx_hashes does not currently
+            # consume this field, but enumerate_block_signatures does.
+            attestations=list(attestations or []),
         )
         from messagechain.core.block import canonical_block_tx_hashes
         tx_hashes = canonical_block_tx_hashes(_block_like)
@@ -520,6 +526,18 @@ class ProofOfStake:
             stamped_version = CURRENT_VALIDATOR_VERSION
         else:
             stamped_version = _VV_UNSIGNALLED
+        # Compute witness_root from the same block-like namespace already
+        # built for canonical_block_tx_hashes — every signed body slot the
+        # proposer is committing to is reachable through it.  Pre-activation
+        # blocks leave the field at its all-zero default; post-activation
+        # blocks MUST populate it or validate_block rejects.
+        from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
+        from messagechain.core.witness import compute_block_witness_root
+        if new_block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT:
+            witness_root = compute_block_witness_root(_block_like)
+        else:
+            witness_root = b"\x00" * 32
+
         header = BlockHeader(
             version=1,
             block_number=new_block_number,
@@ -528,6 +546,7 @@ class ProofOfStake:
             timestamp=chosen_ts,
             proposer_id=proposer_entity.entity_id,
             state_root=state_root,
+            witness_root=witness_root,
             mempool_snapshot_root=snapshot_root,
             state_root_checkpoint=state_root_checkpoint,
             validator_version=stamped_version,
