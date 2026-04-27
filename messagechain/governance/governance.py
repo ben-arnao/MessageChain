@@ -879,12 +879,21 @@ class GovernanceTracker:
 
         return ProposalStatus.OPEN
 
-    def list_proposals(self, current_block: int) -> list[dict]:
+    def list_proposals(
+        self, current_block: int, voter_id: bytes | None = None,
+    ) -> list[dict]:
         """Return a JSON-friendly snapshot of every tracked proposal.
 
         Used by the CLI's `proposals` command so operators can see what's
         open, how many blocks remain, and the current tally without
         needing to decode state manually.
+
+        When ``voter_id`` is provided, each row includes a ``voted``
+        boolean indicating whether that entity has cast a vote on this
+        proposal — the in-CLI banner uses it to suppress a "vote
+        needed" alert for proposals the operator has already voted on.
+        Field is omitted (not False) when no voter_id is supplied so
+        existing consumers see byte-identical rows.
         """
         rows = []
         for pid, state in self.proposals.items():
@@ -894,7 +903,7 @@ class GovernanceTracker:
                 0,
                 GOVERNANCE_VOTING_WINDOW - (current_block - state.created_at_block),
             )
-            rows.append({
+            row = {
                 "proposal_id": pid.hex(),
                 "proposer_id": state.proposal.proposer_id.hex(),
                 "title": state.proposal.title,
@@ -906,7 +915,10 @@ class GovernanceTracker:
                 "total_participating": participating,
                 "total_eligible": eligible,
                 "vote_count": len(state.votes),
-            })
+            }
+            if voter_id is not None:
+                row["voted"] = voter_id in state.votes
+            rows.append(row)
         rows.sort(key=lambda r: r["created_at_block"], reverse=True)
         return rows
 

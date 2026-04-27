@@ -35,7 +35,29 @@ DEFAULT_ONBOARD = {
     "entity_id_hex": "",
 }
 
-_ALLOWED_CONFIG_KEYS = frozenset(DEFAULT_ONBOARD)
+# Opt-in governance-proposal email notifier.  Lives in onboarding so
+# the operator can manage it via the same `messagechain config set/get`
+# surface as auto_upgrade / auto_rotate; the actual SMTP code lives
+# in `messagechain.runtime.notify`.  This module only knows the *keys*
+# (so we can validate config_set calls) and the type-coercion rules.
+_NOTIFY_EMAIL_BOOL_KEYS = frozenset({
+    "notify.email.enabled",
+    "notify.email.smtp_starttls",
+})
+_NOTIFY_EMAIL_INT_KEYS = frozenset({
+    "notify.email.smtp_port",
+})
+_NOTIFY_EMAIL_STR_KEYS = frozenset({
+    "notify.email.recipient",
+    "notify.email.smtp_host",
+    "notify.email.smtp_username",
+    "notify.email.smtp_password",
+})
+_ALLOWED_NOTIFY_EMAIL_KEYS = (
+    _NOTIFY_EMAIL_BOOL_KEYS | _NOTIFY_EMAIL_INT_KEYS | _NOTIFY_EMAIL_STR_KEYS
+)
+
+_ALLOWED_CONFIG_KEYS = frozenset(DEFAULT_ONBOARD) | _ALLOWED_NOTIFY_EMAIL_KEYS
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +116,25 @@ def resolve_onboard_config_path() -> str | None:
 # Read / write onboard.toml
 # ---------------------------------------------------------------------------
 
+def _flatten_toml(data: dict, prefix: str = "") -> dict:
+    """Walk a tomllib-parsed dict and return a flat key->value map.
+
+    `notify.email.enabled = true` parses as a nested dict
+    ``{"notify": {"email": {"enabled": True}}}``; we expose it back
+    to callers as the dotted key ``"notify.email.enabled"`` so the
+    `messagechain config get/set` UX is symmetric (set with a dotted
+    key, read with the same dotted key).
+    """
+    out: dict = {}
+    for k, v in data.items():
+        full = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.update(_flatten_toml(v, full))
+        else:
+            out[full] = v
+    return out
+
+
 def read_onboard_config(path: str | None = None) -> dict:
     """Return a dict with DEFAULT_ONBOARD merged with any on-disk overrides.
 
@@ -111,9 +152,10 @@ def read_onboard_config(path: str | None = None) -> dict:
             data = tomllib.load(f)
     except OSError:
         return cfg
+    flat = _flatten_toml(data)
     for key in _ALLOWED_CONFIG_KEYS:
-        if key in data:
-            cfg[key] = data[key]
+        if key in flat:
+            cfg[key] = flat[key]
     return cfg
 
 
@@ -127,11 +169,17 @@ def _format_value(value) -> str:
 
 
 def write_onboard_config(path: str, cfg: dict) -> None:
-    """Write the onboard config with a stable key order + comment header."""
+    """Write the onboard config with a stable key order + comment header.
+
+    Notify-email keys (`notify.email.*`) are emitted as a TOML inline
+    section under ``[notify.email]`` only when at least one of them is
+    set — keeps the file uncluttered for operators who don't use the
+    email notifier.
+    """
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    merged = dict(DEFAULT_ONBOARD)
+    merged: dict = dict(DEFAULT_ONBOARD)
     for key, val in cfg.items():
         if key in _ALLOWED_CONFIG_KEYS:
             merged[key] = val
@@ -140,6 +188,29 @@ def write_onboard_config(path: str, cfg: dict) -> None:
     order = ["auto_upgrade", "auto_rotate", "data_dir", "keyfile", "entity_id_hex"]
     for key in order:
         lines.append(f"{key} = {_format_value(merged.get(key, DEFAULT_ONBOARD[key]))}")
+
+    # Emit the [notify.email] section iff any notify.email.* key is set.
+    notify_email_set = any(
+        k in merged for k in _ALLOWED_NOTIFY_EMAIL_KEYS
+    )
+    if notify_email_set:
+        notify_order = [
+            "notify.email.enabled",
+            "notify.email.recipient",
+            "notify.email.smtp_host",
+            "notify.email.smtp_port",
+            "notify.email.smtp_username",
+            "notify.email.smtp_password",
+            "notify.email.smtp_starttls",
+        ]
+        lines.append("")
+        lines.append("[notify.email]")
+        for full_key in notify_order:
+            if full_key not in merged:
+                continue
+            short = full_key.rsplit(".", 1)[1]
+            lines.append(f"{short} = {_format_value(merged[full_key])}")
+
     data = "\n".join(lines) + "\n"
     # Writing keyfile paths is harmless; the sensitive thing is the keyfile itself.
     with open(path, "w") as f:
@@ -170,11 +241,26 @@ def config_set(key: str, value, path: str | None = None) -> str:
     )
     cfg = read_onboard_config(resolved)
     # Normalize booleans from CLI-supplied strings.
-    if key in ("auto_upgrade", "auto_rotate"):
+    if key in ("auto_upgrade", "auto_rotate") or key in _NOTIFY_EMAIL_BOOL_KEYS:
         value = _coerce_bool(value)
+    elif key in _NOTIFY_EMAIL_INT_KEYS:
+        value = _coerce_int(value, key)
     cfg[key] = value
     write_onboard_config(resolved, cfg)
     return resolved
+
+
+def _coerce_int(value, key: str) -> int:
+    if isinstance(value, bool):
+        # bool is a subclass of int — refuse it so "true" can't sneak in
+        # as a port number.
+        raise ValueError(f"{key} requires an integer, got bool")
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except ValueError as e:
+        raise ValueError(f"{key} requires an integer: {e}")
 
 
 def _coerce_bool(value) -> bool:

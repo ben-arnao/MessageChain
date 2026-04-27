@@ -913,7 +913,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "`messagechain config get <key>` prints the value; "
             "`messagechain config set <key> <value>` writes it. "
-            "Supported keys: auto_upgrade, auto_rotate, data_dir, keyfile, entity_id_hex."
+            "Supported keys: auto_upgrade, auto_rotate, data_dir, keyfile, "
+            "entity_id_hex, notify.email.enabled, notify.email.recipient, "
+            "notify.email.smtp_host, notify.email.smtp_port, "
+            "notify.email.smtp_username, notify.email.smtp_password, "
+            "notify.email.smtp_starttls."
         ),
     )
     config_sub = config_p.add_subparsers(dest="config_action", required=True)
@@ -923,6 +927,26 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_p.add_argument("key")
     config_set_p.add_argument("value")
 
+    # --- notify-test / notify-status ---
+    sub.add_parser(
+        "notify-test",
+        help="Send a one-shot test email using the configured SMTP creds.",
+        description=(
+            "Send a one-shot test email using the SMTP credentials in "
+            "onboard.toml (notify.email.*). Useful at setup time to "
+            "verify the email path works before relying on it for real "
+            "governance-proposal notifications."
+        ),
+    )
+    sub.add_parser(
+        "notify-status",
+        help="Print current notify config (password redacted) + last-sent log.",
+        description=(
+            "Print the current notify.email.* config (with the SMTP "
+            "password redacted) and the most-recent notification "
+            "timestamps from the local notify_state.json."
+        ),
+    )
 
     return parser
 
@@ -1533,6 +1557,40 @@ def _collect_private_key():
         sys.exit(1)
 
 
+def _print_open_proposals_banner_local(server, entity) -> None:
+    """Show a banner if the local node has any open proposals this
+    entity hasn't voted on.
+
+    Reads `server.blockchain.governance` directly -- no RPC, no network
+    hop. Safe to call from inside `_run` after `server.start()`.
+
+    The function is a no-op for relay-only nodes (entity is None) and
+    for any chain where governance state is empty or unloaded.
+    """
+    if entity is None:
+        return
+    try:
+        from messagechain.runtime import notify as _notify
+        proposals = server.blockchain.governance.list_proposals(
+            server.blockchain.height, voter_id=entity.entity_id,
+        )
+    except Exception:
+        return
+    voted_ids = {
+        str(p.get("proposal_id"))
+        for p in proposals
+        if p.get("voted")
+    }
+    text = _notify.format_open_proposals_banner(
+        proposals=proposals,
+        voter_id_hex=entity.entity_id_hex,
+        voted_proposal_ids=voted_ids,
+    )
+    if text:
+        print()
+        print(text)
+
+
 def cmd_start(args):
     """Start a MessageChain node."""
     from messagechain.identity.identity import Entity
@@ -1655,6 +1713,22 @@ def cmd_start(args):
         port_info = f"P2P: {args.port} | RPC: {args.rpc_port}"
         print(f"Node running. {port_info}")
         print(f"Data: {args.data_dir}")
+
+        # Governance-proposal banner: surface any open proposals the
+        # operator hasn't yet voted on.  Cheap, in-process read of the
+        # local blockchain state -- no RPC round-trip.  Quiet when there
+        # are no open proposals OR the operator has already voted on
+        # all of them.  Always runs, regardless of whether email
+        # notifications are configured (banner is the always-on
+        # fallback; email is the convenience layer on top).
+        try:
+            _print_open_proposals_banner_local(server, entity)
+        except Exception as e:
+            # Banner must never abort startup -- log and continue.
+            logging.getLogger(__name__).warning(
+                "governance proposal banner skipped (%s)", type(e).__name__,
+            )
+
         print("Press Ctrl+C to stop.\n")
         try:
             while True:
@@ -4902,7 +4976,57 @@ def cmd_doctor(args):
     print()
     verdict = {0: "GREEN", 1: "YELLOW (warnings)", 2: "RED (blocking)"}[worst]
     print(f"  Result: {verdict}")
+
+    # Governance-proposal banner: best-effort RPC probe of the local
+    # node.  Silent if the node is not reachable / no entity_id_hex
+    # configured / no open proposals -- never alters doctor's exit code.
+    try:
+        _doctor_proposal_banner(cfg, getattr(args, "server", None))
+    except Exception:
+        pass
+
     sys.exit(worst)
+
+
+def _doctor_proposal_banner(cfg: dict, server_arg: str | None) -> None:
+    """Best-effort RPC probe for open proposals + banner emission.
+
+    Used by `cmd_doctor` so that an operator running `messagechain
+    doctor` notices an open proposal even if they're not actively
+    watching the validator log.  Silent on any failure (no node yet,
+    no entity_id, RPC error) -- doctor's job is preflight, not
+    chain-state introspection.
+    """
+    from messagechain.runtime import notify as _notify
+
+    entity_hex = cfg.get("entity_id_hex") or ""
+    if not entity_hex:
+        return
+    try:
+        from client import rpc_call
+    except Exception:
+        return
+    host, port = _parse_server_local_default(server_arg)
+    try:
+        resp = rpc_call(host, port, "list_proposals", {"voter_id": entity_hex})
+    except Exception:
+        return
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return
+    proposals = (resp.get("result") or {}).get("proposals") or []
+    voted_ids = {
+        str(p.get("proposal_id"))
+        for p in proposals
+        if p.get("voted")
+    }
+    text = _notify.format_open_proposals_banner(
+        proposals=proposals,
+        voter_id_hex=entity_hex,
+        voted_proposal_ids=voted_ids,
+    )
+    if text:
+        print()
+        print(text)
 
 
 def cmd_rotate_key_if_needed(args):
@@ -4994,6 +5118,46 @@ def cmd_config(args):
         sys.exit(2)
 
 
+def cmd_notify_test(args):
+    """Send a one-shot test email using the configured SMTP creds."""
+    from messagechain.runtime import notify as _notify
+    from messagechain.runtime import onboarding as _ob
+
+    cfg = _ob.read_onboard_config()
+    try:
+        _notify.notify_test(cfg)
+    except _notify.NotifyConfigError as e:
+        print(f"Error: {e}")
+        sys.exit(2)
+    except Exception as e:
+        # SMTP / network error -- show the operator the failure mode
+        # without leaking the password (the exception class + recipient
+        # are enough to diagnose; never str(cfg)).
+        print(
+            f"Error: SMTP send failed ({type(e).__name__}): {e}"
+        )
+        sys.exit(2)
+    print("Test email sent. Check the configured recipient inbox.")
+
+
+def cmd_notify_status(args):
+    """Print current notify config (password redacted) + last-sent log."""
+    from messagechain.runtime import notify as _notify
+    from messagechain.runtime import onboarding as _ob
+
+    cfg = _ob.read_onboard_config()
+    # Pull last_sent from the persisted state file (default location);
+    # not reading any chain state here.
+    data_dir = cfg.get("data_dir") or None
+    state_path = _notify.default_state_path(data_dir)
+    try:
+        state = _notify.NotifyState.load(state_path)
+        last_sent = dict(state.last_sent)
+    except Exception:
+        last_sent = {}
+    print(_notify.format_status(cfg, last_sent=last_sent))
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -5041,6 +5205,8 @@ def main():
         "doctor": cmd_doctor,
         "rotate-key-if-needed": cmd_rotate_key_if_needed,
         "config": cmd_config,
+        "notify-test": cmd_notify_test,
+        "notify-status": cmd_notify_status,
     }
 
     handler = commands.get(args.command)
