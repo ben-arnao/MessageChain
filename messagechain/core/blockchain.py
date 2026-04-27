@@ -2868,9 +2868,10 @@ class Blockchain:
         # Cooldown between successive rotations by the same entity.
         # Blocks forensic-evasion spam where a funded attacker rotates
         # every block to erase recent-slashable-behavior associations.
-        # See iter 6 H2 audit finding.  In-memory tracking only (resets
-        # on restart, which is conservatively-safe: restart timing is
-        # operator-controlled, not attacker-triggerable over RPC).
+        # See iter 6 H2 audit finding.  The map is persisted to chaindb,
+        # included in state snapshots (STATE_SNAPSHOT_VERSION >= 18),
+        # committed into the state root, and restored across reorgs and
+        # cold restarts — it is consensus-critical, not advisory.
         last_rot_h = self.key_rotation_last_height.get(tx.entity_id, -KEY_ROTATION_COOLDOWN_BLOCKS)
         elapsed = self.height - last_rot_h
         if elapsed < KEY_ROTATION_COOLDOWN_BLOCKS:
