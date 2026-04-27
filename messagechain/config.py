@@ -3547,6 +3547,40 @@ GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 = 50
 MAX_PROPOSAL_TITLE_BYTES_TIER19 = 200
 MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19 = 2_000
 
+# ─── Tier 21: per-message community_id ─────────────────────────────────
+#
+# A short fixed-length community_id field on MessageTransaction lets
+# senders attach a Reddit-style community/topic grouping to a post.
+# Pure first-poster-creates semantics — there is NO on-chain registry,
+# NO creation tx, and NO claim mechanism.  Any 16-byte value is a
+# valid community_id; the namespace emerges from convention (apps
+# typically derive id = sha256(community_name_normalized)[:16] so a
+# human-readable name maps deterministically to the on-chain id).
+#
+# Why fixed 16 bytes:
+#   - 128-bit namespace, no realistic collision under any plausible
+#     organic-growth model.
+#   - Fixed length avoids the canonical-encoding edge cases (NFC,
+#     length cap, character whitelist) that a variable-length UTF-8
+#     community name would inherit from the message-text path.
+#   - Wire overhead is bounded at COMMUNITY_ID_STORED_BYTES (= 17:
+#     1B presence flag + 16B id), comparable to prev-pointer's 33B.
+#   - A community_id is app-layer grouping infra, not user speech —
+#     readability of the raw on-chain bytes is a non-goal.  The
+#     (id, name) mapping lives in indexers/clients.
+#
+# Fee treatment: charged at the live per-stored-byte rate (same model
+# as prev-pointer).  Excluded from MAX_MESSAGE_CHARS — community_id
+# is structural metadata, not human-content.
+#
+# Tier 20 (REWARD_CURVE_HEIGHT, anchored in CLAUDE.md but unbuilt) is
+# left uncommitted so it can land at any later activation height; the
+# tier-numbering is nominal and the constants are what matter at
+# runtime.  Tier 21 takes 15_000 to ride above Tier 19 (13_000) with
+# ~2000 blocks of runway (~16h at 30 s/block) for the upgrade window.
+COMMUNITY_ID_HEIGHT = 15_000  # Tier 21
+COMMUNITY_ID_BYTES = 16
+
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
     "rides on top of the established post-Tier-18 schedule; activating "
@@ -3562,6 +3596,15 @@ assert GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 > 0, (
     "GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 must be positive — a zero "
     "rate reopens the size-amortization escape hatch the surcharge "
     "exists to close"
+)
+assert COMMUNITY_ID_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
+    "COMMUNITY_ID_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — "
+    "Tier 21 rides on top of the established post-Tier-19 schedule"
+)
+assert COMMUNITY_ID_BYTES == 16, (
+    "COMMUNITY_ID_BYTES is part of the wire format — changing it "
+    "reshapes the v5 signed payload and breaks replay of any block "
+    "that included a community_id-bearing tx"
 )
 
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
@@ -3672,6 +3715,7 @@ for _fork_name, _fork_height in (
     ("REACT_TX_HEIGHT", REACT_TX_HEIGHT),
     ("TIER_18_HEIGHT", TIER_18_HEIGHT),
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
+    ("COMMUNITY_ID_HEIGHT", COMMUNITY_ID_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
