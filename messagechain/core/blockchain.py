@@ -1239,15 +1239,45 @@ class Blockchain:
             # save/restore-symmetry rule holds: either the whole
             # block's state lands on disk or none of it does.
             if hasattr(self.db, "set_reaction_choice"):
-                for key in self.reaction_state._dirty_keys:
-                    voter, target, tu = key
-                    if key in self.reaction_state.choices:
+                if full_flush:
+                    # Round-13 fix: full-flush mode (post `_reset_state`,
+                    # post-reorg replay).  The dirty-key optimization
+                    # below skips rows that exist only on a rolled-back
+                    # fork -- the canonical replay never touches those
+                    # keys, so `_dirty_keys` doesn't include them, and
+                    # the on-disk row survives.  After the next cold
+                    # restart `_load_from_db` rehydrates the orphan
+                    # vote, mixes it into `state_root_contribution()`,
+                    # and the restarted node silently forks off peers
+                    # that didn't restart.  Round-12 fixed the
+                    # FAILED-reorg path via `restore_state_snapshot`'s
+                    # wipe+re-insert; this closes the SUCCESSFUL-reorg
+                    # twin.  Wipe the table inside the same SQL
+                    # transaction (atomic with the re-INSERTs that
+                    # follow) and re-emit every entry from the
+                    # canonical-replay in-memory state.
+                    if hasattr(self.db, "clear_all_reaction_choices"):
+                        self.db.clear_all_reaction_choices()
+                    for key, choice in self.reaction_state.choices.items():
+                        voter, target, tu = key
                         self.db.set_reaction_choice(
-                            voter, target, tu,
-                            self.reaction_state.choices[key],
+                            voter, target, tu, choice,
                         )
-                    else:
-                        self.db.clear_reaction_choice(voter, target, tu)
+                else:
+                    # Steady-state path: only touch rows the most
+                    # recent block actually mutated.  Keeps per-block
+                    # cost O(K_touched) instead of O(N_total_votes).
+                    for key in self.reaction_state._dirty_keys:
+                        voter, target, tu = key
+                        if key in self.reaction_state.choices:
+                            self.db.set_reaction_choice(
+                                voter, target, tu,
+                                self.reaction_state.choices[key],
+                            )
+                        else:
+                            self.db.clear_reaction_choice(
+                                voter, target, tu,
+                            )
             self.db.commit_transaction()
             self.reaction_state.mark_persisted()
         except Exception:
