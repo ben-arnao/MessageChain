@@ -4,7 +4,12 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.24.0] — 2026-04-26
+
+Minor release. **Hard fork: Tier 22 — voter rewards on passed
+proposals** (activates at `VOTER_REWARD_HEIGHT = 19000`). Plus a
+faucet rate-limit retune and a web-UI prose trim — both
+non-consensus, active immediately.
 
 ### Governance — Tier 22: voter rewards on passed proposals (activates block 19000)
 
@@ -44,6 +49,18 @@ participation without a rubber-stamp incentive.
   `voter_reward_pool = 0` and `finalize_voter_rewards` is a no-op for
   zero-pool proposals — replay through Tier 22 height does not
   perturb their state.
+
+### Changed (off-chain, active immediately)
+
+- **Faucet: 15-min rolling window cap replaces daily cap** (401d940).
+  The public-feed faucet now meters per-IP requests over a 15-min
+  rolling window instead of a calendar-day cap, smoothing out the
+  abuse vector where one IP could exhaust the daily budget in
+  seconds at midnight UTC.
+- **Web UI: trim hero/faucet/footer prose; consolidate entity
+  profile sections** (3e49408). Tightens the public-facing copy on
+  https://messagechain.org and folds duplicated entity-profile
+  sub-sections together. Cosmetic only — no API changes.
 
 ## [1.23.0] — 2026-04-26
 
