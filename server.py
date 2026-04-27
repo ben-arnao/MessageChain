@@ -3077,21 +3077,39 @@ class Server(SharedRuntimeMixin):
         }
 
     def _rpc_submit_transfer(self, params: dict) -> dict:
-        """Accept a signed transfer transaction from a client."""
+        """Accept a signed transfer transaction from a client.
+
+        Routes through `submit_transaction_to_mempool` (which dispatches
+        on `tx.__class__`) so transfers get the SAME censorship-evidence
+        defenses as messages: opt-in SubmissionReceipt on admission, and
+        the validator-bound proof of admission the user can later file
+        as a CensorshipEvidenceTx if the transfer is silently dropped.
+
+        Pre-fix this path inlined its own validate+add and never
+        consulted `self.receipt_issuer` — a coerced validator who admits
+        the transfer then drops it left ZERO on-chain evidence, despite
+        CLAUDE.md anchoring transfer as a "first-class, fully supported
+        tx type" held to "mainstream-asset quality bars."  Post-fix the
+        user holds a signed receipt the moment admission completes.
+        """
         try:
+            from messagechain.network.submission_server import (
+                submit_transaction_to_mempool,
+            )
             tx = TransferTransaction.deserialize(params["transaction"])
             # Pending nonce scans all pools (message + transfer + stake +
-            # unstake + governance) so sequential tx of any type work.
+            # unstake + governance + react) so sequential tx of any type
+            # work.  Threaded into the central helper via the
+            # pending_nonce kwarg.
             pending_nonce = self._get_pending_nonce_all_pools(tx.entity_id)
-            valid, reason = self.blockchain.validate_transfer_transaction(
-                tx, expected_nonce=pending_nonce,
+            issuer = self.receipt_issuer if params.get("request_receipt") else None
+            result = submit_transaction_to_mempool(
+                tx, self.blockchain, self.mempool,
+                receipt_issuer=issuer,
+                pending_nonce=pending_nonce,
             )
-            if not valid:
-                return {"ok": False, "error": reason}
-            # Record arrival height — see _rpc_submit_transaction for rationale.
-            self.mempool.add_transaction(
-                tx, arrival_block_height=self.blockchain.height,
-            )
+            if not result.ok:
+                return {"ok": False, "error": result.error}
 
             tx_hash_hex = tx.tx_hash.hex()
             self._track_seen_tx(tx_hash_hex)
@@ -3099,102 +3117,71 @@ class Server(SharedRuntimeMixin):
                 self._relay_tx_inv([tx_hash_hex]), "relay_tx_inv",
             )
 
-            return {
-                "ok": True,
-                "result": {
-                    "tx_hash": tx.tx_hash.hex(),
-                    "amount": tx.amount,
-                    "fee": tx.fee,
-                    "message": "Transfer accepted into mempool",
-                },
+            payload = {
+                "tx_hash": tx.tx_hash.hex(),
+                "amount": tx.amount,
+                "fee": tx.fee,
+                "message": (
+                    "Transfer accepted into mempool (duplicate)"
+                    if result.duplicate
+                    else "Transfer accepted into mempool"
+                ),
             }
+            # Surface the signed receipt in the response when the
+            # validator issued one — the user holds this as their
+            # CensorshipEvidenceTx weapon if the transfer is later
+            # dropped.
+            if result.receipt_hex:
+                payload["receipt"] = result.receipt_hex
+            return {"ok": True, "result": payload}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_submit_react(self, params: dict) -> dict:
         """Accept a signed ReactTransaction (Tier 17) into the mempool.
 
-        Validates the activation gate, signature, fee floor, target
-        existence, and nonce monotonicity before admission.  Mirrors
-        the shape of `_rpc_submit_transfer` so wallet code can treat
-        every tx-submission endpoint uniformly.
+        Routes through `submit_transaction_to_mempool` (which dispatches
+        on `tx.__class__`) so React votes get the SAME censorship-
+        evidence defenses as messages and transfers: opt-in
+        SubmissionReceipt on admission.  Pre-fix this path inlined its
+        own validate+add and never consulted `self.receipt_issuer` —
+        a coerced validator dropping DOWN votes on a target it favors
+        left zero on-chain accountability.
+
+        Cross-pool WOTS+ leaf dedupe stays in the RPC handler (it's
+        a Server-instance check that scans pending stake/unstake/
+        authority/governance pools the helper has no access to);
+        every other gate is delegated to the helper so the audit
+        surface stays consolidated.
         """
         try:
-            from messagechain.core.reaction import (
-                ReactTransaction,
-                verify_react_transaction,
-                REACT_CHOICE_CLEAR,
-                REACT_TX_HEIGHT,
+            from messagechain.core.reaction import ReactTransaction
+            from messagechain.network.submission_server import (
+                submit_transaction_to_mempool,
             )
             tx = ReactTransaction.deserialize(params["transaction"])
-            # Activation gate — refuse pre-fork submissions outright so
-            # wallets get a clean error rather than "your tx silently
-            # never made it into a block."  Uses `chain.height + 1`
-            # because the next block, not the current tip, is what
-            # decides admission.
-            next_height = self.blockchain.height + 1
-            if next_height < REACT_TX_HEIGHT:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"ReactTransaction submissions are not yet active — "
-                        f"REACT_TX_HEIGHT={REACT_TX_HEIGHT}, current height "
-                        f"{self.blockchain.height}"
-                    ),
-                }
-            voter_pk = self.blockchain.public_keys.get(tx.voter_id)
-            if voter_pk is None:
+
+            # Voter existence is pre-checked here so an unknown signer
+            # gets a clean "voter is not a registered entity" error
+            # instead of the cross-pool leaf-check firing first (it
+            # fails closed when it can't resolve a signer pubkey, which
+            # would surface as a confusing leaf-reuse error to a wallet
+            # that simply hasn't registered yet).  The helper repeats
+            # this check for the gossip / non-RPC ingress paths.
+            if tx.voter_id not in self.blockchain.public_keys:
                 return {
                     "ok": False,
                     "error": "voter is not a registered entity",
                 }
-            if not verify_react_transaction(
-                tx, voter_pk, current_height=next_height,
-            ):
-                return {
-                    "ok": False,
-                    "error": (
-                        "react tx signature/fee/canon-form/activation/"
-                        "self-trust check failed"
-                    ),
-                }
-            # Strict target existence — same rule the block-validate
-            # path enforces, surfaced at admission so a wallet can't
-            # submit a vote pointing at nothing.
-            if tx.target_is_user:
-                if tx.target not in self.blockchain.public_keys:
-                    return {
-                        "ok": False,
-                        "error": "user-trust target is not a registered entity",
-                    }
-            else:
-                if (
-                    self.blockchain.db is None
-                    or self.blockchain.db.get_tx_location(tx.target) is None
-                ):
-                    return {
-                        "ok": False,
-                        "error": "message-react target tx_hash not found in chain",
-                    }
-            # Nonce — share the same monotonic space as every other
-            # tx kind from this voter so a wallet can interleave
-            # transfers, messages, and react votes under one cursor.
-            expected_nonce = self._get_pending_nonce_all_pools(tx.voter_id)
-            if tx.nonce != expected_nonce:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Invalid nonce: expected {expected_nonce}, "
-                        f"got {tx.nonce}"
-                    ),
-                }
-            # Round-12: cross-pool WOTS+ leaf dedupe, mirroring every
-            # other RPC submit endpoint.  Without this an attacker (or
-            # buggy wallet) could submit a Transfer at leaf N then a
-            # React at leaf N -- both pass, both apply in the same
-            # block, the WOTS+ leaf secret is publicly leaked from the
-            # two signatures, and any observer can forge a third tx
-            # under that leaf to drain the voter.
+
+            # Round-12: cross-pool WOTS+ leaf dedupe stays at the RPC
+            # boundary because it scans Server-instance-local pending
+            # pools (stake, unstake, authority, governance) the helper
+            # has no handle on.  Without this an attacker (or buggy
+            # wallet) could submit a Transfer at leaf N then a React
+            # at leaf N -- both pass, both apply in the same block, the
+            # WOTS+ leaf secret leaks from the two signatures, and any
+            # observer can forge a third tx under that leaf.
             if not self._check_leaf_across_all_pools(tx):
                 return {
                     "ok": False,
@@ -3203,36 +3190,36 @@ class Server(SharedRuntimeMixin):
                         "-- leaf reuse rejected"
                     ),
                 }
-            # Per-entity hot-key watermark gate -- mirrors the chain-
-            # level check added in _validate_react_tx_in_block.  Every
-            # other RPC submit path applies this gate; React was the
-            # lone gap.
-            if tx.signature.leaf_index < self.blockchain.leaf_watermarks.get(
-                tx.voter_id, 0,
-            ):
-                return {
-                    "ok": False,
-                    "error": (
-                        f"WOTS+ leaf {tx.signature.leaf_index} already "
-                        f"consumed (watermark "
-                        f"{self.blockchain.leaf_watermarks[tx.voter_id]}) "
-                        f"-- leaf reuse rejected"
-                    ),
-                }
-            if not self.mempool.add_react_transaction(tx):
-                return {"ok": False, "error": "react pool full or duplicate"}
-            return {
-                "ok": True,
-                "result": {
-                    "tx_hash": tx.tx_hash.hex(),
-                    "voter_id": tx.voter_id.hex(),
-                    "target": tx.target.hex(),
-                    "target_is_user": tx.target_is_user,
-                    "choice": tx.choice,
-                    "fee": tx.fee,
-                    "message": "ReactTransaction accepted into mempool",
-                },
+
+            # Pending nonce scans all pools so a voter's interleaved
+            # transfer / message / react submissions all see sequential
+            # nonces.  Threaded into the central helper.
+            pending_nonce = self._get_pending_nonce_all_pools(tx.voter_id)
+            issuer = self.receipt_issuer if params.get("request_receipt") else None
+            result = submit_transaction_to_mempool(
+                tx, self.blockchain, self.mempool,
+                receipt_issuer=issuer,
+                pending_nonce=pending_nonce,
+            )
+            if not result.ok:
+                return {"ok": False, "error": result.error}
+
+            payload = {
+                "tx_hash": tx.tx_hash.hex(),
+                "voter_id": tx.voter_id.hex(),
+                "target": tx.target.hex(),
+                "target_is_user": tx.target_is_user,
+                "choice": tx.choice,
+                "fee": tx.fee,
+                "message": (
+                    "ReactTransaction accepted into mempool (duplicate)"
+                    if result.duplicate
+                    else "ReactTransaction accepted into mempool"
+                ),
             }
+            if result.receipt_hex:
+                payload["receipt"] = result.receipt_hex
+            return {"ok": True, "result": payload}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
