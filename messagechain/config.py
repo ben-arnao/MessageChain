@@ -2043,15 +2043,41 @@ FINALITY_VOTE_MAX_AGE_BLOCKS = 10 * FINALITY_INTERVAL
 # witness data moves to a separate storage tier.
 WITNESS_SEPARATION_ENABLED = True       # feature gate
 WITNESS_RETENTION_BLOCKS = 200          # keep witnesses in main storage for this many blocks beyond finality
-# Opt-in auto-separation: when True, ChainDB.auto_separate_finalized_
-# witnesses moves signatures of old finalized blocks from inline
-# storage to the side-table on every call.  Default False so the
-# existing block-read surface (callers that don't pass
-# include_witnesses=True) is unchanged on upgrade.  Operators enable
-# this once they've verified their block-consumer paths either
-# tolerate stripped blocks or opt into witnesses explicitly.
-# Nothing is deleted in either mode — separation only moves bytes.
-WITNESS_AUTO_SEPARATION_ENABLED = False
+# Auto-separation: when True (and tip >= WITNESS_AUTO_SEPARATION_HEIGHT),
+# ChainDB.auto_separate_finalized_witnesses moves signatures of old
+# finalized blocks from inline storage to the side-table on every
+# call.  The default flipped from False -> True at the
+# WITNESS_AUTO_SEPARATION_HEIGHT hard fork (see below) — at saturation
+# WOTS+ signatures are ~73% of full-node block storage and serve only
+# auditability after finalization, so leaving them inline forever
+# would push commodity full-node storage off-target on the centuries
+# horizon CLAUDE.md anchors to ("ordinary user — not just a datacenter
+# — can sync and store the full history of the chain decades or
+# centuries from now").  Nothing is ever deleted — separation only
+# moves bytes from blocks.data into block_witnesses.witness_data on
+# the same node, and reassembly via
+# get_block_by_hash(..., include_witnesses=True) stays available.
+# This flag remains an operator-facing kill switch: setting it to
+# False at runtime suspends new separation work without touching
+# already-separated blocks.
+WITNESS_AUTO_SEPARATION_ENABLED = True
+
+# Hard fork activation height.  Pre-fork blocks (block_number <
+# WITNESS_AUTO_SEPARATION_HEIGHT) are NEVER stripped — the chain
+# committed to their inline encoding before the fork activated, and
+# replay determinism for historical blocks requires those bytes to
+# stay where they are.  At and above this height the sweep starts
+# processing newly-finalized blocks past the retention window.
+#
+# Activation: WITNESS_AUTO_SEPARATION_HEIGHT = 3000, riding above the
+# Tier 23 cluster (currently topping out at HONESTY_CURVE_HEIGHT = 720
+# after the 1.26.0 fast-forward sweep) with a comfortable runway from
+# the live mainnet tip (~670 at the time of this writing) — ~2330
+# blocks of advance notice (~16 days at 600s/block) for operators to
+# upgrade.  The fork is one-way: once activated, pre-fork blocks
+# remain un-stripped forever; only blocks at or above this height are
+# eligible for separation.
+WITNESS_AUTO_SEPARATION_HEIGHT = 3000
 
 
 # Governance — on-chain voting for protocol/codebase changes

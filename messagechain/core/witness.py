@@ -25,6 +25,29 @@ def _hash(data: bytes) -> bytes:
     return default_hash(data)
 
 
+def is_witness_separation_active(height: int) -> bool:
+    """Return True iff witness auto-separation is active at ``height``.
+
+    Two-part gate:
+      1. ``WITNESS_AUTO_SEPARATION_ENABLED`` — operator-facing kill
+         switch.  Set to False at runtime to suspend new separation
+         work (already-stripped blocks stay stripped).
+      2. ``height >= WITNESS_AUTO_SEPARATION_HEIGHT`` — hard fork
+         activation.  Pre-fork blocks (``block_number < FORK_HEIGHT``)
+         are never eligible, even after the fork activates — the chain
+         committed to their inline encoding and replay determinism
+         requires those bytes to stay inline forever.
+
+    Imported lazily so test-time monkey-patches of the config module
+    take effect without a re-import dance.
+    """
+    import messagechain.config as _cfg
+    if not getattr(_cfg, "WITNESS_AUTO_SEPARATION_ENABLED", False):
+        return False
+    fork_h = getattr(_cfg, "WITNESS_AUTO_SEPARATION_HEIGHT", 0)
+    return height >= fork_h
+
+
 # Sentinel signature for witness-stripped transactions.  Empty lists +
 # empty bytes so the Signature dataclass is structurally valid but
 # trivially distinguishable from a real WOTS+ signature.
