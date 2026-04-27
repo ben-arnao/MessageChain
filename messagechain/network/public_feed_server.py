@@ -219,8 +219,8 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         """POST /faucet  body: {"address": "<entity_id_hex>"}.
 
         Returns JSON {"ok": ..., "tx_hash": ..., "amount": ...,
-        "remaining_today": ..., "error": ...}.  The three
-        rate-limit layers (per-/24 IP, per-address, daily cap) are
+        "remaining_window": ..., "error": ...}.  The two
+        rate-limit layers (per-/24 IP cooldown, per-window cap) are
         enforced inside FaucetState.try_drip; this handler is just
         the HTTP boundary.
         """
@@ -275,7 +275,7 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
                 "ok": True,
                 "tx_hash": result.tx_hash,
                 "amount": result.amount,
-                "remaining_today": result.remaining_today,
+                "remaining_window": result.remaining_window,
             })
         else:
             # 429 for rate-limit-style refusals so well-behaved
@@ -284,7 +284,7 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(status, {
                 "ok": False,
                 "error": result.error,
-                "remaining_today": result.remaining_today,
+                "remaining_window": result.remaining_window,
             })
 
     def do_PUT(self):
@@ -456,13 +456,14 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         }
         if ctx.faucet is not None:
             # Surface the visible knobs so the UI can render an
-            # accurate "X drips remaining today" line without a second
-            # round trip.  The drip amount and per-IP cooldown rarely
-            # change but operators may tweak them across releases.
+            # accurate "X drips remaining this window" line without a
+            # second round trip.  The drip amount and window length
+            # rarely change but operators may tweak them across releases.
             body["faucet"] = {
                 "drip_amount": ctx.faucet.drip_amount,
-                "remaining_today": ctx.faucet.remaining_today(),
-                "daily_cap": ctx.faucet.daily_cap,
+                "remaining_window": ctx.faucet.remaining_window(),
+                "window_cap": ctx.faucet.window_cap,
+                "window_sec": ctx.faucet.window_sec,
             }
         self._send_json(200, body)
 

@@ -25,18 +25,17 @@ that hop:
     requiring a third-party CAPTCHA -- staying inside the project's
     no-external-deps stance and keeping Tor / privacy users
     first-class (they pay CPU, not credentials).
-  * IP rate-limit (per-/24 cooldown) is kept as defense-in-depth,
-    but treated as the cheap first filter rather than the actual
-    gate -- VPNs and CGNAT make per-IP throttling noisy.  PoW does
-    the real work; IP limits stop noise.
-  * Per-address one-shot: a given address can claim once per
-    process lifetime regardless of IP / PoW.
-  * Per-day aggregate cap: FAUCET_DAILY_CAP drips total per UTC day,
-    cap on operator's daily exposure.
+  * Per-/24 IP cooldown (FAUCET_IP_COOLDOWN_SEC) is kept as
+    defense-in-depth, but treated as the cheap first filter rather
+    than the actual gate -- VPNs and CGNAT make per-IP throttling
+    noisy.  PoW does the real work; IP limits stop noise.
+  * Per-window aggregate cap: FAUCET_WINDOW_DRIPS drips total per
+    rolling FAUCET_WINDOW_SEC bucket, cap on the operator's
+    short-term exposure.  The window resets on a fixed UTC grid so
+    "X drips remaining" is meaningful to the user.
 
 State is in-memory and intentionally non-durable.  A restart resets
-the per-address claim list, per-IP cooldowns, and outstanding
-challenges; the daily cap counter is reconstructed from scratch.
+per-IP cooldowns, the window counter, and outstanding challenges.
 This keeps the surface small for v1; persistent state moves to
 Phase 2 once we see real abuse patterns worth defending against.
 """
@@ -59,7 +58,7 @@ logger = logging.getLogger("messagechain.faucet")
 # tries on average = ~4 seconds desktop / ~12s mobile.  Honest users
 # pay CPU, not credentials -- privacy/Tor users stay first-class.
 # Each unique address requires an independent PoW: bulk farming N
-# addresses costs N * average_solve_time, so daily-cap drains take
+# addresses costs N * average_solve_time, so window-cap drains take
 # real wall-clock time even with parallel hardware.
 FAUCET_POW_BITS = 22
 
@@ -75,24 +74,35 @@ FAUCET_CHALLENGE_TTL_SEC = 600
 FAUCET_MAX_PENDING_CHALLENGES = 4096
 
 
-# Per-drip token amount.  Sized for ~3-4 short messages at the live
+# Per-drip token amount.  Sized for ~1 short message at the live
 # LINEAR fee floor (BASE_TX_FEE=10 + FEE_PER_STORED_BYTE=1 * stored).
-# Big enough that the user can experiment, small enough that abuse
-# costs the operator only modest amounts before the daily cap fires.
-FAUCET_DRIP = 1000
+# Small per-drip amount lets the faucet cycle quickly: a user can
+# come back every window (FAUCET_WINDOW_SEC) for another, instead of
+# getting one fat drip and then being locked out for 24h.
+FAUCET_DRIP = 300
 
-# Maximum drips per UTC day across all sources.  Hard ceiling on the
-# operator's daily exposure.  At FAUCET_DRIP=1000 + transfer fee ~=
-# 200, a fully drained day costs ~120,000 tokens.  The faucet wallet
-# should be funded for ~2-3x this so a sustained-cap week does not
-# dry it out before refill.
-FAUCET_DAILY_CAP = 50
+# Window length over which the cap is enforced.  15 minutes is short
+# enough that "I missed this window, I'll grab one in a few minutes"
+# is the natural user reaction, instead of "I'm locked out for a
+# day."  Aligned to a fixed UTC grid (window = floor(now / WINDOW_SEC))
+# so all clients see the same window boundaries and "X left this
+# window" stays consistent across requests.
+FAUCET_WINDOW_SEC = 900  # 15 minutes
 
-# Per-/24 IP cooldown.  24 hours.  /24 chosen instead of full /32 so
+# Maximum drips per FAUCET_WINDOW_SEC window across all sources.
+# Hard ceiling on the operator's per-window exposure.  At
+# FAUCET_DRIP=300 + transfer fee ~= 1110, a fully drained window
+# costs ~5,640 tokens; sustained for 24h that is ~540,000 tokens.
+# The faucet wallet should be funded for several days of sustained
+# cap so a peak day does not dry it out before refill.
+FAUCET_WINDOW_DRIPS = 4
+
+# Per-/24 IP cooldown.  Matches FAUCET_WINDOW_SEC: a single network
+# may grab one drip per window.  /24 chosen instead of full /32 so
 # a residential NAT does not give one user 256 drips by cycling
 # devices on the same network -- still cheap to defeat with a /16
 # IP pool but raises the bar for casual abuse.
-FAUCET_IP_COOLDOWN_SEC = 86_400
+FAUCET_IP_COOLDOWN_SEC = FAUCET_WINDOW_SEC
 
 
 def _ip_cidr_24(ip: str) -> str:
@@ -111,14 +121,15 @@ def _ip_cidr_24(ip: str) -> str:
     return ".".join(parts[:3]) + ".0/24"
 
 
-def _utc_day(ts: float) -> int:
-    """UTC day number for the given Unix timestamp.
+def _window_index(ts: float, window_sec: int) -> int:
+    """Window bucket index for the given Unix timestamp.
 
-    Dividing by 86400 gives a stable bucket that rolls over at
-    UTC midnight, which matches what an operator would expect when
-    looking at the daily cap counter.
+    Dividing by `window_sec` gives a stable bucket aligned to the UTC
+    epoch grid.  At window_sec=900 the boundary lands every 15 minutes
+    on the UTC clock (00, 15, 30, 45 past the hour), which matches
+    what the UI surfaces to the user.
     """
-    return int(ts // 86_400)
+    return int(ts // max(1, window_sec))
 
 
 @dataclass
@@ -127,7 +138,7 @@ class FaucetDripResult:
     error: str = ""
     tx_hash: str = ""
     amount: int = 0
-    remaining_today: int = 0
+    remaining_window: int = 0
 
 
 @dataclass
@@ -211,20 +222,20 @@ class FaucetState:
     submit_callback: Callable[[dict], tuple[bool, str]]
     build_tx_callback: Callable[[bytes], dict]
     drip_amount: int = FAUCET_DRIP
-    daily_cap: int = FAUCET_DAILY_CAP
+    window_cap: int = FAUCET_WINDOW_DRIPS
+    window_sec: int = FAUCET_WINDOW_SEC
     ip_cooldown_sec: int = FAUCET_IP_COOLDOWN_SEC
     pow_difficulty: int = FAUCET_POW_BITS
     challenge_ttl_sec: int = FAUCET_CHALLENGE_TTL_SEC
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _ip_last_drip: dict[str, float] = field(default_factory=dict)
-    _addresses_claimed: set[bytes] = field(default_factory=set)
     # Outstanding PoW challenges keyed by seed (16-byte random).
     # Bounded by FAUCET_MAX_PENDING_CHALLENGES; oldest-by-expiry
     # evicted when full.
     _pending_challenges: dict[bytes, "FaucetChallenge"] = field(default_factory=dict)
-    _day: int = 0
-    _drips_today: int = 0
+    _window: int = 0
+    _drips_window: int = 0
 
     def issue_challenge(self, address_hex: str) -> tuple[bool, str, dict]:
         """Mint a fresh PoW challenge for the given recipient address.
@@ -235,9 +246,9 @@ class FaucetState:
 
         No rate limit on issuance: an attacker who spams /challenge
         gets back challenges they cannot use without solving the PoW
-        anyway.  The per-address one-shot still applies at try_drip
+        anyway.  The IP cooldown + window cap still apply at try_drip
         time, so a malicious requester cannot drain by hoarding
-        challenges for an already-claimed address.
+        challenges.
         """
         try:
             address = bytes.fromhex(address_hex.strip())
@@ -296,20 +307,20 @@ class FaucetState:
             del self._pending_challenges[seed]
         return len(stale)
 
-    def _reset_day_if_rolled_locked(self, now: float) -> None:
-        """Roll the daily counter at UTC midnight.
+    def _reset_window_if_rolled_locked(self, now: float) -> None:
+        """Roll the window counter when the bucket index advances.
 
         Caller MUST hold `_lock`.  Cheap: integer compare per call.
         """
-        today = _utc_day(now)
-        if today != self._day:
-            self._day = today
-            self._drips_today = 0
+        bucket = _window_index(now, self.window_sec)
+        if bucket != self._window:
+            self._window = bucket
+            self._drips_window = 0
 
-    def remaining_today(self) -> int:
+    def remaining_window(self) -> int:
         with self._lock:
-            self._reset_day_if_rolled_locked(time.time())
-            return max(0, self.daily_cap - self._drips_today)
+            self._reset_window_if_rolled_locked(time.time())
+            return max(0, self.window_cap - self._drips_window)
 
     def try_drip(
         self,
@@ -324,15 +335,14 @@ class FaucetState:
           1. recipient_hex is a valid 64-char hex entity_id.
           2. challenge_seed + nonce are present and valid PoW for this
              address (the actual abuse gate).
-          3. address has not already claimed (one-shot per process).
-          4. /24 IP has not drip'd in the last 24 hours (defense-in-depth).
-          5. daily cap not yet exhausted (operator's exposure ceiling).
-          6. submit_callback succeeds.
+          3. /24 IP has not drip'd in the last `ip_cooldown_sec` seconds
+             (defense-in-depth).
+          4. window cap not yet exhausted (operator's exposure ceiling).
+          5. submit_callback succeeds.
 
         On success: state is committed (challenge consumed, IP cooldown
-        set, address added to claimed set, daily counter incremented)
-        BEFORE the function returns, so a concurrent request cannot
-        double-spend the same slot.
+        set, window counter incremented) BEFORE the function returns,
+        so a concurrent request cannot double-spend the same slot.
         """
         # Address sanity outside the lock -- pure CPU work.
         try:
@@ -373,13 +383,13 @@ class FaucetState:
 
         with self._lock:
             now = time.time()
-            self._reset_day_if_rolled_locked(now)
+            self._reset_window_if_rolled_locked(now)
             self._evict_expired_challenges_locked(now)
 
             # PoW gate -- the actual abuse defense.  Missing/expired
             # challenge or wrong nonce both fail here BEFORE we touch
             # any other rate-limit state, so a malformed POST does not
-            # consume the per-IP cooldown slot or the daily cap.
+            # consume the per-IP cooldown slot or the window cap.
             challenge = self._pending_challenges.get(challenge_seed)
             if challenge is None:
                 return FaucetDripResult(
@@ -388,7 +398,7 @@ class FaucetState:
                         "challenge unknown or expired -- request a fresh "
                         "one via GET /faucet/challenge"
                     ),
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
             if challenge.address != recipient_bytes:
                 return FaucetDripResult(
@@ -397,7 +407,7 @@ class FaucetState:
                         "challenge was issued for a different address -- "
                         "request a new challenge bound to this address"
                     ),
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
             if not _verify_pow(
                 challenge.seed, nonce, challenge.address,
@@ -409,45 +419,36 @@ class FaucetState:
                         f"nonce does not satisfy proof-of-work "
                         f"(need {challenge.difficulty} leading zero bits)"
                     ),
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
             # Consume the challenge atomically so a stolen pair cannot
             # be replayed even if it satisfies the PoW.  Drop it from
             # the pending set BEFORE checking the other rate limits so
-            # a per-address-claimed rejection still burns the challenge
-            # (the requester needs to do new PoW for the next attempt).
+            # a cooldown rejection still burns the challenge (the
+            # requester needs to do new PoW for the next attempt).
             del self._pending_challenges[challenge_seed]
-
-            if recipient_bytes in self._addresses_claimed:
-                return FaucetDripResult(
-                    ok=False,
-                    error=(
-                        "this address has already received a drip from "
-                        "this faucet (one per address)"
-                    ),
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
-                )
 
             last = self._ip_last_drip.get(cidr)
             if last is not None and now - last < self.ip_cooldown_sec:
-                wait_h = (self.ip_cooldown_sec - (now - last)) / 3600.0
+                wait_min = (self.ip_cooldown_sec - (now - last)) / 60.0
                 return FaucetDripResult(
                     ok=False,
                     error=(
                         f"this network ({cidr}) already received a drip "
-                        f"in the last 24h; try again in {wait_h:.1f}h"
+                        f"recently; try again in {wait_min:.1f} min"
                     ),
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
 
-            if self._drips_today >= self.daily_cap:
+            if self._drips_window >= self.window_cap:
                 return FaucetDripResult(
                     ok=False,
                     error=(
-                        f"daily faucet cap ({self.daily_cap} drips) "
-                        "reached; resets at 00:00 UTC"
+                        f"faucet window cap ({self.window_cap} drips per "
+                        f"{self.window_sec // 60} min) reached; resets "
+                        f"shortly"
                     ),
-                    remaining_today=0,
+                    remaining_window=0,
                 )
 
             # Build + submit INSIDE the lock so a concurrent request
@@ -459,7 +460,7 @@ class FaucetState:
                 return FaucetDripResult(
                     ok=False,
                     error=f"faucet wallet build failed: {e}",
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
 
             ok, reason = self.submit_callback(tx_dict)
@@ -468,22 +469,21 @@ class FaucetState:
                 return FaucetDripResult(
                     ok=False,
                     error=f"chain rejected drip tx: {reason}",
-                    remaining_today=max(0, self.daily_cap - self._drips_today),
+                    remaining_window=max(0, self.window_cap - self._drips_window),
                 )
 
             # Success path: commit state.
             self._ip_last_drip[cidr] = now
-            self._addresses_claimed.add(recipient_bytes)
-            self._drips_today += 1
+            self._drips_window += 1
             tx_hash = tx_dict.get("tx_hash", "")
             logger.info(
-                "faucet drip: %s -> %s amount=%d (today=%d/%d)",
+                "faucet drip: %s -> %s amount=%d (window=%d/%d)",
                 cidr, recipient_hex[:16], self.drip_amount,
-                self._drips_today, self.daily_cap,
+                self._drips_window, self.window_cap,
             )
             return FaucetDripResult(
                 ok=True,
                 tx_hash=tx_hash,
                 amount=self.drip_amount,
-                remaining_today=max(0, self.daily_cap - self._drips_today),
+                remaining_window=max(0, self.window_cap - self._drips_window),
             )

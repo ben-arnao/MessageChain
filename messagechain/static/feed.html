@@ -385,13 +385,14 @@
   </div>
   <p class="entity-search err" id="entitySearchErr" hidden></p>
   <details class="faucet" id="faucetBox" hidden>
-    <summary>First time? Get starter tokens (<span id="faucetRemaining">…</span> left today)</summary>
+    <summary>First time? Get starter tokens (<span id="faucetRemaining">…</span> left this window)</summary>
     <div class="body">
       <p>
         New wallets need on-chain balance before they can send their first
         message. Paste your address below to receive a starter drip
-        (<span id="faucetAmount">…</span> tokens, enough for ~3 short
-        messages). One drip per address, one drip per network per 24h.
+        (<span id="faucetAmount">…</span> tokens, enough for ~1 short
+        message). The faucet refreshes every 15 minutes; one drip per
+        network per window.
       </p>
       <ol>
         <li>
@@ -617,7 +618,7 @@
       if (data.ok && data.faucet_enabled && data.faucet) {
         faucetBox.hidden = false;
         faucetAmount.textContent = data.faucet.drip_amount;
-        faucetRemaining.textContent = data.faucet.remaining_today;
+        faucetRemaining.textContent = data.faucet.remaining_window;
       } else {
         faucetBox.hidden = true;
       }
