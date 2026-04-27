@@ -3856,6 +3856,84 @@ assert HONESTY_CURVE_RESTART_DRIFT_SECS > 0, (
     "anchored honest-restart insurance"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 24 — Honesty-curve rate factor
+# ─────────────────────────────────────────────────────────────────────
+# Tier 23 introduced honest-history relief based on track_record, but
+# track_record is a pure VOLUME measure: a validator with 1000 good
+# blocks and 5 priors gets the same relief as one with 1000 good
+# blocks and 0 priors.  The CLAUDE.md anchor ("a node that has
+# behaved correctly for a long run and trips on one block should not
+# be punished the same as a node that misbehaves repeatedly") implies
+# the curve should account for the *rate* of good-vs-bad behavior,
+# not just the absolute count of good actions.
+#
+# Tier 24 closes that gap with a single composition: post-activation,
+# track_record is rate-adjusted by subtracting
+# `BAD_PENALTY_WEIGHT × prior_offenses` from the raw weighted sum,
+# clamped to ≥ 0.  Effect:
+#
+#   * Long-tenured validator with 0 priors: relief unchanged (high
+#     track_record → small severity).
+#   * Long-tenured validator with many priors: track_record erodes
+#     fast → relief shrinks → severity climbs back toward base.
+#   * Mixed pattern (good run, then a streak of slashes): the relief
+#     decays in proportion to bad volume.  Combined with Tier 23's
+#     escalation multiplier (1 + REPEAT_MULTIPLIER × prior), the net
+#     effect is a smooth penalty ramp that respects the good:bad
+#     ratio rather than just the counts.
+#
+# BAD_PENALTY_WEIGHT defaults to HONEST_TRACK_THRESHOLD (=100): each
+# prior offense erases roughly one threshold's worth of good
+# standing.  At default weights (block=4, attest=1) and threshold=100,
+# that's ≈ 25 good blocks OR ≈ 100 good attestations to "earn back"
+# from one slash.  The shape is anchored; the exact weight is a
+# tuning knob.
+#
+# Activation rides above HONESTY_CURVE_HEIGHT (Tier 23) with normal
+# fork runway.  Below activation: track_record is computed exactly
+# as Tier 23 left it — byte-for-byte preservation across the fork
+# boundary so historical slashes replay under the rule current at
+# their height.
+HONESTY_CURVE_RATE_HEIGHT = 5000  # Tier 24
+
+# Each prior recorded offense subtracts this much from the raw
+# track_record before the relief multiplier is computed.  Default
+# equals HONEST_TRACK_THRESHOLD so one slash erodes one threshold's
+# worth of accumulated good standing.
+HONESTY_CURVE_BAD_PENALTY_WEIGHT = 100
+
+# Perfect-record amnesty threshold (Tier 24).  A validator whose
+# track_record clears this bar AND has zero priors gets full pass
+# (severity = 0) on AMBIGUOUS evidence — the "low CHANCE of getting
+# penalized" half of the CLAUDE.md anchored property.  Default 10×
+# HONEST_TRACK_THRESHOLD: a validator must accumulate ten thresholds
+# of good behavior before earning the amnesty.  Single-shot: the
+# amnesty bumps slash_offense_counts so the next AMBIGUOUS incident
+# sees priors=1 and no longer qualifies (the validator must rebuild
+# the perfect-record cushion).  Only AMBIGUOUS evidence can be
+# amnestied — UNAMBIGUOUS double-sign / state-root divergence is
+# always slashable regardless of tenure (deliberate-Byzantine bar).
+HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD = 1_000
+
+assert HONESTY_CURVE_RATE_HEIGHT > HONESTY_CURVE_HEIGHT, (
+    "HONESTY_CURVE_RATE_HEIGHT must follow HONESTY_CURVE_HEIGHT — Tier "
+    "24 rides on top of the Tier 23 honesty-curve baseline; activating "
+    "the rate factor before the underlying curve exists is nonsensical"
+)
+assert HONESTY_CURVE_BAD_PENALTY_WEIGHT > 0, (
+    "HONESTY_CURVE_BAD_PENALTY_WEIGHT must be positive — at 0 the rate "
+    "factor is a no-op and Tier 24 reduces to Tier 23 behavior"
+)
+assert (
+    HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD > HONESTY_CURVE_HONEST_TRACK_THRESHOLD
+), (
+    "HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD must exceed HONEST_TRACK_"
+    "THRESHOLD — the amnesty band is a STRICTER condition (full pass) "
+    "than the relief band (small severity), so the threshold must be "
+    "higher; otherwise relief and amnesty collapse into one rule"
+)
+
 
 def get_honesty_curve_active(current_block: int) -> bool:
     """Return True if the honesty curve has activated at this height.

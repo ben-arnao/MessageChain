@@ -1138,6 +1138,7 @@ class InclusionViolationResult:
 def process_inclusion_list_violation(
     etx: InclusionListViolationEvidenceTx,
     blockchain,
+    current_height: int | None = None,
 ) -> InclusionViolationResult:
     """Apply a violation evidence: slash the accused if still eligible.
 
@@ -1148,10 +1149,24 @@ def process_inclusion_list_violation(
     Decision rules:
       * If (list_hash, omitted_tx_hash, accused_proposer_id) is already
         in `processed_violations` → reject (double-slash defence).
-      * Slash the offender's stake by compute_violation_slash_amount;
-        burn the tokens.
+      * Slash the offender's stake; burn the tokens.
       * Record the (list_hash, tx_hash, proposer_id) in
         processed_violations.
+
+    Severity policy:
+      * Pre-Tier-24 (``HONESTY_CURVE_RATE_HEIGHT``): flat
+        ``INCLUSION_VIOLATION_SLASH_BPS`` rate via
+        ``compute_violation_slash_amount`` — historical replay
+        byte-identical to pre-fork behavior.
+      * Post-Tier-24: route through ``slashing_severity`` with
+        ``OffenseKind.INCLUSION_LIST_VIOLATION`` and
+        ``Unambiguity.UNAMBIGUOUS``.  An inclusion-list violation
+        is unambiguous because the proposer demonstrably failed to
+        include a tx the list mandated — there's no honest restart-
+        crash explanation.  Track-record relief still applies for a
+        first offense from a long-tenured validator (UNAMBIGUOUS_
+        FIRST_PCT band, default 50%).  Repeat violations escalate
+        to 100%.
 
     The dedupe key includes list_hash because two overlapping lists
     can mandate the same tx; omitting that tx while both are active
@@ -1159,6 +1174,11 @@ def process_inclusion_list_violation(
     accused_height) because the height range is implied by the list's
     window — two evidences for the same (list, tx, proposer) at
     different heights are true duplicates.
+
+    ``current_height`` is required for the post-Tier-24 path; callers
+    that omit it (legacy / older tests) fall back to the flat-BPS
+    semantics, which is byte-identical to the pre-fork behavior so
+    no historical replay diverges.
     """
     proc = blockchain.inclusion_list_processor
     key = (
@@ -1174,13 +1194,44 @@ def process_inclusion_list_violation(
     current_stake = blockchain.supply.staked.get(
         etx.accused_proposer_id, 0,
     )
-    slash_amount = compute_violation_slash_amount(current_stake)
+    # Tier 24: route through honesty curve when active.  Below
+    # activation: legacy flat-BPS path (byte-for-byte preserved).
+    use_curve = False
+    if current_height is not None:
+        from messagechain.config import HONESTY_CURVE_RATE_HEIGHT
+        use_curve = current_height >= HONESTY_CURVE_RATE_HEIGHT
+    if use_curve:
+        from messagechain.consensus.honesty_curve import (
+            OffenseKind,
+            Unambiguity,
+            slashing_severity,
+        )
+        sev_pct = slashing_severity(
+            etx.accused_proposer_id,
+            OffenseKind.INCLUSION_LIST_VIOLATION,
+            Unambiguity.UNAMBIGUOUS,
+            blockchain,
+        )
+        slash_amount = (current_stake * sev_pct) // 100
+    else:
+        slash_amount = compute_violation_slash_amount(current_stake)
     if slash_amount > 0:
         blockchain.supply.staked[etx.accused_proposer_id] = (
             current_stake - slash_amount
         )
         blockchain.supply.total_supply -= slash_amount
         blockchain.supply.total_burned += slash_amount
+        # Tier 24: increment offense counter so the curve sees this
+        # violation in subsequent severity calls (escalation +
+        # rate-factor erosion both read it).  Pre-curve path skips
+        # the bump to keep historical replay byte-identical.
+        if use_curve and hasattr(blockchain, "slash_offense_counts"):
+            cur = blockchain.slash_offense_counts.get(
+                etx.accused_proposer_id, 0,
+            )
+            blockchain.slash_offense_counts[etx.accused_proposer_id] = (
+                cur + 1
+            )
     proc.processed_violations.add(key)
     return InclusionViolationResult(
         accepted=True, slashed=True,
