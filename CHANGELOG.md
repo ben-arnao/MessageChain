@@ -4,6 +4,55 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.29.0] — 2026-04-27
+
+Tier 27 hard fork — symmetric no-self-react rule.
+
+ReactTransaction shipped at Tier 17 with an asymmetric self-vote
+rule: self-trust votes were rejected (a free unbounded reputation
+pump otherwise), but message-react votes on one's own messages were
+allowed on the rationale that the per-tx fee was the spam tax.  That
+rationale undersells the score's purpose — a vote signals external
+reception, not author preference.  Allowing self-message-reacts lets
+an author cheaply pump their own visibility wherever message_score
+is consulted (sort order, "popular" feeds, any future reputation
+derivative); a fee gates spam volume, not motivated self-promotion.
+
+Tier 27 closes the asymmetry.  At/after `REACT_NO_SELF_MESSAGE_HEIGHT
+= 12_000`, a ReactTx with `target_is_user=False` is rejected at the
+admission layer when its `target` (a message tx_hash) resolves to a
+MessageTransaction whose authoring `entity_id` equals `voter_id`.
+Pre-activation blocks keep their original admission outcomes —
+historical state must continue to apply under the rules in force
+when each block was produced.
+
+Implementation:
+* `messagechain/config.py` — new `REACT_NO_SELF_MESSAGE_HEIGHT`
+  constant + monotonicity assertion above `REVOKE_TX_WINDOW_HEIGHT`.
+* `messagechain/storage/chaindb.py` — new `get_message_author`
+  helper resolves `tx_hash → entity_id` via the existing
+  `tx_locations` index + `get_block_by_number`; O(1) index lookup
+  plus one block load per check, amortized through SQLite's row
+  cache.  Returns None if the location is missing, the block load
+  fails, or the in-block tx is not a MessageTransaction.  Threads
+  `state` through so compact entity-ref blocks decode correctly.
+* `messagechain/core/blockchain.py` — `validate_block` rejects a
+  ReactTx whose voter authored its message target, gated on the
+  activation height.
+* `messagechain/network/submission_server.py` — mempool admission
+  rejects matching submissions so they don't accumulate in the
+  pool only to be filtered later.
+* `server.py` — proposer pre-filters self-message-reacts pulled
+  from the mempool before assembling a block, so a stale entry
+  admitted pre-activation does not poison a post-activation block.
+* `messagechain/core/reaction.py` — module + `create_react_transaction`
+  docstrings updated to describe the symmetric rule and where each
+  half of the check lives.
+
+No new persisted state is introduced — message txs already carry
+their authoring `entity_id`, so resolving authorship is read-only
+against the existing `tx_locations` index.
+
 ## [1.28.6] — 2026-04-27
 
 Critical consensus hotfix — companion to 1.28.5.  Same bug class

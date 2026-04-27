@@ -4093,6 +4093,47 @@ REVOKE_TX_WINDOW_HEIGHT = 10_000  # Tier 26
 # kill-switch coverage when they get home.
 REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS = 13_140
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 27 — Symmetric no-self-react rule
+# ─────────────────────────────────────────────────────────────────────
+# Tier 17 (REACT_TX_HEIGHT) shipped ReactTransaction with an asymmetry:
+# self-trust votes (target_is_user=True with target == voter_id) were
+# rejected (a free unbounded reputation pump otherwise), but message-
+# react votes (target_is_user=False with the message-author == voter)
+# were ALLOWED on the rationale that the per-tx fee was the spam tax.
+#
+# That rationale undersells the score's purpose: a vote signals
+# external reception, not author preference.  Allowing self-votes on
+# one's own message lets an author cheaply pump their own visibility
+# whenever message_score is consulted (sort order, "popular" feeds,
+# any future reputation derivative), with the only cost being a fee
+# the author would pay to anyone else's vote at the same price.  The
+# fee gates spam volume, not motivated self-promotion.
+#
+# Tier 27 closes the asymmetry: at/after activation, a ReactTx with
+# target_is_user=False is rejected if its `target` (a message tx_hash)
+# resolves to a MessageTransaction whose sender_id equals the voter_id.
+# Pre-activation blocks keep admitting self-message-reacts unchanged
+# for replay determinism — historical state must continue to apply
+# under the rules in force when each block was produced.
+#
+# The author-of-target lookup uses the existing tx_locations index
+# (Tier 10) plus a block load via get_block_by_number.  Both are
+# already on the message-react admission path (the existence check
+# at blockchain.py:7938-7948 calls get_tx_location), so post-Tier-27
+# admission adds a single get_block_by_number per message-react tx.
+# Cost is bounded by the per-block byte budget * react fee floor; the
+# index lookup is O(1) and the block load is amortized via SQLite's
+# row cache.  No new persisted state is added — the chain's message
+# txs already carry sender_id, so resolving authorship is read-only.
+#
+# Activation height rides above Tier 26 (REVOKE_TX_WINDOW_HEIGHT =
+# 10_000) with ample runway over current mainnet tip, so no in-flight
+# pre-signed message-react is invalidated by the fork itself —
+# operators upgrade through the prior fork before the new admission
+# rule starts.
+REACT_NO_SELF_MESSAGE_HEIGHT = 12_000  # Tier 27
+
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
     "rides on top of the established post-Tier-18 schedule; activating "
@@ -4122,6 +4163,14 @@ assert REVOKE_TX_WINDOW_HEIGHT > COMMUNITY_ID_HEIGHT, (
     "with the standard runway buffer.  Pre-activation, legacy "
     "un-windowed revoke txs are accepted as before; at/above, the "
     "wire format requires the [valid_from, valid_to] window."
+)
+assert REACT_NO_SELF_MESSAGE_HEIGHT > REVOKE_TX_WINDOW_HEIGHT, (
+    "REACT_NO_SELF_MESSAGE_HEIGHT must follow REVOKE_TX_WINDOW_HEIGHT — "
+    "Tier 27 rides above the highest established fork (Tier 26 revoke-"
+    "window) with the standard runway buffer.  Pre-activation, self-"
+    "reacts on one's own messages are admitted as before (Tier 17 "
+    "rules); at/above, message-react admission rejects when the "
+    "target's authoring sender_id equals the voter_id."
 )
 assert REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS > 0, (
     "REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS must be positive — a zero "

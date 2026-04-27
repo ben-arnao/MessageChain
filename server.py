@@ -3802,11 +3802,35 @@ class Server(SharedRuntimeMixin):
         # Tier 17: drain react pool only at/after activation height.
         # Pre-activation a populated react slot would be rejected by
         # validate_block, so don't even ask the mempool for entries.
-        from messagechain.config import REACT_TX_HEIGHT as _REACT_H
-        if self.blockchain.height + 1 >= _REACT_H:
+        from messagechain.config import (
+            REACT_TX_HEIGHT as _REACT_H,
+            REACT_NO_SELF_MESSAGE_HEIGHT as _REACT_NO_SELF_H,
+        )
+        next_height = self.blockchain.height + 1
+        if next_height >= _REACT_H:
             react_txs = self.mempool.get_react_transactions(
                 max_count=MAX_TXS_PER_BLOCK,
             )
+            # Tier 27: drop self-reacts on own messages before block
+            # assembly so a stale mempool entry from before activation
+            # does not poison an otherwise-valid block.  validate_block
+            # enforces the same rule — this is proposer-side hygiene
+            # so we never produce a block we'd reject.
+            if (
+                next_height >= _REACT_NO_SELF_H
+                and self.blockchain.db is not None
+                and react_txs
+            ):
+                _filtered = []
+                for _rtx in react_txs:
+                    if not _rtx.target_is_user:
+                        _author = self.blockchain.db.get_message_author(
+                            _rtx.target, state=self.blockchain,
+                        )
+                        if _author is not None and _author == _rtx.voter_id:
+                            continue
+                    _filtered.append(_rtx)
+                react_txs = _filtered
         else:
             react_txs = []
         # Drain pending authority txs (SetAuthorityKey / Revoke / KeyRotation)

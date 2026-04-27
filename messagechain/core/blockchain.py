@@ -7946,6 +7946,32 @@ class Blockchain:
                             f"message-react target "
                             f"{rtx.target.hex()[:16]} not in chain"
                         )
+                    # Tier 27: at/after REACT_NO_SELF_MESSAGE_HEIGHT a
+                    # voter cannot react to their own message.  The
+                    # rule symmetrizes the existing user-trust no-self
+                    # gate (see verify_react_transaction) — a vote
+                    # signals external reception, not author preference.
+                    # Pre-activation blocks keep admitting self-message-
+                    # reacts unchanged for replay determinism.
+                    from messagechain.config import (
+                        REACT_NO_SELF_MESSAGE_HEIGHT,
+                    )
+                    if (
+                        block.header.block_number
+                        >= REACT_NO_SELF_MESSAGE_HEIGHT
+                        and self.db is not None
+                    ):
+                        author = self.db.get_message_author(
+                            rtx.target, state=self,
+                        )
+                        if author is not None and author == rtx.voter_id:
+                            return False, (
+                                f"Invalid react tx "
+                                f"{rtx.tx_hash.hex()[:16]}: "
+                                f"voter cannot react to their own "
+                                f"message (target "
+                                f"{rtx.target.hex()[:16]})"
+                            )
                 # Nonce — shares the same monotonic counter as every
                 # other fee-paying tx kind from the same voter.
                 expected_nonce = pending_nonces.get(
