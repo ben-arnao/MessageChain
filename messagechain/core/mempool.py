@@ -18,6 +18,7 @@ Now supports:
 
 import os
 import secrets
+import threading
 import time
 from collections import defaultdict
 from messagechain.config import (
@@ -58,6 +59,22 @@ class Mempool:
     def __init__(self, max_size: int = MEMPOOL_MAX_SIZE, tx_ttl: int = MEMPOOL_TX_TTL,
                  per_sender_limit: int = MEMPOOL_PER_SENDER_LIMIT,
                  fee_policy: DynamicFeePolicy | None = None):
+        # Thread-safety: every method that touches mempool state acquires
+        # this lock for the full duration of its read or write.  RLock
+        # (not plain Lock) because some methods call sibling methods
+        # while still holding the lock — e.g. `try_replace_by_fee` calls
+        # `_remove_tx`, `add_transaction` calls `_remove_tx` for the
+        # full-pool eviction path, `expire_transactions` calls
+        # `_remove_tx` per expired tx.  Plain Lock would self-deadlock
+        # in those cases; RLock allows reentrant acquisition by the
+        # owning thread at the cost of a single-microsecond reentrance
+        # check.  See the regression in the 1.28.3/1.28.4 to_thread
+        # change — RPC submits AND block production both run on worker
+        # threads, so concurrent get_transactions / add_transaction
+        # races on `self.pending` raised
+        # `RuntimeError: dictionary changed size during iteration` and
+        # silently killed proposer slots.
+        self._lock = threading.RLock()
         self.pending: dict[bytes, MessageTransaction] = {}  # tx_hash -> tx
         self._sender_counts: dict[bytes, int] = defaultdict(int)  # entity_id -> count
         # Block height at which each tx first entered THIS mempool.  Used by
@@ -135,54 +152,55 @@ class Mempool:
         chain height so a long-waited tx can be distinguished from a fresh
         arrival.
         """
-        if tx.tx_hash in self.pending:
-            return False
-
-        # Reject expired transactions on arrival
-        if self._is_expired(tx):
-            return False
-
-        # WOTS+ leaf-reuse defense at admission: if another pending tx from
-        # the same entity already uses this leaf_index, reject. Without this
-        # guard, two rapid sends from the same wallet (same watermark
-        # observation) can both slip through validate_transaction (chain
-        # state hasn't bumped yet) and force the block-level dedupe to
-        # reject the WHOLE block. Catching it here errors the client
-        # immediately on the second attempt instead.
-        incoming_leaf = tx.signature.leaf_index
-        for existing in self.pending.values():
-            if (existing.entity_id == tx.entity_id
-                    and existing.signature.leaf_index == incoming_leaf):
+        with self._lock:
+            if tx.tx_hash in self.pending:
                 return False
 
-        # Flat admission floor — every tx must pay at least
-        # MARKET_FEE_FLOOR (=1).  We no longer scale the relay floor
-        # with mempool pressure: the spam ceiling is delivered by block
-        # cadence + per-block byte budget, not per-tx fee inflation.
-        # See CLAUDE.md "Fee model — minimum fee is 1, never 0."
-        from messagechain.config import MARKET_FEE_FLOOR
-        if tx.fee < MARKET_FEE_FLOOR:
-            return False
+            # Reject expired transactions on arrival
+            if self._is_expired(tx):
+                return False
 
-        # Per-sender ancestor limit: prevent deep unconfirmed chains (BTC-style)
-        if self._sender_counts[tx.entity_id] >= min(self.per_sender_limit, MEMPOOL_MAX_ANCESTORS):
-            return False
+            # WOTS+ leaf-reuse defense at admission: if another pending tx from
+            # the same entity already uses this leaf_index, reject. Without this
+            # guard, two rapid sends from the same wallet (same watermark
+            # observation) can both slip through validate_transaction (chain
+            # state hasn't bumped yet) and force the block-level dedupe to
+            # reject the WHOLE block. Catching it here errors the client
+            # immediately on the second attempt instead.
+            incoming_leaf = tx.signature.leaf_index
+            for existing in self.pending.values():
+                if (existing.entity_id == tx.entity_id
+                        and existing.signature.leaf_index == incoming_leaf):
+                    return False
 
-        if len(self.pending) >= self.max_size:
-            # Evict the lowest fee-per-byte tx — same priority axis used
-            # for block inclusion, so a tx admitted here is one the next
-            # proposer would actually pick over what's being kicked out.
-            min_tx = min(self.pending.values(), key=_fee_per_byte)
-            if _fee_per_byte(tx) <= _fee_per_byte(min_tx):
-                return False  # new tx doesn't beat the worst density in pool
-            self._remove_tx(min_tx)
+            # Flat admission floor — every tx must pay at least
+            # MARKET_FEE_FLOOR (=1).  We no longer scale the relay floor
+            # with mempool pressure: the spam ceiling is delivered by block
+            # cadence + per-block byte budget, not per-tx fee inflation.
+            # See CLAUDE.md "Fee model — minimum fee is 1, never 0."
+            from messagechain.config import MARKET_FEE_FLOOR
+            if tx.fee < MARKET_FEE_FLOOR:
+                return False
 
-        self.pending[tx.tx_hash] = tx
-        self._sender_counts[tx.entity_id] += 1
-        self.arrival_heights[tx.tx_hash] = (
-            arrival_block_height if arrival_block_height is not None else 0
-        )
-        return True
+            # Per-sender ancestor limit: prevent deep unconfirmed chains (BTC-style)
+            if self._sender_counts[tx.entity_id] >= min(self.per_sender_limit, MEMPOOL_MAX_ANCESTORS):
+                return False
+
+            if len(self.pending) >= self.max_size:
+                # Evict the lowest fee-per-byte tx — same priority axis used
+                # for block inclusion, so a tx admitted here is one the next
+                # proposer would actually pick over what's being kicked out.
+                min_tx = min(self.pending.values(), key=_fee_per_byte)
+                if _fee_per_byte(tx) <= _fee_per_byte(min_tx):
+                    return False  # new tx doesn't beat the worst density in pool
+                self._remove_tx(min_tx)
+
+            self.pending[tx.tx_hash] = tx
+            self._sender_counts[tx.entity_id] += 1
+            self.arrival_heights[tx.tx_hash] = (
+                arrival_block_height if arrival_block_height is not None else 0
+            )
+            return True
 
     def get_transactions(self, max_count: int) -> list[MessageTransaction]:
         """
@@ -194,8 +212,9 @@ class Mempool:
         size — a 200-byte tx paying fee=199 beats a 1024-byte tx paying
         fee=200 because it claims fewer bytes of the budget per unit fee.
         """
-        txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
-        return txs[:max_count]
+        with self._lock:
+            txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
+            return txs[:max_count]
 
     def get_transactions_with_entity_cap(
         self, max_count: int,
@@ -207,18 +226,19 @@ class Mempool:
         further txs from that entity are skipped — even if they have
         higher fee density than txs from other entities.
         """
-        txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
-        selected: list[MessageTransaction] = []
-        entity_counts: dict[bytes, int] = {}
-        for tx in txs:
-            if len(selected) >= max_count:
-                break
-            count = entity_counts.get(tx.entity_id, 0)
-            if count >= MAX_TXS_PER_ENTITY_PER_BLOCK:
-                continue
-            selected.append(tx)
-            entity_counts[tx.entity_id] = count + 1
-        return selected
+        with self._lock:
+            txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
+            selected: list[MessageTransaction] = []
+            entity_counts: dict[bytes, int] = {}
+            for tx in txs:
+                if len(selected) >= max_count:
+                    break
+                count = entity_counts.get(tx.entity_id, 0)
+                if count >= MAX_TXS_PER_ENTITY_PER_BLOCK:
+                    continue
+                selected.append(tx)
+                entity_counts[tx.entity_id] = count + 1
+            return selected
 
     def get_forced_inclusion_set(
         self, current_block_height: int,
@@ -236,19 +256,20 @@ class Mempool:
         attester voting converges on the honest subset; see
         messagechain.consensus.forced_inclusion for the enforcement path.
         """
-        cutoff = current_block_height - FORCED_INCLUSION_WAIT_BLOCKS
-        qualifying = [
-            tx for tx in self.pending.values()
-            if self.arrival_heights.get(tx.tx_hash, 0) <= cutoff
-        ]
-        qualifying.sort(
-            key=lambda t: (
-                -_fee_per_byte(t),
-                self.arrival_heights.get(t.tx_hash, 0),
-                t.tx_hash,
+        with self._lock:
+            cutoff = current_block_height - FORCED_INCLUSION_WAIT_BLOCKS
+            qualifying = [
+                tx for tx in self.pending.values()
+                if self.arrival_heights.get(tx.tx_hash, 0) <= cutoff
+            ]
+            qualifying.sort(
+                key=lambda t: (
+                    -_fee_per_byte(t),
+                    self.arrival_heights.get(t.tx_hash, 0),
+                    t.tx_hash,
+                )
             )
-        )
-        return qualifying[:FORCED_INCLUSION_SET_SIZE]
+            return qualifying[:FORCED_INCLUSION_SET_SIZE]
 
     def get_pending_nonce(self, entity_id: bytes, on_chain_nonce: int) -> int:
         """Return the next expected nonce for *entity_id* considering mempool txs.
@@ -257,30 +278,39 @@ class Mempool:
         that is >= on_chain_nonce.  If any are found, returns max_nonce + 1.
         Otherwise returns on_chain_nonce unchanged.
         """
-        max_nonce = on_chain_nonce - 1  # sentinel: below on_chain
-        for tx in self.pending.values():
-            if tx.entity_id == entity_id and tx.nonce >= on_chain_nonce:
-                if tx.nonce > max_nonce:
-                    max_nonce = tx.nonce
-        if max_nonce >= on_chain_nonce:
-            return max_nonce + 1
-        return on_chain_nonce
+        with self._lock:
+            max_nonce = on_chain_nonce - 1  # sentinel: below on_chain
+            for tx in self.pending.values():
+                if tx.entity_id == entity_id and tx.nonce >= on_chain_nonce:
+                    if tx.nonce > max_nonce:
+                        max_nonce = tx.nonce
+            if max_nonce >= on_chain_nonce:
+                return max_nonce + 1
+            return on_chain_nonce
 
     def _remove_tx(self, tx: MessageTransaction):
-        """Remove a single transaction and update sender count."""
-        if tx.tx_hash in self.pending:
-            del self.pending[tx.tx_hash]
-            self._sender_counts[tx.entity_id] = max(0, self._sender_counts[tx.entity_id] - 1)
-            if self._sender_counts[tx.entity_id] == 0:
-                del self._sender_counts[tx.entity_id]
-        self.arrival_heights.pop(tx.tx_hash, None)
+        """Remove a single transaction and update sender count.
+
+        Always called from a public method that already holds
+        ``self._lock``; the RLock allows the reentrant acquire below
+        without self-deadlock.  Wrapping anyway keeps this method
+        safe to call from any future entry point.
+        """
+        with self._lock:
+            if tx.tx_hash in self.pending:
+                del self.pending[tx.tx_hash]
+                self._sender_counts[tx.entity_id] = max(0, self._sender_counts[tx.entity_id] - 1)
+                if self._sender_counts[tx.entity_id] == 0:
+                    del self._sender_counts[tx.entity_id]
+            self.arrival_heights.pop(tx.tx_hash, None)
 
     def remove_transactions(self, tx_hashes: list[bytes]):
         """Remove transactions after they've been included in a block."""
-        for h in tx_hashes:
-            tx = self.pending.get(h)
-            if tx:
-                self._remove_tx(tx)
+        with self._lock:
+            for h in tx_hashes:
+                tx = self.pending.get(h)
+                if tx:
+                    self._remove_tx(tx)
 
     def expire_transactions(self) -> int:
         """
@@ -288,14 +318,15 @@ class Mempool:
 
         Returns the number of expired transactions removed.
         """
-        now = time.time()
-        expired = [
-            tx for tx in self.pending.values()
-            if now - tx.timestamp > self.tx_ttl
-        ]
-        for tx in expired:
-            self._remove_tx(tx)
-        return len(expired)
+        with self._lock:
+            now = time.time()
+            expired = [
+                tx for tx in self.pending.values()
+                if now - tx.timestamp > self.tx_ttl
+            ]
+            for tx in expired:
+                self._remove_tx(tx)
+            return len(expired)
 
     def _is_expired(self, tx: MessageTransaction) -> bool:
         """Check if a transaction has exceeded its TTL."""
@@ -323,40 +354,44 @@ class Mempool:
 
         Returns True if replacement succeeded, False otherwise.
         """
-        # Find existing tx from same sender with same nonce
-        existing = None
-        for tx in self.pending.values():
-            if tx.entity_id == new_tx.entity_id and tx.nonce == new_tx.nonce:
-                existing = tx
-                break
+        with self._lock:
+            # Find existing tx from same sender with same nonce
+            existing = None
+            for tx in self.pending.values():
+                if tx.entity_id == new_tx.entity_id and tx.nonce == new_tx.nonce:
+                    existing = tx
+                    break
 
-        if existing is None:
-            return False  # nothing to replace
+            if existing is None:
+                return False  # nothing to replace
 
-        if _fee_per_byte(new_tx) <= _fee_per_byte(existing):
-            return False  # new fee-per-byte density must be strictly higher
+            if _fee_per_byte(new_tx) <= _fee_per_byte(existing):
+                return False  # new fee-per-byte density must be strictly higher
 
-        # Verify signature on the replacement (prevents censorship via
-        # unsigned replacements that evict valid transactions).
-        # public_key is REQUIRED — reject if not provided.
-        if public_key is None:
-            return False
-        from messagechain.core.transaction import verify_transaction
-        if not verify_transaction(
-            new_tx, public_key, current_height=current_height,
-        ):
-            return False
+            # Verify signature on the replacement (prevents censorship via
+            # unsigned replacements that evict valid transactions).
+            # public_key is REQUIRED — reject if not provided.
+            if public_key is None:
+                return False
+            # `verify_transaction` is a pure function over (tx, pubkey,
+            # height) that does not re-enter the mempool, so calling it
+            # under the lock is safe and adds no deadlock surface.
+            from messagechain.core.transaction import verify_transaction
+            if not verify_transaction(
+                new_tx, public_key, current_height=current_height,
+            ):
+                return False
 
-        # Remove old, add new.  Carry the original arrival height forward
-        # so RBF replacements don't reset the forced-inclusion clock (an
-        # attacker should not be able to cancel a pending censorship duty
-        # by spamming trivial fee bumps).
-        prior_arrival = self.arrival_heights.get(existing.tx_hash, 0)
-        self._remove_tx(existing)
-        self.pending[new_tx.tx_hash] = new_tx
-        self._sender_counts[new_tx.entity_id] += 1
-        self.arrival_heights[new_tx.tx_hash] = prior_arrival
-        return True
+            # Remove old, add new.  Carry the original arrival height forward
+            # so RBF replacements don't reset the forced-inclusion clock (an
+            # attacker should not be able to cancel a pending censorship duty
+            # by spamming trivial fee bumps).
+            prior_arrival = self.arrival_heights.get(existing.tx_hash, 0)
+            self._remove_tx(existing)
+            self.pending[new_tx.tx_hash] = new_tx
+            self._sender_counts[new_tx.entity_id] += 1
+            self.arrival_heights[new_tx.tx_hash] = prior_arrival
+            return True
 
     def get_fee_estimate(self, message_bytes: int = 0) -> int:
         """Estimate the absolute fee to bid for inclusion of a tx of given size.
@@ -375,12 +410,13 @@ class Mempool:
         should pass their actual stored byte count for a useful estimate.
         """
         from messagechain.config import MARKET_FEE_FLOOR
-        if not self.pending or message_bytes <= 0:
-            return MARKET_FEE_FLOOR
-        densities = sorted(_fee_per_byte(tx) for tx in self.pending.values())
-        median_density = densities[len(densities) // 2]
-        estimate = int(median_density * message_bytes)
-        return max(MARKET_FEE_FLOOR, estimate)
+        with self._lock:
+            if not self.pending or message_bytes <= 0:
+                return MARKET_FEE_FLOOR
+            densities = sorted(_fee_per_byte(tx) for tx in self.pending.values())
+            median_density = densities[len(densities) // 2]
+            estimate = int(median_density * message_bytes)
+            return max(MARKET_FEE_FLOOR, estimate)
 
     # save_to_file / load_from_file exist so operator tooling (and our
     # own test suite) can round-trip a pending-pool snapshot for debug
@@ -397,7 +433,11 @@ class Mempool:
         server — see module comment for why.  Returns the number of
         transactions saved."""
         import json
-        txs = [tx.serialize() for tx in self.pending.values()]
+        # Snapshot under the lock so a concurrent mutation can't corrupt
+        # the serialized list mid-iteration; the actual file write is
+        # done outside the lock to avoid pinning the mempool on slow I/O.
+        with self._lock:
+            txs = [tx.serialize() for tx in self.pending.values()]
         try:
             with open(path, "w") as f:
                 json.dump(txs, f)
@@ -416,6 +456,9 @@ class Mempool:
         except (FileNotFoundError, json.JSONDecodeError):
             return 0
 
+        # add_transaction acquires the lock per call; we don't hold it
+        # across the whole loop so concurrent block production isn't
+        # blocked while a forensic dump replays.
         loaded = 0
         for tx_data in txs_data:
             try:
@@ -434,39 +477,40 @@ class Mempool:
 
         Returns True if the tx was accepted into the orphan pool.
         """
-        if tx.tx_hash in self.orphan_pool:
-            return False
+        with self._lock:
+            if tx.tx_hash in self.orphan_pool:
+                return False
 
-        # Reject if nonce gap is too large
-        gap = tx.nonce - expected_nonce
-        if gap <= 0 or gap > MEMPOOL_MAX_ORPHAN_NONCE_GAP:
-            return False
+            # Reject if nonce gap is too large
+            gap = tx.nonce - expected_nonce
+            if gap <= 0 or gap > MEMPOOL_MAX_ORPHAN_NONCE_GAP:
+                return False
 
-        # Per-sender limit
-        if self._orphan_sender_counts[tx.entity_id] >= MEMPOOL_MAX_ORPHAN_PER_SENDER:
-            return False
+            # Per-sender limit
+            if self._orphan_sender_counts[tx.entity_id] >= MEMPOOL_MAX_ORPHAN_PER_SENDER:
+                return False
 
-        # Global limit — random eviction when full. Rejecting new entries
-        # outright lets an early attacker lock honest orphans out of the
-        # pool; random eviction matches Bitcoin Core's approach and keeps
-        # the pool rotating under adversarial pressure.
-        if len(self.orphan_pool) >= MEMPOOL_MAX_ORPHAN_TXS:
-            # secrets.choice gives an unbiased pick from the current
-            # key set without the modulo-bias that `os.urandom(4) % n`
-            # introduces — and crucially without exposing the attacker a
-            # modulo-predictable mapping from a 32-bit draw to a victim
-            # index.
-            victim_hash = secrets.choice(list(self.orphan_pool.keys()))
-            victim_tx = self.orphan_pool.pop(victim_hash)
-            self._orphan_sender_counts[victim_tx.entity_id] = max(
-                0, self._orphan_sender_counts[victim_tx.entity_id] - 1
-            )
-            if self._orphan_sender_counts[victim_tx.entity_id] == 0:
-                del self._orphan_sender_counts[victim_tx.entity_id]
+            # Global limit — random eviction when full. Rejecting new entries
+            # outright lets an early attacker lock honest orphans out of the
+            # pool; random eviction matches Bitcoin Core's approach and keeps
+            # the pool rotating under adversarial pressure.
+            if len(self.orphan_pool) >= MEMPOOL_MAX_ORPHAN_TXS:
+                # secrets.choice gives an unbiased pick from the current
+                # key set without the modulo-bias that `os.urandom(4) % n`
+                # introduces — and crucially without exposing the attacker a
+                # modulo-predictable mapping from a 32-bit draw to a victim
+                # index.
+                victim_hash = secrets.choice(list(self.orphan_pool.keys()))
+                victim_tx = self.orphan_pool.pop(victim_hash)
+                self._orphan_sender_counts[victim_tx.entity_id] = max(
+                    0, self._orphan_sender_counts[victim_tx.entity_id] - 1
+                )
+                if self._orphan_sender_counts[victim_tx.entity_id] == 0:
+                    del self._orphan_sender_counts[victim_tx.entity_id]
 
-        self.orphan_pool[tx.tx_hash] = tx
-        self._orphan_sender_counts[tx.entity_id] += 1
-        return True
+            self.orphan_pool[tx.tx_hash] = tx
+            self._orphan_sender_counts[tx.entity_id] += 1
+            return True
 
     def promote_orphans(self, entity_id: bytes, new_nonce: int) -> list[MessageTransaction]:
         """Promote orphan txs whose nonce gap has been filled.
@@ -475,38 +519,40 @@ class Mempool:
         advancing the expected nonce for an entity. Returns the list of
         promoted transactions (caller should add them to main pool).
         """
-        promoted = []
-        to_remove = []
-        for tx_hash, tx in self.orphan_pool.items():
-            if tx.entity_id == entity_id and tx.nonce == new_nonce:
-                promoted.append(tx)
-                to_remove.append(tx_hash)
+        with self._lock:
+            promoted = []
+            to_remove = []
+            for tx_hash, tx in self.orphan_pool.items():
+                if tx.entity_id == entity_id and tx.nonce == new_nonce:
+                    promoted.append(tx)
+                    to_remove.append(tx_hash)
 
-        for tx_hash in to_remove:
-            tx = self.orphan_pool.pop(tx_hash)
-            self._orphan_sender_counts[tx.entity_id] = max(
-                0, self._orphan_sender_counts[tx.entity_id] - 1
-            )
-            if self._orphan_sender_counts[tx.entity_id] == 0:
-                del self._orphan_sender_counts[tx.entity_id]
+            for tx_hash in to_remove:
+                tx = self.orphan_pool.pop(tx_hash)
+                self._orphan_sender_counts[tx.entity_id] = max(
+                    0, self._orphan_sender_counts[tx.entity_id] - 1
+                )
+                if self._orphan_sender_counts[tx.entity_id] == 0:
+                    del self._orphan_sender_counts[tx.entity_id]
 
-        return promoted
+            return promoted
 
     def expire_orphans(self) -> int:
         """Remove expired orphan transactions. Returns count removed."""
-        now = time.time()
-        expired = [
-            tx_hash for tx_hash, tx in self.orphan_pool.items()
-            if now - tx.timestamp > self.tx_ttl
-        ]
-        for tx_hash in expired:
-            tx = self.orphan_pool.pop(tx_hash)
-            self._orphan_sender_counts[tx.entity_id] = max(
-                0, self._orphan_sender_counts[tx.entity_id] - 1
-            )
-            if self._orphan_sender_counts[tx.entity_id] == 0:
-                del self._orphan_sender_counts[tx.entity_id]
-        return len(expired)
+        with self._lock:
+            now = time.time()
+            expired = [
+                tx_hash for tx_hash, tx in self.orphan_pool.items()
+                if now - tx.timestamp > self.tx_ttl
+            ]
+            for tx_hash in expired:
+                tx = self.orphan_pool.pop(tx_hash)
+                self._orphan_sender_counts[tx.entity_id] = max(
+                    0, self._orphan_sender_counts[tx.entity_id] - 1
+                )
+                if self._orphan_sender_counts[tx.entity_id] == 0:
+                    del self._orphan_sender_counts[tx.entity_id]
+            return len(expired)
 
     def add_slash_transaction(self, slash_tx) -> bool:
         """Add a validated SlashTransaction to the slash pool.
@@ -516,24 +562,27 @@ class Mempool:
         are rare and high-value, so we accept strict FIFO (refuse new
         entries when full) rather than build another eviction scheme.
         """
-        if slash_tx.tx_hash in self.slash_pool:
-            return False
-        if len(self.slash_pool) >= self.slash_pool_max_size:
-            return False
-        self.slash_pool[slash_tx.tx_hash] = slash_tx
-        return True
+        with self._lock:
+            if slash_tx.tx_hash in self.slash_pool:
+                return False
+            if len(self.slash_pool) >= self.slash_pool_max_size:
+                return False
+            self.slash_pool[slash_tx.tx_hash] = slash_tx
+            return True
 
     def get_slash_transactions(self, max_count: int | None = None) -> list:
         """Return pending slash transactions for inclusion in a new block."""
-        items = list(self.slash_pool.values())
-        if max_count is not None:
-            items = items[:max_count]
-        return items
+        with self._lock:
+            items = list(self.slash_pool.values())
+            if max_count is not None:
+                items = items[:max_count]
+            return items
 
     def remove_slash_transactions(self, tx_hashes: list[bytes]):
         """Remove slash txs after they've been included in a block."""
-        for h in tx_hashes:
-            self.slash_pool.pop(h, None)
+        with self._lock:
+            for h in tx_hashes:
+                self.slash_pool.pop(h, None)
 
     # ── Finality vote pool ───────────────────────────────────────
 
@@ -545,25 +594,31 @@ class Mempool:
         peer can't silently dislodge an existing vote by re-sending
         a structurally-identical one.
         """
-        key = vote.consensus_hash()
-        if key in self.finality_pool:
-            return False
-        if len(self.finality_pool) >= self.finality_pool_max_size:
-            return False
-        self.finality_pool[key] = vote
-        return True
+        # `vote.consensus_hash()` is a pure derivation on the vote
+        # object — no mempool re-entry, safe to compute under the lock
+        # (and required so the membership check + insert are atomic).
+        with self._lock:
+            key = vote.consensus_hash()
+            if key in self.finality_pool:
+                return False
+            if len(self.finality_pool) >= self.finality_pool_max_size:
+                return False
+            self.finality_pool[key] = vote
+            return True
 
     def get_finality_votes(self, max_count: int | None = None) -> list:
         """Return pending finality votes for inclusion in a new block."""
-        items = list(self.finality_pool.values())
-        if max_count is not None:
-            items = items[:max_count]
-        return items
+        with self._lock:
+            items = list(self.finality_pool.values())
+            if max_count is not None:
+                items = items[:max_count]
+            return items
 
     def remove_finality_votes(self, keys: list[bytes]):
         """Remove finality votes after inclusion in a block."""
-        for k in keys:
-            self.finality_pool.pop(k, None)
+        with self._lock:
+            for k in keys:
+                self.finality_pool.pop(k, None)
 
     # ── Censorship-evidence pool ─────────────────────────────────
 
@@ -575,24 +630,27 @@ class Mempool:
         are small and rare.  Strict FIFO (refuse new entries when
         full).
         """
-        if tx.tx_hash in self.censorship_evidence_pool:
-            return False
-        if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
-            return False
-        if tx.fee < MIN_FEE:
-            return False
-        self.censorship_evidence_pool[tx.tx_hash] = tx
-        return True
+        with self._lock:
+            if tx.tx_hash in self.censorship_evidence_pool:
+                return False
+            if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
+                return False
+            if tx.fee < MIN_FEE:
+                return False
+            self.censorship_evidence_pool[tx.tx_hash] = tx
+            return True
 
     def get_censorship_evidence_txs(self, max_count: int | None = None) -> list:
-        items = list(self.censorship_evidence_pool.values())
-        if max_count is not None:
-            items = items[:max_count]
-        return items
+        with self._lock:
+            items = list(self.censorship_evidence_pool.values())
+            if max_count is not None:
+                items = items[:max_count]
+            return items
 
     def remove_censorship_evidence_txs(self, tx_hashes: list[bytes]):
-        for h in tx_hashes:
-            self.censorship_evidence_pool.pop(h, None)
+        with self._lock:
+            for h in tx_hashes:
+                self.censorship_evidence_pool.pop(h, None)
 
     # ── Tier 17 ReactTransaction pool ────────────────────────────
 
@@ -635,34 +693,35 @@ class Mempool:
         + the chain-side checks in `validate_block`); the mempool
         enforces dedup, the protocol fee floor, and the cap.
         """
-        if tx.tx_hash in self.react_pool:
-            return False
-        # Admission floor matches the consensus-side floor exactly.
-        # Pre-Tier-16 the protocol baseline was MIN_FEE=100; post-fork
-        # the baseline is MARKET_FEE_FLOOR=1.  Using MIN_FEE here would
-        # silently reject txs that the chain itself would accept,
-        # defeating the Tier-18 Gap-5 work that aligned ReactTx
-        # admission with the market floor.  Match it.  (Same pattern
-        # the message-tx pool's `add_transaction` uses — see line ~155.)
-        from messagechain.config import MARKET_FEE_FLOOR
-        if tx.fee < MARKET_FEE_FLOOR:
-            return False
-        if len(self.react_pool) < self.react_pool_max_size:
+        with self._lock:
+            if tx.tx_hash in self.react_pool:
+                return False
+            # Admission floor matches the consensus-side floor exactly.
+            # Pre-Tier-16 the protocol baseline was MIN_FEE=100; post-fork
+            # the baseline is MARKET_FEE_FLOOR=1.  Using MIN_FEE here would
+            # silently reject txs that the chain itself would accept,
+            # defeating the Tier-18 Gap-5 work that aligned ReactTx
+            # admission with the market floor.  Match it.  (Same pattern
+            # the message-tx pool's `add_transaction` uses — see line ~155.)
+            from messagechain.config import MARKET_FEE_FLOOR
+            if tx.fee < MARKET_FEE_FLOOR:
+                return False
+            if len(self.react_pool) < self.react_pool_max_size:
+                self.react_pool[tx.tx_hash] = tx
+                return True
+            # Pool is full — fee-density eviction.  Find the lowest-density
+            # pending entry; admit the incoming tx only if it beats it.
+            incoming_density = self._react_fee_density(tx)
+            worst_hash = min(
+                self.react_pool,
+                key=lambda h: self._react_fee_density(self.react_pool[h]),
+            )
+            worst_density = self._react_fee_density(self.react_pool[worst_hash])
+            if incoming_density <= worst_density:
+                return False
+            del self.react_pool[worst_hash]
             self.react_pool[tx.tx_hash] = tx
             return True
-        # Pool is full — fee-density eviction.  Find the lowest-density
-        # pending entry; admit the incoming tx only if it beats it.
-        incoming_density = self._react_fee_density(tx)
-        worst_hash = min(
-            self.react_pool,
-            key=lambda h: self._react_fee_density(self.react_pool[h]),
-        )
-        worst_density = self._react_fee_density(self.react_pool[worst_hash])
-        if incoming_density <= worst_density:
-            return False
-        del self.react_pool[worst_hash]
-        self.react_pool[tx.tx_hash] = tx
-        return True
 
     def get_react_transactions(self, max_count: int | None = None) -> list:
         """Return pending ReactTransactions ordered by fee density (highest first).
@@ -671,20 +730,26 @@ class Mempool:
         consistently picks the highest-revenue set under any per-block
         scarcity (count cap or unified byte budget).
         """
-        items = sorted(
-            self.react_pool.values(),
-            key=self._react_fee_density,
-            reverse=True,
-        )
-        if max_count is not None:
-            items = items[:max_count]
-        return items
+        with self._lock:
+            items = sorted(
+                self.react_pool.values(),
+                key=self._react_fee_density,
+                reverse=True,
+            )
+            if max_count is not None:
+                items = items[:max_count]
+            return items
 
     def remove_react_transactions(self, tx_hashes: list[bytes]):
         """Remove react txs after inclusion in a block."""
-        for h in tx_hashes:
-            self.react_pool.pop(h, None)
+        with self._lock:
+            for h in tx_hashes:
+                self.react_pool.pop(h, None)
 
     @property
     def size(self) -> int:
-        return len(self.pending)
+        # `len()` on a dict is a single C-level read on the dict's
+        # ma_used field — atomic under the GIL — but wrapping anyway
+        # keeps the policy uniform: every state read holds the lock.
+        with self._lock:
+            return len(self.pending)
