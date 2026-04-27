@@ -146,6 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
             "PREV_POINTER_HEIGHT."
         ),
     )
+    send.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness (target_blocks rung in the "
+             "percentile estimator).  high = ~1 block, normal = ~3 "
+             "blocks (default), low = ~10 blocks.  Ignored when "
+             "--fee is set.",
+    )
 
     # --- send-multi ---
     send_multi = sub.add_parser(
@@ -216,6 +223,11 @@ def build_parser() -> argparse.ArgumentParser:
              "single mistyped character sends funds to an "
              "unrecoverable address.  Prefer the mc1... form.",
     )
+    transfer.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
+    )
 
     # --- balance ---
     balance = sub.add_parser(
@@ -238,6 +250,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt (for scripts / CI).",
     )
+    stake.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
+    )
 
     # --- unstake ---
     unstake = sub.add_parser(
@@ -255,6 +272,11 @@ def build_parser() -> argparse.ArgumentParser:
     unstake.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt (for scripts / CI).",
+    )
+    unstake.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
     )
 
     # --- bootstrap-seed ---
@@ -329,6 +351,11 @@ def build_parser() -> argparse.ArgumentParser:
     rotate.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt (for scripts / CI).",
+    )
+    rotate.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
     )
 
     # --- key-status ---
@@ -482,6 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
     propose.add_argument("--description", required=True, help="Detailed description")
     propose.add_argument("--fee", type=int, default=None, help="Transaction fee (default: 1000)")
     propose.add_argument("--server", type=str, default=None, help="Server address host:port")
+    propose.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
+    )
 
     # --- vote ---
     vote = sub.add_parser(
@@ -495,6 +527,11 @@ def build_parser() -> argparse.ArgumentParser:
     vote_group.add_argument("--no", action="store_true", help="Vote no")
     vote.add_argument("--fee", type=int, default=None, help="Transaction fee (default: 100)")
     vote.add_argument("--server", type=str, default=None, help="Server address host:port")
+    vote.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
+    )
 
     # --- generate-key ---
     sub.add_parser(
@@ -715,12 +752,44 @@ def build_parser() -> argparse.ArgumentParser:
     # --- estimate-fee ---
     estimate_fee = sub.add_parser(
         "estimate-fee",
-        help="Estimate the fee for a prospective message or transfer",
-        description="Query the node for the recommended fee without submitting.",
+        help="Estimate the fee for a prospective tx (any kind)",
+        description=(
+            "Query the node for the recommended fee without submitting. "
+            "Accepts either the legacy --message / --transfer shortcuts or "
+            "the unified --tx-type {message,transfer,stake,unstake,react,"
+            "propose,vote,rotate-key} surface, with optional --urgency "
+            "{low,normal,high}.  Prints a breakdown so the user can see "
+            "why the fee is what it is (protocol minimum, mempool "
+            "percentile, total recommended, per-byte rate)."
+        ),
     )
-    fee_mode = estimate_fee.add_mutually_exclusive_group(required=True)
-    fee_mode.add_argument("--message", type=str, help="Message text to price")
-    fee_mode.add_argument("--transfer", action="store_true", help="Price a funds transfer")
+    # Either the user names the kind explicitly via --tx-type, or uses
+    # one of the two legacy shortcuts (--message TEXT, --transfer).
+    # Argparse's mutually_exclusive_group can't model "any one of these
+    # three is required" cleanly when the legacy shortcuts also carry
+    # payload, so we leave them all optional and validate in
+    # cmd_estimate_fee.
+    estimate_fee.add_argument("--message", type=str, default=None, help="Message text to price (legacy shortcut for --tx-type message)")
+    estimate_fee.add_argument("--transfer", action="store_true", help="Price a funds transfer (legacy shortcut for --tx-type transfer)")
+    estimate_fee.add_argument(
+        "--tx-type", dest="tx_type", default=None,
+        choices=("message", "transfer", "stake", "unstake", "react",
+                 "propose", "vote", "rotate-key"),
+        help="Tx kind to price.  For 'message' optionally supply "
+             "--message TEXT to price the exact byte count; for "
+             "'propose' supply --title and --description; other "
+             "kinds need no extra payload args.",
+    )
+    estimate_fee.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="How aggressively to bid above the floor.  high = ~1 block "
+             "(90th percentile), normal = ~3 blocks (75th, default), "
+             "low = ~10 blocks (25th).",
+    )
+    # Optional payload args used by certain --tx-type values; harmless
+    # when not relevant.
+    estimate_fee.add_argument("--title", type=str, default=None, help="Proposal title (for --tx-type propose)")
+    estimate_fee.add_argument("--description", type=str, default=None, help="Proposal description (for --tx-type propose)")
     estimate_fee.add_argument("--server", type=str, default=None, help="Server address host:port")
 
     # --- ping ---
@@ -1976,18 +2045,46 @@ def cmd_send(args):
         )
     fee = args.fee
     if fee is None:
-        # Pass our stored byte count so the server returns a size-aware
-        # density-based suggestion (median fee-per-byte * stored_bytes)
-        # -- same axis the proposer's selection priority ranks on.
-        est_resp = rpc_call(host, port, "get_fee_estimate", {
-            "message_bytes": len(stored_bytes),
-        })
-        server_suggested = (
-            est_resp["result"]["fee_estimate"] if est_resp.get("ok") else 0
+        # Drive the auto-pick through the unified helper in
+        # `messagechain.economics.auto_fee` so every tx-submitting
+        # CLI command uses the same fee picker (CLAUDE.md anchor:
+        # "When the fee model shifts, every auto-fee path shifts with
+        # it").  The percentile rung is selected by --urgency (default
+        # "normal" = ~3 blocks = 75th percentile).
+        from messagechain.economics.auto_fee import (
+            auto_fee, urgency_to_target_blocks,
         )
-        fee = max(local_min, server_suggested)
-        note = " (auto - server floor)" if server_suggested >= local_min else " (auto - size floor)"
-        print(f"Fee: {fee} tokens{note}")
+        urgency = getattr(args, "urgency", "normal")
+        target_blocks = urgency_to_target_blocks(urgency)
+        # Server-side percentile estimate * stored bytes -- mirrors the
+        # proposer's selection axis (fee-per-byte) so a default send
+        # under load actually competes for inclusion instead of being
+        # silently evicted at the floor.
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "message",
+            "message": args.message,
+            "target_blocks": target_blocks,
+            "urgency": urgency,
+        })
+        if est_resp.get("ok"):
+            mempool_estimate = est_resp["result"].get("mempool_fee", 0)
+        else:
+            mempool_estimate = 0
+        fee = auto_fee(
+            "message",
+            stored_size=len(stored_bytes) + prev_overhead,
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        # Don't drop below the local floor either (auto_fee already
+        # enforces tx_floor, but the live signature-aware floor adds a
+        # term auto_fee doesn't see -- keep both checks).
+        fee = max(fee, local_min)
+        print(
+            f"Fee: {fee} tokens (auto, target ~{target_blocks} blocks, "
+            f"urgency={urgency})"
+        )
     else:
         if fee < local_min:
             print(
@@ -2323,12 +2420,49 @@ def cmd_transfer(args):
     # Fee policy:
     #   * --fee explicit:  honor it if it clears the estimator floor
     #     (which includes any NEW_ACCOUNT_FEE surcharge); else error.
-    #   * --fee omitted:   use the server-suggested minimum (which
-    #     already bundles the surcharge when needed).
+    #   * --fee omitted:   use the unified auto-fee helper so every
+    #     tx-submitting command shares one picker (CLAUDE.md anchor).
+    #     The helper's tx_floor("transfer", ...) already bundles the
+    #     surcharge when recipient_is_new.
     fee = args.fee
     required_floor = max(MIN_FEE, server_min_fee)
     if fee is None:
-        fee = required_floor
+        from messagechain.economics.auto_fee import (
+            auto_fee, urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        # Probe live tip so the helper sees the right height-aware
+        # floor.  RPC failure -> fall back to the server's min_fee
+        # (which already encodes the surcharge if any).
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        # Mempool percentile estimate at the urgency-derived rung.
+        # Transfers don't compete in the message-byte-budget knapsack,
+        # so the percentile estimate is mostly informational here --
+        # the type-specific MIN_FEE floor binds.
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "transfer",
+            "recipient_id": recipient_id.hex(),
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee(
+            "transfer",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+            recipient_is_new=recipient_is_new,
+        )
+        # Reconcile with the live server's view of the floor -- server
+        # may already include surcharge details we computed locally.
+        fee = max(fee, required_floor)
     elif fee < required_floor:
         if recipient_is_new:
             print(
@@ -2433,12 +2567,42 @@ def cmd_stake(args):
         leaf = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(leaf)
 
-    # Default fee: post-flat floor is the safe choice pre- and post-
-    # activation (MIN_FEE=100 pre, MIN_FEE_POST_FLAT=1000 post).  The
-    # previous default of 1 was below BOTH floors and got on-chain-
-    # rejected for underpriced whenever --fee was omitted.
+    # Default fee: drive through the unified auto-fee helper so the
+    # "stake" picker matches every other tx-submitting command
+    # (CLAUDE.md anchor: "When the fee model shifts, every auto-fee
+    # path shifts with it").  Floor is MIN_FEE post-Tier-16; the
+    # urgency-driven percentile estimate lifts the bid above the
+    # floor under load.
     from messagechain.config import MIN_FEE_POST_FLAT
-    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee, urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "stake",
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee(
+            "stake",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        # Pre-Tier-16 chains historically required MIN_FEE_POST_FLAT;
+        # never drop below that for backwards compatibility.
+        fee = max(fee, MIN_FEE_POST_FLAT)
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
@@ -2505,10 +2669,37 @@ def cmd_unstake(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    # Default fee: post-flat floor is safe pre- and post-activation.
-    # See cmd_stake for rationale -- 1 was below both MIN_FEE floors.
+    # Default fee: route through the unified auto-fee helper.  Mirrors
+    # cmd_stake; the type-specific floor (MIN_FEE) binds and the
+    # urgency-driven percentile estimate sits above it under load.
     from messagechain.config import MIN_FEE_POST_FLAT
-    fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee, urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "unstake",
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee(
+            "unstake",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        fee = max(fee, MIN_FEE_POST_FLAT)
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")
@@ -2824,7 +3015,35 @@ def cmd_rotate_key(args):
         entity, rotation_number=current_rotation, progress=progress,
     )
 
-    fee = args.fee if args.fee is not None else KEY_ROTATION_FEE
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee as auto_fee_helper,
+            urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "rotate-key",
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee_helper(
+            "rotate-key",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        # Defensive backstop on the type-specific floor.
+        fee = max(fee, KEY_ROTATION_FEE)
     rot_tx = create_key_rotation(
         entity, new_kp, rotation_number=current_rotation, fee=fee,
     )
@@ -3316,8 +3535,32 @@ def cmd_propose(args):
         len(args.title.encode("utf-8"))
         + len(args.description.encode("utf-8"))
     )
-    auto_fee = proposal_fee_floor(payload_bytes, target_height)
-    fee = args.fee if args.fee is not None else auto_fee
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee as auto_fee_helper,
+            urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "propose",
+            "payload_bytes": payload_bytes,
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee_helper(
+            "propose",
+            payload_bytes=payload_bytes,
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        # Defensive: never undercut the chain's own floor function.
+        fee = max(fee, proposal_fee_floor(payload_bytes, target_height))
     tx = create_proposal(
         entity, args.title, args.description, fee=fee,
         current_height=target_height,
@@ -3370,7 +3613,34 @@ def cmd_vote(args):
         print(f"Error: Invalid proposal ID (must be 32 bytes hex): {args.proposal}")
         sys.exit(1)
 
-    fee = args.fee if args.fee is not None else GOVERNANCE_VOTE_FEE
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee as auto_fee_helper,
+            urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "vote",
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee_helper(
+            "vote",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+        fee = max(fee, GOVERNANCE_VOTE_FEE)
     tx = create_vote(entity, proposal_id, approve, fee=fee)
 
     response = rpc_call(host, port, "submit_vote", {
@@ -4277,13 +4547,66 @@ def cmd_cut_checkpoint(args):
 
 
 def cmd_estimate_fee(args):
-    """Estimate fee for a message or funds transfer."""
+    """Estimate fee for any tx kind, with urgency-driven percentile pick.
+
+    Resolves --message / --transfer / --tx-type into a single tx-type
+    label, dispatches the unified `estimate_fee` RPC with target_blocks
+    derived from --urgency, and prints a breakdown the user can read:
+
+        Tx type:            <kind>
+        Urgency:            <urgency>  (target ~N blocks)
+        Stored bytes:       <bytes>
+        Per-byte rate:      <density>
+        Mempool percentile: <fee>
+        Protocol minimum:   <fee>
+        Recommended fee:    <fee>
+
+    Replaces the prior message/transfer-only path, in line with the
+    CLAUDE.md anchor "Auto-fee adjusts to fit this model. ... When the
+    fee model shifts, every auto-fee path shifts with it."
+    """
+    from messagechain.economics.auto_fee import (
+        TX_TYPES, urgency_to_target_blocks,
+    )
+
     host, port = _parse_server(args.server)
 
-    if args.transfer:
-        params = {"kind": "transfer"}
-    else:
-        params = {"kind": "message", "message": args.message}
+    # Resolve tx_type from the three input shapes.  --tx-type wins; the
+    # --message / --transfer shortcuts set it implicitly.
+    tx_type = getattr(args, "tx_type", None)
+    if tx_type is None:
+        if args.message is not None:
+            tx_type = "message"
+        elif args.transfer:
+            tx_type = "transfer"
+        else:
+            print(
+                "Error: estimate-fee requires --tx-type, --message, or "
+                "--transfer.  Run `messagechain estimate-fee --help` for "
+                "the full list of tx kinds."
+            )
+            sys.exit(2)
+    if tx_type not in TX_TYPES:
+        print(f"Error: unknown tx_type {tx_type!r}")
+        sys.exit(2)
+
+    urgency = getattr(args, "urgency", "normal")
+    target_blocks = urgency_to_target_blocks(urgency)
+
+    params: dict = {
+        "kind": tx_type,
+        "target_blocks": target_blocks,
+        "urgency": urgency,
+    }
+    # Tx-type-specific payload args that affect size or floor.
+    if tx_type == "message" and args.message is not None:
+        params["message"] = args.message
+    if tx_type == "propose":
+        title = getattr(args, "title", None) or ""
+        description = getattr(args, "description", None) or ""
+        params["payload_bytes"] = (
+            len(title.encode("utf-8")) + len(description.encode("utf-8"))
+        )
 
     from client import rpc_call
     response = rpc_call(host, port, "estimate_fee", params)
@@ -4294,9 +4617,19 @@ def cmd_estimate_fee(args):
 
     result = response["result"]
     print("=== Fee Estimate ===\n")
-    print(f"  Recommended fee:    {result['recommended_fee']}")
+    print(f"  Tx type:            {result.get('tx_type', tx_type)}")
+    print(
+        f"  Urgency:            {result.get('urgency', urgency)} "
+        f"(target ~{result.get('target_blocks', target_blocks)} blocks)"
+    )
+    stored = result.get("stored_bytes", 0)
+    if stored:
+        per_byte = result.get("fee_per_byte", 0)
+        print(f"  Stored bytes:       {stored}")
+        print(f"  Mempool per byte:   {per_byte}")
     print(f"  Protocol minimum:   {result['min_fee']}")
     print(f"  Mempool suggestion: {result['mempool_fee']}")
+    print(f"  Recommended fee:    {result['recommended_fee']}")
 
 
 def cmd_ping(args):

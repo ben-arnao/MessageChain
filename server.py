@@ -2747,36 +2747,49 @@ class Server(SharedRuntimeMixin):
             return {"ok": False, "error": sanitize_error(str(e))}
 
     def _rpc_estimate_fee(self, params: dict) -> dict:
-        """Price a prospective message or transfer without submitting.
+        """Price a prospective tx of any kind without submitting.
+
+        Single source of truth for fee quotes spanning every tx kind
+        (`message`, `transfer`, `stake`, `unstake`, `react`, `propose`,
+        `vote`, `rotate-key`).  Replaces the prior message+transfer-
+        only path; the unified surface mirrors the unified auto-fee
+        helper in `messagechain.economics.auto_fee` so a CLI quote and
+        a CLI submission compute the same number.
 
         Returns:
-          - min_fee: protocol floor (size-based for messages, MIN_FEE +
-            NEW_ACCOUNT_FEE for transfers to brand-new recipients, else
-            MIN_FEE).
-          - mempool_fee: median of pending-tx fees (demand signal).
-          - recommended_fee: max(min_fee, mempool_fee) — safe to submit now.
-          - recipient_is_new (transfers only): True iff the target
-            `recipient_id` does not yet exist on chain, so the client can
-            display "+NEW_ACCOUNT_FEE surcharge (burned)" if it wants.
+          - min_fee: protocol admission floor at the live tip height.
+          - mempool_fee: percentile estimate at `target_blocks` rung,
+            multiplied by stored bytes (for kinds where density ranks).
+          - recommended_fee: max(min_fee, mempool_fee).
+          - tx_type / urgency / target_blocks / stored_bytes /
+            fee_per_byte: breakdown fields for the CLI to display.
+          - recipient_is_new (transfers only): surfaced for
+            NEW_ACCOUNT_FEE awareness.
 
-        For `kind=message`, the size curve dominates on long messages.
-        For `kind=transfer`, pass `recipient_id` (hex) to get a surcharge-
-        inclusive estimate when the recipient has no on-chain state yet.
-        Omit `recipient_id` (or supply an invalid hex) to fall back to the
-        legacy estimate that assumes an existing recipient.
+        Pass `target_blocks` (1 / 3 / 10 typical) to drive the
+        percentile rung; omit for the legacy median behavior.
         """
         from messagechain.core.transaction import calculate_min_fee
         from messagechain.config import (
             MIN_FEE, NEW_ACCOUNT_FEE, MAX_MESSAGE_CHARS,
             FEE_INCLUDES_SIGNATURE_HEIGHT,
         )
+        from messagechain.economics.auto_fee import (
+            TX_TYPES, tx_floor, stored_size_for,
+        )
+
         kind = params.get("kind", "message")
+        if kind not in TX_TYPES:
+            return {"ok": False, "error": f"Unknown fee kind: {kind}"}
+
+        target_height = self.blockchain.height + 1
+        target_blocks = int(params.get("target_blocks", 3) or 3)
+        urgency = params.get("urgency", "normal")
         recipient_is_new = False
-        # ``message_bytes`` drives the size-aware mempool estimate
-        # below.  Defaults to 0 for kinds without a meaningful payload
-        # size (e.g. transfer) — the estimator returns the floor in
-        # that case and ``min_fee`` carries the actual price.
-        message_bytes = 0
+        stored_bytes = 0
+        message_bytes = 0  # for the mempool size-aware estimator
+        payload_bytes = 0
+
         if kind == "message":
             msg = params.get("message", "")
             if not isinstance(msg, str):
@@ -2785,40 +2798,82 @@ class Server(SharedRuntimeMixin):
                 return {"ok": False, "error": f"Message exceeds {MAX_MESSAGE_CHARS} chars"}
             msg_bytes = msg.encode("utf-8")
             message_bytes = len(msg_bytes)
-            # Post-activation consensus prices (message + witness) bytes.
-            # The server advertises the same rule clients will face at
-            # submission time so estimates don't under-quote.  Pre-activation
-            # the signature term is zero, preserving legacy estimates.
-            target_height = self.blockchain.height + 1
+            stored_bytes = stored_size_for(
+                "message", message_bytes=message_bytes,
+            )
+            # Live admission rule mirrors the legacy path so a quote
+            # never under-prices vs what a submit will face.  Pre-Tier-16
+            # signature-aware pricing is still respected if requested.
             sig_bytes = params.get("signature_bytes")
             if (
                 target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
                 and isinstance(sig_bytes, int)
                 and sig_bytes > 0
             ):
-                min_fee = calculate_min_fee(msg_bytes, signature_bytes=sig_bytes)
+                min_fee = calculate_min_fee(
+                    msg_bytes, signature_bytes=sig_bytes,
+                    current_height=target_height,
+                )
             else:
-                min_fee = calculate_min_fee(msg_bytes)
+                min_fee = calculate_min_fee(
+                    msg_bytes, current_height=target_height,
+                )
         elif kind == "transfer":
-            min_fee = MIN_FEE
-            # Optional recipient_id: if provided and the recipient has no
-            # on-chain state, the chain will require a NEW_ACCOUNT_FEE
-            # surcharge on apply, so surface it here.
             recipient_id_hex = params.get("recipient_id")
             if recipient_id_hex:
                 recipient_id = parse_hex(recipient_id_hex, expected_len=32)
                 if recipient_id is not None:
                     if self.blockchain._recipient_is_new(recipient_id):
                         recipient_is_new = True
-                        min_fee += NEW_ACCOUNT_FEE
+            min_fee = tx_floor(
+                "transfer",
+                current_height=target_height,
+                recipient_is_new=recipient_is_new,
+            )
+            stored_bytes = stored_size_for("transfer")
+        elif kind == "propose":
+            payload_bytes = int(params.get("payload_bytes", 0) or 0)
+            min_fee = tx_floor(
+                "propose",
+                payload_bytes=payload_bytes,
+                current_height=target_height,
+            )
+            stored_bytes = stored_size_for("propose", payload_bytes=payload_bytes)
+        elif kind in ("stake", "unstake", "react", "vote", "rotate-key"):
+            min_fee = tx_floor(kind, current_height=target_height)
+            stored_bytes = stored_size_for(kind)
         else:
+            # TX_TYPES gate above already filtered, but be defensive.
             return {"ok": False, "error": f"Unknown fee kind: {kind}"}
 
-        mempool_fee = self.mempool.get_fee_estimate(message_bytes=message_bytes)
+        # Drive the mempool percentile estimator at the urgency-derived
+        # rung.  For kinds where density doesn't apply (no stored bytes,
+        # or the kind isn't in the mempool's pending pool), the
+        # estimator returns the floor and the type-specific min_fee
+        # binds.
+        try:
+            mempool_fee = self.mempool.get_fee_estimate(
+                message_bytes=message_bytes, target_blocks=target_blocks,
+            )
+        except TypeError:
+            # Older mempool implementations without target_blocks.
+            mempool_fee = self.mempool.get_fee_estimate(
+                message_bytes=message_bytes,
+            )
+
+        recommended = max(int(min_fee), int(mempool_fee))
+        fee_per_byte = (
+            recommended / stored_bytes if stored_bytes > 0 else 0
+        )
         result = {
+            "tx_type": kind,
+            "urgency": urgency,
+            "target_blocks": target_blocks,
+            "stored_bytes": stored_bytes,
+            "fee_per_byte": fee_per_byte,
             "min_fee": min_fee,
             "mempool_fee": mempool_fee,
-            "recommended_fee": max(min_fee, mempool_fee),
+            "recommended_fee": recommended,
             "recipient_is_new": recipient_is_new,
         }
         return {"ok": True, "result": result}
