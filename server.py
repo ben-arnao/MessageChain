@@ -1867,6 +1867,9 @@ class Server(SharedRuntimeMixin):
         elif method == "estimate_fee":
             return self._rpc_estimate_fee(request.get("params", {}))
 
+        elif method == "get_tx_status":
+            return self._rpc_get_tx_status(request.get("params", {}))
+
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
@@ -3303,6 +3306,175 @@ class Server(SharedRuntimeMixin):
             "block_hash": block.block_hash.hex(),
             "state_root": block.header.state_root.hex(),
         }}
+
+    def _rpc_get_tx_status(self, params: dict) -> dict:
+        """Inclusion status for a tx_hash — backs `messagechain receipt`.
+
+        The receipt CLI is the user-visible surface that names the
+        slashing-backed permanence guarantee.  After `messagechain send`
+        a user gets a tx hash and ten minutes of nothing; this RPC is
+        what lets the CLI distinguish:
+
+          * INCLUDED  — tx is in a block.  Returns block_height,
+                        block_hash, tx_index, attester count, attesting
+                        stake / total stake, the 2/3 threshold flag,
+                        and a Merkle inclusion proof against the block
+                        header's merkle_root.
+          * PENDING   — tx is in mempool but not yet in a block.
+                        Returns in_mempool=True so the CLI can prompt
+                        for the submit-evidence escalation if waited
+                        long enough.
+          * NOT_FOUND — tx is in neither.  CLI prints the three-cause
+                        diagnostic ('never submitted' / 'collusion' /
+                        'malformed').
+
+        Read-only, content-neutral.  Leaks nothing not already
+        derivable from chain state — every inclusion is public anyway.
+        """
+        tx_hash_hex = params.get("tx_hash")
+        if not tx_hash_hex:
+            return {"ok": False, "error": "missing required param: tx_hash"}
+        tx_hash = parse_hex(tx_hash_hex, expected_len=32)
+        if tx_hash is None:
+            return {"ok": False, "error": "Invalid tx_hash (must be 32 bytes hex)"}
+
+        # 1. Has the tx landed on-chain?  Use the persistent index built
+        #    by chaindb.index_tx_locations — O(1) lookup.  If the chaindb
+        #    isn't wired up (test fixture / pre-index migration), fall
+        #    back to a scan.
+        location = None
+        if getattr(self.blockchain, "db", None) is not None:
+            try:
+                location = self.blockchain.db.get_tx_location(tx_hash)
+            except Exception:
+                location = None
+
+        if location is None:
+            # Fallback: linear scan.  Bounded by chain length; only
+            # taken on test fixtures with no DB or as a safety net.
+            for height_idx, blk in enumerate(getattr(self.blockchain, "chain", [])):
+                for tx in getattr(blk, "transactions", []) or []:
+                    if getattr(tx, "tx_hash", None) == tx_hash:
+                        location = (height_idx, 0)
+                        break
+                if location is not None:
+                    break
+
+        if location is not None:
+            return self._build_included_status(tx_hash, location)
+
+        # 2. Pending in mempool?
+        mempool = self.mempool
+        in_mempool = False
+        if mempool is not None:
+            if tx_hash in getattr(mempool, "pending", {}):
+                in_mempool = True
+            elif tx_hash in (getattr(mempool, "react_pool", {}) or {}):
+                in_mempool = True
+            elif tx_hash in (getattr(mempool, "slash_pool", {}) or {}):
+                in_mempool = True
+            elif tx_hash in (getattr(mempool, "censorship_evidence_pool", {}) or {}):
+                in_mempool = True
+            elif tx_hash in (getattr(mempool, "orphan_pool", {}) or {}):
+                in_mempool = True
+
+        if in_mempool:
+            return {"ok": True, "result": {
+                "status": "pending",
+                "in_mempool": True,
+                "current_height": int(self.blockchain.height),
+            }}
+
+        # 3. Not found anywhere we can see.
+        return {"ok": True, "result": {"status": "not_found"}}
+
+    def _build_included_status(self, tx_hash: bytes, location: tuple) -> dict:
+        """Helper: assemble the full INCLUDED-status response.
+
+        Split out so the dispatch path stays readable; also lets the
+        included path stay testable in isolation.
+        """
+        from messagechain.config import (
+            FINALITY_THRESHOLD_NUMERATOR, FINALITY_THRESHOLD_DENOMINATOR,
+        )
+        block_height, _legacy_index = location
+        block = self.blockchain.get_block(block_height)
+        if block is None:
+            # Index claims a block but we can't load it — treat as
+            # not_found rather than crashing.  This shouldn't happen on
+            # a healthy chain but is defensible against migration races.
+            return {"ok": True, "result": {"status": "not_found"}}
+
+        # Compute the canonical tx_index in the merkle ordering — this
+        # is the index the inclusion proof must use, NOT the on-disk
+        # tx_locations.tx_index (which records the per-variant order).
+        from messagechain.core.block import canonical_block_tx_hashes
+        canonical_hashes = canonical_block_tx_hashes(block)
+        try:
+            canonical_index = canonical_hashes.index(tx_hash)
+        except ValueError:
+            # The tx is recorded as in this block but isn't in the
+            # merkle inputs — schema drift or a non-MessageTransaction
+            # tx.  Surface what we can without a proof.
+            canonical_index = None
+
+        # Build the inclusion proof against the block header's
+        # merkle_root.  Skipped for txs we couldn't locate in the
+        # canonical ordering above.
+        proof_dict = None
+        if canonical_index is not None:
+            try:
+                from messagechain.core.spv import generate_merkle_proof
+                proof = generate_merkle_proof(block, canonical_index)
+                proof_dict = proof.serialize()
+            except Exception:
+                proof_dict = None
+
+        # Attester count + attesting stake.  Pull from the chain's
+        # FinalityTracker — the same source the consensus layer uses
+        # to decide finality.  This means a "permanent" verdict in the
+        # CLI exactly tracks consensus-layer finality, not some
+        # secondary heuristic.
+        block_hash = block.block_hash
+        finality = getattr(self.blockchain, "finality", None)
+        attester_set = set()
+        attesting_stake = 0
+        if finality is not None:
+            attester_set = set(getattr(finality, "attestations", {}).get(block_hash, set()))
+            attesting_stake = int(
+                getattr(finality, "attested_stake", {}).get(block_hash, 0)
+            )
+
+        staked = dict(getattr(self.blockchain.supply, "staked", {}) or {})
+        total_stake = sum(int(v) for v in staked.values())
+        # Total validator count = staked validators with non-zero
+        # stake (the committee a 2/3 threshold is measured against).
+        total_validators = sum(1 for v in staked.values() if int(v) > 0)
+        threshold_met = (
+            total_stake > 0
+            and attesting_stake * FINALITY_THRESHOLD_DENOMINATOR
+            >= total_stake * FINALITY_THRESHOLD_NUMERATOR
+        )
+
+        result = {
+            "status": "included",
+            "block_height": int(block_height),
+            "block_hash": block_hash.hex(),
+            "tx_index": int(canonical_index) if canonical_index is not None else -1,
+            "merkle_root": block.header.merkle_root.hex(),
+            "block_timestamp": int(block.header.timestamp),
+            "current_height": int(self.blockchain.height),
+            "attesters": len(attester_set),
+            "total_validators": int(total_validators),
+            "attesting_stake": int(attesting_stake),
+            "total_stake": int(total_stake),
+            "finality_threshold_met": bool(threshold_met),
+            "finality_numerator": int(FINALITY_THRESHOLD_NUMERATOR),
+            "finality_denominator": int(FINALITY_THRESHOLD_DENOMINATOR),
+        }
+        if proof_dict is not None:
+            result["merkle_proof"] = proof_dict
+        return {"ok": True, "result": result}
 
     # ── Block Production ────────────────────────────────────────────
     # _block_production_loop now lives on SharedRuntimeMixin.
