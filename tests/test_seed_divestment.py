@@ -115,7 +115,7 @@ class TestDivestmentSchedule(unittest.TestCase):
 
     def test_noop_well_before_start(self):
         """Early blocks are completely inert for divestment accounting."""
-        for h in (1, 100, 10_000, START - 1):
+        for h in (1, 100, START // 2, START - 1):
             self._apply_step(h)
         self.assertEqual(
             self.chain.supply.get_staked(self.seed_id), self.initial_stake,

@@ -4,6 +4,72 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.22.0] — 2026-04-26
+
+Minor release. **Tightens the seed-divestment schedule** so the
+non-discretionary unwind of founder stake starts sooner and ends at
+a smaller floor — cleaner end-state for "secure early on,
+democratize later on, leave the founder a meaningful but
+non-controlling stake."
+
+This is a parameter-only consensus change (no schema bumps, no new
+state, no apply-path or sim-path code edits). Both validators must
+upgrade before `SEED_DIVESTMENT_RETUNE_HEIGHT = 1400`; current head
+~302 leaves comfortable runway. Pre-RETUNE byte-for-byte historical
+replay is preserved.
+
+### Changed (consensus, parameter-only)
+
+- `SEED_DIVESTMENT_START_HEIGHT`: 50_000 → **7_500** (~50 days from
+  current head at 600s/block, down from ~10 months). With one
+  operator running both validators and effectively zero external
+  stake, the longer runway buys nothing — pulling start in tightens
+  the credibility story for external observers without sacrificing
+  security. The 4-year bleed window length (`END - START = 210_384`
+  blocks) is preserved so the per-block divestment rate stays sane;
+  only the start moves.
+- `SEED_DIVESTMENT_END_HEIGHT` (derived): 260_384 → **217_884**.
+- `SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE`: 20_000_000 →
+  **10_000_000** (~14.3% of supply → ~7.1% of supply). End-state
+  reads as "top holder, not controlling holder" — meaningful
+  founder reward commensurate with bootstrap effort, but the
+  lottery share grows non-founder wallets to a clearly democratized
+  end-state. Floor is the post-RETUNE/REDIST value; legacy 1M
+  pre-RETUNE floor is unchanged byte-for-byte.
+- `SEED_MAX_STAKE_CEILING` (derived from floor): 20M → **10M**.
+  Existing seed stake above 10M (currently ~22.5M on v1) is
+  grandfathered — the ceiling is enforced on `StakeTransaction`
+  validation only, not on existing stake; divestment will drain v1
+  to the new floor naturally over the bleed window.
+
+### End-state numbers (post-bleed, ~year 2030)
+
+For the founder bootstrap of ~95M staked:
+
+|                    | 1.21.0 schedule | 1.22.0 schedule |
+|--------------------|---------------:|---------------:|
+| Founder retained   | 20M (~14.3%) | **10M (~7.1%)** |
+| Burned             | 37.5M (~26.8%) | **42.5M (~30.4%)** |
+| Lottery payouts    | 33.75M (~24.1%) | **38.25M (~27.3%)** |
+| Treasury           | 3.75M (~2.7%) | **4.25M (~3.0%)** |
+
+(Percentages of pre-burn 140M supply. Post-burn supply trends to
+~97.5M under the new schedule, so the founder's ~10M post-bleed
+share is ~10.3% of circulating supply.)
+
+### Why this is safe to land now
+
+- Current chain head ~302; `SEED_DIVESTMENT_RETUNE_HEIGHT = 1400`
+  hasn't activated, so neither floor nor split params are in effect
+  yet. Both nodes upgrade before block 1400 and the new values
+  apply from the very first divestment block (`START + 1`).
+- No state-snapshot version bump (state shape unchanged).
+- No new tx kinds, no new mempool rules, no fee-model changes.
+- v1's current 22.5M staked is grandfathered above the new 10M
+  ceiling; the seed-stake-ceiling rule blocks `StakeTransaction`
+  validation only, not existing stake. Divestment will grind it
+  down naturally.
+
 ## [1.21.0] — 2026-04-27
 
 Minor release. **Hard fork: Tier 18 — unified fee market** (activates

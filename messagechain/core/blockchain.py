@@ -4335,8 +4335,8 @@ class Blockchain:
             _SCALE = self._DIVESTMENT_SCALE
             # Activation-gated parameters — pre-RETUNE returns the
             # legacy (1M floor, 25% treasury, 0% lottery) values, RETUNE-
-            # era returns the retune (20M floor, 5% treasury, 0% lottery)
-            # values, and REDIST-era returns the redistribution (20M
+            # era returns the retune (10M floor, 5% treasury, 0% lottery)
+            # values, and REDIST-era returns the redistribution (10M
             # floor, 5% treasury, 45% lottery) values so sim/apply match
             # at every height across both fork boundaries.
             _SDRF, _sim_burn_bps, _SDT, _lottery_bps = _gsdp(block_height)
@@ -7644,14 +7644,14 @@ class Blockchain:
 
         # Seed stake ceiling (SEED_STAKE_CEILING_HEIGHT fork).  Without
         # this gate, after SEED_DIVESTMENT_END_HEIGHT drains the
-        # founder's seed to the 20M retention floor, nothing prevents
+        # founder's seed to the 10M retention floor, nothing prevents
         # the founder from buying / recovering tokens externally and
-        # re-staking them back above 20M — silently undoing the
+        # re-staking them back above the floor — silently undoing the
         # divestment's dilution effect.  At/after activation, any stake
         # tx whose entity is in `seed_entity_ids` is rejected when the
-        # resulting stake would exceed SEED_MAX_STAKE_CEILING (= 20M).
-        # Seeds may still stake UP TO 20M and unstake freely; the
-        # ceiling is permanent and does not lift after END.  Non-seed
+        # resulting stake would exceed SEED_MAX_STAKE_CEILING (= 10M).
+        # Seeds may still stake UP TO the ceiling and unstake freely;
+        # the ceiling is permanent and does not lift after END.  Non-seed
         # validators are unaffected.  Pre-activation: no ceiling check
         # (legacy behavior, byte-for-byte historical replay).
         from messagechain.config import (
@@ -8600,7 +8600,7 @@ class Blockchain:
         split is activation-gated (see
         ``messagechain.config.get_seed_divestment_params``): pre-retune
         it is 75/25 against a 1M floor; post-retune it is 95/5 against
-        a 20M floor.  Outside that window this is a no-op.
+        a 10M floor.  Outside that window this is a no-op.
 
         Divestible = max(0, initial_seed_stake - retain_floor(block_height)).
         Only the excess above the floor is subject to divestment; the
@@ -8656,9 +8656,9 @@ class Blockchain:
         # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT
         # and SEED_DIVESTMENT_REDIST_HEIGHT): pre-RETUNE the legacy
         # (floor=1M, burn=75%, treasury=25%, lottery=0%) values apply
-        # byte-for-byte; RETUNE-era the retune (floor=20M, burn=95%,
+        # byte-for-byte; RETUNE-era the retune (floor=10M, burn=95%,
         # treasury=5%, lottery=0%) values apply; REDIST-era the
-        # redistribution (floor=20M, burn=50%, treasury=5%,
+        # redistribution (floor=10M, burn=50%, treasury=5%,
         # lottery=45%) values apply — the lottery share accumulates
         # in SupplyTracker.lottery_prize_pool for later payout via
         # the reputation-weighted lottery.  The sim path in

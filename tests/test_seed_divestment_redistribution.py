@@ -4,11 +4,11 @@ Background
 ----------
 The retune (shipped in commit b498806) fixed the treasury-
 concentration problem by deepening the burn share to 95% and lifting
-the retain floor to 20M, but still routed most of the founder's
-divested 75M to burn.  That preserved supply hygiene but did NOT
-grow non-founder stake: with 75M of tokens leaving circulation and
-none entering new wallets, the founder stays at ~93% consensus
-weight forever.
+the retain floor (originally to 20M; later compressed to 10M in
+1.21.0), but still routed most of the founder's divested stake to
+burn.  That preserved supply hygiene but did NOT grow non-founder
+stake: with the divested tokens leaving circulation and none entering
+new wallets, the founder stays at high consensus weight forever.
 
 The redistribution fork redirects the burn share again:
 
@@ -188,7 +188,7 @@ class TestGetSeedDivestmentParams(unittest.TestCase):
         self.assertEqual(lot_bps, 0)
 
     def test_retune_era(self):
-        """RETUNE <= h < REDIST — 20M/95/5/0."""
+        """RETUNE <= h < REDIST — 10M/95/5/0."""
         # Force a well-separated REDIST height for this test.
         orig = config.SEED_DIVESTMENT_REDIST_HEIGHT
         config.SEED_DIVESTMENT_REDIST_HEIGHT = 10 ** 9
@@ -198,7 +198,7 @@ class TestGetSeedDivestmentParams(unittest.TestCase):
                     config.SEED_DIVESTMENT_RETUNE_HEIGHT,
                 )
             )
-            self.assertEqual(floor, 20_000_000)
+            self.assertEqual(floor, 10_000_000)
             self.assertEqual(burn_bps, 9500)
             self.assertEqual(tres_bps, 500)
             self.assertEqual(lot_bps, 0)
@@ -206,23 +206,23 @@ class TestGetSeedDivestmentParams(unittest.TestCase):
             config.SEED_DIVESTMENT_REDIST_HEIGHT = orig
 
     def test_redist_era(self):
-        """h >= REDIST — 20M/50/5/45."""
+        """h >= REDIST — 10M/50/5/45."""
         floor, burn_bps, tres_bps, lot_bps = (
             config.get_seed_divestment_params(
                 config.SEED_DIVESTMENT_REDIST_HEIGHT,
             )
         )
-        self.assertEqual(floor, 20_000_000)
+        self.assertEqual(floor, 10_000_000)
         self.assertEqual(burn_bps, 5000)
         self.assertEqual(tres_bps, 500)
         self.assertEqual(lot_bps, 4500)
 
     def test_redist_era_far_future(self):
-        """Well past REDIST — still 20M/50/5/45."""
+        """Well past REDIST — still 10M/50/5/45."""
         floor, burn_bps, tres_bps, lot_bps = (
             config.get_seed_divestment_params(10 ** 9)
         )
-        self.assertEqual(floor, 20_000_000)
+        self.assertEqual(floor, 10_000_000)
         self.assertEqual(burn_bps, 5000)
         self.assertEqual(tres_bps, 500)
         self.assertEqual(lot_bps, 4500)
@@ -618,7 +618,15 @@ class TestSeedExclusionInLottery(unittest.TestCase):
 
 
 class TestEndStateMath(unittest.TestCase):
-    """Full-window conservation: burn + treasury + lottery_payouts + retained = 95M."""
+    """Full-window conservation: burn + treasury + lottery_payouts + retained = 95M.
+
+    With the 1.21.0 floor compression (20M → 10M), divestible grows
+    from 75M to 85M and the burn/treasury/lottery split rescales
+    proportionally:
+        burn      = 50% × 85M = 42.5M
+        treasury  =  5% × 85M =  4.25M
+        lottery   = 45% × 85M = 38.25M
+    """
 
     def test_full_window_conservation(self):
         """Simulate the 4-year divestment window at sampled heights,
@@ -712,35 +720,27 @@ class TestEndStateMath(unittest.TestCase):
             config.SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE + 2,
         )
 
-        # Headline numbers for the report.  Divestible = 95M - 20M = 75M.
+        # Headline numbers for the report.  Divestible = 95M - 10M = 85M.
         # Split: 50% burn / 5% treasury / 45% lottery.
-        # Expected (pre-rounding): burn=37.5M, treasury=3.75M,
-        # lottery=33.75M.  Integer-division rounding absorbs into the
+        # Expected (pre-rounding): burn=42.5M, treasury=4.25M,
+        # lottery=38.25M.  Integer-division rounding absorbs into the
         # LOTTERY side (lottery is the remainder of each per-block
         # split, receiving any bps-ratio drift), so lottery actual can
         # be slightly above nominal and burn/treasury slightly below.
         # Tolerance of 2 * WINDOW ≈ 420K tokens (~0.5% of divestible)
         # is ample and reflects the sum of both rounding tails.
         tol = 2 * WINDOW
-        self.assertAlmostEqual(total_burned, 37_500_000, delta=tol)
-        self.assertAlmostEqual(treasury_gain, 3_750_000, delta=tol)
-        self.assertAlmostEqual(total_lottery_paid, 33_750_000, delta=tol)
-        self.assertAlmostEqual(retained_stake, 20_000_000, delta=2)
+        self.assertAlmostEqual(total_burned, 42_500_000, delta=tol)
+        self.assertAlmostEqual(treasury_gain, 4_250_000, delta=tol)
+        self.assertAlmostEqual(total_lottery_paid, 38_250_000, delta=tol)
+        self.assertAlmostEqual(retained_stake, 10_000_000, delta=2)
 
-        # Headline numbers for a 95M → 20M founder divestment under
-        # REDIST (as printed at development time):
-        #     initial_stake      = 95,000,000
-        #     divested           = 74,999,999
-        #     burned             = 37,448,352   (49.93%, nominal 50.00%)
-        #     treasury           =  3,576,528   ( 4.77%, nominal  5.00%)
-        #     lottery_paid       = 33,975,119   (45.30%, nominal 45.00%)
-        #     final_stake        = 20,000,001
-        #     pool_residual      = 0
         # Integer-division drift on the per-block treasury and burn
         # shares flows to the lottery (which treats lottery_share as
-        # the catch-all remainder), which is why lottery is slightly
-        # above nominal (~225K tokens over the 4-year window ≈ 0.3%
-        # of divestible — negligible for redistribution intent).
+        # the catch-all remainder), so lottery actual is slightly
+        # above the nominal 45% — a small fraction (~0.3% of
+        # divestible) over the 4-year window, negligible for
+        # redistribution intent.
 
 
 if __name__ == "__main__":
