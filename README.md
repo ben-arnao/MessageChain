@@ -206,11 +206,16 @@ The leaf-index files record which one-time WOTS+ leaves the keyfile
 has already burned. **Restoring the keyfile without the matching
 leaf-index files re-signs already-used leaves**, which mathematically
 discloses the WOTS+ private key for those leaves and produces
-equivocation evidence on chain. The protocol slashes 100% of stake
-on detection (`SLASH_PENALTY_PCT = 100`); there is no operator
-recovery path. Treat the leaf-index files as security-critical
-state, not as a regenerable cache. Snapshot them whenever you
-snapshot the keyfile, and never restore one without the other.
+equivocation evidence on chain. Pre-Tier 20 the protocol slashed
+100% of stake on detection (`SLASH_PENALTY_PCT = 100`) with no
+recovery path. At/after `SOFT_SLASH_HEIGHT = 15000` the per-offense
+penalty drops to `SOFT_SLASH_PCT = 5` and the validator stays in
+the set with reduced stake — but a leaf-index restore burns leaves
+in BULK, producing many distinct equivocation events that compound
+geometrically `(1 - 0.05)^N` toward total stake loss. Treat the
+leaf-index files as security-critical state, not as a regenerable
+cache. Snapshot them whenever you snapshot the keyfile, and never
+restore one without the other.
 
 **Migrate to a new host.** Stop the validator on the old host
 (`systemctl stop messagechain-validator`), then copy **both** the

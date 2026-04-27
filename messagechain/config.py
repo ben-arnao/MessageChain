@@ -3477,6 +3477,64 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
     "fee market across Message + Transfer + React, so React must be a "
     "first-class tx kind on chain before the unified budget bites"
 )
+
+# ----------------------------------------------------------------------
+# Tier 20: soft equivocation slash (operator-mistake survivability)
+# ----------------------------------------------------------------------
+#
+# Pre-fork policy: any double-proposal / double-attestation / finality-
+# double-vote evidence resulted in 100% stake burn + full bootstrap-
+# escrow burn + permanent removal from the validator set
+# (`slashed_validators`).  That penalty matched a deliberate Byzantine
+# attack but was catastrophic for the most common honest-operator
+# failure mode: running two nodes under the same key (failover
+# misconfig, restored backup with the old node still running, restart
+# race).  One accidental dual-sign wiped the operator's full bond.
+#
+# Post-fork policy: equivocation slashes SOFT_SLASH_PCT of stake +
+# the same fraction of bootstrap escrow + the same fraction of any
+# pending unstakes (kept in the slash basis so an attacker cannot
+# escape by unstaking faster than evidence can be submitted, but at
+# the partial percent).  The validator stays in the set with reduced
+# stake — no permanent ban from a single offense; only the SAME piece
+# of evidence is dedupe'd via `_processed_evidence`.
+#
+# Repeat-offender economics fall out without escalation logic: each
+# new piece of evidence slashes 5% of what remains, so a stuck dual-
+# node operator with N accidental dual-signs decays geometrically as
+# (1-0.05)^N — 10 mistakes ≈ 40% loss, 50 mistakes ≈ 92% loss.
+# Sustained misbehavior still approaches total stake loss; a single
+# accident does not.
+#
+# Activation: rides above Tier 19 (PROPOSAL_FEE_TIER19_HEIGHT = 13000)
+# with a ~2000-block runway (~14 days at 600 s/block), giving
+# operators time to acknowledge the new slashing semantics.
+SOFT_SLASH_HEIGHT = 15000  # Tier 20
+SOFT_SLASH_PCT = 5  # % of stake/escrow/pending burned per equivocation post-fork
+
+
+def get_slash_pct(current_block: int) -> int:
+    """Return the % of stake/escrow burned for one equivocation offense
+    at this height.  Pre-fork: SLASH_PENALTY_PCT (100, full burn).
+    Post-fork: SOFT_SLASH_PCT (5, partial).
+
+    The dynamic config lookup (re-read each call) is what lets test
+    suites monkey-patch SOFT_SLASH_HEIGHT to exercise both regimes
+    without spinning the chain forward 15k blocks.
+    """
+    from messagechain import config as _cfg
+    if current_block >= _cfg.SOFT_SLASH_HEIGHT:
+        return _cfg.SOFT_SLASH_PCT
+    return _cfg.SLASH_PENALTY_PCT
+
+
+assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
+    "SOFT_SLASH_PCT must be a partial slash (0 < pct < 100). The whole "
+    "point of Tier 20 is to soften the catastrophic full-burn penalty "
+    "for honest dual-node operator mistakes; equality with "
+    "SLASH_PENALTY_PCT would make the fork a no-op"
+)
+
 assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
     "message-byte budget — otherwise a block of pure messages valid "
@@ -3672,12 +3730,25 @@ for _fork_name, _fork_height in (
     ("REACT_TX_HEIGHT", REACT_TX_HEIGHT),
     ("TIER_18_HEIGHT", TIER_18_HEIGHT),
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
+    ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
         f"BOOTSTRAP_END_HEIGHT ({_BEH})"
     )
 del _fork_name, _fork_height
+
+# Tier 20 (soft equivocation slash) rides above Tier 19 (proposal fee
+# tightening).  The two forks touch disjoint subsystems (slashing vs
+# governance fees) so the order is operational, not semantic — but
+# spacing them by ~2000 blocks (~14 days at 600 s/block) gives
+# operators a clean cutover window per fork rather than collapsing
+# both rule changes into a single activation block.
+assert SOFT_SLASH_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
+    "SOFT_SLASH_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier 20 "
+    "soft slashing rides above the latest established fork (Tier 19 "
+    "proposal fee tightening)"
+)
 
 
 def validate_block_hex_size(block_data) -> bool:
