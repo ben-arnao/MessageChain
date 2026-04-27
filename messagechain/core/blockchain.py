@@ -6213,6 +6213,36 @@ class Blockchain:
                     f"FINALIZED: block #{att.block_number} ({att.block_hash.hex()[:16]}) "
                     f"reached 2/3+ attestation threshold"
                 )
+                # Witness auto-separation sweep — post-finality
+                # housekeeping that moves WOTS+ signature bytes from
+                # the inline blocks.data BLOB into the side-table for
+                # blocks past the retention window.  At saturation
+                # this is ~73% of full-node disk and is the load-
+                # bearing storage optimization for the
+                # accessible-full-node-for-centuries goal.  Called on
+                # every finality advance: the sweep itself is gated
+                # internally by WITNESS_AUTO_SEPARATION_ENABLED (kill
+                # switch) and WITNESS_AUTO_SEPARATION_HEIGHT (hard-
+                # fork activation), so the call site stays simple and
+                # future fork-height changes don't need a parallel
+                # edit here.  Idempotent (skips already-stripped
+                # blocks).  Wrapped in a narrow try/except: witness
+                # separation is post-finality housekeeping, not a
+                # consensus rule -- a chaindb hiccup must NOT break
+                # the finality advance.
+                if self.db is not None:
+                    try:
+                        self.db.auto_separate_finalized_witnesses(
+                            att.block_number, state=self,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Witness auto-separation sweep raised at "
+                            "finalized_height=%d -- finality advance "
+                            "is unaffected; will retry on the next "
+                            "finality advance.",
+                            att.block_number,
+                        )
 
     def _apply_finality_votes(self, block: Block, proposer_id: bytes):
         """Apply finality votes: bounty, watermark, checkpoint update.
