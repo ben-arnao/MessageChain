@@ -606,7 +606,7 @@ def create_proposal(
     title: str,
     description: str,
     reference_hash: bytes = b"",
-    fee: int = GOVERNANCE_PROPOSAL_FEE,
+    fee: int | None = None,
     current_height: int | None = None,
 ) -> ProposalTransaction:
     """Create and sign a governance proposal.
@@ -618,6 +618,12 @@ def create_proposal(
     for legacy callers / isolated unit tests), v1 is emitted to
     preserve byte-for-byte signing compatibility with the existing
     chain.
+
+    `fee`: when None, defaults to ``proposal_fee_floor(payload_bytes,
+    current_height)`` -- the height-aware floor (legacy 10_000 pre-
+    Tier-19, or ``100_000 + 50 * payload_bytes`` post-Tier-19).
+    Callers who want to overpay (e.g. wallet auto-fee bidding above
+    a congested mempool) supply an explicit value.
     """
     version = GOVERNANCE_TX_VERSION_V1
     if (
@@ -625,6 +631,13 @@ def create_proposal(
         and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
     ):
         version = GOVERNANCE_TX_VERSION_LENGTH_PREFIX
+    if fee is None:
+        payload_bytes = (
+            len(title.encode("utf-8"))
+            + len(description.encode("utf-8"))
+            + len(reference_hash)
+        )
+        fee = proposal_fee_floor(payload_bytes, current_height)
     tx = ProposalTransaction(
         proposer_id=proposer_entity.entity_id,
         title=title,
@@ -668,17 +681,24 @@ def create_treasury_spend_proposal(
     amount: int,
     title: str,
     description: str,
-    fee: int = GOVERNANCE_PROPOSAL_FEE,
+    fee: int | None = None,
     current_height: int | None = None,
 ) -> TreasurySpendTransaction:
     """Create and sign a treasury spend proposal.  See `create_proposal`
-    for the version-gating rationale."""
+    for the version-gating and fee-default rationale (Tier 19 surcharge
+    applies symmetrically to treasury-spend)."""
     version = GOVERNANCE_TX_VERSION_V1
     if (
         current_height is not None
         and current_height >= config.GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT
     ):
         version = GOVERNANCE_TX_VERSION_LENGTH_PREFIX
+    if fee is None:
+        payload_bytes = (
+            len(title.encode("utf-8"))
+            + len(description.encode("utf-8"))
+        )
+        fee = proposal_fee_floor(payload_bytes, current_height)
     tx = TreasurySpendTransaction(
         proposer_id=proposer_entity.entity_id,
         recipient_id=recipient_id,
@@ -1104,6 +1124,82 @@ MAX_PROPOSAL_DESCRIPTION_LENGTH = 10_000
 MAX_PROPOSAL_TITLE_BYTES = 400
 MAX_PROPOSAL_DESCRIPTION_BYTES = 20_000
 
+# Tier 19 monotonicity invariant: the post-fork byte caps must
+# tighten (never loosen) the legacy caps, otherwise the per-byte
+# surcharge can be re-amortized away by a wider cap.  Use raise (not
+# assert) so the check survives ``python -O`` -- consensus-critical
+# files in this scope are required to use raise rather than assert
+# (see tests/test_invariants_survive_optimize_mode.py).
+if config.MAX_PROPOSAL_TITLE_BYTES_TIER19 > MAX_PROPOSAL_TITLE_BYTES:
+    raise RuntimeError(
+        "MAX_PROPOSAL_TITLE_BYTES_TIER19 must be <= legacy "
+        "MAX_PROPOSAL_TITLE_BYTES (Tier 19 only tightens the cap)"
+    )
+if (
+    config.MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19
+    > MAX_PROPOSAL_DESCRIPTION_BYTES
+):
+    raise RuntimeError(
+        "MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19 must be <= legacy "
+        "MAX_PROPOSAL_DESCRIPTION_BYTES (Tier 19 only tightens the cap)"
+    )
+
+
+def proposal_payload_bytes(tx) -> int:
+    """Return the variable-length payload (title + description +
+    reference_hash) bytes that Tier 19's per-byte surcharge prices.
+
+    Operates on either a ProposalTransaction or a
+    TreasurySpendTransaction; the latter has no reference_hash so a
+    getattr fallback returns 0 bytes for that field.
+    """
+    return (
+        len(tx.title.encode("utf-8"))
+        + len(tx.description.encode("utf-8"))
+        + len(getattr(tx, "reference_hash", b""))
+    )
+
+
+def proposal_fee_floor(payload_bytes: int, current_height: int | None) -> int:
+    """Return the active flat-fee floor for a proposal-class tx.
+
+    Pre-PROPOSAL_FEE_TIER19_HEIGHT (or unknown height): the legacy
+    flat ``GOVERNANCE_PROPOSAL_FEE`` (10_000), which historical chain
+    state was admitted under.
+
+    At/after the fork height: ``GOVERNANCE_PROPOSAL_FEE_TIER19 +
+    GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 * payload_bytes``.  The
+    per-byte term locks the fee/byte invariant intrinsically — a
+    future cap-raise can no longer re-amortize the floor away.
+    """
+    if (
+        current_height is not None
+        and current_height >= config.PROPOSAL_FEE_TIER19_HEIGHT
+    ):
+        return (
+            config.GOVERNANCE_PROPOSAL_FEE_TIER19
+            + config.GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 * payload_bytes
+        )
+    return GOVERNANCE_PROPOSAL_FEE
+
+
+def _proposal_byte_caps(current_height: int | None) -> tuple[int, int]:
+    """(title_byte_cap, description_byte_cap) active at ``current_height``.
+
+    Pre-PROPOSAL_FEE_TIER19_HEIGHT: legacy 400 / 20_000.  Post-fork:
+    tightened 200 / 2_000 — long-form rationale must live off-chain
+    behind ``reference_hash`` (already on the tx).
+    """
+    if (
+        current_height is not None
+        and current_height >= config.PROPOSAL_FEE_TIER19_HEIGHT
+    ):
+        return (
+            config.MAX_PROPOSAL_TITLE_BYTES_TIER19,
+            config.MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19,
+        )
+    return MAX_PROPOSAL_TITLE_BYTES, MAX_PROPOSAL_DESCRIPTION_BYTES
+
 
 def verify_proposal(
     tx: ProposalTransaction,
@@ -1146,23 +1242,32 @@ def verify_proposal(
         ):
             return False
     from messagechain.core.transaction import enforce_signature_aware_min_fee
+    # Tier 19: flat_floor is height-aware -- post-fork it is
+    # ``100_000 + 50 * payload_bytes`` (locks proposal fee/byte above
+    # any plausible message fee/byte); pre-fork it is the legacy
+    # flat 10_000 so historical blocks replay byte-for-byte.
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=GOVERNANCE_PROPOSAL_FEE,
+        flat_floor=proposal_fee_floor(
+            proposal_payload_bytes(tx), current_height,
+        ),
     ):
         return False
     if not tx.title:
         return False
-    # M10: Bound title/description to prevent block bloat
+    # M10: Bound title/description to prevent block bloat.  Tier 19
+    # tightens the byte caps (title 400→200, description 20_000→
+    # 2_000); the character-count caps stay as a fast-path rejection.
     if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
         return False
     if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
         return False
-    if len(tx.title.encode("utf-8")) > MAX_PROPOSAL_TITLE_BYTES:
+    title_byte_cap, desc_byte_cap = _proposal_byte_caps(current_height)
+    if len(tx.title.encode("utf-8")) > title_byte_cap:
         return False
-    if len(tx.description.encode("utf-8")) > MAX_PROPOSAL_DESCRIPTION_BYTES:
+    if len(tx.description.encode("utf-8")) > desc_byte_cap:
         return False
     if tx.reference_hash and len(tx.reference_hash) != 32:
         return False
@@ -1222,11 +1327,17 @@ def verify_treasury_spend(
         ):
             return False
     from messagechain.core.transaction import enforce_signature_aware_min_fee
+    # Tier 19: same height-aware floor as plain ProposalTransaction --
+    # treasury-spends carry identical permanent-state weight (snapshot,
+    # active-proposal slot, full voting window) so the surcharge applies
+    # symmetrically.
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=GOVERNANCE_PROPOSAL_FEE,
+        flat_floor=proposal_fee_floor(
+            proposal_payload_bytes(tx), current_height,
+        ),
     ):
         return False
     if not tx.title:
@@ -1239,14 +1350,16 @@ def verify_treasury_spend(
         return False  # treasury cannot send to itself
     # Same length/byte caps as ProposalTransaction — treasury-spend
     # proposals were missing these entirely, which left their
-    # title/description fields as an unbounded escape hatch.
+    # title/description fields as an unbounded escape hatch.  Tier 19
+    # tightens the byte caps for both classes.
     if len(tx.title) > MAX_PROPOSAL_TITLE_LENGTH:
         return False
     if len(tx.description) > MAX_PROPOSAL_DESCRIPTION_LENGTH:
         return False
-    if len(tx.title.encode("utf-8")) > MAX_PROPOSAL_TITLE_BYTES:
+    title_byte_cap, desc_byte_cap = _proposal_byte_caps(current_height)
+    if len(tx.title.encode("utf-8")) > title_byte_cap:
         return False
-    if len(tx.description.encode("utf-8")) > MAX_PROPOSAL_DESCRIPTION_BYTES:
+    if len(tx.description.encode("utf-8")) > desc_byte_cap:
         return False
     msg_hash = _hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

@@ -3465,6 +3465,86 @@ assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "creating a backward-incompatible activation surprise"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 19 — Proposal fee tightening + per-byte surcharge
+# ─────────────────────────────────────────────────────────────────────
+# Governance proposals (advisory + treasury-spend) carry permanent on-
+# chain weight far heavier than a normal message: each one allocates a
+# stake_snapshot of the entire validator electorate (held for the full
+# GOVERNANCE_VOTING_WINDOW = 1008 blocks ≈ 7 days), counts toward the
+# MAX_ACTIVE_PROPOSALS = 500 cap, and lives forever in the chain
+# whether it passes, fails, or attracts zero votes.
+#
+# Pre-fork the floor was a flat GOVERNANCE_PROPOSAL_FEE = 10_000
+# regardless of payload size, with a 20 KB description ceiling.  At
+# max size that's ≈0.49 fee/byte — under any congestion the typical
+# message's EIP-1559 base fee × bytes wins (and after Tier 18 the
+# unified market makes those bytes auctioned against everything else),
+# so a max-sized proposal pays LESS per stored byte than a typical
+# message.  That inverts the per-byte cost ordering: the heavier tx
+# kind (proposal) is cheaper per byte than the lighter one (message),
+# and the size-amortization escape hatch lets a spammer stuff ~half
+# a block's MAX_BLOCK_MESSAGE_BYTES into a single proposal at sub-
+# message rates.  Tier 18 unified the market for the kinds it covers
+# but ProposalTransaction was not in that scope -- this fork closes
+# the residual gap.
+#
+# Tier 19 closes the inversion with three coordinated levers:
+#
+#   1. Tighter byte caps — description 20_000 → 2_000, title 400 →
+#      200.  Long-form rationale must live off-chain behind
+#      ``reference_hash`` (already a field on ProposalTransaction).
+#      Cuts the worst-case payload from ≈20.4 KB to ≈2.2 KB.
+#
+#   2. Higher flat floor — GOVERNANCE_PROPOSAL_FEE 10_000 → 100_000.
+#      At the new ≈2.2 KB max payload that's ≈45 fee/byte minimum —
+#      well above any plausible message fee/byte under congestion.
+#
+#   3. Per-byte surcharge —
+#      GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 = 50.  Locks the
+#      fee/byte invariant intrinsically: it cannot be re-amortized
+#      away by raising the byte cap in a future fork.  The total
+#      post-Tier-19 floor for a proposal whose payload (title +
+#      description + reference_hash) is ``p`` bytes is
+#          GOVERNANCE_PROPOSAL_FEE_TIER19
+#          + GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 * p
+#      i.e. ≥ 100_000 + 50·p tokens.  At any p this exceeds the
+#      typical message floor (MARKET_FEE_FLOOR=1 + EIP-1559 base ×
+#      message bytes) by orders of magnitude.
+#
+# Activation rides above Tier 18 (TIER_18_HEIGHT = 11_000).  Runway
+# 11_000 → 13_000 = ~2000 blocks (~14 days at 600 s/block) gives
+# operators time to upgrade past the prior fork before the new
+# proposal admission rule starts biting.
+#
+# Legacy constants (GOVERNANCE_PROPOSAL_FEE,
+# MAX_PROPOSAL_TITLE_BYTES, MAX_PROPOSAL_DESCRIPTION_BYTES — the
+# latter two live in messagechain.governance.governance) remain the
+# active rule pre-fork so historical blocks replay byte-for-byte
+# under the rule current at their height.
+PROPOSAL_FEE_TIER19_HEIGHT = 13_000  # Tier 19
+GOVERNANCE_PROPOSAL_FEE_TIER19 = 100_000
+GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 = 50
+MAX_PROPOSAL_TITLE_BYTES_TIER19 = 200
+MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19 = 2_000
+
+assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
+    "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
+    "rides on top of the established post-Tier-18 schedule; activating "
+    "the proposal-fee tightening before Tier 18 settles would interleave "
+    "two unrelated forks in the same upgrade window"
+)
+assert GOVERNANCE_PROPOSAL_FEE_TIER19 > GOVERNANCE_PROPOSAL_FEE, (
+    "GOVERNANCE_PROPOSAL_FEE_TIER19 must raise (not lower) the legacy "
+    "flat floor — Tier 19's whole point is to push proposal fee/byte "
+    "above typical message fee/byte"
+)
+assert GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 > 0, (
+    "GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 must be positive — a zero "
+    "rate reopens the size-amortization escape hatch the surcharge "
+    "exists to close"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
@@ -3570,6 +3650,9 @@ for _fork_name, _fork_height in (
     ("MESSAGE_TX_LENGTH_PREFIX_HEIGHT", MESSAGE_TX_LENGTH_PREFIX_HEIGHT),
     ("GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT", GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT),
     ("MARKET_FEE_FLOOR_HEIGHT", MARKET_FEE_FLOOR_HEIGHT),
+    ("REACT_TX_HEIGHT", REACT_TX_HEIGHT),
+    ("TIER_18_HEIGHT", TIER_18_HEIGHT),
+    ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
