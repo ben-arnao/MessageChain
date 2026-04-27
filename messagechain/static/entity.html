@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MessageChain — entity profile</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #111;
+    --muted: #666;
+    --card: #f5f5f5;
+    --border: #ddd;
+    --accent: #0a5;
+    --pos: #0a5;
+    --neg: #c33;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0e10;
+      --fg: #eee;
+      --muted: #888;
+      --card: #1a1a1d;
+      --border: #2a2a2e;
+      --accent: #6c9;
+      --pos: #6c9;
+      --neg: #e88;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.45;
+  }
+  header {
+    padding: 1.2rem 1.2rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    margin: 0 0 0.25rem;
+    font-size: 1.35rem;
+    letter-spacing: -0.01em;
+  }
+  header h1 a {
+    color: var(--fg);
+    text-decoration: none;
+  }
+  header .sub {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  header .sub a { color: var(--accent); }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1rem 1rem 4rem;
+  }
+  .id-row {
+    margin: 0.4rem 0 1rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .status {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin: 0.75rem 0;
+  }
+  .status.error { color: var(--neg); }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.6rem;
+    margin: 0.6rem 0;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.7rem 0.85rem;
+  }
+  .stat .label {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.25rem;
+  }
+  .stat .value {
+    font-size: 1.05rem;
+    font-weight: 600;
+  }
+  .stat .value.pos { color: var(--pos); }
+  .stat .value.neg { color: var(--neg); }
+  .stat .sub {
+    color: var(--muted);
+    font-size: 0.78rem;
+    margin-top: 0.2rem;
+  }
+  .section {
+    margin-top: 1.4rem;
+  }
+  .section h2 {
+    font-size: 0.95rem;
+    margin: 0 0 0.5rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .search {
+    margin: 0.6rem 0 0.4rem;
+    display: flex;
+    gap: 0.5rem;
+  }
+  .search input {
+    flex: 1;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .search button {
+    padding: 0.45rem 0.9rem;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  footer {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+    text-align: center;
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">MessageChain</a></h1>
+  <p class="sub">entity profile</p>
+</header>
+<main>
+  <div class="search">
+    <input id="searchBox" type="text" autocomplete="off"
+           placeholder="64-char hex entity_id"
+           aria-label="Search entity_id">
+    <button id="searchBtn" type="button">Open</button>
+  </div>
+  <div class="id-row" id="idRow"></div>
+  <p class="status" id="status">Loading…</p>
+  <div id="profile" hidden>
+    <div class="section">
+      <h2>Identity</h2>
+      <div class="grid" id="identityGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Funds</h2>
+      <div class="grid" id="fundsGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Posts</h2>
+      <div class="grid" id="postsGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Reputation &amp; reactions</h2>
+      <div class="grid" id="reputationGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Validator activity</h2>
+      <div class="grid" id="validatorGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Governance</h2>
+      <div class="grid" id="governanceGrid"></div>
+    </div>
+  </div>
+</main>
+<footer>
+  Read-only snapshot at chain height <span id="chainHeight">…</span>.
+  <a href="/">Back to live feed</a>
+</footer>
+<script>
+(function () {
+  "use strict";
+  const statusEl = document.getElementById("status");
+  const profileEl = document.getElementById("profile");
+  const idRow = document.getElementById("idRow");
+  const heightEl = document.getElementById("chainHeight");
+  const searchBox = document.getElementById("searchBox");
+  const searchBtn = document.getElementById("searchBtn");
+
+  function entityIdFromPath() {
+    // Expect /e/<64-hex>.  Anything else → empty.
+    const m = location.pathname.match(/^\/e\/([0-9a-fA-F]{64})$/);
+    return m ? m[1].toLowerCase() : "";
+  }
+
+  function fmtTs(sec) {
+    if (typeof sec !== "number") return "—";
+    const d = new Date(sec * 1000);
+    if (isNaN(d.getTime())) return "—";
+    return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  }
+
+  function fmtInt(n) {
+    if (typeof n !== "number") return "—";
+    return n.toLocaleString();
+  }
+
+  function fmtPct(p) {
+    if (typeof p !== "number") return "—";
+    return p.toFixed(1) + "%";
+  }
+
+  function clearGrids() {
+    for (const id of [
+      "identityGrid", "fundsGrid", "postsGrid",
+      "reputationGrid", "validatorGrid", "governanceGrid",
+    ]) {
+      const g = document.getElementById(id);
+      if (g) g.replaceChildren();
+    }
+  }
+
+  function addStat(gridId, label, value, sub, valueClass) {
+    const card = document.createElement("div");
+    card.className = "stat";
+    const l = document.createElement("div");
+    l.className = "label";
+    l.textContent = label;
+    const v = document.createElement("div");
+    v.className = "value" + (valueClass ? " " + valueClass : "");
+    v.textContent = value === null || value === undefined ? "—" : String(value);
+    card.appendChild(l);
+    card.appendChild(v);
+    if (sub) {
+      const s = document.createElement("div");
+      s.className = "sub";
+      s.textContent = sub;
+      card.appendChild(s);
+    }
+    document.getElementById(gridId).appendChild(card);
+  }
+
+  function signClass(n) {
+    if (typeof n !== "number") return "";
+    if (n > 0) return "pos";
+    if (n < 0) return "neg";
+    return "";
+  }
+
+  function render(profile, height) {
+    clearGrids();
+    heightEl.textContent = height;
+
+    // Identity
+    const us = profile.user_since;
+    addStat("identityGrid",
+      "User since",
+      us ? fmtTs(us.timestamp) : "never seen",
+      us ? ("block " + us.block_number) : null);
+    addStat("identityGrid",
+      "On-chain status",
+      profile.exists ? "registered" : "not seen");
+
+    // Funds
+    addStat("fundsGrid", "Spendable balance", fmtInt(profile.balance));
+    addStat("fundsGrid",
+      "Total funds",
+      fmtInt(profile.total_funds),
+      "balance + staked + pending unstake");
+    addStat("fundsGrid",
+      "Staked",
+      fmtInt(profile.staked),
+      typeof profile.stake_pct_of_funds === "number"
+        ? fmtPct(profile.stake_pct_of_funds) + " of total funds"
+        : null);
+    if (profile.pending_unstake > 0) {
+      addStat("fundsGrid", "Pending unstake", fmtInt(profile.pending_unstake));
+    }
+    addStat("fundsGrid",
+      "Mining rewards",
+      fmtInt(profile.rewards.estimated_block_rewards),
+      profile.rewards.blocks_proposed + " block(s) proposed");
+    addStat("fundsGrid", "Total fees paid", fmtInt(profile.fees_paid));
+
+    // Posts
+    const m = profile.messages;
+    addStat("postsGrid", "Total messages", fmtInt(m.total));
+    addStat("postsGrid",
+      "First post",
+      m.first_post_timestamp ? fmtTs(m.first_post_timestamp) : "—",
+      m.first_post_block ? "block " + m.first_post_block : null);
+    addStat("postsGrid",
+      "Last post",
+      m.last_post_timestamp ? fmtTs(m.last_post_timestamp) : "—",
+      m.last_post_block ? "block " + m.last_post_block : null);
+
+    // Reputation & reactions
+    const rep = profile.reputation;
+    addStat("reputationGrid",
+      "Reputation score",
+      fmtInt(rep.score),
+      "+" + rep.ups_received + " up, -" + rep.downs_received + " down",
+      signClass(rep.score));
+    const ps = profile.post_score;
+    addStat("reputationGrid",
+      "Post score",
+      fmtInt(ps.total),
+      "+" + ps.ups_received + " up, -" + ps.downs_received + " down across all messages",
+      signClass(ps.total));
+    addStat("reputationGrid", "Reactions cast", fmtInt(profile.reactions_cast));
+    const ul = profile.react_majority_alignment.user_level;
+    addStat("reputationGrid",
+      "User-react majority match",
+      fmtPct(ul.pct),
+      ul.with_majority + " / " + ul.votes + " user-reactions agreed with current sign");
+    const pl = profile.react_majority_alignment.post_level;
+    addStat("reputationGrid",
+      "Post-react majority match",
+      fmtPct(pl.pct),
+      pl.with_majority + " / " + pl.votes + " post-reactions agreed with current sign");
+
+    // Validator activity
+    addStat("validatorGrid", "Blocks proposed", fmtInt(profile.rewards.blocks_proposed));
+    addStat("validatorGrid", "Estimated block rewards", fmtInt(profile.rewards.estimated_block_rewards));
+
+    // Governance
+    addStat("governanceGrid", "Proposals made", fmtInt(profile.governance.proposals_made));
+    addStat("governanceGrid", "Votes cast", fmtInt(profile.governance.votes_cast));
+
+    profileEl.hidden = false;
+  }
+
+  async function load(id) {
+    statusEl.className = "status";
+    statusEl.textContent = "Loading…";
+    profileEl.hidden = true;
+    idRow.textContent = id;
+    try {
+      const r = await fetch("/v1/entity?id=" + encodeURIComponent(id),
+                            { cache: "no-store" });
+      const data = await r.json();
+      if (!r.ok || !data.ok) {
+        statusEl.className = "status error";
+        statusEl.textContent = "Lookup failed: " + (data.error || ("HTTP " + r.status));
+        return;
+      }
+      statusEl.textContent = "";
+      render(data.profile, data.height);
+    } catch (e) {
+      statusEl.className = "status error";
+      statusEl.textContent = "Network error: " + e.message;
+    }
+  }
+
+  function gotoSearch() {
+    const v = (searchBox.value || "").trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(v)) {
+      statusEl.className = "status error";
+      statusEl.textContent = "Address must be exactly 64 hex characters.";
+      return;
+    }
+    location.href = "/e/" + v;
+  }
+  searchBtn.addEventListener("click", gotoSearch);
+  searchBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") gotoSearch();
+  });
+
+  const id = entityIdFromPath();
+  if (!id) {
+    statusEl.className = "status error";
+    statusEl.textContent = "URL must be /e/<64-char hex entity_id>";
+    return;
+  }
+  searchBox.value = id;
+  load(id);
+})();
+</script>
+</body>
+</html>
