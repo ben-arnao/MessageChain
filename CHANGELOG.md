@@ -4,6 +4,26 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.27.1] — 2026-04-27
+
+Hotfix.  Raises `MAX_PROPOSER_FALLBACK_ROUNDS` from 5 → 100.
+
+The original cap of 5 fallback rounds covered legitimate missed-slot
+scenarios on a healthy chain.  During the 1.25.x → 1.26.x rollout a
+series of regressions (mempool sort key on `TransferTransaction`, a
+corrupted height-guard ratchet from earlier crash-restarts) left the
+chain stalled for ~2 hours.  Round count grew to ~12 (one per 10-min
+slot interval), and every recovery proposal was rejected with
+"Proposer round N exceeds cap 5 — timestamp-skew slot hijacking
+rejected".  The chain could not self-heal until the cap was lifted.
+
+100 covers ~16 hours of stall and still bounds slot-rotation grinding
+to a small constant — comfortably below the future-drift window's
+worst-case abuse surface (`MAX_BLOCK_FUTURE_DRIFT = 120 s`).  No
+consensus impact for healthy chains; only changes which blocks
+honest fallback proposers are allowed to publish during a long
+stall window.
+
 ## [1.27.0] — 2026-04-27
 
 Minor release. **Hard fork: Tier 24 — track-record-aware slashing**

@@ -634,9 +634,17 @@ BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_T
 # proposer can still inflate the implied round count by picking a
 # parent.ts well below current wall clock; the explicit round cap keeps
 # slot-rotation grinding bounded regardless of future-drift tolerance.
-# Five fallback rounds covers legitimate missed-slot scenarios with
-# margin; anything beyond is network pathology or abuse.
-MAX_PROPOSER_FALLBACK_ROUNDS = 5
+# Original cap of 5 covered legitimate missed-slot scenarios.  In
+# 1.26.2 the cap was raised to 100 after an operational chain-stall
+# during the 1.25.x → 1.26.x rollout sequence (the chain went ~2h
+# without a block while a series of regressions in mempool sort key
+# and a corrupted height-guard ratchet were being patched).  Round
+# count (= ts_gap / BLOCK_TIME_TARGET ≈ 1 per 10 min) had run up to
+# ~12, so every recovery proposal was rejected by the round cap and
+# the chain couldn't self-heal until the cap was lifted.  100 covers
+# ~16 h of stall and still bounds slot-rotation grinding to a small
+# constant — well below the future-drift window's worst-case abuse.
+MAX_PROPOSER_FALLBACK_ROUNDS = 100
 # Cap on concurrently-active governance proposals.  Without this, an
 # attacker willing to pay PROPOSAL_FEE per proposal can spin up enough
 # proposals to balloon governance state (each snapshot copies the
