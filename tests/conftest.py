@@ -49,5 +49,25 @@ def _reset_merkle_height_after_slow(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _wipe_leaves_dir_per_test():
+    """Clear ~/.messagechain/leaves/ between tests.
+
+    Many tests share the deterministic _TEST_PRIVKEY = bytes(range(32))
+    fixture (or similar) and exercise CLI signing paths that persist
+    leaf cursors via _bind_persistent_leaf_index. Without per-test
+    cleanup, accumulated leaf-index state across tests on the same
+    fixture entity_id hits next_leaf >= 2^MERKLE_TREE_HEIGHT (=16) and
+    raises ``Corrupted leaf index file``. Wipe the directory before
+    each test to keep the hermeticity the session-scoped HOME sandbox
+    started.
+    """
+    import shutil
+    leaves_dir = os.path.join(_TEST_HOME_DIR, ".messagechain", "leaves")
+    if os.path.isdir(leaves_dir):
+        shutil.rmtree(leaves_dir, ignore_errors=True)
+    yield
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: run with production MERKLE_TREE_HEIGHT=20")
