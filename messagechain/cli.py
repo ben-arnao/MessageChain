@@ -3210,8 +3210,10 @@ def cmd_set_receipt_subtree_root(args):
 def cmd_propose(args):
     """Create a governance proposal."""
     from messagechain.identity.identity import Entity
-    from messagechain.governance.governance import create_proposal
-    from messagechain.config import GOVERNANCE_PROPOSAL_FEE
+    from messagechain.governance.governance import (
+        create_proposal,
+        proposal_fee_floor,
+    )
 
     print("=== Create Proposal ===\n")
     print(f"  Title: {args.title}")
@@ -3234,8 +3236,27 @@ def cmd_propose(args):
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
     entity.keypair.advance_to_leaf(watermark)
 
-    fee = args.fee if args.fee is not None else GOVERNANCE_PROPOSAL_FEE
-    tx = create_proposal(entity, args.title, args.description, fee=fee)
+    # Query the live chain tip so the auto-fee picks the right floor
+    # rule.  Pre-Tier-19: flat GOVERNANCE_PROPOSAL_FEE.  Post-Tier-19:
+    # GOVERNANCE_PROPOSAL_FEE_TIER19 + per-byte surcharge * payload.
+    # On RPC failure fall back to height=None (legacy floor) -- the
+    # node will reject under-priced submissions and the user can retry
+    # with explicit --fee.
+    info_resp = rpc_call(host, port, "get_chain_info", {})
+    target_height = None
+    if info_resp.get("ok"):
+        count = info_resp["result"].get("height", 0) or 0
+        target_height = max(count - 1, 0) + 1
+    payload_bytes = (
+        len(args.title.encode("utf-8"))
+        + len(args.description.encode("utf-8"))
+    )
+    auto_fee = proposal_fee_floor(payload_bytes, target_height)
+    fee = args.fee if args.fee is not None else auto_fee
+    tx = create_proposal(
+        entity, args.title, args.description, fee=fee,
+        current_height=target_height,
+    )
 
     response = rpc_call(host, port, "submit_proposal", {
         "transaction": tx.serialize(),

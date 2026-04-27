@@ -2663,7 +2663,17 @@ class Server(SharedRuntimeMixin):
                 return {"ok": False, "error": "Entity not registered"}
 
             public_key = self.blockchain.public_keys[entity_id]
-            if not verify_proposal(tx, public_key):
+            # Thread the prospective inclusion height so mempool
+            # admission applies the same rule as block validation
+            # (Tier 15 length-prefix gate, Tier 19 fee floor and
+            # tightened byte caps).  Without this, a tx that meets
+            # the legacy floor but fails the post-fork rule would sit
+            # in the pool only to be rejected at block time -- wasted
+            # work and a confusing failure mode for clients.
+            if not verify_proposal(
+                tx, public_key,
+                current_height=self.blockchain.height + 1,
+            ):
                 return {"ok": False, "error": "Invalid proposal transaction"}
 
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
@@ -2705,7 +2715,12 @@ class Server(SharedRuntimeMixin):
                 return {"ok": False, "error": "Entity not registered"}
 
             public_key = self.blockchain.public_keys[entity_id]
-            if not verify_vote(tx, public_key):
+            # Thread inclusion height so mempool admission matches
+            # block validation (R5-A signature-aware fee floor).
+            if not verify_vote(
+                tx, public_key,
+                current_height=self.blockchain.height + 1,
+            ):
                 return {"ok": False, "error": "Invalid vote transaction"}
 
             if not self.blockchain.supply.can_afford_fee(entity_id, tx.fee):
