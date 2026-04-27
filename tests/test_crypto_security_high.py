@@ -100,8 +100,13 @@ class TestLeafIndexPersistence(unittest.TestCase):
         self.index_path = os.path.join(self.tmpdir, "leaf_index.json")
 
     def tearDown(self):
-        if os.path.exists(self.index_path):
-            os.remove(self.index_path)
+        # Cross-process advisory lock leaves a sibling .lock file next
+        # to the cursor; sweep any stragglers so rmdir doesn't fail.
+        for fn in os.listdir(self.tmpdir):
+            try:
+                os.remove(os.path.join(self.tmpdir, fn))
+            except OSError:
+                pass
         os.rmdir(self.tmpdir)
 
     def test_persist_and_load_leaf_index(self):

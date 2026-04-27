@@ -315,9 +315,19 @@ class TestSignRefusesOnFsyncFailure(unittest.TestCase):
             )
 
     def test_sign_recovers_after_transient_eio(self):
-        """If fsync recovers on the next try, the SAME leaf is used
-        (rollback preserved it).  This is the recovery path an
-        operator sees after fixing a disk issue."""
+        """If fsync recovers on the next try, the next sign succeeds.
+
+        Note on which leaf is used: ``_fsync_parent_dir`` runs AFTER
+        ``os.replace`` has already swapped the cursor file to the
+        advanced value — only the directory's durability fsync raised.
+        From an outside observer's perspective the leaf IS already
+        burned on disk; the in-memory rollback was best-effort.  With
+        the cross-process advisory lock in place, ``sign`` re-loads
+        the cursor from disk inside the lock and observes the
+        advanced value, so the next sign uses the NEXT leaf.  This is
+        the safer semantic: burning a leaf is cheap, reusing one is
+        unrecoverable.
+        """
         with tempfile.TemporaryDirectory() as td:
             kp = _make_persistent_keypair(td)
             msg = b"\xbb" * 32
@@ -329,12 +339,18 @@ class TestSignRefusesOnFsyncFailure(unittest.TestCase):
                 with self.assertRaises(LeafIndexPersistError):
                     kp.sign(msg)
             self.assertEqual(kp._next_leaf, 0)
-
-            # Recovery — fsync succeeds.
-            sig = kp.sign(msg)
-            self.assertEqual(sig.leaf_index, 0)
-            self.assertEqual(kp._next_leaf, 1)
+            # The on-disk cursor advanced before fsync raised — rename
+            # already happened.  Honoring this on the retry is the
+            # whole point of the cross-process lock's load-inside-lock
+            # step.
             self.assertEqual(_read_persisted_leaf(kp.leaf_index_path), 1)
+
+            # Recovery — fsync succeeds.  The retry observes the
+            # already-advanced disk cursor and signs the next leaf.
+            sig = kp.sign(msg)
+            self.assertEqual(sig.leaf_index, 1)
+            self.assertEqual(kp._next_leaf, 2)
+            self.assertEqual(_read_persisted_leaf(kp.leaf_index_path), 2)
 
     def test_sign_with_einval_succeeds(self):
         """EINVAL (tmpfs) on dir fsync: sign() must still succeed."""
