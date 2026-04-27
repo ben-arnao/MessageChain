@@ -220,6 +220,16 @@ def create_finality_vote(
     votes and the evidence being submitted.  See the field docstring
     on ``FinalityVote.signed_at_height`` for the full rationale.
     """
+    # Tier 23 same-height sign guard.  Finality votes are tracked
+    # under their own counter (independent of block / attestation
+    # signing) so a validator can legitimately propose a block at
+    # height H, attest at H, AND finality-vote at H.  Re-signing at
+    # the same target_block_number is the slashable shape; the guard
+    # refuses before producing a signature.  See height_guard.py.
+    guard = getattr(signer_entity, "height_sign_guard", None)
+    if guard is not None:
+        guard.record_finality_sign(target_block_number)
+
     vote = FinalityVote(
         signer_entity_id=signer_entity.entity_id,
         target_block_hash=target_block_hash,
