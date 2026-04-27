@@ -275,7 +275,29 @@ from messagechain.crypto.hashing import default_hash
 #                  u64 height || u32 pk_len || pk
 #      The Merkle leaf builder hashes one leaf per (eid, height, pk)
 #      tuple under _TAG_KEY_HISTORY for state-root commitment.
-STATE_SNAPSHOT_VERSION = 20  # wire format version for encode/decode
+#  v21 — reaction_choices added.  dict[(voter, target, target_is_user),
+#      choice] capturing the ground-truth latest react vote per
+#      (voter, target) pair under Tier 17.  Consensus-critical:
+#      `state_root_contribution()` mixes this dict into the chain
+#      state root post-REACT_TX_HEIGHT, so two state-synced nodes
+#      that disagree on this dict compute different state roots.
+#      Pre-v21 the snapshot had ZERO coverage of reaction_choices --
+#      `serialize_state` didn't extract it, the encode/decode pair
+#      didn't write/read it, and `_install_state_snapshot` left
+#      `self.reaction_state` as the default empty `ReactionState()`
+#      after install.  Once REACT_TX_HEIGHT activates and the first
+#      vote lands, every checkpoint-bootstrapped node would fail the
+#      install-time root-equality check (synced node computes root
+#      over empty reactions; canonical header committed root over
+#      real reactions) -- state-sync becomes IMPOSSIBLE post-Tier-17.
+#      Round-12 fix.  Wire layout (appended after v20's key_history):
+#          u32 entry_count
+#          for each (voter, target, target_is_user) sorted lex:
+#              u32 voter_len || voter || u32 target_len || target ||
+#              u8 target_is_user || u8 choice
+#      Mirrored into chaindb's `reaction_choices` table at install
+#      time so cold restart on the synced node rehydrates from disk.
+STATE_SNAPSHOT_VERSION = 21  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -358,6 +380,15 @@ _TAG_PAST_RECEIPT_ROOT = b"prrk"
 # fork when a slash for a rotated equivocator lands.  See the
 # STATE_SNAPSHOT_VERSION header comment on v20 for the exploit chain.
 _TAG_KEY_HISTORY = b"khist"
+# v21: reaction_choices -- dict[(voter_id, target, target_is_user),
+# choice] capturing the ground-truth latest react vote per
+# (voter, target) pair under Tier 17.  ReactionState's
+# `state_root_contribution()` is mixed into the chain state root at
+# heights >= REACT_TX_HEIGHT, so two state-synced nodes that
+# disagree on this dict produce divergent state roots.  Pre-v21 the
+# snapshot didn't carry it at all -- state-sync was unreachable
+# post-activation.  Round-12 fix.
+_TAG_REACTION_CHOICES = b"react"
 # Processed bogus-rejection-evidence set: every evidence_hash that has
 # ever been applied (slashed OR admitted-no-slash).  One-phase, no
 # pending counterpart — bogusness is decided at apply-time so there
@@ -731,6 +762,24 @@ def serialize_state(blockchain) -> dict:
                 blockchain, "key_history", {},
             ).items()
         },
+        # v21: Tier 17 reaction_choices map.  Ground-truth latest
+        # vote per (voter, target, target_is_user) -- the only
+        # ReactionState field that needs persisting; aggregates
+        # (`_user_trust_score`, `_message_score`) rebuild from it on
+        # install via ReactionState.deserialize.  MUST be in the
+        # snapshot or a state-synced node post-REACT_TX_HEIGHT
+        # computes a different state-root contribution than warm
+        # nodes -- silent fork on the next contested vote.  Tuples
+        # are normalised to bytes / bool / int so binary round-trip
+        # and hand-built dicts compare equal.
+        "reaction_choices": {
+            (bytes(voter), bytes(target), bool(tu)): int(choice)
+            for (voter, target, tu), choice in getattr(
+                getattr(blockchain, "reaction_state", None),
+                "choices",
+                {},
+            ).items()
+        },
     }
 
 
@@ -998,6 +1047,17 @@ def deserialize_state(snapshot: dict) -> dict:
     # this strictly so the default only affects hand-built snapshot
     # dicts.
     out.setdefault("key_history", {})
+    # Pre-v21 snapshots lack the reaction_choices map.  A migrating
+    # chain starts with an empty Tier 17 reaction state -- pre-
+    # REACT_TX_HEIGHT this is correct (no votes can have been cast).
+    # Live upgrades from v20 to v21 at the snapshot layer should
+    # re-bake snapshots so historical reactions carry forward; in-
+    # place upgrades that re-decode a historical v20 blob will lose
+    # any reactions the v20 blob carried (which is none, since v20
+    # had no reaction coverage).  Binary decode populates this
+    # strictly so the default only affects hand-built snapshot
+    # dicts.
+    out.setdefault("reaction_choices", {})
     return out
 
 
@@ -1093,6 +1153,49 @@ def _bytes_set_dict_leaves(tag: bytes, items) -> list[bytes]:
                 + struct.pack(">I", len(eid)) + eid
                 + struct.pack(">I", len(root)) + root
             ))
+    return leaves
+
+
+def _reaction_choices_leaves(tag: bytes, items) -> list[bytes]:
+    """Build sorted leaves for the v21 reaction_choices section
+    (dict[(voter, target, target_is_user), choice]).  Each leaf
+    hashes
+        HASH( tag || u32_be(len(voter)) || voter ||
+              u32_be(len(target)) || target ||
+              u8 target_is_user || u8 choice )
+    -- one leaf per pair, sorted lexicographically by
+    (voter, target, target_is_user) for canonical encoding regardless
+    of dict iteration order.
+
+    NOTE: this Merkle commitment is independent of
+    ReactionState.state_root_contribution() (which is a linear hash
+    over the same map).  The two MUST agree on which entries exist
+    -- the snapshot section ensures state-synced nodes inherit the
+    same map a replaying node holds, and `state_root_contribution`
+    re-derives a 32-byte digest from that map at every block apply.
+    """
+    leaves: list[bytes] = []
+    if not isinstance(items, dict):
+        raise TypeError(
+            f"_reaction_choices_leaves expected dict, got "
+            f"{type(items).__name__}"
+        )
+    for key in sorted(items.keys()):
+        voter, target, tu = key
+        if not isinstance(voter, bytes) or not isinstance(target, bytes):
+            raise TypeError(
+                f"_reaction_choices_leaves expected (bytes, bytes, bool) "
+                f"key, got ({type(voter).__name__}, {type(target).__name__}, "
+                f"{type(tu).__name__})"
+            )
+        choice = int(items[key])
+        leaves.append(_h(
+            tag
+            + struct.pack(">I", len(voter)) + voter
+            + struct.pack(">I", len(target)) + target
+            + struct.pack(">B", 1 if tu else 0)
+            + struct.pack(">B", choice & 0xFF)
+        ))
     return leaves
 
 
@@ -1257,6 +1360,15 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_KEY_HISTORY: _merkle(_key_history_leaves(
             _TAG_KEY_HISTORY,
             snap.get("key_history", {}))),
+        # v21: Tier 17 reaction_choices ground truth.  ReactionState's
+        # `state_root_contribution()` mixes the same map into the
+        # chain state root post-REACT_TX_HEIGHT, so two state-synced
+        # nodes that disagreed on this section would compute
+        # different contributions and silently fork.  See
+        # _TAG_REACTION_CHOICES docstring.
+        _TAG_REACTION_CHOICES: _merkle(_reaction_choices_leaves(
+            _TAG_REACTION_CHOICES,
+            snap.get("reaction_choices", {}))),
         # Bogus-rejection processed set — the double-slash defense.
         # One section, no pending counterpart (apply-time decision).
         _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
@@ -1676,6 +1788,61 @@ def _decode_key_history(blob: bytes, off: int) -> tuple[dict, int]:
     return out, off
 
 
+def _encode_reaction_choices(d: dict) -> bytes:
+    """Encode the v21 reaction_choices section
+    (dict[(voter, target, target_is_user), choice]).
+
+    Wire layout:
+        u32 entry_count
+        for each (voter, target, target_is_user) sorted lex:
+            u32 voter_len || voter
+            u32 target_len || target
+            u8 target_is_user
+            u8 choice
+    """
+    out = bytearray()
+    out += struct.pack(">I", len(d))
+    for key in sorted(d.keys()):
+        voter, target, tu = key
+        if not isinstance(voter, bytes) or not isinstance(target, bytes):
+            raise ChainIntegrityError(
+                f"state-snapshot reaction_choices expected "
+                f"(bytes, bytes, bool) key, got "
+                f"({type(voter).__name__}, {type(target).__name__}, "
+                f"{type(tu).__name__})"
+            )
+        choice = int(d[key])
+        out += struct.pack(">I", len(voter)) + voter
+        out += struct.pack(">I", len(target)) + target
+        out += struct.pack(">B", 1 if tu else 0)
+        out += struct.pack(">B", choice & 0xFF)
+    return bytes(out)
+
+
+def _decode_reaction_choices(
+    blob: bytes, off: int,
+) -> tuple[dict, int]:
+    """Inverse of _encode_reaction_choices."""
+    (n,) = struct.unpack_from(">I", blob, off)
+    off += 4
+    out: dict[tuple[bytes, bytes, bool], int] = {}
+    for _ in range(n):
+        (vlen,) = struct.unpack_from(">I", blob, off)
+        off += 4
+        voter = bytes(blob[off:off + vlen])
+        off += vlen
+        (tlen,) = struct.unpack_from(">I", blob, off)
+        off += 4
+        target = bytes(blob[off:off + tlen])
+        off += tlen
+        (tu_byte,) = struct.unpack_from(">B", blob, off)
+        off += 1
+        (choice,) = struct.unpack_from(">B", blob, off)
+        off += 1
+        out[(voter, target, bool(tu_byte))] = int(choice)
+    return out, off
+
+
 def _encode_int_bytes_dict(d: dict) -> bytes:
     out = bytearray()
     out += struct.pack(">I", len(d))
@@ -1927,6 +2094,17 @@ def encode_snapshot(snap: dict) -> bytes:
     # cannot verify slash evidence whose signing height predates a
     # rotation, silently forking at the slash block.
     out += _encode_key_history(snap.get("key_history", {}))
+    # v21: Tier 17 reaction_choices (Tier 17).  Strictly appended
+    # after v20's key_history so a v20 blob is a strict prefix of a
+    # v21 blob through the end of v20's final field.  See
+    # _TAG_REACTION_CHOICES for why this must live in the state-
+    # root commitment -- without it, a state-synced node post-
+    # REACT_TX_HEIGHT computes a different state-root contribution
+    # than the warm cluster (which holds the real reaction_choices),
+    # making checkpoint-bootstrap impossible after activation.
+    out += _encode_reaction_choices(
+        snap.get("reaction_choices", {}),
+    )
     return bytes(out)
 
 
@@ -2060,6 +2238,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # v20+: key_history (bytes -> list[(int, bytes)] dict).
     # Always present on v20+ blobs.
     key_history, off = _decode_key_history(blob, off)
+    # v21+: Tier 17 reaction_choices (dict[(voter, target,
+    # target_is_user), choice]).  Always present on v21+ blobs;
+    # pre-v21 blobs are rejected by the strict version check above.
+    reaction_choices, off = _decode_reaction_choices(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -2114,4 +2296,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "key_rotation_last_height": key_rotation_last_height,
         "past_receipt_subtree_roots": past_receipt_subtree_roots,
         "key_history": key_history,
+        "reaction_choices": reaction_choices,
     }
