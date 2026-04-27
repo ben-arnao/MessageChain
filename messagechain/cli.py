@@ -2398,9 +2398,30 @@ def cmd_send(args):
 
     if response.get("ok"):
         result = response["result"]
+        tx_hash_hex = result["tx_hash"]
         print(f"\nMessage sent!")
-        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  TX hash: {tx_hash_hex}")
         print(f"  Fee:     {result['fee']} tokens")
+        # Round-6 audit fix: name the headline promise of the project at
+        # the exact moment the user just paid for it, and point at the
+        # receipt CLI -- the verification surface that grounds the
+        # permanence claim in slashable evidence rather than marketing
+        # copy.  The `--cross-check-server` pointer is the paranoid-user
+        # pivot for the validator-collusion threat model: a single RPC
+        # node can't unilaterally forge inclusion if a second is asked
+        # to confirm.
+        print(
+            "\n"
+            "  Permanence: once this tx is included in a finalized block\n"
+            "              (~10 min), the message is permanent and can\n"
+            "              never be deleted by any party.  Validators\n"
+            "              that drop or suppress it lose stake on chain.\n"
+            "\n"
+            "  Verify inclusion:\n"
+            f"    messagechain receipt {tx_hash_hex}\n"
+            f"    messagechain receipt {tx_hash_hex} "
+            "--cross-check-server <other_validator>"
+        )
     else:
         err = response.get("error", "")
         print(f"\nFailed: {err}")
