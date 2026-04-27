@@ -4,6 +4,45 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.1] — 2026-04-27
+
+Patch release.  **Pre-activation hard-fork wire-format revision for
+Tier 25 `community_id`.**  No on-chain consequences (mainnet tip well
+below the prior `COMMUNITY_ID_HEIGHT=6_000` activation; no v5 txs
+exist yet), but the v5 layout shipped in 1.28.0 is REPLACED — operators
+must upgrade past 1.28.0 before the new activation height to avoid
+parsing v5 blobs against the obsolete rule.
+
+### Changed (consensus, pre-activation)
+
+- **Tier 25 `community_id` redesigned from 16-byte opaque hash to
+  short ASCII handle.**  v5 wire form is now `1B presence flag + 1B
+  length + N bytes` (when set) where the payload is 1–32 bytes drawn
+  from `[a-z0-9_-]` with first/last byte in `[a-z0-9]` (DNS-label
+  style).  Rationale: an identifier needs zero-ambiguity semantics
+  that the message-content validator does not provide — the prior
+  opaque-hash design forced an off-chain `(hash → human name)`
+  dictionary to be maintained by every client, and a permissive
+  Unicode handle would have opened homoglyph-impersonation attacks
+  (`art` (Latin) vs `аrt` (Cyrillic а) render identically).  Strict
+  ASCII charset removes both problems and is asymmetrically
+  reversible — a future tier can loosen the rule additively without
+  breaking the wire format, but a permissive-then-tightened rule
+  cannot be done without a new tx version.  Native-script community
+  *names* live at L2/app layer (display name / icon / description),
+  exactly like every successful identifier system (DNS, GitHub
+  handles, Reddit subreddits, Twitter handles).  Anchored as a
+  settled-design entry in CLAUDE.md.
+- **`COMMUNITY_ID_HEIGHT` bumped 6_000 → 8_000** to widen the
+  operator upgrade window for the wire-format revision.
+
+### Operator upgrade
+
+- All validators must be on 1.28.1+ before block 8_000.  No urgency
+  at the time of release (mainnet tip well below 5_000); the
+  `messagechain upgrade` CLI handles the rolling upgrade with
+  health-check rollback.
+
 ## [1.28.0] — 2026-04-27
 
 Minor release.  **Hard fork: Tier 25 — optional `community_id` on

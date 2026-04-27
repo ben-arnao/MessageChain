@@ -3982,38 +3982,67 @@ def get_honesty_curve_active(current_block: int) -> bool:
 
 # ─── Tier 25: per-message community_id ─────────────────────────────────
 #
-# A short fixed-length community_id field on MessageTransaction lets
+# An optional short ASCII-handle field on MessageTransaction lets
 # senders attach a Reddit-style community/topic grouping to a post.
 # Pure first-poster-creates semantics — there is NO on-chain registry,
-# NO creation tx, and NO claim mechanism.  Any 16-byte value is a
-# valid community_id; the namespace emerges from convention (apps
-# typically derive id = sha256(community_name_normalized)[:16] so a
-# human-readable name maps deterministically to the on-chain id).
+# NO creation tx, NO claim mechanism, and NO entity owns a community.
+# The community_id is purely a CATEGORY TAG; the (handle → display
+# name / description / icon) mapping is L2/app-layer concern.
 #
-# Why fixed 16 bytes:
-#   - 128-bit namespace, no realistic collision under any plausible
-#     organic-growth model.
-#   - Fixed length avoids the canonical-encoding edge cases (NFC,
-#     length cap, character whitelist) that a variable-length UTF-8
-#     community name would inherit from the message-text path.
-#   - Wire overhead is bounded at COMMUNITY_ID_STORED_BYTES (= 17:
-#     1B presence flag + 16B id), comparable to prev-pointer's 33B.
-#   - A community_id is app-layer grouping infra, not user speech —
-#     readability of the raw on-chain bytes is a non-goal.  The
-#     (id, name) mapping lives in indexers/clients.
+# Wire format / charset (v5 MessageTransaction):
+#   * Presence flag (1B): 0x00 = absent, 0x01 = present.
+#   * Length byte (1B): valid range [1, MAX_COMMUNITY_ID_LEN].
+#   * N bytes of ASCII handle text in [a-z0-9_-].
+#   * First and last byte MUST NOT be '-' or '_' (DNS-label style).
 #
-# Fee treatment: charged at the live per-stored-byte rate (same model
-# as prev-pointer).  Excluded from MAX_MESSAGE_CHARS — community_id
-# is structural metadata, not human-content.
+# Why a stricter rule than message text:
+#   * Identifiers must be UNAMBIGUOUS.  Allowing the full Tier 12
+#     UTF-8 whitelist (L*/M*/N*/P*/Zs) opens the homoglyph attack
+#     vector — `art` (Latin) vs `аrt` (Cyrillic а) render identically
+#     but are distinct strings, so a hostile actor can squat a
+#     visually-identical community handle.  Permanence makes this
+#     worse, not better: an impersonation handle is on chain forever.
+#     Restricting to [a-z0-9_-] makes the namespace zero-ambiguity.
+#   * Case-insensitivity by construction (lowercase only) avoids
+#     "Art" / "art" / "ART" fragmentation by typo.
+#   * No whitespace eliminates "art" vs "art " vs " art" fragments.
+#   * Leading/trailing punctuation rule (`[a-z0-9]` at edges) avoids
+#     "art" vs "-art" vs "art_" edge cases.
+#   * Length cap of 32 is enough for organic-growth handles
+#     (Reddit caps at 21, GitHub at 39) and small enough that wire
+#     overhead is bounded at 1+1+32 = 34 bytes worst case (vs 17B
+#     for the original opaque-hash design but typically 5-15 bytes).
 #
-# Activation rides above Tier 24 (HONESTY_CURVE_RATE_HEIGHT = 5_000),
-# the highest unreached fork height at the time this tier was cut.
-# 6_000 leaves a ~1000-block runway above the prior fork; community_id
-# touches a disjoint subsystem (message wire format) from the
-# slashing-curve work, so spacing only needs to satisfy the upgrade
-# cutover window, not interleave semantics.
-COMMUNITY_ID_HEIGHT = 6_000  # Tier 25
-COMMUNITY_ID_BYTES = 16
+# Internationalization tradeoff: native-script community NAMES live
+# at app/L2 layer (display name, icon, description), exactly like
+# GitHub `torvalds` (ASCII) → display name in any script.  Message
+# CONTENT keeps the full Tier 12 UTF-8 whitelist — only the grouping
+# handle is restricted, in line with every successful identifier
+# system (DNS, GitHub, package names, Reddit, Twitter handles).
+#
+# Asymmetric reversibility: starting strict and loosening later is
+# additive (a future tier can allow more codepoints behind a new
+# version flag without invalidating any existing community_id).
+# Starting permissive and tightening later requires breaking the
+# wire format.  Strict-first is the correct default.
+#
+# Fee treatment: counted toward stored bytes for the per-stored-byte
+# fee floor and the proposer's fee-per-byte ranking.  Excluded from
+# MAX_MESSAGE_CHARS — community_id is structural metadata, not the
+# user's speech.
+#
+# Activation rides above Tier 24 (HONESTY_CURVE_RATE_HEIGHT = 5_000).
+# Originally cut at 6_000 in 1.28.0; bumped to 8_000 in 1.28.1 alongside
+# the wire-format revision (16-byte opaque -> ASCII handle), widening
+# the operator upgrade window so the in-flight 1.28.0 nodes are not
+# left parsing the new v5 layout against stale rules.  Pre-activation
+# at the time of the bump (mainnet tip well below 5_000), so the
+# height change is operationally costless.
+COMMUNITY_ID_HEIGHT = 8_000  # Tier 25
+# Maximum length in ASCII bytes (= chars, since charset is ASCII).
+# Anchored as part of the wire format — see _validate_community_id
+# in messagechain.core.transaction for the structural rules.
+MAX_COMMUNITY_ID_LEN = 32
 
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
@@ -4038,10 +4067,10 @@ assert COMMUNITY_ID_HEIGHT > HONESTY_CURVE_RATE_HEIGHT, (
     "operator upgrade cutover window since the wire-format and "
     "slashing-curve subsystems are disjoint"
 )
-assert COMMUNITY_ID_BYTES == 16, (
-    "COMMUNITY_ID_BYTES is part of the wire format — changing it "
-    "reshapes the v5 signed payload and breaks replay of any block "
-    "that included a community_id-bearing tx"
+assert MAX_COMMUNITY_ID_LEN >= 1 and MAX_COMMUNITY_ID_LEN <= 255, (
+    "MAX_COMMUNITY_ID_LEN must fit in a u8 length byte and allow at "
+    "least one character — wire format reserves a single byte for "
+    "the length prefix"
 )
 
 # ─────────────────────────────────────────────────────────────────────
