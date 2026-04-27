@@ -6046,22 +6046,41 @@ class Blockchain:
                         self.supply.balances.get(proposer_id, 0) + payout
                     )
 
-        # 3: checkpoint update.  Use the stake snapshot at the
-        # target block so a validator who has since unstaked can
-        # still be counted for finalizing a block they voted for.
-        # Fall back to live staked map for very old targets whose
-        # snapshot was pruned.  Apply-path clamp (FINALITY_VOTE_CAP_HEIGHT
-        # fork) also truncates this loop so a block that slipped past
-        # validation cannot inflate the checkpoint-vote tally either.
         # 3: checkpoint update over the SAME survivors -- the
         # pre-filter above already excluded replays (and the
         # MAX_FINALITY_VOTES_PER_BLOCK overflow), so iterate the
         # survivors list directly.  This guarantees the mint loop and
         # the checkpoint loop stay in lockstep (each survivor mints
         # iff and only iff it contributes to the 2/3 tally).
+        #
+        # Use the stake snapshot pinned at the target block so a
+        # validator who has since unstaked can still be counted for
+        # finalizing a block they voted for.  Skip-if-missing rather
+        # than fall back to `self.supply.staked`: the live map reflects
+        # post-target stake churn, so two peers with different
+        # snapshot-retention state (e.g. cold-restarted vs. unrestarted)
+        # would compute different 2/3 denominators and reach divergent
+        # `crossed` decisions, splitting the persistent
+        # finalized_hashes set across the network.  Validation rejects
+        # votes older than FINALITY_VOTE_MAX_AGE_BLOCKS and the chaindb
+        # mirror retains a pin for every block in that window, so a
+        # validated vote on the honest path always finds its pin --
+        # this branch is defense-in-depth for the can't-happen case
+        # (test-harness skip, validation drift, future refactor bug)
+        # and must NOT substitute live state when it triggers.
         for vote_idx, v in survivors:
             pinned = self._stake_snapshots.get(v.target_block_number)
-            stake_map = pinned if pinned is not None else dict(self.supply.staked)
+            if pinned is None:
+                logger.error(
+                    f"FinalityVote target #{v.target_block_number} "
+                    f"({v.target_block_hash.hex()[:16]}) has no pinned "
+                    f"stake snapshot at apply time -- skipping checkpoint "
+                    f"update to avoid live-state denominator divergence "
+                    f"across peers.  This indicates validation drift or "
+                    f"snapshot-mirror corruption."
+                )
+                continue
+            stake_map = pinned
             signer_stake = stake_map.get(v.signer_entity_id, 0)
             total_stake = sum(stake_map.values())
             crossed = self.finalized_checkpoints.add_vote(
