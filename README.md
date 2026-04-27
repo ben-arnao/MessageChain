@@ -3,8 +3,10 @@
 [![release](https://img.shields.io/github/v/release/ben-arnao/MessageChain)](https://github.com/ben-arnao/MessageChain/releases)
 [![license](https://img.shields.io/github/license/ben-arnao/MessageChain)](./LICENSE)
 
-A blockchain for sending messages. Quantum-resistant, proof-of-stake,
-built to last centuries.
+A permanent, censorship-resistant ledger for human speech.
+**Your message can never be deleted.** A well-formed message that
+pays the fee floor is guaranteed inclusion — validators that drop or
+suppress it lose stake on chain.
 
 **Status:** mainnet live. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.
@@ -13,20 +15,30 @@ built to last centuries.
 
 ## Why
 
-- **Censorship-resistant communication.** No platform, government, or
-  ISP can hide, filter, or silently remove your messages. If it's
-  on-chain, it's there forever.
-- **Costly to spam.** Every message costs real tokens. Bots can
-  participate, but they pay the same price as everyone else —
-  AI-generated noise has a floor.
+- **Your message can never be deleted.** Once a message is on-chain,
+  no platform, government, ISP, or validator can hide, filter, or
+  remove it. The ledger is the source of truth and there is no
+  takedown path.
+- **Suppression is slashable.** A well-formed message that pays the
+  per-byte floor and fits the block budget cannot be quietly dropped.
+  Refusing to include or attest to such a message produces evidence
+  that any node can submit, and the offending validators lose stake.
+- **Permanence is funded forever.** Storage is paid for by perpetual
+  validator rewards, not a one-shot endowment. The security budget
+  never runs out, so the promise of permanence does not have an
+  expiry date.
+- **Costly to spam.** Every message costs real tokens, with the fee
+  scaling linearly in stored bytes. Bots can participate, but they
+  pay the same price as everyone else — AI-generated noise has a
+  floor.
 - **Simple and durable.** Designed to run for centuries with minimal
   moving parts. Slow blocks and expensive fees are features, not bugs.
   Zero runtime dependencies outside the Python stdlib.
 - **Democratic by default.** On-chain governance, distributed
-  validation, no privileged operators. L2s can layer reputation,
-  identity, and moderation on top.
+  validation, no privileged operators, no permissioned validator set.
+  L2s can layer reputation, identity, and moderation on top.
 - **Cheap to validate.** Runs on commodity hardware — no GPUs, no
-  specialized rigs.
+  specialized rigs. Quantum-resistant signatures throughout.
 
 ## Install
 
