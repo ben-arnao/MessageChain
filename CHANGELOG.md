@@ -4,6 +4,37 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.5] — 2026-04-27
+
+Critical consensus hotfix — `compute_post_state_root` was missing
+the v3 first-send-pubkey install mirror in the message-transaction
+loop, causing every block carrying a v3 MessageTransaction with
+`sender_pubkey` set to be self-rejected by the proposer with
+`Invalid state_root — state commitment mismatch`.
+
+The transfer-tx sim has had this mirror since Tier 13 was wired
+up (see `sim_public_keys[ttx.entity_id] = ttx.sender_pubkey` at
+the transfer loop), but the message-tx sim never got the same
+treatment.  Result: a fresh entity submitting its first message
+(v3, `include_pubkey=True`) couldn't get its tx into a block.
+Honest proposers built the block, simulated the post-state with
+`sim_public_keys` un-updated, signed it with that stale state_root,
+then rejected their own block when `_apply_block_state` actually
+installed the pubkey and produced a different state_root.
+
+Symptom on mainnet: chain stalled at h=678 with a v3 message tx
+in mempool.  Every 10 minutes v1's proposer logged
+`Failed to add proposed block: Invalid state_root — state
+commitment mismatch`; the chain couldn't progress until the
+mempool was drained or the bug was fixed.
+
+Fix mirrors the transfer-tx pattern in `compute_post_state_root`:
+on a v3 message tx with `sender_pubkey` set and the entity not yet
+in `sim_public_keys`, install the pubkey into the sim dict before
+the fee/burn/leaf-watermark mutations.  No on-chain consequences
+for pre-fix history (no v3 message tx with `sender_pubkey` ever
+landed; the bug prevented it from landing in the first place).
+
 ## [1.28.4] — 2026-04-27
 
 Critical operational hotfix for submit-path lock contention.  The

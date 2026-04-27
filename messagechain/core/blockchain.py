@@ -4387,6 +4387,24 @@ class Blockchain:
 
         # Simulate fee payments for message transactions (with burn)
         for tx in transactions:
+            # First-send pubkey reveal: a v3 MessageTransaction may
+            # carry a `sender_pubkey` that registers the sender's
+            # long-term public key on chain at the moment of first
+            # post.  `_apply_block_state` installs it via
+            # `self.public_keys[tx.entity_id] = tx.sender_pubkey`
+            # (see `apply_message_tx` first-spend branch).  The sim
+            # MUST mirror that mutation or the post-block state_root
+            # diverges from apply and honest validators reject the
+            # block — same shape as the transfer-tx sim mirror at
+            # `sim_public_keys[ttx.entity_id] = ttx.sender_pubkey`
+            # below.  Pre-Tier-13 (v1/v2) txs have no `sender_pubkey`
+            # attribute so the getattr fallback keeps the loop
+            # backwards-compatible.
+            if (
+                getattr(tx, "sender_pubkey", b"")
+                and tx.entity_id not in sim_public_keys
+            ):
+                sim_public_keys[tx.entity_id] = tx.sender_pubkey
             # M1/M2: Clamp tip to >= 0 to prevent negative balances
             effective_base_fee = min(current_base_fee, tx.fee)
             tip = tx.fee - effective_base_fee
