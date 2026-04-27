@@ -28,6 +28,7 @@ from messagechain.config import (
     TREASURY_ENTITY_ID, VALIDATOR_MIN_STAKE, BLOCK_REWARD_FLOOR,
     PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
     PROPOSER_REWARD_CAP,
+    PROPOSER_CAP_HALVING_HEIGHT,
     BASE_FEE_INITIAL, BASE_FEE_MAX_CHANGE_DENOMINATOR,
     TARGET_BLOCK_SIZE, MIN_TIP,
     BLOCK_BYTES_RAISE_HEIGHT, TARGET_BLOCK_SIZE_POST_RAISE,
@@ -416,7 +417,35 @@ class SupplyTracker:
         self.total_supply += reward
         self.total_minted += reward
 
-        effective_cap = reward if bootstrap else PROPOSER_REWARD_CAP
+        # Per-block cap on combined proposer earnings.
+        #
+        # Pre-PROPOSER_CAP_HALVING_HEIGHT (Tier 19): the cap is the
+        # import-time constant `PROPOSER_REWARD_CAP` (=4 with the
+        # default constants).  This silently turns OFF once the
+        # halving schedule drives reward down to BLOCK_REWARD_FLOOR=4
+        # — at floor era a mega-staker can earn proposer_share(1) +
+        # attester_pool(3) = 4 = cap, no clawback ever fires.
+        #
+        # Post-activation: recompute the cap from the actual reward
+        # at this height so it stays at exactly
+        # `PROPOSER_REWARD_NUMERATOR / DENOMINATOR` of issuance across
+        # all halving eras.  At BLOCK_REWARD=16 this is unchanged
+        # (cap=4); after the first halving it tightens to 2; at floor
+        # it tightens to 1 — the mega-staker capture is properly
+        # bounded forever.
+        #
+        # Bootstrap path is orthogonal: when no validator has staked
+        # yet, the whole reward goes to the proposer regardless of
+        # cap (genesis incentive).
+        if bootstrap:
+            effective_cap = reward
+        elif block_height >= PROPOSER_CAP_HALVING_HEIGHT:
+            effective_cap = (
+                reward * PROPOSER_REWARD_NUMERATOR
+                // PROPOSER_REWARD_DENOMINATOR
+            )
+        else:
+            effective_cap = PROPOSER_REWARD_CAP
 
         # Proposer + attester pool split.
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR

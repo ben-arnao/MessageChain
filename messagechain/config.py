@@ -3535,6 +3535,34 @@ assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
     "SLASH_PENALTY_PCT would make the fork a no-op"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 21: halvings-aware proposer reward cap
+# ─────────────────────────────────────────────────────────────────────
+# `PROPOSER_REWARD_CAP` is computed once at module load as
+#     BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+# i.e. 16 * 1 / 4 = 4 tokens.  This frozen value silently turns the
+# anti-mega-staker cap OFF once the halving schedule drives the actual
+# block reward down to BLOCK_REWARD_FLOOR=4: at floor era a single
+# validator who proposes AND attests can earn proposer_share(1) +
+# attester_pool(3) = 4 tokens, which equals the cap exactly — no
+# clawback, no burn.  The mechanism is permanently non-binding.
+#
+# Post-activation: the per-block cap is recomputed every block from
+# the actual `reward` returned by `calculate_block_reward(height)`,
+# which already accounts for halvings AND the v1/v2 deflation-floor
+# boosts.  The cap stays at exactly 1/4 of the issued reward
+# regardless of era — at BLOCK_REWARD=16 the cap is 4 (unchanged from
+# today), at the first halving (8) it's 2, at floor (4) it's 1.
+#
+# Pre-activation: continues to read the import-time
+# `PROPOSER_REWARD_CAP` constant byte-for-byte so historical blocks
+# replay identically.
+#
+# Activation height: well before the first halving
+# (HALVING_INTERVAL=210_240) so the new logic is in place long before
+# the failure mode could manifest.  Sits above Tier 20 with the same
+# ~2000-block runway pattern.
+PROPOSER_CAP_HALVING_HEIGHT = 17000  # Tier 21
 assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
     "message-byte budget — otherwise a block of pure messages valid "
@@ -3680,6 +3708,13 @@ assert FINALITY_VOTE_CAP_HEIGHT < FINALITY_REWARD_FROM_ISSUANCE_HEIGHT, (
 assert ATTESTER_CAP_FIX_HEIGHT > ATTESTER_REWARD_CAP_HEIGHT, (
     "ATTESTER_CAP_FIX_HEIGHT must follow ATTESTER_REWARD_CAP_HEIGHT"
 )
+# Halvings-aware proposer cap rides on top of Tier 18.  No structural
+# dependency on TIER_18_HEIGHT itself, but ordering keeps the fork
+# numbering monotone and gives operators a single readable timeline.
+assert PROPOSER_CAP_HALVING_HEIGHT > SOFT_SLASH_HEIGHT, (
+    "PROPOSER_CAP_HALVING_HEIGHT must follow SOFT_SLASH_HEIGHT — Tier 21 "
+    "rides above Tier 20 in the fork schedule"
+)
 # The registration-burn grandfather reads the already-raised validator
 # min stake floor.  Activating the burn before the min-stake raise
 # means the grandfather's floor check runs against the legacy 100
@@ -3731,6 +3766,7 @@ for _fork_name, _fork_height in (
     ("TIER_18_HEIGHT", TIER_18_HEIGHT),
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
     ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
+    ("PROPOSER_CAP_HALVING_HEIGHT", PROPOSER_CAP_HALVING_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
