@@ -42,6 +42,7 @@ from messagechain.config import (
     DEFLATION_FLOOR_V2_HEIGHT,
     DEFLATION_REBATE_BPS,
     DEFLATION_REBATE_WINDOW_BLOCKS,
+    REWARD_CURVE_HEIGHT,
     REWARD_CURVE_SMALL_THRESHOLD_BPS,
     REWARD_CURVE_MID_THRESHOLD_BPS,
     REWARD_CURVE_SMALL_NUMERATOR,
@@ -596,6 +597,21 @@ class SupplyTracker:
             )
             cap_active = block_height >= ATTESTER_REWARD_CAP_HEIGHT
             cap_fix_active = block_height >= ATTESTER_CAP_FIX_HEIGHT
+            # REWARD_CURVE_HEIGHT (Tier 20): apply per-attester
+            # multiplier based on stake share before the per-entity
+            # cap.  Curve runs first so the cap remains a strict
+            # upper bound — mid-tier validators (multiplier > 1) hit
+            # the cap faster, small validators (multiplier < 1) reach
+            # it slower; neither can exceed cap_per_entity.  Pre-
+            # activation: byte-for-byte identical to legacy (no
+            # multiplier path executes).  Total active stake is read
+            # from self.staked at mint time, which reflects the
+            # post-block staking state — same value the sim mirror
+            # in blockchain.py reads from sim_staked.
+            curve_active = block_height >= REWARD_CURVE_HEIGHT
+            total_active_stake = (
+                sum(self.staked.values()) if curve_active else 0
+            )
             cap_per_entity = 0
             if cap_active:
                 epoch_start = (
@@ -635,12 +651,26 @@ class SupplyTracker:
 
             for eid in paid_committee:
                 reward_amount = per_slot_reward
+                # REWARD_CURVE_HEIGHT (Tier 20): apply piecewise-
+                # constant multiplier based on this attester's stake
+                # share of total active stake.  Defensive zero-stake
+                # short-circuit: if the network has no stake at all,
+                # bps is undefined and we fall back to baseline (1/1)
+                # — same effect as legacy.  per_slot_reward == 0 is
+                # also a no-op (multiplier on 0 is 0).
+                if curve_active and per_slot_reward > 0 and total_active_stake > 0:
+                    stake_bps = (
+                        self.staked.get(eid, 0) * 10_000
+                        // total_active_stake
+                    )
+                    num, den = reward_curve_multiplier(stake_bps)
+                    reward_amount = reward_amount * num // den
                 if cap_active and per_slot_reward > 0:
                     earned = self.attester_epoch_earnings.get(eid, 0)
                     available = cap_per_entity - earned
                     if available < 0:
                         available = 0
-                    reward_amount = min(per_slot_reward, available)
+                    reward_amount = min(reward_amount, available)
                     # Bookkeeping: track credited amount (pre-cap
                     # overflow) so the tracker reflects ACTUAL
                     # earnings, not paid-intent.
@@ -678,7 +708,24 @@ class SupplyTracker:
         # participation invariant intact: tokens in circulation were
         # earned by a validator who did real work, the rest is
         # deflationary.
-        burned = attester_pool - attester_tokens_paid
+        #
+        # REWARD_CURVE_HEIGHT (Tier 20): the per-attester multiplier
+        # can push `attester_tokens_paid` either side of `attester_
+        # pool`.  Under-allocation (small-band-heavy committee) keeps
+        # the legacy semantic: pool minus actual = burned.  Over-
+        # allocation (mid-band-heavy committee) is curve-driven mint:
+        # the excess is added to total_supply / total_minted as a
+        # net new issuance.  Pre-Tier-20 the over-allocation case is
+        # unreachable because `attester_tokens_paid ≤ attester_pool`
+        # always held, so this branch is byte-for-byte identical to
+        # legacy at heights below activation.
+        if attester_tokens_paid > attester_pool:
+            curve_mint_extra = attester_tokens_paid - attester_pool
+            self.total_supply += curve_mint_extra
+            self.total_minted += curve_mint_extra
+            burned = 0
+        else:
+            burned = attester_pool - attester_tokens_paid
 
         # Proposer-cap check: in a multi-validator committee, the
         # proposer's combined earnings (proposer share + committee
