@@ -1966,9 +1966,20 @@ class Server(SharedRuntimeMixin):
                 submit_transaction_to_mempool,
             )
             tx = MessageTransaction.deserialize(params["transaction"])
+            # Receipt issuance is OPT-IN per submission via the
+            # x-mc-receipt parameter.  The default path skips the
+            # receipt subtree entirely so submission stays fast even
+            # if the receipt-subtree leaf-cursor lock is held by
+            # another in-flight sign.  Pre-fix, every submit
+            # synchronously waited up to 30s on that lock — a single
+            # contention event froze every other submit on the
+            # validator.  Censorship-evidence clients that need a
+            # receipt can opt in by setting `request_receipt: true`
+            # in the submission params.
+            issuer = self.receipt_issuer if params.get("request_receipt") else None
             result = submit_transaction_to_mempool(
                 tx, self.blockchain, self.mempool,
-                receipt_issuer=self.receipt_issuer,
+                receipt_issuer=issuer,
             )
             if not result.ok:
                 return {"ok": False, "error": result.error}

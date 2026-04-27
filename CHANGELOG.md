@@ -4,6 +4,31 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.4] — 2026-04-27
+
+Critical operational hotfix for submit-path lock contention.  The
+1.28.3 to_thread fix moved the synchronous WOTS+ sign off the
+asyncio event loop, but the underlying problem remained: every
+`_rpc_submit_*` call passed `receipt_issuer=self.receipt_issuer`,
+which forces a SubmissionReceipt to be signed using a leaf from
+the receipt subtree.  That sign acquires a cross-process advisory
+file lock with a 30-second timeout (`_LEAF_CURSOR_LOCK_TIMEOUT_S`).
+On a node where the lock was held perpetually by the validator
+process itself (`/proc/locks` showed `FLOCK ADVISORY WRITE` on
+`receipt_leaf_index.json.lock`), every submit blocked the full
+30 s before the receipt issuance gave up — long enough that
+clients with a 10–30 s socket timeout always timed out.
+
+**Receipt issuance is now opt-in.**  Submit handlers
+(`_rpc_submit_transaction`, `_rpc_submit_transfer`,
+`_rpc_submit_react`) skip the receipt subtree by default and
+return immediately after the tx is admitted to the mempool.
+Censorship-evidence clients that need a SubmissionReceipt can opt
+in by passing `request_receipt: true` in the submission params.
+
+No consensus impact, no wire-format change.  Default-path submits
+go from 30 s+ timeouts to single-digit milliseconds.
+
 ## [1.28.3] — 2026-04-27
 
 Critical operational hotfix.  Submit RPCs (`submit_transaction`,
