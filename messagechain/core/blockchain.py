@@ -3653,6 +3653,130 @@ class Blockchain:
             return False, reason
         return True, "Valid"
 
+    def validate_inclusion_list_violation_evidence_tx(
+        self, tx, chain_height: int | None = None,
+    ) -> tuple[bool, str]:
+        """Admission-time validation for an InclusionListViolationEvidenceTx.
+
+        Two layers:
+
+        Layer 1 — stateless / cheap-first (mirrors the other evidence
+        validators):
+          * submitter is registered
+          * accused_proposer is registered
+          * accused_proposer is NOT already slashed
+          * (list_hash, omitted_tx_hash, accused_proposer_id) NOT
+            already in processor.processed_violations (double-slash
+            defence)
+          * submitter can afford the fee
+          * WOTS+ leaf-watermark gate
+          * stateless verify (omitted_tx ∈ list.entries, fee floor,
+            submitter signature)
+
+        Layer 2 — state-dependent gate (the consensus-objective check
+        the audit demanded the apply path consult before slashing):
+          * the named list is currently in active_lists (its forward
+            window has not yet been wiped by expire())
+          * accused_height sits inside the list's forward window
+            [publish_height + 1, publish_height + window_blocks]
+          * the chain's recorded proposer for accused_height matches
+            accused_proposer_id (consults
+            processor.proposers_by_height[list_hash])
+          * the omitted tx_hash has NOT been recorded as included
+            during the window (consults processor.inclusions_seen)
+
+        Each Layer 2 check converts a "well-formed evidence" claim into
+        a fact the chain has already independently observed — so a
+        forged accusation against a proposer who never proposed at that
+        height, or against a tx that actually landed, is rejected here
+        rather than silently slashing an innocent.
+        """
+        from messagechain.consensus.inclusion_list import (
+            verify_inclusion_list_violation_evidence_tx,
+        )
+        # Layer 1 — cheap, stateless / light state.
+        if tx.submitter_id not in self.public_keys:
+            return False, "Unknown submitter — must register first"
+        if tx.accused_proposer_id not in self.public_keys:
+            return False, "Unknown accused proposer"
+        if tx.accused_proposer_id in self.slashed_validators:
+            return False, "Accused proposer already slashed"
+
+        proc = self.inclusion_list_processor
+        dedup_key = (
+            tx.inclusion_list.list_hash,
+            tx.omitted_tx_hash,
+            tx.accused_proposer_id,
+        )
+        if dedup_key in proc.processed_violations:
+            return False, "Violation already processed (double-slash defence)"
+
+        if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
+            return False, "Submitter cannot afford fee"
+        if (
+            tx.signature.leaf_index
+            < self.leaf_watermarks.get(tx.submitter_id, 0)
+        ):
+            return False, (
+                f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+                f"(watermark "
+                f"{self.leaf_watermarks[tx.submitter_id]}) — leaf reuse "
+                f"rejected"
+            )
+        submitter_pk = self.public_keys[tx.submitter_id]
+        ok, reason = verify_inclusion_list_violation_evidence_tx(
+            tx, submitter_pk,
+        )
+        if not ok:
+            return False, reason
+
+        # Layer 2 — state-dependent gate.
+        list_hash = tx.inclusion_list.list_hash
+        active = proc.active_lists.get(tx.inclusion_list.publish_height)
+        if active is None or active.list_hash != list_hash:
+            return False, (
+                "Named inclusion list is not in active_lists — its "
+                "forward window has expired or it was never registered "
+                "(evidence stale or for an unknown list)"
+            )
+        ph = active.publish_height
+        if not (ph < tx.accused_height <= ph + active.window_blocks):
+            return False, (
+                f"accused_height {tx.accused_height} sits outside the "
+                f"list's forward window "
+                f"({ph + 1}..{ph + active.window_blocks})"
+            )
+        recorded_proposer = (
+            proc.proposers_by_height.get(list_hash, {})
+            .get(tx.accused_height)
+        )
+        if recorded_proposer != tx.accused_proposer_id:
+            return False, (
+                f"accused_proposer_id does not match the chain's "
+                f"recorded proposer for height {tx.accused_height} "
+                f"(forged accusation against an innocent bystander, or "
+                f"that height was never observed in-window)"
+            )
+        # If the omitted tx WAS observed inside the window, the
+        # accusation is refuted: the proposer at accused_height did not
+        # land it themselves, but a later in-window block did, and the
+        # consensus-objective definition of inclusion-list violation
+        # is per-list (the list mandates that SOMEBODY include the tx
+        # in the window, not that THIS proposer be the one to do it).
+        seen_heights = proc.inclusions_seen.get(
+            (list_hash, tx.omitted_tx_hash), [],
+        )
+        in_window_inclusions = [
+            h for h in seen_heights if ph < h <= ph + active.window_blocks
+        ]
+        if in_window_inclusions:
+            return False, (
+                f"omitted_tx_hash WAS included in-window (heights "
+                f"{in_window_inclusions}) — list satisfied, no "
+                f"violation"
+            )
+        return True, "Valid"
+
     def validate_non_response_evidence_tx(
         self, tx,
     ) -> tuple[bool, str]:
@@ -9173,6 +9297,92 @@ class Blockchain:
                     f"evidence={etx.evidence_hash.hex()[:16]}"
                 )
 
+        # ── InclusionListProcessor wiring (consensus-objective censorship
+        # defence).  Three lifecycle hooks fire on every block apply:
+        #
+        #   1. register()      — if this block PUBLISHES a quorum-backed
+        #                        InclusionList (block.inclusion_list is
+        #                        non-None and has entries), make it
+        #                        active so future blocks in its window
+        #                        are observed against it.
+        #   2. observe_block() — record THIS block's proposer +
+        #                        included tx_hashes against every
+        #                        currently-active list whose forward
+        #                        window covers block_number.  Populates
+        #                        proposers_by_height (which the
+        #                        violation-evidence gate consults) and
+        #                        inclusions_seen (which the same gate
+        #                        consults to refuse evidence for txs
+        #                        that DID land).
+        #   3. process_inclusion_list_violation_evidence_txs() — admit
+        #                        any in-block evidence txs through the
+        #                        state-dependent gate and slash the
+        #                        accused proposer when the gate accepts.
+        #
+        # `expire()` runs at end-of-block (further down — see comment
+        # near `censorship_processor.mature`).  Order matters: register
+        # + observe must precede evidence-tx processing so a same-block
+        # evidence's gate consults the freshest state; expire must
+        # follow evidence-tx processing so an evidence landing in the
+        # block AT (publish_height + window) — the last legal slot
+        # before the list's tracking is dropped — still finds the list
+        # in active_lists.
+        block_lst = getattr(block, "inclusion_list", None)
+        if block_lst is not None and getattr(block_lst, "entries", None):
+            self.inclusion_list_processor.register(
+                block_lst, current_height=block.header.block_number,
+            )
+        self.inclusion_list_processor.observe_block(block)
+
+        # Admit InclusionListViolationEvidenceTxes.  Validator block-
+        # verification has already run validate_inclusion_list_violation
+        # _evidence_tx for syntactic + leaf checks; we re-run it here
+        # so the apply path never slashes on an unverified or stale
+        # claim.  An evidence rejected at apply-time is a no-op:
+        # NO fee, NO watermark bump, NO slash — same posture as
+        # bogus-rejection's honest-rejection path.
+        for etx in getattr(block, "inclusion_list_violation_evidence_txs", []):
+            ok, reason = self.validate_inclusion_list_violation_evidence_tx(
+                etx, chain_height=block.header.block_number,
+            )
+            if not ok:
+                logger.warning(
+                    f"InclusionListViolationEvidenceTx "
+                    f"{etx.tx_hash.hex()[:16]} rejected at apply-time: "
+                    f"{reason}"
+                )
+                continue
+            from messagechain.consensus.inclusion_list import (
+                process_inclusion_list_violation,
+            )
+            result = process_inclusion_list_violation(etx, self)
+            if not result.accepted:
+                logger.info(
+                    f"InclusionListViolationEvidenceTx "
+                    f"{etx.tx_hash.hex()[:16]} refused at apply-time: "
+                    f"{result.reason}"
+                )
+                continue
+            if not self.supply.pay_fee_with_burn(
+                etx.submitter_id, proposer_id, etx.fee, current_base_fee,
+            ):
+                logger.error(
+                    f"InclusionListViolationEvidenceTx "
+                    f"{etx.tx_hash.hex()[:16]} fee payment failed — "
+                    f"skipping (state may drift)"
+                )
+                continue
+            self._bump_watermark(etx.submitter_id, etx.signature.leaf_index)
+            if result.slashed:
+                logger.info(
+                    f"INCLUSION-LIST-VIOLATION-SLASHED validator "
+                    f"{result.offender_id.hex()[:16]}: "
+                    f"stake_burned={result.slash_amount}, "
+                    f"list={etx.inclusion_list.list_hash.hex()[:16]}, "
+                    f"omitted_tx={etx.omitted_tx_hash.hex()[:16]}, "
+                    f"accused_height={etx.accused_height}"
+                )
+
         # Apply authority transactions (SetAuthorityKey / Revoke / KeyRotation).
         # These all carry block-level state changes that previously only
         # applied on the node receiving the RPC — committing them through
@@ -9746,6 +9956,21 @@ class Blockchain:
         )
         for m in matured:
             self._apply_censorship_slash(m)
+
+        # Drop inclusion lists whose forward window has closed.  Runs
+        # AFTER the inclusion-list violation-evidence apply loop above
+        # so an evidence tx landing at exactly (publish_height + window)
+        # — the last legal slot — still finds the list in active_lists
+        # before this expire wipes it.  We discard the per-list
+        # violation records emitted by expire(): the slashing pathway
+        # is by-evidence-tx (so honest finder pays the fee, deters
+        # spurious accusations, and keeps the apply path content-
+        # neutral), not by automatic emit-and-slash.  expire's own
+        # bookkeeping cleanup (active_lists.pop, inclusions_seen
+        # cleanup) is what we're after on this call.
+        self.inclusion_list_processor.expire(
+            current_height=block.header.block_number,
+        )
 
         # Witness-ack registry: every entry in
         # `block.acks_observed_this_block` is a soft-vote signal from
