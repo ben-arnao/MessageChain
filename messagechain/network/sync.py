@@ -49,6 +49,19 @@ SYNC_TIMEOUT = 30  # seconds to wait for a response
 MAX_SYNC_PEERS = 3  # max peers to sync from simultaneously
 SYNC_STALE_TIMEOUT = 60  # restart sync if stuck for this long
 
+# Tolerance bands for ``ChainSyncer._maybe_validate_peer_weight``.
+# The verification compares ``our_weight + sum(stake_weight(hdr) for hdr
+# in delivered_headers)`` against the peer's handshake claim.
+# ``compute_block_stake_weight`` consults live ``supply.staked`` rather
+# than the per-block stake snapshot the peer saw when computing their
+# claim, so small drift is expected on healthy chains; ±5% absorbs that
+# drift while still catching the audit's 4× over-claim attack with a
+# wide margin.  Tightening the band would risk false rejections on
+# legitimate peers across stake-rebalance events; widening it makes
+# the gate easier to defeat.
+PEER_WEIGHT_TOLERANCE_LOW = 0.95
+PEER_WEIGHT_TOLERANCE_HIGH = 1.05
+
 
 class SyncState(Enum):
     IDLE = "idle"
@@ -59,12 +72,31 @@ class SyncState(Enum):
 
 @dataclass
 class PeerSyncInfo:
-    """Track what we know about a peer's chain."""
+    """Track what we know about a peer's chain.
+
+    ``cumulative_weight`` is the peer's *handshake claim*, sanity-capped
+    by ``Node._accept_peer_weight`` but NOT cryptographically verified.
+    A sybil cluster can lie up to the cap (``max(1_000_000,
+    4 × our_weight)``).  Any sync decision that pivots on the claim
+    therefore needs to gate on ``peer_weight_evidence_validated``,
+    which is set ONLY after the peer has delivered headers whose
+    computed cumulative weight matches the claim within tolerance
+    (see ``ChainSyncer._maybe_validate_peer_weight``).
+
+    ``delivered_header_weight`` is the running sum of stake-weight
+    contributions from headers this peer has delivered since the
+    handshake claim was recorded; it's the evidence the verification
+    hook uses.  Reset on each new ``update_peer_height`` call so a
+    re-handshaking peer can't reuse stale evidence to validate an
+    inflated new claim.
+    """
     peer_address: str
     chain_height: int
     best_block_hash: str = ""
     last_response_time: float = 0.0
     cumulative_weight: int = 0
+    peer_weight_evidence_validated: bool = False
+    delivered_header_weight: int = 0
 
 
 class ChainSyncer:
@@ -168,6 +200,11 @@ class ChainSyncer:
             logger.warning(f"Peer {peer_address} reported absurd height {height}, clamping")
             height = MAX_SANE_BLOCK_HEIGHT
 
+        # Replacing the entry resets ``peer_weight_evidence_validated`` and
+        # ``delivered_header_weight`` to their defaults, which is the
+        # correct semantics: a peer issuing a fresh handshake claim must
+        # re-prove that claim against newly delivered headers — stale
+        # evidence from the prior claim does NOT carry over.
         self.peer_heights[peer_address] = PeerSyncInfo(
             peer_address=peer_address,
             chain_height=height,
@@ -378,6 +415,17 @@ class ChainSyncer:
 
         self.pending_headers.extend(valid_headers)
 
+        # Audit: accumulate per-peer delivered weight from the headers
+        # this peer actually shipped, and flip
+        # ``peer_weight_evidence_validated`` if their handshake claim
+        # is consistent with delivery.  Without this gate,
+        # ``Node._minority_fork_likely`` trusts the unverified handshake
+        # claim — a sybil cluster filling >=2 outbound slots can lie
+        # about cumulative_weight up to ``_accept_peer_weight``'s cap
+        # and trip the heuristic, burning IBD bandwidth on attacker-
+        # controlled chains.  See tests/test_peer_weight_verification.py.
+        self._maybe_validate_peer_weight(peer_addr, valid_headers)
+
         # Request more headers if we got a full batch
         if len(headers_data) >= HEADERS_BATCH_SIZE:
             next_start = headers_data[-1]["block_number"] + 1
@@ -403,6 +451,132 @@ class ChainSyncer:
         ]
         eligible.sort(key=lambda p: p.chain_height, reverse=True)
         return [p.peer_address for p in eligible]
+
+    def _maybe_validate_peer_weight(
+        self, peer_addr: str, valid_headers: list[dict],
+    ) -> None:
+        """Compare delivered cumulative weight to peer's handshake claim.
+
+        Increments ``info.delivered_header_weight`` for each header the
+        peer ships.  Once the peer has delivered headers up to (or past)
+        the height they claimed at handshake, compute the total
+        ``our_weight + delivered_header_weight`` and compare to the
+        claim.  If the totals match within
+        ``[PEER_WEIGHT_TOLERANCE_LOW, PEER_WEIGHT_TOLERANCE_HIGH]`` of
+        the claim, set ``peer_weight_evidence_validated = True`` so
+        ``Node._minority_fork_likely`` will admit this peer as a
+        corroborating voter.  If the peer over-claimed (delivered far
+        less than their handshake number), the flag stays False and
+        an offense is recorded so repeat liars accumulate ban-score.
+
+        Bootstrap-friendly: this hook works regardless of where our
+        own height/weight sits — the verification is only that the
+        peer's claim is self-consistent with their delivery, not that
+        their chain matches ours.
+        """
+        info = self.peer_heights.get(peer_addr)
+        if info is None:
+            return
+        if info.peer_weight_evidence_validated:
+            return  # already validated this claim — nothing to do
+        if info.cumulative_weight <= 0:
+            return  # no claim to verify
+
+        # Accumulate delivered weight from this batch.
+        stakes = self._stakes_for_validation()
+        for hdr in valid_headers:
+            info.delivered_header_weight += self._header_stake_weight(
+                hdr, stakes,
+            )
+
+        # Have we received headers up to or past the claimed tip?
+        # ``valid_headers`` may be empty (peer skipped already-known
+        # blocks) or partial; check the cumulative pending-headers tip.
+        last_delivered_height = (
+            self.pending_headers[-1].get("block_number", 0)
+            if self.pending_headers else self.blockchain.height
+        )
+        if last_delivered_height < info.chain_height:
+            return  # not yet at the claimed tip — defer validation
+
+        our_weight = self._our_cumulative_weight()
+        delivered_total = our_weight + info.delivered_header_weight
+        claim = info.cumulative_weight
+
+        # Avoid division-by-zero on the bootstrap-edge claim=0 case.
+        if claim <= 0:
+            return
+
+        ratio = delivered_total / claim
+        if PEER_WEIGHT_TOLERANCE_LOW <= ratio <= PEER_WEIGHT_TOLERANCE_HIGH:
+            info.peer_weight_evidence_validated = True
+            logger.debug(
+                f"Peer {peer_addr} weight claim verified: "
+                f"delivered={delivered_total} claim={claim} "
+                f"ratio={ratio:.3f}"
+            )
+        elif ratio < PEER_WEIGHT_TOLERANCE_LOW:
+            # Peer over-claimed: their handshake number is materially
+            # higher than what their delivered headers actually compute
+            # to.  Leaves the flag False AND records an offense — this
+            # is the audit-finding's primary attack surface.
+            logger.warning(
+                f"Peer {peer_addr} over-claimed cumulative_weight: "
+                f"claim={claim} delivered={delivered_total} "
+                f"ratio={ratio:.3f} (tolerance low={PEER_WEIGHT_TOLERANCE_LOW})"
+            )
+            self._on_peer_offense(
+                peer_addr, OFFENSE_PROTOCOL_VIOLATION,
+                f"weight_overclaim:claim={claim}:delivered={delivered_total}",
+            )
+        else:
+            # ratio > HIGH: delivered weight EXCEEDS the claim.  This is
+            # weird but not adversarial in the audit sense (under-
+            # claiming hurts the peer's own sync-selection prospects).
+            # Leave the flag False on safety grounds and log; do NOT
+            # record an offense — could be a stake-rebalance racing
+            # the claim.
+            logger.debug(
+                f"Peer {peer_addr} delivered more weight than claimed: "
+                f"claim={claim} delivered={delivered_total} ratio={ratio:.3f}"
+            )
+
+    def _stakes_for_validation(self) -> dict:
+        """Best-effort live stakes table for the verification hook.
+
+        Returns ``self.blockchain.supply.staked`` if available, else an
+        empty dict.  ``_header_stake_weight`` falls back to the
+        ``compute_block_stake_weight`` floor of 1 per missing entry, so
+        an empty dict still produces meaningful per-header weight.
+        """
+        supply = getattr(self.blockchain, "supply", None)
+        if supply is None:
+            return {}
+        return getattr(supply, "staked", {}) or {}
+
+    @staticmethod
+    def _header_stake_weight(hdr: dict, stakes: dict) -> int:
+        """Compute one header's contribution to cumulative stake weight.
+
+        Mirrors ``compute_block_stake_weight``: looks up the proposer's
+        live stake (decoded from the header dict's hex ``proposer_id``)
+        and floors at 1 so blocks always add some weight (bootstrap
+        mode + missing-entry tolerance).
+        """
+        pid_hex = hdr.get("proposer_id", "")
+        try:
+            pid = bytes.fromhex(pid_hex) if isinstance(pid_hex, str) else b""
+        except ValueError:
+            pid = b""
+        return max(1, stakes.get(pid, 0))
+
+    def _our_cumulative_weight(self) -> int:
+        """Our chain's cumulative weight via ForkChoice's best-tip cache."""
+        fork_choice = getattr(self.blockchain, "fork_choice", None)
+        if fork_choice is None:
+            return 0
+        best = fork_choice.get_best_tip()
+        return best[2] if best else 0
 
     async def _request_next_blocks(self, peer_addr: str):
         """Single-peer request — kept for headers fallback + tests.

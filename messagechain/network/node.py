@@ -417,13 +417,27 @@ class Node(SharedRuntimeMixin):
         our_weight = self._current_cumulative_weight()
         # Inspect the syncer's peer-tip cache (populated by
         # update_peer_height on each handshake / weight echo).
+        #
+        # Audit gate: filter to peers whose ``cumulative_weight`` claim
+        # has been *verified* against headers they actually delivered.
+        # Without this filter a sybil cluster filling >=2 outbound slots
+        # can lie about cumulative_weight up to ``_accept_peer_weight``'s
+        # cap, trip the strict-majority test below, and burn IBD
+        # bandwidth on attacker-controlled chains
+        # (``tests/test_peer_weight_verification.py`` is the regression
+        # guard).  Verification is set in
+        # ``ChainSyncer._maybe_validate_peer_weight`` after the peer
+        # has delivered headers consistent with their claim within
+        # ``PEER_WEIGHT_TOLERANCE_LOW..HIGH``.
         candidates = [
             info for info in self.syncer.peer_heights.values()
             if info.chain_height >= our_height
+            and getattr(info, "peer_weight_evidence_validated", False)
         ]
         if len(candidates) < 2:
-            # Too few peers at-or-above us to corroborate; refuse to
-            # trigger sync on a single peer's word.
+            # Too few VERIFIED peers at-or-above us to corroborate;
+            # refuse to trigger sync on a single peer's word, and never
+            # trigger on unverified word.
             return False
         heavier = sum(
             1 for info in candidates
