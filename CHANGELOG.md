@@ -4,13 +4,13 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.28.1] — 2026-04-27
+## [1.28.2] — 2026-04-27
 
 Patch release.  **Pre-activation hard-fork wire-format revision for
 Tier 25 `community_id`.**  No on-chain consequences (mainnet tip well
 below the prior `COMMUNITY_ID_HEIGHT=6_000` activation; no v5 txs
 exist yet), but the v5 layout shipped in 1.28.0 is REPLACED — operators
-must upgrade past 1.28.0 before the new activation height to avoid
+must upgrade past 1.28.1 before the new activation height to avoid
 parsing v5 blobs against the obsolete rule.
 
 ### Changed (consensus, pre-activation)
