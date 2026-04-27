@@ -4793,9 +4793,9 @@ async def run(args):
         )
         if faucet_state is not None:
             logger.info(
-                "Faucet active: drip=%d daily_cap=%d",
+                "Faucet active: drip=%d window_cap=%d",
                 faucet_state.drip_amount,
-                faucet_state.daily_cap,
+                faucet_state.window_cap,
             )
 
     # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run

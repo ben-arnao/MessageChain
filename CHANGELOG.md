@@ -4,6 +4,17 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.1] — 2026-04-26
+
+Hotfix for 1.25.0. The Tier 22 (1.24.0) faucet rework retired
+`FaucetState.daily_cap` in favor of `window_cap`, but a leftover log
+line in `server.py` still referenced the old attribute. Validators
+running with `--faucet-keyfile` (the public-feed validator) crashed
+on startup with `AttributeError: 'FaucetState' object has no
+attribute 'daily_cap'`. Fix renames the log line to `window_cap`.
+
+No consensus impact. Activation heights from 1.25.0 unchanged.
+
 ## [1.25.0] — 2026-04-26
 
 ### Hard fork — fast-forwarded Tier 2 + Tier 7 + Tier 13–17 activations
