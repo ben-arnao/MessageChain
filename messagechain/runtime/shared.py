@@ -153,9 +153,33 @@ class SharedRuntimeMixin:
         # Small startup delay so the host finishes init before first attempt
         await asyncio.sleep(1)
 
+        # Imported lazily so this mixin stays a pure runtime helper
+        # without a hard dependency on the consensus package's import
+        # order at module-load time.
+        from messagechain.consensus.pos import ProposerSkipSlotError
+        from messagechain.consensus.height_guard import (
+            HeightAlreadySignedError,
+        )
+
         while self._running:
             try:
                 await self._try_produce_block()
+            except ProposerSkipSlotError as e:
+                # Pre-sign local validation rejected this slot's
+                # candidate (e.g. round_number > cap on a long-stalled
+                # chain).  No floor was advanced; we'll retry at the
+                # next slot.  This is the working-as-designed defense
+                # against floor poisoning — log at INFO so operators
+                # can see slot skips without it looking like an error.
+                logger.info("Skipping block production slot: %s", e)
+            except HeightAlreadySignedError as e:
+                # The persistent same-height guard refused a re-sign.
+                # If this fires it's the guard working as designed
+                # (crash-restart at the same height) — log at WARNING,
+                # not ERROR.  An ERROR-level log here historically
+                # produced misleading "block production failed"
+                # alarms for what is in fact the correct behavior.
+                logger.warning("Same-height sign guard refused: %s", e)
             except Exception:
                 logger.exception("Block production iteration failed")
 

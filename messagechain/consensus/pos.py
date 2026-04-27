@@ -29,6 +29,131 @@ def _hash(data: bytes) -> bytes:
     return default_hash(data)
 
 
+class ProposerSkipSlotError(RuntimeError):
+    """Raised by ``create_block`` when the candidate block would fail
+    the validator-side rejection rules that depend solely on
+    (header, prev_block, wall-clock now).
+
+    Distinct from ``HeightAlreadySignedError``: this is raised BEFORE
+    the height-guard floor is reserved, so the floor is unaffected and
+    the proposer may legitimately retry at the same height in a future
+    slot.  Catching this in the block-production loop and skipping the
+    slot is the correct response.
+
+    The bug this prevents: pre-fix, ``record_block_sign`` ran before
+    these checks, so a candidate that would be rejected downstream
+    (e.g. round_number > MAX_PROPOSER_FALLBACK_ROUNDS on a long-stalled
+    chain) still permanently advanced the height-guard floor.  After
+    that, every legitimate retry at the same height was refused as
+    "already signed at height N" — the chain wedged with no recovery
+    path short of manual floor surgery.
+
+    See ``_local_pre_sign_validation`` for the rule list, and
+    ``tests/test_proposer_floor_not_poisoned_on_local_rejection.py``
+    for the regression coverage.
+    """
+
+
+def _local_pre_sign_validation(
+    header,
+    prev_block,
+    *,
+    now: float | None = None,
+    median_time_past: float | None = None,
+) -> str | None:
+    """Mirror the (header, prev_block, wall-clock)-only rejection rules
+    from ``Blockchain.validate_block``.
+
+    Returns ``None`` if the candidate block would NOT be rejected by
+    any of these rules; returns a short error string explaining the
+    rejection otherwise.
+
+    The rules covered are exactly those that depend solely on the
+    candidate header, the parent block, and the proposer's wall-clock
+    time — not on full state-machine application, signature
+    verification, mempool content, or anything else heavy.  They are
+    the only rules that can fire AFTER the proposer has built the
+    block but BEFORE any validator-side state work is done, which makes
+    them the rules that risk poisoning the height-guard floor on
+    rejection (the floor is reserved inside ``create_block`` itself).
+
+    Mirroring authoritative checks like this is a deliberate
+    duplication.  The contract is: the validator-side check is the
+    one consensus runs against; the pre-sign check is a defensive
+    pre-flight that prevents floor poisoning on our own rejected
+    blocks.  If the two ever drift, the worst case is a block we
+    pre-accepted gets rejected by the network (small liveness loss,
+    no equivocation, no floor poisoning — because the floor is now
+    only reserved if BOTH the pre-sign check AND the eventual
+    validator-side check accept the timestamp; see ``create_block``).
+    Drift in the other direction (pre-sign accepts what the network
+    would reject) is the historical bug we're fixing.
+
+    Coverage as of this fix:
+      * timestamp-too-early (``ts_gap < BLOCK_TIME_TARGET``)
+      * round-cap (``round_number > MAX_PROPOSER_FALLBACK_ROUNDS``)
+      * future-drift (``timestamp > now + MAX_BLOCK_FUTURE_DRIFT``)
+      * MTP, when ``median_time_past`` is supplied by the caller
+
+    Other validate_block rules — state-root match, signature
+    verification, fee/byte-budget, etc. — are NOT mirrored here
+    because they don't fire on (header, prev, now) alone.  If a
+    future rule does, add it here too.
+    """
+    # The whole pre-sign check is gated on ``ENFORCE_SLOT_TIMING``.
+    # The test conftest pins this to False to let unit tests assemble
+    # synthetic block sequences (back-to-back same-second blocks for
+    # MTP coverage, far-future timestamps for VRF lookahead coverage,
+    # etc.) without slot-timing constraints.  Production keeps it
+    # True so all four rules fire and the height-guard floor is
+    # never advanced for a block the validator-side would reject.
+    #
+    # Pre-sign being slightly weaker than validator-side in test mode
+    # is safe by design: the floor-poisoning concern only matters
+    # when a height-guard is attached and a real signature is
+    # produced, which is the production wiring path.  Tests that
+    # exercise the floor-poisoning property explicitly toggle
+    # ENFORCE_SLOT_TIMING=True in their setUp/tearDown — see
+    # tests/test_proposer_floor_not_poisoned_on_local_rejection.py.
+    import messagechain.config as _cfg
+    if not getattr(_cfg, "ENFORCE_SLOT_TIMING", True):
+        return None
+
+    from messagechain.config import (
+        BLOCK_TIME_TARGET,
+        MAX_PROPOSER_FALLBACK_ROUNDS,
+        MAX_BLOCK_FUTURE_DRIFT,
+    )
+
+    if now is None:
+        now = time.time()
+
+    ts_gap = header.timestamp - prev_block.header.timestamp
+    if ts_gap < BLOCK_TIME_TARGET:
+        return (
+            f"timestamp too early: gap {ts_gap:.0f}s < "
+            f"BLOCK_TIME_TARGET {BLOCK_TIME_TARGET}s"
+        )
+    round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
+    if round_number > MAX_PROPOSER_FALLBACK_ROUNDS:
+        return (
+            f"proposer round {round_number} exceeds cap "
+            f"{MAX_PROPOSER_FALLBACK_ROUNDS} — would be rejected by "
+            f"validate_block as timestamp-skew slot hijacking"
+        )
+    if header.timestamp > now + MAX_BLOCK_FUTURE_DRIFT:
+        return (
+            f"timestamp {header.timestamp} > now + "
+            f"MAX_BLOCK_FUTURE_DRIFT ({MAX_BLOCK_FUTURE_DRIFT}s)"
+        )
+    if median_time_past is not None and header.timestamp <= median_time_past:
+        return (
+            f"timestamp {header.timestamp} <= median_time_past "
+            f"{median_time_past}"
+        )
+    return None
+
+
 class ProofOfStake:
     """Stake-weighted block proposer selection and validation."""
 
@@ -416,6 +541,40 @@ class ProofOfStake:
                     sig = getattr(tx, "signature", None)
                     if sig is not None and hasattr(sig, "leaf_index"):
                         proposer_entity.keypair.advance_to_leaf(sig.leaf_index + 1)
+
+        # Pre-sign local validation.  Mirror the validator-side
+        # rejection rules that depend solely on (header, prev_block,
+        # wall-clock now), so a candidate that the network would
+        # reject is caught HERE — before the height-guard reservation
+        # below — and never poisons the floor.
+        #
+        # Why this is load-bearing: the height-guard floor is durable
+        # by design (a crash-restart must refuse to re-sign at any
+        # height where a prior signature could have escaped the
+        # process).  Pre-fix, ``record_block_sign`` ran before
+        # ``add_block``'s validation, so a candidate rejected
+        # downstream (round-cap, future-drift, etc.) advanced the
+        # floor anyway — every legitimate retry at the same height
+        # was then refused as "already signed", with no recovery short
+        # of manual floor surgery.  Running these checks pre-sign
+        # closes that path: the floor only ratchets when the block
+        # would actually pass network validation, while the
+        # crash-restart equivocation guarantee is preserved (the
+        # floor still ratchets BEFORE the signing call below).
+        # MTP is handled by the outer ``Blockchain.propose_block`` (it
+        # computes the timestamp as ``max(now, mtp + epsilon)``) so by
+        # the time we land here the MTP rule is already satisfied for
+        # the production path.  Tests that invoke ``create_block``
+        # directly with an explicit ``timestamp`` are expected to know
+        # what they're doing; we don't have chain access here to
+        # second-guess them.
+        local_err = _local_pre_sign_validation(header, prev_block)
+        if local_err is not None:
+            raise ProposerSkipSlotError(
+                f"create_block at height {new_block_number} rejected "
+                f"pre-sign: {local_err}; skipping slot without advancing "
+                f"the height-guard floor"
+            )
 
         # Tier 23 same-height sign guard.  If the proposer entity has a
         # ``height_sign_guard`` attached (production validators wire one
