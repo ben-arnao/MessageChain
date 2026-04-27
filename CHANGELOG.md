@@ -4,6 +4,106 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.0] — 2026-04-27
+
+Minor release.  **Hard fork: Tier 25 — optional `community_id` on
+`MessageTransaction`** (activates at `COMMUNITY_ID_HEIGHT = 6_000`).
+Plus the root-cause fix for the chain-stall vector the 1.27.1 hotfix
+unstuck, durability fixes for Tier 23/24 slash state, the
+witness-auto-separation sweep wiring fix that completes the 1.27.0
+default-on flip, a wallet-backup CLI surface, and a test-infra fix
+for the leaf-cursor flake under xdist load.
+
+### Added (consensus, gated by activation height)
+
+- **Tier 25 — optional `community_id` on `MessageTransaction`**
+  (306728d).  At `COMMUNITY_ID_HEIGHT=6000` an optional `community_id`
+  field on the message wire format unlocks app-layer community
+  tagging without changing the chain's permanence properties or the
+  fee market.  Activation is `+1000` blocks above Tier 24 — disjoint
+  from the slashing-curve subsystem so the only spacing constraint
+  is the operator upgrade window.
+
+### Security / correctness (active immediately, no fork gate)
+
+- **Pre-sign local validation in `ProofOfStake.create_block`**
+  (fce9148).  Root-cause fix for the live chain-stall incident at
+  height 671 the 1.27.1 hotfix unstuck.  Pre-fix, the height-guard
+  floor was reserved BEFORE local validation ran; when the network's
+  downstream `validate_block` rejected a constructed block (round-
+  cap, future-drift, MTP, timestamp-too-early), the floor was already
+  durably advanced and every legitimate retry at the same height was
+  refused as `HeightAlreadySignedError`.  Fix: a new
+  `_local_pre_sign_validation` helper mirrors the
+  (header, prev_block, wall-clock now)-only rejection rules from
+  `validate_block`; if any reject, `create_block` raises a new
+  `ProposerSkipSlotError` BEFORE the floor reservation.  Crash-restart
+  equivocation guarantee preserved (the floor still ratchets BEFORE
+  signing).  The pre-sign helper is gated on `ENFORCE_SLOT_TIMING` so
+  the test-suite's synthetic-block-construction patterns keep working
+  unchanged.  Same wedge cannot recur regardless of cap value.
+
+- **`slash_offense_counts` persistence** (01f5dff).  The Tier 23/24
+  honesty-curve and amnesty rules read `slash_offense_counts[entity]`
+  to compute per-offense severity.  Pre-fix the counter lived only
+  in memory: a validator restart, snapshot reload, or reorg reset
+  every entity's count to 0, effectively granting amnesty on every
+  bounce — defeating the "single-shot amnesty" anchor (one free
+  AMBIGUOUS-evidence pass, then standard small severity).  Now
+  durably persisted alongside other state in chaindb, restored on
+  load, snapshotted with state-root commitments, and rolled forward/
+  back in the same atomic transaction as the surrounding state on
+  reorg.
+
+### Operational
+
+- **Witness auto-separation sweep wiring** (143208f).  The 1.27.0
+  fork flipped `WITNESS_AUTO_SEPARATION_ENABLED` to True at
+  `WITNESS_AUTO_SEPARATION_HEIGHT=3000`, but the sweep helper was
+  never called by the finality advance path — so finalized blocks
+  past `WITNESS_RETENTION_BLOCKS` had their inline WOTS+ signatures
+  retained anyway.  This fix wires the sweep into every successful
+  finality advance, materializing the storage savings the 1.27.0
+  fork was supposed to deliver.
+
+- **Block-production loop log levels** (fce9148).
+  `ProposerSkipSlotError` (a working-as-designed slot skip) now
+  logs at INFO; `HeightAlreadySignedError` (the same-height guard
+  firing on crash-restart) now logs at WARNING.  Pre-fix both
+  surfaced as `Block production iteration failed` ERROR alarms
+  despite being the correct behavior.
+
+### Wallet UX
+
+- **`messagechain backup-wallet` CLI** (8d627cb).  New command and
+  README guidance for capturing a portable wallet backup
+  (private-key seed + chain-state-derived parameters) so an operator
+  can restore the same WOTS+ identity on a new host without losing
+  leaf-watermark continuity.  Operator-only feature; no consensus
+  impact.
+
+### Test infrastructure
+
+- **`tests/conftest`: wipe `~/.messagechain/leaves/` per test**
+  (2325f4f).  The 1.27.0 cross-process leaf-cursor lock made the
+  CLI tests share an on-disk cursor across xdist workers; with
+  `tree_height=4` (16 leaves) under the test conftest, parallel
+  signing tests could exhaust the cursor and a later test's
+  `load_leaf_index` would raise `ValueError: Corrupted leaf index
+  file: next_leaf >= num_leaves`.  Wiping the per-test leaf-cursor
+  directory in the fixture eliminates the shared-state interaction
+  without weakening the production lock semantics.
+
+### Operator notes
+
+- Validators must upgrade to 1.28.0 within the runway window
+  (current tip → 6000) to follow the Tier 25 fork.  Pre-1.28.0
+  nodes will reject post-fork messages that carry a `community_id`
+  field.
+- The pre-sign-validation, slash-counter-persistence, and witness-
+  sweep-wiring fixes are active immediately on upgrade.  Roll
+  validators with `messagechain upgrade --yes`.
+
 ## [1.27.1] — 2026-04-27
 
 Hotfix.  Raises `MAX_PROPOSER_FALLBACK_ROUNDS` from 5 → 100.
