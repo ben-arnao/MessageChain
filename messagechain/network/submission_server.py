@@ -198,19 +198,46 @@ def _should_request_rejection(ctx, client_ip: str, header_set: bool) -> bool:
 
 
 def submit_transaction_to_mempool(
-    tx: MessageTransaction,
+    tx,
     blockchain,
     mempool,
     receipt_issuer: Optional[ReceiptIssuer] = None,
     request_rejection: bool = False,
     witnessed_request_hash: Optional[bytes] = None,
     ack_allowed: bool = True,
+    *,
+    pending_nonce: Optional[int] = None,
 ) -> SubmissionResult:
     """Validate `tx` against chain state and inject into `mempool`.
 
     Mirrors the Server._rpc_submit_transaction ingress path so
     forced-inclusion arrival tracking stays consistent across ingress
     points (local RPC, P2P gossip, public HTTPS submission).
+
+    Dispatches on `tx.__class__` so the SAME censorship-evidence
+    pipeline (signed receipt on admission, signed rejection on opt-in
+    failure) covers every tx type the chain accepts:
+
+      * MessageTransaction  -> validate_transaction + mempool.add_transaction
+      * TransferTransaction -> validate_transfer_transaction + mempool.add_transaction
+      * ReactTransaction    -> verify_react_transaction (+ chain target/voter
+                               existence) + mempool.add_react_transaction
+
+    Pre-fix only the message path consulted receipt_issuer; the RPC
+    submit_transfer / submit_react handlers inlined their own
+    validate+add and never returned a receipt.  CLAUDE.md anchors
+    transfer as a "first-class, fully supported tx type" held to
+    "mainstream-asset quality bars" — silently-droppable transfers
+    fail that bar.  Reactions (Tier 17 trust score) are the same shape
+    of censorship target.
+
+    `pending_nonce` (optional): if provided, overrides the default
+    mempool.get_pending_nonce lookup.  Used by RPC handlers that
+    compute an all-pools nonce (message + transfer + stake + unstake +
+    governance + react) so consecutive submissions of mixed tx kinds
+    from the same entity work.  When None, defaults to the
+    mempool-only view, preserving the message-path behavior shipped in
+    1.28.4.
 
     `receipt_issuer` (optional): if provided, a SubmissionReceipt is
     issued on fresh admission and returned via result.receipt_hex.
@@ -234,6 +261,31 @@ def submit_transaction_to_mempool(
     via BogusRejectionEvidenceTx — closes the receipt-less censorship
     gap where a coerced validator answers honest submissions with a lie.
     """
+    # Dispatch by tx class.  Keep the MessageTransaction path inline
+    # below for byte-for-byte parity with 1.28.4; delegate Transfer
+    # and React to dedicated helpers in this module so the parallel
+    # paths stay simple to audit side-by-side.
+    from messagechain.core.transfer import TransferTransaction
+    from messagechain.core.reaction import ReactTransaction
+    if isinstance(tx, TransferTransaction):
+        return _submit_transfer_to_mempool(
+            tx, blockchain, mempool,
+            receipt_issuer=receipt_issuer,
+            request_rejection=request_rejection,
+            witnessed_request_hash=witnessed_request_hash,
+            ack_allowed=ack_allowed,
+            pending_nonce=pending_nonce,
+        )
+    if isinstance(tx, ReactTransaction):
+        return _submit_react_to_mempool(
+            tx, blockchain, mempool,
+            receipt_issuer=receipt_issuer,
+            request_rejection=request_rejection,
+            witnessed_request_hash=witnessed_request_hash,
+            ack_allowed=ack_allowed,
+            pending_nonce=pending_nonce,
+        )
+    # Fall through to the MessageTransaction path.
     # Helper — issue a SubmissionAck iff the caller passed a
     # witnessed_request_hash AND the server has a ReceiptIssuer
     # AND the caller-side per-IP / observation-store gate has not
@@ -370,6 +422,376 @@ def submit_transaction_to_mempool(
     return SubmissionResult(
         ok=True, tx_hash=tx.tx_hash, receipt_hex=receipt_hex,
         ack_hex=_maybe_issue_ack(ACK_ADMITTED),
+    )
+
+
+def _maybe_issue_receipt_for(
+    receipt_issuer: Optional[ReceiptIssuer], tx_hash: bytes,
+) -> str:
+    """Best-effort receipt issuance.  Empty string if no issuer or
+    the issuer raises (a broken issuer must NOT block submission
+    success — the tx is already in the mempool, so the safe answer
+    is "admitted, no receipt").
+    """
+    if receipt_issuer is None:
+        return ""
+    try:
+        receipt = receipt_issuer.issue(tx_hash)
+        return receipt.to_bytes().hex()
+    except Exception:
+        logger.exception("receipt issuance failed")
+        return ""
+
+
+def _maybe_issue_rejection_for(
+    receipt_issuer: Optional[ReceiptIssuer],
+    tx_hash: bytes,
+    code: int,
+    request_rejection: bool,
+    context: str,
+) -> str:
+    """Best-effort signed-rejection issuance for any tx type."""
+    if not request_rejection or receipt_issuer is None:
+        return ""
+    try:
+        rej = receipt_issuer.issue_rejection(tx_hash, code)
+        return rej.to_bytes().hex()
+    except Exception:
+        logger.exception("rejection issuance failed for %s", context)
+        return ""
+
+
+def _maybe_issue_ack_for(
+    receipt_issuer: Optional[ReceiptIssuer],
+    witnessed_request_hash: Optional[bytes],
+    ack_allowed: bool,
+    action_code_int: int,
+) -> str:
+    """Best-effort SubmissionAck issuance for any tx type.
+
+    Mirrors the message-path's inner _maybe_issue_ack helper exactly:
+    same gate semantics (ack_allowed + issuer present + 32-byte hash),
+    same broad-except, same return shape (hex or empty string).
+    """
+    if not ack_allowed:
+        return ""
+    if witnessed_request_hash is None or receipt_issuer is None:
+        return ""
+    if len(witnessed_request_hash) != 32:
+        return ""
+    try:
+        ack = receipt_issuer.issue_ack(
+            witnessed_request_hash, action_code_int,
+        )
+        return ack.to_bytes().hex()
+    except Exception:
+        logger.exception("ack issuance failed")
+        return ""
+
+
+def _submit_transfer_to_mempool(
+    tx,
+    blockchain,
+    mempool,
+    receipt_issuer: Optional[ReceiptIssuer] = None,
+    request_rejection: bool = False,
+    witnessed_request_hash: Optional[bytes] = None,
+    ack_allowed: bool = True,
+    pending_nonce: Optional[int] = None,
+) -> SubmissionResult:
+    """Validate-and-admit path for TransferTransaction.
+
+    Mirrors the MessageTransaction path's shape (idempotency check ->
+    validate -> add -> issue receipt) but uses
+    `validate_transfer_transaction` for validation.  Transfers share
+    `mempool.pending` with messages so the same `add_transaction` and
+    `pending` containment check apply.
+
+    `pending_nonce` (optional): when provided, overrides the default
+    mempool-only nonce lookup.  RPC callers thread the all-pools
+    nonce through here so a user's interleaved transfer / message /
+    stake submissions all see sequential nonces.
+    """
+    from messagechain.consensus.witness_submission import (
+        ACK_ADMITTED, ACK_REJECTED,
+    )
+
+    # Idempotency: a transfer already in pending is a success retry.
+    if tx.tx_hash in mempool.pending:
+        return SubmissionResult(
+            ok=True, tx_hash=tx.tx_hash, duplicate=True,
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_ADMITTED,
+            ),
+        )
+
+    on_chain_nonce = blockchain.nonces.get(tx.entity_id, 0)
+    if pending_nonce is None:
+        effective_nonce = mempool.get_pending_nonce(
+            tx.entity_id, on_chain_nonce,
+        )
+    else:
+        effective_nonce = pending_nonce
+    valid, reason = blockchain.validate_transfer_transaction(
+        tx, expected_nonce=effective_nonce,
+    )
+    if not valid:
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    added = mempool.add_transaction(
+        tx, arrival_block_height=blockchain.height,
+    )
+    if not added:
+        if tx.tx_hash in mempool.pending:
+            return SubmissionResult(
+                ok=True, tx_hash=tx.tx_hash, duplicate=True,
+                ack_hex=_maybe_issue_ack_for(
+                    receipt_issuer, witnessed_request_hash,
+                    ack_allowed, ACK_ADMITTED,
+                ),
+            )
+        mempool_reason = "Mempool rejected transfer (rate / fee / cap)"
+        return SubmissionResult(
+            ok=False, error=mempool_reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_mempool_reason(mempool_reason),
+                request_rejection, mempool_reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    return SubmissionResult(
+        ok=True, tx_hash=tx.tx_hash,
+        receipt_hex=_maybe_issue_receipt_for(receipt_issuer, tx.tx_hash),
+        ack_hex=_maybe_issue_ack_for(
+            receipt_issuer, witnessed_request_hash,
+            ack_allowed, ACK_ADMITTED,
+        ),
+    )
+
+
+def _submit_react_to_mempool(
+    tx,
+    blockchain,
+    mempool,
+    receipt_issuer: Optional[ReceiptIssuer] = None,
+    request_rejection: bool = False,
+    witnessed_request_hash: Optional[bytes] = None,
+    ack_allowed: bool = True,
+    pending_nonce: Optional[int] = None,
+) -> SubmissionResult:
+    """Validate-and-admit path for ReactTransaction (Tier 17).
+
+    React votes use a separate `mempool.react_pool` and a custom
+    validation pipeline (`verify_react_transaction` + chain-side
+    target/voter existence + nonce + leaf-watermark gates).  Same
+    receipt-issuance / signed-rejection / ack semantics as the other
+    paths so a coerced validator dropping DOWN votes on a target it
+    favors leaves on-chain accountability.
+    """
+    from messagechain.consensus.witness_submission import (
+        ACK_ADMITTED, ACK_REJECTED,
+    )
+    from messagechain.core.reaction import (
+        verify_react_transaction, REACT_TX_HEIGHT,
+    )
+
+    # Idempotency: a react already in the react pool is a success
+    # retry.  No new receipt issued (mirrors the message-path policy
+    # — re-issuing would burn a fresh subtree leaf per retry).
+    if tx.tx_hash in mempool.react_pool:
+        return SubmissionResult(
+            ok=True, tx_hash=tx.tx_hash, duplicate=True,
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_ADMITTED,
+            ),
+        )
+
+    next_height = blockchain.height + 1
+
+    # Activation gate.
+    if next_height < REACT_TX_HEIGHT:
+        reason = (
+            f"ReactTransaction submissions are not yet active — "
+            f"REACT_TX_HEIGHT={REACT_TX_HEIGHT}, current height "
+            f"{blockchain.height}"
+        )
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    # Voter must be a registered entity (we need their pubkey to
+    # verify the signature; an unknown signer cannot be slashed for
+    # REJECT_INVALID_SIG either).
+    voter_pk = blockchain.public_keys.get(tx.voter_id)
+    if voter_pk is None:
+        reason = "voter is not a registered entity"
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    if not verify_react_transaction(
+        tx, voter_pk, current_height=next_height,
+    ):
+        reason = (
+            "react tx signature/fee/canon-form/activation/"
+            "self-trust check failed"
+        )
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    # Target existence — same rule the block-validate path enforces.
+    if tx.target_is_user:
+        if tx.target not in blockchain.public_keys:
+            reason = "user-trust target is not a registered entity"
+            return SubmissionResult(
+                ok=False, error=reason,
+                rejection_hex=_maybe_issue_rejection_for(
+                    receipt_issuer, tx.tx_hash,
+                    _rejection_code_for_validate_reason(reason),
+                    request_rejection, reason,
+                ),
+                ack_hex=_maybe_issue_ack_for(
+                    receipt_issuer, witnessed_request_hash,
+                    ack_allowed, ACK_REJECTED,
+                ),
+            )
+    else:
+        if (
+            blockchain.db is None
+            or blockchain.db.get_tx_location(tx.target) is None
+        ):
+            reason = "message-react target tx_hash not found in chain"
+            return SubmissionResult(
+                ok=False, error=reason,
+                rejection_hex=_maybe_issue_rejection_for(
+                    receipt_issuer, tx.tx_hash,
+                    _rejection_code_for_validate_reason(reason),
+                    request_rejection, reason,
+                ),
+                ack_hex=_maybe_issue_ack_for(
+                    receipt_issuer, witnessed_request_hash,
+                    ack_allowed, ACK_REJECTED,
+                ),
+            )
+
+    # Nonce — caller threads the all-pools nonce through here so a
+    # voter's interleaved transfer / message / react submissions all
+    # see sequential nonces.  When None, we fall back to the
+    # on-chain nonce; the RPC handler is the source of truth for the
+    # cross-pool view (this helper has no access to per-server
+    # pending stake/governance pools).
+    on_chain_nonce = blockchain.nonces.get(tx.voter_id, 0)
+    if pending_nonce is not None:
+        effective_nonce = pending_nonce
+    else:
+        effective_nonce = on_chain_nonce
+    if tx.nonce != effective_nonce:
+        reason = (
+            f"Invalid nonce: expected {effective_nonce}, "
+            f"got {tx.nonce}"
+        )
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    # Per-entity hot-key watermark gate — mirrors the chain-level
+    # check in _validate_react_tx_in_block.
+    voter_watermark = blockchain.leaf_watermarks.get(tx.voter_id, 0)
+    if tx.signature.leaf_index < voter_watermark:
+        reason = (
+            f"WOTS+ leaf {tx.signature.leaf_index} already consumed "
+            f"(watermark {voter_watermark}) -- leaf reuse rejected"
+        )
+        return SubmissionResult(
+            ok=False, error=reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_validate_reason(reason),
+                request_rejection, reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    if not mempool.add_react_transaction(tx):
+        mempool_reason = "react pool full or duplicate"
+        return SubmissionResult(
+            ok=False, error=mempool_reason,
+            rejection_hex=_maybe_issue_rejection_for(
+                receipt_issuer, tx.tx_hash,
+                _rejection_code_for_mempool_reason(mempool_reason),
+                request_rejection, mempool_reason,
+            ),
+            ack_hex=_maybe_issue_ack_for(
+                receipt_issuer, witnessed_request_hash,
+                ack_allowed, ACK_REJECTED,
+            ),
+        )
+
+    return SubmissionResult(
+        ok=True, tx_hash=tx.tx_hash,
+        receipt_hex=_maybe_issue_receipt_for(receipt_issuer, tx.tx_hash),
+        ack_hex=_maybe_issue_ack_for(
+            receipt_issuer, witnessed_request_hash,
+            ack_allowed, ACK_ADMITTED,
+        ),
     )
 
 
