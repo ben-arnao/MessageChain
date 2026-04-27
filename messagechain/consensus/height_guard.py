@@ -135,6 +135,23 @@ class HeightSignGuard:
         self.last_block_signed: int = -1
         self.last_attestation_signed: int = -1
         self.last_finality_signed: int = -1
+        # Per-role pending reservations.  Each entry is
+        # ``(prior_floor, reserved_height)`` for the most recent
+        # ``record_<role>_sign(height)`` call that hasn't yet been
+        # rolled back (or implicitly committed by another reservation).
+        # Tracked in memory only — on process restart, all entries
+        # reset to None and the on-disk floor is treated as durable
+        # (no backward movement on restart, ever).  Consumed by
+        # ``rollback_<role>_sign`` to undo a reservation when the
+        # candidate block was rejected post-sign (state-root mismatch,
+        # downstream validate_block rejection, in-create_block
+        # exception path) — without rollback, every such rejection
+        # permanently advances the floor and the chain wedges.
+        self._pending: dict[str, tuple[int, int] | None] = {
+            _KEY_BLOCK: None,
+            _KEY_ATTEST: None,
+            _KEY_FINALITY: None,
+        }
 
     @classmethod
     def load_or_create(cls, path: str) -> "HeightSignGuard":
@@ -226,6 +243,14 @@ class HeightSignGuard:
         failure), the in-memory counter is restored — exactly the
         same shape as ``KeyPair.sign``'s persist-before-sign rollback
         path.
+
+        Records ``(prior, height)`` in ``self._pending[role_attr]``
+        so a subsequent ``rollback_<role>_sign(height)`` can undo
+        this reservation if the candidate block is rejected after
+        the floor was advanced (state-root mismatch, byte-budget
+        overflow, in-create_block exception, etc.).  Without
+        rollback those rejections permanently poison the floor and
+        the chain wedges with no recovery short of manual surgery.
         """
         prior = getattr(self, role_attr)
         if height <= prior:
@@ -241,6 +266,78 @@ class HeightSignGuard:
         except Exception:
             setattr(self, role_attr, prior)
             raise
+        # Persist succeeded — record the pending reservation so it
+        # can be rolled back if the caller signals rejection.
+        self._pending[role_attr] = (prior, int(height))
+
+    def _rollback(self, role_attr: str, height: int) -> bool:
+        """Undo a recently-recorded ``_reserve(role_attr, height)``.
+
+        Returns True if a rollback was performed, False if no matching
+        pending reservation exists.
+
+        Safety preconditions for the rollback to proceed:
+
+          1. ``self._pending[role_attr]`` matches ``(_, height)`` —
+             a prior in-memory ``_reserve`` set up the rollback path
+             for exactly this height.
+          2. The on-disk floor is still ``height`` — nobody has since
+             advanced past it via another ``_reserve`` call (which
+             would invalidate the in-memory pending state).
+
+        If either fails, this is a no-op and returns False.  The
+        floor is left where it is — the caller should treat the
+        no-op as "not safe to roll back, move on."
+
+        The rollback IS durable: the prior floor is persisted to
+        disk before this method returns.  If the persist fails the
+        in-memory floor is restored to ``height`` and
+        ``HeightGuardPersistError`` is raised — better to leave the
+        floor poisoned than have on-disk and in-memory state
+        disagree about whether a sign at ``height`` is permitted.
+
+        Crash-window analysis (vs. the safe-failure-mode anchor):
+
+          * Crash between ``_reserve`` and ``_rollback`` — the
+            on-disk floor stays at ``height``.  On restart the
+            ``_pending`` dict is empty (in-memory only); a re-sign
+            at ``height`` is refused.  Liveness loss for one block
+            at this height; NO equivocation (the prior signature,
+            if any, was either never produced or never escaped the
+            killed process).
+
+          * Crash inside ``_persist`` of the rollback — the call
+            re-raises and the in-memory floor is restored to
+            ``height``.  On-disk state may be at ``prior`` (write
+            partially landed) or ``height`` (write didn't land).
+            Either way the next ``_reserve`` sees the in-memory
+            ``height`` floor and refuses any re-sign at or below
+            it.  Same outcome as above: liveness loss, no
+            equivocation.
+        """
+        pending = self._pending.get(role_attr)
+        if pending is None:
+            return False
+        prior, recorded = pending
+        if recorded != int(height):
+            return False
+        if getattr(self, role_attr) != recorded:
+            # Someone else moved the floor; in-memory pending is stale.
+            self._pending[role_attr] = None
+            return False
+        setattr(self, role_attr, prior)
+        try:
+            self._persist()
+        except Exception:
+            # On-disk state may now disagree with in-memory.  Restore
+            # in-memory to the higher floor and re-raise; the caller
+            # learns durability failed and can decide how loudly to
+            # surface it.  Better a poisoned floor than a silent
+            # split between memory and disk on a guard.
+            setattr(self, role_attr, recorded)
+            raise
+        self._pending[role_attr] = None
+        return True
 
     def record_block_sign(self, height: int) -> None:
         """Reserve the proposer-signing slot at ``height``.
@@ -252,8 +349,28 @@ class HeightSignGuard:
         NOT sign — the on-disk state shows another signature was
         already produced at this height in a previous run of this
         process.
+
+        If the candidate block ends up REJECTED after this returns
+        (downstream ``add_block`` rejection on state-root mismatch,
+        byte-budget overflow, post-sign exception, etc.), call
+        ``rollback_block_sign(height)`` BEFORE the next propose
+        attempt — without rollback the floor stays poisoned and
+        every subsequent legitimate proposal at this height fails
+        with ``HeightAlreadySignedError``.
         """
         self._reserve("last_block_signed", int(height))
+
+    def rollback_block_sign(self, height: int) -> bool:
+        """Undo a ``record_block_sign(height)`` reservation.
+
+        See ``_rollback`` for the safety contract and crash-window
+        analysis.  Use when the candidate block was REJECTED after
+        the floor was reserved (state-root mismatch, byte-budget
+        overflow, in-create_block exception, downstream
+        ``add_block`` rejection) — without rollback the floor stays
+        poisoned permanently.
+        """
+        return self._rollback("last_block_signed", int(height))
 
     def record_attestation_sign(self, height: int) -> None:
         """Reserve the attestation-signing slot at ``height``.
@@ -262,6 +379,10 @@ class HeightSignGuard:
         a validator can both propose and attest at the same height.
         """
         self._reserve("last_attestation_signed", int(height))
+
+    def rollback_attestation_sign(self, height: int) -> bool:
+        """Undo a ``record_attestation_sign(height)`` reservation."""
+        return self._rollback("last_attestation_signed", int(height))
 
     def record_finality_sign(self, height: int) -> None:
         """Reserve the finality-vote-signing slot at ``height``.
@@ -272,6 +393,10 @@ class HeightSignGuard:
         floors.
         """
         self._reserve("last_finality_signed", int(height))
+
+    def rollback_finality_sign(self, height: int) -> bool:
+        """Undo a ``record_finality_sign(height)`` reservation."""
+        return self._rollback("last_finality_signed", int(height))
 
     # ── introspection (used by tests + operator CLI) ────────────────
 
