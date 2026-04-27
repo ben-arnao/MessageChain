@@ -387,6 +387,97 @@ class Node(SharedRuntimeMixin):
                 logger.debug(f"Outbound maintenance tick failed: {e}")
             await asyncio.sleep(OUTBOUND_MAINTAIN_INTERVAL)
 
+    def _minority_fork_likely(self) -> bool:
+        """Detect whether we're likely on a minority/unintentional fork.
+
+        Heuristic: count peers reporting ``chain_height >= our_height``
+        AND ``cumulative_weight > our_weight``.  If a majority (>50%)
+        of those at-or-above peers report HEAVIER chains AT our same
+        height, our tip is probably the worse fork.
+
+        Conservative thresholds:
+          * Requires ≥ 2 corroborating peers (a single disagreeing
+            peer never triggers sync — could be a buggy or malicious
+            outlier).
+          * Strict-majority test (count > total // 2 + 1).  At small
+            peer counts (typical mainnet today) this means 2-of-3,
+            3-of-4, etc. — never a tied vote.
+
+        The CLAUDE.md anchor: "a node that ends up on a minority/
+        unintentional fork must auto-resync to the canonical chain
+        with no manual state surgery on the operator side."  This
+        method is the detection half of that contract; the syncer
+        + ForkChoice already handle the recovery half once
+        ``start_sync`` is invoked.
+
+        Pure read of ``self.syncer.peer_heights``; no network IO.
+        Safe to call from any handler.
+        """
+        our_height = self.blockchain.height
+        our_weight = self._current_cumulative_weight()
+        # Inspect the syncer's peer-tip cache (populated by
+        # update_peer_height on each handshake / weight echo).
+        candidates = [
+            info for info in self.syncer.peer_heights.values()
+            if info.chain_height >= our_height
+        ]
+        if len(candidates) < 2:
+            # Too few peers at-or-above us to corroborate; refuse to
+            # trigger sync on a single peer's word.
+            return False
+        heavier = sum(
+            1 for info in candidates
+            if info.cumulative_weight > our_weight
+        )
+        # Strict majority: more than half of the at-or-above set
+        # report a heavier chain.
+        return heavier > len(candidates) // 2
+
+    def _after_block_added(self, block) -> None:
+        """Operator-runtime hooks fired after a block is accepted by add_block.
+
+        Currently dispatches to ``runtime.notify.process_block_for_
+        notifications`` so any newly-open governance proposal in this
+        block triggers an email to the configured operator address.
+        Idempotent: ``NotifyState`` records which proposal_ids were
+        emailed-for so a re-fire on reorg replay is a no-op.
+
+        ALL exceptions are swallowed and logged.  This hook is on the
+        block-accept hot path — it MUST never raise into add_block's
+        caller, and it MUST never affect chain state (the notify
+        module's design assertion).  CLAUDE.md anchor: "operators
+        should be notified when an active proposal is open — they
+        shouldn't have to be polling the chain."  Pre-this-change the
+        notify hook was DEFINED but never CALLED; this wires it.
+
+        Lazy import of ``runtime.notify`` keeps the consensus path
+        independent: a stripped-down Node built without runtime
+        dependencies still imports cleanly.
+        """
+        try:
+            from messagechain.runtime import notify
+            from messagechain.runtime.onboarding import read_onboard_config
+            cfg = read_onboard_config()
+            # Quick exit if email isn't enabled — avoids the
+            # list_proposals call entirely on the hot path.  notify's
+            # internal short-circuit would handle this too, but bailing
+            # here saves the governance read on every block.
+            if not cfg.get(notify.NOTIFY_EMAIL_ENABLED, False):
+                return
+            notify.process_block_for_notifications(
+                current_height=self.blockchain.height,
+                list_proposals=lambda: self.blockchain.governance.list_proposals(
+                    current_block=self.blockchain.height,
+                ),
+                config=cfg,
+                state_path=notify.default_state_path(self.data_dir),
+            )
+        except Exception as e:
+            # Catch-all defends against ANY downstream failure leaking
+            # into the consensus path.  Log at debug so a misconfigured
+            # SMTP / missing onboard.toml doesn't spam the journal.
+            logger.debug(f"post-block notify hook failed: {e}")
+
     # _next_connection_type, _track_seen_tx, _get_peer_writer now live
     # on SharedRuntimeMixin.
 
@@ -922,12 +1013,34 @@ class Node(SharedRuntimeMixin):
                 cumulative_weight=peer_weight,
             )
 
-            # If peer is ahead, initiate sync
-            if peer_height > self.blockchain.height and not self.syncer.is_syncing:
-                t = asyncio.create_task(self.syncer.start_sync())
-                t.add_done_callback(
-                    lambda x: self._handle_task_exception("syncer.start_sync", x)
-                )
+            # If peer is ahead, initiate sync.  Two trigger conditions:
+            #
+            #   (a) `peer_height > our_height` — the obvious "catch
+            #       up" case; we're behind by N blocks and need to
+            #       fetch them.  Existing behavior, unchanged.
+            #
+            #   (b) `peer_height == our_height` BUT a majority of
+            #       peers report HIGHER cumulative_weight at our
+            #       height — the minority-fork case anchored in
+            #       CLAUDE.md ("a node that ends up on a minority/
+            #       unintentional fork must auto-resync ... with no
+            #       manual state surgery").  Pre-this-change a node
+            #       stuck on a less-weighted fork at the same height
+            #       as the canonical chain would never trigger sync
+            #       because peer_height was equal — operator had to
+            #       notice and intervene.  Now the same start_sync
+            #       path fires; the syncer's header walk then
+            #       rebuilds from peers' canonical tip and ForkChoice
+            #       picks the heavier chain on apply.
+            if not self.syncer.is_syncing:
+                should_sync = peer_height > self.blockchain.height
+                if not should_sync and peer_height == self.blockchain.height:
+                    should_sync = self._minority_fork_likely()
+                if should_sync:
+                    t = asyncio.create_task(self.syncer.start_sync())
+                    t.add_done_callback(
+                        lambda x: self._handle_task_exception("syncer.start_sync", x)
+                    )
 
             # Inbound peer just introduced itself; return the favor so
             # their Peer record can populate entity/height/version. The
@@ -1043,6 +1156,7 @@ class Node(SharedRuntimeMixin):
                     + [tx.tx_hash for tx in block.transfer_transactions]
                 )
                 self.mempool.remove_transactions(all_tx_hashes)
+                self._after_block_added(block)
                 logger.info(f"Added block #{block.header.block_number} ({reason})")
                 # Equivocation watcher: feed the signed header in AFTER
                 # the block has passed validation (add_block verifies
@@ -1174,6 +1288,8 @@ class Node(SharedRuntimeMixin):
                     return
                 success, reason = self.blockchain.add_block(block, source_peer=address)
                 self._drain_orphan_flood_offenses()
+                if success:
+                    self._after_block_added(block)
                 if not success and reason.lower().startswith("checkpoint violation"):
                     # Same gate as ANNOUNCE_BLOCK: a peer serving a
                     # mismatched block at a checkpointed height earns an
@@ -2091,6 +2207,7 @@ class Node(SharedRuntimeMixin):
 
         success, reason = self.blockchain.add_block(block)
         if success:
+            self._after_block_added(block)
             if txs:
                 self.mempool.remove_transactions([tx.tx_hash for tx in txs])
             if slash_txs:

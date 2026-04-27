@@ -178,10 +178,21 @@ def _track_record(blockchain: "Blockchain", validator_id: bytes) -> int:
     attestation: a successful proposal is a stronger correctness
     signal (the proposer authored every byte; an attester only
     voted on someone else's bytes).
+
+    Post-Tier-24 (``HONESTY_CURVE_RATE_HEIGHT``): the raw weighted
+    sum is rate-adjusted by subtracting
+    ``BAD_PENALTY_WEIGHT × prior_offenses`` and clamping to ≥ 0.
+    This implements the good:bad RATE component of the honesty
+    curve — long-tenured validators who have also accumulated many
+    slashes lose relief proportional to their bad volume, while
+    long-tenured validators with clean records keep full relief.
+    Pre-activation: byte-for-byte identical to the Tier 23 formula.
     """
     from messagechain.config import (
         HONESTY_CURVE_ATTEST_WEIGHT,
         HONESTY_CURVE_BLOCK_WEIGHT,
+        HONESTY_CURVE_RATE_HEIGHT,
+        HONESTY_CURVE_BAD_PENALTY_WEIGHT,
     )
     good_blocks = getattr(blockchain, "proposer_sig_counts", {}).get(
         validator_id, 0,
@@ -189,10 +200,23 @@ def _track_record(blockchain: "Blockchain", validator_id: bytes) -> int:
     good_atts = getattr(blockchain, "reputation", {}).get(
         validator_id, 0,
     )
-    return (
+    raw = (
         HONESTY_CURVE_BLOCK_WEIGHT * good_blocks
         + HONESTY_CURVE_ATTEST_WEIGHT * good_atts
     )
+    # Tier 24 rate factor.  Read current chain height from the
+    # blockchain object — slash application happens at chain tip,
+    # so this is the height the severity decision corresponds to.
+    # Defensive getattr: tests construct stripped-down Blockchain
+    # mocks without a `height` attribute; treat absence as
+    # pre-activation (raw value, no rate adjustment).
+    current_height = getattr(blockchain, "height", 0)
+    if current_height >= HONESTY_CURVE_RATE_HEIGHT:
+        priors = getattr(blockchain, "slash_offense_counts", {}).get(
+            validator_id, 0,
+        )
+        raw = max(0, raw - HONESTY_CURVE_BAD_PENALTY_WEIGHT * priors)
+    return raw
 
 
 def _prior_offenses(blockchain: "Blockchain", validator_id: bytes) -> int:
@@ -240,9 +264,11 @@ def slashing_severity(
     from messagechain.config import (
         HONESTY_CURVE_AMBIGUOUS_BASE_PCT,
         HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER,
+        HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD,
         HONESTY_CURVE_HONEST_TRACK_FLOOR,
         HONESTY_CURVE_HONEST_TRACK_THRESHOLD,
         HONESTY_CURVE_MIN_PCT,
+        HONESTY_CURVE_RATE_HEIGHT,
         HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT,
     )
 
@@ -268,6 +294,26 @@ def slashing_severity(
         return _clamp_pct(sev, HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT, 100)
 
     # ---- AMBIGUOUS path --------------------------------------------
+    # Tier 24 perfect-record amnesty.  A validator with no priors AND
+    # a track_record clearing AMNESTY_TRACK_THRESHOLD gets full pass
+    # (severity 0) on AMBIGUOUS (restart-shape) evidence.  This is the
+    # "low CHANCE of getting penalized" half of the CLAUDE.md anchor
+    # — veterans with a clean record are insured against a single
+    # restart-crash incident, not just slashed at a smaller fraction.
+    # Single-shot by construction: the slash apply path bumps
+    # slash_offense_counts even on a 0-severity outcome, so the next
+    # AMBIGUOUS incident sees prior=1 and falls back to the standard
+    # (small) severity.  Pre-Tier-24: amnesty does not apply (returns
+    # standard severity instead of 0).  UNAMBIGUOUS evidence is never
+    # amnestied — the deliberate-Byzantine bar stands.
+    current_height = getattr(blockchain, "height", 0)
+    if (
+        current_height >= HONESTY_CURVE_RATE_HEIGHT
+        and prior == 0
+        and track >= HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD
+    ):
+        return 0
+
     base = HONESTY_CURVE_AMBIGUOUS_BASE_PCT
     # Repeat-offense escalation: linear-in-prior with multiplier
     # weight, so prior=5 at multiplier=2 gives base × 11.  Quick
