@@ -88,7 +88,7 @@ class TestRetuneConstants(unittest.TestCase):
     def test_new_floor_constant(self):
         self.assertTrue(hasattr(config, "SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE"))
         self.assertEqual(
-            config.SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE, 20_000_000,
+            config.SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE, 10_000_000,
         )
 
     def test_new_burn_bps_constant(self):
@@ -146,7 +146,7 @@ class TestParamsSelector(unittest.TestCase):
         floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT,
         )
-        self.assertEqual(floor, 20_000_000)
+        self.assertEqual(floor, 10_000_000)
         self.assertEqual(burn_bps, 9500)
         self.assertEqual(tres_bps, 500)
 
@@ -154,7 +154,7 @@ class TestParamsSelector(unittest.TestCase):
         floor, burn_bps, tres_bps, _lottery_bps = config.get_seed_divestment_params(
             config.SEED_DIVESTMENT_RETUNE_HEIGHT + 10_000,
         )
-        self.assertEqual(floor, 20_000_000)
+        self.assertEqual(floor, 10_000_000)
         self.assertEqual(burn_bps, 9500)
         self.assertEqual(tres_bps, 500)
 
@@ -187,7 +187,7 @@ class TestDivestmentStepsUnderRetune(unittest.TestCase):
         self.assertEqual(tres_bps, config.SEED_DIVESTMENT_TREASURY_BPS)
 
     def test_post_retune_drains_to_new_floor(self):
-        """Stake 95M initial + floor 20M → divestible = 75M over the window."""
+        """Stake 95M initial + floor 10M → divestible = 85M over the window."""
         # 95M like the mainnet founder.  Run through the full window.
         chain, seed, _ = _bootstrapped_chain(stake_amount=95_000_000)
         seed_id = seed.entity_id
@@ -199,7 +199,7 @@ class TestDivestmentStepsUnderRetune(unittest.TestCase):
 
         start = config.SEED_DIVESTMENT_START_HEIGHT
         end = config.SEED_DIVESTMENT_END_HEIGHT
-        # RETUNE_HEIGHT (50_000) < START (105_192), so every divestment
+        # RETUNE_HEIGHT (1400) < START (7500), so every divestment
         # block lives in the post-activation regime.
         for h in range(start + 1, end + 1):
             chain._apply_seed_divestment(h)
@@ -210,9 +210,9 @@ class TestDivestmentStepsUnderRetune(unittest.TestCase):
         self.assertLess(stake_now, new_floor + 2)
 
         total_drained = initial - stake_now
-        # Divestible = 95M - 20M = 75M.
-        self.assertGreaterEqual(total_drained, 75_000_000 - 1)
-        self.assertLessEqual(total_drained, 75_000_000)
+        # Divestible = 95M - 10M = 85M.
+        self.assertGreaterEqual(total_drained, 85_000_000 - 1)
+        self.assertLessEqual(total_drained, 85_000_000)
 
         burn = initial_supply - chain.supply.total_supply
         treasury_gain = chain.supply.get_balance(TREASURY) - initial_treasury
@@ -236,11 +236,11 @@ class TestDivestmentStepsUnderRetune(unittest.TestCase):
         self.assertGreaterEqual(treasury_gain, expected_treasury - window)
 
     def test_post_retune_does_not_divest_at_or_below_new_floor(self):
-        """Stake == new floor (20M) → divestible == 0, no drain."""
-        chain, seed, _ = _bootstrapped_chain(stake_amount=20_000_000)
+        """Stake == new floor (10M) → divestible == 0, no drain."""
+        chain, seed, _ = _bootstrapped_chain(stake_amount=10_000_000)
         seed_id = seed.entity_id
         initial = chain.supply.get_staked(seed_id)
-        self.assertEqual(initial, 20_000_000)
+        self.assertEqual(initial, 10_000_000)
         initial_treasury = chain.supply.get_balance(TREASURY)
         initial_supply = chain.supply.total_supply
 

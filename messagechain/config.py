@@ -1578,14 +1578,17 @@ OUTBOUND_BLOCK_RELAY_ONLY_SLOTS = 2
 # of truth for BOOTSTRAP_END_HEIGHT.  Window length is fixed at 210,384
 # blocks (~4 years) to match the existing halving cadence.
 from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT as _BEH  # noqa: E402
-# Compressed from _BEH (105_192) to 50_000 — ~1 year of runway at
-# 600s blocks instead of the original ~2 years.  The bleed window
-# duration (END - START = 210_384 blocks ≈ 4 years) is preserved so
-# the per-block divestment rate stays sane; only the start is pulled
-# forward.  See CHANGELOG 1.11.0 rationale: with one operator and no
-# external validators, the original 2-year timer was buying nothing.
-SEED_DIVESTMENT_START_HEIGHT = 50_000                                  # was _BEH (105_192)
-SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 260_384
+# Compressed from 50_000 to 7_500 — ~50 days of runway at 600s blocks.
+# Earlier compressions (_BEH 105_192 → 50_000) still buy nothing while
+# the operator runs both validators with effectively zero external
+# stake; pulling start in further tightens the credibility story for
+# external observers without sacrificing security (the 4-year bleed
+# itself is unchanged).  The bleed window duration (END - START =
+# 210_384 blocks ≈ 4 years) is preserved so the per-block divestment
+# rate stays sane; only the start is pulled forward.  See CHANGELOG
+# 1.21.0 rationale.
+SEED_DIVESTMENT_START_HEIGHT = 7_500                                   # was 50_000
+SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 217_884
 SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
 SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
 assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
@@ -1606,15 +1609,23 @@ assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
 # The legacy value (1M) was sized against a 1B GENESIS_SUPPLY; after
 # the 1B→140M supply rebase the relative weight of the routed-to-
 # treasury 25% share climbed and the 94M-burn schedule became
-# co-complicit in a governance-captured-treasury outcome.  The
-# post-retune values (floor=20M, burn=95%, treasury=5%) are the
-# correct sizing for 140M supply — founder ends with 5M liquid + 20M
-# stake = 25M (~14% of supply), dominant-but-not-decisive.  Activation
-# gated by SEED_DIVESTMENT_RETUNE_HEIGHT below.  Pre-activation the
-# legacy values apply byte-for-byte.
+# co-complicit in a governance-captured-treasury outcome.
+#
+# Floor history on the 140M supply:
+#   * 20M (~14.3% of supply)  — the original retune target, "dominant
+#     but not decisive".  Read in retrospect as still founder-heavy
+#     given the thin starting validator set.
+#   * 10M (~7.1% of supply)   — current target.  "Top holder, not
+#     controlling holder."  Leaves the founder a meaningful position
+#     commensurate with bootstrap effort while the lottery share grows
+#     non-founder wallets to a clearly democratized end-state.
+#
+# Floor is a CONSENSUS CONSTANT — changing it is a hard fork.  The
+# RETUNE/REDIST forks gate activation; pre-activation the legacy 1M
+# floor applies byte-for-byte.
 SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # LEGACY — see get_seed_divestment_params
 # The founder's initial stake is divested DOWN TO this floor, not to zero.
-SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE = 20_000_000
+SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE = 10_000_000
 SEED_DIVESTMENT_BURN_BPS_POST_RETUNE = 9500       # 95% burn after retune
 SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE = 500    # 5% treasury after retune
 assert (
@@ -1683,9 +1694,9 @@ def get_seed_divestment_params(
 
     Hard-fork-gated three-era schedule:
       * pre-RETUNE: legacy 1M floor, 75% burn, 25% treasury, 0% lottery.
-      * RETUNE-era (RETUNE <= h < REDIST): 20M floor, 95% burn,
+      * RETUNE-era (RETUNE <= h < REDIST): 10M floor, 95% burn,
         5% treasury, 0% lottery.
-      * REDIST-era (h >= REDIST): 20M floor, 50% burn, 5% treasury,
+      * REDIST-era (h >= REDIST): 10M floor, 50% burn, 5% treasury,
         45% lottery.
 
     The fourth element (lottery_bps) is the share of each divestment
@@ -2567,9 +2578,10 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 # as written permits a near-total drain inside a year, defeating its
 # purpose as a safeguard against a governance-captured treasury.
 #
-# Post-seed-divestment founder stake is ~14% of supply liquid + ~60%
-# pre-retune stake → founder individually approaches the 2/3
-# supermajority threshold and IS governance.  The spend-rate cap is
+# Post-seed-divestment founder stake is ~7% of supply staked (10M of
+# ~95M post-burn supply) + ~60% pre-retune stake → founder individually
+# approaches the 2/3 supermajority threshold during the bleed and IS
+# governance until divestment completes.  The spend-rate cap is
 # the last line of defense between founder and treasury, so it must
 # survive a year of uninterrupted max-vote governance.
 #
@@ -2786,14 +2798,14 @@ FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap 
 # ─────────────────────────────────────────────────────────────────────
 # Seed-validator stake ceiling (founder re-stake defense, hard fork)
 # ─────────────────────────────────────────────────────────────────────
-# SEED_DIVESTMENT_END_HEIGHT (block 315,576) terminates the forced
-# divestment schedule with the founder's seed entity_id locked at
-# SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE (= 20M) staked tokens.
+# SEED_DIVESTMENT_END_HEIGHT terminates the forced divestment schedule
+# with the founder's seed entity_id locked at
+# SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE (= 10M) staked tokens.
 # Nothing in the legacy StakeTransaction validation prevents the
 # founder from ACCUMULATING tokens externally (purchases, unstake-
 # then-transfer, OTC) and re-staking them — i.e. the entire dilution
 # the divestment schedule produced can be silently undone by a normal
-# stake tx that pushes the seed back above 20M.
+# stake tx that pushes the seed back above the floor.
 #
 # Fix: at/after SEED_STAKE_CEILING_HEIGHT, any StakeTransaction whose
 # entity_id is in `seed_entity_ids` is rejected when
@@ -2807,7 +2819,7 @@ FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap 
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 20_000_000
+SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 10_000_000
 SEED_STAKE_CEILING_HEIGHT = 900  # Tier 1 (compressed: was 56_000)
 
 # ─────────────────────────────────────────────────────────────────────
@@ -3477,6 +3489,163 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
     "fee market across Message + Transfer + React, so React must be a "
     "first-class tx kind on chain before the unified budget bites"
 )
+
+# ----------------------------------------------------------------------
+# Tier 20: soft equivocation slash (operator-mistake survivability)
+# ----------------------------------------------------------------------
+#
+# Pre-fork policy: any double-proposal / double-attestation / finality-
+# double-vote evidence resulted in 100% stake burn + full bootstrap-
+# escrow burn + permanent removal from the validator set
+# (`slashed_validators`).  That penalty matched a deliberate Byzantine
+# attack but was catastrophic for the most common honest-operator
+# failure mode: running two nodes under the same key (failover
+# misconfig, restored backup with the old node still running, restart
+# race).  One accidental dual-sign wiped the operator's full bond.
+#
+# Post-fork policy: equivocation slashes SOFT_SLASH_PCT of stake +
+# the same fraction of bootstrap escrow + the same fraction of any
+# pending unstakes (kept in the slash basis so an attacker cannot
+# escape by unstaking faster than evidence can be submitted, but at
+# the partial percent).  The validator stays in the set with reduced
+# stake — no permanent ban from a single offense; only the SAME piece
+# of evidence is dedupe'd via `_processed_evidence`.
+#
+# Repeat-offender economics fall out without escalation logic: each
+# new piece of evidence slashes 5% of what remains, so a stuck dual-
+# node operator with N accidental dual-signs decays geometrically as
+# (1-0.05)^N — 10 mistakes ≈ 40% loss, 50 mistakes ≈ 92% loss.
+# Sustained misbehavior still approaches total stake loss; a single
+# accident does not.
+#
+# Activation: rides above Tier 19 (PROPOSAL_FEE_TIER19_HEIGHT = 13000)
+# with a ~2000-block runway (~14 days at 600 s/block), giving
+# operators time to acknowledge the new slashing semantics.
+SOFT_SLASH_HEIGHT = 15000  # Tier 20
+SOFT_SLASH_PCT = 5  # % of stake/escrow/pending burned per equivocation post-fork
+
+
+def get_slash_pct(current_block: int) -> int:
+    """Return the % of stake/escrow burned for one equivocation offense
+    at this height.  Pre-fork: SLASH_PENALTY_PCT (100, full burn).
+    Post-fork: SOFT_SLASH_PCT (5, partial).
+
+    The dynamic config lookup (re-read each call) is what lets test
+    suites monkey-patch SOFT_SLASH_HEIGHT to exercise both regimes
+    without spinning the chain forward 15k blocks.
+    """
+    from messagechain import config as _cfg
+    if current_block >= _cfg.SOFT_SLASH_HEIGHT:
+        return _cfg.SOFT_SLASH_PCT
+    return _cfg.SLASH_PENALTY_PCT
+
+
+assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
+    "SOFT_SLASH_PCT must be a partial slash (0 < pct < 100). The whole "
+    "point of Tier 20 is to soften the catastrophic full-burn penalty "
+    "for honest dual-node operator mistakes; equality with "
+    "SLASH_PENALTY_PCT would make the fork a no-op"
+)
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 21: halvings-aware proposer reward cap
+# ─────────────────────────────────────────────────────────────────────
+# `PROPOSER_REWARD_CAP` is computed once at module load as
+#     BLOCK_REWARD * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+# i.e. 16 * 1 / 4 = 4 tokens.  This frozen value silently turns the
+# anti-mega-staker cap OFF once the halving schedule drives the actual
+# block reward down to BLOCK_REWARD_FLOOR=4: at floor era a single
+# validator who proposes AND attests can earn proposer_share(1) +
+# attester_pool(3) = 4 tokens, which equals the cap exactly — no
+# clawback, no burn.  The mechanism is permanently non-binding.
+#
+# Post-activation: the per-block cap is recomputed every block from
+# the actual `reward` returned by `calculate_block_reward(height)`,
+# which already accounts for halvings AND the v1/v2 deflation-floor
+# boosts.  The cap stays at exactly 1/4 of the issued reward
+# regardless of era — at BLOCK_REWARD=16 the cap is 4 (unchanged from
+# today), at the first halving (8) it's 2, at floor (4) it's 1.
+#
+# Pre-activation: continues to read the import-time
+# `PROPOSER_REWARD_CAP` constant byte-for-byte so historical blocks
+# replay identically.
+#
+# Activation height: well before the first halving
+# (HALVING_INTERVAL=210_240) so the new logic is in place long before
+# the failure mode could manifest.  Sits above Tier 20 with the same
+# ~2000-block runway pattern.
+PROPOSER_CAP_HALVING_HEIGHT = 17000  # Tier 21
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 22 — Voter rewards on passed proposals
+# ─────────────────────────────────────────────────────────────────────
+# Governance suffers from a quiet-electorate problem: the binding
+# supermajority test (yes_weight × 3 > total_eligible × 2) means an
+# unread proposal lapses by inertia even when no one objects.  Validators
+# already pay for the *processing* of a vote (the VoteTransaction's
+# normal tx fee is paid to the block proposer), but the *staker* casting
+# the vote gets nothing for the attention cost of reading and judging
+# the proposal.  Pure pay-for-participation is rejected (rubber-stamp
+# incentive — vote on everything without reading), so this fork adopts
+# a retrospective design:
+#
+#   1. At proposal-apply time, the proposer pays VOTER_REWARD_SURCHARGE
+#      ON TOP OF the regular tx fee.  The surcharge is held in a per-
+#      proposal escrow on ProposalState.voter_reward_pool — debited
+#      from the proposer's balance, NOT minted, NOT burned.  The
+#      net-inflation invariant is unchanged because the tokens still
+#      exist; they're just not in any individual balance.
+#
+#   2. At proposal close (the same block where prune_closed_proposals
+#      runs):
+#        - If yes_weight * 3 > total_eligible * 2 (the existing binding
+#          supermajority rule, evaluated in live-weight mode like the
+#          H6 treasury-spend tally) — distribute the pool pro-rata by
+#          live stake to YES voters whose stake_at_close > 0.
+#        - Otherwise (proposal failed or had insufficient yes-weight) —
+#          burn the entire pool (decrement total_supply, increment
+#          total_burned).
+#
+#   3. Whale cap: a single yes-voter cannot collect more than
+#      VOTER_REWARD_MAX_SHARE_BPS / 10_000 of the pool, even if they
+#      hold all the yes-side stake.  Excess from the cap burns.  The
+#      cap exists because without it a 70%-stake validator captures
+#      ~70% of every reward and the system reduces to "validators tax
+#      proposers via a 2/3 rubber stamp on their own proposals."
+#
+#   4. Integer-division dust burns deterministically (so every node
+#      agrees byte-for-byte on the post-distribution state).
+#
+# Pay-on-pass intentionally has a small yes-bias for marginal voters.
+# Acceptable because passing requires affirmative 2/3 supermajority —
+# nudging the truly-undecided from "abstain" to "yes" cannot drag a bad
+# proposal across that bar, but it can save a good one from a sleepy
+# electorate.  The alternative (pay both sides of every vote) just
+# degenerates back into pay-for-participation.
+#
+# Activation: VOTER_REWARD_HEIGHT = 19000, riding above
+# PROPOSER_CAP_HALVING_HEIGHT (17000) with the established ~2000-block
+# runway pattern.  Pre-fork proposals close with no payout; their
+# voter_reward_pool stays 0 by construction (the surcharge debit is
+# height-gated).
+VOTER_REWARD_HEIGHT = 19_000  # Tier 22
+VOTER_REWARD_SURCHARGE = 50_000        # tokens escrowed per post-fork proposal
+VOTER_REWARD_MAX_SHARE_BPS = 2_500     # cap on single-voter share (25%)
+
+assert VOTER_REWARD_HEIGHT > PROPOSER_CAP_HALVING_HEIGHT, (
+    "VOTER_REWARD_HEIGHT must follow PROPOSER_CAP_HALVING_HEIGHT — Tier 22 "
+    "rides above Tier 21 in the fork schedule"
+)
+assert VOTER_REWARD_SURCHARGE > 0, (
+    "VOTER_REWARD_SURCHARGE must be positive — a zero surcharge makes the "
+    "fork a no-op (nothing to escrow, nothing to distribute)"
+)
+assert 0 < VOTER_REWARD_MAX_SHARE_BPS <= 10_000, (
+    "VOTER_REWARD_MAX_SHARE_BPS must be in (0, 10_000] bps — 10_000 = "
+    "no cap, 0 would mean every voter gets nothing and the entire pool "
+    "burns regardless of outcome"
+)
+
 assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
     "message-byte budget — otherwise a block of pure messages valid "
@@ -3622,6 +3791,13 @@ assert FINALITY_VOTE_CAP_HEIGHT < FINALITY_REWARD_FROM_ISSUANCE_HEIGHT, (
 assert ATTESTER_CAP_FIX_HEIGHT > ATTESTER_REWARD_CAP_HEIGHT, (
     "ATTESTER_CAP_FIX_HEIGHT must follow ATTESTER_REWARD_CAP_HEIGHT"
 )
+# Halvings-aware proposer cap rides on top of Tier 18.  No structural
+# dependency on TIER_18_HEIGHT itself, but ordering keeps the fork
+# numbering monotone and gives operators a single readable timeline.
+assert PROPOSER_CAP_HALVING_HEIGHT > SOFT_SLASH_HEIGHT, (
+    "PROPOSER_CAP_HALVING_HEIGHT must follow SOFT_SLASH_HEIGHT — Tier 21 "
+    "rides above Tier 20 in the fork schedule"
+)
 # The registration-burn grandfather reads the already-raised validator
 # min stake floor.  Activating the burn before the min-stake raise
 # means the grandfather's floor check runs against the legacy 100
@@ -3672,12 +3848,27 @@ for _fork_name, _fork_height in (
     ("REACT_TX_HEIGHT", REACT_TX_HEIGHT),
     ("TIER_18_HEIGHT", TIER_18_HEIGHT),
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
+    ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
+    ("PROPOSER_CAP_HALVING_HEIGHT", PROPOSER_CAP_HALVING_HEIGHT),
+    ("VOTER_REWARD_HEIGHT", VOTER_REWARD_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
         f"BOOTSTRAP_END_HEIGHT ({_BEH})"
     )
 del _fork_name, _fork_height
+
+# Tier 20 (soft equivocation slash) rides above Tier 19 (proposal fee
+# tightening).  The two forks touch disjoint subsystems (slashing vs
+# governance fees) so the order is operational, not semantic — but
+# spacing them by ~2000 blocks (~14 days at 600 s/block) gives
+# operators a clean cutover window per fork rather than collapsing
+# both rule changes into a single activation block.
+assert SOFT_SLASH_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
+    "SOFT_SLASH_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier 20 "
+    "soft slashing rides above the latest established fork (Tier 19 "
+    "proposal fee tightening)"
+)
 
 
 def validate_block_hex_size(block_data) -> bool:
