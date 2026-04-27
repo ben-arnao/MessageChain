@@ -3979,6 +3979,42 @@ def get_honesty_curve_active(current_block: int) -> bool:
     from messagechain import config as _cfg
     return current_block >= _cfg.HONESTY_CURVE_HEIGHT
 
+
+# ─── Tier 25: per-message community_id ─────────────────────────────────
+#
+# A short fixed-length community_id field on MessageTransaction lets
+# senders attach a Reddit-style community/topic grouping to a post.
+# Pure first-poster-creates semantics — there is NO on-chain registry,
+# NO creation tx, and NO claim mechanism.  Any 16-byte value is a
+# valid community_id; the namespace emerges from convention (apps
+# typically derive id = sha256(community_name_normalized)[:16] so a
+# human-readable name maps deterministically to the on-chain id).
+#
+# Why fixed 16 bytes:
+#   - 128-bit namespace, no realistic collision under any plausible
+#     organic-growth model.
+#   - Fixed length avoids the canonical-encoding edge cases (NFC,
+#     length cap, character whitelist) that a variable-length UTF-8
+#     community name would inherit from the message-text path.
+#   - Wire overhead is bounded at COMMUNITY_ID_STORED_BYTES (= 17:
+#     1B presence flag + 16B id), comparable to prev-pointer's 33B.
+#   - A community_id is app-layer grouping infra, not user speech —
+#     readability of the raw on-chain bytes is a non-goal.  The
+#     (id, name) mapping lives in indexers/clients.
+#
+# Fee treatment: charged at the live per-stored-byte rate (same model
+# as prev-pointer).  Excluded from MAX_MESSAGE_CHARS — community_id
+# is structural metadata, not human-content.
+#
+# Activation rides above Tier 24 (HONESTY_CURVE_RATE_HEIGHT = 5_000),
+# the highest unreached fork height at the time this tier was cut.
+# 6_000 leaves a ~1000-block runway above the prior fork; community_id
+# touches a disjoint subsystem (message wire format) from the
+# slashing-curve work, so spacing only needs to satisfy the upgrade
+# cutover window, not interleave semantics.
+COMMUNITY_ID_HEIGHT = 6_000  # Tier 25
+COMMUNITY_ID_BYTES = 16
+
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
     "rides on top of the established post-Tier-18 schedule; activating "
@@ -3994,6 +4030,18 @@ assert GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 > 0, (
     "GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 must be positive — a zero "
     "rate reopens the size-amortization escape hatch the surcharge "
     "exists to close"
+)
+assert COMMUNITY_ID_HEIGHT > HONESTY_CURVE_RATE_HEIGHT, (
+    "COMMUNITY_ID_HEIGHT must follow HONESTY_CURVE_RATE_HEIGHT — "
+    "Tier 25 rides on top of the highest established fork (Tier 24, "
+    "honesty-curve rate factor); spacing only needs to satisfy the "
+    "operator upgrade cutover window since the wire-format and "
+    "slashing-curve subsystems are disjoint"
+)
+assert COMMUNITY_ID_BYTES == 16, (
+    "COMMUNITY_ID_BYTES is part of the wire format — changing it "
+    "reshapes the v5 signed payload and breaks replay of any block "
+    "that included a community_id-bearing tx"
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -4206,6 +4254,7 @@ for _fork_name, _fork_height in (
     ("PROPOSER_CAP_HALVING_HEIGHT", PROPOSER_CAP_HALVING_HEIGHT),
     ("VOTER_REWARD_HEIGHT", VOTER_REWARD_HEIGHT),
     ("HONESTY_CURVE_HEIGHT", HONESTY_CURVE_HEIGHT),
+    ("COMMUNITY_ID_HEIGHT", COMMUNITY_ID_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "

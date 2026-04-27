@@ -31,6 +31,7 @@ from messagechain.config import (
     INTL_MESSAGE_HEIGHT,
     MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
     MARKET_FEE_FLOOR, MARKET_FEE_FLOOR_HEIGHT,
+    COMMUNITY_ID_HEIGHT, COMMUNITY_ID_BYTES,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -66,6 +67,18 @@ SENDER_PUBKEY_STORED_BYTES = 33
 # same tx_hash.  Pre-activation v4 admission is rejected; historical
 # v1/v2/v3 replay continues unchanged.
 TX_VERSION_LENGTH_PREFIX = 4
+# Tx-logic version that enables the optional `community_id` field
+# (Tier 25 — COMMUNITY_ID_HEIGHT).  v5 inherits the v4 wire layout
+# (length-prefixed signable_data + always-emitted prev / sender_pubkey
+# presence-flag blocks) and appends a community_id presence-flag block
+# at the end.  When set, community_id is exactly COMMUNITY_ID_BYTES
+# (16) bytes; when None (presence flag = 0x00), the optional payload
+# is omitted.  v1-v4 MUST NOT carry community_id.
+TX_VERSION_COMMUNITY_ID = 5
+# Raw byte cost of the community_id field when set (1B presence flag
+# + 16B id).  Charged at the per-stored-byte fee basis alongside `prev`
+# and `sender_pubkey` so opt-in to the feature is uniformly priced.
+COMMUNITY_ID_STORED_BYTES = 1 + COMMUNITY_ID_BYTES
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -106,6 +119,14 @@ class MessageTransaction:
     # tx that re-supplies the pubkey for an already-installed entity, so
     # the field is structurally exclusive with "already registered").
     sender_pubkey: bytes = b""
+    # `community_id` (optional, v5+): COMMUNITY_ID_BYTES-byte opaque
+    # grouping identifier — Reddit-style "this post belongs to community
+    # X".  Only meaningful at version >= TX_VERSION_COMMUNITY_ID.  When
+    # set on a v5 tx, the 1-byte presence flag and 16-byte id are
+    # included in both _signable_data and the wire form.  No on-chain
+    # registry exists; the namespace is purely conventional (apps
+    # typically derive id = sha256(community_name_normalized)[:16]).
+    community_id: bytes | None = None
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -189,6 +210,22 @@ class MessageTransaction:
                         f"got {len(self.sender_pubkey)}"
                     )
                 base += b"\x01" + self.sender_pubkey
+        # Version 5 (Tier 25) appends the community_id presence-flag
+        # block in the same shape as prev / sender_pubkey.  Including
+        # the flag in the signed payload prevents an attacker from
+        # grafting a community_id onto a legitimately-signed v5 tx
+        # whose sender meant to leave it absent.
+        if self.version >= TX_VERSION_COMMUNITY_ID:
+            if self.community_id is None:
+                base += b"\x00"
+            else:
+                if len(self.community_id) != COMMUNITY_ID_BYTES:
+                    raise ValueError(
+                        f"community_id must be exactly "
+                        f"{COMMUNITY_ID_BYTES} bytes, "
+                        f"got {len(self.community_id)}"
+                    )
+                base += b"\x01" + self.community_id
         return base
 
     @property
@@ -260,6 +297,13 @@ class MessageTransaction:
         # round-trip stays minimal.
         if self.version >= TX_VERSION_FIRST_SEND_PUBKEY and self.sender_pubkey:
             d["sender_pubkey"] = self.sender_pubkey.hex()
+        # Same omit-when-empty rule for community_id: a v5 tx without
+        # one stays minimal in the dict round-trip.
+        if (
+            self.version >= TX_VERSION_COMMUNITY_ID
+            and self.community_id is not None
+        ):
+            d["community_id"] = self.community_id.hex()
         return d
 
     def to_bytes(self, state=None) -> bytes:
@@ -332,6 +376,15 @@ class MessageTransaction:
                 parts.append(b"\x00")
             else:
                 parts.append(b"\x01" + self.sender_pubkey)
+        # Version 5 wire form: same presence-flag layout for the
+        # optional community_id field, immediately after sender_pubkey
+        # and before the signature.  Inside the signed payload
+        # (_signable_data) for the same reason as prev/sender_pubkey.
+        if self.version >= TX_VERSION_COMMUNITY_ID:
+            if self.community_id is None:
+                parts.append(b"\x00")
+            else:
+                parts.append(b"\x01" + self.community_id)
         parts.extend([
             struct.pack(">I", len(sig_blob)),
             sig_blob,
@@ -415,6 +468,31 @@ class MessageTransaction:
                     f"MessageTransaction sender_pubkey flag must be "
                     f"0 or 1, got {pk_flag}"
                 )
+        # Version 5 wire form: same presence-flag-then-bytes layout for
+        # the optional community_id field.  v1-v4 blobs skip entirely.
+        community_id: bytes | None = None
+        if version >= TX_VERSION_COMMUNITY_ID:
+            if offset + 1 > len(data):
+                raise ValueError(
+                    "MessageTransaction community_id flag truncated"
+                )
+            cid_flag = data[offset]; offset += 1
+            if cid_flag == 0x00:
+                community_id = None
+            elif cid_flag == 0x01:
+                if offset + COMMUNITY_ID_BYTES > len(data):
+                    raise ValueError(
+                        "MessageTransaction community_id truncated"
+                    )
+                community_id = bytes(
+                    data[offset:offset + COMMUNITY_ID_BYTES]
+                )
+                offset += COMMUNITY_ID_BYTES
+            else:
+                raise ValueError(
+                    f"MessageTransaction community_id flag must be "
+                    f"0 or 1, got {cid_flag}"
+                )
         sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
         if offset + sig_len > len(data):
             raise ValueError("MessageTransaction signature truncated")
@@ -436,6 +514,7 @@ class MessageTransaction:
             compression_flag=compression_flag,
             prev=prev,
             sender_pubkey=sender_pubkey,
+            community_id=community_id,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -482,6 +561,10 @@ class MessageTransaction:
         sender_pubkey = (
             bytes.fromhex(sender_pubkey_hex) if sender_pubkey_hex else b""
         )
+        community_id_hex = data.get("community_id")
+        community_id = (
+            bytes.fromhex(community_id_hex) if community_id_hex else None
+        )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             message=stored,
@@ -493,6 +576,7 @@ class MessageTransaction:
             compression_flag=flag,
             prev=prev_bytes,
             sender_pubkey=sender_pubkey,
+            community_id=community_id,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -761,6 +845,7 @@ def create_transaction(
     prev: bytes | None = None,
     *,
     include_pubkey: bool = False,
+    community_id: bytes | None = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
@@ -858,6 +943,40 @@ def create_transaction(
             prev_overhead += 1      # sender_pubkey presence flag (always under v4)
     else:
         tx_version = base_version
+    # Tier 25: opting into community_id bumps the tx to v5.  v5
+    # inherits the v4 layout in full (so any prev / sender_pubkey
+    # overhead the v4 gate above already added carries through), and
+    # appends the community_id presence-flag block — 1B presence flag
+    # if community_id is None, COMMUNITY_ID_STORED_BYTES (= 17) if set.
+    # We only bump version when the caller actually supplies a
+    # community_id; non-community senders post-activation stay at v4
+    # (or v1-v3 pre-Tier-14) so the common-case footprint is unchanged.
+    if community_id is not None:
+        if len(community_id) != COMMUNITY_ID_BYTES:
+            raise ValueError(
+                f"community_id must be exactly {COMMUNITY_ID_BYTES} "
+                f"bytes, got {len(community_id)}"
+            )
+        if (
+            current_height is not None
+            and current_height < COMMUNITY_ID_HEIGHT
+        ):
+            raise ValueError(
+                f"community_id requires current_height >= "
+                f"COMMUNITY_ID_HEIGHT ({COMMUNITY_ID_HEIGHT}); "
+                f"got {current_height}"
+            )
+        # If we landed below v4 (e.g. an isolated test that didn't pass
+        # current_height), promoting straight to v5 would skip the v4
+        # presence-flag bytes the layout requires.  Add them now so
+        # the wire form, signed payload, and fee accounting all agree.
+        if tx_version < TX_VERSION_LENGTH_PREFIX:
+            if prev is None:
+                prev_overhead += 1  # prev presence flag (v3+ requirement)
+            if not include_pubkey:
+                prev_overhead += 1  # sender_pubkey presence flag
+        tx_version = TX_VERSION_COMMUNITY_ID
+        prev_overhead += COMMUNITY_ID_STORED_BYTES
     if prev is not None and len(prev) != 32:
         raise ValueError(
             f"prev must be exactly 32 bytes, got {len(prev)}"
@@ -872,7 +991,8 @@ def create_transaction(
             f"Fee must be at least {min_required} for this message "
             f"({len(stored)} stored bytes, flag={flag}"
             f"{', prev=set' if prev is not None else ''}"
-            f"{', sender_pubkey=set' if include_pubkey else ''})"
+            f"{', sender_pubkey=set' if include_pubkey else ''}"
+            f"{', community_id=set' if community_id is not None else ''})"
         )
 
     tx = MessageTransaction(
@@ -886,6 +1006,7 @@ def create_transaction(
         compression_flag=flag,
         prev=prev,
         sender_pubkey=entity.public_key if include_pubkey else b"",
+        community_id=community_id,
     )
 
     # Sign the transaction data with quantum-resistant signature
@@ -919,21 +1040,43 @@ def verify_transaction(
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
-    # ── Version gate for tiers 10 / 11 / 12 ──
+    # ── Version gate for tiers 10 / 11 / 12 / 14 / 21 ──
     # Pre-activation: only version=1 txs are accepted.  A higher-
     # version tx arriving before its fork point would allow its
     # extra bytes (or, for v4, the new length-prefixed signable
-    # commitment) to land in a block whose replay semantics don't
-    # know about the change, so we reject at the validation
-    # boundary.  Post-PREV_POINTER_HEIGHT: v1, v2 accepted.
-    # Post-FIRST_SEND_PUBKEY_HEIGHT: v3 also accepted.
-    # Post-MESSAGE_TX_LENGTH_PREFIX_HEIGHT: v4 also accepted (and is
-    # the recommended creation path for new txs; v1/v2/v3 remain
-    # admissible for backward compatibility).  Any version above
-    # v4 is rejected until its own activation fork.
-    if tx.version > TX_VERSION_LENGTH_PREFIX:
+    # commitment, or for v5, the community_id block) to land in a
+    # block whose replay semantics don't know about the change, so
+    # we reject at the validation boundary.
+    #   Post-PREV_POINTER_HEIGHT: v1, v2 accepted.
+    #   Post-FIRST_SEND_PUBKEY_HEIGHT: v3 also accepted.
+    #   Post-MESSAGE_TX_LENGTH_PREFIX_HEIGHT: v4 also accepted (and is
+    #     the recommended creation path for new non-community txs;
+    #     v1/v2/v3 remain admissible for backward compatibility).
+    #   Post-COMMUNITY_ID_HEIGHT: v5 also accepted (recommended path
+    #     for new community-tagged txs).
+    # Any version above v5 is rejected until its own activation fork.
+    if tx.version > TX_VERSION_COMMUNITY_ID:
         return False
-    if tx.version >= TX_VERSION_LENGTH_PREFIX:
+    if tx.version >= TX_VERSION_COMMUNITY_ID:
+        if (
+            current_height is not None
+            and current_height < COMMUNITY_ID_HEIGHT
+        ):
+            return False
+        # v5 inherits the full v4 trailer layout (prev + sender_pubkey
+        # presence-flag blocks always present) and adds the community_id
+        # presence-flag block.  When set, community_id MUST be exactly
+        # COMMUNITY_ID_BYTES bytes; tampering with the length without
+        # re-signing produces a tx_hash mismatch downstream, but we
+        # also reject the structural error here for a clearer failure.
+        if (
+            tx.community_id is not None
+            and len(tx.community_id) != COMMUNITY_ID_BYTES
+        ):
+            return False
+        if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
+            return False
+    elif tx.version >= TX_VERSION_LENGTH_PREFIX:
         if (
             current_height is not None
             and current_height < MESSAGE_TX_LENGTH_PREFIX_HEIGHT
@@ -945,6 +1088,11 @@ def verify_transaction(
         # >H length prefix on `message` inside `_signable_data`.
         if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
             return False
+        # v1-v4 MUST NOT carry community_id — the field was added at
+        # v5, and a sub-v5 tx with community_id set would be a
+        # signature-doesn't-cover-this-field tampering attempt.
+        if tx.community_id is not None:
+            return False
     elif tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
         if (
             current_height is not None
@@ -953,9 +1101,14 @@ def verify_transaction(
             return False
         if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
             return False
+        # v1-v3 also pre-date community_id; reject smuggling.
+        if tx.community_id is not None:
+            return False
     else:
-        # v1/v2 MUST NOT carry a sender_pubkey field.
+        # v1/v2 MUST NOT carry a sender_pubkey or community_id field.
         if tx.sender_pubkey:
+            return False
+        if tx.community_id is not None:
             return False
     if tx.version >= TX_VERSION_PREV_POINTER:
         if current_height is not None and current_height < PREV_POINTER_HEIGHT:
@@ -1032,6 +1185,14 @@ def verify_transaction(
         ) + (SENDER_PUBKEY_STORED_BYTES if tx.sender_pubkey else 1)
     else:
         prev_overhead = PREV_POINTER_STORED_BYTES if tx.prev is not None else 0
+    # v5 adds the community_id presence-flag block: 1B when None,
+    # COMMUNITY_ID_STORED_BYTES (= 17) when set.  Mirrors
+    # create_transaction's accounting so the local fee floor a sender
+    # computed matches what the chain enforces here.
+    if tx.version >= TX_VERSION_COMMUNITY_ID:
+        prev_overhead += (
+            COMMUNITY_ID_STORED_BYTES if tx.community_id is not None else 1
+        )
     if tx.fee < calculate_min_fee(
         tx.message,
         signature_bytes=sig_len,
