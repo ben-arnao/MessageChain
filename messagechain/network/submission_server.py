@@ -1299,6 +1299,140 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
         self._ok(resp)
 
 
+class ReceiptBudgetTracker:
+    """Per-IP receipt-subtree leaf-budget tracker — shared across surfaces.
+
+    Owns the dedicated rejection-budget and ack-budget token buckets
+    that gate WOTS+ leaf consumption from the validator's
+    RECEIPT_SUBTREE (65k leaves at height 16).  Without per-IP budgets
+    on these issuance paths an attacker can drain the entire subtree
+    from one IP in hours, silently collapsing the censorship-evidence
+    pipeline (receipts, rejections, acks all draw from the same
+    subtree).
+
+    Critical invariant: HTTPS and RPC submission surfaces MUST consult
+    the SAME tracker instance.  If each surface had its own bucket
+    dict, an attacker would split traffic across both surfaces and
+    drain twice the per-IP burst before any gate fired.  Hosting the
+    tracker on the top-level Server (or Node) and passing the same
+    instance into every surface that issues receipts/rejections/acks
+    keeps the invariant.
+
+    Methods:
+      * `rejection_budget_check(ip)` — gates SignedRejection issuance
+        AND (post-2026-04-27) the RPC `request_receipt` opt-in
+        receipt-on-success issuance.  Both share the same bucket
+        because either path consumes one leaf from the same subtree.
+      * `ack_budget_check(ip)` — gates SubmissionAck issuance on the
+        witnessed-submission path.
+
+    The bucket dicts are LRU-evicted at `max_tracked_ips` to prevent
+    an attacker rotating IPs from blowing memory with one-shot buckets.
+    """
+
+    def __init__(self, max_tracked_ips: int = 4096):
+        self._buckets_lock = threading.Lock()
+        # Dedicated per-IP budget for X-MC-Request-Receipt=1
+        # submissions (HTTPS) and `request_receipt: True` RPC
+        # submissions.  Each rejection / RPC-receipt-on-success burns
+        # one WOTS+ leaf from the receipt subtree (65k one-time keys
+        # at height 16).  Sharing this with the RPC opt-in receipt
+        # path closes the cross-surface drain — an attacker cannot
+        # split traffic across HTTPS + RPC and burn the burst twice.
+        self._rejection_buckets: dict[str, TokenBucket] = {}
+        # Dedicated per-IP budget for the X-MC-Witnessed-Submission
+        # opt-in path.  Every SubmissionAck consumes one WOTS+ leaf
+        # from the SAME receipt subtree as receipts and rejections.
+        self._ack_buckets: dict[str, TokenBucket] = {}
+        # Shared last-active timestamp dict — used by both bucket
+        # families for LRU eviction.
+        self._last_active: dict[str, float] = {}
+        self._max_tracked_ips = max_tracked_ips
+
+    def rejection_budget_check(self, ip: str) -> bool:
+        """Consume one token from `ip`'s REJECTION bucket; True iff allowed.
+
+        Gates both:
+          * the HTTPS opt-in SignedRejection issuance path
+            (X-MC-Request-Receipt=1 + invalid tx), AND
+          * the RPC opt-in receipt-on-success issuance path
+            (`request_receipt: True` + valid tx).
+
+        Both consume one leaf from the same RECEIPT_SUBTREE; sharing
+        the bucket means an attacker can't drain twice by alternating
+        surfaces.  Exhausting the budget does NOT block the
+        underlying submission — it only prevents the receipt /
+        rejection from being issued for that request.
+        """
+        import time as _time
+        with self._buckets_lock:
+            bucket = self._rejection_buckets.get(ip)
+            if bucket is None:
+                if len(self._rejection_buckets) >= self._max_tracked_ips:
+                    # Inactive eviction — drop fully-refilled buckets.
+                    to_drop = []
+                    for _ip, _b in self._rejection_buckets.items():
+                        _b._refill()
+                        if _b.tokens >= _b.max_tokens:
+                            to_drop.append(_ip)
+                    for _ip in to_drop:
+                        del self._rejection_buckets[_ip]
+                    if len(self._rejection_buckets) >= self._max_tracked_ips:
+                        # LRU by last_active.
+                        oldest_ip = min(
+                            self._rejection_buckets,
+                            key=lambda k: self._last_active.get(k, 0.0),
+                        )
+                        del self._rejection_buckets[oldest_ip]
+                    if len(self._rejection_buckets) >= self._max_tracked_ips:
+                        return False
+                bucket = TokenBucket(
+                    rate=SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC,
+                    max_tokens=SUBMISSION_REJECTION_BURST,
+                )
+                self._rejection_buckets[ip] = bucket
+            self._last_active[ip] = _time.time()
+            return bucket.consume()
+
+    def ack_budget_check(self, ip: str) -> bool:
+        """Consume one token from `ip`'s ACK bucket; True iff allowed.
+
+        Each SubmissionAck consumes a WOTS+ leaf from the validator's
+        receipt subtree.  Without a dedicated cap, an attacker
+        spamming `X-MC-Witnessed-Submission` headers from a /24
+        drains the whole subtree in minutes.  Exhausting the ack
+        budget does NOT block the underlying submission -- it only
+        prevents an ack from being issued for that request.
+        """
+        import time as _time
+        with self._buckets_lock:
+            bucket = self._ack_buckets.get(ip)
+            if bucket is None:
+                if len(self._ack_buckets) >= self._max_tracked_ips:
+                    to_drop = []
+                    for _ip, _b in self._ack_buckets.items():
+                        _b._refill()
+                        if _b.tokens >= _b.max_tokens:
+                            to_drop.append(_ip)
+                    for _ip in to_drop:
+                        del self._ack_buckets[_ip]
+                    if len(self._ack_buckets) >= self._max_tracked_ips:
+                        oldest_ip = min(
+                            self._ack_buckets,
+                            key=lambda k: self._last_active.get(k, 0.0),
+                        )
+                        del self._ack_buckets[oldest_ip]
+                    if len(self._ack_buckets) >= self._max_tracked_ips:
+                        return False
+                bucket = TokenBucket(
+                    rate=SUBMISSION_ACK_RATE_LIMIT_PER_SEC,
+                    max_tokens=SUBMISSION_ACK_BURST,
+                )
+                self._ack_buckets[ip] = bucket
+            self._last_active[ip] = _time.time()
+            return bucket.consume()
+
+
 class _HandlerContext:
     """Shared state for all handlers on a single SubmissionServer.
 
@@ -1317,6 +1451,7 @@ class _HandlerContext:
         proof_relay_callback=None,
         ack_relay_callback=None,
         witness_observation_store=None,
+        budget_tracker: Optional[ReceiptBudgetTracker] = None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -1349,30 +1484,19 @@ class _HandlerContext:
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._buckets_lock = threading.Lock()
-        # Dedicated per-IP budget for X-MC-Request-Receipt=1 submissions.
-        # Each exhaustion-via-bad-sig-spam rejection would otherwise
-        # burn a leaf from the RECEIPT_SUBTREE (65k one-time keys at
-        # height 16).  Sharing the base submission bucket means one
-        # attacker IP could drain the subtree in hours.  Dedicated
-        # bucket keeps honest slash-evidence issuance flowing at a
-        # slow rate while closing the leaf-drain vector.
-        self._rejection_buckets: dict[str, TokenBucket] = {}
-        # Dedicated per-IP budget for the X-MC-Witnessed-Submission
-        # opt-in path.  Every SubmissionAck consumes one WOTS+ leaf
-        # from the SAME receipt subtree as receipts and rejections.
-        # Pre-fix the ack path had no per-IP budget AND no binding
-        # to a prior gossiped SubmissionRequest -- an attacker
-        # spamming HTTP POSTs with random 32-byte header values
-        # from a /24 drained all 65k leaves in minutes, after which
-        # the entire censorship-evidence pipeline (receipts,
-        # rejections, acks) collapsed silently because every issuance
-        # path shares the subtree.  Sized so honest opt-in flows
-        # (which paid WITNESS_SURCHARGE at the gossip layer) always
-        # get an ack while any IP-flood attacker hits the ceiling
-        # within seconds.
-        self._ack_buckets: dict[str, TokenBucket] = {}
-        # Cap the dict to prevent an attacker rotating IPs from
-        # exhausting memory with one-shot buckets.
+        # Receipt-subtree leaf budget — shared across HTTPS and RPC
+        # surfaces.  When the caller passes an explicit tracker we
+        # reuse it (production wiring: Server constructs once, passes
+        # the same instance into SubmissionServer); when not, we
+        # build a private one (test/legacy bare-context paths).  The
+        # `rejection_budget_check` and `ack_budget_check` methods
+        # delegate to it so the existing handler call sites stay
+        # unchanged.  See class docstring for the cross-surface
+        # invariant.
+        self._budget_tracker = (
+            budget_tracker if budget_tracker is not None
+            else ReceiptBudgetTracker()
+        )
         self._max_tracked_ips = 4096
 
     def rate_limit_check(self, ip: str) -> bool:
@@ -1398,90 +1522,36 @@ class _HandlerContext:
             return bucket.consume()
 
     def rejection_budget_check(self, ip: str) -> bool:
-        """Consume one token from `ip`'s REJECTION bucket; True iff allowed.
+        """Delegate to the shared `ReceiptBudgetTracker`.
 
-        Separate from rate_limit_check — exhausting the rejection
-        budget does NOT block the underlying submission, it only
-        prevents a SignedRejection from being issued for that request.
-        See the SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC comment in
-        config.py for the rationale (receipt-subtree leaf drain).
+        Kept on `_HandlerContext` so existing HTTP handler call sites
+        (and tests that construct a bare context) don't need to know
+        about the tracker.  See `ReceiptBudgetTracker.rejection_budget_check`
+        for the threat model.
         """
-        import time as _time
-        with self._buckets_lock:
-            bucket = self._rejection_buckets.get(ip)
-            if bucket is None:
-                if len(self._rejection_buckets) >= self._max_tracked_ips:
-                    # Inactive/LRU eviction on the rejection dict.
-                    # Inline, mirrors the base-bucket logic above but
-                    # scoped to self._rejection_buckets.
-                    to_drop = []
-                    for _ip, _b in self._rejection_buckets.items():
-                        _b._refill()
-                        if _b.tokens >= _b.max_tokens:
-                            to_drop.append(_ip)
-                    for _ip in to_drop:
-                        del self._rejection_buckets[_ip]
-                    if len(self._rejection_buckets) >= self._max_tracked_ips:
-                        # LRU by last_active (shared with the base
-                        # bucket — we reuse the same timestamps).
-                        oldest_ip = min(
-                            self._rejection_buckets,
-                            key=lambda k: self._last_active.get(k, 0.0),
-                        )
-                        del self._rejection_buckets[oldest_ip]
-                    if len(self._rejection_buckets) >= self._max_tracked_ips:
-                        return False
-                bucket = TokenBucket(
-                    rate=SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC,
-                    max_tokens=SUBMISSION_REJECTION_BURST,
-                )
-                self._rejection_buckets[ip] = bucket
-            self._last_active[ip] = _time.time()
-            return bucket.consume()
+        return self._budget_tracker.rejection_budget_check(ip)
 
     def ack_budget_check(self, ip: str) -> bool:
-        """Consume one token from `ip`'s ACK bucket; True iff allowed.
+        """Delegate to the shared `ReceiptBudgetTracker`.
 
-        Separate from rate_limit_check and rejection_budget_check.
-        Each SubmissionAck consumes a WOTS+ leaf from the validator's
-        receipt subtree -- without a dedicated cap, an attacker
-        spamming `X-MC-Witnessed-Submission` headers from a /24 drains
-        the whole subtree in minutes.  Exhausting the ack budget
-        does NOT block the underlying submission -- it only prevents
-        an ack from being issued for that request.  The HTTP handler
-        then passes `ack_allowed=False` to submit_transaction_to_mempool
-        so the submission still processes; the witnessed-submission
-        client just doesn't get a signed ack back.
+        Same shape as `rejection_budget_check` — see the tracker
+        method for the witnessed-submission ack threat model.
         """
-        import time as _time
-        with self._buckets_lock:
-            bucket = self._ack_buckets.get(ip)
-            if bucket is None:
-                if len(self._ack_buckets) >= self._max_tracked_ips:
-                    # Inactive eviction.
-                    to_drop = []
-                    for _ip, _b in self._ack_buckets.items():
-                        _b._refill()
-                        if _b.tokens >= _b.max_tokens:
-                            to_drop.append(_ip)
-                    for _ip in to_drop:
-                        del self._ack_buckets[_ip]
-                    if len(self._ack_buckets) >= self._max_tracked_ips:
-                        # LRU by last_active (shared timestamps).
-                        oldest_ip = min(
-                            self._ack_buckets,
-                            key=lambda k: self._last_active.get(k, 0.0),
-                        )
-                        del self._ack_buckets[oldest_ip]
-                    if len(self._ack_buckets) >= self._max_tracked_ips:
-                        return False
-                bucket = TokenBucket(
-                    rate=SUBMISSION_ACK_RATE_LIMIT_PER_SEC,
-                    max_tokens=SUBMISSION_ACK_BURST,
-                )
-                self._ack_buckets[ip] = bucket
-            self._last_active[ip] = _time.time()
-            return bucket.consume()
+        return self._budget_tracker.ack_budget_check(ip)
+
+    # ── Compatibility shims for legacy tests ─────────────────────────
+    # A handful of existing tests poke at the bucket dicts directly
+    # (test_rejection_rate_limit.py introspection cases).  Expose
+    # them as @property views onto the tracker so those tests keep
+    # working without re-templating.
+
+    @property
+    def _rejection_buckets(self):
+        return self._budget_tracker._rejection_buckets
+
+    @property
+    def _ack_buckets(self):
+        return self._budget_tracker._ack_buckets
 
     def _evict_inactive_locked(self):
         """Drop buckets that are fully refilled (peer hasn't posted in a while)."""
@@ -1567,6 +1637,7 @@ class SubmissionServer:
         proof_relay_callback=None,
         ack_relay_callback: Optional[Callable[[bytes], None]] = None,
         witness_observation_store=None,
+        budget_tracker: Optional[ReceiptBudgetTracker] = None,
     ):
         self.blockchain = blockchain
         self.mempool = mempool
@@ -1593,6 +1664,14 @@ class SubmissionServer:
         # no ack).
         self.ack_relay_callback = ack_relay_callback
         self.witness_observation_store = witness_observation_store
+        # Optional shared receipt-subtree budget tracker.  Production
+        # wiring passes the SAME instance the top-level Server holds,
+        # so HTTPS and RPC surfaces consult one set of per-IP buckets
+        # and an attacker cannot drain twice by splitting traffic.
+        # When omitted (bare/test contexts) `_HandlerContext`
+        # constructs a private tracker — fine for isolated tests but
+        # NOT what production should ever do.
+        self.budget_tracker = budget_tracker
         self._httpd: Optional[_ThreadingHTTPSServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -1632,6 +1711,7 @@ class SubmissionServer:
             proof_relay_callback=self.proof_relay_callback,
             ack_relay_callback=self.ack_relay_callback,
             witness_observation_store=self.witness_observation_store,
+            budget_tracker=self.budget_tracker,
         )
         ssl_context = self._build_ssl_context()
         self._httpd.socket = ssl_context.wrap_socket(
