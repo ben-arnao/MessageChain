@@ -1829,7 +1829,17 @@ class Server(SharedRuntimeMixin):
             # JSON serialization per RPC.  500 is large enough for any
             # realistic governance workload and small enough to keep
             # response time + bandwidth bounded.
-            proposals = self.blockchain.governance.list_proposals(self.blockchain.height)
+            params = request.get("params", {}) or {}
+            voter_id_hex = params.get("voter_id")
+            voter_id_bytes: bytes | None = None
+            if isinstance(voter_id_hex, str) and voter_id_hex:
+                try:
+                    voter_id_bytes = bytes.fromhex(voter_id_hex)
+                except ValueError:
+                    return {"ok": False, "error": "Invalid voter_id (expected hex)"}
+            proposals = self.blockchain.governance.list_proposals(
+                self.blockchain.height, voter_id=voter_id_bytes,
+            )
             truncated = len(proposals) > 500
             return {
                 "ok": True,
@@ -2350,6 +2360,42 @@ class Server(SharedRuntimeMixin):
             # down block production.  Log and move on — the operator can
             # inspect logs; the chain keeps running.
             logger.warning("AUTO_RESTAKE: sweep failed: %r", e)
+
+    def _maybe_notify_governance_proposals(self) -> None:
+        """Best-effort: email the operator if a new open proposal landed.
+
+        Called after each successful add_block.  Operator-runtime path
+        ONLY — consensus state never depends on the outcome of this
+        call.  Behavior:
+          * No-op when notify.email.enabled is unset / false.
+          * No-op when SMTP credentials are missing.
+          * Idempotent: each proposal_id is emailed at most once across
+            restarts (state lives in <data_dir>/notify_state.json).
+          * Swallows ALL exceptions — block production must never abort
+            because the email subsystem misbehaved.
+        """
+        try:
+            from messagechain.runtime import notify as _notify
+            from messagechain.runtime import onboarding as _ob
+            cfg = _ob.read_onboard_config()
+            if not cfg.get("notify.email.enabled"):
+                return  # cheap fast-path; avoid any further work
+            state_path = _notify.default_state_path(self.data_dir)
+            current_height = self.blockchain.height
+            _notify.process_block_for_notifications(
+                current_height=current_height,
+                list_proposals=lambda: (
+                    self.blockchain.governance.list_proposals(current_height)
+                ),
+                config=cfg,
+                state_path=state_path,
+            )
+        except Exception as e:
+            logger.warning(
+                "notify: governance-proposal hook failed (%s); "
+                "consensus unaffected",
+                type(e).__name__,
+            )
 
     def _tx_signer_pubkey(self, tx) -> bytes | None:
         """Return the public key that `tx`'s signature verifies under.
@@ -3440,6 +3486,10 @@ class Server(SharedRuntimeMixin):
             # production must never abort because a restake sweep
             # misbehaved (this is best-effort, opt-in operator convenience).
             self._maybe_auto_restake()
+            # Opt-in governance-proposal email notify (operator-runtime
+            # only; never affects consensus).  Reads onboard.toml each
+            # call so flags can be flipped without restart.
+            self._maybe_notify_governance_proposals()
         else:
             if block_producer.is_clock_skew_reason(reason):
                 logger.warning(
@@ -3958,6 +4008,10 @@ class Server(SharedRuntimeMixin):
                 # tx means we skip the broadcast — block fails 2/3
                 # finality if enough honest attesters concur.
                 await self._maybe_attest_accepted_block(block)
+                # Operator-runtime email notification path (opt-in;
+                # never affects consensus).  See cmd-doc on
+                # _maybe_notify_governance_proposals for guarantees.
+                self._maybe_notify_governance_proposals()
             else:
                 # Orderly-flow rejections (orphan / already-known) are
                 # not peer misbehaviour — they mean we're behind or
