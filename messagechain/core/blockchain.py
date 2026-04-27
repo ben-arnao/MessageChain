@@ -11481,16 +11481,50 @@ class Blockchain:
         feature).  `prev` is omitted for pre-fork txs and for post-fork
         txs that don't carry a pointer — clients should treat its
         absence as "no predecessor."
+
+        Each entry also carries `ups` / `downs` (UP and DOWN react-tx
+        counts on this message's tx_hash) and `up_pct` (ups /
+        (ups+downs)) so the feed UI can render a vote indicator
+        without a second round trip.  Counts come from the latest
+        per-(voter, target) choice in ReactionState — superseded
+        votes don't double-count.  `up_pct` is null when the message
+        has no UP/DOWN votes.
         """
+        # Pre-aggregate UP/DOWN counts per message tx_hash in one pass
+        # over the ReactionState so the per-message lookup below is O(1).
+        # The aggregate score in `_message_score` is `ups - downs` (a
+        # signed int), so we cannot recover ups + downs separately from
+        # it — count both sides explicitly here.
+        from messagechain.config import (
+            REACT_CHOICE_UP as _UP,
+            REACT_CHOICE_DOWN as _DOWN,
+        )
+        msg_votes: dict[bytes, list[int]] = {}  # tx_hash -> [ups, downs]
+        for (_voter, target, target_is_user), choice in (
+            self.reaction_state.choices.items()
+        ):
+            if target_is_user:
+                continue
+            counts = msg_votes.setdefault(target, [0, 0])
+            if choice == _UP:
+                counts[0] += 1
+            elif choice == _DOWN:
+                counts[1] += 1
+
         messages = []
         for block in reversed(self.chain):
             for tx in reversed(block.transactions):
+                ups, downs = msg_votes.get(tx.tx_hash, (0, 0))
+                total = ups + downs
                 entry = {
                     "message": tx.plaintext.decode("utf-8", errors="replace"),
                     "entity_id": tx.entity_id.hex(),
                     "timestamp": tx.timestamp,
                     "tx_hash": tx.tx_hash.hex(),
                     "block_number": block.header.block_number,
+                    "ups": ups,
+                    "downs": downs,
+                    "up_pct": (100.0 * ups / total) if total > 0 else None,
                 }
                 prev = getattr(tx, "prev", None)
                 if prev is not None:
