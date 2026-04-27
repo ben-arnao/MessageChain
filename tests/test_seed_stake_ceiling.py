@@ -64,20 +64,20 @@ def _build_chain(entity: Entity, is_seed: bool) -> Blockchain:
 class TestSeedStakeCeilingPostActivation(unittest.TestCase):
     """Post-activation: seed cannot stake above SEED_MAX_STAKE_CEILING."""
 
-    def test_seed_cannot_restake_above_20m(self):
-        """Post-activation: seed at 19M + 2M (total 21M) must be rejected.
+    def test_seed_cannot_restake_above_ceiling(self):
+        """Post-activation: seed at 9M + 2M (total 11M) must be rejected.
 
         Simulates the attack: founder unstaked to 0 during divestment,
-        bought tokens externally to 21M, attempts to re-stake past the
-        ceiling in one shot.  Reject is the expected and required
-        behavior.
+        bought tokens externally past the floor, attempts to re-stake
+        past the ceiling in one shot.  Reject is the expected and
+        required behavior.
         """
         seed = Entity.create(b"seed-ceiling-over".ljust(32, b"\x00"))
         chain = _build_chain(seed, is_seed=True)
         # Fund liberally so insufficient-balance is NOT why the tx fails.
         chain.supply.balances[seed.entity_id] = 100_000_000
-        # Seed already sits at 19M staked — top-up would land at 21M.
-        chain.supply.staked[seed.entity_id] = 19_000_000
+        # Seed already sits at 9M staked — top-up would land at 11M (above 10M ceiling).
+        chain.supply.staked[seed.entity_id] = 9_000_000
         tx = create_stake_transaction(
             seed, amount=2_000_000,
             nonce=chain.nonces.get(seed.entity_id, 0),
@@ -93,16 +93,16 @@ class TestSeedStakeCeilingPostActivation(unittest.TestCase):
                 pending_pubkey_installs={},
             )
         self.assertFalse(ok, (
-            "seed re-stake pushing total above 20M must be rejected"
+            "seed re-stake pushing total above ceiling must be rejected"
         ))
         self.assertIn("seed", reason.lower())
 
     def test_seed_exactly_at_ceiling_accepted(self):
-        """Post-activation: reaching exactly 20M (inclusive) is fine.
+        """Post-activation: reaching exactly the ceiling (inclusive) is fine.
 
-        Ceiling is <= 20M, not < 20M — the retention floor from
-        divestment IS 20M, so staking up to and including that value
-        must succeed.  Only strictly above is rejected.
+        Ceiling is <=, not < — the retention floor from divestment IS
+        the ceiling value, so staking up to and including it must
+        succeed.  Only strictly above is rejected.
         """
         seed = Entity.create(b"seed-ceiling-exact".ljust(32, b"\x00"))
         chain = _build_chain(seed, is_seed=True)
@@ -150,7 +150,7 @@ class TestSeedStakeCeilingPostActivation(unittest.TestCase):
         self.assertIn("seed", reason.lower())
 
     def test_seed_below_ceiling_accepted(self):
-        """Seed topping up from 15M by 2M (total 17M) must succeed.
+        """Seed topping up from 5M by 2M (total 7M) must succeed.
 
         Captures the "seed can still operate normally below the
         ceiling" requirement.
@@ -158,7 +158,7 @@ class TestSeedStakeCeilingPostActivation(unittest.TestCase):
         seed = Entity.create(b"seed-ceiling-under".ljust(32, b"\x00"))
         chain = _build_chain(seed, is_seed=True)
         chain.supply.balances[seed.entity_id] = 100_000_000
-        chain.supply.staked[seed.entity_id] = 15_000_000
+        chain.supply.staked[seed.entity_id] = 5_000_000
         tx = create_stake_transaction(
             seed, amount=2_000_000,
             nonce=chain.nonces.get(seed.entity_id, 0),
@@ -176,7 +176,7 @@ class TestSeedStakeCeilingPostActivation(unittest.TestCase):
         self.assertTrue(ok, f"seed stake below ceiling must succeed: {reason}")
 
     def test_non_seed_unaffected(self):
-        """A non-seed validator can stake well above the 20M ceiling."""
+        """A non-seed validator can stake well above the seed ceiling."""
         bob = Entity.create(b"non-seed-large".ljust(32, b"\x00"))
         chain = _build_chain(bob, is_seed=False)
         chain.supply.balances[bob.entity_id] = 100_000_000

@@ -1578,14 +1578,17 @@ OUTBOUND_BLOCK_RELAY_ONLY_SLOTS = 2
 # of truth for BOOTSTRAP_END_HEIGHT.  Window length is fixed at 210,384
 # blocks (~4 years) to match the existing halving cadence.
 from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT as _BEH  # noqa: E402
-# Compressed from _BEH (105_192) to 50_000 — ~1 year of runway at
-# 600s blocks instead of the original ~2 years.  The bleed window
-# duration (END - START = 210_384 blocks ≈ 4 years) is preserved so
-# the per-block divestment rate stays sane; only the start is pulled
-# forward.  See CHANGELOG 1.11.0 rationale: with one operator and no
-# external validators, the original 2-year timer was buying nothing.
-SEED_DIVESTMENT_START_HEIGHT = 50_000                                  # was _BEH (105_192)
-SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 260_384
+# Compressed from 50_000 to 7_500 — ~50 days of runway at 600s blocks.
+# Earlier compressions (_BEH 105_192 → 50_000) still buy nothing while
+# the operator runs both validators with effectively zero external
+# stake; pulling start in further tightens the credibility story for
+# external observers without sacrificing security (the 4-year bleed
+# itself is unchanged).  The bleed window duration (END - START =
+# 210_384 blocks ≈ 4 years) is preserved so the per-block divestment
+# rate stays sane; only the start is pulled forward.  See CHANGELOG
+# 1.21.0 rationale.
+SEED_DIVESTMENT_START_HEIGHT = 7_500                                   # was 50_000
+SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 217_884
 SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
 SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
 assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
@@ -1606,15 +1609,23 @@ assert SEED_DIVESTMENT_BURN_BPS + SEED_DIVESTMENT_TREASURY_BPS == 10_000
 # The legacy value (1M) was sized against a 1B GENESIS_SUPPLY; after
 # the 1B→140M supply rebase the relative weight of the routed-to-
 # treasury 25% share climbed and the 94M-burn schedule became
-# co-complicit in a governance-captured-treasury outcome.  The
-# post-retune values (floor=20M, burn=95%, treasury=5%) are the
-# correct sizing for 140M supply — founder ends with 5M liquid + 20M
-# stake = 25M (~14% of supply), dominant-but-not-decisive.  Activation
-# gated by SEED_DIVESTMENT_RETUNE_HEIGHT below.  Pre-activation the
-# legacy values apply byte-for-byte.
+# co-complicit in a governance-captured-treasury outcome.
+#
+# Floor history on the 140M supply:
+#   * 20M (~14.3% of supply)  — the original retune target, "dominant
+#     but not decisive".  Read in retrospect as still founder-heavy
+#     given the thin starting validator set.
+#   * 10M (~7.1% of supply)   — current target.  "Top holder, not
+#     controlling holder."  Leaves the founder a meaningful position
+#     commensurate with bootstrap effort while the lottery share grows
+#     non-founder wallets to a clearly democratized end-state.
+#
+# Floor is a CONSENSUS CONSTANT — changing it is a hard fork.  The
+# RETUNE/REDIST forks gate activation; pre-activation the legacy 1M
+# floor applies byte-for-byte.
 SEED_DIVESTMENT_RETAIN_FLOOR = 1_000_000  # LEGACY — see get_seed_divestment_params
 # The founder's initial stake is divested DOWN TO this floor, not to zero.
-SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE = 20_000_000
+SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE = 10_000_000
 SEED_DIVESTMENT_BURN_BPS_POST_RETUNE = 9500       # 95% burn after retune
 SEED_DIVESTMENT_TREASURY_BPS_POST_RETUNE = 500    # 5% treasury after retune
 assert (
@@ -1683,9 +1694,9 @@ def get_seed_divestment_params(
 
     Hard-fork-gated three-era schedule:
       * pre-RETUNE: legacy 1M floor, 75% burn, 25% treasury, 0% lottery.
-      * RETUNE-era (RETUNE <= h < REDIST): 20M floor, 95% burn,
+      * RETUNE-era (RETUNE <= h < REDIST): 10M floor, 95% burn,
         5% treasury, 0% lottery.
-      * REDIST-era (h >= REDIST): 20M floor, 50% burn, 5% treasury,
+      * REDIST-era (h >= REDIST): 10M floor, 50% burn, 5% treasury,
         45% lottery.
 
     The fourth element (lottery_bps) is the share of each divestment
@@ -2567,9 +2578,10 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 # as written permits a near-total drain inside a year, defeating its
 # purpose as a safeguard against a governance-captured treasury.
 #
-# Post-seed-divestment founder stake is ~14% of supply liquid + ~60%
-# pre-retune stake → founder individually approaches the 2/3
-# supermajority threshold and IS governance.  The spend-rate cap is
+# Post-seed-divestment founder stake is ~7% of supply staked (10M of
+# ~95M post-burn supply) + ~60% pre-retune stake → founder individually
+# approaches the 2/3 supermajority threshold during the bleed and IS
+# governance until divestment completes.  The spend-rate cap is
 # the last line of defense between founder and treasury, so it must
 # survive a year of uninterrupted max-vote governance.
 #
@@ -2786,14 +2798,14 @@ FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap 
 # ─────────────────────────────────────────────────────────────────────
 # Seed-validator stake ceiling (founder re-stake defense, hard fork)
 # ─────────────────────────────────────────────────────────────────────
-# SEED_DIVESTMENT_END_HEIGHT (block 315,576) terminates the forced
-# divestment schedule with the founder's seed entity_id locked at
-# SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE (= 20M) staked tokens.
+# SEED_DIVESTMENT_END_HEIGHT terminates the forced divestment schedule
+# with the founder's seed entity_id locked at
+# SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE (= 10M) staked tokens.
 # Nothing in the legacy StakeTransaction validation prevents the
 # founder from ACCUMULATING tokens externally (purchases, unstake-
 # then-transfer, OTC) and re-staking them — i.e. the entire dilution
 # the divestment schedule produced can be silently undone by a normal
-# stake tx that pushes the seed back above 20M.
+# stake tx that pushes the seed back above the floor.
 #
 # Fix: at/after SEED_STAKE_CEILING_HEIGHT, any StakeTransaction whose
 # entity_id is in `seed_entity_ids` is rejected when
@@ -2807,7 +2819,7 @@ FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap 
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 20_000_000
+SEED_MAX_STAKE_CEILING = SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE   # 10_000_000
 SEED_STAKE_CEILING_HEIGHT = 900  # Tier 1 (compressed: was 56_000)
 
 # ─────────────────────────────────────────────────────────────────────
