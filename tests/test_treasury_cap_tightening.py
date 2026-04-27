@@ -107,7 +107,7 @@ class TestCapTighteningConstants(unittest.TestCase):
         self.assertTrue(hasattr(config, "TREASURY_CAP_TIGHTEN_HEIGHT"))
         # Tier 1 of the canonical fork schedule (see CLAUDE.md).
         # Compressed in 1.11.0 from 52_000 to 1200 — see CHANGELOG.
-        self.assertEqual(config.TREASURY_CAP_TIGHTEN_HEIGHT, 1200)
+        self.assertEqual(config.TREASURY_CAP_TIGHTEN_HEIGHT, 703)
 
     def test_helper_returns_legacy_bps_pre_activation(self):
         self.assertEqual(

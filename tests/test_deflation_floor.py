@@ -208,14 +208,21 @@ class TestBoostUnwind(unittest.TestCase):
 
     def test_supply_drops_back_below_floor_boost_resumes(self):
         """Bidirectional: boost can kick in, unwind, and kick in again
-        in a subsequent cycle.  Not path-dependent."""
+        in a subsequent cycle.  Not path-dependent.
+
+        Both calls pin to POST_ACTIVATION_HEIGHT (V1 only) — the
+        post-1.26.0 fork sweep places DEFLATION_FLOOR_V2_HEIGHT one
+        block past V1, so POST+1 lands on V2 territory where the
+        rebate model supersedes the V1 multiplier.  Same-height,
+        different-supply preserves the boost-resume invariant.
+        """
         supply = SupplyTracker()
         supply.total_supply = TARGET_CIRCULATING_SUPPLY_FLOOR + 1
         r1 = supply.calculate_block_reward(POST_ACTIVATION_HEIGHT)
         self.assertEqual(r1, BLOCK_REWARD)
 
         supply.total_supply = TARGET_CIRCULATING_SUPPLY_FLOOR - 1
-        r2 = supply.calculate_block_reward(POST_ACTIVATION_HEIGHT + 1)
+        r2 = supply.calculate_block_reward(POST_ACTIVATION_HEIGHT)
         self.assertEqual(r2, BLOCK_REWARD * DEFLATION_ISSUANCE_MULTIPLIER)
 
 

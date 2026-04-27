@@ -51,6 +51,19 @@ PRE_FIX_HEIGHT = ATTESTER_CAP_FIX_HEIGHT - 1       # old (broken) formula
 POST_FIX_HEIGHT = ATTESTER_CAP_FIX_HEIGHT          # new (issuance-only) formula
 
 
+def _post_fix_epoch_start() -> int:
+    """Return the first epoch start at-or-after POST_FIX_HEIGHT.
+
+    Pre-1.26.0 the canonical fork heights were placed on epoch
+    boundaries (e.g. 2300), so `(POST_FIX // INTERVAL) * INTERVAL`
+    coincided with POST_FIX itself.  After the 1.26.0 fork sweep the
+    activation heights cluster at 700-720 and may not land on an
+    epoch boundary; round UP so the helper still returns a height
+    where FIX is unambiguously active across the whole epoch.
+    """
+    return ((POST_FIX_HEIGHT - 1) // FINALITY_INTERVAL + 1) * FINALITY_INTERVAL
+
+
 def _make_committee(n: int) -> list[bytes]:
     out: list[bytes] = []
     i = 0
@@ -121,16 +134,17 @@ class TestPostFixIssuanceOnlyCap(unittest.TestCase):
         # Large fee pool — would inflate old cap to 512+
         supply.attester_fee_pool_this_block = 500
 
-        # Pre-seed tracker to 11 (cap-1).
-        epoch_start = (
-            (POST_FIX_HEIGHT // FINALITY_INTERVAL) * FINALITY_INTERVAL
-        )
+        # Pre-seed tracker to 11 (cap-1).  Mint at the first block of
+        # the post-fix epoch so the tracker's epoch_start matches
+        # mint's epoch (the in-place tracker would otherwise reset on
+        # epoch boundary and the pre-seed would be discarded).
+        epoch_start = _post_fix_epoch_start()
         supply.attester_epoch_earnings_start = epoch_start
         supply.attester_epoch_earnings = {eid: 11 for eid in committee}
 
         supply.mint_block_reward(
             proposer,
-            block_height=POST_FIX_HEIGHT,
+            block_height=epoch_start,
             attester_committee=committee,
         )
         # cap_per_entity = 12; earned = 11; available = 1; credit = 1.
@@ -155,10 +169,10 @@ class TestPostFixIssuanceOnlyCap(unittest.TestCase):
             for eid in [proposer, *committee, TREASURY_ENTITY_ID]:
                 supply.balances[eid] = 0
             supply.attester_fee_pool_this_block = fee_pool
-            # Pre-seed at cap so the NEXT credit is cap-bound.
-            epoch_start = (
-                (POST_FIX_HEIGHT // FINALITY_INTERVAL) * FINALITY_INTERVAL
-            )
+            # Pre-seed at cap so the NEXT credit is cap-bound.  Mint
+            # at the first block of the post-fix epoch so the tracker
+            # doesn't reset across an epoch boundary.
+            epoch_start = _post_fix_epoch_start()
             supply.attester_epoch_earnings_start = epoch_start
             supply.attester_epoch_earnings = {
                 eid: expected_cap for eid in committee
@@ -166,7 +180,7 @@ class TestPostFixIssuanceOnlyCap(unittest.TestCase):
 
             supply.mint_block_reward(
                 proposer,
-                block_height=POST_FIX_HEIGHT,
+                block_height=epoch_start,
                 attester_committee=committee,
             )
             # Tracker pinned at cap regardless of fee_pool.
@@ -188,9 +202,7 @@ class TestPathIndependence(unittest.TestCase):
         committee = _make_committee(128)
         for eid in [proposer, *committee, TREASURY_ENTITY_ID]:
             supply.balances[eid] = 0
-        epoch_start = (
-            (POST_FIX_HEIGHT // FINALITY_INTERVAL) * FINALITY_INTERVAL
-        )
+        epoch_start = _post_fix_epoch_start()
         for i, fee_pool in enumerate(fee_sequence):
             supply.attester_fee_pool_this_block = fee_pool
             supply.mint_block_reward(
@@ -257,9 +269,7 @@ class TestActivationBoundary(unittest.TestCase):
         committee = _make_committee(128)
         for eid in [proposer, *committee, TREASURY_ENTITY_ID]:
             supply.balances[eid] = 0
-        epoch_start = (
-            (POST_FIX_HEIGHT // FINALITY_INTERVAL) * FINALITY_INTERVAL
-        )
+        epoch_start = _post_fix_epoch_start()
         # Mint 3 blocks each with per_slot=4.  After each, earnings
         # increment by 4 → 4, 8, 12.
         for offset in range(3):

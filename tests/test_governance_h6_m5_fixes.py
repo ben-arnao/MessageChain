@@ -32,6 +32,39 @@ from messagechain.config import (
     GOVERNANCE_VOTING_WINDOW,
     TREASURY_ENTITY_ID,
 )
+from messagechain import config as _config
+
+
+_BYPASSED_HEIGHTS = (
+    "TREASURY_CAP_TIGHTEN_HEIGHT",
+    "TREASURY_REBASE_HEIGHT",
+    "DEFLATION_FLOOR_HEIGHT",
+    "DEFLATION_FLOOR_V2_HEIGHT",
+    "PROPOSAL_FEE_TIER19_HEIGHT",
+    "VOTER_REWARD_HEIGHT",
+)
+
+
+class _TreasuryCapBypass:
+    """Pin every non-bootstrap fork height far in the future for the
+    test's duration.  Post-1.26.0 fork sweep these activations cluster
+    at 700-720 and fire on the close block of the test's voting
+    window, perturbing balances the test pre-seeds.  The original
+    schedule put the close block well before any of these forks; we
+    restore that property for the test only."""
+
+    def __enter__(self):
+        self._orig = {
+            n: getattr(_config, n) for n in _BYPASSED_HEIGHTS
+        }
+        for n in _BYPASSED_HEIGHTS:
+            setattr(_config, n, 10_000_000)
+        return self
+
+    def __exit__(self, *exc):
+        for n, v in self._orig.items():
+            setattr(_config, n, v)
+        return False
 
 
 def _make_block(block_number: int, proposer_id: bytes, governance_txs: list):
@@ -55,6 +88,7 @@ class TestH6SlashedVoterWeightZeroedInBindingTally(unittest.TestCase):
     def setUp(self):
         for e in (self.alice, self.bob, self.carol):
             e.keypair._next_leaf = 0
+        self._cap_bypass = _TreasuryCapBypass().__enter__()
         self.supply = SupplyTracker()
         # Attack scenario: Bob holds a huge malicious stake, Alice and
         # Carol are honest.  Bob alone exceeds 2/3 — so if his pre-slash
@@ -68,6 +102,9 @@ class TestH6SlashedVoterWeightZeroedInBindingTally(unittest.TestCase):
         # Treasury has 100k.
         self.supply.balances[TREASURY_ENTITY_ID] = 100_000
         self.tracker = GovernanceTracker()
+
+    def tearDown(self):
+        self._cap_bypass.__exit__(None, None, None)
 
     def test_slashed_voter_contributes_zero_to_binding_tally(self):
         """A treasury spend needs >2/3 of eligible to pass.  If a malicious
@@ -178,12 +215,16 @@ class TestM5SameBlockTreasurySpendOrdering(unittest.TestCase):
     def setUp(self):
         for e in (self.alice, self.bob, self.carol):
             e.keypair._next_leaf = 0
+        self._cap_bypass = _TreasuryCapBypass().__enter__()
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         for e in (self.alice, self.bob, self.carol):
             self.chain.supply.balances[e.entity_id] = 1_000_000
             self.chain.public_keys[e.entity_id] = e.public_key
             self.chain.supply.staked[e.entity_id] = 10_000
+
+    def tearDown(self):
+        self._cap_bypass.__exit__(None, None, None)
 
     def _both_spends_close_same_block(self, treasury_budget: int, each: int):
         """Set up two distinct treasury-spend proposals created at the

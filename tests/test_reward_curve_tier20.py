@@ -38,13 +38,17 @@ class TestRewardCurveActivation(unittest.TestCase):
         # invariant visible to anyone reading the test suite.
         self.assertGreater(REWARD_CURVE_HEIGHT, PROPOSAL_FEE_TIER19_HEIGHT)
 
-    def test_runway_at_least_2000_blocks(self):
-        # ~14 days at 600 s/block — operators need time to upgrade
-        # past the prior fork before the new reward distribution
-        # starts biting.  The 2000-block runway is the same shape
-        # used for Tier 18 → Tier 19.
+    def test_runway_at_least_one_block(self):
+        # Original runway was ~2000 blocks (~14 days at 600s) so
+        # operators had time to upgrade past Tier 19 before the
+        # new reward distribution started biting.  1.26.0 collapses
+        # the entire fork schedule into a tight near-tip window
+        # (mainnet has zero non-operator users), so the only
+        # remaining invariant here is strict ordering — the actual
+        # rollout runway lives in the release/upgrade workflow now,
+        # not in inter-fork height gaps.
         self.assertGreaterEqual(
-            REWARD_CURVE_HEIGHT - PROPOSAL_FEE_TIER19_HEIGHT, 2000,
+            REWARD_CURVE_HEIGHT - PROPOSAL_FEE_TIER19_HEIGHT, 1,
         )
 
 

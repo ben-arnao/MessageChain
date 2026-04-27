@@ -757,7 +757,7 @@ LEAF_INDEX_FILENAME = "leaf_index.json"
 # convention shared with the other pending forks.
 VALIDATOR_MIN_STAKE = 100                # LEGACY — see get_validator_min_stake
 VALIDATOR_MIN_STAKE_POST_RAISE = 10_000  # 0.007% of 140M supply
-MIN_STAKE_RAISE_HEIGHT = 1000  # Tier 2 (compressed: was 60_000)
+MIN_STAKE_RAISE_HEIGHT = 701  # Tier 2 — fast-forwarded for 1.26.0 hard fork sweep
 
 
 def get_validator_min_stake(block_height: int) -> int:
@@ -848,7 +848,7 @@ LOTTERY_INTERVAL = 144       # blocks (~1 day at 600s)
 # to mainnet.
 LOTTERY_BOUNTY = 100                 # LEGACY — see get_lottery_bounty
 LOTTERY_BOUNTY_POST_RAISE = 5_000
-LOTTERY_BOUNTY_RAISE_HEIGHT = 1100  # Tier 2 (compressed: was 62_000)
+LOTTERY_BOUNTY_RAISE_HEIGHT = 702  # Tier 2 — fast-forwarded for 1.26.0 hard fork sweep
 
 
 def get_lottery_bounty(block_height: int) -> int:
@@ -2520,7 +2520,7 @@ FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
 # finality-weight credit, the reward is a bonus not a gate on
 # participation.  Operators MUST replace this placeholder with a
 # concrete coordinated-fork height before deploying to mainnet.
-ATTESTER_REWARD_SPLIT_HEIGHT = 1700  # Tier 4 (compressed: was 78_000)
+ATTESTER_REWARD_SPLIT_HEIGHT = 706  # Tier 4 — fast-forwarded for 1.26.0 hard fork sweep
 
 # Target attester committee size post-activation.  Decoupled from the
 # per-block reward pool so a floor-era reward budget (3 tokens/block
@@ -2563,7 +2563,7 @@ ATTESTER_COMMITTEE_TARGET_SIZE = 128
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-TREASURY_REBASE_HEIGHT = 1300  # Tier 3 (compressed: was 68_000)
+TREASURY_REBASE_HEIGHT = 704  # Tier 3 — fast-forwarded for 1.26.0 hard fork sweep
 TREASURY_REBASE_BURN_AMOUNT = 33_000_000  # 40M - 33M = 7M ≈ 5% of 140M
 TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # LEGACY — see get_treasury_max_spend_bps_per_epoch
 TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
@@ -2610,7 +2610,7 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 TREASURY_MAX_SPEND_BPS_PER_EPOCH_POST_TIGHTEN = 10    # 0.1% per 100-block epoch
 TREASURY_MAX_SPEND_BPS_PER_YEAR = 500                 # 5% per rolling-year window
 TREASURY_SPEND_CAP_YEAR_BLOCKS = 52_560               # 365 days at 600s (≈1yr)
-TREASURY_CAP_TIGHTEN_HEIGHT = 1200                    # Tier 1 semantically.  Constraints:
+TREASURY_CAP_TIGHTEN_HEIGHT = 703                     # Tier 1 — fast-forwarded for 1.26.0 hard fork sweep.  Constraints:
                                                       # (1) > GOVERNANCE_VOTING_WINDOW (1008) so
                                                       # existing treasury-spend tests with ~1014
                                                       # close-blocks don't trip the new 5%-annual
@@ -2690,7 +2690,7 @@ assert TREASURY_SPEND_CAP_YEAR_BLOCKS > TREASURY_SPEND_CAP_EPOCH_BLOCKS, (
 # is independent of other *_HEIGHT forks even though it shares the
 # same placeholder value.
 ATTESTER_FEE_SHARE_BPS = 5000           # 50% of base-fee burn → attester pool
-ATTESTER_FEE_FUNDING_HEIGHT = 1800  # Tier 4 (compressed: was 80_000)
+ATTESTER_FEE_FUNDING_HEIGHT = 707  # Tier 4 — fast-forwarded for 1.26.0 hard fork sweep
 
 # ─────────────────────────────────────────────────────────────────────
 # Per-entity attester-reward cap per epoch (hard fork)
@@ -2734,7 +2734,7 @@ PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH = 100  # 1% of epoch pool
 # Tier 4.  Activates after ATTESTER_REWARD_SPLIT_HEIGHT (78,000) and
 # ATTESTER_FEE_FUNDING_HEIGHT (80,000) so the cap operates on the
 # post-split, fee-funded pool.
-ATTESTER_REWARD_CAP_HEIGHT = 2000  # Tier 4 (compressed: was 84_000)
+ATTESTER_REWARD_CAP_HEIGHT = 709  # Tier 4 — fast-forwarded for 1.26.0 hard fork sweep
 
 assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
     "cap must be a positive basis-point fraction <= 100%"
@@ -2771,7 +2771,7 @@ assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
 # coordinated-fork height before deploying to mainnet.  The height
 # is independent of ATTESTER_FEE_FUNDING_HEIGHT even though it
 # shares the same placeholder value.
-FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 1900  # Tier 4 (compressed: was 82_000; must follow FINALITY_VOTE_CAP_HEIGHT)
+FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 708  # Tier 4 — fast-forwarded for 1.26.0 hard fork sweep (must follow FINALITY_VOTE_CAP_HEIGHT)
 
 # ─────────────────────────────────────────────────────────────────────
 # Finality-vote apply-path clamp (defense-in-depth, hard fork)
@@ -2793,7 +2793,7 @@ FINALITY_REWARD_FROM_ISSUANCE_HEIGHT = 1900  # Tier 4 (compressed: was 82_000; m
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploying to mainnet.
-FINALITY_VOTE_CAP_HEIGHT = 800  # Tier 1 (compressed: was 54_000; defensive cap MUST activate before direct-mint)
+FINALITY_VOTE_CAP_HEIGHT = 700  # Tier 1 — fast-forwarded for 1.26.0 hard fork sweep
 
 # ─────────────────────────────────────────────────────────────────────
 # Seed-validator stake ceiling (founder re-stake defense, hard fork)
@@ -2887,7 +2887,7 @@ DEFLATION_ISSUANCE_MULTIPLIER = 2
 
 # Activation — operators must replace with a concrete coordinated
 # height before deploy.
-DEFLATION_FLOOR_HEIGHT = 2500  # Tier 5 (compressed: was 90_000; legacy v1; superseded by v2)
+DEFLATION_FLOOR_HEIGHT = 711  # Tier 5 — fast-forwarded for 1.26.0 hard fork sweep (legacy v1; superseded by v2)
 
 # ─────────────────────────────────────────────────────────────────────
 # Fee-responsive deflation floor (v2 hard fork)
@@ -2928,7 +2928,7 @@ DEFLATION_FLOOR_HEIGHT = 2500  # Tier 5 (compressed: was 90_000; legacy v1; supe
 # coordinated-fork height before deploy.
 DEFLATION_REBATE_BPS = 7000                 # 70% rebate share
 DEFLATION_REBATE_WINDOW_BLOCKS = 1000       # ~1 week at 600s/block
-DEFLATION_FLOOR_V2_HEIGHT = 2600            # Tier 5 (compressed: was 92_000; must follow DEFLATION_FLOOR_HEIGHT)
+DEFLATION_FLOOR_V2_HEIGHT = 712             # Tier 5 — fast-forwarded for 1.26.0 hard fork sweep (must follow DEFLATION_FLOOR_HEIGHT)
 
 assert 0 < DEFLATION_REBATE_BPS <= 10_000, (
     "DEFLATION_REBATE_BPS must be a non-empty fraction <= 100%"
@@ -2968,7 +2968,7 @@ assert DEFLATION_REBATE_WINDOW_BLOCKS > 0, (
 #
 # Operators MUST replace the placeholder height with a concrete
 # coordinated-fork height before deploy.
-ATTESTER_CAP_FIX_HEIGHT = 2300              # Tier 4 (compressed: was 86_000; must follow ATTESTER_REWARD_CAP_HEIGHT with 300-block gap so pre-fix-window tests have room)
+ATTESTER_CAP_FIX_HEIGHT = 710               # Tier 4 — fast-forwarded for 1.26.0 hard fork sweep (must follow ATTESTER_REWARD_CAP_HEIGHT)
 
 # ─────────────────────────────────────────────────────────────────────
 # Validator registration burn (hard fork)
@@ -3008,7 +3008,7 @@ ATTESTER_CAP_FIX_HEIGHT = 2300              # Tier 4 (compressed: was 86_000; mu
 # independent of other *_HEIGHT forks even though it shares the
 # placeholder spacing convention (current_height + 50_000).
 VALIDATOR_REGISTRATION_BURN = 10_000
-VALIDATOR_REGISTRATION_BURN_HEIGHT = 2700  # Tier 6 (compressed: was 96_000; must follow MIN_STAKE_RAISE_HEIGHT)
+VALIDATOR_REGISTRATION_BURN_HEIGHT = 713  # Tier 6 — fast-forwarded for 1.26.0 hard fork sweep (must follow MIN_STAKE_RAISE_HEIGHT)
 
 assert VALIDATOR_REGISTRATION_BURN > 0, (
     "registration burn must be positive — zero disables sybil defense"
@@ -3203,7 +3203,7 @@ FIRST_SEND_PUBKEY_HEIGHT = 500           # Tier 11 (bootstrap-compressed)
 # clean — a CJK user gets ~341 chars for the same byte budget an
 # English user gets 1024 chars; each pays per byte for the storage
 # they actually pin to permanent state.
-INTL_MESSAGE_HEIGHT = 1500              # Tier 12
+INTL_MESSAGE_HEIGHT = 705               # Tier 12 — fast-forwarded for 1.26.0 hard fork sweep
 
 # Tier 13 (Fork 1, audit finding #2): validator version signaling.
 # At/after VERSION_SIGNALING_HEIGHT, blocks serialize under V2 wire
@@ -3455,7 +3455,7 @@ assert REACT_TX_HEIGHT > MARKET_FEE_FLOOR_HEIGHT, (
 #
 # Activation: rides above Tier 17 (REACT_TX_HEIGHT = 9000) with a
 # ~2000-block runway (~14 days at 600 s/block).
-TIER_18_HEIGHT = 11000
+TIER_18_HEIGHT = 714  # Tier 18 — fast-forwarded for 1.26.0 hard fork sweep
 
 # Unified per-block byte ceiling for the fee-bearing tx kinds.
 #
@@ -3521,7 +3521,7 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
 # Activation: rides above Tier 19 (PROPOSAL_FEE_TIER19_HEIGHT = 13000)
 # with a ~2000-block runway (~14 days at 600 s/block), giving
 # operators time to acknowledge the new slashing semantics.
-SOFT_SLASH_HEIGHT = 15000  # Tier 20
+SOFT_SLASH_HEIGHT = 716  # Tier 20 — fast-forwarded for 1.26.0 hard fork sweep
 SOFT_SLASH_PCT = 5  # % of stake/escrow/pending burned per equivocation post-fork
 
 
@@ -3574,7 +3574,7 @@ assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
 # (HALVING_INTERVAL=210_240) so the new logic is in place long before
 # the failure mode could manifest.  Sits above Tier 20 with the same
 # ~2000-block runway pattern.
-PROPOSER_CAP_HALVING_HEIGHT = 17000  # Tier 21
+PROPOSER_CAP_HALVING_HEIGHT = 718  # Tier 21 — fast-forwarded for 1.26.0 hard fork sweep
 
 # ─────────────────────────────────────────────────────────────────────
 # Tier 22 — Voter rewards on passed proposals
@@ -3628,7 +3628,7 @@ PROPOSER_CAP_HALVING_HEIGHT = 17000  # Tier 21
 # runway pattern.  Pre-fork proposals close with no payout; their
 # voter_reward_pool stays 0 by construction (the surcharge debit is
 # height-gated).
-VOTER_REWARD_HEIGHT = 19_000  # Tier 22
+VOTER_REWARD_HEIGHT = 719  # Tier 22 — fast-forwarded for 1.26.0 hard fork sweep
 VOTER_REWARD_SURCHARGE = 50_000        # tokens escrowed per post-fork proposal
 VOTER_REWARD_MAX_SHARE_BPS = 2_500     # cap on single-voter share (25%)
 
@@ -3710,7 +3710,7 @@ assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
 # latter two live in messagechain.governance.governance) remain the
 # active rule pre-fork so historical blocks replay byte-for-byte
 # under the rule current at their height.
-PROPOSAL_FEE_TIER19_HEIGHT = 13_000  # Tier 19
+PROPOSAL_FEE_TIER19_HEIGHT = 715  # Tier 19 — fast-forwarded for 1.26.0 hard fork sweep
 GOVERNANCE_PROPOSAL_FEE_TIER19 = 100_000
 GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 = 50
 MAX_PROPOSAL_TITLE_BYTES_TIER19 = 200
@@ -3782,7 +3782,7 @@ MAX_PROPOSAL_DESCRIPTION_BYTES_TIER19 = 2_000
 #
 # Activation: HONESTY_CURVE_HEIGHT = 21000, riding above Tier 22
 # (VOTER_REWARD_HEIGHT = 19000) with the standard ~2000-block runway.
-HONESTY_CURVE_HEIGHT = 21_000  # Tier 23
+HONESTY_CURVE_HEIGHT = 720  # Tier 23 — fast-forwarded for 1.26.0 hard fork sweep
 
 # Severity-curve tuning knobs.  Anchored *shape* is "small AMBIGUOUS
 # baseline + escalation per repeat + relief from honest history",
@@ -3919,7 +3919,7 @@ assert GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 > 0, (
 # with a ~2000-block runway (~14 days at 600 s/block) so operators
 # upgrade through the prior fork before the new reward distribution
 # starts.
-REWARD_CURVE_HEIGHT = 15_000  # Tier 20
+REWARD_CURVE_HEIGHT = 717  # Tier 20 (reward curve) — fast-forwarded for 1.26.0 hard fork sweep
 
 # Stake-share thresholds in basis points (1 bp = 0.01%, so 50 bp = 0.5%
 # and 500 bp = 5%).  Defined as bp ints to keep the curve evaluable in

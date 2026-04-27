@@ -90,7 +90,7 @@ class TestRebaseConstants(unittest.TestCase):
         self.assertTrue(hasattr(config, "TREASURY_REBASE_HEIGHT"))
         # Tier 3 of the canonical fork schedule (see CLAUDE.md).
         # Compressed in 1.11.0 from 68_000 to 1300 — see CHANGELOG.
-        self.assertEqual(config.TREASURY_REBASE_HEIGHT, 1300)
+        self.assertEqual(config.TREASURY_REBASE_HEIGHT, 704)
 
     def test_spend_cap_constant(self):
         self.assertTrue(hasattr(config, "TREASURY_MAX_SPEND_BPS_PER_EPOCH"))

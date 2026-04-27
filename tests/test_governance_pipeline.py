@@ -28,6 +28,7 @@ from messagechain.config import (
     GOVERNANCE_VOTING_WINDOW, GOVERNANCE_PROPOSAL_FEE,
     GOVERNANCE_VOTE_FEE, TREASURY_ENTITY_ID,
 )
+from messagechain import config as _config
 
 
 def _make_block(block_number: int, proposer_id: bytes, governance_txs: list):
@@ -50,6 +51,24 @@ class TestGovernancePipeline(unittest.TestCase):
     def setUp(self):
         for e in (self.alice, self.bob, self.carol):
             e.keypair._next_leaf = 0
+        # Pin every non-bootstrap fork height past the test's
+        # close_block — post-1.26.0 fork sweep clusters them all at
+        # 700-720, which is well before the post-voting-window close
+        # block (~1014).  Treasury rebase + cap-tighten in particular
+        # would perturb the seeded treasury before the spend runs.
+        self._orig_heights = {
+            n: getattr(_config, n)
+            for n in (
+                "TREASURY_CAP_TIGHTEN_HEIGHT",
+                "TREASURY_REBASE_HEIGHT",
+                "DEFLATION_FLOOR_HEIGHT",
+                "DEFLATION_FLOOR_V2_HEIGHT",
+                "PROPOSAL_FEE_TIER19_HEIGHT",
+                "VOTER_REWARD_HEIGHT",
+            )
+        }
+        for n in self._orig_heights:
+            setattr(_config, n, 10_000_000)
         self.chain = Blockchain()
         self.chain.initialize_genesis(self.alice)
         # Give each entity enough liquid balance to pay fees
@@ -59,6 +78,10 @@ class TestGovernancePipeline(unittest.TestCase):
         # Stake all three so they have governance voting power
         for e in (self.alice, self.bob, self.carol):
             self.chain.supply.staked[e.entity_id] = 10_000
+
+    def tearDown(self):
+        for n, v in self._orig_heights.items():
+            setattr(_config, n, v)
 
     def test_proposal_and_vote_flow_registers_state(self):
         proposal = create_proposal(

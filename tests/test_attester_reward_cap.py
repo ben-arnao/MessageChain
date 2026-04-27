@@ -51,6 +51,25 @@ POST_ACTIVATION_HEIGHT = max(
 )
 
 
+class _CapFixBypass:
+    """Pin ATTESTER_CAP_FIX_HEIGHT far in the future for the test.
+    Post-1.26.0 fork sweep collapses the gap between
+    ATTESTER_REWARD_CAP_HEIGHT and ATTESTER_CAP_FIX_HEIGHT to a
+    single block, so any test exercising PRE-FIX cap semantics in
+    a mid-epoch block needs the cap-fix gate held off."""
+
+    def __enter__(self):
+        from messagechain import config as _config
+        self._mod = _config
+        self._orig = _config.ATTESTER_CAP_FIX_HEIGHT
+        _config.ATTESTER_CAP_FIX_HEIGHT = 10_000_000
+        return self
+
+    def __exit__(self, *exc):
+        self._mod.ATTESTER_CAP_FIX_HEIGHT = self._orig
+        return False
+
+
 def _make_committee(n: int) -> list[bytes]:
     """Deterministic list of n distinct 32-byte IDs avoiding the
     proposer ID 0x70 ('p') used throughout this file."""
@@ -177,6 +196,10 @@ class TestAccumulationAcrossEpochHitsCap(unittest.TestCase):
         """Seed an entity at exactly cap-minus-one, mint one more
         block, verify only the leftover 1 token credits and the rest
         burns."""
+        with _CapFixBypass():
+            self._run_accumulation_and_cap_burn()
+
+    def _run_accumulation_and_cap_burn(self):
         supply = SupplyTracker()
         proposer = b"p" * 32
         # Choose a height that is NOT the first block of its epoch so

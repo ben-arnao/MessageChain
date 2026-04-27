@@ -4,6 +4,79 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.26.0] — 2026-04-27
+
+### Hard fork — fast-forwarded ALL non-bootstrap activation heights
+
+The mainnet has zero non-operator users at the moment, so we're
+collapsing the entire forward-fork schedule into a tight cluster
+just past the current tip (≈668).  Twenty-one separate Tier 1–23
+activations that previously ranged from height 800 to 21,000 now
+all activate within a single ~20-block window starting at 700.
+Every fork that was scheduled past current tip is in this sweep
+EXCEPT the bootstrap-related ones — `SEED_STAKE_CEILING_HEIGHT`,
+`SEED_DIVESTMENT_RETUNE_HEIGHT`, `SEED_DIVESTMENT_REDIST_HEIGHT`,
+`SEED_DIVESTMENT_START_HEIGHT`, `SEED_DIVESTMENT_END_HEIGHT`, and
+`BOOTSTRAP_END_HEIGHT` are unchanged.  Replay determinism is
+unaffected — the chain has not crossed any of the touched heights.
+
+New activation heights (in original tier order):
+
+- `FINALITY_VOTE_CAP_HEIGHT` 800 → **700** (Tier 1)
+- `MIN_STAKE_RAISE_HEIGHT` 1000 → **701** (Tier 2)
+- `LOTTERY_BOUNTY_RAISE_HEIGHT` 1100 → **702** (Tier 2)
+- `TREASURY_CAP_TIGHTEN_HEIGHT` 1200 → **703** (Tier 1)
+- `TREASURY_REBASE_HEIGHT` 1300 → **704** (Tier 3)
+- `INTL_MESSAGE_HEIGHT` 1500 → **705** (Tier 12)
+- `ATTESTER_REWARD_SPLIT_HEIGHT` 1700 → **706** (Tier 4)
+- `ATTESTER_FEE_FUNDING_HEIGHT` 1800 → **707** (Tier 4)
+- `FINALITY_REWARD_FROM_ISSUANCE_HEIGHT` 1900 → **708** (Tier 4)
+- `ATTESTER_REWARD_CAP_HEIGHT` 2000 → **709** (Tier 4)
+- `ATTESTER_CAP_FIX_HEIGHT` 2300 → **710** (Tier 4)
+- `DEFLATION_FLOOR_HEIGHT` 2500 → **711** (Tier 5)
+- `DEFLATION_FLOOR_V2_HEIGHT` 2600 → **712** (Tier 5)
+- `VALIDATOR_REGISTRATION_BURN_HEIGHT` 2700 → **713** (Tier 6)
+- `TIER_18_HEIGHT` 11000 → **714** (Tier 18)
+- `PROPOSAL_FEE_TIER19_HEIGHT` 13000 → **715** (Tier 19)
+- `SOFT_SLASH_HEIGHT` 15000 → **716** (Tier 20)
+- `REWARD_CURVE_HEIGHT` 15000 → **717** (Tier 20)
+- `PROPOSER_CAP_HALVING_HEIGHT` 17000 → **718** (Tier 21)
+- `VOTER_REWARD_HEIGHT` 19000 → **719** (Tier 22)
+- `HONESTY_CURVE_HEIGHT` 21000 → **720** (Tier 23)
+
+### Test fixtures touched by the sweep
+
+Several tests were originally written assuming hundreds of blocks
+between adjacent fork heights.  With the schedule compressed,
+those windows shrink to a single block; tests are updated minimally:
+
+- `test_attester_cap_fix.py` uses a `_post_fix_epoch_start()`
+  helper that ceiling-divides to the first epoch entirely past
+  `ATTESTER_CAP_FIX_HEIGHT`, and mints at `epoch_start` instead of
+  the raw activation height so the per-epoch tracker's reset
+  doesn't fire mid-test.
+- `test_attester_reward_cap.py` wraps the cap-burn test in a
+  `_CapFixBypass` context manager that pins
+  `ATTESTER_CAP_FIX_HEIGHT` far in the future, since the test
+  exercises strictly PRE-fix behavior.
+- `test_governance_h6_m5_fixes.py` and `test_governance_pipeline.py`
+  bypass `TREASURY_CAP_TIGHTEN_HEIGHT`, `TREASURY_REBASE_HEIGHT`,
+  `DEFLATION_FLOOR_HEIGHT`, `DEFLATION_FLOOR_V2_HEIGHT`,
+  `PROPOSAL_FEE_TIER19_HEIGHT`, and `VOTER_REWARD_HEIGHT` for the
+  test's duration — these tests exercise the legacy uncapped
+  treasury-spend path and would be perturbed by the rebase-burn
+  firing on the close block.
+- `test_deflation_floor.py::test_supply_drops_back_below_floor_boost_resumes`
+  pins both calls to `POST_ACTIVATION_HEIGHT` (V1) instead of
+  `POST_ACTIVATION_HEIGHT + 1` (V2 territory) so V1 multiplier
+  semantics are testable in the now-1-block V1-only window.
+- `test_reward_curve_tier20.py` relaxes the runway lower bound
+  from 2000 to 1 — runway is now an operations property of the
+  release/upgrade flow, not an inter-fork height invariant.
+- Canonical-height assertions in `test_lottery_bounty_raise.py`,
+  `test_min_stake_raise.py`, `test_treasury_rebase.py`, and
+  `test_treasury_cap_tightening.py` updated to the new values.
+
 ## [1.25.2] — 2026-04-27
 
 UI release riding the live ReactTx + prev-pointer activation. No
