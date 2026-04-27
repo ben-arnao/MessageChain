@@ -342,6 +342,20 @@ class Blockchain:
         # rejection rule survives restart.  Loaded from disk in
         # _load_from_db; rehydrated empty for in-memory chains.
         self.finalized_checkpoints: FinalityCheckpoints = FinalityCheckpoints()
+        # Fork-emergency detector — observes every signature-verified
+        # FinalityVote (gossip-time AND block-apply-time) and flags
+        # heights where 2/3+ of stake has committed to a block hash this
+        # node does not have. Surfaces the "we're stuck on the wrong
+        # side of an unintentional hard fork" condition automatically;
+        # see messagechain.consensus.fork_emergency for the policy
+        # rationale (validator auto-halt safe; full-node auto-rewind
+        # opt-in via FORK_EMERGENCY_AUTO_RECOVERY).
+        from messagechain.consensus.fork_emergency import (
+            ForkEmergencyDetector,
+        )
+        self.fork_emergency_detector: ForkEmergencyDetector = (
+            ForkEmergencyDetector()
+        )
         # On-chain governance state: proposals, votes, and append-only
         # audit logs for executed binding outcomes.  Block processing
         # calls _apply_governance_block(block) which dispatches
@@ -3333,7 +3347,18 @@ class Blockchain:
         # equivocating, those rewards evaporate.  Tokens previously
         # credited to supply.balances are reclaimed via the supply
         # tracker's reduction path.
-        escrow_burned = self._escrow.slash_all(tx.evidence.offender_id)
+        #
+        # Tier 20 soft-slash gate: pre-fork the slash burns 100% (full
+        # wipe + permaban via slashed_validators).  Post-fork the slash
+        # is partial (SOFT_SLASH_PCT) and the offender stays in the
+        # validator set — only `_processed_evidence` dedupes so the
+        # SAME piece of evidence cannot land twice.  See config.py
+        # Tier 20 block for the operator-mistake-survivability rationale.
+        from messagechain.config import get_slash_pct
+        slash_pct = get_slash_pct(self.height)
+        escrow_burned = self._escrow.slash_all(
+            tx.evidence.offender_id, slash_pct=slash_pct,
+        )
         if escrow_burned > 0:
             # Reduce both balance (tokens were credited there at mint)
             # and total_supply (escrow-burn is a permanent destruction,
@@ -3349,15 +3374,21 @@ class Blockchain:
             self.supply.total_burned += escrow_burned
 
         slashed, finder_reward = self.supply.slash_validator(
-            tx.evidence.offender_id, tx.submitter_id
+            tx.evidence.offender_id, tx.submitter_id, slash_pct=slash_pct,
         )
-        self.slashed_validators.add(tx.evidence.offender_id)
         self._processed_evidence.add(tx.evidence.evidence_hash)
-        # Reputation reset: a slashed validator forfeits all accumulated
-        # reputation and re-enters the lottery pool (if at all) as a
-        # zero-reputation newcomer.  Prevents the "misbehave once, earn
-        # back your reputation from cached history" attack.
-        self._clear_reputation(tx.evidence.offender_id)
+        if slash_pct == 100:
+            # Pre-Tier 19 path: full burn + permanent ban.  The slashed
+            # validator set is consensus state — adding the offender
+            # here is what makes them ineligible for future block
+            # production / reward selection.
+            self.slashed_validators.add(tx.evidence.offender_id)
+            # Reputation reset: a slashed validator forfeits all
+            # accumulated reputation and re-enters the lottery pool
+            # (if at all) as a zero-reputation newcomer.  Prevents the
+            # "misbehave once, earn back your reputation from cached
+            # history" attack.
+            self._clear_reputation(tx.evidence.offender_id)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -4335,8 +4366,8 @@ class Blockchain:
             _SCALE = self._DIVESTMENT_SCALE
             # Activation-gated parameters — pre-RETUNE returns the
             # legacy (1M floor, 25% treasury, 0% lottery) values, RETUNE-
-            # era returns the retune (20M floor, 5% treasury, 0% lottery)
-            # values, and REDIST-era returns the redistribution (20M
+            # era returns the retune (10M floor, 5% treasury, 0% lottery)
+            # values, and REDIST-era returns the redistribution (10M
             # floor, 5% treasury, 45% lottery) values so sim/apply match
             # at every height across both fork boundaries.
             _SDRF, _sim_burn_bps, _SDT, _lottery_bps = _gsdp(block_height)
@@ -4422,10 +4453,26 @@ class Blockchain:
         from messagechain.config import (
             ATTESTER_REWARD_SPLIT_HEIGHT,
             ATTESTER_COMMITTEE_TARGET_SIZE,
+            PROPOSER_CAP_HALVING_HEIGHT,
         )
         reward = self.supply.calculate_block_reward(block_height)
         is_bootstrap = not any(s > 0 for s in sim_staked.values())
-        effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
+        # Mirror mint_block_reward's effective_cap selection.  Tier 19
+        # (PROPOSER_CAP_HALVING_HEIGHT) makes the cap track halvings:
+        # post-activation it is `reward * NUMERATOR // DENOMINATOR`
+        # rather than the import-time constant.  Pre-activation
+        # preserves byte-for-byte legacy behavior.  Any divergence
+        # here vs. mint_block_reward produces an "Invalid state_root"
+        # rejection on add_block.
+        if is_bootstrap:
+            effective_cap = reward
+        elif block_height >= PROPOSER_CAP_HALVING_HEIGHT:
+            effective_cap = (
+                reward * PROPOSER_REWARD_NUMERATOR
+                // PROPOSER_REWARD_DENOMINATOR
+            )
+        else:
+            effective_cap = PROPOSER_REWARD_CAP
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         attester_pool = reward - proposer_share
 
@@ -6083,6 +6130,14 @@ class Blockchain:
             stake_map = pinned
             signer_stake = stake_map.get(v.signer_entity_id, 0)
             total_stake = sum(stake_map.values())
+            # Feed the same vote into the fork-emergency detector. The
+            # block-apply path is the authoritative source of truth
+            # (signatures already verified by validate_block); gossip
+            # ingest also feeds via observe_finality_vote so emergencies
+            # surface BEFORE a bad fork's votes ever land in our blocks.
+            self._observe_vote_for_emergency(
+                v, signer_stake, total_stake, stake_map,
+            )
             crossed = self.finalized_checkpoints.add_vote(
                 v, signer_stake, total_stake,
             )
@@ -6114,6 +6169,60 @@ class Blockchain:
             if not hasattr(self, "_pending_finality_slashes"):
                 self._pending_finality_slashes = []
             self._pending_finality_slashes.extend(pending)
+
+    def _observe_vote_for_emergency(
+        self,
+        vote,
+        signer_stake: int,
+        total_stake: int,
+        stake_map: dict,
+    ) -> None:
+        """Feed one signature-verified FinalityVote into the detector.
+
+        Looks up the local block hash at the vote's target height so
+        the detector can flag a supermajority disagreement (or the
+        complete absence of a local block at that height). Tolerates
+        the height being beyond the chain tip — passes None for
+        local_hash, which the detector treats as "we don't have it
+        yet" and still allows an emergency once 2/3 of stake commits.
+        """
+        height = vote.target_block_number
+        if 0 <= height < len(self.chain):
+            local_hash = self.chain[height].block_hash
+        else:
+            local_hash = None
+        try:
+            self.fork_emergency_detector.observe_vote(
+                vote, signer_stake, total_stake, local_hash,
+            )
+        except Exception:
+            # Detector is advisory — never let it crash consensus.
+            logger.exception(
+                "ForkEmergencyDetector.observe_vote raised; ignoring",
+            )
+
+    def observe_finality_vote(self, vote) -> None:
+        """Public hook for gossip-layer callers to feed verified votes.
+
+        Network handler (`_handle_announce_finality_vote`) calls this
+        after signature verification so the detector sees votes BEFORE
+        they ever land in a block. Without this, an emergency would
+        only surface once a divergent fork's votes were embedded in
+        OUR blocks — much too late on a small mainnet where we may
+        ourselves be the minority producing the bad chain.
+
+        Looks up signer stake at the vote's target height using the
+        same pinned-snapshot rule as `_apply_finality_votes` so the
+        2/3 denominator matches consensus exactly.
+        """
+        height = vote.target_block_number
+        pinned = self._stake_snapshots.get(height)
+        stake_map = pinned if pinned is not None else dict(self.supply.staked)
+        signer_stake = stake_map.get(vote.signer_entity_id, 0)
+        total_stake = sum(stake_map.values())
+        self._observe_vote_for_emergency(
+            vote, signer_stake, total_stake, stake_map,
+        )
 
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
@@ -7663,14 +7772,14 @@ class Blockchain:
 
         # Seed stake ceiling (SEED_STAKE_CEILING_HEIGHT fork).  Without
         # this gate, after SEED_DIVESTMENT_END_HEIGHT drains the
-        # founder's seed to the 20M retention floor, nothing prevents
+        # founder's seed to the 10M retention floor, nothing prevents
         # the founder from buying / recovering tokens externally and
-        # re-staking them back above 20M — silently undoing the
+        # re-staking them back above the floor — silently undoing the
         # divestment's dilution effect.  At/after activation, any stake
         # tx whose entity is in `seed_entity_ids` is rejected when the
-        # resulting stake would exceed SEED_MAX_STAKE_CEILING (= 20M).
-        # Seeds may still stake UP TO 20M and unstake freely; the
-        # ceiling is permanent and does not lift after END.  Non-seed
+        # resulting stake would exceed SEED_MAX_STAKE_CEILING (= 10M).
+        # Seeds may still stake UP TO the ceiling and unstake freely;
+        # the ceiling is permanent and does not lift after END.  Non-seed
         # validators are unaffected.  Pre-activation: no ceiling check
         # (legacy behavior, byte-for-byte historical replay).
         from messagechain.config import (
@@ -7887,7 +7996,24 @@ class Blockchain:
             gtx, self.public_keys[sender], current_height=self.height + 1,
         ):
             return False, "Invalid signature or fields"
-        if not self.supply.can_afford_fee(sender, gtx.fee):
+        # Tier 22: post-fork proposal admission requires the proposer
+        # to also cover VOTER_REWARD_SURCHARGE on top of the regular
+        # tx fee.  Validation enforces affordability for fee +
+        # surcharge so apply-time can trust the surcharge debit will
+        # succeed.  Vote txs and treasury-spend txs are unchanged
+        # (only ProposalTransaction carries the surcharge).
+        from messagechain.config import (
+            VOTER_REWARD_HEIGHT,
+            VOTER_REWARD_SURCHARGE,
+        )
+        next_height = self.height + 1
+        required = gtx.fee
+        if (
+            isinstance(gtx, ProposalTransaction)
+            and next_height >= VOTER_REWARD_HEIGHT
+        ):
+            required += VOTER_REWARD_SURCHARGE
+        if not self.supply.can_afford_fee(sender, required):
             return False, (
                 f"Insufficient balance for fee {gtx.fee} "
                 f"from sender {sender.hex()[:16]}"
@@ -8619,7 +8745,7 @@ class Blockchain:
         split is activation-gated (see
         ``messagechain.config.get_seed_divestment_params``): pre-retune
         it is 75/25 against a 1M floor; post-retune it is 95/5 against
-        a 20M floor.  Outside that window this is a no-op.
+        a 10M floor.  Outside that window this is a no-op.
 
         Divestible = max(0, initial_seed_stake - retain_floor(block_height)).
         Only the excess above the floor is subject to divestment; the
@@ -8675,9 +8801,9 @@ class Blockchain:
         # Hard-fork-gated parameters (SEED_DIVESTMENT_RETUNE_HEIGHT
         # and SEED_DIVESTMENT_REDIST_HEIGHT): pre-RETUNE the legacy
         # (floor=1M, burn=75%, treasury=25%, lottery=0%) values apply
-        # byte-for-byte; RETUNE-era the retune (floor=20M, burn=95%,
+        # byte-for-byte; RETUNE-era the retune (floor=10M, burn=95%,
         # treasury=5%, lottery=0%) values apply; REDIST-era the
-        # redistribution (floor=20M, burn=50%, treasury=5%,
+        # redistribution (floor=10M, burn=50%, treasury=5%,
         # lottery=45%) values apply — the lottery share accumulates
         # in SupplyTracker.lottery_prize_pool for later payout via
         # the reputation-weighted lottery.  The sim path in
@@ -8926,13 +9052,22 @@ class Blockchain:
         # offender had built up also evaporate.  Matches the policy
         # from apply_slash_transaction (which is the other entry point
         # for slashing — kept semantically identical to avoid drift).
+        # Tier 20 soft-slash gate.  The block-apply path is the
+        # canonical second entry point for slashing and MUST stay
+        # semantically identical to apply_slash_transaction — any drift
+        # here vs. there means a slash applied via direct call diverges
+        # from a slash applied via block inclusion, breaking determinism.
+        from messagechain.config import get_slash_pct
+        slash_pct_for_block = get_slash_pct(block.header.block_number)
         for stx in block.slash_transactions:
             if not self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee):
                 logger.error(
                     f"Slash tx {stx.tx_hash.hex()[:16]} fee payment failed — skipping"
                 )
                 continue
-            escrow_burned = self._escrow.slash_all(stx.evidence.offender_id)
+            escrow_burned = self._escrow.slash_all(
+                stx.evidence.offender_id, slash_pct=slash_pct_for_block,
+            )
             if escrow_burned > 0:
                 cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
                 self.supply.balances[stx.evidence.offender_id] = max(
@@ -8940,11 +9075,19 @@ class Blockchain:
                 )
                 self.supply.total_supply -= escrow_burned
                 self.supply.total_burned += escrow_burned
-            self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
-            self.slashed_validators.add(stx.evidence.offender_id)
-            # Reputation reset: same policy as apply_slash_transaction;
-            # a slashed validator forfeits accumulated reputation.
-            self._clear_reputation(stx.evidence.offender_id)
+            self.supply.slash_validator(
+                stx.evidence.offender_id,
+                stx.submitter_id,
+                slash_pct=slash_pct_for_block,
+            )
+            if slash_pct_for_block == 100:
+                self.slashed_validators.add(stx.evidence.offender_id)
+                # Reputation reset: same policy as
+                # apply_slash_transaction; a slashed validator
+                # forfeits accumulated reputation.  Skipped post-fork
+                # because the offender stays in the set with reduced
+                # stake and continues to earn/lose reputation normally.
+                self._clear_reputation(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
@@ -10024,12 +10167,24 @@ class Blockchain:
             ProposalTransaction, VoteTransaction,
             TreasurySpendTransaction,
         )
-        from messagechain.config import GOVERNANCE_VOTING_WINDOW
+        from messagechain.config import (
+            GOVERNANCE_VOTING_WINDOW,
+            VOTER_REWARD_HEIGHT,
+            VOTER_REWARD_SURCHARGE,
+        )
 
         tracker = self.governance
         current_block = block.header.block_number
         proposer_id = block.header.proposer_id
         current_base_fee = self.supply.base_fee
+        # Tier 22: post-fork proposals carry a surcharge that escrows
+        # into a per-proposal voter-reward pool.  Pre-fork the
+        # surcharge is 0 so add_proposal stores voter_reward_pool=0
+        # exactly as before — historical replay is byte-identical.
+        voter_reward_active = current_block >= VOTER_REWARD_HEIGHT
+        proposal_surcharge = (
+            VOTER_REWARD_SURCHARGE if voter_reward_active else 0
+        )
 
         # Phase 1: register
         for gtx in block.governance_txs:
@@ -10041,8 +10196,29 @@ class Blockchain:
                         f"Governance proposal fee payment failed — skipping"
                     )
                     continue
+                # Tier 22: debit the voter-reward surcharge from the
+                # proposer's balance and escrow it on the proposal
+                # state.  No mint/burn here — the tokens stay in
+                # circulation, just sequestered until close.  Skip if
+                # the proposer can't afford it (validation should
+                # have rejected the tx in this case, but be defensive
+                # for replay paths that hit a partially-debited
+                # balance — better to skip the surcharge than to
+                # underflow).
+                escrow = 0
+                if proposal_surcharge > 0:
+                    if self.supply.get_balance(gtx.proposer_id) >= proposal_surcharge:
+                        self.supply.balances[gtx.proposer_id] -= proposal_surcharge
+                        escrow = proposal_surcharge
+                    else:
+                        logger.error(
+                            "Voter-reward surcharge debit failed — "
+                            "proposer balance insufficient post-fee; "
+                            "proposal escrows zero pool"
+                        )
                 tracker.add_proposal(
                     gtx, block_height=current_block, supply_tracker=self.supply,
+                    voter_reward_pool=escrow,
                 )
                 self._bump_watermark(gtx.proposer_id, gtx.signature.leaf_index)
             elif isinstance(gtx, VoteTransaction):
@@ -10074,6 +10250,22 @@ class Blockchain:
             tracker.execute_treasury_spend(
                 state.proposal, self.supply, current_block=current_block,
                 is_new_account=self._recipient_is_new,
+            )
+
+        # Phase 2.5: Tier 22 — finalize voter rewards for any proposal
+        # closing this block.  Distribute the per-proposal escrow
+        # pro-rata to live-stake yes-voters on pass, or burn the pool
+        # on fail.  Iterated in deterministic proposal_id order so
+        # state mutations are reproducible across nodes.  Pre-fork
+        # proposals carry voter_reward_pool == 0 and finalize is a
+        # no-op for them — historical replay is byte-identical.
+        closing = sorted(
+            pid for pid, state in tracker.proposals.items()
+            if current_block - state.created_at_block > GOVERNANCE_VOTING_WINDOW
+        )
+        for pid in closing:
+            tracker.finalize_voter_rewards(
+                pid, self.supply, current_block=current_block,
             )
 
         # Phase 3: prune
@@ -10548,6 +10740,25 @@ class Blockchain:
 
         # Process any orphan blocks that depend on this block
         self._process_orphans(block.block_hash)
+
+        # Auto-clear any fork-emergencies whose flagged height is now
+        # populated by the supermajority hash on our local chain.
+        # Cheap (bounded by the detector's tracked-height cap) and the
+        # only safe place to do it — after a successful append/reorg
+        # we know self.chain reflects the new state.
+        try:
+            self.fork_emergency_detector.recheck_after_chain_advance(
+                lambda h: (
+                    self.chain[h].block_hash
+                    if 0 <= h < len(self.chain)
+                    else None
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "fork_emergency_detector.recheck_after_chain_advance "
+                "raised; ignoring",
+            )
 
         return True, f"Block added (reward: {reward}, fees: {total_fees})"
 

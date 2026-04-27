@@ -3,10 +3,10 @@
 The faucet exists to close the receive-to-exist cold-start gap for
 fresh user wallets. These tests pin three things:
 
-  1. The three-layer rate limit (per-/24 IP, per-address, daily cap)
+  1. The two-layer rate limit (per-/24 IP cooldown, per-window cap)
      fires in the right order with the right error messages.
   2. State commits inside the lock so two concurrent requests cannot
-     squeeze past the daily cap.
+     squeeze past the window cap.
   3. The HTTP boundary correctly maps results into 200 / 4xx
      responses and surfaces the same error strings.
 """
@@ -22,14 +22,15 @@ from unittest.mock import MagicMock
 
 from messagechain.network.faucet import (
     FAUCET_DRIP,
+    FAUCET_WINDOW_SEC,
     FaucetState,
     _ip_cidr_24,
-    _utc_day,
+    _window_index,
 )
 
 
 def _mk_state(
-    daily_cap: int = 5, drip_amount: int = FAUCET_DRIP,
+    window_cap: int = 5, drip_amount: int = FAUCET_DRIP,
     pow_difficulty: int = 1,
 ):
     """Build a FaucetState with stub callbacks that always succeed.
@@ -54,7 +55,7 @@ def _mk_state(
         submit_callback=submit_cb,
         build_tx_callback=build_cb,
         drip_amount=drip_amount,
-        daily_cap=daily_cap,
+        window_cap=window_cap,
         pow_difficulty=pow_difficulty,
     ), submits
 
@@ -123,7 +124,7 @@ def _try_drip_with_pow(state, client_ip: str, address_hex: str):
 
     Mirrors what the HTTP layer does end-to-end.  Existing rate-limit
     tests use this so the PoW gate is satisfied and they can focus
-    on the per-IP / per-address / daily-cap behavior they care about.
+    on the per-IP / window-cap behavior they care about.
     """
     try:
         seed_hex, nonce = _solve_pow_for(state, address_hex)
@@ -158,30 +159,34 @@ class TestRateLimitOrdering(unittest.TestCase):
         self.assertIn("32 bytes", r.error)
 
     def test_first_drip_succeeds_and_decrements_counter(self):
-        st, submits = _mk_state(daily_cap=10)
+        st, submits = _mk_state(window_cap=10)
         r = _try_drip_with_pow(st, "1.2.3.4", "ab" * 32)
         self.assertTrue(r.ok, r.error)
         self.assertEqual(r.amount, FAUCET_DRIP)
-        self.assertEqual(r.remaining_today, 9)
+        self.assertEqual(r.remaining_window, 9)
         self.assertEqual(len(submits), 1)
 
-    def test_address_re_request_blocked(self):
-        st, submits = _mk_state(daily_cap=10)
+    def test_address_re_request_from_different_network_allowed(self):
+        """No per-address one-shot anymore: a fresh /24 with a fresh
+        challenge can re-claim the same address (subject only to the
+        window cap).  This is the deliberate change from the old
+        24h/lifetime-of-process gate -- with smaller drips and a 15-min
+        cycle, repeat claims are expected."""
+        st, submits = _mk_state(window_cap=10)
         addr = "ab" * 32
-        _try_drip_with_pow(st, "1.2.3.4", addr)
-        # Different IP, same address -> still blocked (one per address).
-        r = _try_drip_with_pow(st, "5.6.7.8", addr)
-        self.assertFalse(r.ok)
-        self.assertIn("already received", r.error)
-        self.assertEqual(len(submits), 1,
-            "second drip must not call submit")
+        r1 = _try_drip_with_pow(st, "1.2.3.4", addr)
+        self.assertTrue(r1.ok, r1.error)
+        # Different /24, same address -> allowed.
+        r2 = _try_drip_with_pow(st, "5.6.7.8", addr)
+        self.assertTrue(r2.ok, r2.error)
+        self.assertEqual(len(submits), 2)
 
     def test_per_24_ip_cooldown_blocks_neighbor_in_same_cidr(self):
         """1.2.3.4 and 1.2.3.99 share the /24, so the second drip
         is rejected with the cooldown message even though the address
         is different.
         """
-        st, _ = _mk_state(daily_cap=10)
+        st, _ = _mk_state(window_cap=10)
         _try_drip_with_pow(st, "1.2.3.4", "ab" * 32)
         r = _try_drip_with_pow(st, "1.2.3.99", "cd" * 32)
         self.assertFalse(r.ok)
@@ -189,29 +194,29 @@ class TestRateLimitOrdering(unittest.TestCase):
         self.assertIn("/24", r.error)
 
     def test_different_24_ip_is_allowed(self):
-        st, submits = _mk_state(daily_cap=10)
+        st, submits = _mk_state(window_cap=10)
         _try_drip_with_pow(st, "1.2.3.4", "ab" * 32)
         r = _try_drip_with_pow(st, "1.2.4.4", "cd" * 32)
         self.assertTrue(r.ok, r.error)
         self.assertEqual(len(submits), 2)
 
-    def test_daily_cap_hard_stop(self):
-        st, submits = _mk_state(daily_cap=2)
+    def test_window_cap_hard_stop(self):
+        st, submits = _mk_state(window_cap=2)
         # Three drips from three different /24s + addresses; third
         # must hit the cap.
         _try_drip_with_pow(st, "10.0.1.1", "11" * 32)
         _try_drip_with_pow(st, "10.0.2.1", "22" * 32)
         r = _try_drip_with_pow(st, "10.0.3.1", "33" * 32)
         self.assertFalse(r.ok)
-        self.assertIn("daily faucet cap", r.error)
-        self.assertEqual(r.remaining_today, 0)
+        self.assertIn("window cap", r.error)
+        self.assertEqual(r.remaining_window, 0)
         self.assertEqual(len(submits), 2,
             "submit must not run after cap is hit")
 
     def test_submit_failure_does_not_consume_quota(self):
-        """If the chain rejects the tx, the per-IP cooldown / cap /
-        per-address record must NOT be marked -- otherwise a
-        transient validator hiccup permanently locks out the user.
+        """If the chain rejects the tx, the per-IP cooldown / cap
+        must NOT be marked -- otherwise a transient validator hiccup
+        permanently locks out the user.
         """
         def submit_cb(tx_dict):
             return False, "Insufficient balance"
@@ -222,7 +227,7 @@ class TestRateLimitOrdering(unittest.TestCase):
         st = FaucetState(
             submit_callback=submit_cb,
             build_tx_callback=build_cb,
-            daily_cap=5,
+            window_cap=5,
             pow_difficulty=1,
         )
         addr = "ab" * 32
@@ -235,13 +240,13 @@ class TestRateLimitOrdering(unittest.TestCase):
         r2 = _try_drip_with_pow(st, "1.2.3.4", addr)
         self.assertTrue(r2.ok,
             "after a submit failure, a retry must be allowed")
-        self.assertEqual(r2.remaining_today, 4)
+        self.assertEqual(r2.remaining_window, 4)
 
 
 class TestConcurrentDrips(unittest.TestCase):
 
     def test_no_overshoot_under_burst(self):
-        """20 simultaneous threads requesting drips on a daily_cap=5
+        """20 simultaneous threads requesting drips on a window_cap=5
         faucet must yield exactly 5 successes -- the lock must
         serialize check + commit so the cap is never exceeded.
 
@@ -249,7 +254,7 @@ class TestConcurrentDrips(unittest.TestCase):
         serialize challenge issuance under contention anyway, and
         the test cares about cap correctness, not PoW concurrency).
         """
-        st, submits = _mk_state(daily_cap=5)
+        st, submits = _mk_state(window_cap=5)
 
         results = []
         addr_seq = [bytes([i]) * 32 for i in range(20)]
@@ -275,27 +280,27 @@ class TestConcurrentDrips(unittest.TestCase):
 
         successes = sum(1 for ok in results if ok)
         self.assertEqual(successes, 5,
-            f"daily cap of 5 must yield exactly 5 successes "
+            f"window cap of 5 must yield exactly 5 successes "
             f"under 20-way burst; got {successes}")
         self.assertEqual(len(submits), 5)
 
 
-class TestUtcDayRollover(unittest.TestCase):
+class TestWindowRollover(unittest.TestCase):
 
-    def test_counter_resets_at_utc_day_boundary(self):
-        st, _ = _mk_state(daily_cap=2)
-        # Pretend we are partway through day D with the cap exhausted.
-        st._day = _utc_day(time.time())
-        st._drips_today = 2
-        self.assertEqual(st.remaining_today(), 0)
+    def test_counter_resets_when_window_advances(self):
+        st, _ = _mk_state(window_cap=2)
+        # Pretend we are partway through window W with the cap exhausted.
+        st._window = _window_index(time.time(), st.window_sec)
+        st._drips_window = 2
+        self.assertEqual(st.remaining_window(), 0)
 
-        # Force the day forward by mutating _day; remaining_today()
-        # internally reads time.time() so we cannot drive that, but
-        # we can simulate a subsequent caller from "tomorrow" by
-        # calling the locked reset directly.
-        st._day -= 1  # make stored day "yesterday"
-        self.assertEqual(st.remaining_today(), 2,
-            "counter must reset when stored day != today")
+        # Simulate a subsequent caller from the next window by mutating
+        # the stored bucket index to "previous" -- the next
+        # remaining_window() call computes the current bucket from
+        # time.time() and rolls.
+        st._window -= 1
+        self.assertEqual(st.remaining_window(), 2,
+            "counter must reset when stored window != current")
 
 
 class TestIpCidr24Helper(unittest.TestCase):
@@ -311,6 +316,22 @@ class TestIpCidr24Helper(unittest.TestCase):
         self.assertEqual(_ip_cidr_24("not-an-ip"), "not-an-ip")
 
 
+class TestWindowIndexHelper(unittest.TestCase):
+
+    def test_buckets_align_to_window_grid(self):
+        # Two timestamps in the same window must hash to the same
+        # bucket; one second past the boundary must bump.
+        boundary = 1_700_000_000  # arbitrary epoch sec
+        boundary -= boundary % FAUCET_WINDOW_SEC  # snap down
+        b0 = _window_index(boundary, FAUCET_WINDOW_SEC)
+        b_end = _window_index(boundary + FAUCET_WINDOW_SEC - 1,
+                              FAUCET_WINDOW_SEC)
+        b_next = _window_index(boundary + FAUCET_WINDOW_SEC,
+                               FAUCET_WINDOW_SEC)
+        self.assertEqual(b0, b_end)
+        self.assertEqual(b_next, b0 + 1)
+
+
 class TestFaucetHTTPEndpoint(unittest.TestCase):
     """Spin up a real PublicFeedServer with a stub FaucetState and
     exercise POST /faucet over HTTP. Pins the response shape, status
@@ -321,7 +342,7 @@ class TestFaucetHTTPEndpoint(unittest.TestCase):
     def setUpClass(cls):
         from messagechain.network.public_feed_server import PublicFeedServer
 
-        cls.state, cls.submits = _mk_state(daily_cap=3)
+        cls.state, cls.submits = _mk_state(window_cap=3)
 
         # PublicFeedServer needs a blockchain; stub the bare attrs
         # _serve_info and the rate-limiter touch. _serve_latest is
@@ -347,21 +368,18 @@ class TestFaucetHTTPEndpoint(unittest.TestCase):
 
     def setUp(self):
         # FaucetState is class-scoped (so the bound TCP server can stay
-        # shared and tests run fast), but its rate-limit / cap / claimed
-        # state mutates per drip.  Without an explicit reset, test order
+        # shared and tests run fast), but its rate-limit / cap state
+        # mutates per drip.  Without an explicit reset, test order
         # determines outcomes -- e.g. a successful drip in one test
         # leaves the per-/24 cooldown set, and a later "wrong nonce"
         # test sees a cooldown-shaped 429 instead of the PoW-shaped 429
-        # it asserts on.  This used to "work" purely on xdist scheduling
-        # luck spreading tests across workers; perturbing the test count
-        # surfaced the latent ordering dependency.  Reset everything
-        # mutable here so each test starts from a clean rate-limit slate.
+        # it asserts on.  Reset everything mutable here so each test
+        # starts from a clean rate-limit slate.
         with self.state._lock:
             self.state._ip_last_drip.clear()
-            self.state._addresses_claimed.clear()
             self.state._pending_challenges.clear()
-            self.state._drips_today = 0
-            self.state._day = 0
+            self.state._drips_window = 0
+            self.state._window = 0
         self.submits.clear()
 
     def _get_challenge(self, address_hex: str):
@@ -419,6 +437,7 @@ class TestFaucetHTTPEndpoint(unittest.TestCase):
         self.assertTrue(body.get("ok"))
         self.assertIn("tx_hash", body)
         self.assertEqual(body["amount"], FAUCET_DRIP)
+        self.assertIn("remaining_window", body)
 
     def test_post_without_pow_fields_returns_400(self):
         status, body = self._post_faucet({"address": "ee" * 32})
@@ -516,7 +535,7 @@ class TestPoWGate(unittest.TestCase):
         self.assertGreater(payload["expires_at"], time.time())
 
     def test_solve_then_drip_succeeds(self):
-        st, submits = _mk_state(daily_cap=10, pow_difficulty=8)
+        st, submits = _mk_state(window_cap=10, pow_difficulty=8)
         seed_hex, nonce = _solve_pow_for(st, "ee" * 32)
         r = st.try_drip(
             "1.2.3.4", "ee" * 32,
@@ -557,18 +576,18 @@ class TestPoWGate(unittest.TestCase):
     def test_challenge_consumed_on_use_no_replay(self):
         """A successful drip burns the challenge.  A second attempt
         with the same (seed, nonce) must fail with 'unknown or
-        expired' even if the address has not been claimed via some
-        other path."""
-        st, _ = _mk_state(daily_cap=10, pow_difficulty=4)
+        expired' -- the per-IP cooldown also catches it on the same
+        /24, but using a different /24 isolates the challenge gate."""
+        st, _ = _mk_state(window_cap=10, pow_difficulty=4)
         seed_hex, nonce = _solve_pow_for(st, "ee" * 32)
         r1 = st.try_drip(
             "1.2.3.4", "ee" * 32,
             challenge_seed_hex=seed_hex, nonce=nonce,
         )
         self.assertTrue(r1.ok, r1.error)
-        # Replay -- challenge is consumed, address is also in the
-        # claimed set, but we should hit the challenge-unknown gate
-        # FIRST since it runs before the address-claimed check.
+        # Replay -- challenge is consumed.  Use a different /24 to
+        # rule out the IP cooldown error and isolate the
+        # challenge-unknown gate.
         r2 = st.try_drip(
             "5.6.7.8", "ee" * 32,
             challenge_seed_hex=seed_hex, nonce=nonce,

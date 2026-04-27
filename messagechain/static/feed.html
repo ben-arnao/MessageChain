@@ -63,13 +63,6 @@
     color: var(--muted);
     font-size: 0.95rem;
   }
-  .hero ul {
-    margin: 0.4rem 0 0.8rem;
-    padding-left: 1.1rem;
-    color: var(--muted);
-    font-size: 0.9rem;
-  }
-  .hero ul li { margin: 0.2rem 0; }
   .hero .post-cta {
     display: inline-block;
     margin-top: 0.2rem;
@@ -80,20 +73,6 @@
     font-weight: 600;
     text-decoration: none;
     font-size: 0.9rem;
-  }
-  .hero .post-cta + .post-hint {
-    display: block;
-    margin-top: 0.5rem;
-    font-size: 0.8rem;
-    color: var(--muted);
-  }
-  .hero .post-hint code {
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 0.78rem;
-    background: var(--card);
-    padding: 0.05rem 0.3rem;
-    border-radius: 3px;
-    border: 1px solid var(--border);
   }
   main {
     max-width: 720px;
@@ -196,15 +175,6 @@
     color: var(--muted);
     font-style: italic;
   }
-  footer {
-    max-width: 720px;
-    margin: 0 auto;
-    padding: 1rem;
-    font-size: 0.8rem;
-    color: var(--muted);
-    text-align: center;
-  }
-  footer a { color: var(--accent); }
   details.faucet {
     background: var(--card);
     border: 1px solid var(--border);
@@ -352,59 +322,36 @@
 <header>
   <h1>MessageChain</h1>
   <p class="sub">
-    a permanent, decentralized ledger for human speech ·
+    A permanent, censorship-resistant ledger for human speech ·
     <a href="/gh">github</a>
   </p>
 </header>
 <section class="hero">
   <h2>Your message can never be deleted.</h2>
   <p>
-    MessageChain is a quantum-resistant, proof-of-stake blockchain
-    purpose-built for short messages. No platform, government, or
-    ISP can hide, filter, or silently remove what you post — once a
-    message is on-chain, it is there forever, replicated across every
-    validator on the network.
+    Quantum-resistant proof-of-stake. Once on-chain, your post is
+    replicated across every validator forever — no relay, no admin,
+    no takedown.
   </p>
-  <ul>
-    <li><strong>Censorship-resistant</strong> — no relay, no admin, no takedown button.</li>
-    <li><strong>Built to last centuries</strong> — post-quantum signatures, perpetual validator rewards.</li>
-    <li><strong>Costly to spam</strong> — every message pays a real fee, so AI-generated noise has a floor.</li>
-  </ul>
   <a class="post-cta" href="/gh/start">Post your first message →</a>
-  <span class="post-hint">
-    Install the CLI, generate a key offline, get starter tokens below, then
-    <code>messagechain send "hello world"</code>.
-  </span>
 </section>
 <main>
   <div class="entity-search">
     <input id="entitySearchBox" type="text" autocomplete="off"
-           placeholder="Look up an entity — paste 64-char hex entity_id"
+           placeholder="Look up entity_id (64 hex chars)"
            aria-label="Look up entity by entity_id">
-    <button id="entitySearchBtn" type="button">Open profile</button>
+    <button id="entitySearchBtn" type="button">Open</button>
   </div>
   <p class="entity-search err" id="entitySearchErr" hidden></p>
   <details class="faucet" id="faucetBox" hidden>
-    <summary>First time? Get starter tokens (<span id="faucetRemaining">…</span> left today)</summary>
+    <summary>Get starter tokens (<span id="faucetRemaining">…</span> left this window)</summary>
     <div class="body">
       <p>
-        New wallets need on-chain balance before they can send their first
-        message. Paste your address below to receive a starter drip
-        (<span id="faucetAmount">…</span> tokens, enough for ~3 short
-        messages). One drip per address, one drip per network per 24h.
+        Paste your <code>entity_id</code> to receive
+        <span id="faucetAmount">…</span> tokens (~1 message).
+        Refreshes every 15 min; one drip per network per window.
+        No CLI yet? See <a href="/gh/start">getting started</a>.
       </p>
-      <ol>
-        <li>
-          Install the CLI — see
-          <a href="/gh/start">getting started</a>
-          (Python 3.10+, no third-party deps).
-        </li>
-        <li>
-          Generate a key offline: <code>messagechain generate-key</code> —
-          write the printed hex on paper.
-        </li>
-        <li>Paste your printed <code>entity_id</code> below:</li>
-      </ol>
       <input id="faucetAddr" type="text" autocomplete="off"
              placeholder="64-char hex entity_id"
              aria-label="Wallet address (entity_id)">
@@ -417,37 +364,26 @@
           <div class="tx" id="faucetSuccessTx"></div>
         </div>
         <div class="row">
-          <div class="label">Now post your first message</div>
+          <div class="label">Next: post your first message</div>
           <ol>
+            <li>Wait one block (~10 min) for the drip to confirm.</li>
             <li>
-              Wait one block (~10 minutes) for the drip to confirm.
-            </li>
-            <li>
-              On the machine with your private key, run:
+              On the machine with your private key:
               <code class="cmd" id="faucetSuccessCmd">messagechain send "hello world"</code>
             </li>
-            <li>
-              Wait one more block, then refresh this page — your
-              message will appear in the feed below.
-            </li>
+            <li>Wait one more block, then refresh — your message appears below.</li>
           </ol>
         </div>
       </div>
       <p style="margin-top:0.6rem; font-size:0.78rem; color:var(--muted);">
-        First request runs a small proof-of-work in your browser
-        (~5 sec on desktop, ~15 sec on mobile).  Costs you a few
-        seconds of CPU; costs an attacker the same per address, so
-        bulk farming is uneconomical.  No CAPTCHA, no third-party
-        scripts -- you can run this on Tor.
+        Browser proof-of-work (~5s desktop, ~15s mobile) replaces the
+        CAPTCHA. No third-party scripts; works over Tor.
       </p>
     </div>
   </details>
   <p class="status" id="status">Loading…</p>
   <div id="feed"></div>
 </main>
-<footer>
-  Auto-refreshes every 15 seconds. Newest first.
-</footer>
 <script>
 (function () {
   "use strict";
@@ -617,7 +553,7 @@
       if (data.ok && data.faucet_enabled && data.faucet) {
         faucetBox.hidden = false;
         faucetAmount.textContent = data.faucet.drip_amount;
-        faucetRemaining.textContent = data.faucet.remaining_today;
+        faucetRemaining.textContent = data.faucet.remaining_window;
       } else {
         faucetBox.hidden = true;
       }

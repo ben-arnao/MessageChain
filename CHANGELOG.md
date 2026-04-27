@@ -4,6 +4,225 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.1] — 2026-04-26
+
+Hotfix for 1.25.0. The Tier 22 (1.24.0) faucet rework retired
+`FaucetState.daily_cap` in favor of `window_cap`, but a leftover log
+line in `server.py` still referenced the old attribute. Validators
+running with `--faucet-keyfile` (the public-feed validator) crashed
+on startup with `AttributeError: 'FaucetState' object has no
+attribute 'daily_cap'`. Fix renames the log line to `window_cap`.
+
+No consensus impact. Activation heights from 1.25.0 unchanged.
+
+## [1.25.0] — 2026-04-26
+
+### Hard fork — fast-forwarded Tier 2 + Tier 7 + Tier 13–17 activations
+
+Coordinated multi-tier fork that pulls forward seven previously
+distant activation heights into a tight near-future window so the
+Tier 17 ReactTransaction feature can be exercised live on mainnet
+without waiting ~58 days for the chain to grow into the original
+schedule. The chain has not yet reached any of these forks (current
+tip ~611), so pre-fork replay is unaffected.
+
+New activation heights (strict ordering preserved):
+
+- `FEE_INCLUDES_SIGNATURE_HEIGHT` 1200 → **615** (Tier 2)
+- `FLAT_FEE_HEIGHT` 2800 → **616** (Tier 7)
+- `VERSION_SIGNALING_HEIGHT` 3500 → **620** (Tier 13)
+- `MESSAGE_TX_LENGTH_PREFIX_HEIGHT` 4500 → **621** (Tier 14)
+- `GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT` 5000 → **622** (Tier 15)
+- `MARKET_FEE_FLOOR_HEIGHT` 7000 → **623** (Tier 16)
+- `REACT_TX_HEIGHT` 9000 → **624** (Tier 17)
+
+Tier 18 (`TIER_18_HEIGHT = 11000`), Tier 19, Tier 20, Tier 21, and
+Tier 22 are left at their original heights. After the rollout,
+ReactTransaction admission opens at block 624 (`REACT_FEE_FLOOR = 10`
+per-tx until Tier 18 collapses to MARKET_FEE_FLOOR=1).
+
+### Test fixtures
+
+- `tests/test_fee_includes_signature_height_env.py` updated to the
+  new default (615) and a sub-FLAT_FEE_HEIGHT env override value
+  (610) to satisfy the `FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT`
+  invariant under the compressed window.
+
+## [1.24.0] — 2026-04-26
+
+Minor release. **Hard fork: Tier 22 — voter rewards on passed
+proposals** (activates at `VOTER_REWARD_HEIGHT = 19000`). Plus a
+faucet rate-limit retune and a web-UI prose trim — both
+non-consensus, active immediately.
+
+### Governance — Tier 22: voter rewards on passed proposals (activates block 19000)
+
+Hard fork at `VOTER_REWARD_HEIGHT = 19000` (rides above Tier 21's 17000
+with the established ~2000-block runway). Reward-aligned governance
+participation without a rubber-stamp incentive.
+
+- **Per-proposal escrow funded by a proposer surcharge.** Post-fork,
+  every `ProposalTransaction` debits an additional
+  `VOTER_REWARD_SURCHARGE = 50_000` from the proposer's balance on
+  top of the regular tx fee. The surcharge is held in
+  `ProposalState.voter_reward_pool` — debited from the proposer, not
+  minted, not burned. Net inflation invariant is preserved because
+  the tokens stay in circulation, just sequestered until close.
+- **Pay-on-pass, retrospective only.** At proposal close, if
+  `yes_weight × 3 > total_eligible × 2` (the existing supermajority
+  rule, evaluated in live-weight mode like the H6 binding tally),
+  the pool is distributed pro-rata-by-live-stake to YES voters whose
+  `get_staked > 0` at close. Proposals that fail the threshold burn
+  the entire pool. No-voters and slashed-out yes-voters get nothing.
+  The asymmetry is intentional: rewarding both sides degenerates back
+  into pay-for-participation, which incentivizes uninformed voting.
+- **Whale cap.** A single yes-voter cannot collect more than
+  `VOTER_REWARD_MAX_SHARE_BPS / 10_000 = 25%` of the pool, even if
+  they hold all the yes-side stake. Excess from the cap burns
+  deterministically. Without this cap, a 70%-stake validator captures
+  ~70% of every reward and the system reduces to "validators tax
+  proposers via a 2/3 rubber stamp on their own proposals."
+- **Dust burns deterministically.** Integer-division remainder from
+  pro-rata distribution burns rather than going to a "lucky voter" —
+  every node agrees on the post-distribution state byte-for-byte.
+- **Validation enforces fee + surcharge affordability.** Post-fork
+  proposal admission requires the proposer's balance to cover both
+  the tx fee and the surcharge; pre-fork validation is unchanged so
+  historical replay is byte-identical.
+- **Pre-fork proposals are no-ops.** Pre-fork-height proposals carry
+  `voter_reward_pool = 0` and `finalize_voter_rewards` is a no-op for
+  zero-pool proposals — replay through Tier 22 height does not
+  perturb their state.
+
+### Changed (off-chain, active immediately)
+
+- **Faucet: 15-min rolling window cap replaces daily cap** (401d940).
+  The public-feed faucet now meters per-IP requests over a 15-min
+  rolling window instead of a calendar-day cap, smoothing out the
+  abuse vector where one IP could exhaust the daily budget in
+  seconds at midnight UTC.
+- **Web UI: trim hero/faucet/footer prose; consolidate entity
+  profile sections** (3e49408). Tightens the public-facing copy on
+  https://messagechain.org and folds duplicated entity-profile
+  sub-sections together. Cosmetic only — no API changes.
+
+## [1.23.0] — 2026-04-26
+
+Combined release rolling up everything since the 1.21.0 tag — the
+1.22.0 metadata bump and Tier 21 reward-cap rework were prepared on
+`origin/main` but never tagged, so this version folds Tier 20 (soft
+equivocation slash), the fork-emergency detector, Tier 21
+(halvings-aware proposer reward cap), and the seed-divestment
+retune-v2 into a single coordinated release. Validators upgrading
+from 1.21.0 land on 1.23.0 directly.
+
+This is the first release covering Tier 20, Tier 21, and the
+divestment retune; pre-fork chain history replays byte-identically
+under all three forks.
+
+### Consensus — Tier 20: soft equivocation slash (activates block 15000)
+
+Hard fork at `SOFT_SLASH_HEIGHT = 15000` (rides above Tier 19's 13000
+with a ~2000-block runway, ~14 days at 600 s/block). Honest-operator
+survivability under accidental dual-sign.
+
+- **Equivocation penalty drops from 100% to 5% per offense.** Any
+  double-proposal / double-attestation / finality-double-vote
+  evidence used to wipe 100% of the offender's stake + full
+  bootstrap escrow + permanently ban via `slashed_validators`. That
+  penalty matched a deliberate Byzantine attack but was catastrophic
+  for the most common honest-operator failure mode (failover
+  misconfig, restored backup with the old node still running,
+  restart race). Post-fork the slash is partial —
+  `SOFT_SLASH_PCT = 5` of stake + the same fraction of bootstrap
+  escrow + the same fraction of any pending unstakes. The validator
+  stays in the set with reduced stake; only `_processed_evidence`
+  dedupes so the SAME piece of evidence cannot be applied twice.
+- **Repeat-offender economics fall out without escalation logic.**
+  Each new piece of evidence slashes 5% of what remains:
+  `(1 - 0.05)^N` — 10 mistakes ≈ 40% loss, 50 ≈ 92%. Sustained
+  misbehavior still approaches total loss; a single accident does
+  not.
+- **Pending unstakes scaled in place.** Each pending entry's amount
+  is multiplied by `(1 - SOFT_SLASH_PCT/100)`; `release_block` is
+  preserved so the unbonding schedule the offender originally chose
+  is not extended by the slash. DB mirroring uses atomic
+  clear-and-re-add so cold-booted nodes rehydrate the same shape.
+- **Pre-fork path byte-identical.** `slash_validator(slash_pct=100)`
+  takes the legacy full-wipe code path verbatim; `slash_all` with
+  the same default does the same for escrow.
+
+### Operations — fork-emergency detector + validator auto-halt
+
+- Detector watches for unintentional fork conditions; validator
+  auto-halts rather than continuing to mint on a divergent fork.
+  Reduces operator damage when consensus splits unexpectedly.
+
+### Consensus — Tier 21: halvings-aware proposer reward cap (activates block 17000)
+
+Hard fork at `PROPOSER_CAP_HALVING_HEIGHT = 17000`.
+
+- **Per-block proposer reward cap is now recomputed every block.**
+  Previously computed once at module load as `BLOCK_REWARD * 1/4 = 4`
+  tokens. Once halvings drove the actual issued reward down to
+  `BLOCK_REWARD_FLOOR = 4`, the cap (still 4) equaled the entire
+  block reward — so a single validator who proposes AND attests
+  could sweep everything with no clawback. The anti-mega-staker
+  mechanism silently turned off forever at floor era.
+- Post-fork the cap is recomputed every block from the live
+  `reward` returned by the issuance schedule, so the clawback ratio
+  is preserved across halvings. Pre-fork blocks still apply the
+  cached cap byte-for-byte for replay parity.
+
+### Consensus — seed-divestment retune-v2 (parameter-only)
+
+Tightens the non-discretionary founder-stake unwind so it starts
+sooner and ends at a smaller floor — cleaner end-state for "secure
+early on, democratize later on, leave the founder a meaningful but
+non-controlling stake." Parameter-only (no schema bumps, no new
+state, no apply-path or sim-path code edits). Both validators must
+upgrade before `SEED_DIVESTMENT_RETUNE_HEIGHT = 1400`; current head
+is well below that, so plenty of runway.
+
+- `SEED_DIVESTMENT_START_HEIGHT`: 50_000 → **7_500** (~50 days at
+  600s/block, down from ~10 months). The 4-year bleed window length
+  (`END - START = 210_384` blocks) is preserved so the per-block
+  divestment rate stays sane; only the start moves.
+- `SEED_DIVESTMENT_END_HEIGHT` (derived): 260_384 → **217_884**.
+- `SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE`: 20_000_000 →
+  **10_000_000** (~14.3% of supply → ~7.1% of supply). End-state
+  reads as "top holder, not controlling holder." Legacy 1M
+  pre-RETUNE floor is unchanged byte-for-byte.
+- `SEED_MAX_STAKE_CEILING` (derived from floor): 20M → **10M**.
+  Existing seed stake above 10M (currently ~22.5M on v1) is
+  grandfathered — the ceiling is enforced on `StakeTransaction`
+  validation only, not on existing stake; divestment will drain v1
+  to the new floor naturally over the bleed window.
+
+End-state for the ~95M founder bootstrap shifts:
+
+|                    | pre-retune    | post-retune     |
+|--------------------|---------------:|---------------:|
+| Founder retained   | 20M (~14.3%) | **10M (~7.1%)** |
+| Burned             | 37.5M (~26.8%) | **42.5M (~30.4%)** |
+| Lottery payouts    | 33.75M (~24.1%) | **38.25M (~27.3%)** |
+| Treasury           | 3.75M (~2.7%) | **4.25M (~3.0%)** |
+
+### Files (this release)
+
+- `messagechain/config.py` — `SOFT_SLASH_HEIGHT`, `SOFT_SLASH_PCT`,
+  `get_slash_pct`, `PROPOSER_CAP_HALVING_HEIGHT`, divestment
+  parameter retune, ordering invariants.
+- `messagechain/economics/inflation.py` — `slash_validator()` +
+  proposer-cap recomputation gating.
+- `messagechain/economics/escrow.py` — `slash_all()` partial-burn
+  branch.
+- `messagechain/core/blockchain.py` — slash apply paths gate on
+  `get_slash_pct(height)`; comment updates for new divestment floor.
+- `tests/test_soft_slash_fork.py`, `tests/test_seed_divestment*.py`,
+  `tests/test_seed_stake_ceiling.py`, fork-emergency tests, Tier 21
+  reward-cap tests.
+
 ## [1.21.0] — 2026-04-27
 
 Minor release. **Hard fork: Tier 18 — unified fee market** (activates

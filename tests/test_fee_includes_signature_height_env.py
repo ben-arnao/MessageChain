@@ -53,13 +53,13 @@ class TestFeeIncludesSigHeightEnvSet(unittest.TestCase):
 
     def test_env_var_override_applied(self):
         out = _run_config_probe(
-            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "1500"},
+            {"MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT": "610"},
             _PROBE,
         )
-        # Must be < FLAT_FEE_HEIGHT (2500 post-1.11.0 compression) per
-        # config.py's invariant assertion that the signature-gate
-        # precedes the flat-fee fork.
-        self.assertEqual(out, "1500")
+        # Must be < FLAT_FEE_HEIGHT (fast-forwarded to 616 for live
+        # ReactTx test) per config.py's invariant assertion that the
+        # signature-gate precedes the flat-fee fork.
+        self.assertEqual(out, "610")
 
 
 class TestFeeIncludesSigHeightDefault(unittest.TestCase):
@@ -68,7 +68,7 @@ class TestFeeIncludesSigHeightDefault(unittest.TestCase):
 
     def test_default_when_unset(self):
         out = _run_config_probe({}, _PROBE)
-        self.assertEqual(out, "1200")
+        self.assertEqual(out, "615")
 
 
 class TestFeeIncludesSigHeightInvalidInt(unittest.TestCase):

@@ -11,7 +11,9 @@ to stdout/stderr is the public key + the gcloud confirmation line.
 The script's process memory holds the private key briefly, then exits.
 
 Tree height is forced to 16 (65,536 lifetime signatures), which is
-plenty for years of bootstrap drips at the FAUCET_DAILY_CAP rate.
+plenty for years of bootstrap drips at the FAUCET_WINDOW_DRIPS rate
+(4 drips / 15 min = 384 drips/day worst case, ~170 days to leaf
+exhaustion at full saturation -- a comfortable rotation runway).
 Cold keygen takes ~10-20 minutes at this height; warm restarts hit
 the keypair cache and are instant.  Override via env var
 $MESSAGECHAIN_MERKLE_TREE_HEIGHT before invoking if needed; do NOT
@@ -31,8 +33,8 @@ Operator deployment workflow:
   4. From any wallet with sufficient balance, transfer enough
      tokens to cover the desired drip runway:
         messagechain transfer --to <faucet-pubkey> --amount <N>
-     A common starting allocation is FAUCET_DRIP * 200 = 200,000
-     tokens (~ 4 days at the daily cap).
+     A common starting allocation is FAUCET_DRIP * 2000 = 600,000
+     tokens (~5 days at the per-window cap, 4 drips / 15 min).
   5. POST {"address": "<entity_id_hex>"} to /faucet on the public
      feed to verify a drip lands.
 """

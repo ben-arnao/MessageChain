@@ -73,6 +73,11 @@
     margin: 0.75rem 0;
   }
   .status.error { color: var(--neg); }
+  .status-row {
+    margin: 0.4rem 0 0.8rem;
+    font-size: 0.9rem;
+    color: var(--muted);
+  }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -164,10 +169,7 @@
   <div class="id-row" id="idRow"></div>
   <p class="status" id="status">Loading…</p>
   <div id="profile" hidden>
-    <div class="section">
-      <h2>Identity</h2>
-      <div class="grid" id="identityGrid"></div>
-    </div>
+    <p class="status-row" id="statusRow"></p>
     <div class="section">
       <h2>Funds</h2>
       <div class="grid" id="fundsGrid"></div>
@@ -177,12 +179,8 @@
       <div class="grid" id="postsGrid"></div>
     </div>
     <div class="section">
-      <h2>Reputation &amp; reactions</h2>
+      <h2>Reputation</h2>
       <div class="grid" id="reputationGrid"></div>
-    </div>
-    <div class="section">
-      <h2>Validator activity</h2>
-      <div class="grid" id="validatorGrid"></div>
     </div>
     <div class="section">
       <h2>Governance</h2>
@@ -229,12 +227,14 @@
 
   function clearGrids() {
     for (const id of [
-      "identityGrid", "fundsGrid", "postsGrid",
-      "reputationGrid", "validatorGrid", "governanceGrid",
+      "fundsGrid", "postsGrid",
+      "reputationGrid", "governanceGrid",
     ]) {
       const g = document.getElementById(id);
       if (g) g.replaceChildren();
     }
+    const sr = document.getElementById("statusRow");
+    if (sr) sr.textContent = "";
   }
 
   function addStat(gridId, label, value, sub, valueClass) {
@@ -268,15 +268,17 @@
     clearGrids();
     heightEl.textContent = height;
 
-    // Identity
+    // Top-line status: registered + first-seen, in a single sentence.
+    const sr = document.getElementById("statusRow");
     const us = profile.user_since;
-    addStat("identityGrid",
-      "User since",
-      us ? fmtTs(us.timestamp) : "never seen",
-      us ? ("block " + us.block_number) : null);
-    addStat("identityGrid",
-      "On-chain status",
-      profile.exists ? "registered" : "not seen");
+    if (profile.exists && us) {
+      sr.textContent = "Registered since " + fmtTs(us.timestamp) +
+        " (block " + us.block_number + ").";
+    } else if (profile.exists) {
+      sr.textContent = "Registered.";
+    } else {
+      sr.textContent = "Not seen on-chain.";
+    }
 
     // Funds
     addStat("fundsGrid", "Spendable balance", fmtInt(profile.balance));
@@ -294,7 +296,7 @@
       addStat("fundsGrid", "Pending unstake", fmtInt(profile.pending_unstake));
     }
     addStat("fundsGrid",
-      "Mining rewards",
+      "Block rewards",
       fmtInt(profile.rewards.estimated_block_rewards),
       profile.rewards.blocks_proposed + " block(s) proposed");
     addStat("fundsGrid", "Total fees paid", fmtInt(profile.fees_paid));
@@ -311,34 +313,30 @@
       m.last_post_timestamp ? fmtTs(m.last_post_timestamp) : "—",
       m.last_post_block ? "block " + m.last_post_block : null);
 
-    // Reputation & reactions
+    // Reputation
     const rep = profile.reputation;
     addStat("reputationGrid",
       "Reputation score",
       fmtInt(rep.score),
-      "+" + rep.ups_received + " up, -" + rep.downs_received + " down",
+      "+" + rep.ups_received + " / -" + rep.downs_received,
       signClass(rep.score));
     const ps = profile.post_score;
     addStat("reputationGrid",
       "Post score",
       fmtInt(ps.total),
-      "+" + ps.ups_received + " up, -" + ps.downs_received + " down across all messages",
+      "+" + ps.ups_received + " / -" + ps.downs_received,
       signClass(ps.total));
     addStat("reputationGrid", "Reactions cast", fmtInt(profile.reactions_cast));
     const ul = profile.react_majority_alignment.user_level;
     addStat("reputationGrid",
-      "User-react majority match",
+      "Majority match (users)",
       fmtPct(ul.pct),
-      ul.with_majority + " / " + ul.votes + " user-reactions agreed with current sign");
+      ul.with_majority + " / " + ul.votes + " agreed with current sign");
     const pl = profile.react_majority_alignment.post_level;
     addStat("reputationGrid",
-      "Post-react majority match",
+      "Majority match (posts)",
       fmtPct(pl.pct),
-      pl.with_majority + " / " + pl.votes + " post-reactions agreed with current sign");
-
-    // Validator activity
-    addStat("validatorGrid", "Blocks proposed", fmtInt(profile.rewards.blocks_proposed));
-    addStat("validatorGrid", "Estimated block rewards", fmtInt(profile.rewards.estimated_block_rewards));
+      pl.with_majority + " / " + pl.votes + " agreed with current sign");
 
     // Governance
     addStat("governanceGrid", "Proposals made", fmtInt(profile.governance.proposals_made));
