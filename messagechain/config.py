@@ -3445,13 +3445,32 @@ assert REACT_TX_HEIGHT > MARKET_FEE_FLOOR_HEIGHT, (
 # ~2000-block runway (~14 days at 600 s/block).
 TIER_18_HEIGHT = 11000
 
-# Unified per-block byte ceiling for the fee-bearing tx kinds.  Sized
-# so that a block at-or-near each per-kind structural cap (45 message
-# txs × ~3 KB witness + 45 transfer/react txs × ~2.7 KB witness)
-# would be over the unified ceiling — making the budget the binding
-# scarcity under all-lanes-full congestion, while leaving normal
-# operation comfortably under the cap.
-MAX_BLOCK_TOTAL_BYTES = 300_000
+# Unified per-block byte ceiling for the fee-bearing tx kinds.
+#
+# Sizing target: must bind under TWO-lane congestion (the typical
+# organic high-load shape — e.g. messages + react both heated up by
+# a viral thread).  Three-lane-only binding is too loose because in
+# practice transfers, messages, and reacts rarely all spike together,
+# so a 3-lane-only cap leaves each lane with its own siloed market
+# under any realistic congestion pattern.
+#
+# Production tx sizes (measured at MERKLE_TREE_HEIGHT=20):
+#   message  ~2.9 KB  (witness dominates; 1 KB max payload adds ~1 KB)
+#   transfer ~2.9 KB
+#   react    ~2.9 KB
+# Per-kind structural cap (MAX_TXS_PER_BLOCK = 45):
+#   1-lane max:  ~150 KB    (45 messages-with-1KB-payload)
+#   2-lane max:  ~280 KB
+#   3-lane max:  ~390 KB
+#
+# Setting the cap at 200 KB:
+#   * fits 1-lane-full of any kind (no honest-block rejection)
+#   * BINDS under 2-lane congestion (forces cross-kind auction)
+#   * binds harder under 3-lane (the natural extreme)
+# This is the smallest value that delivers the user-stated goal of
+# "any tx kind competes for any byte under congestion" without
+# rejecting any otherwise-valid 1-lane block.
+MAX_BLOCK_TOTAL_BYTES = 200_000
 
 assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
     "TIER_18_HEIGHT must follow REACT_TX_HEIGHT — Tier 18 unifies the "
