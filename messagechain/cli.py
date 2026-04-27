@@ -1079,6 +1079,41 @@ def build_parser() -> argparse.ArgumentParser:
     config_set_p.add_argument("value")
 
     # --- notify-test / notify-status ---
+    # --- backup-wallet -------------------------------------------------
+    backup = sub.add_parser(
+        "backup-wallet",
+        help="Tar up keyfile + leaf-cursor into a single offline archive.",
+        description=(
+            "Bundle the two files that together make a complete wallet "
+            "backup -- the keyfile (your hex secret) and the matching "
+            "~/.messagechain/leaves/<entity_id_hex>.idx (the WOTS+ leaf "
+            "cursor) -- into a single .tar.gz.  Restoring a keyfile "
+            "without the matching leaf cursor re-uses one-time WOTS+ "
+            "leaves and produces equivocation evidence on chain (100% "
+            "slash on detection).  Local-only: this command never "
+            "touches the chain or the network."
+        ),
+    )
+    backup.add_argument(
+        "--keyfile", type=str, default=None,
+        help="Path to the keyfile (defaults to global --keyfile).  Required.",
+    )
+    backup.add_argument(
+        "--leaves", type=str, default=None,
+        help="Path to the leaf-cursor file (defaults to "
+             "~/.messagechain/leaves/<entity_id_hex>.idx, derived from "
+             "--keyfile).",
+    )
+    backup.add_argument(
+        "--entity-id", type=str, default=None, dest="entity_id",
+        help="Entity ID hex.  When omitted, derived from --keyfile.",
+    )
+    backup.add_argument(
+        "--output", type=str, default=None,
+        help="Output path for the tarball.  Defaults to "
+             "<entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz in CWD.",
+    )
+
     sub.add_parser(
         "notify-test",
         help="Send a one-shot test email using the configured SMTP creds.",
@@ -1683,6 +1718,11 @@ def _bind_persistent_leaf_index(
     """
     path = _resolve_leaf_index_path(entity.entity_id_hex, data_dir=data_dir)
     parent = path.parent
+    # Snapshot existence BEFORE we touch the file so the create-hint
+    # below fires exactly once -- the first time this wallet's cursor
+    # is materialized on this host.  Subsequent signing calls find the
+    # file already present and stay silent.
+    existed_before = os.path.exists(str(path))
     try:
         os.makedirs(parent, exist_ok=True)
     except OSError:
@@ -1718,6 +1758,24 @@ def _bind_persistent_leaf_index(
     if int(chain_leaf) > 0:
         try:
             entity.keypair.advance_to_leaf(int(chain_leaf))
+        except Exception:
+            pass
+
+    # 3. First-create hint.  If the cursor file did not exist before
+    #    this call, the user is one block-sign away from a persisted
+    #    leaf cursor that is now security-critical state -- restoring
+    #    a keyfile without this file re-uses one-time WOTS+ leaves and
+    #    produces equivocation evidence on chain (see README "Wallet
+    #    backups").  Print exactly one stderr line so wallet users
+    #    learn the file exists.  Subsequent calls (file already there)
+    #    stay silent -- this is not a per-sign nag.
+    if not existed_before:
+        try:
+            sys.stderr.write(
+                f"Note: leaf cursor created at {path_str}. "
+                f"Back this up alongside your keyfile, or you risk "
+                f"slashing on next sign.\n"
+            )
         except Exception:
             pass
 
@@ -6174,6 +6232,131 @@ def cmd_config(args):
         sys.exit(2)
 
 
+def cmd_backup_wallet(args):
+    """Tar up the keyfile + the matching leaf-cursor into one archive.
+
+    Local-only: never touches the chain, never opens a socket, never
+    requires a running daemon.  The command exists because the two
+    files that together constitute a complete wallet backup live in
+    different places by default (the keyfile wherever the user put
+    it; the leaf cursor under ``~/.messagechain/leaves/<entity>.idx``)
+    and a paper-only backup of the keyfile alone is a self-slash trap
+    -- restoring without the leaf cursor re-uses one-time WOTS+ leaves
+    and produces equivocation evidence on chain (100% slash on
+    detection at slashing-active heights).
+
+    Inputs:
+      ``--keyfile``    path to the keyfile (or global --keyfile)
+      ``--leaves``     path to the leaf cursor (default derived from
+                       entity_id under ~/.messagechain/leaves/)
+      ``--entity-id``  entity_id hex (default: derived from keyfile)
+      ``--output``     tarball path (default:
+                       <entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz
+                       in CWD)
+
+    Failure modes are clean: if either input file is missing, print a
+    message naming the missing path and exit non-zero.  Never produces
+    a partial archive.
+    """
+    import datetime as _dt
+    import tarfile as _tar
+
+    keyfile = getattr(args, "keyfile", None)
+    if not keyfile:
+        print(
+            "Error: --keyfile is required (path to the file containing "
+            "your hex private key)."
+        )
+        return 2
+
+    entity_hex = getattr(args, "entity_id", None)
+    leaves_path = getattr(args, "leaves", None)
+
+    # Derive entity_id from keyfile when not explicitly provided.  Need
+    # the keyfile to actually exist for that derivation to work, so the
+    # missing-keyfile branch must come first.
+    if not os.path.exists(keyfile):
+        print(f"Error: keyfile not found: {keyfile}")
+        return 2
+
+    if entity_hex is None:
+        try:
+            from messagechain.identity.identity import Entity
+            private_key = _load_key_from_file(
+                keyfile,
+                accept_raw_hex=bool(getattr(args, "data_dir", None)),
+            )
+            entity = Entity.create(private_key)
+            entity_hex = entity.entity_id_hex
+        except KeyFileError as e:
+            print(f"Error: {e}")
+            return 2
+        except Exception as e:
+            print(
+                f"Error: cannot derive entity_id from {keyfile}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return 2
+
+    # Resolve the leaves path either from --leaves or via the same
+    # default-resolution every signing command uses.
+    if leaves_path is None:
+        leaves_path = str(_resolve_leaf_index_path(
+            entity_hex, data_dir=getattr(args, "data_dir", None),
+        ))
+
+    if not os.path.exists(leaves_path):
+        print(
+            f"Error: leaf cursor not found: {leaves_path}\n"
+            "If you have signed any tx with this wallet, the leaf "
+            "cursor MUST exist on this host -- restoring the keyfile "
+            "without it re-uses one-time WOTS+ leaves and produces "
+            "equivocation evidence on chain (slashable).  Find the "
+            "real cursor file and pass it via --leaves before "
+            "re-running."
+        )
+        return 2
+
+    output = getattr(args, "output", None)
+    if not output:
+        today = _dt.date.today().strftime("%Y%m%d")
+        output = f"{entity_hex}-wallet-backup-{today}.tar.gz"
+
+    # Both inputs are present.  Build into a tmp file and rename, so a
+    # crash mid-write never leaves a half-archive at the requested
+    # path -- callers should be able to retry without a stale file
+    # tripping their next attempt.
+    output_abs = os.path.abspath(output)
+    tmp_path = output_abs + ".part"
+    try:
+        with _tar.open(tmp_path, "w:gz") as tf:
+            tf.add(keyfile, arcname=os.path.basename(keyfile))
+            tf.add(leaves_path, arcname=os.path.basename(leaves_path))
+        os.replace(tmp_path, output_abs)
+    except Exception as e:
+        # Best-effort cleanup of the partial.
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        print(
+            f"Error: failed to write backup archive {output_abs}: "
+            f"{type(e).__name__}: {e}"
+        )
+        return 2
+
+    print(f"Wrote wallet backup: {output_abs}")
+    print(f"  entity_id: {entity_hex}")
+    print(
+        "Store this archive somewhere offline (paper-equivalent: "
+        "encrypted USB in a safe, NOT cloud sync). The keyfile and "
+        "leaf cursor are both security-critical -- never restore one "
+        "without the other."
+    )
+    return 0
+
+
 def cmd_notify_test(args):
     """Send a one-shot test email using the configured SMTP creds."""
     from messagechain.runtime import notify as _notify
@@ -6265,6 +6448,7 @@ def main():
         "config": cmd_config,
         "notify-test": cmd_notify_test,
         "notify-status": cmd_notify_status,
+        "backup-wallet": cmd_backup_wallet,
     }
 
     handler = commands.get(args.command)
