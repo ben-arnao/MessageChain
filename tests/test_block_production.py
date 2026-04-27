@@ -341,7 +341,18 @@ class TestStrictProposerValidation(unittest.TestCase):
 
     def test_early_timestamp_rejected_with_enforcement_on(self):
         """When ENFORCE_SLOT_TIMING is True, a block with a timestamp less
-        than BLOCK_TIME_TARGET after the parent must be rejected."""
+        than BLOCK_TIME_TARGET after the parent must be rejected.
+
+        Post the proposer-side pre-sign-validation fix (see
+        ``messagechain.consensus.pos._local_pre_sign_validation``),
+        ``create_block`` itself raises ``ProposerSkipSlotError`` for
+        this case rather than constructing a doomed block — so the
+        rejection now happens one step earlier than it used to.  The
+        rule is the same; only the surface that enforces it has
+        moved.
+        """
+        from messagechain.consensus.pos import ProposerSkipSlotError
+
         original = messagechain.config.ENFORCE_SLOT_TIMING
         try:
             messagechain.config.ENFORCE_SLOT_TIMING = True
@@ -349,15 +360,16 @@ class TestStrictProposerValidation(unittest.TestCase):
             latest = chain.get_latest_block()
             proposer = entities[0]  # only one staked, so always selected
 
-            # Propose with a timestamp just after the parent (way too early)
-            block = consensus.create_block(
-                proposer, [], latest,
-                state_root=chain.compute_post_state_root([], proposer.entity_id, 1),
-                timestamp=latest.header.timestamp + 1,
-            )
-            ok, reason = chain.add_block(block)
-            self.assertFalse(ok)
-            self.assertIn("too early", reason.lower())
+            # Propose with a timestamp just after the parent (way too early).
+            with self.assertRaises(ProposerSkipSlotError) as cm:
+                consensus.create_block(
+                    proposer, [], latest,
+                    state_root=chain.compute_post_state_root(
+                        [], proposer.entity_id, 1,
+                    ),
+                    timestamp=latest.header.timestamp + 1,
+                )
+            self.assertIn("too early", str(cm.exception).lower())
         finally:
             messagechain.config.ENFORCE_SLOT_TIMING = original
 
