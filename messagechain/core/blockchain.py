@@ -4453,10 +4453,26 @@ class Blockchain:
         from messagechain.config import (
             ATTESTER_REWARD_SPLIT_HEIGHT,
             ATTESTER_COMMITTEE_TARGET_SIZE,
+            PROPOSER_CAP_HALVING_HEIGHT,
         )
         reward = self.supply.calculate_block_reward(block_height)
         is_bootstrap = not any(s > 0 for s in sim_staked.values())
-        effective_cap = reward if is_bootstrap else PROPOSER_REWARD_CAP
+        # Mirror mint_block_reward's effective_cap selection.  Tier 19
+        # (PROPOSER_CAP_HALVING_HEIGHT) makes the cap track halvings:
+        # post-activation it is `reward * NUMERATOR // DENOMINATOR`
+        # rather than the import-time constant.  Pre-activation
+        # preserves byte-for-byte legacy behavior.  Any divergence
+        # here vs. mint_block_reward produces an "Invalid state_root"
+        # rejection on add_block.
+        if is_bootstrap:
+            effective_cap = reward
+        elif block_height >= PROPOSER_CAP_HALVING_HEIGHT:
+            effective_cap = (
+                reward * PROPOSER_REWARD_NUMERATOR
+                // PROPOSER_REWARD_DENOMINATOR
+            )
+        else:
+            effective_cap = PROPOSER_REWARD_CAP
         proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         attester_pool = reward - proposer_share
 
