@@ -6484,8 +6484,17 @@ class Blockchain:
         if block.header.timestamp > max_future:
             return False, f"Block timestamp {block.header.timestamp} too far in the future"
 
-        # Check transaction count (all types combined)
+        # Check transaction count (all types combined).  Tier 18: at
+        # and after TIER_18_HEIGHT, react_transactions count too —
+        # closes the silo where a vote flood was uncapped at the
+        # cross-kind tx-count layer.
+        from messagechain.config import (
+            TIER_18_HEIGHT as _TIER_18_H,
+            MAX_BLOCK_TOTAL_BYTES as _MAX_TOTAL_B,
+        )
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if block.header.block_number >= _TIER_18_H:
+            total_tx_count += len(getattr(block, "react_transactions", []) or [])
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
 
@@ -6495,6 +6504,48 @@ class Blockchain:
         total_message_bytes = sum(len(tx.message) for tx in block.transactions)
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
+
+        # Tier 18: unified per-block byte budget across Message +
+        # Transfer + React.  Each tx contributes its serialized byte
+        # cost (payload + WOTS+ witness).  Pre-fork blocks keep only
+        # the legacy per-kind caps above; post-fork blocks ALSO
+        # satisfy this single ceiling, so a hot lane forces the
+        # others to compete for shared bytes — the cross-kind market
+        # mechanism Tier 18 introduces.  `to_bytes()` cost here is
+        # O(tx) per call; total work scales with total fee-bearing
+        # txs in the block, which is already bounded by the tx-count
+        # cap above.
+        if block.header.block_number >= _TIER_18_H:
+            total_block_bytes = 0
+            for _tx in block.transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid message tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            for _tx in block.transfer_transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid transfer tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            for _tx in getattr(block, "react_transactions", []) or []:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid react tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            if total_block_bytes > _MAX_TOTAL_B:
+                return False, (
+                    f"Block total bytes {total_block_bytes} exceed Tier-18 "
+                    f"unified budget {_MAX_TOTAL_B}"
+                )
 
         # Per-entity message tx cap — prevents a single entity from
         # monopolizing block space (anti-flooding / anti-censorship).
@@ -8757,8 +8808,16 @@ class Blockchain:
         # Idempotent via ``supply.rolling_fee_burn_seeded``.
         self._apply_deflation_floor_v2_seed(block.header.block_number)
 
-        # Count total txs for base fee adjustment
+        # Count total txs for base fee adjustment.  Tier 18: at and
+        # after TIER_18_HEIGHT, react_transactions count toward the
+        # EIP-1559 fullness signal so a hot vote lane raises base_fee
+        # the same way a hot message or transfer lane does — closes
+        # the cross-kind market silo where a react flood was invisible
+        # to the controller.
+        from messagechain.config import TIER_18_HEIGHT as _TIER_18_H
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if block.header.block_number >= _TIER_18_H:
+            total_tx_count += len(getattr(block, "react_transactions", []) or [])
 
         # Apply message transaction fees (EIP-1559: burn base fee, tip to proposer)
         for tx in block.transactions:

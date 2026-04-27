@@ -379,11 +379,21 @@ def verify_react_transaction(
         return False
 
     # Fee floor — uses the same per-height ladder as every other tx kind.
+    # Tier 18: at/after TIER_18_HEIGHT the type-specific REACT_FEE_FLOOR
+    # retires.  ReactTx admission is gated by the same MARKET_FEE_FLOOR=1
+    # baseline every other kind sees, so the fee market alone (EIP-1559
+    # base_fee + tip) sets the price.  Pre-fork blocks keep
+    # REACT_FEE_FLOOR=10 for replay determinism.
+    from messagechain.config import TIER_18_HEIGHT, MARKET_FEE_FLOOR
+    if current_height is not None and current_height >= TIER_18_HEIGHT:
+        active_floor = MARKET_FEE_FLOOR
+    else:
+        active_floor = REACT_FEE_FLOOR
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=REACT_FEE_FLOOR,
+        flat_floor=active_floor,
     ):
         return False
 
