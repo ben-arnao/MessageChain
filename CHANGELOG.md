@@ -4,6 +4,83 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0] — 2026-04-26
+
+Minor release. **Tier 19 — soft equivocation slash for honest-operator
+mistake survivability.** Hard fork at `SOFT_SLASH_HEIGHT = 13000`
+(rides above Tier 18's 11000 with a ~2000-block runway, ~14 days at
+600 s/block). Pre-fork chain history replays byte-identically; only
+post-fork blocks see the new partial-burn rules.
+
+### Consensus (Tier 19, activates block 13000)
+
+- **Equivocation penalty drops from 100% to 5% per offense.** Previously
+  any double-proposal / double-attestation / finality-double-vote
+  evidence wiped 100% of the offender's stake + full bootstrap escrow
+  + permanently banned them via `slashed_validators`. That penalty
+  matched a deliberate Byzantine attack but was catastrophic for the
+  most common honest-operator failure mode: running two nodes under
+  the same key (failover misconfig, restored backup with the old node
+  still running, restart race). One accidental dual-sign wiped the
+  operator's full bond.
+
+  Post-fork the slash is partial — `SOFT_SLASH_PCT = 5` of stake +
+  the same fraction of bootstrap escrow + the same fraction of any
+  pending unstakes (kept in the slash basis so an attacker cannot
+  outrun evidence by unstaking). The validator stays in the set with
+  reduced stake; only `_processed_evidence` dedupes so the SAME piece
+  of evidence cannot be applied twice. New evidence against the same
+  offender lands at a fresh partial slash.
+
+- **Repeat-offender economics fall out without escalation logic.**
+  Each new piece of evidence slashes 5% of what remains, so a stuck
+  dual-node operator decays geometrically as `(1 - 0.05)^N` —
+  10 mistakes ≈ 40% loss, 50 mistakes ≈ 92% loss. Sustained
+  misbehavior still approaches total stake loss; a single accident
+  does not. No additional state to track; same primitive applied
+  per-evidence.
+
+- **Pending unstakes scaled in place.** Each pending entry's amount
+  is multiplied by `(1 - SOFT_SLASH_PCT/100)`; `release_block` is
+  preserved so the unbonding schedule the offender originally chose
+  is not extended by the slash (extension would be a hidden second
+  penalty on top of the proportional burn). DB mirroring uses an
+  atomic clear-and-re-add so cold-booted nodes rehydrate the same
+  shape as running nodes.
+
+- **Pre-fork path byte-identical.** `slash_validator(slash_pct=100)`
+  takes the legacy full-wipe code path verbatim; `slash_all` with
+  the same default does the same for escrow. State-tree determinism
+  for replay of historical chain state is preserved.
+
+### Files
+
+- `messagechain/config.py` — added `SOFT_SLASH_HEIGHT`, `SOFT_SLASH_PCT`,
+  `get_slash_pct(current_block)`, ordering invariants.
+- `messagechain/economics/inflation.py` — `slash_validator()` accepts
+  `slash_pct`; partial-burn branch scales stake + each pending entry
+  proportionally.
+- `messagechain/economics/escrow.py` — `slash_all()` accepts `slash_pct`;
+  partial branch shrinks each entry, preserves `unlock_at`.
+- `messagechain/core/blockchain.py` — both slash apply paths
+  (`apply_slash_transaction` + `_apply_block_state` slash loop) gate
+  on `get_slash_pct(height)` and skip the `slashed_validators` /
+  reputation-clear branch when `slash_pct < 100`.
+- `tests/test_soft_slash_fork.py` — 9 tests covering both regimes
+  (pre-fork preservation, post-fork partial, no permaban, repeat
+  compounding, pending-unstake scaling, finder-reward scaling,
+  evidence dedupe).
+
+### Why now
+
+The current network is small (single-digit live validators) but the
+catastrophic full-burn was the single loudest objection to running a
+mainnet validator: one operator mistake → bond gone, no recovery.
+Landing this before validator count grows means the new regime is
+established before any operator gets bitten by the legacy rule.
+Activation height 13000 (~1 week of runway from current tip ~700)
+gives operators time to upgrade.
+
 ## [1.20.0] — 2026-04-26
 
 Minor release. **Two CRITICAL Tier 17 wiring fixes from the round-12

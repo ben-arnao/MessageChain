@@ -98,22 +98,43 @@ class EscrowLedger:
         self._entries = still_held
         return list(matured_by_eid.items())
 
-    def slash_all(self, entity_id: bytes) -> int:
-        """Burn every escrow entry for this entity.  Returns total burned.
+    def slash_all(self, entity_id: bytes, slash_pct: int = 100) -> int:
+        """Burn `slash_pct` of every escrow entry for this entity.
+        Returns total burned.
 
-        Slash is all-or-nothing for escrow (same semantics as the
-        existing SupplyTracker.slash_validator for stake).  Partial
-        slashing would leave the attacker still profiting from some
-        fraction of their accumulated misbehavior, which is the wrong
-        incentive — the whole escrow balance is what they stood to lose.
+        Pre-Tier 19 (default slash_pct=100): every entry for this entity
+        is removed entirely — full escrow wipe matching the legacy
+        equivocation policy.
+
+        Tier 19+ (slash_pct=SOFT_SLASH_PCT, typically 5): each entry's
+        amount is scaled by (1 - slash_pct/100) in place; entries that
+        round to zero are dropped, others retain their original
+        `unlock_at` so the escrow maturity schedule the offender
+        accumulated is not extended by the slash.
         """
+        if not 0 < slash_pct <= 100:
+            raise ValueError(
+                f"slash_pct must be in (0, 100], got {slash_pct}"
+            )
         total_burned = 0
         still_held: list[EscrowEntry] = []
         for entry in self._entries:
-            if entry.entity_id == entity_id:
-                total_burned += entry.amount
-            else:
+            if entry.entity_id != entity_id:
                 still_held.append(entry)
+                continue
+            if slash_pct == 100:
+                total_burned += entry.amount
+                continue
+            burn = entry.amount * slash_pct // 100
+            total_burned += burn
+            remaining = entry.amount - burn
+            if remaining > 0:
+                still_held.append(EscrowEntry(
+                    entity_id=entry.entity_id,
+                    amount=remaining,
+                    earned_at=entry.earned_at,
+                    unlock_at=entry.unlock_at,
+                ))
         self._entries = still_held
         return total_burned
 

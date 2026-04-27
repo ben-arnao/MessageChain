@@ -3458,6 +3458,69 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
     "fee market across Message + Transfer + React, so React must be a "
     "first-class tx kind on chain before the unified budget bites"
 )
+
+# ----------------------------------------------------------------------
+# Tier 19: soft equivocation slash (operator-mistake survivability)
+# ----------------------------------------------------------------------
+#
+# Pre-fork policy: any double-proposal / double-attestation / finality-
+# double-vote evidence resulted in 100% stake burn + full bootstrap-
+# escrow burn + permanent removal from the validator set
+# (`slashed_validators`).  That penalty matched a deliberate Byzantine
+# attack but was catastrophic for the most common honest-operator
+# failure mode: running two nodes under the same key (failover
+# misconfig, restored backup with the old node still running, restart
+# race).  One accidental dual-sign wiped the operator's full bond.
+#
+# Post-fork policy: equivocation slashes SOFT_SLASH_PCT of stake +
+# the same fraction of bootstrap escrow + the same fraction of any
+# pending unstakes (kept in the slash basis so an attacker cannot
+# escape by unstaking faster than evidence can be submitted, but at
+# the partial percent).  The validator stays in the set with reduced
+# stake — no permanent ban from a single offense; only the SAME piece
+# of evidence is dedupe'd via `_processed_evidence`.
+#
+# Repeat-offender economics fall out without escalation logic: each
+# new piece of evidence slashes 5% of what remains, so a stuck dual-
+# node operator with N accidental dual-signs decays geometrically as
+# (1-0.05)^N — 10 mistakes ≈ 40% loss, 50 mistakes ≈ 92% loss.
+# Sustained misbehavior still approaches total stake loss; a single
+# accident does not.
+#
+# Activation: rides above Tier 18 (TIER_18_HEIGHT = 11000) with a
+# ~2000-block runway (~14 days at 600 s/block), giving operators time
+# to acknowledge the new slashing semantics.
+SOFT_SLASH_HEIGHT = 13000
+SOFT_SLASH_PCT = 5  # % of stake/escrow/pending burned per equivocation post-fork
+
+
+def get_slash_pct(current_block: int) -> int:
+    """Return the % of stake/escrow burned for one equivocation offense
+    at this height.  Pre-fork: SLASH_PENALTY_PCT (100, full burn).
+    Post-fork: SOFT_SLASH_PCT (5, partial).
+
+    The dynamic config lookup (re-read each call) is what lets test
+    suites monkey-patch SOFT_SLASH_HEIGHT to exercise both regimes
+    without spinning the chain forward 13k blocks.
+    """
+    from messagechain import config as _cfg
+    if current_block >= _cfg.SOFT_SLASH_HEIGHT:
+        return _cfg.SOFT_SLASH_PCT
+    return _cfg.SLASH_PENALTY_PCT
+
+
+assert SOFT_SLASH_HEIGHT > TIER_18_HEIGHT, (
+    "SOFT_SLASH_HEIGHT must follow TIER_18_HEIGHT — Tier 19 soft "
+    "slashing is a consensus rule change and rides above the latest "
+    "established fork (Tier 18 unified fee market)"
+)
+assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
+    "SOFT_SLASH_PCT must be a partial slash (0 < pct < 100). The whole "
+    "point of Tier 19 is to soften the catastrophic full-burn penalty "
+    "for honest dual-node operator mistakes; equality with "
+    "SLASH_PENALTY_PCT would make the fork a no-op"
+)
+
 assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
     "message-byte budget — otherwise a block of pure messages valid "

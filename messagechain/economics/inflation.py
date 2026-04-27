@@ -1115,15 +1115,50 @@ class SupplyTracker:
         self.total_burned += amount
         return True
 
-    def slash_validator(self, offender_id: bytes, finder_id: bytes) -> tuple[int, int]:
+    def slash_validator(
+        self,
+        offender_id: bytes,
+        finder_id: bytes,
+        slash_pct: int = 100,
+    ) -> tuple[int, int]:
         """
-        Slash a validator: burn their entire stake + pending unstakes, pay finder a reward.
+        Slash a validator: burn `slash_pct` of stake + pending unstakes,
+        pay finder a reward proportional to what was burned.
+
+        Pre-Tier 19 (default slash_pct=100): the full-burn path — every
+        token in `staked` and every pending-unstake entry is wiped, and
+        the offender is dropped from the validator set by the caller.
+
+        Tier 19+ (slash_pct=SOFT_SLASH_PCT, typically 5): partial burn.
+        Stake is reduced proportionally; each pending entry's amount is
+        scaled by (1 - slash_pct/100) and rewritten in place; the
+        offender retains the remaining stake and stays in the set
+        (caller decides whether to mutate `slashed_validators`).  Pending
+        unstakes stay in the slash basis on purpose — otherwise an
+        equivocator could outrun evidence by unstaking immediately.
 
         Returns (total_slashed, finder_reward).
         """
+        if not 0 < slash_pct <= 100:
+            raise ValueError(
+                f"slash_pct must be in (0, 100], got {slash_pct}"
+            )
+
         staked_amount = self.staked.get(offender_id, 0)
         pending_amount = self.get_pending_unstake(offender_id)
-        slashed_amount = staked_amount + pending_amount
+        basis = staked_amount + pending_amount
+
+        if basis == 0:
+            return 0, 0
+
+        # Compute per-bucket slash so rounding lands once per bucket
+        # rather than redistributing a single combined slash —
+        # otherwise a partial slash with stake=0 + pending=N would
+        # have to drain pending, but a combined-then-apportioned path
+        # would round it to staked=0 and lose the pending burn entirely.
+        stake_burn = staked_amount * slash_pct // 100
+        pending_burn = pending_amount * slash_pct // 100
+        slashed_amount = stake_burn + pending_burn
 
         if slashed_amount == 0:
             return 0, 0
@@ -1131,17 +1166,47 @@ class SupplyTracker:
         finder_reward = slashed_amount * SLASH_FINDER_REWARD_PCT // 100
         burned = slashed_amount - finder_reward
 
-        # Remove all stake and pending unstakes
-        self.staked[offender_id] = 0
-        if offender_id in self.pending_unstakes:
-            del self.pending_unstakes[offender_id]
-        # Mirror the slash into the DB so restarted peers see the same
-        # empty queue — without this, a cold-booted node would rehydrate
-        # a ghost queue for a slashed offender and release tokens that
-        # the canonical chain burned.
         db = self.db if hasattr(self, "db") else None
-        if db is not None and hasattr(db, "clear_all_pending_unstakes"):
-            db.clear_all_pending_unstakes(offender_id)
+        if slash_pct == 100:
+            # Full burn — preserve the exact pre-Tier 19 byte-level
+            # state transition so historical chain replay reaches the
+            # same `staked`/`pending_unstakes` shape it always did.
+            self.staked[offender_id] = 0
+            if offender_id in self.pending_unstakes:
+                del self.pending_unstakes[offender_id]
+            # Mirror the slash into the DB so restarted peers see the
+            # same empty queue — without this, a cold-booted node would
+            # rehydrate a ghost queue for a slashed offender and release
+            # tokens that the canonical chain burned.
+            if db is not None and hasattr(db, "clear_all_pending_unstakes"):
+                db.clear_all_pending_unstakes(offender_id)
+        else:
+            # Partial burn — scale stake and each pending entry in
+            # place.  Each entry's release_block is preserved so the
+            # unbonding schedule the offender originally chose is not
+            # extended by the slash (extending it would be a hidden
+            # second penalty on top of the proportional burn).
+            self.staked[offender_id] = staked_amount - stake_burn
+            if offender_id in self.pending_unstakes:
+                rebuilt = []
+                for amount, release_block in self.pending_unstakes[offender_id]:
+                    new_amount = amount - (amount * slash_pct // 100)
+                    if new_amount > 0:
+                        rebuilt.append((new_amount, release_block))
+                if rebuilt:
+                    self.pending_unstakes[offender_id] = rebuilt
+                else:
+                    del self.pending_unstakes[offender_id]
+                # Mirror the rewritten queue into the DB.  No
+                # per-entry "scale" primitive exists, so we clear and
+                # re-add — atomic replace, same shape on every replayer.
+                if db is not None and hasattr(db, "clear_all_pending_unstakes"):
+                    db.clear_all_pending_unstakes(offender_id)
+                if db is not None and hasattr(db, "add_pending_unstake"):
+                    for new_amount, release_block in rebuilt:
+                        db.add_pending_unstake(
+                            offender_id, new_amount, release_block,
+                        )
 
         # Pay finder
         self.balances[finder_id] = self.balances.get(finder_id, 0) + finder_reward
