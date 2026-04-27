@@ -6,35 +6,90 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.23.0] — 2026-04-26
 
-Minor release. **Tightens the seed-divestment schedule** so the
-non-discretionary unwind of founder stake starts sooner and ends at
-a smaller floor — cleaner end-state for "secure early on,
-democratize later on, leave the founder a meaningful but
-non-controlling stake."
+Combined release rolling up everything since the 1.21.0 tag — the
+1.22.0 metadata bump and Tier 21 reward-cap rework were prepared on
+`origin/main` but never tagged, so this version folds Tier 20 (soft
+equivocation slash), the fork-emergency detector, Tier 21
+(halvings-aware proposer reward cap), and the seed-divestment
+retune-v2 into a single coordinated release. Validators upgrading
+from 1.21.0 land on 1.23.0 directly.
 
-This is a parameter-only consensus change (no schema bumps, no new
+This is the first release covering Tier 20, Tier 21, and the
+divestment retune; pre-fork chain history replays byte-identically
+under all three forks.
+
+### Consensus — Tier 20: soft equivocation slash (activates block 15000)
+
+Hard fork at `SOFT_SLASH_HEIGHT = 15000` (rides above Tier 19's 13000
+with a ~2000-block runway, ~14 days at 600 s/block). Honest-operator
+survivability under accidental dual-sign.
+
+- **Equivocation penalty drops from 100% to 5% per offense.** Any
+  double-proposal / double-attestation / finality-double-vote
+  evidence used to wipe 100% of the offender's stake + full
+  bootstrap escrow + permanently ban via `slashed_validators`. That
+  penalty matched a deliberate Byzantine attack but was catastrophic
+  for the most common honest-operator failure mode (failover
+  misconfig, restored backup with the old node still running,
+  restart race). Post-fork the slash is partial —
+  `SOFT_SLASH_PCT = 5` of stake + the same fraction of bootstrap
+  escrow + the same fraction of any pending unstakes. The validator
+  stays in the set with reduced stake; only `_processed_evidence`
+  dedupes so the SAME piece of evidence cannot be applied twice.
+- **Repeat-offender economics fall out without escalation logic.**
+  Each new piece of evidence slashes 5% of what remains:
+  `(1 - 0.05)^N` — 10 mistakes ≈ 40% loss, 50 ≈ 92%. Sustained
+  misbehavior still approaches total loss; a single accident does
+  not.
+- **Pending unstakes scaled in place.** Each pending entry's amount
+  is multiplied by `(1 - SOFT_SLASH_PCT/100)`; `release_block` is
+  preserved so the unbonding schedule the offender originally chose
+  is not extended by the slash. DB mirroring uses atomic
+  clear-and-re-add so cold-booted nodes rehydrate the same shape.
+- **Pre-fork path byte-identical.** `slash_validator(slash_pct=100)`
+  takes the legacy full-wipe code path verbatim; `slash_all` with
+  the same default does the same for escrow.
+
+### Operations — fork-emergency detector + validator auto-halt
+
+- Detector watches for unintentional fork conditions; validator
+  auto-halts rather than continuing to mint on a divergent fork.
+  Reduces operator damage when consensus splits unexpectedly.
+
+### Consensus — Tier 21: halvings-aware proposer reward cap (activates block 17000)
+
+Hard fork at `PROPOSER_CAP_HALVING_HEIGHT = 17000`.
+
+- **Per-block proposer reward cap is now recomputed every block.**
+  Previously computed once at module load as `BLOCK_REWARD * 1/4 = 4`
+  tokens. Once halvings drove the actual issued reward down to
+  `BLOCK_REWARD_FLOOR = 4`, the cap (still 4) equaled the entire
+  block reward — so a single validator who proposes AND attests
+  could sweep everything with no clawback. The anti-mega-staker
+  mechanism silently turned off forever at floor era.
+- Post-fork the cap is recomputed every block from the live
+  `reward` returned by the issuance schedule, so the clawback ratio
+  is preserved across halvings. Pre-fork blocks still apply the
+  cached cap byte-for-byte for replay parity.
+
+### Consensus — seed-divestment retune-v2 (parameter-only)
+
+Tightens the non-discretionary founder-stake unwind so it starts
+sooner and ends at a smaller floor — cleaner end-state for "secure
+early on, democratize later on, leave the founder a meaningful but
+non-controlling stake." Parameter-only (no schema bumps, no new
 state, no apply-path or sim-path code edits). Both validators must
 upgrade before `SEED_DIVESTMENT_RETUNE_HEIGHT = 1400`; current head
-is well below that, so plenty of runway. Pre-RETUNE byte-for-byte
-historical replay is preserved.
-
-### Changed (consensus, parameter-only)
+is well below that, so plenty of runway.
 
 - `SEED_DIVESTMENT_START_HEIGHT`: 50_000 → **7_500** (~50 days at
-  600s/block, down from ~10 months). With one operator running both
-  validators and effectively zero external stake, the longer runway
-  buys nothing — pulling start in tightens the credibility story
-  for external observers without sacrificing security. The 4-year
-  bleed window length (`END - START = 210_384` blocks) is
-  preserved so the per-block divestment rate stays sane; only the
-  start moves.
+  600s/block, down from ~10 months). The 4-year bleed window length
+  (`END - START = 210_384` blocks) is preserved so the per-block
+  divestment rate stays sane; only the start moves.
 - `SEED_DIVESTMENT_END_HEIGHT` (derived): 260_384 → **217_884**.
 - `SEED_DIVESTMENT_RETAIN_FLOOR_POST_RETUNE`: 20_000_000 →
   **10_000_000** (~14.3% of supply → ~7.1% of supply). End-state
-  reads as "top holder, not controlling holder" — meaningful
-  founder reward commensurate with bootstrap effort, but the
-  lottery share grows non-founder wallets to a clearly democratized
-  end-state. Floor is the post-RETUNE/REDIST value; legacy 1M
+  reads as "top holder, not controlling holder." Legacy 1M
   pre-RETUNE floor is unchanged byte-for-byte.
 - `SEED_MAX_STAKE_CEILING` (derived from floor): 20M → **10M**.
   Existing seed stake above 10M (currently ~22.5M on v1) is
@@ -42,110 +97,29 @@ historical replay is preserved.
   validation only, not on existing stake; divestment will drain v1
   to the new floor naturally over the bleed window.
 
-### End-state numbers (post-bleed, ~year 2030)
+End-state for the ~95M founder bootstrap shifts:
 
-For the founder bootstrap of ~95M staked:
-
-|                    | pre-1.23.0    | post-1.23.0     |
+|                    | pre-retune    | post-retune     |
 |--------------------|---------------:|---------------:|
 | Founder retained   | 20M (~14.3%) | **10M (~7.1%)** |
 | Burned             | 37.5M (~26.8%) | **42.5M (~30.4%)** |
 | Lottery payouts    | 33.75M (~24.1%) | **38.25M (~27.3%)** |
 | Treasury           | 3.75M (~2.7%) | **4.25M (~3.0%)** |
 
-(Percentages of pre-burn 140M supply. Post-burn supply trends to
-~97.5M under the new schedule, so the founder's ~10M post-bleed
-share is ~10.3% of circulating supply.)
+### Files (this release)
 
-### Why this is safe to land now
-
-- `SEED_DIVESTMENT_RETUNE_HEIGHT = 1400` hasn't activated yet, so
-  neither floor nor split params are in effect. Both nodes upgrade
-  before block 1400 and the new values apply from the very first
-  divestment block (`START + 1`).
-- No state-snapshot version bump (state shape unchanged).
-- No new tx kinds, no new mempool rules, no fee-model changes.
-- v1's current 22.5M staked is grandfathered above the new 10M
-  ceiling; the seed-stake-ceiling rule blocks `StakeTransaction`
-  validation only, not existing stake. Divestment will grind it
-  down naturally.
-
-## [1.22.0] — 2026-04-27
-
-Minor release. **Tier 20 — soft equivocation slash for honest-operator
-mistake survivability.** Hard fork at `SOFT_SLASH_HEIGHT = 15000`
-(rides above Tier 19's 13000 with a ~2000-block runway, ~14 days at
-600 s/block). Pre-fork chain history replays byte-identically; only
-post-fork blocks see the new partial-burn rules.
-
-### Consensus (Tier 20, activates block 15000)
-
-- **Equivocation penalty drops from 100% to 5% per offense.** Previously
-  any double-proposal / double-attestation / finality-double-vote
-  evidence wiped 100% of the offender's stake + full bootstrap escrow
-  + permanently banned them via `slashed_validators`. That penalty
-  matched a deliberate Byzantine attack but was catastrophic for the
-  most common honest-operator failure mode: running two nodes under
-  the same key (failover misconfig, restored backup with the old node
-  still running, restart race). One accidental dual-sign wiped the
-  operator's full bond.
-
-  Post-fork the slash is partial — `SOFT_SLASH_PCT = 5` of stake +
-  the same fraction of bootstrap escrow + the same fraction of any
-  pending unstakes (kept in the slash basis so an attacker cannot
-  outrun evidence by unstaking). The validator stays in the set with
-  reduced stake; only `_processed_evidence` dedupes so the SAME piece
-  of evidence cannot be applied twice. New evidence against the same
-  offender lands at a fresh partial slash.
-
-- **Repeat-offender economics fall out without escalation logic.**
-  Each new piece of evidence slashes 5% of what remains, so a stuck
-  dual-node operator decays geometrically as `(1 - 0.05)^N` —
-  10 mistakes ≈ 40% loss, 50 mistakes ≈ 92% loss. Sustained
-  misbehavior still approaches total stake loss; a single accident
-  does not. No additional state to track; same primitive applied
-  per-evidence.
-
-- **Pending unstakes scaled in place.** Each pending entry's amount
-  is multiplied by `(1 - SOFT_SLASH_PCT/100)`; `release_block` is
-  preserved so the unbonding schedule the offender originally chose
-  is not extended by the slash (extension would be a hidden second
-  penalty on top of the proportional burn). DB mirroring uses an
-  atomic clear-and-re-add so cold-booted nodes rehydrate the same
-  shape as running nodes.
-
-- **Pre-fork path byte-identical.** `slash_validator(slash_pct=100)`
-  takes the legacy full-wipe code path verbatim; `slash_all` with
-  the same default does the same for escrow. State-tree determinism
-  for replay of historical chain state is preserved.
-
-### Files
-
-- `messagechain/config.py` — added `SOFT_SLASH_HEIGHT`, `SOFT_SLASH_PCT`,
-  `get_slash_pct(current_block)`, ordering invariants.
-- `messagechain/economics/inflation.py` — `slash_validator()` accepts
-  `slash_pct`; partial-burn branch scales stake + each pending entry
-  proportionally.
-- `messagechain/economics/escrow.py` — `slash_all()` accepts `slash_pct`;
-  partial branch shrinks each entry, preserves `unlock_at`.
-- `messagechain/core/blockchain.py` — both slash apply paths
-  (`apply_slash_transaction` + `_apply_block_state` slash loop) gate
-  on `get_slash_pct(height)` and skip the `slashed_validators` /
-  reputation-clear branch when `slash_pct < 100`.
-- `tests/test_soft_slash_fork.py` — 9 tests covering both regimes
-  (pre-fork preservation, post-fork partial, no permaban, repeat
-  compounding, pending-unstake scaling, finder-reward scaling,
-  evidence dedupe).
-
-### Why now
-
-The current network is small (single-digit live validators) but the
-catastrophic full-burn was the single loudest objection to running a
-mainnet validator: one operator mistake → bond gone, no recovery.
-Landing this before validator count grows means the new regime is
-established before any operator gets bitten by the legacy rule.
-Activation height 15000 (~1 week of runway from current tip ~700)
-gives operators time to upgrade.
+- `messagechain/config.py` — `SOFT_SLASH_HEIGHT`, `SOFT_SLASH_PCT`,
+  `get_slash_pct`, `PROPOSER_CAP_HALVING_HEIGHT`, divestment
+  parameter retune, ordering invariants.
+- `messagechain/economics/inflation.py` — `slash_validator()` +
+  proposer-cap recomputation gating.
+- `messagechain/economics/escrow.py` — `slash_all()` partial-burn
+  branch.
+- `messagechain/core/blockchain.py` — slash apply paths gate on
+  `get_slash_pct(height)`; comment updates for new divestment floor.
+- `tests/test_soft_slash_fork.py`, `tests/test_seed_divestment*.py`,
+  `tests/test_seed_stake_ceiling.py`, fork-emergency tests, Tier 21
+  reward-cap tests.
 
 ## [1.21.0] — 2026-04-27
 
