@@ -628,7 +628,15 @@ class Mempool:
         """
         if tx.tx_hash in self.react_pool:
             return False
-        if tx.fee < MIN_FEE:
+        # Admission floor matches the consensus-side floor exactly.
+        # Pre-Tier-16 the protocol baseline was MIN_FEE=100; post-fork
+        # the baseline is MARKET_FEE_FLOOR=1.  Using MIN_FEE here would
+        # silently reject txs that the chain itself would accept,
+        # defeating the Tier-18 Gap-5 work that aligned ReactTx
+        # admission with the market floor.  Match it.  (Same pattern
+        # the message-tx pool's `add_transaction` uses — see line ~155.)
+        from messagechain.config import MARKET_FEE_FLOOR
+        if tx.fee < MARKET_FEE_FLOOR:
             return False
         if len(self.react_pool) < self.react_pool_max_size:
             self.react_pool[tx.tx_hash] = tx
