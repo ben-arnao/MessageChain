@@ -105,6 +105,45 @@ Wait one block (~10 minutes) for your message to be included, then:
 messagechain read --last 20
 ```
 
+### 5. Back up your wallet
+
+Two files together make a complete wallet backup:
+
+1. **The keyfile** — your hex private key. Lose this and the funds
+   are gone with no recovery.
+2. **`~/.messagechain/leaves/<entity_id_hex>.idx`** — the WOTS+
+   leaf cursor. Records which one-time signature leaves your key
+   has already burned.
+
+**Restoring the keyfile without the matching leaf-cursor file
+re-signs already-used WOTS+ leaves**, which mathematically discloses
+the WOTS+ private key for those leaves and produces equivocation
+evidence on chain — 100% slash on detection. Treat the leaf cursor
+as security-critical state, not as a regenerable cache. Back up both
+files together; never restore one without the other; both are
+security-critical.
+
+The CLI ships a one-shot helper that bundles them:
+
+```bash
+messagechain backup-wallet --keyfile /path/to/keyfile
+# writes <entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz in CWD
+```
+
+Or roll your own:
+
+```bash
+tar czf wallet-backup.tgz \
+    -C / path/to/keyfile \
+    "$HOME/.messagechain/leaves/<entity_id_hex>.idx"
+```
+
+Store the archive offline (encrypted USB in a safe, not cloud sync).
+If you have a keyfile but no leaf-cursor file (disk loss after a
+keyfile-only paper backup), do NOT sign anything — the first sign
+will reuse leaves and slash. Recover the high-water-mark leaf index
+from chain state first.
+
 ## CLI reference
 
 ### Personal wallet
@@ -119,6 +158,7 @@ messagechain send "reply" --prev <tx_hash>      # reply/chain to a prior message
 messagechain transfer --to mc1… --amount 100    # send tokens
 messagechain read --last 50                     # recent messages
 messagechain estimate-fee --message "hi"        # fee preview
+messagechain backup-wallet --keyfile <path>     # tar keyfile + leaf cursor
 ```
 
 ### Chain & validator info
