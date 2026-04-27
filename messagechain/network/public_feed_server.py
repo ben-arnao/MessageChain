@@ -219,8 +219,8 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         """POST /faucet  body: {"address": "<entity_id_hex>"}.
 
         Returns JSON {"ok": ..., "tx_hash": ..., "amount": ...,
-        "remaining_window": ..., "error": ...}.  The two
-        rate-limit layers (per-/24 IP cooldown, per-window cap) are
+        "remaining_window": ..., "error": ...}.  The three
+        rate-limit layers (per-/24 IP, per-address, daily cap) are
         enforced inside FaucetState.try_drip; this handler is just
         the HTTP boundary.
         """
@@ -456,14 +456,14 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         }
         if ctx.faucet is not None:
             # Surface the visible knobs so the UI can render an
-            # accurate "X drips remaining this window" line without a
-            # second round trip.  The drip amount and window length
-            # rarely change but operators may tweak them across releases.
+            # accurate "X drips remaining" line without a second round
+            # trip.  Tier 22 retired the daily cap in favor of a
+            # rolling-window cap; the public field is renamed in step
+            # so any UI client polling /v1/info gets a consistent name.
             body["faucet"] = {
                 "drip_amount": ctx.faucet.drip_amount,
                 "remaining_window": ctx.faucet.remaining_window(),
                 "window_cap": ctx.faucet.window_cap,
-                "window_sec": ctx.faucet.window_sec,
             }
         self._send_json(200, body)
 

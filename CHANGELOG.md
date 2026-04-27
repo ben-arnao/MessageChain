@@ -4,6 +4,31 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.2] — 2026-04-27
+
+UI release riding the live ReactTx + prev-pointer activation. No
+consensus changes — static feed and entity-profile rendering only,
+plus one parallel `daily_cap` cleanup the Tier 22 rework missed.
+
+### Changed (UI, off-chain, active immediately)
+
+- **Public feed: distinguish replies from multi-tx continuations.**
+  A `prev` pointer chaining a message to the SAME entity's previous
+  message is now rendered as `↪ continued from <hex>` with a
+  3px accent-colored left-border bar on the card; cross-author
+  references stay as `↳ in reply to <hex>` with the original styling.
+  Lets readers tell at a glance whether they're seeing a thread or a
+  long post split across multiple txs.
+- **Public feed: explicit "in reply to" / "continued from" labels.**
+  Replaces the bare `refs <hex>` text — the chevron alone wasn't a
+  strong-enough signal that the link points to a referenced post.
+- **/v1/info: rename `daily_cap` → `window_cap`.** Tier 22 (1.24.0)
+  retired the daily cap on the faucet in favor of a 15-min rolling
+  window, but `_serve_info` still emitted the old field name and
+  would have 500'd whenever a UI client polled it with the faucet
+  enabled — same class of bug as the 1.25.1 hotfix, this time on
+  the public-feed handler instead of the startup log line.
+
 ## [1.25.1] — 2026-04-26
 
 Hotfix for 1.25.0. The Tier 22 (1.24.0) faucet rework retired

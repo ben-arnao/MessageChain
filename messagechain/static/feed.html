@@ -143,6 +143,12 @@
     gap: 0.3rem;
   }
   .msg .prev .arrow { color: var(--accent); }
+  .msg .prev .label {
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-size: 0.7rem;
+    color: var(--muted);
+  }
   .msg .prev a.ref {
     color: var(--accent);
     text-decoration: none;
@@ -157,6 +163,17 @@
     cursor: default;
     pointer-events: none;
   }
+  /* Same-author continuation: a `prev` pointer that links a chain of
+     messages by the SAME entity is a multi-tx post, not a reply.
+     Distinct left-border bar + accent label so the eye groups
+     continuations visually with their predecessor without
+     conflating them with cross-author replies. */
+  .msg.continuation {
+    border-left: 3px solid var(--accent);
+    padding-left: 0.85rem;
+  }
+  .msg .prev.continuation .arrow { color: var(--accent); }
+  .msg .prev.continuation .label { color: var(--accent); }
   /* When the user clicks a ref link the referenced card becomes the
      URL fragment target; highlight it briefly so the scroll lands
      somewhere visible.  Keeps state in the URL so it survives a
@@ -405,9 +422,19 @@
     return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
   }
 
-  function renderMessage(m, knownHashes) {
+  function renderMessage(m, knownHashes, hashToAuthor) {
     const card = document.createElement("div");
     card.className = "msg";
+    // Same-author chain detection: if this message's `prev` is in
+    // the current view AND the predecessor was authored by the same
+    // entity, this card is a continuation (multi-tx post), not a
+    // reply.  Tag the card so the left-border styling kicks in.
+    const isContinuation = !!(
+      m.prev && hashToAuthor && hashToAuthor.get(m.prev) === m.entity_id
+    );
+    if (isContinuation) {
+      card.classList.add("continuation");
+    }
     // Card id = "tx-" + full tx_hash so a `prev` anchor can jump here.
     // Using the full hash (not the shortened one) matches the data
     // key we get from /v1/latest, and keeps anchors stable across
@@ -438,12 +465,20 @@
     if (m.prev) {
       const prevRow = document.createElement("div");
       prevRow.className = "prev";
+      if (isContinuation) {
+        prevRow.classList.add("continuation");
+      }
       const arrow = document.createElement("span");
       arrow.className = "arrow";
-      arrow.textContent = "↳";
+      // ↪ for same-author continuation (multi-tx post), ↳ for a
+      // cross-author reply / external reference.
+      arrow.textContent = isContinuation ? "↪" : "↳";
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = isContinuation ? "continued from" : "in reply to";
       const ref = document.createElement("a");
       ref.className = "ref";
-      ref.textContent = "refs " + shortHex(m.prev, 10, 6);
+      ref.textContent = shortHex(m.prev, 10, 6);
       ref.title = m.prev;
       // Anchor-jump to the referenced card when it's in the current
       // feed window.  When the target isn't rendered (older than the
@@ -457,6 +492,7 @@
         ref.title = m.prev + " (older than this view)";
       }
       prevRow.appendChild(arrow);
+      prevRow.appendChild(label);
       prevRow.appendChild(ref);
       card.appendChild(prevRow);
     }
@@ -501,12 +537,19 @@
     // Build the set of tx_hashes present in THIS render pass so
     // renderMessage can decide whether a `prev` anchor has a target.
     // Out-of-window refs get muted styling instead of a dead link.
+    // Also build a tx_hash -> entity_id map so renderMessage can
+    // tell a same-author continuation (multi-tx post) apart from a
+    // cross-author reply when the predecessor is in-view.
     const knownHashes = new Set();
+    const hashToAuthor = new Map();
     for (const m of messages) {
-      if (m.tx_hash) knownHashes.add(m.tx_hash);
+      if (m.tx_hash) {
+        knownHashes.add(m.tx_hash);
+        if (m.entity_id) hashToAuthor.set(m.tx_hash, m.entity_id);
+      }
     }
     for (const m of messages) {
-      feedEl.appendChild(renderMessage(m, knownHashes));
+      feedEl.appendChild(renderMessage(m, knownHashes, hashToAuthor));
     }
     statusEl.textContent = "Chain height " + height + " · showing " + messages.length + " newest";
     // If the URL already has a fragment (user landed here via an
