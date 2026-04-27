@@ -16,6 +16,7 @@ import hmac
 import json
 import logging
 import os
+import stat
 import struct
 from dataclasses import dataclass, field
 from messagechain.config import (
@@ -64,6 +65,36 @@ class LeafCursorLockTimeoutError(RuntimeError):
     investigate (typically: another shell, a hung CLI, or a stale lock
     on a crashed process whose fd was closed by the OS — in which
     case retrying is enough).
+    """
+
+
+class LeafCursorLockSymlinkRefusedError(RuntimeError):
+    """Raised when the leaf-cursor advisory lock path is unsafe to open.
+
+    The lock file (``<leaf_index_path>.lock``) sits next to the WOTS+
+    leaf-index cursor.  If a hostile uid on a shared host (or a
+    misconfigured shared-tenancy mount) pre-creates the lock path as a
+    symlink, two MessageChain processes that follow *different* symlinks
+    take their advisory locks on different files.  Each appears to hold
+    an exclusive lock, and BOTH proceed past ``load_leaf_index`` to
+    sign at the same on-disk leaf cursor.  WOTS+ leaf reuse mathematically
+    reveals the leaf's private key — an attacker who scrapes both
+    signatures from the chain or mempool can forge new transactions
+    (spend balance, rotate key, impersonate identity) at that leaf.
+
+    This refusal is raised when:
+
+      * the lock path itself is a symlink (POSIX ``O_NOFOLLOW`` /
+        Windows ``os.path.islink`` pre-check);
+      * the parent directory contains a symlink, so the realpath of the
+        lock path differs from its abspath (mirrors the existing
+        persist-side guard — see ``persist_leaf_index`` realpath check);
+      * the path resolves to a non-regular file (directory, FIFO,
+        device) — defense-in-depth via post-open ``S_ISREG`` assertion.
+
+    The right operator response is to inspect the wallet directory and
+    remove the offending symlink/non-regular entry; signing must NOT
+    proceed silently through whatever the symlink pointed at.
     """
 
 
@@ -117,10 +148,114 @@ def _acquire_leaf_cursor_lock(lock_path: str, timeout_s: float | None = None):
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    # Open with append mode so the file is created on first acquire
-    # and not truncated on subsequent ones.  We never write content to
-    # the lock file; flock on the fd is the entire payload.
-    handle = open(lock_path, "a+")
+    # ------------------------------------------------------------------
+    # Symlink-traversal guard (CRITICAL for WOTS+ safety).
+    #
+    # If a hostile uid on a shared host pre-creates the lock path as a
+    # symlink, two MessageChain processes that follow different
+    # symlinks both take "exclusive" advisory locks on different files
+    # and both proceed to sign at the same on-disk leaf cursor.
+    # WOTS+ leaf reuse leaks the leaf's private key.
+    #
+    # Defenses, layered:
+    #   (a) realpath(lock_path) must equal abspath(lock_path) — same
+    #       guard the persist path uses (see persist_leaf_index).
+    #       Catches symlinks anywhere in the path, including parent
+    #       directories.
+    #   (b) POSIX: open with O_NOFOLLOW so the open itself fails with
+    #       ELOOP if the final component is a symlink.  Windows lacks
+    #       O_NOFOLLOW; we pre-check with os.path.islink (Windows
+    #       symlinks require Developer Mode or admin to create, so the
+    #       attack surface is much narrower; documented TOCTOU below).
+    #   (c) Post-open S_ISREG assertion — even with O_NOFOLLOW, defend
+    #       against directories, FIFOs, devices, etc. landing at the
+    #       lock path.
+    # ------------------------------------------------------------------
+    abspath_lock = os.path.abspath(lock_path)
+    if os.path.realpath(lock_path) != abspath_lock:
+        raise LeafCursorLockSymlinkRefusedError(
+            f"refusing to acquire leaf-cursor lock through a symlink: "
+            f"{lock_path} (realpath {os.path.realpath(lock_path)!r} "
+            f"differs from abspath {abspath_lock!r}); inspect the "
+            f"wallet directory for hostile or misconfigured symlinks."
+        )
+
+    if os.name == "nt":
+        # Windows: no O_NOFOLLOW.  Pre-check with islink + lstat.
+        # TOCTOU window between the pre-check and the open call: an
+        # attacker would need to create a symlink in that ~microsecond
+        # window AND have permission to do so (Developer Mode or
+        # admin), which is a much narrower threat than the POSIX case.
+        if os.path.islink(lock_path):
+            raise LeafCursorLockSymlinkRefusedError(
+                f"refusing to acquire leaf-cursor lock at a symlink: "
+                f"{lock_path}; inspect the wallet directory."
+            )
+        # Pre-flight: if a non-regular entry already lives at the lock
+        # path (directory, reparse point, junction, etc.) Windows'
+        # plain ``open()`` raises ``PermissionError`` rather than
+        # surfacing the underlying mismatch — convert to the explicit
+        # refusal so operators see the actual problem.  os.lstat does
+        # not follow symlinks (matching the islink check above).
+        try:
+            pre_st = os.lstat(lock_path)
+        except FileNotFoundError:
+            pre_st = None
+        if pre_st is not None and not stat.S_ISREG(pre_st.st_mode):
+            raise LeafCursorLockSymlinkRefusedError(
+                f"refusing to acquire leaf-cursor lock at non-regular "
+                f"file: {lock_path} (st_mode={pre_st.st_mode:#o}); "
+                f"inspect the wallet directory."
+            )
+        # Open with append mode so the file is created on first acquire
+        # and not truncated on subsequent ones.
+        handle = open(lock_path, "a+")
+    else:
+        # POSIX: O_NOFOLLOW makes the open itself fail with ELOOP if
+        # the final path component is a symlink.  We then wrap the fd
+        # with os.fdopen to keep the existing handle semantics ("a+"
+        # text-mode file object that supports .seek/.fileno/.close).
+        try:
+            fd = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError as e:
+            if e.errno in (errno.ELOOP, errno.EMLINK):
+                raise LeafCursorLockSymlinkRefusedError(
+                    f"refusing to acquire leaf-cursor lock at a "
+                    f"symlink: {lock_path}; inspect the wallet "
+                    f"directory."
+                ) from e
+            raise
+        try:
+            handle = os.fdopen(fd, "a+")
+        except Exception:
+            os.close(fd)
+            raise
+
+    # Defense-in-depth: even with O_NOFOLLOW, ensure we landed on a
+    # regular file.  A directory, FIFO, character/block device, or
+    # socket at the lock path is unsafe — refuse and clean up the fd.
+    try:
+        st = os.fstat(handle.fileno())
+    except OSError:
+        try:
+            handle.close()
+        except OSError:
+            pass
+        raise
+    if not stat.S_ISREG(st.st_mode):
+        try:
+            handle.close()
+        except OSError:
+            pass
+        raise LeafCursorLockSymlinkRefusedError(
+            f"refusing to acquire leaf-cursor lock at non-regular "
+            f"file: {lock_path} (st_mode={st.st_mode:#o}); inspect "
+            f"the wallet directory."
+        )
 
     deadline = _time_monotonic() + max(0.0, float(timeout_s))
 
