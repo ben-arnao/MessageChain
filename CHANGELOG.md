@@ -4,6 +4,92 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.20.0] — 2026-04-26
+
+Minor release. **Two CRITICAL Tier 17 wiring fixes from the round-12
+audit.** Hard fork: `STATE_SNAPSHOT_VERSION 20 → 21` (additive
+section for `reaction_choices`; pre-v21 snapshot blobs are rejected
+by the strict version check). Plus a fee-coherence improvement.
+
+Neither round-12 critical is exploitable today (Tier 17 activates at
+`REACT_TX_HEIGHT = 9000`, current tip ~590), but both MUST land
+before activation block 9000 or first-touch turns into key
+compromise / state-sync hard break. **All mainnet operators should
+upgrade ASAP.**
+
+### Security (round-12 audit)
+
+- **`ReactTransaction` now enforces WOTS+ leaf-watermark + in-block
+  leaf-collision sweep + cross-pool dedupe** (3dd5ff0). Three layers
+  of leaf-reuse defense were missing on the new react path:
+  - `_validate_react_tx_in_block` admitted any `leaf_index`,
+    including one already past the voter's `leaf_watermarks[]`.
+    Mirror the message / transfer / stake / governance gate.
+  - The block-level `_check_leaf` sweep iterated every other tx
+    kind but NOT `block.react_transactions` — two same-leaf signed
+    payloads in the same block (e.g. Transfer at leaf N + React at
+    leaf N from the same voter) bypassed dedup, both applied, the
+    WOTS+ leaf secret was publicly leaked from the two signatures.
+  - `Server._check_leaf_across_all_pools` didn't scan
+    `mempool.react_pool`; `_rpc_submit_react` skipped both the
+    cross-pool check and the per-entity watermark gate at admission.
+  - Two distinct signed payloads under the same WOTS+ leaf trivially
+    leak enough one-time-key material for any observer to forge
+    arbitrary signatures under that leaf — including a
+    `TransferTransaction` draining the voter's full balance and
+    stake. Once `REACT_TX_HEIGHT` activates, any wallet bug or
+    backup-restore that regresses `_next_leaf` (per
+    `reference_test_wallets.md` workflow) and submits
+    `transfer-then-react` hands the network a leaf-reuse pair.
+- **`ReactionState` ground-truth `choices` map now in snapshot +
+  chaindb save/restore symmetry** (3dd5ff0). Pre-fix:
+  - `state_snapshot.serialize_state` didn't extract
+    `reaction_choices`; `_TAG_REACTION_CHOICES` didn't exist;
+    `encode_snapshot` / `decode_snapshot` didn't write/read it;
+    `compute_state_root` committed zero reaction data.
+  - `_install_state_snapshot` left `self.reaction_state` as the
+    default empty `ReactionState()` after install.
+  - `chaindb.save_state_snapshot` didn't capture
+    `reaction_choices`; `restore_state_snapshot` didn't wipe /
+    re-insert.
+  - Once `REACT_TX_HEIGHT` activates and the first vote lands, every
+    checkpoint-bootstrapped node would FAIL the install-time
+    root-equality check (synced node computes
+    `state_root_contribution()` over empty reactions; canonical
+    header committed root over real reactions) — **state-sync
+    becomes IMPOSSIBLE** post-activation. Reorg across a
+    React-bearing block leaves orphan-fork rows on disk → cold
+    restart silently forks. Same defect class as the round-2
+    `entity_id_to_index`, round-4 `key_rotation_last_height`, and
+    round-7 `receipt_subtree_roots` mirror leaks.
+  - **Fix.** Bump `STATE_SNAPSHOT_VERSION 20 → 21`. Add
+    `_TAG_REACTION_CHOICES` Merkle section + leaf builder.
+    `serialize_state` extracts `blockchain.reaction_state.choices`.
+    `_install_state_snapshot` rebuilds `ReactionState` from the
+    snapshot map AND mirrors entries to chaindb.
+    `chaindb.save_state_snapshot` captures `reaction_choices`;
+    `restore_state_snapshot` wipes the table and re-INSERTs inside
+    the same SQL transaction (mirrors round-8 pattern).
+
+### Changed
+
+- **Mempool fee-coherence: size-aware estimator, best-fit fill,
+  flat `MARKET_FEE_FLOOR`** (9ce9cdb). Mempool block-fill selection
+  now uses a size-aware fee-per-byte estimator and best-fit
+  packing; protocol-level `MARKET_FEE_FLOOR` enforced flatly across
+  all tx kinds at admission.
+
+### Notes
+
+- The `STATE_SNAPSHOT_VERSION` bump is a wire-format break: a
+  v1.20+ node cannot decode a v20 snapshot blob (and vice versa).
+  Live operators do not currently bootstrap via checkpoint, so this
+  is forward-only — re-bake any archived snapshots on the upgraded
+  code.
+- No CLI / RPC behavior change for honest operators on the
+  steady-state path (Tier 17 still activates at height 9000;
+  honest validators don't trigger the leaf-reuse class).
+
 ## [1.19.1] — 2026-04-26
 
 Patch release. **CRITICAL upgrade-blocking fix.** 1.19.0 shipped
