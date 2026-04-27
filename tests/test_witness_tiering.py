@@ -138,10 +138,19 @@ class TestAutoSeparationFlag(unittest.TestCase):
             _cfg, "WITNESS_AUTO_SEPARATION_ENABLED", False,
         )
         self._saved_retention = _cfg.WITNESS_RETENTION_BLOCKS
+        # Pin the fork height to 0 so tests using small block numbers
+        # exercise post-fork behavior unconditionally.  The
+        # WITNESS_AUTO_SEPARATION_HEIGHT gate has its own dedicated
+        # tests in test_witness_separation_default_on.py.
+        self._saved_height = getattr(
+            _cfg, "WITNESS_AUTO_SEPARATION_HEIGHT", 0,
+        )
+        _cfg.WITNESS_AUTO_SEPARATION_HEIGHT = 0
 
     def tearDown(self):
         _cfg.WITNESS_AUTO_SEPARATION_ENABLED = self._saved_flag
         _cfg.WITNESS_RETENTION_BLOCKS = self._saved_retention
+        _cfg.WITNESS_AUTO_SEPARATION_HEIGHT = self._saved_height
         self.db.close()
 
     def test_noop_when_disabled(self):
@@ -219,12 +228,17 @@ class TestSeparatedBlockRoundTrip(unittest.TestCase):
             _cfg, "WITNESS_AUTO_SEPARATION_ENABLED", False,
         )
         self._saved_retention = _cfg.WITNESS_RETENTION_BLOCKS
+        self._saved_height = getattr(
+            _cfg, "WITNESS_AUTO_SEPARATION_HEIGHT", 0,
+        )
         _cfg.WITNESS_AUTO_SEPARATION_ENABLED = True
         _cfg.WITNESS_RETENTION_BLOCKS = 0
+        _cfg.WITNESS_AUTO_SEPARATION_HEIGHT = 0
 
     def tearDown(self):
         _cfg.WITNESS_AUTO_SEPARATION_ENABLED = self._saved_flag
         _cfg.WITNESS_RETENTION_BLOCKS = self._saved_retention
+        _cfg.WITNESS_AUTO_SEPARATION_HEIGHT = self._saved_height
         self.db.close()
 
     def test_reassembled_block_has_original_signatures(self):

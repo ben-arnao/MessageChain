@@ -2622,19 +2622,24 @@ class ChainDB:
     ) -> int:
         """Move witnesses of old finalized blocks to the side table.
 
-        Opt-in via WITNESS_AUTO_SEPARATION_ENABLED.  When disabled
-        (the default) this is a no-op — the current storage shape
-        is preserved byte-for-byte and no existing block-read caller
-        silently loses access to inline signatures.
+        Two-part gate:
+          1. WITNESS_AUTO_SEPARATION_ENABLED (operator kill switch).
+          2. WITNESS_AUTO_SEPARATION_HEIGHT (hard-fork activation).
+             Pre-fork blocks (block_number < fork_height) are NEVER
+             stripped — replay determinism for blocks the chain
+             committed to inline forever.
 
-        When enabled, every block at height <=
-        (finalized_height - WITNESS_RETENTION_BLOCKS) whose witness
-        data is still inline gets re-organized: signatures move from
-        the `blocks.data` BLOB to the `block_witnesses` side table.
-        Nothing is deleted — the message payload, timestamp, and
-        entity_id stay in place forever; only the WOTS sig bytes
-        move.  A caller that needs the full block still passes
-        `include_witnesses=True` to get_block_by_hash.
+        When both gates pass, every block at
+            block_number >= WITNESS_AUTO_SEPARATION_HEIGHT
+        AND
+            block_number <= (finalized_height - WITNESS_RETENTION_BLOCKS)
+        whose witness data is still inline gets re-organized:
+        signatures move from the `blocks.data` BLOB to the
+        `block_witnesses` side table.  Nothing is deleted — the
+        message payload, timestamp, and entity_id stay in place
+        forever; only the WOTS sig bytes move.  A caller that needs
+        the full block still passes `include_witnesses=True` to
+        get_block_by_hash.
 
         Idempotent: skips blocks already separated (identified by a
         row in block_witnesses).  Safe to call on every finality
@@ -2646,20 +2651,30 @@ class ChainDB:
         if not getattr(_cfg, "WITNESS_AUTO_SEPARATION_ENABLED", False):
             return 0
 
+        # Hard-fork gate — the sweep itself is inert until the
+        # finality horizon crosses the activation height.  Pre-fork
+        # blocks remain inline forever (filtered again in the SQL
+        # WHERE clause as a defense in depth).
+        fork_height = getattr(_cfg, "WITNESS_AUTO_SEPARATION_HEIGHT", 0)
+        if finalized_height < fork_height:
+            return 0
+
         retention = _cfg.WITNESS_RETENTION_BLOCKS
         horizon = finalized_height - retention
         if horizon < 0:
             return 0
 
-        # Candidate blocks: finalized depth past the retention window
-        # AND not yet separated.  LEFT JOIN is cheap — the blocks
-        # table is indexed on block_hash and block_witnesses is
-        # keyed on the same hash.
+        # Candidate blocks: at-or-above the fork height (pre-fork
+        # blocks are never eligible, full stop), past the retention
+        # window of the finality horizon, and not yet separated.
+        # LEFT JOIN is cheap — both tables are keyed on block_hash.
         cur = self._conn.execute(
             "SELECT b.block_hash FROM blocks b "
             "LEFT JOIN block_witnesses w ON b.block_hash = w.block_hash "
-            "WHERE b.block_number <= ? AND w.block_hash IS NULL",
-            (horizon,),
+            "WHERE b.block_number >= ? "
+            "AND b.block_number <= ? "
+            "AND w.block_hash IS NULL",
+            (fork_height, horizon),
         )
         candidates = [bytes(row[0]) for row in cur.fetchall()]
 
