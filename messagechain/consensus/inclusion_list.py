@@ -1224,14 +1224,27 @@ def process_inclusion_list_violation(
         # Tier 24: increment offense counter so the curve sees this
         # violation in subsequent severity calls (escalation +
         # rate-factor erosion both read it).  Pre-curve path skips
-        # the bump to keep historical replay byte-identical.
+        # the bump to keep historical replay byte-identical.  Route
+        # through the `_bump_slash_offense_count` chokepoint when
+        # available so the chaindb mirror picks up the bump and a
+        # cold-restarted node grades the next violation identically
+        # to uprestarted peers (without persistence the dict resets
+        # to empty on restart, and `slashing_severity` returns a
+        # different `slash_pct` → state_root diverges → chain split).
+        # Fall back to direct dict mutation on stripped-down test
+        # stubs that lack the chokepoint method.
         if use_curve and hasattr(blockchain, "slash_offense_counts"):
-            cur = blockchain.slash_offense_counts.get(
-                etx.accused_proposer_id, 0,
-            )
-            blockchain.slash_offense_counts[etx.accused_proposer_id] = (
-                cur + 1
-            )
+            if hasattr(blockchain, "_bump_slash_offense_count"):
+                blockchain._bump_slash_offense_count(
+                    etx.accused_proposer_id,
+                )
+            else:
+                cur = blockchain.slash_offense_counts.get(
+                    etx.accused_proposer_id, 0,
+                )
+                blockchain.slash_offense_counts[etx.accused_proposer_id] = (
+                    cur + 1
+                )
     proc.processed_violations.add(key)
     return InclusionViolationResult(
         accepted=True, slashed=True,
