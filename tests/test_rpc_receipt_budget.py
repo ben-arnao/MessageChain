@@ -112,7 +112,11 @@ def _make_server_with_chain(seed: bytes):
     # default MERKLE_TREE_HEIGHT=4 (16 leaves) is too tight.
     alice = Entity.create(seed, tree_height=6)
     chain = Blockchain()
-    chain.initialize_genesis(alice)
+    # Generous genesis allocation so tests that submit transfer +
+    # react in addition to messages don't blow alice's spendable
+    # balance budget (default GENESIS_ALLOCATION = 10k, which is too
+    # tight once we add a 10-token-floor transfer + REACT_FEE_FLOOR).
+    chain.initialize_genesis(alice, allocation_table={alice.entity_id: 10_000_000})
     register_entity_for_test(chain, alice)
     # Roomy per-sender cap so a test that submits >5 receipted txs
     # from one funded entity doesn't bounce on the mempool's
@@ -387,6 +391,117 @@ class TestWarningLogOnBudgetExhaustion(_BudgetTestBase):
             ),
             f"expected receipt-budget warning, got: {cm.output}",
         )
+
+
+class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
+    """The same receipt-budget gate must apply to `_rpc_submit_transfer`
+    and `_rpc_submit_react` — the sibling fix routed those handlers
+    through `submit_transaction_to_mempool` and they now also accept
+    `request_receipt: True`.  Without the gate an attacker draining
+    via transfers / react votes would still drain the same subtree
+    (it's one shared 65k-leaf pool, regardless of which RPC flavor
+    burns it).
+
+    A single shared bucket per IP guards all three surfaces: even an
+    attacker alternating between message + transfer + react submits
+    can't get more than SUBMISSION_REJECTION_BURST receipts before
+    the silent-downgrade kicks in.
+    """
+
+    def test_transfer_path_consumes_same_bucket_as_message(self):
+        from messagechain.core.transfer import create_transfer_transaction
+        srv, alice = _make_server_with_chain(b"r-budget-mix-tr".ljust(32, b"\x00"))
+        bob = Entity.create(b"r-budget-mix-tr-bob".ljust(32, b"\x00"))
+        register_entity_for_test(srv.blockchain, bob)
+        ip = "10.0.0.7"
+
+        # Exhaust budget via the MESSAGE surface.
+        for nonce in range(SUBMISSION_REJECTION_BURST):
+            tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
+            resp = srv._rpc_submit_transaction(
+                {"transaction": tx_blob, "request_receipt": True},
+                client_ip=ip,
+            )
+            self.assertTrue(resp["ok"], resp)
+
+        # Now a TRANSFER from the same IP must NOT receive a receipt
+        # (shared bucket is empty).  Tiny amount + minimal fee — alice
+        # only has GENESIS_ALLOCATION (10k) on chain, so the transfer
+        # has to fit inside that budget after the message fees we
+        # already paid.  Both message admission and transfer admission
+        # consult chain-only `spendable_balance` (mempool charges
+        # aren't deducted until block production), so 10k is enough
+        # for one transfer regardless of pending messages.
+        transfer = create_transfer_transaction(
+            entity=alice,
+            recipient_id=bob.entity_id,
+            amount=100,
+            fee=10_000,
+            nonce=SUBMISSION_REJECTION_BURST,
+        )
+        resp = srv._rpc_submit_transfer(
+            {"transaction": transfer.serialize(), "request_receipt": True},
+            client_ip=ip,
+        )
+        self.assertTrue(resp["ok"], resp)
+        self.assertNotIn(
+            "receipt", resp["result"],
+            "transfer surface did NOT honor the shared receipt-budget "
+            "bucket — an attacker can drain via the transfer surface "
+            "even after the message surface ran dry.",
+        )
+
+    def test_react_path_consumes_same_bucket_as_message(self):
+        # ReactTransaction has its own activation gate / target shape;
+        # the simpler shared-bucket invariant we want to prove is that
+        # the gate fires.  Use the same scaffolding as the transfer
+        # test but with a react tx.
+        from messagechain.core.reaction import (
+            create_react_transaction,
+            REACT_CHOICE_UP,
+        )
+        # Force the react activation height to 0 so the test doesn't
+        # need to advance the chain past REACT_TX_HEIGHT.
+        import messagechain.core.reaction as _reaction_mod
+        orig_height = _reaction_mod.REACT_TX_HEIGHT
+        _reaction_mod.REACT_TX_HEIGHT = 0
+        try:
+            srv, alice = _make_server_with_chain(b"r-budget-mix-rx".ljust(32, b"\x00"))
+            bob = Entity.create(b"r-budget-mix-rx-bob".ljust(32, b"\x00"))
+            register_entity_for_test(srv.blockchain, bob)
+            ip = "10.0.0.8"
+
+            # Exhaust budget via MESSAGE.
+            for nonce in range(SUBMISSION_REJECTION_BURST):
+                tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
+                resp = srv._rpc_submit_transaction(
+                    {"transaction": tx_blob, "request_receipt": True},
+                    client_ip=ip,
+                )
+                self.assertTrue(resp["ok"], resp)
+
+            # React from same IP must come back receipt-less.
+            react = create_react_transaction(
+                entity=alice,
+                target=bob.entity_id,
+                target_is_user=True,
+                choice=REACT_CHOICE_UP,
+                fee=10_000,
+                nonce=SUBMISSION_REJECTION_BURST,
+            )
+            resp = srv._rpc_submit_react(
+                {"transaction": react.serialize(), "request_receipt": True},
+                client_ip=ip,
+            )
+            self.assertTrue(resp["ok"], resp)
+            self.assertNotIn(
+                "receipt", resp["result"],
+                "react surface did NOT honor the shared receipt-budget "
+                "bucket — an attacker can drain via the react surface "
+                "even after the message surface ran dry.",
+            )
+        finally:
+            _reaction_mod.REACT_TX_HEIGHT = orig_height
 
 
 if __name__ == "__main__":
