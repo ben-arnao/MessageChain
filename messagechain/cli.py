@@ -468,6 +468,20 @@ def build_parser() -> argparse.ArgumentParser:
             "this works fully offline."
         ),
     )
+    revoke.add_argument(
+        "--valid-for-blocks", type=int, default=None,
+        help=(
+            "Tier 26: width of the chain-height window the signed "
+            "revoke is valid in.  Default 13140 blocks (~90 days at "
+            "600s/block) -- the recommended quarterly cold-key re-sign "
+            "cadence.  A leaked pre-signed hex expires within this "
+            "many blocks of its valid_to_height, bounding the bearer-"
+            "replay attack surface.  Pre-fork (height < "
+            "REVOKE_TX_WINDOW_HEIGHT) the window is still emitted but "
+            "not enforced by the chain, so upgrading the CLI ahead of "
+            "the fork is safe."
+        ),
+    )
 
     # --- broadcast-revoke ---
     bcast = sub.add_parser(
@@ -3478,16 +3492,53 @@ def cmd_emergency_revoke(args):
     #                     switch you only reach for under duress.  The
     #                     extra tokens come out of the cold-key holder's
     #                     balance only when (and if) the revoke fires.
-    from messagechain.config import MIN_FEE_POST_FLAT
+    from messagechain.config import (
+        MIN_FEE_POST_FLAT,
+        REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS,
+    )
     if args.fee is not None:
         fee = args.fee
     elif print_only:
         fee = MIN_FEE_POST_FLAT * 10
     else:
         fee = MIN_FEE_POST_FLAT
-    tx = create_revoke_transaction(
-        cold, fee=fee, entity_id=target_entity_id,
+
+    # Tier 26 window: every signed revoke commits to a chain-height
+    # range so leaked hexes expire.  In live (broadcast) mode we probe
+    # the tip via RPC so the window starts at "now"; in print-only
+    # mode we cannot touch the network, so valid_from defaults to 0
+    # (the window opens at genesis) and the operator gets the FULL
+    # configured width as their re-sign deadline.  Pre-fork the window
+    # is harmlessly carried in the wire format but not enforced; post-
+    # fork the chain rejects out-of-window blobs.
+    # getattr fallback keeps older test fixtures (which build Namespaces
+    # by hand and predate this flag) working without code surgery in
+    # every test that constructs an argparse.Namespace for cmd_
+    # emergency_revoke.
+    raw_valid_for = getattr(args, "valid_for_blocks", None)
+    valid_for = (
+        raw_valid_for
+        if raw_valid_for is not None
+        else REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS
     )
+    if print_only:
+        valid_from = 0
+    else:
+        # Probe tip below; for now hold None and fill it in after the
+        # rpc_call (we need `host, port` first, which is computed
+        # further down for the live branch).
+        valid_from = None
+    valid_to = None  # filled in once valid_from is resolved
+    if valid_from is not None:
+        valid_to = valid_from + valid_for
+
+    tx = None  # built once valid_from / valid_to are settled
+    if print_only:
+        tx = create_revoke_transaction(
+            cold, fee=fee, entity_id=target_entity_id,
+            valid_from_height=valid_from,
+            valid_to_height=valid_to,
+        )
 
     if print_only:
         # Air-gapped pre-sign path: print the serialized tx as hex on
@@ -3501,6 +3552,15 @@ def cmd_emergency_revoke(args):
         print(f"  Target entity: {target_entity_id.hex()}")
         print(f"  Fee paid on broadcast: {fee} tokens")
         print(f"  Tx hash: {tx.tx_hash.hex()}")
+        # Tier 26 window: surface BOTH endpoints so the operator
+        # records the re-sign deadline alongside the hex.  An expired
+        # blob is inert post-fork, so this is the "ladder" the
+        # operator climbs every quarter.
+        print(f"  Valid from height: {tx.valid_from_height}")
+        print(f"  Valid to height:   {tx.valid_to_height}  "
+              f"(re-sign before this height -- "
+              f"~{(tx.valid_to_height - tx.valid_from_height) * 600 // 86400} "
+              "days at 600s blocks)")
         print(f"  Bytes (length {len(tx_hex)//2}):\n")
         print(tx_hex)
         print()
@@ -3518,12 +3578,27 @@ def cmd_emergency_revoke(args):
     from client import rpc_call
 
     # Probe tip height so the warning reflects the CURRENTLY active
-    # unbonding fork.
+    # unbonding fork.  The same probe seeds the Tier 26 window so the
+    # signed blob's valid_from is "now" and valid_to is "now + N".
     tip_resp = rpc_call(host, port, "get_chain_info", {})
     revoke_tip: int | None = None
     if tip_resp.get("ok"):
         count = tip_resp["result"].get("height", 0) or 0
         revoke_tip = max(count - 1, 0)
+
+    # Now that we have the tip, build the live revoke with a window
+    # anchored at the current chain height.  If the probe failed (no
+    # tip), default to 0 -- pre-fork the chain accepts un-windowed
+    # revokes anyway, and post-fork an unreachable RPC means the
+    # operator will see a clear "window not yet active" rejection
+    # rather than a silent broadcast.
+    valid_from = revoke_tip if revoke_tip is not None else 0
+    valid_to = valid_from + valid_for
+    tx = create_revoke_transaction(
+        cold, fee=fee, entity_id=target_entity_id,
+        valid_from_height=valid_from,
+        valid_to_height=valid_to,
+    )
 
     if not getattr(args, "yes", False):
         tid_hex = target_entity_id.hex()
@@ -3532,6 +3607,10 @@ def cmd_emergency_revoke(args):
         print(f"  Target entity: {tid_short}")
         print(f"  (full: {tid_hex})")
         print(f"  Fee:           {fee} tokens")
+        print(
+            f"  Window:        height {tx.valid_from_height}..{tx.valid_to_height} "
+            f"(width {valid_for} blocks)"
+        )
         print(
             f"  This disables the validator PERMANENTLY.  Staked funds "
             f"release to the operator's balance after the unbonding "
