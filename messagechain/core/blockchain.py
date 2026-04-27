@@ -4757,9 +4757,24 @@ class Blockchain:
                     PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
                     as _ARCB,
                     FINALITY_INTERVAL as _FI,
+                    REWARD_CURVE_HEIGHT as _RCH,
+                )
+                from messagechain.economics.inflation import (
+                    reward_curve_multiplier as _reward_curve_multiplier,
                 )
                 _cap_active = block_height >= _ARCH
                 _cap_fix_active = block_height >= _ACFH
+                # REWARD_CURVE_HEIGHT (Tier 20): mirror the apply-path
+                # multiplier.  Apply path reads total active stake
+                # from self.supply.staked AT mint time, which equals
+                # sim_staked here (sim has applied every staking-
+                # affecting tx of this block before the reward step).
+                # Curve runs BEFORE the per-entity cap so the cap
+                # remains a strict upper bound — same order as apply.
+                _curve_active = block_height >= _RCH
+                _sim_total_stake = (
+                    sum(sim_staked.values()) if _curve_active else 0
+                )
                 _sim_epoch_earnings: dict[bytes, int] = {}
                 _cap_per_entity = 0
                 if _cap_active:
@@ -4790,10 +4805,26 @@ class Blockchain:
                     )
                 for eid in attester_committee:
                     _reward_amount = per_slot_reward
+                    # Tier 20 curve: identical computation to apply
+                    # path's mint_block_reward.  Defensive zero-
+                    # stake short-circuit matches: bps undefined in
+                    # that case, helper would return small-band
+                    # (unintended), so skip the multiplier entirely.
+                    if (
+                        _curve_active
+                        and per_slot_reward > 0
+                        and _sim_total_stake > 0
+                    ):
+                        _stake_bps = (
+                            sim_staked.get(eid, 0) * 10_000
+                            // _sim_total_stake
+                        )
+                        _num, _den = _reward_curve_multiplier(_stake_bps)
+                        _reward_amount = _reward_amount * _num // _den
                     if _cap_active and per_slot_reward > 0:
                         _earned = _sim_epoch_earnings.get(eid, 0)
                         _available = max(0, _cap_per_entity - _earned)
-                        _reward_amount = min(per_slot_reward, _available)
+                        _reward_amount = min(_reward_amount, _available)
                         _sim_epoch_earnings[eid] = (
                             _earned + _reward_amount
                         )
