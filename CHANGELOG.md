@@ -4,6 +4,28 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.3] — 2026-04-27
+
+Critical operational hotfix.  Submit RPCs (`submit_transaction`,
+`submit_transfer`, `submit_react`) now run inside `asyncio.to_thread`
+so the WOTS+ sign + 30-second cross-process file-lock wait that
+`receipt_issuer.issue()` performs no longer blocks the event loop.
+
+Pre-fix, a single submit RPC could pin the entire asyncio event
+loop for up to 30 seconds — every other handler (including
+`get_chain_info`, peer message dispatch, block-production gossip)
+froze in lockstep.  When a client retry-loop hit the natural ~10s
+client socket timeout it would re-submit, queueing another sync
+sign behind the first; the lock was held continuously and the
+validator went globally unresponsive.  Symptom seen on mainnet:
+v2's RPC stopped answering ~20 minutes after a 1.28.x rollout,
+RPC port LISTEN but no completion, kernel `epoll_wait` never woke
+up because the user-thread was busy in fcntl.flock retry loop.
+
+The submit handlers themselves are unchanged; only the dispatch
+site in `_process_rpc` is updated.  No consensus impact, no
+wire-format change.  Test suite green (4270 / 21 skipped).
+
 ## [1.28.2] — 2026-04-27
 
 Patch release.  **Pre-activation hard-fork wire-format revision for

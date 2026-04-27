@@ -1700,7 +1700,20 @@ class Server(SharedRuntimeMixin):
                 }
 
         if method == "submit_transaction":
-            return self._rpc_submit_transaction(request["params"])
+            # Run the synchronous submit handler in the asyncio thread
+            # pool.  The handler internally calls
+            # receipt_issuer.issue() which performs a WOTS+ sign and
+            # waits up to 30s on a cross-process file lock — both
+            # CPU-bound and I/O-blocking.  Calling it inline blocks
+            # the entire asyncio event loop for the duration, freezing
+            # every other RPC handler and peer-message dispatch.  Under
+            # a client retry-loop the lock contention compounds and
+            # the validator becomes globally unresponsive.  to_thread
+            # isolates the blocking work; the event loop stays
+            # available for concurrent reads + peer traffic.
+            return await asyncio.to_thread(
+                self._rpc_submit_transaction, request["params"],
+            )
 
         elif method == "get_entity":
             return self._rpc_get_entity(request["params"])
@@ -1825,10 +1838,21 @@ class Server(SharedRuntimeMixin):
             return self._rpc_unstake(request["params"])
 
         elif method == "submit_transfer":
-            return self._rpc_submit_transfer(request["params"])
+            # Same to_thread isolation as submit_transaction — the
+            # submit path may sign a SubmissionReceipt synchronously.
+            return await asyncio.to_thread(
+                self._rpc_submit_transfer, request["params"],
+            )
 
         elif method == "submit_react":
-            return self._rpc_submit_react(request["params"])
+            # Same to_thread isolation as submit_transaction.  ReactTx
+            # admission verifies WOTS+ signatures, which is CPU-bound;
+            # keeping it off the event loop preserves RPC liveness for
+            # other clients (and for our own block-production peer
+            # gossip) while the verify runs.
+            return await asyncio.to_thread(
+                self._rpc_submit_react, request["params"],
+            )
 
         elif method == "get_user_trust":
             return self._rpc_get_user_trust(request["params"])
