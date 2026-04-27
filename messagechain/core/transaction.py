@@ -31,7 +31,7 @@ from messagechain.config import (
     INTL_MESSAGE_HEIGHT,
     MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
     MARKET_FEE_FLOOR, MARKET_FEE_FLOOR_HEIGHT,
-    COMMUNITY_ID_HEIGHT, COMMUNITY_ID_BYTES,
+    COMMUNITY_ID_HEIGHT, MAX_COMMUNITY_ID_LEN,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -70,15 +70,87 @@ TX_VERSION_LENGTH_PREFIX = 4
 # Tx-logic version that enables the optional `community_id` field
 # (Tier 25 — COMMUNITY_ID_HEIGHT).  v5 inherits the v4 wire layout
 # (length-prefixed signable_data + always-emitted prev / sender_pubkey
-# presence-flag blocks) and appends a community_id presence-flag block
-# at the end.  When set, community_id is exactly COMMUNITY_ID_BYTES
-# (16) bytes; when None (presence flag = 0x00), the optional payload
-# is omitted.  v1-v4 MUST NOT carry community_id.
+# presence-flag blocks) and appends a community_id presence-flag
+# block at the end.  When set, the block is 1B presence flag + 1B
+# length + N bytes of ASCII handle text drawn from [a-z0-9_-], with
+# first/last byte in [a-z0-9] and N in [1, MAX_COMMUNITY_ID_LEN].
+# When None (presence flag = 0x00), no length byte and no payload
+# bytes are emitted.  v1-v4 MUST NOT carry community_id.
 TX_VERSION_COMMUNITY_ID = 5
-# Raw byte cost of the community_id field when set (1B presence flag
-# + 16B id).  Charged at the per-stored-byte fee basis alongside `prev`
-# and `sender_pubkey` so opt-in to the feature is uniformly priced.
-COMMUNITY_ID_STORED_BYTES = 1 + COMMUNITY_ID_BYTES
+# Maximum stored-byte cost of the community_id block when set:
+# 1B presence flag + 1B length byte + MAX_COMMUNITY_ID_LEN handle
+# bytes.  Used as an upper bound for tests / fee-floor headroom
+# estimates; actual cost is computed dynamically per-tx since
+# handles vary in length.
+MAX_COMMUNITY_ID_STORED_BYTES = 1 + 1 + MAX_COMMUNITY_ID_LEN
+# Allowed handle character set (interior bytes): lowercase letters,
+# digits, hyphen, underscore.  Frozenset for O(1) membership.
+_COMMUNITY_ID_ALLOWED = frozenset(
+    b"abcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+# Edge bytes (first / last) are restricted further to [a-z0-9] —
+# DNS-label style, prevents `art` vs `-art` vs `art_` fragmentation
+# at zero cost.
+_COMMUNITY_ID_EDGE_ALLOWED = frozenset(
+    b"abcdefghijklmnopqrstuvwxyz0123456789"
+)
+
+
+def _community_id_stored_bytes(handle: "str | None", version: int) -> int:
+    """Stored-byte cost of the community_id block at this version.
+
+    v1-v4: 0 (no block emitted).
+    v5+ with handle=None: 1 (presence flag only).
+    v5+ with handle set: 1 + 1 + len(handle.encode('ascii')).
+    """
+    if version < TX_VERSION_COMMUNITY_ID:
+        return 0
+    if handle is None:
+        return 1
+    return 1 + 1 + len(handle.encode("ascii"))
+
+
+def _validate_community_id(handle: str) -> tuple[bool, str]:
+    """Return (ok, reason) for the Tier 25 community_id handle rule.
+
+    Anchored properties (see config.MAX_COMMUNITY_ID_LEN comment block):
+        * ASCII bytes only, no Unicode (homoglyph-resistant).
+        * Lowercase a-z, digits 0-9, hyphen `-`, underscore `_`.
+        * Length in [1, MAX_COMMUNITY_ID_LEN] bytes.
+        * First and last byte in [a-z0-9] (no leading/trailing
+          punctuation — DNS-label style — to prevent `art` /
+          `-art` / `art_` fragmentation).
+    """
+    if not isinstance(handle, str):
+        return False, "community_id must be a str"
+    try:
+        encoded = handle.encode("ascii")
+    except UnicodeEncodeError:
+        return False, "community_id must be ASCII (no Unicode)"
+    n = len(encoded)
+    if n == 0:
+        return False, "community_id must be at least 1 byte"
+    if n > MAX_COMMUNITY_ID_LEN:
+        return False, (
+            f"community_id exceeds {MAX_COMMUNITY_ID_LEN} bytes "
+            f"(got {n})"
+        )
+    if encoded[0] not in _COMMUNITY_ID_EDGE_ALLOWED:
+        return False, (
+            f"community_id first byte must be [a-z0-9], "
+            f"got {bytes([encoded[0]])!r}"
+        )
+    if encoded[-1] not in _COMMUNITY_ID_EDGE_ALLOWED:
+        return False, (
+            f"community_id last byte must be [a-z0-9], "
+            f"got {bytes([encoded[-1]])!r}"
+        )
+    for b in encoded:
+        if b not in _COMMUNITY_ID_ALLOWED:
+            return False, (
+                f"community_id byte {bytes([b])!r} not in [a-z0-9_-]"
+            )
+    return True, "OK"
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -119,14 +191,14 @@ class MessageTransaction:
     # tx that re-supplies the pubkey for an already-installed entity, so
     # the field is structurally exclusive with "already registered").
     sender_pubkey: bytes = b""
-    # `community_id` (optional, v5+): COMMUNITY_ID_BYTES-byte opaque
-    # grouping identifier — Reddit-style "this post belongs to community
-    # X".  Only meaningful at version >= TX_VERSION_COMMUNITY_ID.  When
-    # set on a v5 tx, the 1-byte presence flag and 16-byte id are
-    # included in both _signable_data and the wire form.  No on-chain
-    # registry exists; the namespace is purely conventional (apps
-    # typically derive id = sha256(community_name_normalized)[:16]).
-    community_id: bytes | None = None
+    # `community_id` (optional, v5+): short ASCII handle grouping the
+    # post into a Reddit-style community/topic.  Only meaningful at
+    # version >= TX_VERSION_COMMUNITY_ID.  Charset / length / edge
+    # rules enforced by _validate_community_id (1-MAX_COMMUNITY_ID_LEN
+    # bytes from [a-z0-9_-], first/last byte in [a-z0-9]).  No
+    # on-chain registry, no claim, no entity owns a community —
+    # purely a category tag whose meaning lives at L2/app layer.
+    community_id: str | None = None
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -210,22 +282,22 @@ class MessageTransaction:
                         f"got {len(self.sender_pubkey)}"
                     )
                 base += b"\x01" + self.sender_pubkey
-        # Version 5 (Tier 25) appends the community_id presence-flag
-        # block in the same shape as prev / sender_pubkey.  Including
-        # the flag in the signed payload prevents an attacker from
-        # grafting a community_id onto a legitimately-signed v5 tx
-        # whose sender meant to leave it absent.
+        # Version 5 (Tier 25) appends the community_id block.  When
+        # set, the block is presence-flag + length-byte + N ASCII
+        # bytes; when None, just the presence flag.  Including the
+        # length byte and bytes in the signed payload prevents an
+        # attacker from grafting or rewriting a community_id on a
+        # legitimately-signed v5 tx — same rationale as the prev /
+        # sender_pubkey blocks above.
         if self.version >= TX_VERSION_COMMUNITY_ID:
             if self.community_id is None:
                 base += b"\x00"
             else:
-                if len(self.community_id) != COMMUNITY_ID_BYTES:
-                    raise ValueError(
-                        f"community_id must be exactly "
-                        f"{COMMUNITY_ID_BYTES} bytes, "
-                        f"got {len(self.community_id)}"
-                    )
-                base += b"\x01" + self.community_id
+                ok, reason = _validate_community_id(self.community_id)
+                if not ok:
+                    raise ValueError(reason)
+                cid_bytes = self.community_id.encode("ascii")
+                base += b"\x01" + struct.pack(">B", len(cid_bytes)) + cid_bytes
         return base
 
     @property
@@ -298,12 +370,14 @@ class MessageTransaction:
         if self.version >= TX_VERSION_FIRST_SEND_PUBKEY and self.sender_pubkey:
             d["sender_pubkey"] = self.sender_pubkey.hex()
         # Same omit-when-empty rule for community_id: a v5 tx without
-        # one stays minimal in the dict round-trip.
+        # one stays minimal in the dict round-trip.  Emitted as the
+        # plain ASCII handle string (not hex) — that is the canonical
+        # human-readable form callers will recognize.
         if (
             self.version >= TX_VERSION_COMMUNITY_ID
             and self.community_id is not None
         ):
-            d["community_id"] = self.community_id.hex()
+            d["community_id"] = self.community_id
         return d
 
     def to_bytes(self, state=None) -> bytes:
@@ -376,15 +450,19 @@ class MessageTransaction:
                 parts.append(b"\x00")
             else:
                 parts.append(b"\x01" + self.sender_pubkey)
-        # Version 5 wire form: same presence-flag layout for the
-        # optional community_id field, immediately after sender_pubkey
-        # and before the signature.  Inside the signed payload
-        # (_signable_data) for the same reason as prev/sender_pubkey.
+        # Version 5 wire form: presence-flag-then-length-then-bytes
+        # for the optional community_id handle, immediately after
+        # sender_pubkey and before the signature.  Layout matches
+        # _signable_data so wire bytes are byte-for-byte identical to
+        # what was signed.
         if self.version >= TX_VERSION_COMMUNITY_ID:
             if self.community_id is None:
                 parts.append(b"\x00")
             else:
-                parts.append(b"\x01" + self.community_id)
+                cid_bytes = self.community_id.encode("ascii")
+                parts.append(
+                    b"\x01" + struct.pack(">B", len(cid_bytes)) + cid_bytes
+                )
         parts.extend([
             struct.pack(">I", len(sig_blob)),
             sig_blob,
@@ -468,9 +546,13 @@ class MessageTransaction:
                     f"MessageTransaction sender_pubkey flag must be "
                     f"0 or 1, got {pk_flag}"
                 )
-        # Version 5 wire form: same presence-flag-then-bytes layout for
-        # the optional community_id field.  v1-v4 blobs skip entirely.
-        community_id: bytes | None = None
+        # Version 5 wire form: presence-flag-then-length-then-bytes
+        # for the optional community_id handle.  v1-v4 blobs skip
+        # entirely.  Parse-time rejects malformed structure (bad
+        # flag, truncated length / bytes, length out of range, or
+        # non-decodable ASCII); semantic charset validation is
+        # delegated to verify_transaction.
+        community_id: str | None = None
         if version >= TX_VERSION_COMMUNITY_ID:
             if offset + 1 > len(data):
                 raise ValueError(
@@ -480,14 +562,30 @@ class MessageTransaction:
             if cid_flag == 0x00:
                 community_id = None
             elif cid_flag == 0x01:
-                if offset + COMMUNITY_ID_BYTES > len(data):
+                if offset + 1 > len(data):
                     raise ValueError(
-                        "MessageTransaction community_id truncated"
+                        "MessageTransaction community_id length "
+                        "byte truncated"
                     )
-                community_id = bytes(
-                    data[offset:offset + COMMUNITY_ID_BYTES]
-                )
-                offset += COMMUNITY_ID_BYTES
+                cid_len = data[offset]; offset += 1
+                if cid_len < 1 or cid_len > MAX_COMMUNITY_ID_LEN:
+                    raise ValueError(
+                        f"MessageTransaction community_id length "
+                        f"{cid_len} out of [1, {MAX_COMMUNITY_ID_LEN}]"
+                    )
+                if offset + cid_len > len(data):
+                    raise ValueError(
+                        "MessageTransaction community_id bytes truncated"
+                    )
+                cid_bytes = bytes(data[offset:offset + cid_len])
+                offset += cid_len
+                try:
+                    community_id = cid_bytes.decode("ascii")
+                except UnicodeDecodeError:
+                    raise ValueError(
+                        "MessageTransaction community_id bytes are "
+                        "not valid ASCII"
+                    )
             else:
                 raise ValueError(
                     f"MessageTransaction community_id flag must be "
@@ -561,9 +659,11 @@ class MessageTransaction:
         sender_pubkey = (
             bytes.fromhex(sender_pubkey_hex) if sender_pubkey_hex else b""
         )
-        community_id_hex = data.get("community_id")
+        # community_id is emitted as the plain ASCII handle string;
+        # accept missing or empty as "absent".
+        community_id_str = data.get("community_id")
         community_id = (
-            bytes.fromhex(community_id_hex) if community_id_hex else None
+            community_id_str if community_id_str else None
         )
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
@@ -845,7 +945,7 @@ def create_transaction(
     prev: bytes | None = None,
     *,
     include_pubkey: bool = False,
-    community_id: bytes | None = None,
+    community_id: str | None = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
@@ -946,17 +1046,15 @@ def create_transaction(
     # Tier 25: opting into community_id bumps the tx to v5.  v5
     # inherits the v4 layout in full (so any prev / sender_pubkey
     # overhead the v4 gate above already added carries through), and
-    # appends the community_id presence-flag block — 1B presence flag
-    # if community_id is None, COMMUNITY_ID_STORED_BYTES (= 17) if set.
-    # We only bump version when the caller actually supplies a
-    # community_id; non-community senders post-activation stay at v4
-    # (or v1-v3 pre-Tier-14) so the common-case footprint is unchanged.
+    # appends the community_id block — 1B presence flag if None,
+    # otherwise 1B flag + 1B length + N ASCII bytes.  We only bump
+    # version when the caller actually supplies a community_id;
+    # non-community senders post-activation stay at v4 (or v1-v3
+    # pre-Tier-14) so the common-case footprint is unchanged.
     if community_id is not None:
-        if len(community_id) != COMMUNITY_ID_BYTES:
-            raise ValueError(
-                f"community_id must be exactly {COMMUNITY_ID_BYTES} "
-                f"bytes, got {len(community_id)}"
-            )
+        ok, reason = _validate_community_id(community_id)
+        if not ok:
+            raise ValueError(reason)
         if (
             current_height is not None
             and current_height < COMMUNITY_ID_HEIGHT
@@ -976,7 +1074,8 @@ def create_transaction(
             if not include_pubkey:
                 prev_overhead += 1  # sender_pubkey presence flag
         tx_version = TX_VERSION_COMMUNITY_ID
-        prev_overhead += COMMUNITY_ID_STORED_BYTES
+        # 1B presence flag + 1B length + N ASCII handle bytes.
+        prev_overhead += 1 + 1 + len(community_id.encode("ascii"))
     if prev is not None and len(prev) != 32:
         raise ValueError(
             f"prev must be exactly 32 bytes, got {len(prev)}"
@@ -1065,15 +1164,15 @@ def verify_transaction(
             return False
         # v5 inherits the full v4 trailer layout (prev + sender_pubkey
         # presence-flag blocks always present) and adds the community_id
-        # presence-flag block.  When set, community_id MUST be exactly
-        # COMMUNITY_ID_BYTES bytes; tampering with the length without
-        # re-signing produces a tx_hash mismatch downstream, but we
-        # also reject the structural error here for a clearer failure.
-        if (
-            tx.community_id is not None
-            and len(tx.community_id) != COMMUNITY_ID_BYTES
-        ):
-            return False
+        # block.  When set, community_id MUST satisfy the handle rule
+        # (charset / length / edge bytes).  Tampering with the
+        # community_id post-signing would produce a tx_hash mismatch
+        # downstream, but we also reject the structural error here for
+        # a clearer failure.
+        if tx.community_id is not None:
+            ok, _reason = _validate_community_id(tx.community_id)
+            if not ok:
+                return False
         if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
             return False
     elif tx.version >= TX_VERSION_LENGTH_PREFIX:
@@ -1185,13 +1284,13 @@ def verify_transaction(
         ) + (SENDER_PUBKEY_STORED_BYTES if tx.sender_pubkey else 1)
     else:
         prev_overhead = PREV_POINTER_STORED_BYTES if tx.prev is not None else 0
-    # v5 adds the community_id presence-flag block: 1B when None,
-    # COMMUNITY_ID_STORED_BYTES (= 17) when set.  Mirrors
+    # v5 adds the community_id block: 1B when None, otherwise
+    # 1B flag + 1B length + N handle bytes.  Mirrors
     # create_transaction's accounting so the local fee floor a sender
     # computed matches what the chain enforces here.
     if tx.version >= TX_VERSION_COMMUNITY_ID:
-        prev_overhead += (
-            COMMUNITY_ID_STORED_BYTES if tx.community_id is not None else 1
+        prev_overhead += _community_id_stored_bytes(
+            tx.community_id, tx.version
         )
     if tx.fee < calculate_min_fee(
         tx.message,
