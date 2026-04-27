@@ -6099,8 +6099,21 @@ class Blockchain:
         validator churn between N-1 and N corrupts both the numerator
         (ghost stake still counted) and the denominator (validators who
         unstaked make the threshold artificially easier or harder to hit).
-        We consult _stake_snapshots[N-1] and fall back to `stakes` only
-        when no snapshot is available (bootstrap / loaded-from-db edge).
+
+        Skip-if-missing rather than fall back to the live `stakes` map.
+        On the honest path the pin always exists: `initialize_genesis`
+        pins height 0, every applied block pins its own height in
+        `_record_stake_snapshot`, and attestations only target the
+        immediate parent (N-1) -- so when block N is being applied the
+        pin for N-1 was set at the end of N-1's apply.  A missing pin
+        means a peer-divergent state (cold-restart with mirror past
+        FINALITY_VOTE_MAX_AGE_BLOCKS, snapshot-mirror corruption, or a
+        future refactor bug); silently substituting live state would
+        produce different `justified` decisions on different peers --
+        the same divergence trap _apply_finality_votes closes for the
+        long-range checkpoint layer.  Justification feeds the
+        finalization-stall counter and downstream consensus paths, so
+        deterministic skip beats silent corruption.
         """
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
         for att in block.attestations:
@@ -6110,14 +6123,25 @@ class Blockchain:
             # every LOTTERY_INTERVAL blocks; drives "honest behavior =
             # real-time influence" during bootstrap.  Routed through
             # `_bump_reputation` so the in-memory dict and the
-            # chaindb `reputation` table stay in lockstep.
+            # chaindb `reputation` table stay in lockstep.  Reputation
+            # is independent of the 2/3 stake math, so it is bumped
+            # before the pin lookup -- skipping the finality update on
+            # missing pin must NOT also drop reputation, which would
+            # be a second divergence axis.
             self._bump_reputation(att.validator_id)
             target_block = att.block_number
             pinned = self._stake_snapshots.get(target_block)
-            if pinned is not None:
-                stakes_for_att = pinned
-            else:
-                stakes_for_att = stakes
+            if pinned is None:
+                logger.error(
+                    f"Attestation target #{target_block} "
+                    f"({att.block_hash.hex()[:16]}) has no pinned stake "
+                    f"snapshot at apply time -- skipping finality update "
+                    f"to avoid live-state denominator divergence across "
+                    f"peers.  This indicates validation drift or "
+                    f"snapshot-mirror corruption."
+                )
+                continue
+            stakes_for_att = pinned
             validator_stake = stakes_for_att.get(att.validator_id, 0)
             total_stake = sum(stakes_for_att.values())
             # Finality safety floor: independent of bootstrap_progress,
