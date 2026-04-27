@@ -55,12 +55,33 @@ Validation rules (verify_react_transaction)
 5. If target_is_user: target ≠ voter_id (no self-trust).
 6. Signature verifies under the supplied public_key.
 
-Self-trust note: a user can react UP/DOWN/CLEAR on their OWN message
-tx_hashes — the no-self-vote rule applies only to user-trust votes,
-because a user up-voting their own user-trust score would be a free
-unbounded reputation pump.  Reacting to your own message is fine; if
-you want to inflate your message-score that way, every self-react
-still costs full fee (which is the spam discipline).
+Note: the no-self-vote rule on message tx_hashes is enforced at the
+admission layer (block validation + mempool submission), NOT in this
+pure verifier — resolving authorship of a target tx_hash requires
+chain state (tx_locations index + block load), which the verifier
+deliberately does not take.  See the self-vote rule below.
+
+Self-vote rule (full picture)
+-----------------------------
+
+The protocol's broader anchor: a vote signals external reception, not
+author preference.  This applies symmetrically to both target types:
+
+* User-trust votes (target_is_user=True): a voter cannot vote on
+  themselves.  Enforced from Tier 17 (REACT_TX_HEIGHT) by the pure
+  `voter_id == target` check in `verify_react_transaction`.
+
+* Message-react votes (target_is_user=False): a voter cannot vote on
+  a message they themselves authored.  Enforced from Tier 27
+  (REACT_NO_SELF_MESSAGE_HEIGHT) at the admission layer
+  (`Blockchain.validate_block` + `submission_server.process_react_tx`)
+  because authorship of a target tx_hash requires resolving the
+  target through the chain's tx_locations index → block → tx, which
+  is state-dependent.  Pre-Tier-27 blocks DID admit self-reacts on
+  one's own messages — the original rationale was "the per-tx fee is
+  the spam tax."  Tier 27 closes that hole: a fee gates spam volume,
+  not motivated self-promotion.  Pre-activation blocks keep their
+  original admission outcomes for replay determinism.
 """
 
 from __future__ import annotations
@@ -323,6 +344,15 @@ def create_react_transaction(
     The chain-side guards (entity registered, target exists, signature
     verifies, fee covers floor at current_height) live in
     `verify_react_transaction` and the apply path.
+
+    Tier 27 (REACT_NO_SELF_MESSAGE_HEIGHT) extends the no-self rule to
+    message-react votes: a voter cannot react to a message they
+    themselves authored.  That check is NOT enforced here because
+    authorship of a target tx_hash requires chain-state lookup; the
+    admission path (`Blockchain.validate_block` +
+    `submission_server.process_react_tx`) catches it.  Wallets/CLIs
+    that build a self-message-react with this constructor will be
+    rejected at submission post-Tier-27.
     """
     if choice not in _VALID_CHOICES:
         raise ValueError(f"invalid react choice: {choice!r}")

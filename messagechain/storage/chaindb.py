@@ -473,6 +473,56 @@ class ChainDB:
             return None
         return (int(row[0]), int(row[1]))
 
+    def get_message_author(self, tx_hash: bytes, state=None) -> bytes | None:
+        """Return the authoring entity_id of the MessageTransaction at
+        `tx_hash`, or None if `tx_hash` is not a MessageTransaction in
+        canonical chain history.
+
+        Used by the Tier 27 message-react admission rule to reject a
+        ReactTx whose voter is also the target message's author.  The
+        lookup chains tx_locations (O(1)) → get_block_by_number (one
+        block load) → block.transactions[tx_index] → entity_id; cost is
+        amortized by SQLite's row cache for hot-tip blocks.  Returns
+        None if the location is missing, the block load fails, the
+        in-block tx is not a MessageTransaction (e.g. a confused caller
+        passes a transfer/stake tx_hash), or its `entity_id` is unset.
+
+        `state` MUST be the live Blockchain when blocks were stored in
+        compact entity-ref form (the standard production path) — without
+        it, the block decoder cannot resolve the varint indices back to
+        full 32-byte entity_ids and Block.from_bytes raises.  Callers
+        on the consensus path pass `state=self` (the Blockchain).
+        """
+        loc = self.get_tx_location(tx_hash)
+        if loc is None:
+            return None
+        block_height, tx_index = loc
+        try:
+            blk = self.get_block_by_number(block_height, state=state)
+        except Exception:
+            # Compact-form decode without a state map raises ValueError.
+            # Treat any decode failure as "author unknown" rather than
+            # propagating — admission paths fall back to admitting
+            # under the conservative "author cannot be confirmed equal
+            # to voter" interpretation, which keeps the gate from
+            # blocking legitimate non-self reacts when state is missing.
+            return None
+        if blk is None:
+            return None
+        if tx_index < 0 or tx_index >= len(blk.transactions):
+            return None
+        tx = blk.transactions[tx_index]
+        if tx.tx_hash != tx_hash:
+            return None
+        # MessageTransaction stores its author under `entity_id` (the
+        # signer/sender of the message).  Non-message txs landing at
+        # this tx_index would not match the tx_hash check above; this
+        # getattr is defence-in-depth.
+        author = getattr(tx, "entity_id", None)
+        if author is None or len(author) != 32:
+            return None
+        return bytes(author)
+
     def _check_db_permissions(self):
         """Warn if chain.db is world-writable.
 

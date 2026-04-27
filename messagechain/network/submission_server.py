@@ -719,6 +719,34 @@ def _submit_react_to_mempool(
                     ack_allowed, ACK_REJECTED,
                 ),
             )
+        # Tier 27: at/after REACT_NO_SELF_MESSAGE_HEIGHT a voter cannot
+        # react to their own message.  Mirrors the block-validate
+        # check so a self-react never reaches the mempool — keeps
+        # rejected witness receipts from being charged against the
+        # admission path's per-IP budget for invalid reacts the
+        # proposer would later drop anyway.
+        from messagechain.config import REACT_NO_SELF_MESSAGE_HEIGHT
+        if next_height >= REACT_NO_SELF_MESSAGE_HEIGHT:
+            author = blockchain.db.get_message_author(
+                tx.target, state=blockchain,
+            )
+            if author is not None and author == tx.voter_id:
+                reason = (
+                    "voter cannot react to their own message "
+                    "(target authored by voter)"
+                )
+                return SubmissionResult(
+                    ok=False, error=reason,
+                    rejection_hex=_maybe_issue_rejection_for(
+                        receipt_issuer, tx.tx_hash,
+                        _rejection_code_for_validate_reason(reason),
+                        request_rejection, reason,
+                    ),
+                    ack_hex=_maybe_issue_ack_for(
+                        receipt_issuer, witnessed_request_hash,
+                        ack_allowed, ACK_REJECTED,
+                    ),
+                )
 
     # Nonce — caller threads the all-pools nonce through here so a
     # voter's interleaved transfer / message / react submissions all
