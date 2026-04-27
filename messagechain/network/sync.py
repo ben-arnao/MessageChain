@@ -239,22 +239,70 @@ class ChainSyncer:
     def get_best_sync_peer(self) -> str | None:
         """Find the peer with the tallest chain to sync from.
 
-        Rejects peers whose cumulative stake weight is below the minimum
-        threshold (nMinimumChainWork equivalent). This prevents a new node
-        from being tricked into syncing a fabricated chain.
+        Two-tier filter:
+          1. ``cumulative_weight >= MIN_CUMULATIVE_STAKE_WEIGHT`` —
+             nMinimumChainWork-equivalent floor that rejects fabricated
+             low-weight chains.
+          2. ``peer_weight_evidence_validated == True`` — prefer peers
+             whose handshake claim has been verified against headers
+             they actually delivered (see
+             ``_maybe_validate_peer_weight``).
+
+        Audit gate (Option B — graceful fallback): if no validated peer
+        is available we fall back to the unvalidated set so a fresh-IBD
+        node (which by definition has no validated peers yet) can still
+        bootstrap.  The fallback emits an explicit
+        ``unvalidated peer ... — bandwidth/eclipse risk`` warning so
+        operator/audit logs surface the trust assumption.
+
+        Even on the validated path, the returned peer must claim
+        ``chain_height > our_height``; otherwise we return None.  In
+        the *no-validated-candidate-ahead* edge case (a validated peer
+        exists but is at-or-below us, while an unvalidated peer claims
+        to be far ahead) we deliberately return None — a validated peer
+        at-or-below us is positive evidence WE are near the tip, and
+        chasing the unvalidated tall claim is exactly the bandwidth
+        burn the audit flagged.  The fallback path only fires when we
+        have *zero* validated peers in the candidate set.
         """
         if not self.peer_heights:
             return None
-        # Filter peers above minimum chain weight
+        # Tier 1: minimum chain-work floor.
         eligible = [
             p for p in self.peer_heights.values()
             if p.cumulative_weight >= MIN_CUMULATIVE_STAKE_WEIGHT
         ]
         if not eligible:
             return None
+
+        # Tier 2: prefer validated peers.
+        validated = [
+            p for p in eligible if p.peer_weight_evidence_validated
+        ]
+        our_height = self.blockchain.height
+
+        if validated:
+            best = max(validated, key=lambda p: p.chain_height)
+            if best.chain_height <= our_height:
+                # A validated peer at-or-below us is positive evidence
+                # we're near the tip; do NOT fall back to unvalidated
+                # peers' claims to be ahead.
+                return None
+            return best.peer_address
+
+        # Fallback: no validated peer available.  Return tallest
+        # eligible-but-unvalidated peer so bootstrap can make progress,
+        # but log a warning so the eclipse/bandwidth-burn risk is
+        # visible to operators and post-incident audits.
         best = max(eligible, key=lambda p: p.chain_height)
-        if best.chain_height <= self.blockchain.height:
+        if best.chain_height <= our_height:
             return None
+        logger.warning(
+            "Syncing against unvalidated peer %s "
+            "(claim height=%d weight=%d) — no validated peer available; "
+            "bandwidth/eclipse risk until peer delivers headers",
+            best.peer_address, best.chain_height, best.cumulative_weight,
+        )
         return best.peer_address
 
     async def start_sync(self) -> bool:
