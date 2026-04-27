@@ -8984,6 +8984,17 @@ class Blockchain:
             affected.add(stx.entity_id)
         for utx in getattr(block, "unstake_transactions", []):
             affected.add(utx.entity_id)
+        # Tier 17 ReactTransaction voters: the apply path bumps the
+        # voter's nonce, balance, and leaf_watermark via
+        # `pay_fee_with_burn` + `_bump_watermark` (see the react-tx loop
+        # in `_apply_block_state`), so the voter's state_tree row MUST
+        # be in the touched set or `compute_current_state_root` reads
+        # stale data while `compute_post_state_root` mirrors the
+        # mutation — and the two diverge.  Symptom on mainnet: a fresh
+        # voter's first react tx made the proposer self-reject the
+        # block with "Invalid state_root — state commitment mismatch".
+        for rtx in getattr(block, "react_transactions", []) or []:
+            affected.add(rtx.voter_id)
         # Seed divestment mutates seed stake + treasury every block within
         # the divestment window.  Cheap to always include (small set, often
         # a single seed); guarantees the incremental state-tree refresh

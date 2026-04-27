@@ -4,6 +4,40 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.6] — 2026-04-27
+
+Critical consensus hotfix — companion to 1.28.5.  Same bug class
+(state_root sim/apply divergence on a tx kind that wasn't fully
+mirrored), this time on Tier 17 ReactTransaction.
+
+`_block_affected_entities` was missing `block.react_transactions` in
+its sweep.  The apply path's react-tx loop bumps the voter's nonce,
+balance, and leaf_watermark via `pay_fee_with_burn` +
+`_bump_watermark`, but the post-apply `_touch_state` call read its
+voter list from `_block_affected_entities` — which never included
+react voters — so the voter's state_tree row stayed at its
+pre-block contents.  Meanwhile `compute_post_state_root` simulated
+the same nonce/balance/watermark mutations into the sim dicts, then
+built its tree commitment from those updated values.  Result: a
+block with even one react tx self-rejected at the proposer with
+`Invalid state_root — state commitment mismatch`.
+
+Symptom on mainnet: chain stalled at h=687 with a UP react tx in
+v1's mempool.  Same `state_root` rejection every 10 minutes; the
+chain couldn't progress until the voter's row was added to the
+touched set.
+
+Fix is one loop in `_block_affected_entities`:
+
+```python
+for rtx in getattr(block, "react_transactions", []) or []:
+    affected.add(rtx.voter_id)
+```
+
+No on-chain consequences for pre-fix history (no react tx ever
+landed; the bug prevented it).  Pairs with the 1.28.5 fix for the
+analogous v3-message-tx sender_pubkey omission.
+
 ## [1.28.5] — 2026-04-27
 
 Critical consensus hotfix — `compute_post_state_root` was missing
