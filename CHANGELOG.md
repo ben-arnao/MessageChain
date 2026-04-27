@@ -4,6 +4,47 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Governance — Tier 22: voter rewards on passed proposals (activates block 19000)
+
+Hard fork at `VOTER_REWARD_HEIGHT = 19000` (rides above Tier 21's 17000
+with the established ~2000-block runway). Reward-aligned governance
+participation without a rubber-stamp incentive.
+
+- **Per-proposal escrow funded by a proposer surcharge.** Post-fork,
+  every `ProposalTransaction` debits an additional
+  `VOTER_REWARD_SURCHARGE = 50_000` from the proposer's balance on
+  top of the regular tx fee. The surcharge is held in
+  `ProposalState.voter_reward_pool` — debited from the proposer, not
+  minted, not burned. Net inflation invariant is preserved because
+  the tokens stay in circulation, just sequestered until close.
+- **Pay-on-pass, retrospective only.** At proposal close, if
+  `yes_weight × 3 > total_eligible × 2` (the existing supermajority
+  rule, evaluated in live-weight mode like the H6 binding tally),
+  the pool is distributed pro-rata-by-live-stake to YES voters whose
+  `get_staked > 0` at close. Proposals that fail the threshold burn
+  the entire pool. No-voters and slashed-out yes-voters get nothing.
+  The asymmetry is intentional: rewarding both sides degenerates back
+  into pay-for-participation, which incentivizes uninformed voting.
+- **Whale cap.** A single yes-voter cannot collect more than
+  `VOTER_REWARD_MAX_SHARE_BPS / 10_000 = 25%` of the pool, even if
+  they hold all the yes-side stake. Excess from the cap burns
+  deterministically. Without this cap, a 70%-stake validator captures
+  ~70% of every reward and the system reduces to "validators tax
+  proposers via a 2/3 rubber stamp on their own proposals."
+- **Dust burns deterministically.** Integer-division remainder from
+  pro-rata distribution burns rather than going to a "lucky voter" —
+  every node agrees on the post-distribution state byte-for-byte.
+- **Validation enforces fee + surcharge affordability.** Post-fork
+  proposal admission requires the proposer's balance to cover both
+  the tx fee and the surcharge; pre-fork validation is unchanged so
+  historical replay is byte-identical.
+- **Pre-fork proposals are no-ops.** Pre-fork-height proposals carry
+  `voter_reward_pool = 0` and `finalize_voter_rewards` is a no-op for
+  zero-pool proposals — replay through Tier 22 height does not
+  perturb their state.
+
 ## [1.23.0] — 2026-04-26
 
 Combined release rolling up everything since the 1.21.0 tag — the

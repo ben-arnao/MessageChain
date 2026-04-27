@@ -748,6 +748,13 @@ class ProposalState:
     stake_snapshot: dict  # entity_id -> staked amount at proposal creation
     total_eligible_stake: int
     votes: dict = field(default_factory=dict)  # voter_id -> bool
+    # Per-proposal escrow funded by VOTER_REWARD_SURCHARGE at apply time
+    # (Tier 22, VOTER_REWARD_HEIGHT).  Zero on pre-fork proposals and on
+    # any proposal whose chain apply path didn't pass the surcharge in.
+    # Distributed pro-rata-by-live-stake to YES voters at close if the
+    # 2/3 supermajority test passes; otherwise burned in full.  Reset
+    # to 0 by finalize_voter_rewards so a redundant call is a no-op.
+    voter_reward_pool: int = 0
 
 
 # --- Governance tracker ---
@@ -771,7 +778,14 @@ class GovernanceTracker:
         # ("show me every treasury spend that ever executed") always works.
         self.treasury_spend_log: list[dict] = []
 
-    def add_proposal(self, tx: ProposalTransaction, block_height: int, supply_tracker):
+    def add_proposal(
+        self,
+        tx: ProposalTransaction,
+        block_height: int,
+        supply_tracker,
+        *,
+        voter_reward_pool: int = 0,
+    ):
         """Register a new proposal and snapshot current stake state.
 
         Snapshot captured as of `block_height` and frozen thereafter:
@@ -807,6 +821,7 @@ class GovernanceTracker:
             created_at_block=block_height,
             stake_snapshot=stake_snapshot,
             total_eligible_stake=total_stake,
+            voter_reward_pool=voter_reward_pool,
         )
         return True
 
@@ -975,6 +990,138 @@ class GovernanceTracker:
                 weight_for(eid) for eid in stake_snapshot.keys()
             )
         return yes_weight, no_weight, total_participating, total_eligible
+
+    def finalize_voter_rewards(
+        self, proposal_id: bytes, supply_tracker, current_block: int,
+    ) -> dict:
+        """Settle the voter-reward escrow at proposal close (Tier 22).
+
+        Behavior:
+
+        - **Pool == 0** (pre-fork proposal, or chain apply path didn't
+          escrow): no-op.  Returns ``{"passed": False, "payouts": {},
+          "burned": 0}`` — no balance, no supply mutation.
+
+        - **Pool > 0, proposal failed** (yes_weight × 3 ≤
+          total_eligible × 2 in live-weight mode): burn the entire
+          pool — decrement ``total_supply``, increment
+          ``total_burned``.  No yes-voter is paid.
+
+        - **Pool > 0, proposal passed**: distribute pro-rata-by-live-
+          stake to YES voters whose ``get_staked > 0`` at close.  Any
+          single voter's share is capped at
+          ``VOTER_REWARD_MAX_SHARE_BPS / 10_000`` of the pool; the
+          excess from the cap burns.  Integer-division dust burns
+          (deterministic — no "lucky voter" picks up the remainder).
+
+        After the call, ``state.voter_reward_pool`` is reset to 0 so a
+        redundant invocation by replay or by an out-of-order block-
+        apply path is a clean no-op.  The chain's
+        ``_apply_governance_block`` calls this once per closing
+        proposal, immediately before ``prune_closed_proposals``.
+
+        The net-inflation invariant
+        (``total_supply == GENESIS_SUPPLY + total_minted -
+        total_burned``) is preserved because:
+
+          * Distribution: tokens move from the pool into voter
+            balances; ``total_supply``/``total_minted``/
+            ``total_burned`` are all unchanged (the escrow accounting
+            sits outside ``total_supply``'s definition — see
+            VOTER_REWARD_HEIGHT in config.py).
+          * Burn (full pool or cap excess + dust): each burned token
+            decrements ``total_supply`` AND increments
+            ``total_burned`` in lockstep.
+
+        Returns a dict ``{"passed": bool, "payouts": dict[bytes, int],
+        "burned": int}`` for inspection; chain code does not need it.
+        """
+        from messagechain.config import VOTER_REWARD_MAX_SHARE_BPS
+
+        state = self.proposals.get(proposal_id)
+        if state is None:
+            return {"passed": False, "payouts": {}, "burned": 0}
+
+        pool = state.voter_reward_pool
+        if pool <= 0:
+            # Pre-fork or already-finalized → no-op.
+            return {"passed": False, "payouts": {}, "burned": 0}
+
+        # Live-weight tally — same semantics as the H6 binding-execution
+        # path.  Voters slashed or fully-unstaked between vote-cast and
+        # close contribute 0 weight.
+        yes_weight, _no_weight, _participating, total_eligible = self.tally(
+            proposal_id, supply_tracker=supply_tracker,
+        )
+        # Strict 2/3 supermajority: yes × 3 > total × 2.  Matches the
+        # rule in execute_treasury_spend so advisory and binding
+        # proposals share the same passage threshold.
+        passed = (
+            total_eligible > 0
+            and yes_weight * GOVERNANCE_APPROVAL_THRESHOLD_DENOMINATOR
+            > total_eligible * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR
+        )
+
+        if not passed:
+            # Burn the entire pool.  Decrement state's pool to 0 so a
+            # replay/idempotent call is a no-op.
+            state.voter_reward_pool = 0
+            supply_tracker.total_supply -= pool
+            supply_tracker.total_burned += pool
+            return {"passed": False, "payouts": {}, "burned": pool}
+
+        # Build the winners set: yes-voters with live stake > 0.
+        winners = {}  # voter_id -> live_stake
+        for voter_id, approve in state.votes.items():
+            if not approve:
+                continue
+            live = supply_tracker.get_staked(voter_id)
+            if live > 0:
+                winners[voter_id] = live
+
+        if not winners:
+            # Edge case: proposal "passed" via silent supermajority
+            # math somehow (e.g., zero eligible after slashing — but
+            # passed is False then).  Defensive: burn pool.
+            state.voter_reward_pool = 0
+            supply_tracker.total_supply -= pool
+            supply_tracker.total_burned += pool
+            return {"passed": True, "payouts": {}, "burned": pool}
+
+        cap = pool * VOTER_REWARD_MAX_SHARE_BPS // 10_000
+        winners_total = sum(winners.values())
+        # Iterate in a deterministic order (sorted by entity_id) so
+        # the dust calculation is reproducible across nodes.  The
+        # individual share = pool * stake // winners_total; dust =
+        # pool - sum(shares) - sum(cap_excess).  Both burn.
+        payouts: dict[bytes, int] = {}
+        capped_excess = 0
+        distributed = 0
+        for voter_id in sorted(winners.keys()):
+            share = pool * winners[voter_id] // winners_total
+            if share > cap:
+                capped_excess += share - cap
+                share = cap
+            payouts[voter_id] = share
+            distributed += share
+
+        # Credit each winner's balance.  No supply mutation — the
+        # tokens are moving from escrow (outside any balance) back
+        # into circulation in the recipients' balances.
+        for voter_id, amount in payouts.items():
+            if amount > 0:
+                supply_tracker.balances[voter_id] = (
+                    supply_tracker.balances.get(voter_id, 0) + amount
+                )
+
+        # Anything not paid out (dust + cap_excess) burns.
+        burned = pool - distributed
+        if burned > 0:
+            supply_tracker.total_supply -= burned
+            supply_tracker.total_burned += burned
+
+        state.voter_reward_pool = 0
+        return {"passed": True, "payouts": payouts, "burned": burned}
 
     def execute_treasury_spend(
         self,

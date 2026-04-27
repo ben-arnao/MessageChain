@@ -3575,6 +3575,77 @@ assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
 # the failure mode could manifest.  Sits above Tier 20 with the same
 # ~2000-block runway pattern.
 PROPOSER_CAP_HALVING_HEIGHT = 17000  # Tier 21
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 22 — Voter rewards on passed proposals
+# ─────────────────────────────────────────────────────────────────────
+# Governance suffers from a quiet-electorate problem: the binding
+# supermajority test (yes_weight × 3 > total_eligible × 2) means an
+# unread proposal lapses by inertia even when no one objects.  Validators
+# already pay for the *processing* of a vote (the VoteTransaction's
+# normal tx fee is paid to the block proposer), but the *staker* casting
+# the vote gets nothing for the attention cost of reading and judging
+# the proposal.  Pure pay-for-participation is rejected (rubber-stamp
+# incentive — vote on everything without reading), so this fork adopts
+# a retrospective design:
+#
+#   1. At proposal-apply time, the proposer pays VOTER_REWARD_SURCHARGE
+#      ON TOP OF the regular tx fee.  The surcharge is held in a per-
+#      proposal escrow on ProposalState.voter_reward_pool — debited
+#      from the proposer's balance, NOT minted, NOT burned.  The
+#      net-inflation invariant is unchanged because the tokens still
+#      exist; they're just not in any individual balance.
+#
+#   2. At proposal close (the same block where prune_closed_proposals
+#      runs):
+#        - If yes_weight * 3 > total_eligible * 2 (the existing binding
+#          supermajority rule, evaluated in live-weight mode like the
+#          H6 treasury-spend tally) — distribute the pool pro-rata by
+#          live stake to YES voters whose stake_at_close > 0.
+#        - Otherwise (proposal failed or had insufficient yes-weight) —
+#          burn the entire pool (decrement total_supply, increment
+#          total_burned).
+#
+#   3. Whale cap: a single yes-voter cannot collect more than
+#      VOTER_REWARD_MAX_SHARE_BPS / 10_000 of the pool, even if they
+#      hold all the yes-side stake.  Excess from the cap burns.  The
+#      cap exists because without it a 70%-stake validator captures
+#      ~70% of every reward and the system reduces to "validators tax
+#      proposers via a 2/3 rubber stamp on their own proposals."
+#
+#   4. Integer-division dust burns deterministically (so every node
+#      agrees byte-for-byte on the post-distribution state).
+#
+# Pay-on-pass intentionally has a small yes-bias for marginal voters.
+# Acceptable because passing requires affirmative 2/3 supermajority —
+# nudging the truly-undecided from "abstain" to "yes" cannot drag a bad
+# proposal across that bar, but it can save a good one from a sleepy
+# electorate.  The alternative (pay both sides of every vote) just
+# degenerates back into pay-for-participation.
+#
+# Activation: VOTER_REWARD_HEIGHT = 19000, riding above
+# PROPOSER_CAP_HALVING_HEIGHT (17000) with the established ~2000-block
+# runway pattern.  Pre-fork proposals close with no payout; their
+# voter_reward_pool stays 0 by construction (the surcharge debit is
+# height-gated).
+VOTER_REWARD_HEIGHT = 19_000  # Tier 22
+VOTER_REWARD_SURCHARGE = 50_000        # tokens escrowed per post-fork proposal
+VOTER_REWARD_MAX_SHARE_BPS = 2_500     # cap on single-voter share (25%)
+
+assert VOTER_REWARD_HEIGHT > PROPOSER_CAP_HALVING_HEIGHT, (
+    "VOTER_REWARD_HEIGHT must follow PROPOSER_CAP_HALVING_HEIGHT — Tier 22 "
+    "rides above Tier 21 in the fork schedule"
+)
+assert VOTER_REWARD_SURCHARGE > 0, (
+    "VOTER_REWARD_SURCHARGE must be positive — a zero surcharge makes the "
+    "fork a no-op (nothing to escrow, nothing to distribute)"
+)
+assert 0 < VOTER_REWARD_MAX_SHARE_BPS <= 10_000, (
+    "VOTER_REWARD_MAX_SHARE_BPS must be in (0, 10_000] bps — 10_000 = "
+    "no cap, 0 would mean every voter gets nothing and the entire pool "
+    "burns regardless of outcome"
+)
+
 assert MAX_BLOCK_TOTAL_BYTES >= MAX_BLOCK_MESSAGE_BYTES, (
     "MAX_BLOCK_TOTAL_BYTES must accommodate at least the legacy "
     "message-byte budget — otherwise a block of pure messages valid "
@@ -3779,6 +3850,7 @@ for _fork_name, _fork_height in (
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
     ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
     ("PROPOSER_CAP_HALVING_HEIGHT", PROPOSER_CAP_HALVING_HEIGHT),
+    ("VOTER_REWARD_HEIGHT", VOTER_REWARD_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
