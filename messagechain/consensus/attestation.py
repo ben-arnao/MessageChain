@@ -126,7 +126,20 @@ def create_attestation(validator_entity, block_hash: bytes, block_number: int) -
     """Create a signed attestation for a block.
 
     The validator asserts: "I have verified this block and consider it valid."
+
+    Tier 23 same-height sign guard.  If the validator entity has a
+    ``height_sign_guard`` attached (production validators wire one in
+    at startup), reserve the attestation-signing slot at this height
+    BEFORE signing.  Refusal raises HeightAlreadySignedError, which
+    propagates to the caller — an honest crash-restart that would
+    otherwise produce a second attestation for the same height
+    (different block_hash from a different fork tip) is short-circuited
+    here instead of producing slashable evidence.
     """
+    guard = getattr(validator_entity, "height_sign_guard", None)
+    if guard is not None:
+        guard.record_attestation_sign(block_number)
+
     att = Attestation(
         validator_id=validator_entity.entity_id,
         block_hash=block_hash,

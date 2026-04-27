@@ -611,6 +611,71 @@ def build_parser() -> argparse.ArgumentParser:
              "queries YOUR local node's peer table)",
     )
 
+    # --- receipt ---
+    # The receipt command is the user-visible surface that names the
+    # protocol's defining property: slashing-backed permanence.  Without
+    # it, `messagechain send` returns a tx hash and ten minutes of
+    # nothing -- a user has no way to distinguish "block hasn't mined
+    # yet" from "validators colluding".  `messagechain receipt <hash>`
+    # closes that gap with a plain-language status that names the
+    # guarantee in every code path (included / pending / not-found).
+    receipt_p = sub.add_parser(
+        "receipt",
+        help="Show inclusion + permanence receipt for a tx hash",
+        description=(
+            "Look up a transaction by hash and print a plain-language "
+            "receipt naming its inclusion status and the slashing-backed "
+            "permanence guarantee.  Three outcomes:\n"
+            "  * INCLUDED  - tx is in a block; receipt names the block, "
+            "the attester count, and an inclusion proof.\n"
+            "  * PENDING   - tx is in mempool; receipt names the wait "
+            "estimate and the submit-evidence escalation if a coerced "
+            "validator is suspected.\n"
+            "  * NOT FOUND - tx is in neither mempool nor chain; "
+            "receipt names the three possible causes.\n"
+            "Read-only; never mutates chain state."
+        ),
+    )
+    receipt_p.add_argument(
+        "tx_hash", type=str,
+        help="32-byte transaction hash in hex (64 hex chars).",
+    )
+    receipt_p.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port",
+    )
+
+    # --- submit-evidence ---
+    # The natural next step from a `receipt` that turned up NOT FOUND
+    # or stale-PENDING.  Today this is a stub that points the user at
+    # the on-chain evidence types; full wiring (sign + submit) lands in
+    # a follow-up branch.  The CLI surface itself ships in this branch
+    # so the receipt's escalation hint resolves to a real command, not
+    # a "Unknown command" error.
+    submit_ev = sub.add_parser(
+        "submit-evidence",
+        help="Submit slashable censorship evidence for a tx (stub)",
+        description=(
+            "Construct and submit a CensorshipEvidenceTx (or related "
+            "evidence type) for a tx whose validator-issued submission "
+            "receipt was followed by non-inclusion past "
+            "EVIDENCE_INCLUSION_WINDOW.  When matured, the issuing "
+            "validator is slashed by CENSORSHIP_SLASH_BPS.  See "
+            "messagechain.consensus.censorship_evidence for the "
+            "consensus-layer pipeline.  This CLI surface ships as a "
+            "stub: the evidence-tx construction path lands in a "
+            "follow-up branch."
+        ),
+    )
+    submit_ev.add_argument(
+        "--tx", dest="tx_hash", type=str, required=True,
+        help="Hex tx hash that was receipted-then-censored",
+    )
+    submit_ev.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port",
+    )
+
     # --- cut-checkpoint ---
     cut_cp = sub.add_parser(
         "cut-checkpoint",
@@ -3870,6 +3935,306 @@ def cmd_peers(args):
         )
 
 
+def _validate_tx_hash_arg(tx_hash_arg: str) -> str | None:
+    """Validate a CLI tx_hash argument.
+
+    Returns the lowercased hex string on success, or None on failure
+    (caller should print a friendly diagnostic and exit 1).  Centralised
+    so `receipt` and `submit-evidence` validate identically.
+    """
+    if not isinstance(tx_hash_arg, str):
+        return None
+    s = tx_hash_arg.strip().lower()
+    # Accept an optional "0x" prefix.
+    if s.startswith("0x"):
+        s = s[2:]
+    if len(s) != 64:
+        return None
+    try:
+        bytes.fromhex(s)
+    except ValueError:
+        return None
+    return s
+
+
+def _fmt_duration(seconds: int | None) -> str:
+    """Render an integer second count as a readable duration.
+
+    Examples: 9 -> "9s", 600 -> "10m", 9012 -> "2h 30m".  Used by the
+    receipt CLI for both included-tx waits and pending-tx ETAs.
+    """
+    if seconds is None or seconds < 0:
+        return "?"
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s" if seconds % 60 else f"{seconds // 60}m"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
+def cmd_receipt(args) -> int:
+    """Show inclusion + permanence receipt for a transaction hash.
+
+    The receipt CLI is the user-visible surface that names the
+    protocol's defining property: slashing-backed permanence.  Every
+    code path here explicitly mentions "permanent" / "can never be
+    deleted" / "slashable evidence" in plain language -- this is a
+    value-prop fix, not a generic explorer command.
+
+    Three outcomes (driven by the get_tx_status RPC):
+      * INCLUDED  - tx is on-chain; receipt names block, attesters,
+                    and inclusion proof.
+      * PENDING   - tx is in mempool; receipt names wait + escalation.
+      * NOT FOUND - receipt names three possible causes + escalation.
+
+    Read-only.  Never mutates chain state.  Returns 0 on a clean
+    response (regardless of inclusion outcome); non-zero on protocol
+    error / bad input.
+    """
+    # Input validation up front -- bad hex shouldn't even hit the RPC.
+    tx_hash_hex = _validate_tx_hash_arg(args.tx_hash)
+    if tx_hash_hex is None:
+        print(
+            f"Error: invalid tx hash '{args.tx_hash}'.\n"
+            f"  Expected: 64 hex characters (32 bytes), optionally with a 0x prefix."
+        )
+        sys.exit(1)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    response = rpc_call(host, port, "get_tx_status", {"tx_hash": tx_hash_hex})
+    if not response.get("ok"):
+        print(f"Error: {response.get('error', 'Could not connect')}")
+        sys.exit(1)
+
+    result = response["result"]
+    status = result.get("status", "?")
+
+    print(f"=== MessageChain receipt for {tx_hash_hex[:16]}... ===\n")
+
+    if status == "included":
+        return _print_included_receipt(result, tx_hash_hex)
+    if status == "pending":
+        return _print_pending_receipt(result, tx_hash_hex, host, port)
+    if status == "not_found":
+        return _print_not_found_receipt(tx_hash_hex)
+
+    # Unknown status -- surface what we got but don't crash.
+    print(f"Unknown status from node: {status}")
+    print(f"Raw result: {result}")
+    return 1
+
+
+def _print_included_receipt(result: dict, tx_hash_hex: str) -> int:
+    """Format the INCLUDED-status receipt.
+
+    Names the permanence guarantee + slashing-backed enforcement in
+    plain language.  Surfaces the inclusion proof as a hex blob the
+    user can save or paste -- same shape SPV clients consume.
+    """
+    block_height = result.get("block_height", "?")
+    block_hash = result.get("block_hash", "")
+    tx_index = result.get("tx_index", "?")
+    merkle_root = result.get("merkle_root", "")
+    attesters = result.get("attesters", 0)
+    total_validators = result.get("total_validators", 0)
+    attesting_stake = result.get("attesting_stake", 0)
+    total_stake = result.get("total_stake", 0)
+    threshold_met = result.get("finality_threshold_met", False)
+    num = result.get("finality_numerator", 2)
+    den = result.get("finality_denominator", 3)
+
+    print(f"  Status:        INCLUDED")
+    print(f"  Block height:  {block_height}")
+    if block_hash:
+        print(f"  Block hash:    {block_hash[:32]}...")
+    print(f"  Tx index:      {tx_index}")
+
+    pct_str = ""
+    if total_stake:
+        pct = 100.0 * attesting_stake / total_stake
+        pct_str = f" ({pct:.1f}% of stake)"
+    pct_threshold = (100.0 * num / den) if den else 66.7
+    print(
+        f"  Attested by:   {attesters}/{total_validators} validators{pct_str}  "
+        f"(threshold {pct_threshold:.1f}%)"
+    )
+
+    if threshold_met:
+        print(f"  Finality:      JUSTIFIED -- {num}/{den} threshold met")
+    else:
+        print(f"  Finality:      pending -- {num}/{den} threshold not yet met")
+
+    # The mission of this command: name the guarantee.
+    print()
+    if threshold_met:
+        print(
+            "  This message is permanent.  It can never be deleted."
+        )
+    else:
+        print(
+            "  This message is on-chain.  Once the 2/3 attestation\n"
+            "  threshold is met, it is permanent and can never be deleted."
+        )
+    print(
+        "  Any validator that suppresses or rejects a future copy of\n"
+        "  this transaction produces slashable evidence on chain (see\n"
+        "  messagechain submit-evidence)."
+    )
+
+    # Inclusion proof -- give the user something they can save.
+    print()
+    if merkle_root:
+        print(f"  Inclusion proof:")
+        print(f"    block merkle_root: {merkle_root}")
+    proof = result.get("merkle_proof")
+    if proof:
+        siblings = proof.get("siblings", [])
+        directions = proof.get("directions", [])
+        print(f"    tx_index:          {proof.get('tx_index', tx_index)}")
+        print(f"    path depth:        {len(siblings)}")
+        for i, (s, d) in enumerate(zip(siblings, directions)):
+            side = "L" if d else "R"
+            print(f"      [{i:>2}] {side}  {s}")
+    else:
+        print("    (no proof emitted -- tx is recorded but outside the "
+              "merkle inputs)")
+
+    return 0
+
+
+def _print_pending_receipt(
+    result: dict, tx_hash_hex: str, host: str, port: int,
+) -> int:
+    """Format the PENDING-status receipt.
+
+    Names the wait estimate and the submit-evidence escalation.  The
+    pending path is exactly when censorship anxiety is highest -- a tx
+    sat in mempool too long, the user wants to know if their validators
+    are colluding.  The escalation hint is the actionable next step.
+    """
+    print(f"  Status:        PENDING -- in mempool, not yet in a block")
+    current_height = result.get("current_height", "?")
+    if current_height != "?":
+        print(f"  Chain tip:     block {current_height}")
+
+    # Try to fetch the block-time hint so the wait estimate is concrete.
+    # Best-effort -- if the call fails (offline node, etc.) we still
+    # name the escalation path.
+    from client import rpc_call as _rpc
+    try:
+        from messagechain.config import BLOCK_TIME_TARGET as _BTT
+    except ImportError:
+        _BTT = 600
+    info = _rpc(host, port, "get_chain_info", {})
+    next_eta = None
+    if info.get("ok"):
+        ssl = info["result"].get("seconds_since_last_block")
+        if isinstance(ssl, int) and ssl >= 0:
+            next_eta = max(0, _BTT - ssl)
+    if next_eta is not None:
+        print(f"  Next block in: ~{_fmt_duration(next_eta)} (target block "
+              f"interval {_fmt_duration(_BTT)})")
+    else:
+        print(f"  Block interval: ~{_fmt_duration(_BTT)} target")
+
+    # Reaffirm the guarantee -- the user shouldn't lose context just
+    # because the tx is still queueing.
+    print()
+    print(
+        "  Once your transaction lands in a block, it is permanent\n"
+        "  and can never be deleted.  Validators who admit a tx and\n"
+        "  then drop it produce slashable evidence on chain."
+    )
+
+    # Escalation: name the submit-evidence path.
+    print()
+    print(
+        "  If your message is not included in the next 2 blocks, run:\n"
+        f"    messagechain submit-evidence --tx {tx_hash_hex}\n"
+        "  to put validator collusion evidence on chain.  Validators\n"
+        "  found to have receipted-then-censored the tx are slashed."
+    )
+    return 0
+
+
+def _print_not_found_receipt(tx_hash_hex: str) -> int:
+    """Format the NOT_FOUND-status receipt.
+
+    Three possible causes are explicit so the user can self-diagnose
+    without bouncing back to the docs.  Names the submit-evidence
+    escalation as the actionable response to the collusion case.
+    """
+    print(f"  Status:        NOT FOUND in mempool or chain")
+    print()
+    print("  This may mean:")
+    print("    (a) the tx was never submitted (typo, network drop, or")
+    print("        the local node hasn't seen it yet);")
+    print("    (b) every validator you queried dropped the tx silently")
+    print("        -- possible coordinated collusion (see")
+    print("        messagechain submit-evidence below);")
+    print("    (c) the tx was malformed and rejected at submission")
+    print("        time (bad signature, exhausted leaf, fee below floor).")
+    print()
+    print(
+        "  MessageChain's headline guarantee: a well-formed message\n"
+        "  paying the fee floor is permanent and can never be deleted\n"
+        "  once on chain.  If a validator coalition is suppressing\n"
+        "  this tx, the slashing-backed evidence path is your remedy:\n"
+        f"    messagechain submit-evidence --tx {tx_hash_hex}"
+    )
+    return 0
+
+
+def cmd_submit_evidence(args) -> int:
+    """Submit a censorship-evidence transaction (stub).
+
+    Full evidence-tx construction (sign + submit) lands in a follow-up
+    branch.  The stub exists so the receipt CLI's escalation hint
+    resolves to a real command rather than a "Unknown command" error.
+
+    Coordination note: a sibling worktree wires the inclusion-list
+    processor; once that lands the full evidence path should ALSO
+    surface InclusionListViolationEvidenceTx as a slashable type,
+    alongside the existing CensorshipEvidenceTx,
+    BogusRejectionEvidenceTx, NonResponseEvidenceTx pipeline.
+    """
+    tx_hash_hex = _validate_tx_hash_arg(args.tx_hash)
+    if tx_hash_hex is None:
+        print(
+            f"Error: invalid tx hash '{args.tx_hash}'.\n"
+            f"  Expected: 64 hex characters (32 bytes)."
+        )
+        sys.exit(1)
+
+    print(f"=== MessageChain submit-evidence for {tx_hash_hex[:16]}... ===\n")
+    print(
+        "  Coming soon: the CensorshipEvidenceTx / "
+        "BogusRejectionEvidenceTx /\n"
+        "  NonResponseEvidenceTx construction + signing path.\n"
+        "  The consensus-layer evidence pipelines already exist:\n"
+        "    - messagechain.consensus.censorship_evidence\n"
+        "    - messagechain.consensus.bogus_rejection_evidence\n"
+        "    - messagechain.consensus.non_response_evidence\n"
+        "    - messagechain.consensus.forced_inclusion\n"
+        "  When matured, evidence slashes the issuing validator by\n"
+        "  CENSORSHIP_SLASH_BPS of their stake."
+    )
+    print()
+    print(
+        "  Until the CLI wiring lands you can:\n"
+        "    1. Save the SubmissionReceipt your validator returned at\n"
+        "       send-time (the `receipt` field of submit_transaction).\n"
+        "    2. After EVIDENCE_INCLUSION_WINDOW blocks of non-inclusion,\n"
+        "       hand the receipt to a node operator who can construct\n"
+        "       and submit the on-chain evidence transaction directly.\n"
+    )
+    return 0
+
+
 def cmd_cut_checkpoint(args):
     """Cut a weak-subjectivity checkpoint from a running node.
 
@@ -5195,6 +5560,8 @@ def main():
         "proposals": cmd_proposals,
         "validators": cmd_validators,
         "peers": cmd_peers,
+        "receipt": cmd_receipt,
+        "submit-evidence": cmd_submit_evidence,
         "cut-checkpoint": cmd_cut_checkpoint,
         "estimate-fee": cmd_estimate_fee,
         "ping": cmd_ping,
