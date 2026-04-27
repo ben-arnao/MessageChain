@@ -3431,6 +3431,25 @@ class Blockchain:
         slash_pct = self._compute_slash_pct(tx, self.height) if (
             get_honesty_curve_active(self.height)
         ) else get_slash_pct(self.height)
+        # Tier 24 perfect-record amnesty: severity may legitimately be
+        # 0 for a long-tenured zero-priors validator on AMBIGUOUS
+        # (restart-shape) evidence.  Skip the slash entirely — but
+        # still consume the evidence (idempotency: same evidence
+        # cannot retry) and bump the offense counter (one-shot
+        # amnesty: next AMBIGUOUS incident sees prior=1 and falls
+        # back to standard severity).  No finder reward (nothing
+        # was burned).  No slashed_validators entry (no permaban).
+        if slash_pct == 0:
+            self._processed_evidence.add(tx.evidence.evidence_hash)
+            self.slash_offense_counts[tx.evidence.offender_id] = (
+                self.slash_offense_counts.get(tx.evidence.offender_id, 0) + 1
+            )
+            logger.info(
+                f"SLASH-AMNESTIED validator "
+                f"{tx.evidence.offender_id.hex()[:16]}: "
+                f"perfect-record + AMBIGUOUS evidence, no burn"
+            )
+            return True, "Validator amnestied (track_record + AMBIGUOUS evidence)"
         escrow_burned = self._escrow.slash_all(
             tx.evidence.offender_id, slash_pct=slash_pct,
         )
@@ -9528,7 +9547,10 @@ class Blockchain:
             from messagechain.consensus.inclusion_list import (
                 process_inclusion_list_violation,
             )
-            result = process_inclusion_list_violation(etx, self)
+            result = process_inclusion_list_violation(
+                etx, self,
+                current_height=block.header.block_number,
+            )
             if not result.accepted:
                 logger.info(
                     f"InclusionListViolationEvidenceTx "
