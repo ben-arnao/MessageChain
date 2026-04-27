@@ -1171,6 +1171,22 @@ class Server(SharedRuntimeMixin):
         import threading as _threading_wl
         self._wallet_leaf_lock = _threading_wl.Lock()
         self.receipt_issuer = None  # ReceiptIssuer for submission receipts
+        # Per-IP receipt-subtree leaf-budget tracker, shared across
+        # the RPC `_rpc_submit_transaction` path AND (when wired) the
+        # public HTTPS SubmissionServer.  The same instance MUST flow
+        # to both surfaces so an attacker can't split traffic across
+        # HTTPS+RPC and drain the per-IP burst twice.  Constructed
+        # eagerly because RPC is always-on; the HTTPS SubmissionServer
+        # is opt-in and reads this through on construction.
+        from messagechain.network.submission_server import (
+            ReceiptBudgetTracker,
+        )
+        self.receipt_budget_tracker = ReceiptBudgetTracker()
+        # Per-IP last-warning timestamps so the budget-exhaustion
+        # warning log doesn't spam — one warning per IP per minute is
+        # plenty signal for the operator without filling the journal
+        # under sustained drain attempts.
+        self._receipt_budget_warn_last: dict[str, float] = {}
         self._running = False
 
         # Network protection — must exist before syncer for the offense callback.
@@ -1711,8 +1727,14 @@ class Server(SharedRuntimeMixin):
             # the validator becomes globally unresponsive.  to_thread
             # isolates the blocking work; the event loop stays
             # available for concurrent reads + peer traffic.
+            #
+            # `client_ip` is threaded through so the handler can gate
+            # `request_receipt` against the per-IP receipt-subtree
+            # leaf budget — see the receipt-budget gate inside
+            # `_rpc_submit_transaction` for the threat model.
             return await asyncio.to_thread(
                 self._rpc_submit_transaction, request["params"],
+                client_ip,
             )
 
         elif method == "get_entity":
@@ -1942,7 +1964,34 @@ class Server(SharedRuntimeMixin):
         else:
             return {"ok": False, "error": f"Unknown method: {method}"}
 
-    def _rpc_submit_transaction(self, params: dict) -> dict:
+    def _maybe_warn_receipt_budget_exhausted(self, client_ip: str) -> None:
+        """Log a warning when an IP's receipt budget kicks in.
+
+        Rate-limited per-IP at one warning per minute so a sustained
+        drain attempt doesn't fill the journal.  The warning lets the
+        operator correlate complaints from receipted clients with
+        upstream budget events without grepping submission logs.
+
+        Defensive against `Server.__new__` test paths that skip
+        `__init__`: if the dict isn't there, lazy-initialize it.
+        """
+        import time as _t
+        if not hasattr(self, "_receipt_budget_warn_last"):
+            self._receipt_budget_warn_last = {}
+        now = _t.time()
+        last = self._receipt_budget_warn_last.get(client_ip, 0.0)
+        if now - last < 60.0:
+            return
+        self._receipt_budget_warn_last[client_ip] = now
+        logger.warning(
+            "receipt-budget exhausted for client_ip=%s; submissions "
+            "still processing without receipt.  See "
+            "messagechain/network/submission_server.py "
+            "ReceiptBudgetTracker for context.",
+            client_ip,
+        )
+
+    def _rpc_submit_transaction(self, params: dict, client_ip: str = "") -> dict:
         """Accept a signed transaction from a client.
 
         Routes through `submit_transaction_to_mempool` (the same
@@ -1960,6 +2009,15 @@ class Server(SharedRuntimeMixin):
         tunnel) admitted-and-dropped txs with zero on-chain
         accountability, defeating the entire censorship-evidence
         pipeline for the RPC surface.
+
+        `client_ip` (default ""): peer IP from the TCP connection,
+        threaded in by `_process_rpc`.  Used to gate the
+        `request_receipt` opt-in receipt-on-success path against the
+        per-IP receipt-subtree leaf budget so an attacker over RPC
+        cannot drain the validator's RECEIPT_SUBTREE (65k leaves at
+        height 16) by spamming receipted submissions from a single
+        IP.  Empty `client_ip` (test harnesses calling the handler
+        directly with no socket) skips the gate.
         """
         try:
             from messagechain.network.submission_server import (
@@ -1976,7 +2034,31 @@ class Server(SharedRuntimeMixin):
             # validator.  Censorship-evidence clients that need a
             # receipt can opt in by setting `request_receipt: true`
             # in the submission params.
-            issuer = self.receipt_issuer if params.get("request_receipt") else None
+            #
+            # Per-IP budget gate (audit 2026-04-27): the HTTPS surface
+            # protects its receipt-subtree via a dedicated rejection-
+            # budget bucket; the RPC surface used to skip the gate
+            # entirely.  An attacker over RPC could burn ~21k leaves
+            # /day from one IP and drain the 65k-leaf subtree in 3
+            # days, silently collapsing the entire censorship-evidence
+            # pipeline.  We now consult the SAME shared tracker the
+            # HTTPS context uses (so cross-surface drain is also
+            # closed).  When the bucket is empty we silently drop
+            # `issuer` to None — submission still processes, the
+            # client just doesn't get a receipt and no leaf burns.
+            issuer = None
+            if params.get("request_receipt"):
+                budget_tracker = getattr(
+                    self, "receipt_budget_tracker", None,
+                )
+                if (
+                    budget_tracker is None
+                    or not client_ip
+                    or budget_tracker.rejection_budget_check(client_ip)
+                ):
+                    issuer = self.receipt_issuer
+                else:
+                    self._maybe_warn_receipt_budget_exhausted(client_ip)
             result = submit_transaction_to_mempool(
                 tx, self.blockchain, self.mempool,
                 receipt_issuer=issuer,
@@ -5143,6 +5225,12 @@ async def run(args):
             witness_observation_store=getattr(
                 server, "witness_observation_store", None,
             ),
+            # Share the receipt-subtree budget tracker with the RPC
+            # surface so an attacker can't split traffic across
+            # HTTPS+RPC and drain the per-IP burst twice.  The Server
+            # constructs this eagerly in __init__; passing it through
+            # here keeps both surfaces consulting one set of buckets.
+            budget_tracker=server.receipt_budget_tracker,
         )
         submission_server.start()
         logger.info(
