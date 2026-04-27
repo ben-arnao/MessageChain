@@ -14,10 +14,18 @@ hash case.
 This test pins ``Node._minority_fork_likely`` behavior:
   * Returns False when we have < 2 corroborating peers (refuses to
     sync on a single peer's word — outlier defense).
-  * Returns True when a strict majority of at-or-above peers report
-    higher cumulative_weight at our same height.
+  * Returns True when a strict majority of at-or-above peers with
+    *verified* weight evidence report higher cumulative_weight at
+    our same height.
   * Returns False when the heavier-weight peers are below us.
   * Returns False when our weight matches or exceeds peer weights.
+  * Returns False when peers are unverified (audit anti-amplification
+    gate — see ``tests/test_peer_weight_verification.py``).
+
+Note: ``add_peer`` defaults to ``validated=True`` here so existing
+positive-trigger cases keep their original semantics; the unverified
+case is covered explicitly in
+``tests/test_peer_weight_verification.py``.
 """
 
 import unittest
@@ -38,11 +46,14 @@ class _NodeStub:
     def _current_cumulative_weight(self) -> int:
         return self._our_weight
 
-    def add_peer(self, addr: str, height: int, weight: int):
-        self.syncer.peer_heights[addr] = PeerSyncInfo(
+    def add_peer(self, addr: str, height: int, weight: int,
+                 validated: bool = True):
+        info = PeerSyncInfo(
             peer_address=addr, chain_height=height,
             best_block_hash="", cumulative_weight=weight,
         )
+        info.peer_weight_evidence_validated = validated
+        self.syncer.peer_heights[addr] = info
 
 
 def _detect(node) -> bool:
