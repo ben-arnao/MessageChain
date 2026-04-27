@@ -102,11 +102,11 @@ class EscrowLedger:
         """Burn `slash_pct` of every escrow entry for this entity.
         Returns total burned.
 
-        Pre-Tier 19 (default slash_pct=100): every entry for this entity
+        Pre-Tier 20 (default slash_pct=100): every entry for this entity
         is removed entirely — full escrow wipe matching the legacy
         equivocation policy.
 
-        Tier 19+ (slash_pct=SOFT_SLASH_PCT, typically 5): each entry's
+        Tier 20+ (slash_pct=SOFT_SLASH_PCT, typically 5): each entry's
         amount is scaled by (1 - slash_pct/100) in place; entries that
         round to zero are dropped, others retain their original
         `unlock_at` so the escrow maturity schedule the offender

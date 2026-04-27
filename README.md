@@ -206,9 +206,9 @@ The leaf-index files record which one-time WOTS+ leaves the keyfile
 has already burned. **Restoring the keyfile without the matching
 leaf-index files re-signs already-used leaves**, which mathematically
 discloses the WOTS+ private key for those leaves and produces
-equivocation evidence on chain. Pre-Tier 19 the protocol slashed
+equivocation evidence on chain. Pre-Tier 20 the protocol slashed
 100% of stake on detection (`SLASH_PENALTY_PCT = 100`) with no
-recovery path. At/after `SOFT_SLASH_HEIGHT = 13000` the per-offense
+recovery path. At/after `SOFT_SLASH_HEIGHT = 15000` the per-offense
 penalty drops to `SOFT_SLASH_PCT = 5` and the validator stays in
 the set with reduced stake — but a leaf-index restore burns leaves
 in BULK, producing many distinct equivocation events that compound

@@ -1125,11 +1125,11 @@ class SupplyTracker:
         Slash a validator: burn `slash_pct` of stake + pending unstakes,
         pay finder a reward proportional to what was burned.
 
-        Pre-Tier 19 (default slash_pct=100): the full-burn path — every
+        Pre-Tier 20 (default slash_pct=100): the full-burn path — every
         token in `staked` and every pending-unstake entry is wiped, and
         the offender is dropped from the validator set by the caller.
 
-        Tier 19+ (slash_pct=SOFT_SLASH_PCT, typically 5): partial burn.
+        Tier 20+ (slash_pct=SOFT_SLASH_PCT, typically 5): partial burn.
         Stake is reduced proportionally; each pending entry's amount is
         scaled by (1 - slash_pct/100) and rewritten in place; the
         offender retains the remaining stake and stays in the set
@@ -1168,7 +1168,7 @@ class SupplyTracker:
 
         db = self.db if hasattr(self, "db") else None
         if slash_pct == 100:
-            # Full burn — preserve the exact pre-Tier 19 byte-level
+            # Full burn — preserve the exact pre-Tier 20 byte-level
             # state transition so historical chain replay reaches the
             # same `staked`/`pending_unstakes` shape it always did.
             self.staked[offender_id] = 0

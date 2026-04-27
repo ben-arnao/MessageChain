@@ -1,4 +1,4 @@
-"""Tier 19 — soft equivocation slash (operator-mistake survivability).
+"""Tier 20 — soft equivocation slash (operator-mistake survivability).
 
 Pre-fork (height < SOFT_SLASH_HEIGHT) the equivocation penalty is a
 full 100% stake + escrow burn plus permanent removal from the
@@ -39,7 +39,7 @@ from messagechain.config import (
     SLASH_FINDER_REWARD_PCT,
     SOFT_SLASH_HEIGHT,
     SOFT_SLASH_PCT,
-    TIER_18_HEIGHT,
+    PROPOSAL_FEE_TIER19_HEIGHT,
 )
 from tests import register_entity_for_test
 
@@ -90,8 +90,8 @@ def _slash_at_height(chain, alice, bob, carol_id, prev_block, fork_active: bool)
 
 class TestTier19ForkConstants(unittest.TestCase):
     def test_fork_height_above_tier_18(self):
-        """SOFT_SLASH_HEIGHT must follow TIER_18_HEIGHT — Tier 19 rides above."""
-        self.assertGreater(SOFT_SLASH_HEIGHT, TIER_18_HEIGHT)
+        """SOFT_SLASH_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier 20 rides above."""
+        self.assertGreater(SOFT_SLASH_HEIGHT, PROPOSAL_FEE_TIER19_HEIGHT)
 
     def test_soft_slash_pct_is_partial(self):
         """The whole point of the fork is a partial slash; equality with the

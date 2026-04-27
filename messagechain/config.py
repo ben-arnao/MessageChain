@@ -3460,7 +3460,7 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
 )
 
 # ----------------------------------------------------------------------
-# Tier 19: soft equivocation slash (operator-mistake survivability)
+# Tier 20: soft equivocation slash (operator-mistake survivability)
 # ----------------------------------------------------------------------
 #
 # Pre-fork policy: any double-proposal / double-attestation / finality-
@@ -3487,10 +3487,10 @@ assert TIER_18_HEIGHT > REACT_TX_HEIGHT, (
 # Sustained misbehavior still approaches total stake loss; a single
 # accident does not.
 #
-# Activation: rides above Tier 18 (TIER_18_HEIGHT = 11000) with a
-# ~2000-block runway (~14 days at 600 s/block), giving operators time
-# to acknowledge the new slashing semantics.
-SOFT_SLASH_HEIGHT = 13000
+# Activation: rides above Tier 19 (PROPOSAL_FEE_TIER19_HEIGHT = 13000)
+# with a ~2000-block runway (~14 days at 600 s/block), giving
+# operators time to acknowledge the new slashing semantics.
+SOFT_SLASH_HEIGHT = 15000  # Tier 20
 SOFT_SLASH_PCT = 5  # % of stake/escrow/pending burned per equivocation post-fork
 
 
@@ -3501,7 +3501,7 @@ def get_slash_pct(current_block: int) -> int:
 
     The dynamic config lookup (re-read each call) is what lets test
     suites monkey-patch SOFT_SLASH_HEIGHT to exercise both regimes
-    without spinning the chain forward 13k blocks.
+    without spinning the chain forward 15k blocks.
     """
     from messagechain import config as _cfg
     if current_block >= _cfg.SOFT_SLASH_HEIGHT:
@@ -3509,14 +3509,9 @@ def get_slash_pct(current_block: int) -> int:
     return _cfg.SLASH_PENALTY_PCT
 
 
-assert SOFT_SLASH_HEIGHT > TIER_18_HEIGHT, (
-    "SOFT_SLASH_HEIGHT must follow TIER_18_HEIGHT — Tier 19 soft "
-    "slashing is a consensus rule change and rides above the latest "
-    "established fork (Tier 18 unified fee market)"
-)
 assert 0 < SOFT_SLASH_PCT < SLASH_PENALTY_PCT, (
     "SOFT_SLASH_PCT must be a partial slash (0 < pct < 100). The whole "
-    "point of Tier 19 is to soften the catastrophic full-burn penalty "
+    "point of Tier 20 is to soften the catastrophic full-burn penalty "
     "for honest dual-node operator mistakes; equality with "
     "SLASH_PENALTY_PCT would make the fork a no-op"
 )
@@ -3716,12 +3711,25 @@ for _fork_name, _fork_height in (
     ("REACT_TX_HEIGHT", REACT_TX_HEIGHT),
     ("TIER_18_HEIGHT", TIER_18_HEIGHT),
     ("PROPOSAL_FEE_TIER19_HEIGHT", PROPOSAL_FEE_TIER19_HEIGHT),
+    ("SOFT_SLASH_HEIGHT", SOFT_SLASH_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
         f"BOOTSTRAP_END_HEIGHT ({_BEH})"
     )
 del _fork_name, _fork_height
+
+# Tier 20 (soft equivocation slash) rides above Tier 19 (proposal fee
+# tightening).  The two forks touch disjoint subsystems (slashing vs
+# governance fees) so the order is operational, not semantic — but
+# spacing them by ~2000 blocks (~14 days at 600 s/block) gives
+# operators a clean cutover window per fork rather than collapsing
+# both rule changes into a single activation block.
+assert SOFT_SLASH_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
+    "SOFT_SLASH_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier 20 "
+    "soft slashing rides above the latest established fork (Tier 19 "
+    "proposal fee tightening)"
+)
 
 
 def validate_block_hex_size(block_data) -> bool:

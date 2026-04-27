@@ -3304,12 +3304,12 @@ class Blockchain:
         # credited to supply.balances are reclaimed via the supply
         # tracker's reduction path.
         #
-        # Tier 19 soft-slash gate: pre-fork the slash burns 100% (full
+        # Tier 20 soft-slash gate: pre-fork the slash burns 100% (full
         # wipe + permaban via slashed_validators).  Post-fork the slash
         # is partial (SOFT_SLASH_PCT) and the offender stays in the
         # validator set — only `_processed_evidence` dedupes so the
         # SAME piece of evidence cannot land twice.  See config.py
-        # Tier 19 block for the operator-mistake-survivability rationale.
+        # Tier 20 block for the operator-mistake-survivability rationale.
         from messagechain.config import get_slash_pct
         slash_pct = get_slash_pct(self.height)
         escrow_burned = self._escrow.slash_all(
@@ -8894,7 +8894,7 @@ class Blockchain:
         # offender had built up also evaporate.  Matches the policy
         # from apply_slash_transaction (which is the other entry point
         # for slashing — kept semantically identical to avoid drift).
-        # Tier 19 soft-slash gate.  The block-apply path is the
+        # Tier 20 soft-slash gate.  The block-apply path is the
         # canonical second entry point for slashing and MUST stay
         # semantically identical to apply_slash_transaction — any drift
         # here vs. there means a slash applied via direct call diverges

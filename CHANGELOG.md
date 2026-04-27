@@ -6,13 +6,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.21.0] — 2026-04-26
 
-Minor release. **Tier 19 — soft equivocation slash for honest-operator
-mistake survivability.** Hard fork at `SOFT_SLASH_HEIGHT = 13000`
-(rides above Tier 18's 11000 with a ~2000-block runway, ~14 days at
-600 s/block). Pre-fork chain history replays byte-identically; only
-post-fork blocks see the new partial-burn rules.
+Minor release. **Two coordinated hard forks: Tier 19 (proposal fee
+tightening, activation `PROPOSAL_FEE_TIER19_HEIGHT = 13000`) and
+Tier 20 (soft equivocation slash, activation `SOFT_SLASH_HEIGHT =
+15000`).** Pre-fork chain history replays byte-identically; only
+post-fork blocks see the new rules.
 
-### Consensus (Tier 19, activates block 13000)
+### Consensus (Tier 19 — proposal fee tightening, activates block 13000)
+
+- **Closes the size-amortization escape hatch in governance proposal
+  admission** that Tier 18's unified fee market did not cover.
+  Three coordinated levers: tighter byte caps (title 400→200,
+  description 20_000→2_000), a per-byte surcharge on top of the flat
+  floor, and a quadratic component that scales with payload size.
+  Pre-fork a max-sized proposal paid ~0.49 fee/byte — under any
+  congestion the typical message's per-byte cost won, so a spammer
+  could pin nearly half a block's `MAX_BLOCK_MESSAGE_BYTES` into a
+  single proposal at sub-message rates. Post-fork the per-byte cost
+  ordering is restored and proposals carry their own permanent-state
+  weight (electorate snapshot for the full
+  `GOVERNANCE_VOTING_WINDOW = 1008` blocks, slot in the
+  `MAX_ACTIVE_PROPOSALS = 500` cap).
+
+### Consensus (Tier 20 — soft equivocation slash, activates block 15000)
 
 - **Equivocation penalty drops from 100% to 5% per offense.** Previously
   any double-proposal / double-attestation / finality-double-vote
@@ -78,7 +94,7 @@ catastrophic full-burn was the single loudest objection to running a
 mainnet validator: one operator mistake → bond gone, no recovery.
 Landing this before validator count grows means the new regime is
 established before any operator gets bitten by the legacy rule.
-Activation height 13000 (~1 week of runway from current tip ~700)
+Activation height 15000 (~1 week of runway from current tip ~700)
 gives operators time to upgrade.
 
 ## [1.20.0] — 2026-04-26
