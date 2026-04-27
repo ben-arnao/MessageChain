@@ -4,6 +4,76 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.21.0] — 2026-04-27
+
+Minor release. **Hard fork: Tier 18 — unified fee market** (activates
+at `TIER_18_HEIGHT = 11000`) and **Tier 19 — proposal fee tightening
++ per-byte surcharge** (activates at `PROPOSAL_FEE_TIER19_HEIGHT =
+13000`). Plus one CRITICAL security fix from the round-13 audit
+(active immediately, pre-Tier-17). Plus front-end features: entity
+profile page (`/e/<id>`) + per-post vote indicator.
+
+### Added (consensus, gated by activation height)
+
+- **Tier 18 — unified fee market across Message + Transfer + React**
+  (b3202e2). At `TIER_18_HEIGHT=11000` the per-block tx-count cap
+  (`MAX_TXS_PER_BLOCK=45`) and total-bytes ceiling
+  (`MAX_BLOCK_TOTAL_BYTES=300_000`) cover Message + Transfer +
+  React jointly, and the EIP-1559 base-fee controller auctions all
+  three kinds against each other. Closes the per-kind silos that
+  let one tx type underprice the others under congestion.
+- **Tier 19 — proposal fee tightening + per-byte surcharge**
+  (cdf89d7). At `PROPOSAL_FEE_TIER19_HEIGHT=13000`:
+  - title cap 400 → 200 bytes; description cap 20_000 → 2_000
+    bytes (long-form rationale moves off-chain behind
+    `reference_hash`).
+  - flat fee 10_000 → 100_000.
+  - new per-byte surcharge: 50 tokens/byte over title +
+    description + reference_hash.
+  - Total post-fork floor for a proposal of payload `p` bytes:
+    `100_000 + 50·p`. At any p this exceeds the typical
+    message floor by orders of magnitude — closes the inversion
+    where a max-size proposal paid LESS per stored byte than a
+    typical message.
+
+### Security (round-13 audit)
+
+- **`_persist_state` now full-flushes `reaction_choices` on
+  post-reorg replay** (bf7f6aa). Pre-fix the per-block reaction
+  flush only iterated `self.reaction_state._dirty_keys`, which
+  contains ONLY the keys touched during the new fork's replay.
+  Old-fork-only rows in chaindb's `reaction_choices` table were
+  never DELETEd. After the next cold restart `_load_from_db`
+  rehydrated the orphan vote, mixed it into
+  `state_root_contribution()`, and the restarted node silently
+  forked off peers that didn't restart on the next state-root
+  computation. Round-12 fixed the FAILED-reorg path via
+  `restore_state_snapshot`; this fix closes the SUCCESSFUL-reorg
+  twin via a `full_flush` sentinel in `_persist_state`. New
+  `ChainDB.clear_all_reaction_choices()` helper wipes the table
+  inside the same SQL transaction as the subsequent re-INSERTs,
+  atomic with the wipe. Steady-state per-block flush still uses
+  the dirty-key optimization (O(K_touched), not O(N_total)).
+
+### Added (frontend / RPC)
+
+- **Entity profile page + RPC** (b2c3384). New `/v1/entity` JSON
+  endpoint and `/e/<entity_id>` static page surface per-entity
+  state.
+- **Per-post vote indicator** (6b5155e). Public feed UI now shows
+  per-post vote counts and renders `entity_id` as a clickable
+  link to the new profile page.
+
+### Operational
+
+- Validators must upgrade to 1.21.0 within the runway window
+  (current tip → 11_000 → 13_000) to follow the Tier 18 / Tier 19
+  forks. Pre-1.21.0 nodes will reject blocks at/after activation
+  height that violate the new fee-market or proposal-fee rules.
+- The round-13 fix is active immediately — closes a state-root
+  fork vector that activates the moment Tier 17
+  (`REACT_TX_HEIGHT=9000`) is crossed plus any subsequent reorg.
+
 ## [1.20.0] — 2026-04-26
 
 Minor release. **Two CRITICAL Tier 17 wiring fixes from the round-12
