@@ -3303,7 +3303,18 @@ class Blockchain:
         # equivocating, those rewards evaporate.  Tokens previously
         # credited to supply.balances are reclaimed via the supply
         # tracker's reduction path.
-        escrow_burned = self._escrow.slash_all(tx.evidence.offender_id)
+        #
+        # Tier 19 soft-slash gate: pre-fork the slash burns 100% (full
+        # wipe + permaban via slashed_validators).  Post-fork the slash
+        # is partial (SOFT_SLASH_PCT) and the offender stays in the
+        # validator set — only `_processed_evidence` dedupes so the
+        # SAME piece of evidence cannot land twice.  See config.py
+        # Tier 19 block for the operator-mistake-survivability rationale.
+        from messagechain.config import get_slash_pct
+        slash_pct = get_slash_pct(self.height)
+        escrow_burned = self._escrow.slash_all(
+            tx.evidence.offender_id, slash_pct=slash_pct,
+        )
         if escrow_burned > 0:
             # Reduce both balance (tokens were credited there at mint)
             # and total_supply (escrow-burn is a permanent destruction,
@@ -3319,15 +3330,21 @@ class Blockchain:
             self.supply.total_burned += escrow_burned
 
         slashed, finder_reward = self.supply.slash_validator(
-            tx.evidence.offender_id, tx.submitter_id
+            tx.evidence.offender_id, tx.submitter_id, slash_pct=slash_pct,
         )
-        self.slashed_validators.add(tx.evidence.offender_id)
         self._processed_evidence.add(tx.evidence.evidence_hash)
-        # Reputation reset: a slashed validator forfeits all accumulated
-        # reputation and re-enters the lottery pool (if at all) as a
-        # zero-reputation newcomer.  Prevents the "misbehave once, earn
-        # back your reputation from cached history" attack.
-        self._clear_reputation(tx.evidence.offender_id)
+        if slash_pct == 100:
+            # Pre-Tier 19 path: full burn + permanent ban.  The slashed
+            # validator set is consensus state — adding the offender
+            # here is what makes them ineligible for future block
+            # production / reward selection.
+            self.slashed_validators.add(tx.evidence.offender_id)
+            # Reputation reset: a slashed validator forfeits all
+            # accumulated reputation and re-enters the lottery pool
+            # (if at all) as a zero-reputation newcomer.  Prevents the
+            # "misbehave once, earn back your reputation from cached
+            # history" attack.
+            self._clear_reputation(tx.evidence.offender_id)
 
         logger.info(
             f"SLASHED validator {tx.evidence.offender_id.hex()[:16]}: "
@@ -8877,13 +8894,22 @@ class Blockchain:
         # offender had built up also evaporate.  Matches the policy
         # from apply_slash_transaction (which is the other entry point
         # for slashing — kept semantically identical to avoid drift).
+        # Tier 19 soft-slash gate.  The block-apply path is the
+        # canonical second entry point for slashing and MUST stay
+        # semantically identical to apply_slash_transaction — any drift
+        # here vs. there means a slash applied via direct call diverges
+        # from a slash applied via block inclusion, breaking determinism.
+        from messagechain.config import get_slash_pct
+        slash_pct_for_block = get_slash_pct(block.header.block_number)
         for stx in block.slash_transactions:
             if not self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee):
                 logger.error(
                     f"Slash tx {stx.tx_hash.hex()[:16]} fee payment failed — skipping"
                 )
                 continue
-            escrow_burned = self._escrow.slash_all(stx.evidence.offender_id)
+            escrow_burned = self._escrow.slash_all(
+                stx.evidence.offender_id, slash_pct=slash_pct_for_block,
+            )
             if escrow_burned > 0:
                 cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
                 self.supply.balances[stx.evidence.offender_id] = max(
@@ -8891,11 +8917,19 @@ class Blockchain:
                 )
                 self.supply.total_supply -= escrow_burned
                 self.supply.total_burned += escrow_burned
-            self.supply.slash_validator(stx.evidence.offender_id, stx.submitter_id)
-            self.slashed_validators.add(stx.evidence.offender_id)
-            # Reputation reset: same policy as apply_slash_transaction;
-            # a slashed validator forfeits accumulated reputation.
-            self._clear_reputation(stx.evidence.offender_id)
+            self.supply.slash_validator(
+                stx.evidence.offender_id,
+                stx.submitter_id,
+                slash_pct=slash_pct_for_block,
+            )
+            if slash_pct_for_block == 100:
+                self.slashed_validators.add(stx.evidence.offender_id)
+                # Reputation reset: same policy as
+                # apply_slash_transaction; a slashed validator
+                # forfeits accumulated reputation.  Skipped post-fork
+                # because the offender stays in the set with reduced
+                # stake and continues to earn/lose reputation normally.
+                self._clear_reputation(stx.evidence.offender_id)
             self.slash_sig_counts[stx.submitter_id] = (
                 self.slash_sig_counts.get(stx.submitter_id, 0) + 1
             )
