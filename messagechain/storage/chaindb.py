@@ -1327,6 +1327,28 @@ class ChainDB:
             (voter_id, target, 1 if target_is_user else 0),
         )
 
+    def clear_all_reaction_choices(self) -> None:
+        """Wipe the entire reaction_choices table.
+
+        Round-13 fix: used by `Blockchain._persist_state`'s full-flush
+        path (post `_reset_state`, post-reorg replay) to drop every
+        row before re-INSERTing the canonical-replay choices.  The
+        round-12 dirty-key flush leaves rows that existed only on a
+        rolled-back fork on disk -- after the next cold restart
+        `_load_from_db` rehydrates the orphan vote, mixes it into
+        `state_root_contribution()`, and the restarted node silently
+        forks off peers that didn't restart.  Wiping here closes the
+        successful-reorg twin of the round-12 failed-reorg fix in
+        `restore_state_snapshot`.
+
+        Caller is expected to be inside an outer
+        `begin_transaction` scope (the one `_persist_state` opens),
+        so the DELETE rides the same SQL transaction as the
+        subsequent re-INSERTs and is atomic with them.  No
+        `_maybe_commit` here.
+        """
+        self._conn.execute("DELETE FROM reaction_choices")
+
     def get_all_reaction_choices(
         self,
     ) -> dict[tuple[bytes, bytes, bool], int]:
