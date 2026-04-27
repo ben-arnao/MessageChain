@@ -342,6 +342,20 @@ class Blockchain:
         # rejection rule survives restart.  Loaded from disk in
         # _load_from_db; rehydrated empty for in-memory chains.
         self.finalized_checkpoints: FinalityCheckpoints = FinalityCheckpoints()
+        # Fork-emergency detector — observes every signature-verified
+        # FinalityVote (gossip-time AND block-apply-time) and flags
+        # heights where 2/3+ of stake has committed to a block hash this
+        # node does not have. Surfaces the "we're stuck on the wrong
+        # side of an unintentional hard fork" condition automatically;
+        # see messagechain.consensus.fork_emergency for the policy
+        # rationale (validator auto-halt safe; full-node auto-rewind
+        # opt-in via FORK_EMERGENCY_AUTO_RECOVERY).
+        from messagechain.consensus.fork_emergency import (
+            ForkEmergencyDetector,
+        )
+        self.fork_emergency_detector: ForkEmergencyDetector = (
+            ForkEmergencyDetector()
+        )
         # On-chain governance state: proposals, votes, and append-only
         # audit logs for executed binding outcomes.  Block processing
         # calls _apply_governance_block(block) which dispatches
@@ -6034,6 +6048,14 @@ class Blockchain:
             stake_map = pinned if pinned is not None else dict(self.supply.staked)
             signer_stake = stake_map.get(v.signer_entity_id, 0)
             total_stake = sum(stake_map.values())
+            # Feed the same vote into the fork-emergency detector. The
+            # block-apply path is the authoritative source of truth
+            # (signatures already verified by validate_block); gossip
+            # ingest also feeds via observe_finality_vote so emergencies
+            # surface BEFORE a bad fork's votes ever land in our blocks.
+            self._observe_vote_for_emergency(
+                v, signer_stake, total_stake, stake_map,
+            )
             crossed = self.finalized_checkpoints.add_vote(
                 v, signer_stake, total_stake,
             )
@@ -6065,6 +6087,60 @@ class Blockchain:
             if not hasattr(self, "_pending_finality_slashes"):
                 self._pending_finality_slashes = []
             self._pending_finality_slashes.extend(pending)
+
+    def _observe_vote_for_emergency(
+        self,
+        vote,
+        signer_stake: int,
+        total_stake: int,
+        stake_map: dict,
+    ) -> None:
+        """Feed one signature-verified FinalityVote into the detector.
+
+        Looks up the local block hash at the vote's target height so
+        the detector can flag a supermajority disagreement (or the
+        complete absence of a local block at that height). Tolerates
+        the height being beyond the chain tip — passes None for
+        local_hash, which the detector treats as "we don't have it
+        yet" and still allows an emergency once 2/3 of stake commits.
+        """
+        height = vote.target_block_number
+        if 0 <= height < len(self.chain):
+            local_hash = self.chain[height].block_hash
+        else:
+            local_hash = None
+        try:
+            self.fork_emergency_detector.observe_vote(
+                vote, signer_stake, total_stake, local_hash,
+            )
+        except Exception:
+            # Detector is advisory — never let it crash consensus.
+            logger.exception(
+                "ForkEmergencyDetector.observe_vote raised; ignoring",
+            )
+
+    def observe_finality_vote(self, vote) -> None:
+        """Public hook for gossip-layer callers to feed verified votes.
+
+        Network handler (`_handle_announce_finality_vote`) calls this
+        after signature verification so the detector sees votes BEFORE
+        they ever land in a block. Without this, an emergency would
+        only surface once a divergent fork's votes were embedded in
+        OUR blocks — much too late on a small mainnet where we may
+        ourselves be the minority producing the bad chain.
+
+        Looks up signer stake at the vote's target height using the
+        same pinned-snapshot rule as `_apply_finality_votes` so the
+        2/3 denominator matches consensus exactly.
+        """
+        height = vote.target_block_number
+        pinned = self._stake_snapshots.get(height)
+        stake_map = pinned if pinned is not None else dict(self.supply.staked)
+        signer_stake = stake_map.get(vote.signer_entity_id, 0)
+        total_stake = sum(stake_map.values())
+        self._observe_vote_for_emergency(
+            vote, signer_stake, total_stake, stake_map,
+        )
 
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
@@ -10499,6 +10575,25 @@ class Blockchain:
 
         # Process any orphan blocks that depend on this block
         self._process_orphans(block.block_hash)
+
+        # Auto-clear any fork-emergencies whose flagged height is now
+        # populated by the supermajority hash on our local chain.
+        # Cheap (bounded by the detector's tracked-height cap) and the
+        # only safe place to do it — after a successful append/reorg
+        # we know self.chain reflects the new state.
+        try:
+            self.fork_emergency_detector.recheck_after_chain_advance(
+                lambda h: (
+                    self.chain[h].block_hash
+                    if 0 <= h < len(self.chain)
+                    else None
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "fork_emergency_detector.recheck_after_chain_advance "
+                "raised; ignoring",
+            )
 
         return True, f"Block added (reward: {reward}, fees: {total_fees})"
 

@@ -1368,6 +1368,21 @@ class Node(SharedRuntimeMixin):
         if self.entity.entity_id not in self.consensus.stakes:
             return
 
+        # Fork-emergency auto-halt: same rationale as the proposal
+        # guard. A validator that keeps attesting on a divergent
+        # branch reinforces the fork and burns leaves; staying silent
+        # is the safe default while the operator investigates.
+        det = getattr(self.blockchain, "fork_emergency_detector", None)
+        if det is not None and det.is_in_emergency():
+            lowest = det.lowest_emergency()
+            if lowest is not None:
+                logger.warning(
+                    "Refusing attestation for block #%d — fork emergency active: %s",
+                    block.header.block_number,
+                    lowest.short(),
+                )
+            return
+
         def _is_includable(tx) -> bool:
             ok, _reason = self.blockchain.validate_transaction(tx)
             return ok
@@ -1510,6 +1525,17 @@ class Node(SharedRuntimeMixin):
                 peer.address, OFFENSE_INVALID_TX, "invalid_finality_vote_sig",
             )
             return
+
+        # Feed the verified vote into the fork-emergency detector
+        # BEFORE pooling so emergencies surface even when the local
+        # mempool already had the vote (dedup pool returns False) but
+        # the detector hasn't seen this signer at this height yet.
+        # Detector is advisory and exception-safe — never let it
+        # block the gossip relay path.
+        try:
+            self.blockchain.observe_finality_vote(vote)
+        except Exception:
+            logger.exception("fork-emergency observe_finality_vote failed")
 
         added = self.mempool.add_finality_vote(vote)
 
@@ -1983,6 +2009,25 @@ class Node(SharedRuntimeMixin):
 
         # Don't produce blocks while syncing
         if self.syncer.is_syncing:
+            return
+
+        # Fork-emergency auto-halt: if 2/3+ of stake has committed to
+        # a block hash we don't have at some height, we are likely on
+        # the wrong side of an unintentional fork. Producing more
+        # blocks would deepen the divergence and could burn
+        # signature leaves on a chain we will need to abandon. Halt
+        # safely — never auto-flip to the supermajority chain (an
+        # autoflip on a quorum-signal bug would weaponize the bug
+        # into network-wide chain abandonment). Operator must
+        # intervene to clear.
+        det = getattr(self.blockchain, "fork_emergency_detector", None)
+        if det is not None and det.is_in_emergency():
+            lowest = det.lowest_emergency()
+            if lowest is not None:
+                logger.warning(
+                    "Halting block proposal — fork emergency active: %s",
+                    lowest.short(),
+                )
             return
 
         # Leaf-reuse defence after snapshot restore.  Twin of the guard
