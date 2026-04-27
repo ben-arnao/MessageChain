@@ -3564,6 +3564,97 @@ assert GOVERNANCE_PROPOSAL_FEE_PER_BYTE_TIER19 > 0, (
     "exists to close"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 20 — Sigmoid validator-reward curve (small/mid/large bands)
+# ─────────────────────────────────────────────────────────────────────
+# CLAUDE.md anchors a three-band shape for per-stake-unit earnings:
+# small validators earn LESS per unit stake (slight suppression to
+# discourage dust validators that add overhead without meaningful
+# security), mid-tier validators earn MORE per unit stake (the catch-
+# up band that compresses the distribution upward over time), and
+# large validators saturate to a linear baseline (capped on the upper
+# end by SEED_STAKE_CEILING_HEIGHT for seed entities).
+#
+# Pre-Tier-20 the only piece in code is the upper cap; the small and
+# mid bands do not exist — every staker below the ceiling earns at the
+# same flat per-stake rate.  Tier 20 introduces the missing two bands
+# as a piecewise-constant multiplier applied to per-attester rewards
+# in mint_block_reward.  Multiplier > 1 mints the delta on top of the
+# halvings-adjusted reward; multiplier < 1 burns the shortfall.  Net
+# issuance fluctuates slightly with the live stake distribution and
+# averages near 1.0 once stakes settle into the curve's design region.
+#
+# Curve shape (basis points; 1 bp = 0.01%):
+#   share <  50 bp  (<0.5%)        → multiplier 80/100  = 0.80
+#   50 bp ≤ share < 500 bp (0.5–5%) → multiplier 125/100 = 1.25
+#   share ≥ 500 bp (≥5%)            → multiplier 1/1     = 1.00 (baseline)
+#
+# Thresholds are expressed as fractions of total active stake (not
+# absolute token amounts) so the curve auto-tracks network growth and
+# does not require re-tuning via hard fork.  Exact numbers are tuning
+# knobs; the SHAPE (small < mid > large, large = baseline) is what's
+# anchored.
+#
+# Activation rides above Tier 19 (PROPOSAL_FEE_TIER19_HEIGHT = 13_000)
+# with a ~2000-block runway (~14 days at 600 s/block) so operators
+# upgrade through the prior fork before the new reward distribution
+# starts.
+REWARD_CURVE_HEIGHT = 15_000  # Tier 20
+
+# Stake-share thresholds in basis points (1 bp = 0.01%, so 50 bp = 0.5%
+# and 500 bp = 5%).  Defined as bp ints to keep the curve evaluable in
+# pure integer arithmetic — no floats anywhere on the consensus path.
+REWARD_CURVE_SMALL_THRESHOLD_BPS = 50    # 0.5% of total active stake
+REWARD_CURVE_MID_THRESHOLD_BPS = 500     # 5%   of total active stake
+
+# Multiplier numerator / denominator per band.  Applied as
+# `reward * num // den` so the result stays integer.  Large band is
+# implicit 1/1 (no scaling) — pre- and post-fork large-validator
+# rewards are byte-identical, which keeps the upper-cap interaction
+# with SEED_STAKE_CEILING simple.
+REWARD_CURVE_SMALL_NUMERATOR = 80
+REWARD_CURVE_SMALL_DENOMINATOR = 100
+REWARD_CURVE_MID_NUMERATOR = 125
+REWARD_CURVE_MID_DENOMINATOR = 100
+
+assert REWARD_CURVE_HEIGHT > PROPOSAL_FEE_TIER19_HEIGHT, (
+    "REWARD_CURVE_HEIGHT must follow PROPOSAL_FEE_TIER19_HEIGHT — Tier "
+    "20 rides on top of the post-Tier-19 schedule; activating the new "
+    "reward curve before Tier 19 settles would interleave two "
+    "unrelated forks in the same upgrade window"
+)
+assert (
+    0 < REWARD_CURVE_SMALL_THRESHOLD_BPS < REWARD_CURVE_MID_THRESHOLD_BPS
+    < 10_000
+), (
+    "Reward-curve thresholds must satisfy "
+    "0 < small < mid < 10_000 (=100%) — anything else collapses or "
+    "inverts the band ordering and makes the piecewise function "
+    "ill-defined"
+)
+assert (
+    REWARD_CURVE_SMALL_NUMERATOR < REWARD_CURVE_SMALL_DENOMINATOR
+), (
+    "REWARD_CURVE_SMALL_NUMERATOR/DENOMINATOR must encode a multiplier "
+    "< 1.0 — the small band is the suppression region; a ≥1 multiplier "
+    "removes the dust-validator disincentive the band exists for"
+)
+assert (
+    REWARD_CURVE_MID_NUMERATOR > REWARD_CURVE_MID_DENOMINATOR
+), (
+    "REWARD_CURVE_MID_NUMERATOR/DENOMINATOR must encode a multiplier "
+    "> 1.0 — the mid band is the catch-up region; a ≤1 multiplier "
+    "removes the boost that closes the gap between mid-tier validators "
+    "and whales"
+)
+assert (
+    REWARD_CURVE_SMALL_DENOMINATOR > 0
+    and REWARD_CURVE_MID_DENOMINATOR > 0
+), (
+    "Reward-curve denominators must be positive — a zero denominator "
+    "is an unevaluable multiplier and would crash the consensus path"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
