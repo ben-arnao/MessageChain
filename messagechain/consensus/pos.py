@@ -274,6 +274,59 @@ class ProofOfStake:
         bogus_rej_txs = list(bogus_rejection_evidence_txs or [])
         acks_observed = list(acks_observed_this_block or [])
         react_txs = list(react_transactions or [])
+
+        # Tier 18: enforce the unified per-block byte budget across
+        # Message + Transfer + React.  Without this trim, an honest
+        # proposer pulling near MAX_TXS_PER_BLOCK from each lane would
+        # exceed MAX_BLOCK_TOTAL_BYTES and validators would reject the
+        # block — wasting the proposer's slot.  Trim policy: while over
+        # budget, evict the lowest-fee-per-byte entry across the three
+        # lanes.  This mirrors the validate_block budget check
+        # symmetrically (same byte accounting, same set of kinds) and
+        # matches the chain-wide fee-density selection priority — the
+        # txs the proposer would have lost the most revenue keeping
+        # are the ones to drop first.
+        from messagechain.config import (
+            TIER_18_HEIGHT as _TIER_18_H,
+            MAX_BLOCK_TOTAL_BYTES as _MAX_TOTAL_B,
+        )
+        new_block_number_preview = prev_block.header.block_number + 1
+        if new_block_number_preview >= _TIER_18_H:
+            def _density(t) -> float:
+                try:
+                    return t.fee / max(1, len(t.to_bytes()))
+                except Exception:
+                    return float(t.fee)
+            def _size(t) -> int:
+                try:
+                    return len(t.to_bytes())
+                except Exception:
+                    return 0
+            # Build a unified candidate list with lane tags so we can
+            # evict from the right list.
+            unified = (
+                [("msg", t) for t in txs]
+                + [("xfer", t) for t in transfer_txs]
+                + [("react", t) for t in react_txs]
+            )
+            total_bytes = sum(_size(t) for _lane, t in unified)
+            if total_bytes > _MAX_TOTAL_B:
+                # Sort ascending by density so the lowest is at index 0.
+                unified.sort(key=lambda lt: _density(lt[1]))
+                while unified and total_bytes > _MAX_TOTAL_B:
+                    lane, victim = unified.pop(0)
+                    total_bytes -= _size(victim)
+                    if lane == "msg":
+                        txs = [t for t in txs if t.tx_hash != victim.tx_hash]
+                    elif lane == "xfer":
+                        transfer_txs = [
+                            t for t in transfer_txs if t.tx_hash != victim.tx_hash
+                        ]
+                    elif lane == "react":
+                        react_txs = [
+                            t for t in react_txs if t.tx_hash != victim.tx_hash
+                        ]
+
         # Route through the canonical tx-hash builder so proposer and
         # validator cannot drift on what's in the merkle tree.  We
         # assemble a minimal namespace-like object that exposes the
