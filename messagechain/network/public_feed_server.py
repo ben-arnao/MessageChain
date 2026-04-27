@@ -61,6 +61,7 @@ _STATIC_DIR = os.path.join(
     "static",
 )
 _FEED_HTML_PATH = os.path.join(_STATIC_DIR, "feed.html")
+_ENTITY_HTML_PATH = os.path.join(_STATIC_DIR, "entity.html")
 
 # Outbound link target for the `/gh` redirect (the public repo).
 _GITHUB_REPO_URL = "https://github.com/ben-arnao/MessageChain"
@@ -327,6 +328,16 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/latest":
             self._serve_latest(ctx, split.query)
             return
+        if path == "/v1/entity":
+            self._serve_entity(ctx, split.query)
+            return
+        if path.startswith("/e/"):
+            # /e/<entity_id_hex>: static profile page.  The page reads
+            # the id from its own URL and queries /v1/entity itself.
+            # Serving the same HTML for any /e/* path keeps the server
+            # branch trivial; client-side validates the hex.
+            self._serve_static_entity()
+            return
         if path == "/gh" or path == "/gh/start":
             # 302 to the public repo so outbound clicks land in the
             # access log (a bare anchor href would let the browser
@@ -390,6 +401,45 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self._send_text(500, "feed page unavailable")
             return
         self._send_html(body)
+
+    def _serve_static_entity(self):
+        try:
+            with open(_ENTITY_HTML_PATH, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._send_text(500, "entity page unavailable")
+            return
+        self._send_html(body)
+
+    def _serve_entity(self, ctx: "_FeedHandlerContext", query: str):
+        from messagechain.network.entity_profile import compute_entity_profile
+        params = parse_qs(query)
+        raw_id = (params.get("id") or [""])[0].strip().lower()
+        if not raw_id or len(raw_id) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be a 64-char hex entity_id",
+            })
+            return
+        try:
+            entity_id = bytes.fromhex(raw_id)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be valid hex",
+            })
+            return
+        try:
+            profile = compute_entity_profile(ctx.blockchain, entity_id)
+        except Exception:
+            logger.exception("compute_entity_profile failed")
+            self._send_json(500, {"ok": False, "error": "chain read failed"})
+            return
+        self._send_json(200, {
+            "ok": True,
+            "height": ctx.blockchain.height,
+            "profile": profile,
+        })
 
     def _serve_info(self, ctx: _FeedHandlerContext):
         chain = ctx.blockchain
