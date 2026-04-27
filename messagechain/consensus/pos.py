@@ -591,36 +591,72 @@ class ProofOfStake:
         if guard is not None:
             guard.record_block_sign(new_block_number)
 
-        # Proposer signs the block header. randao_mix is excluded from
-        # signable_data to break a circular dependency (the mix is derived
-        # from this very signature) but is bound to the block via _compute_hash.
-        header_hash = _hash(header.signable_data())
-        header.proposer_signature = proposer_entity.keypair.sign(header_hash)
+        # If anything between the reserve above and the ``return block``
+        # below raises, the floor stays advanced with no signature
+        # reaching the caller — exactly the floor-poisoning shape that
+        # wedged the chain at heights 671/672 in the 2026-04-27
+        # incident.  Wrap the post-reserve work so any failure path
+        # rolls the floor back durably.  Successful return commits the
+        # reservation as before.
+        #
+        # The caller (``server.py``'s ``_try_produce_block_sync``) is
+        # ALSO responsible for calling ``guard.rollback_block_sign``
+        # when ``add_block`` rejects a block this method returned —
+        # state-root mismatches and other state-machine-level
+        # rejections fire AFTER ``create_block`` has returned and
+        # cannot be detected here.  The two rollback paths together
+        # close the entire window between reserve-and-broadcast.
+        try:
+            # Proposer signs the block header. randao_mix is excluded from
+            # signable_data to break a circular dependency (the mix is derived
+            # from this very signature) but is bound to the block via _compute_hash.
+            header_hash = _hash(header.signable_data())
+            header.proposer_signature = proposer_entity.keypair.sign(header_hash)
 
-        # Derive RANDAO mix from parent.randao_mix + proposer signature.
-        # Each grinding attempt requires a new signature → consumes a fresh
-        # WOTS+ leaf, observable on chain via proposer_sig_counts.
-        from messagechain.consensus.randao import derive_randao_mix
-        header.randao_mix = derive_randao_mix(
-            prev_block.header.randao_mix, header.proposer_signature
-        )
+            # Derive RANDAO mix from parent.randao_mix + proposer signature.
+            # Each grinding attempt requires a new signature → consumes a fresh
+            # WOTS+ leaf, observable on chain via proposer_sig_counts.
+            from messagechain.consensus.randao import derive_randao_mix
+            header.randao_mix = derive_randao_mix(
+                prev_block.header.randao_mix, header.proposer_signature
+            )
 
-        block = Block(
-            header=header,
-            transactions=txs,
-            attestations=attestations or [],
-            transfer_transactions=transfer_txs,
-            slash_transactions=slash_txs,
-            governance_txs=gov_txs,
-            authority_txs=auth_txs,
-            stake_transactions=stake_txs,
-            unstake_transactions=unstake_txs,
-            finality_votes=fin_votes,
-            custody_proofs=cust_proofs,
-            censorship_evidence_txs=censorship_txs,
-            bogus_rejection_evidence_txs=bogus_rej_txs,
-            acks_observed_this_block=acks_observed,
-            react_transactions=react_txs,
-        )
-        block.block_hash = block._compute_hash()
-        return block
+            block = Block(
+                header=header,
+                transactions=txs,
+                attestations=attestations or [],
+                transfer_transactions=transfer_txs,
+                slash_transactions=slash_txs,
+                governance_txs=gov_txs,
+                authority_txs=auth_txs,
+                stake_transactions=stake_txs,
+                unstake_transactions=unstake_txs,
+                finality_votes=fin_votes,
+                custody_proofs=cust_proofs,
+                censorship_evidence_txs=censorship_txs,
+                bogus_rejection_evidence_txs=bogus_rej_txs,
+                acks_observed_this_block=acks_observed,
+                react_transactions=react_txs,
+            )
+            block.block_hash = block._compute_hash()
+            return block
+        except BaseException:
+            if guard is not None:
+                try:
+                    guard.rollback_block_sign(new_block_number)
+                except Exception:
+                    # Rollback durability failure during exception
+                    # handling — log and proceed.  The original
+                    # exception is the user-visible one; the floor
+                    # may be left poisoned, in which case the operator
+                    # sees a HeightAlreadySignedError on the next
+                    # propose attempt and can investigate.  Don't
+                    # mask the original failure.
+                    import logging as _logging
+                    _logging.getLogger(__name__).exception(
+                        "rollback_block_sign(%d) raised during "
+                        "create_block exception handling — floor may "
+                        "remain poisoned",
+                        new_block_number,
+                    )
+            raise

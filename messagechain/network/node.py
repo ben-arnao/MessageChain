@@ -2237,6 +2237,24 @@ class Node(SharedRuntimeMixin):
             )
             await self._broadcast(msg)
         else:
+            # add_block rejected our own candidate.  Roll back the
+            # height-guard floor reservation so a future legitimate
+            # proposal at this height isn't blocked.  See
+            # server.py::_try_produce_block_sync for the matching
+            # rollback wiring on the Server-class production path.
+            wallet_guard = getattr(self.entity, "height_sign_guard", None)
+            if wallet_guard is not None:
+                try:
+                    wallet_guard.rollback_block_sign(
+                        block.header.block_number,
+                    )
+                except Exception:
+                    logger.exception(
+                        "rollback_block_sign(%d) failed after "
+                        "add_block rejection — floor may remain "
+                        "poisoned",
+                        block.header.block_number,
+                    )
             logger.warning(f"Failed to add proposed block: {reason}")
             if block_producer.is_clock_skew_reason(reason):
                 logger.warning(

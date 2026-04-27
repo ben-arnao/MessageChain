@@ -3753,6 +3753,36 @@ class Server(SharedRuntimeMixin):
             # call so flags can be flipped without restart.
             self._maybe_notify_governance_proposals()
         else:
+            # add_block rejected our own candidate.  Roll back the
+            # height-guard floor reservation so a future legitimate
+            # proposal at this height isn't blocked.  Without rollback
+            # the floor stays at ``block.header.block_number`` and
+            # every subsequent attempt at the same height fails with
+            # HeightAlreadySignedError — the chain-stall shape the
+            # 2026-04-27 incident exposed at heights 671/672.
+            #
+            # Rollback runs inside the same wallet-leaf lock as the
+            # propose+sign that placed the reservation, so a
+            # concurrent operator CLI signing on this wallet cannot
+            # race the rollback to a stale view of the floor.
+            wallet_guard = getattr(self.wallet_entity, "height_sign_guard", None)
+            if wallet_guard is not None:
+                with self._wallet_leaf_lock:
+                    try:
+                        wallet_guard.rollback_block_sign(
+                            block.header.block_number,
+                        )
+                    except Exception:
+                        # Rollback durability failure — log loudly,
+                        # let the existing rejection-warning surface
+                        # below.  An operator who sees both will know
+                        # the floor may be poisoned and can investigate.
+                        logger.exception(
+                            "rollback_block_sign(%d) failed after "
+                            "add_block rejection — floor may remain "
+                            "poisoned",
+                            block.header.block_number,
+                        )
             if block_producer.is_clock_skew_reason(reason):
                 logger.warning(
                     f"Failed to add proposed block: {reason}. "
