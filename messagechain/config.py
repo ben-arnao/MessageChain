@@ -2503,7 +2503,7 @@ MAX_BLOCK_HEX_SIZE = 2_000_000  # 2M hex chars = 1MB binary
 FEE_INCLUDES_SIGNATURE_HEIGHT = _profile_int(
     "MESSAGECHAIN_FEE_INCLUDES_SIGNATURE_HEIGHT",
     "FEE_INCLUDES_SIGNATURE_HEIGHT",
-    1200,  # Tier 2 (compressed: was 64_000) — see CHANGELOG 1.11.0
+    615,  # Tier 2 — fast-forwarded for live ReactTx test
 )
 
 # Activation height for decoupling attester committee size from the
@@ -3038,7 +3038,7 @@ assert VALIDATOR_REGISTRATION_BURN > 0, (
 # coordinated-fork height before deploying to mainnet.  Per the FORK
 # SCHEDULE: Tier 7, target 98,000 — after the last Tier 6 fork
 # (VALIDATOR_REGISTRATION_BURN_HEIGHT) and before BOOTSTRAP_END_HEIGHT.
-FLAT_FEE_HEIGHT = 2800  # Tier 7 (compressed: was 98_000)
+FLAT_FEE_HEIGHT = 616   # Tier 7 — fast-forwarded for live ReactTx test (must follow FEE_INCLUDES_SIGNATURE_HEIGHT=615)
 
 assert MIN_FEE_POST_FLAT > MIN_FEE, (
     "MIN_FEE_POST_FLAT must exceed the legacy floor — otherwise the fork "
@@ -3224,7 +3224,7 @@ INTL_MESSAGE_HEIGHT = 1500              # Tier 12
 # operators comfortable time to upgrade without the protection of
 # this very gate (which doesn't exist yet) -- manual coordination is
 # the mitigation for fork-1 itself; subsequent forks use the gate.
-VERSION_SIGNALING_HEIGHT = 3500          # Tier 13 (Fork 1)
+VERSION_SIGNALING_HEIGHT = 620           # Tier 13 (Fork 1) — fast-forwarded for live ReactTx test
 
 # Tier 14 — MessageTransaction signable-data length-prefix fix.
 # Closes a tx_hash-collision hole in the legacy v1/v2/v3 _signable_data:
@@ -3258,7 +3258,7 @@ VERSION_SIGNALING_HEIGHT = 3500          # Tier 13 (Fork 1)
 # RECOMMENDED creation path emits v4.  A future tier can tighten
 # this by REJECTING v3 admission; that's a separate consensus
 # change.
-MESSAGE_TX_LENGTH_PREFIX_HEIGHT = 4500   # Tier 14
+MESSAGE_TX_LENGTH_PREFIX_HEIGHT = 621    # Tier 14 — fast-forwarded for live ReactTx test
 
 assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > FIRST_SEND_PUBKEY_HEIGHT, (
     "MESSAGE_TX_LENGTH_PREFIX_HEIGHT must follow FIRST_SEND_PUBKEY_HEIGHT "
@@ -3300,7 +3300,7 @@ assert MESSAGE_TX_LENGTH_PREFIX_HEIGHT > VERSION_SIGNALING_HEIGHT, (
 # for backward compatibility but the recommended creation path emits
 # v2 (and the founder-led governance regime should use only v2 for
 # any treasury spend during the bootstrap window).
-GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT = 5000   # Tier 15
+GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT = 622    # Tier 15 — fast-forwarded for live ReactTx test
 
 assert GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT > MESSAGE_TX_LENGTH_PREFIX_HEIGHT, (
     "GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT must follow "
@@ -3354,7 +3354,7 @@ assert GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT > MESSAGE_TX_LENGTH_PREFIX_HEIGHT, (
 # = 5000).  Runway window 5000→7000 = ~2000 blocks (~14 days at
 # 600s/block) — operators upgrade in that window.
 MARKET_FEE_FLOOR = 1            # post-Tier-16 protocol fee floor (flat, all sizes)
-MARKET_FEE_FLOOR_HEIGHT = 7000  # Tier 16
+MARKET_FEE_FLOOR_HEIGHT = 623   # Tier 16 — fast-forwarded for live ReactTx test
 
 assert MARKET_FEE_FLOOR >= 1, (
     "MARKET_FEE_FLOOR must be at least 1 — a zero floor reopens the "
@@ -3393,7 +3393,7 @@ assert MARKET_FEE_FLOOR_HEIGHT > GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT, (
 # Runway 7000 → 9000 = ~2000 blocks (~14 days at 600 s/block) to give
 # operators time to upgrade past the prior fork before the new tx kind
 # starts admitting.
-REACT_TX_HEIGHT = 9000  # Tier 17
+REACT_TX_HEIGHT = 624   # Tier 17 — fast-forwarded for live ReactTx test
 
 # ReactTransaction choice byte values (packed into the flags field —
 # see reaction.py).  CLEAR retracts a prior vote; UP and DOWN are the

@@ -4,6 +4,39 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.25.0] — 2026-04-26
+
+### Hard fork — fast-forwarded Tier 2 + Tier 7 + Tier 13–17 activations
+
+Coordinated multi-tier fork that pulls forward seven previously
+distant activation heights into a tight near-future window so the
+Tier 17 ReactTransaction feature can be exercised live on mainnet
+without waiting ~58 days for the chain to grow into the original
+schedule. The chain has not yet reached any of these forks (current
+tip ~611), so pre-fork replay is unaffected.
+
+New activation heights (strict ordering preserved):
+
+- `FEE_INCLUDES_SIGNATURE_HEIGHT` 1200 → **615** (Tier 2)
+- `FLAT_FEE_HEIGHT` 2800 → **616** (Tier 7)
+- `VERSION_SIGNALING_HEIGHT` 3500 → **620** (Tier 13)
+- `MESSAGE_TX_LENGTH_PREFIX_HEIGHT` 4500 → **621** (Tier 14)
+- `GOVERNANCE_TX_LENGTH_PREFIX_HEIGHT` 5000 → **622** (Tier 15)
+- `MARKET_FEE_FLOOR_HEIGHT` 7000 → **623** (Tier 16)
+- `REACT_TX_HEIGHT` 9000 → **624** (Tier 17)
+
+Tier 18 (`TIER_18_HEIGHT = 11000`), Tier 19, Tier 20, Tier 21, and
+Tier 22 are left at their original heights. After the rollout,
+ReactTransaction admission opens at block 624 (`REACT_FEE_FLOOR = 10`
+per-tx until Tier 18 collapses to MARKET_FEE_FLOOR=1).
+
+### Test fixtures
+
+- `tests/test_fee_includes_signature_height_env.py` updated to the
+  new default (615) and a sub-FLAT_FEE_HEIGHT env override value
+  (610) to satisfy the `FLAT_FEE_HEIGHT > FEE_INCLUDES_SIGNATURE_HEIGHT`
+  invariant under the compressed window.
+
 ## [1.24.0] — 2026-04-26
 
 Minor release. **Hard fork: Tier 22 — voter rewards on passed
