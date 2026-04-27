@@ -4,6 +4,59 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.28.1] — 2026-04-27
+
+Patch release.  Closes the entire **floor-poisoning bug class** the
+2026-04-27 chain-stall incident exposed.  1.28.0 mirrored the
+specific (header, prev_block, wall-clock)-only validate_block rules
+into a pre-sign helper, which fixed the round-cap path that wedged
+the chain at height 671.  Hours later the chain wedged AGAIN at
+height 672 via a state-root mismatch — same bug class, different
+rule, not pre-sign-checkable.  This release durably closes the
+window between ``record_block_sign`` and "block has been broadcast"
+so any post-reserve rejection rolls back the floor.
+
+### Security / correctness (active immediately, no fork gate)
+
+- **Durable height-guard floor rollback on post-reserve rejection**
+  (f6d8eea).  ``HeightSignGuard`` gains a per-role pending-reservation
+  tracker plus a ``rollback_<role>_sign(height)`` API that durably
+  restores the prior floor.  ``ProofOfStake.create_block`` wraps its
+  post-reserve work (signing, RANDAO mix, block construction) in a
+  try/except that rolls back on ANY exception before re-raising.
+  Both production block-production paths
+  (``server.py::_try_produce_block_sync`` and
+  ``messagechain/network/node.py::_try_produce_block``) call
+  ``rollback_block_sign`` when their own ``add_block`` rejects the
+  candidate.  Net effect: the floor only ratchets when a block has
+  ACTUALLY been accepted into the local chain — no more poisoning
+  on state-root mismatch, byte-budget overflow, in-create_block
+  exception, or any future rejection rule.
+
+  Crash-window analysis (preserves the safe-failure-mode anchor):
+  every interleaving of process kill between reserve and rollback
+  leaves the on-disk floor at the higher value, refusing re-sign at
+  that height — liveness loss for one block, NO equivocation.  The
+  crash-restart double-sign guarantee is preserved end-to-end.
+
+- **In-memory pending state does NOT survive restart.**  On process
+  reload the on-disk floor is the only durable signal; a freshly-
+  loaded guard cannot roll back a reservation that a previous
+  process committed.  This closes a hypothetical attack where a
+  malicious operator restart could "undo" a real signature by
+  treating the post-restart pending dict as if it could undo
+  pre-restart on-disk state.
+
+### Operator notes
+
+- No fork gate, no consensus impact, no migration step.  Roll
+  validators with ``messagechain upgrade --yes``.
+- This release is the durable fix for the floor-poisoning bug
+  class.  After upgrade, any chain that was previously wedged on a
+  poisoned floor will recover automatically on the next slot
+  attempt at the next height (the proposer reads the canonical tip
+  via fork-choice, advances past the poisoned floor, and produces).
+
 ## [1.28.0] — 2026-04-27
 
 Minor release.  **Hard fork: Tier 25 — optional `community_id` on
