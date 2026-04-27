@@ -2145,6 +2145,45 @@ class Blockchain:
         if not self.supply.can_afford_fee(tx.entity_id, tx.fee):
             return False, f"Insufficient balance for fee of {tx.fee}"
 
+        # Tier 26 chain-height window enforcement.  Above
+        # REVOKE_TX_WINDOW_HEIGHT every revoke must carry a
+        # [valid_from, valid_to] window in its signed payload, and the
+        # CURRENT chain height must fall inside that window.  Pre-fork
+        # legacy blobs (no window) are still accepted to preserve
+        # historical replay determinism.
+        #
+        # The window check is layered: verify_revoke_transaction below
+        # is the authoritative cryptographic check (signature commits
+        # to the window), but emitting the human-readable rejection
+        # reason here means an honest operator broadcasting an expired
+        # blob sees "revoke window expired" instead of "bad signature".
+        from messagechain.config import REVOKE_TX_WINDOW_HEIGHT as _RWH
+        chain_h = self.height + 1
+        if chain_h >= _RWH:
+            if not tx.has_window():
+                return False, (
+                    "Missing chain-height window — revoke txs at or above "
+                    f"REVOKE_TX_WINDOW_HEIGHT={_RWH} must carry "
+                    "[valid_from_height, valid_to_height] in the signed "
+                    "payload (Tier 26).  Pre-signed hex from the legacy "
+                    "format must be re-signed in the windowed format "
+                    "before broadcast."
+                )
+            if chain_h < tx.valid_from_height:
+                return False, (
+                    f"Revoke window not yet active — current height "
+                    f"{chain_h} < valid_from_height "
+                    f"{tx.valid_from_height}; the operator pre-signed "
+                    "for a future window that has not started yet."
+                )
+            if chain_h > tx.valid_to_height:
+                return False, (
+                    f"Revoke window expired — current height {chain_h} "
+                    f"> valid_to_height {tx.valid_to_height}; this "
+                    "pre-signed tx is past its replay-bound deadline "
+                    "and must be re-signed under a fresh window."
+                )
+
         # Authority-gated: signature must verify under the cold key.
         # Deliberately no nonce check — revoke is idempotent and the tx is
         # designed to be pre-signable offline, where the live nonce is
@@ -2152,7 +2191,7 @@ class Blockchain:
         # guard above: any second submission with the same effect is a no-op.
         authority_pk = self.get_authority_key(tx.entity_id)
         if authority_pk is None or not verify_revoke_transaction(
-            tx, authority_pk, current_height=self.height + 1,
+            tx, authority_pk, current_height=chain_h,
         ):
             return False, (
                 "Invalid signature — revoke must be signed by the authority "

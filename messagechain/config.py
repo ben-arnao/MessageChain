@@ -4044,6 +4044,55 @@ COMMUNITY_ID_HEIGHT = 8_000  # Tier 25
 # in messagechain.core.transaction for the structural rules.
 MAX_COMMUNITY_ID_LEN = 32
 
+
+# ─── Tier 26: chain-height window on RevokeTransaction ─────────────────
+#
+# RevokeTransaction is intentionally nonce-free so an operator can
+# pre-sign it on paper / air-gapped media and broadcast later under
+# duress (the cold key never has to come back online during an
+# active incident).  The original design bounded only the FUTURE
+# timestamp drift -- past timestamps were unbounded.  Combined with
+# nonce-free idempotency, that made any captured signed-revoke hex a
+# permanent bearer broadcast token: anyone who later recovered a
+# leaked backup, photo, or USB stick (insider, coerced operator,
+# thief) could broadcast the un-aged revoke and force the target
+# validator into the 7-day unbonding queue.  With two operator
+# validators on mainnet, simultaneously firing both leaked revokes
+# halts consensus.
+#
+# Tier 26 closes the bearer-replay window without giving up the
+# pre-sign / offline workflow.  At/above this height, every revoke
+# commits to a chain-height window [valid_from_height, valid_to_height]
+# in the signable bytes.  Validation rejects the tx if current_height
+# is outside that window.  The operator re-signs every quarter
+# (~13140 blocks ≈ 90 days at 600 s/block); a hex leaked today
+# expires within 90 days of its valid_to_height, bounding the
+# bearer-replay surface.  The window IS the signed payload, so an
+# attacker holding a leaked hex cannot extend it without the cold
+# key -- the signature commits to the original window.
+#
+# Pre-fork (height < REVOKE_TX_WINDOW_HEIGHT) the legacy un-windowed
+# encoding is still accepted, so historical replay is preserved.  The
+# CLI layer always emits the windowed encoding once tooling is
+# upgraded -- the pre-fork branch is purely a replay-determinism
+# concession for blocks already on chain.
+#
+# Activation rides above Tier 25 (COMMUNITY_ID_HEIGHT = 8_000) with
+# ample runway above current mainnet tip (~670 at fork-design time),
+# so no in-flight pre-signed revoke is invalidated by the fork itself
+# -- operators have the full pre-activation window to refresh their
+# stored hexes to the post-fork format.
+REVOKE_TX_WINDOW_HEIGHT = 10_000  # Tier 26
+
+# Default re-sign cadence for the CLI's --print-only path: ~90 days
+# at 600 s/block.  90 days matches a reasonable quarterly cold-key
+# ritual: the operator dusts off the cold key, signs a fresh revoke,
+# replaces the offline copy, and is good for another quarter.  Short
+# enough that a leaked hex expires within a quarter; long enough that
+# an operator who travels for two months still has unexpired
+# kill-switch coverage when they get home.
+REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS = 13_140
+
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
     "rides on top of the established post-Tier-18 schedule; activating "
@@ -4066,6 +4115,19 @@ assert COMMUNITY_ID_HEIGHT > HONESTY_CURVE_RATE_HEIGHT, (
     "honesty-curve rate factor); spacing only needs to satisfy the "
     "operator upgrade cutover window since the wire-format and "
     "slashing-curve subsystems are disjoint"
+)
+assert REVOKE_TX_WINDOW_HEIGHT > COMMUNITY_ID_HEIGHT, (
+    "REVOKE_TX_WINDOW_HEIGHT must follow COMMUNITY_ID_HEIGHT — Tier 26 "
+    "rides above the highest established fork (Tier 25 community-id) "
+    "with the standard runway buffer.  Pre-activation, legacy "
+    "un-windowed revoke txs are accepted as before; at/above, the "
+    "wire format requires the [valid_from, valid_to] window."
+)
+assert REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS > 0, (
+    "REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS must be positive — a zero "
+    "default makes valid_from_height == valid_to_height, which is a "
+    "single-block window that almost certainly does not include the "
+    "broadcast height; a defaulted revoke would then never validate"
 )
 assert MAX_COMMUNITY_ID_LEN >= 1 and MAX_COMMUNITY_ID_LEN <= 255, (
     "MAX_COMMUNITY_ID_LEN must fit in a u8 length byte and allow at "
@@ -4284,6 +4346,7 @@ for _fork_name, _fork_height in (
     ("VOTER_REWARD_HEIGHT", VOTER_REWARD_HEIGHT),
     ("HONESTY_CURVE_HEIGHT", HONESTY_CURVE_HEIGHT),
     ("COMMUNITY_ID_HEIGHT", COMMUNITY_ID_HEIGHT),
+    ("REVOKE_TX_WINDOW_HEIGHT", REVOKE_TX_WINDOW_HEIGHT),
 ):
     assert _fork_height < _BEH, (
         f"{_fork_name} ({_fork_height}) must activate before "
