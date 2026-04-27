@@ -7977,7 +7977,24 @@ class Blockchain:
             gtx, self.public_keys[sender], current_height=self.height + 1,
         ):
             return False, "Invalid signature or fields"
-        if not self.supply.can_afford_fee(sender, gtx.fee):
+        # Tier 22: post-fork proposal admission requires the proposer
+        # to also cover VOTER_REWARD_SURCHARGE on top of the regular
+        # tx fee.  Validation enforces affordability for fee +
+        # surcharge so apply-time can trust the surcharge debit will
+        # succeed.  Vote txs and treasury-spend txs are unchanged
+        # (only ProposalTransaction carries the surcharge).
+        from messagechain.config import (
+            VOTER_REWARD_HEIGHT,
+            VOTER_REWARD_SURCHARGE,
+        )
+        next_height = self.height + 1
+        required = gtx.fee
+        if (
+            isinstance(gtx, ProposalTransaction)
+            and next_height >= VOTER_REWARD_HEIGHT
+        ):
+            required += VOTER_REWARD_SURCHARGE
+        if not self.supply.can_afford_fee(sender, required):
             return False, (
                 f"Insufficient balance for fee {gtx.fee} "
                 f"from sender {sender.hex()[:16]}"
@@ -10131,12 +10148,24 @@ class Blockchain:
             ProposalTransaction, VoteTransaction,
             TreasurySpendTransaction,
         )
-        from messagechain.config import GOVERNANCE_VOTING_WINDOW
+        from messagechain.config import (
+            GOVERNANCE_VOTING_WINDOW,
+            VOTER_REWARD_HEIGHT,
+            VOTER_REWARD_SURCHARGE,
+        )
 
         tracker = self.governance
         current_block = block.header.block_number
         proposer_id = block.header.proposer_id
         current_base_fee = self.supply.base_fee
+        # Tier 22: post-fork proposals carry a surcharge that escrows
+        # into a per-proposal voter-reward pool.  Pre-fork the
+        # surcharge is 0 so add_proposal stores voter_reward_pool=0
+        # exactly as before — historical replay is byte-identical.
+        voter_reward_active = current_block >= VOTER_REWARD_HEIGHT
+        proposal_surcharge = (
+            VOTER_REWARD_SURCHARGE if voter_reward_active else 0
+        )
 
         # Phase 1: register
         for gtx in block.governance_txs:
@@ -10148,8 +10177,29 @@ class Blockchain:
                         f"Governance proposal fee payment failed — skipping"
                     )
                     continue
+                # Tier 22: debit the voter-reward surcharge from the
+                # proposer's balance and escrow it on the proposal
+                # state.  No mint/burn here — the tokens stay in
+                # circulation, just sequestered until close.  Skip if
+                # the proposer can't afford it (validation should
+                # have rejected the tx in this case, but be defensive
+                # for replay paths that hit a partially-debited
+                # balance — better to skip the surcharge than to
+                # underflow).
+                escrow = 0
+                if proposal_surcharge > 0:
+                    if self.supply.get_balance(gtx.proposer_id) >= proposal_surcharge:
+                        self.supply.balances[gtx.proposer_id] -= proposal_surcharge
+                        escrow = proposal_surcharge
+                    else:
+                        logger.error(
+                            "Voter-reward surcharge debit failed — "
+                            "proposer balance insufficient post-fee; "
+                            "proposal escrows zero pool"
+                        )
                 tracker.add_proposal(
                     gtx, block_height=current_block, supply_tracker=self.supply,
+                    voter_reward_pool=escrow,
                 )
                 self._bump_watermark(gtx.proposer_id, gtx.signature.leaf_index)
             elif isinstance(gtx, VoteTransaction):
@@ -10181,6 +10231,22 @@ class Blockchain:
             tracker.execute_treasury_spend(
                 state.proposal, self.supply, current_block=current_block,
                 is_new_account=self._recipient_is_new,
+            )
+
+        # Phase 2.5: Tier 22 — finalize voter rewards for any proposal
+        # closing this block.  Distribute the per-proposal escrow
+        # pro-rata to live-stake yes-voters on pass, or burn the pool
+        # on fail.  Iterated in deterministic proposal_id order so
+        # state mutations are reproducible across nodes.  Pre-fork
+        # proposals carry voter_reward_pool == 0 and finalize is a
+        # no-op for them — historical replay is byte-identical.
+        closing = sorted(
+            pid for pid, state in tracker.proposals.items()
+            if current_block - state.created_at_block > GOVERNANCE_VOTING_WINDOW
+        )
+        for pid in closing:
+            tracker.finalize_voter_rewards(
+                pid, self.supply, current_block=current_block,
             )
 
         # Phase 3: prune
