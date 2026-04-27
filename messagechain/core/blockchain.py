@@ -339,6 +339,15 @@ class Blockchain:
         # bumps the offender's count by 1).  Pre-fork the counter is
         # still maintained so post-fork severity has a populated
         # history to read from at activation height.
+        #
+        # Mirrored to chaindb's `slash_offense_counts` table via the
+        # `_bump_slash_offense_count` chokepoint (mirror of the
+        # reputation pattern).  Without persistence, a cold-booted
+        # node starts with an empty map post-HONESTY_CURVE_RATE_HEIGHT
+        # and grades slash severity differently than uprestarted peers
+        # → state_root diverges → chain split.  Direct writes to
+        # `self.slash_offense_counts[eid]` would skip the mirror;
+        # always go through the chokepoint.
         self.slash_offense_counts: dict[bytes, int] = {}
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
@@ -841,6 +850,25 @@ class Blockchain:
         # legacy chain.db files (pre-reputation-table) loadable.
         if hasattr(self.db, "get_all_reputation"):
             self.reputation = self.db.get_all_reputation()
+        # Rehydrate the per-validator slash-offense counter (Tier 23/24
+        # honesty curve).  Consensus-visible post-HONESTY_CURVE_RATE_HEIGHT:
+        # `slashing_severity` reads `slash_offense_counts.get(offender, 0)`
+        # to grade severity (UNAMBIGUOUS repeat ⇒ 100%, AMBIGUOUS repeat
+        # escalates linearly), AND the Tier 24 rate factor erodes
+        # `track_record` proportionally to priors.  Without this rehydrate,
+        # a cold-booted node starts with an empty map -- grades the next
+        # slash differently than uprestarted peers, `supply.staked[offender]`
+        # diverges, state_root diverges, chain split.  Even pre-fork the
+        # counter is consulted (counter is always maintained as derived
+        # state); rehydrating unconditionally keeps the dict in lockstep
+        # with the on-disk reflection of the same slash-tx stream.
+        # `hasattr` gate keeps legacy chain.db files (pre-table) loadable
+        # under the new binary -- the missing-method case loads an empty
+        # dict, matching the pre-fix behavior on those chains.
+        if hasattr(self.db, "get_all_slash_offense_counts"):
+            self.slash_offense_counts = (
+                self.db.get_all_slash_offense_counts() or {}
+            )
         # Rehydrate the finalization-stall counter.  Consensus-visible:
         # `_apply_block_state` reads it to decide whether to fire the
         # inactivity leak AND scales the per-validator burn
@@ -1921,6 +1949,31 @@ class Blockchain:
                 self.db.set_reaction_choice(
                     voter, target, bool(tu), choice,
                 )
+
+        # v22: per-validator slash-offense counter (Tier 23/24
+        # honesty curve).  MUST be installed -- pre-fix the empty
+        # default would give a state-synced node post-
+        # HONESTY_CURVE_RATE_HEIGHT a different `slash_pct` on the
+        # next slash tx than warm nodes (different `slashing_severity`
+        # input ⇒ different burn ⇒ diverged `supply.staked` ⇒
+        # state_root mismatch ⇒ silent fork).  Mirror each entry into
+        # chaindb's `slash_offense_counts` table so a subsequent cold
+        # restart on this node rehydrates from disk rather than re-
+        # installing through the snapshot path.
+        self.slash_offense_counts = {}
+        for eid, count in snap.get("slash_offense_counts", {}).items():
+            count = int(count)
+            if count <= 0:
+                # Defensive: a zero-count row is semantically equivalent
+                # to absence; skip both the in-memory install and the
+                # mirror to keep the table small and the dict free of
+                # noise entries.
+                continue
+            self.slash_offense_counts[bytes(eid)] = count
+            if self.db is not None and hasattr(
+                self.db, "set_slash_offense_count",
+            ):
+                self.db.set_slash_offense_count(bytes(eid), count)
 
         # Bogus-rejection processor: install processed set from snapshot.
         # No pending counterpart — apply-time decision.
@@ -3037,6 +3090,32 @@ class Blockchain:
         if self.db is not None and hasattr(self.db, "clear_reputation"):
             self.db.clear_reputation(entity_id)
 
+    def _bump_slash_offense_count(
+        self, entity_id: bytes, delta: int = 1,
+    ) -> int:
+        """Increment an entity's slash-offense counter, DB-mirrored.
+
+        Single chokepoint for every successful-slash +1 so the
+        in-memory dict and the chaindb `slash_offense_counts` table
+        never drift.  A direct ``self.slash_offense_counts[eid] += 1``
+        would bypass the mirror and silently reintroduce the cold-
+        restart divergence the table closes -- post-
+        HONESTY_CURVE_RATE_HEIGHT, that divergence forks the chain on
+        the next slash tx (different ``slashing_severity`` →
+        different ``slash_pct`` → different ``supply.staked[offender]``
+        → state_root mismatch).  Mirrors `_bump_reputation`.
+
+        Returns the new count (post-increment) so callers can branch
+        on it if needed.
+        """
+        new = self.slash_offense_counts.get(entity_id, 0) + delta
+        self.slash_offense_counts[entity_id] = new
+        if self.db is not None and hasattr(
+            self.db, "set_slash_offense_count",
+        ):
+            self.db.set_slash_offense_count(entity_id, new)
+        return new
+
     def _set_finalization_stall_counter(self, value: int) -> None:
         """Set `self.blocks_since_last_finalization`, DB-mirrored.
 
@@ -3441,9 +3520,12 @@ class Blockchain:
         # was burned).  No slashed_validators entry (no permaban).
         if slash_pct == 0:
             self._processed_evidence.add(tx.evidence.evidence_hash)
-            self.slash_offense_counts[tx.evidence.offender_id] = (
-                self.slash_offense_counts.get(tx.evidence.offender_id, 0) + 1
-            )
+            # Route through the chokepoint so the chaindb mirror picks
+            # up the bump -- a cold restart between this amnesty and
+            # the next AMBIGUOUS incident must NOT re-grant the free
+            # pass that was already used here.  See
+            # `_bump_slash_offense_count` docstring.
+            self._bump_slash_offense_count(tx.evidence.offender_id)
             logger.info(
                 f"SLASH-AMNESTIED validator "
                 f"{tx.evidence.offender_id.hex()[:16]}: "
@@ -3475,9 +3557,10 @@ class Blockchain:
         # slash against this offender grades higher on the curve.
         # Bumped regardless of fork height — pre-fork the counter is
         # populated as derived state, post-fork it shapes severity.
-        self.slash_offense_counts[tx.evidence.offender_id] = (
-            self.slash_offense_counts.get(tx.evidence.offender_id, 0) + 1
-        )
+        # Routed through the chokepoint so the chaindb mirror picks
+        # up the bump and a cold restart sees the same count as
+        # uprestarted peers.
+        self._bump_slash_offense_count(tx.evidence.offender_id)
         if slash_pct == 100:
             # Pre-Tier 19 path: full burn + permanent ban.  The slashed
             # validator set is consensus state — adding the offender
@@ -9374,9 +9457,10 @@ class Blockchain:
                 stx.submitter_id,
                 slash_pct=stx_slash_pct,
             )
-            self.slash_offense_counts[stx.evidence.offender_id] = (
-                self.slash_offense_counts.get(stx.evidence.offender_id, 0) + 1
-            )
+            # Route through the chokepoint so the chaindb mirror picks
+            # up the bump.  Same cold-restart determinism reasoning as
+            # the apply_slash_transaction site above.
+            self._bump_slash_offense_count(stx.evidence.offender_id)
             if stx_slash_pct == 100:
                 self.slashed_validators.add(stx.evidence.offender_id)
                 # Reputation reset: same policy as
@@ -11824,6 +11908,17 @@ class Blockchain:
             # will disagree on later lottery winners -> different balance
             # state -> consensus fork.
             "reputation": dict(self.reputation),
+            # Slash-offense counter (Tier 23/24 honesty curve) drives
+            # `slashing_severity` for every subsequent slash decision.
+            # A reorg that rolls past a slash-tx block must roll back
+            # the +1 the apply path recorded, or post-reorg
+            # `slashing_severity` would grade the next offense against
+            # a phantom prior the canonical chain never observed --
+            # different `slash_pct` → diverged `supply.staked` →
+            # state_root mismatch → silent fork.  Same defect class as
+            # the reputation snapshot above; mirrors the chaindb
+            # save/restore symmetry added in this fork.
+            "slash_offense_counts": dict(self.slash_offense_counts),
             # Entity-index assignments are chain-local.  A reorged-out block
             # that registered a new entity must also roll back that
             # registration; otherwise _next_entity_index races ahead of what
@@ -12022,6 +12117,14 @@ class Blockchain:
         # to empty so pre-field snapshots from older chain.db files still
         # round-trip.
         self.reputation = dict(snapshot.get("reputation", {}))
+        # Slash-offense counter (Tier 23/24) -- rolls back with the
+        # supply state because the slash-apply path mutated both in
+        # lockstep.  Default to empty so pre-field snapshots restore
+        # cleanly (matches a freshly-initialised Blockchain).  See the
+        # take-snapshot comment for the fork rationale.
+        self.slash_offense_counts = dict(
+            snapshot.get("slash_offense_counts", {}),
+        )
         # Entity-index registry is chain-local bookkeeping; a reorg that
         # removed the block that allocated an index must also reclaim
         # that slot.  Rebuild the reverse map from the restored forward

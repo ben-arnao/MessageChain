@@ -155,8 +155,14 @@ class TestStateSnapshotIncludesReactionChoices(unittest.TestCase):
     `_install_state_snapshot` populates `self.reaction_state` from
     it AND mirrors entries to chaindb."""
 
-    def test_version_bumped_to_21(self):
-        self.assertEqual(
+    def test_version_bumped_to_at_least_21(self):
+        # Original assertion was equality with 21 (the version bump
+        # this fix introduced).  A subsequent audit fix bumped to 22
+        # to add slash_offense_counts; the property this test pins is
+        # "v21 or later carries reaction_choices in the wire format
+        # and snapshot root", so a >= check captures the same intent
+        # without re-breaking on every future field bump.
+        self.assertGreaterEqual(
             STATE_SNAPSHOT_VERSION, 21,
             "Round-12 fix bumps STATE_SNAPSHOT_VERSION 20 -> 21 to "
             "carry reaction_choices in the wire format and snapshot "

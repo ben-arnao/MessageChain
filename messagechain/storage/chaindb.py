@@ -615,6 +615,31 @@ class ChainDB:
                 count INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Tier 23 / Tier 24 honesty-curve repeat-offense counter.
+            -- Per-validator count of successfully-applied slashes.  Read
+            -- by `slashing_severity` to grade severity for the next
+            -- offense — a repeat offender is slashed harder than a
+            -- first-timer (UNAMBIGUOUS repeat ⇒ 100%; AMBIGUOUS repeat
+            -- escalates linearly).  The Tier 24 perfect-record amnesty
+            -- ALSO bumps the counter (single-shot: the next AMBIGUOUS
+            -- incident sees prior=1 and falls back to standard
+            -- severity).  Consensus-critical post-HONESTY_CURVE_RATE_HEIGHT:
+            -- without persistence, a cold-booted node starts with an
+            -- empty map, `slashing_severity` returns different
+            -- `slash_pct` than uprestarted peers on the next slash tx,
+            -- and `supply.staked[offender]` diverges → state_root
+            -- diverges → chain split.  `CREATE TABLE IF NOT EXISTS` is
+            -- the migration path: a v3 chain.db opened under a
+            -- newer binary auto-creates the empty table and starts
+            -- accumulating counts going forward.  Pre-existing chains
+            -- that have already applied slashes will rebuild the
+            -- counter on first replay (counter is derived state — every
+            -- successful `apply_slash_transaction` increments it).
+            CREATE TABLE IF NOT EXISTS slash_offense_counts (
+                entity_id BLOB PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS message_counts (
                 entity_id BLOB PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0
@@ -1488,6 +1513,51 @@ class ChainDB:
         )
         return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
 
+    # ── State: Slash Offense Counts (Tier 23/24 honesty curve) ───
+    # Per-validator slash-applied counter driving the
+    # `slashing_severity` repeat-offense escalation + Tier 24 rate
+    # erosion.  Must mirror `Blockchain.slash_offense_counts` in
+    # lockstep: every increment in `apply_slash_transaction` (and
+    # the inclusion-list-violation slash path) routes through here
+    # via `_bump_slash_offense_count` when a db handle is attached.
+    # On cold start `_load_from_db` rehydrates the full dict via
+    # `get_all_slash_offense_counts()` -- without this, the
+    # restarted peer starts empty, `slashing_severity` returns a
+    # different slash_pct on the next slash tx vs. uprestarted
+    # peers, and `supply.staked[offender]` diverges → state_root
+    # diverges → chain split.  Mirror of the reputation pattern
+    # immediately above.
+
+    def set_slash_offense_count(
+        self, entity_id: bytes, count: int,
+    ) -> None:
+        """Upsert the slash-offense counter for an entity."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO slash_offense_counts "
+            "(entity_id, count) VALUES (?, ?)",
+            (entity_id, int(count)),
+        )
+        self._maybe_commit()
+
+    def clear_slash_offense_count(self, entity_id: bytes) -> None:
+        """Delete the slash-offense row for an entity.
+
+        Used by the reorg-rollback path when a slash tx that bumped
+        the counter ends up on a discarded fork.
+        """
+        self._conn.execute(
+            "DELETE FROM slash_offense_counts WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_slash_offense_counts(self) -> dict[bytes, int]:
+        """Rehydrate the full slash-offense map on cold start."""
+        cur = self._conn.execute(
+            "SELECT entity_id, count FROM slash_offense_counts",
+        )
+        return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
+
     # ── State: Entity Index Registry (bloat reduction) ──────────
 
     def set_entity_index(self, entity_id: bytes, entity_index: int):
@@ -2156,6 +2226,14 @@ class ChainDB:
             # past attestations must restore the pre-reorg counts
             # so the post-reorg replay converges on the same winner.
             "reputation": self.get_all_reputation(),
+            # slash_offense_counts mirror table (Tier 23/24 honesty
+            # curve).  Must round-trip with supply state because the
+            # severity grading at slash-apply time reads this map; a
+            # reorg that rolls past a slash-tx block must restore the
+            # pre-reorg counts so post-reorg replay computes the
+            # identical slash_pct on the canonical chain.  Same defect
+            # class as the reputation mirror above.
+            "slash_offense_counts": self.get_all_slash_offense_counts(),
             # Per-block pinned stake snapshots used as the 2/3
             # finality denominator.  Must round-trip with supply
             # state: a reorg that rolls past any block whose stake
@@ -2265,6 +2343,14 @@ class ChainDB:
             # back with them so the post-reorg replay rebuilds from
             # the ancestor's state, not the losing fork's.
             conn.execute("DELETE FROM reputation")
+            # slash_offense_counts mirrors slash-tx applications.
+            # Same reorg-safety reasoning as reputation: a slash-tx
+            # block on the losing fork must NOT leave a stale +1
+            # row on disk, or post-reorg `slashing_severity` calls
+            # would grade the next offense against a phantom prior
+            # the canonical chain never observed.  Same defect class
+            # as the reputation / receipt-subtree-roots mirror leaks.
+            conn.execute("DELETE FROM slash_offense_counts")
             # stake_snapshots pin the 2/3 finality denominator at
             # each block's apply -- must roll back with the blocks
             # themselves so post-reorg replay repopulates pins
@@ -2362,6 +2448,17 @@ class ChainDB:
                 conn.execute(
                     "INSERT INTO reputation (entity_id, count) "
                     "VALUES (?, ?)",
+                    (eid, int(count)),
+                )
+            # slash_offense_counts re-insert -- mirrors the reputation
+            # block immediately above.  See save_state_snapshot for the
+            # round-trip rationale.
+            for eid, count in snapshot.get(
+                "slash_offense_counts", {},
+            ).items():
+                conn.execute(
+                    "INSERT INTO slash_offense_counts "
+                    "(entity_id, count) VALUES (?, ?)",
                     (eid, int(count)),
                 )
             for block_number, stake_map in snapshot.get(

@@ -297,7 +297,29 @@ from messagechain.crypto.hashing import default_hash
 #              u8 target_is_user || u8 choice
 #      Mirrored into chaindb's `reaction_choices` table at install
 #      time so cold restart on the synced node rehydrates from disk.
-STATE_SNAPSHOT_VERSION = 21  # wire format version for encode/decode
+#  v22 — slash_offense_counts added.  bytes->int dict mapping
+#      validator entity_id to the count of successfully-applied
+#      slashes (Tier 23/24 honesty-curve).  Read by
+#      `slashing_severity` to grade severity for the next offense.
+#      Pre-v22 the snapshot had ZERO coverage of this dict --
+#      pre-HONESTY_CURVE_RATE_HEIGHT (=5000) the in-memory dict was
+#      effectively empty everywhere across restarts (because no
+#      persistence layer either, see the audit fix that landed this
+#      version), so a v21 snapshot taken pre-fork always reproduced
+#      a non-divergent state when restored under v22 with an empty
+#      counts dict.  Post-fork the absence is consensus-fatal: two
+#      state-synced nodes that disagree on this map compute different
+#      `slash_pct` on the next slash tx and silently fork at the
+#      slash block.  Wire layout: appended after v21's
+#      reaction_choices section -- u32 entry_count followed by N
+#      sorted (u32 eid_len || eid || u64 count) records.  Mirrored
+#      into chaindb's `slash_offense_counts` table at install time
+#      so cold restart on the synced node rehydrates from disk.
+#      `deserialize_state` defaults the field to {} so older v21
+#      hand-built dicts decode gracefully (graceful-degrade for
+#      pre-fork snapshots; binary decode of a v21 blob is rejected
+#      by the strict version check anyway).
+STATE_SNAPSHOT_VERSION = 22  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -389,6 +411,20 @@ _TAG_KEY_HISTORY = b"khist"
 # snapshot didn't carry it at all -- state-sync was unreachable
 # post-activation.  Round-12 fix.
 _TAG_REACTION_CHOICES = b"react"
+# v22: slash_offense_counts -- bytes->int dict mapping validator
+# entity_id to the count of successfully-applied slashes (Tier 23/24
+# honesty curve).  `slashing_severity` reads this to grade severity
+# for the next offense (UNAMBIGUOUS repeat ⇒ 100%, AMBIGUOUS repeat
+# escalates linearly), AND the Tier 24 rate factor erodes
+# `track_record` proportionally to priors.  MUST participate in the
+# snapshot root post-HONESTY_CURVE_RATE_HEIGHT: two state-synced
+# nodes that disagreed on this map compute different `slash_pct`
+# on the next slash tx → diverged `supply.staked[offender]` →
+# state_root mismatch → silent fork.  Pre-v22 the snapshot had ZERO
+# coverage of this dict; the audit fix that bumped the wire version
+# also added the chaindb mirror so cold restart no longer empties
+# the map.  See STATE_SNAPSHOT_VERSION header comment on v22.
+_TAG_SLASH_OFFENSE_COUNTS = b"slcnt"
 # Processed bogus-rejection-evidence set: every evidence_hash that has
 # ever been applied (slashed OR admitted-no-slash).  One-phase, no
 # pending counterpart — bogusness is decided at apply-time so there
@@ -780,6 +816,15 @@ def serialize_state(blockchain) -> dict:
                 {},
             ).items()
         },
+        # v22: per-validator slash-offense counter (Tier 23/24
+        # honesty curve).  MUST be in the snapshot or a state-
+        # synced node post-HONESTY_CURVE_RATE_HEIGHT computes a
+        # different `slash_pct` on the next slash tx than warm
+        # nodes -- silent fork at the slash block.  See
+        # _TAG_SLASH_OFFENSE_COUNTS docstring.
+        "slash_offense_counts": dict(
+            getattr(blockchain, "slash_offense_counts", {}),
+        ),
     }
 
 
@@ -1058,6 +1103,22 @@ def deserialize_state(snapshot: dict) -> dict:
     # strictly so the default only affects hand-built snapshot
     # dicts.
     out.setdefault("reaction_choices", {})
+    # Pre-v22 snapshots lack the slash_offense_counts map.  Graceful-
+    # degrade: a v21 hand-built dict (or any pre-v22 in-memory
+    # snapshot) decodes with an empty counter.  Pre-
+    # HONESTY_CURVE_RATE_HEIGHT (=5000) the in-memory dict was
+    # effectively empty everywhere across restarts (the audit fix
+    # that bumped to v22 also landed the chaindb persistence layer),
+    # so an empty restore reproduces the pre-fix behavior on a
+    # pre-fork chain.  Live upgrades from v21 to v22 at the
+    # snapshot layer should re-bake snapshots so historical slashes
+    # carry forward; in-place upgrades that re-decode a historical
+    # v21 blob will lose the field (which is fine pre-fork --
+    # there were no slash counts anyway -- and consensus-relevant
+    # only post-fork, where every node should be on v22).  Binary
+    # decode populates this strictly so the default only affects
+    # hand-built snapshot dicts.
+    out.setdefault("slash_offense_counts", {})
     return out
 
 
@@ -1369,6 +1430,14 @@ def compute_state_root(snapshot: dict) -> bytes:
         _TAG_REACTION_CHOICES: _merkle(_reaction_choices_leaves(
             _TAG_REACTION_CHOICES,
             snap.get("reaction_choices", {}))),
+        # v22: per-validator slash-offense counter.  Drives
+        # `slashing_severity` post-HONESTY_CURVE_RATE_HEIGHT -- two
+        # state-synced nodes that disagreed on this map would
+        # compute different `slash_pct` on the next slash tx and
+        # silently fork.  See _TAG_SLASH_OFFENSE_COUNTS docstring.
+        _TAG_SLASH_OFFENSE_COUNTS: _merkle(_entries_for_section(
+            _TAG_SLASH_OFFENSE_COUNTS,
+            snap.get("slash_offense_counts", {}))),
         # Bogus-rejection processed set — the double-slash defense.
         # One section, no pending counterpart (apply-time decision).
         _TAG_BOGUS_REJECTION_PROCESSED: _merkle(_entries_for_section(
@@ -2105,6 +2174,17 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_reaction_choices(
         snap.get("reaction_choices", {}),
     )
+    # v22: slash_offense_counts (bytes->int dict).  Strictly appended
+    # after v21's reaction_choices so a v21 blob is a strict prefix
+    # of a v22 blob through the end of v21's final field.  See
+    # _TAG_SLASH_OFFENSE_COUNTS for why this must live in the state-
+    # root commitment -- without it, a state-synced node post-
+    # HONESTY_CURVE_RATE_HEIGHT computes a different `slash_pct` on
+    # the next slash tx than warm nodes, silently forking at the
+    # slash block.
+    out += _encode_bytes_int_dict(
+        snap.get("slash_offense_counts", {}),
+    )
     return bytes(out)
 
 
@@ -2242,6 +2322,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # target_is_user), choice]).  Always present on v21+ blobs;
     # pre-v21 blobs are rejected by the strict version check above.
     reaction_choices, off = _decode_reaction_choices(blob, off)
+    # v22+: slash_offense_counts (bytes->int dict).  Always present
+    # on v22+ blobs; pre-v22 blobs are rejected by the strict
+    # version check above.
+    slash_offense_counts, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -2297,4 +2381,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "past_receipt_subtree_roots": past_receipt_subtree_roots,
         "key_history": key_history,
         "reaction_choices": reaction_choices,
+        "slash_offense_counts": slash_offense_counts,
     }
