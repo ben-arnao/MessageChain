@@ -4527,6 +4527,64 @@ assert (
     "runway buffer so callers between the two heights see the legacy "
     "fixed-target committee path."
 )
+# ─── Tier 37: forced-inclusion entity-cap excuse no longer accepts a
+# same-entity lower-fpb fill ──────────────────────────────────────────
+# Tier 34 wired the forced-inclusion gate into multi-list mode and
+# anchored excuse #3 ("entity already at MAX_TXS_PER_ENTITY_PER_BLOCK")
+# against `entity_counts` built from every block tx-list field.  That
+# count, however, included every same-entity tx the proposer chose to
+# include — even at LOWER fee-per-byte than the forced tx itself.  A
+# colluding proposer with multiple pending lower-fpb txs from a single
+# victim entity at sequential nonces could then:
+#
+#   1. Include the lower-fpb txs (filling MAX_TXS_PER_ENTITY_PER_BLOCK).
+#   2. Omit the higher-fpb forced tx of the same entity.
+#   3. Have the gate (correctly per the Tier 34 rule, incorrectly per
+#      the broader anchor) accept the block under excuse #3.
+#
+# Because nonces must be sequential the forced tx IS the next nonce
+# after the fill — it always fits structurally.  The cap was therefore
+# an artifact of the proposer's own selection, not a real reason to
+# skip.  The slashing risk on the inclusion-list-abuse surface
+# collapsed to zero, breaking the CLAUDE.md anchor: "a tx that is well-
+# formed, pays at least the per-byte floor, and fits the byte budget
+# cannot be suppressed by anything weaker than a full validator-set
+# majority actively colluding AND willing to absorb the slashing risk
+# that exposed collusion produces."
+#
+# Tier 37 tightens excuse #3: when computing the cap for a forced tx,
+# same-entity block txs whose fee-per-byte is STRICTLY LOWER than the
+# forced tx's fee-per-byte do NOT count toward the cap.  Equivalent
+# phrasing: the cap binds only on same-entity block txs the proposer
+# could not have replaced with the forced tx without lowering revenue
+# density — anything LESS-dense than the forced tx is the proposer's
+# own selection artifact.  Honest full-quota cases (where same-entity
+# block txs are at >= the forced tx's fpb) still excuse correctly:
+# in that case the proposer maximized density honestly and the forced
+# tx is the one that legitimately gets bumped.
+#
+# Pre-activation: legacy excuse #3 preserved byte-for-byte for replay
+# determinism.  Post-activation: same-entity lower-fpb fill is no
+# longer a valid excuse; the gate flags the omission as censorship.
+FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT = 800  # Tier 37
+assert (
+    FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT
+    > ATTESTER_DYNAMIC_COMMITTEE_HEIGHT
+), (
+    "FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT must follow Tier 36 — Tier "
+    "37 rides on top of the most recent established fork with the "
+    "standard runway buffer so callers between the two heights see "
+    "the legacy excuse-#3 path."
+)
+assert (
+    FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT
+    > FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
+), (
+    "FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT must follow Tier 34 — the "
+    "cap-fix tightens the excuse on the multi-list gate; that gate "
+    "must already be live by the time the new rule activates so the "
+    "entity-count tally Tier 37 reads is the multi-list shape."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "

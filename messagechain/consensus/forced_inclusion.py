@@ -74,6 +74,7 @@ from typing import Callable, Optional
 
 from messagechain.config import (
     FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT,
+    FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT,
     MAX_BLOCK_MESSAGE_BYTES,
     MAX_TXS_PER_BLOCK,
     MAX_TXS_PER_ENTITY_PER_BLOCK,
@@ -110,6 +111,31 @@ def _iter_all_block_txs(block):
     for attr in _BLOCK_TX_LIST_ATTRS:
         for tx in getattr(block, attr, None) or ():
             yield tx
+
+
+def _is_strictly_lower_fpb(other_tx, ref_tx) -> bool:
+    """True iff `other_tx`'s fee-per-stored-byte is STRICTLY LESS than
+    `ref_tx`'s.
+
+    Used by the Tier 37 entity-cap fix to decide whether a same-entity
+    block tx counts toward the cap when evaluating excuse #3 for a
+    forced tx.  A same-entity block tx at strictly lower fpb than the
+    forced tx is a proposer-selection artifact (the proposer chose a
+    LESS dense tx over the forced one of the same entity), not a real
+    structural reason to skip — those txs do NOT count toward the cap.
+
+    Comparison is done as an integer cross-multiplication
+    (`a/b < c/d` iff `a*d < c*b` when b, d > 0) so the consensus path
+    has no float dependency.  Stored bytes are pinned to >= 1 by
+    `_stored_bytes_of`'s fallback so the denominators are always
+    positive.
+    """
+    other_bytes = max(1, _stored_bytes_of(other_tx))
+    ref_bytes = max(1, _stored_bytes_of(ref_tx))
+    other_fee = getattr(other_tx, "fee", 0) or 0
+    ref_fee = getattr(ref_tx, "fee", 0) or 0
+    # other.fpb < ref.fpb  ⇔  other_fee * ref_bytes < ref_fee * other_bytes
+    return other_fee * ref_bytes < ref_fee * other_bytes
 
 
 def _stored_bytes_of(tx) -> int:
@@ -180,6 +206,13 @@ def check_forced_inclusion(
     use_multi_list = (
         int(current_block_height) >= FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
     )
+    # Tier 37: tighten excuse #3 so a colluding proposer cannot fill
+    # the per-entity cap with same-entity LOWER-fpb txs and excuse a
+    # higher-fpb forced tx of the same entity.  Pre-activation: legacy
+    # excuse-#3 logic preserved byte-for-byte for replay determinism.
+    apply_entity_cap_fix = (
+        int(current_block_height) >= FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT
+    )
 
     if not use_multi_list:
         # Pre-Tier-34: the gate was MessageTransaction-only by design
@@ -198,6 +231,12 @@ def check_forced_inclusion(
         if not forced:
             return True, "no forced-inclusion duty"
 
+    # `entity_block_txs` is populated only when the Tier 37 cap-fix is
+    # active — pre-fork the legacy `entity_counts` int tally is enough
+    # and we avoid the extra per-entity list to keep replay byte-
+    # identical (same dict shape, same iteration order, no new objects
+    # touched on the consensus path).
+    entity_block_txs: dict[bytes, list] = {}
     if use_multi_list:
         # Tier 34: walk every known block tx-list field so a forced tx
         # placed in its correct slot (e.g. a TransferTransaction in
@@ -218,6 +257,8 @@ def check_forced_inclusion(
             )
             if eid is not None:
                 entity_counts[eid] = entity_counts.get(eid, 0) + 1
+                if apply_entity_cap_fix:
+                    entity_block_txs.setdefault(eid, []).append(tx)
     else:
         # Pre-Tier-34: legacy message-only path.  Byte-identical to
         # historical attester behavior so any block accepted under
@@ -256,12 +297,28 @@ def check_forced_inclusion(
             getattr(ftx, "entity_id", None)
             or getattr(ftx, "voter_id", None)
         )
-        if (
-            ftx_eid is not None
-            and entity_counts.get(ftx_eid, 0)
-            >= MAX_TXS_PER_ENTITY_PER_BLOCK
-        ):
-            continue
+        if ftx_eid is not None:
+            if apply_entity_cap_fix:
+                # Tier 37: only same-entity block txs at >= the forced
+                # tx's fpb count toward the cap.  Same-entity block txs
+                # at strictly lower fpb are a proposer-selection
+                # artifact (the proposer chose a less-dense tx over the
+                # forced one of the same entity) and do not legitimize
+                # the omission — those nonces fit BEHIND the forced tx
+                # structurally, so the forced tx could replace any one
+                # of them without raising the cap.
+                effective_count = sum(
+                    1
+                    for btx in entity_block_txs.get(ftx_eid, ())
+                    if not _is_strictly_lower_fpb(btx, ftx)
+                )
+                if effective_count >= MAX_TXS_PER_ENTITY_PER_BLOCK:
+                    continue
+            elif (
+                entity_counts.get(ftx_eid, 0)
+                >= MAX_TXS_PER_ENTITY_PER_BLOCK
+            ):
+                continue
 
         # Valid excuse #4: tx is no longer includable per caller-supplied
         # validity oracle (nonce mismatch, insufficient balance, etc.).
