@@ -4,6 +4,53 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.33.0] — 2026-04-28
+
+### Fixed
+- **State-root sim mirrors inclusion-list mutations.** A block carrying
+  a non-empty `inclusion_list` or any
+  `inclusion_list_violation_evidence_txs` self-rejected at the post-
+  apply state-root commitment check.  `process_inclusion_list_violation`
+  slashed stake on the apply path and
+  `_apply_inclusion_list_coverage_leak` drained stake from coverage-
+  divergent attesters, but neither mutation was mirrored in
+  `compute_post_state_root` — the proposer's committed root diverged
+  from the validator-side post-apply root and any IL-bearing block
+  errored "Invalid state_root — state commitment mismatch."  Threads
+  both fields through `propose_block`, `consensus.create_block`, and
+  the sim, with the sim mirroring the slash drain + coverage leak
+  exactly.  Active immediately (no fork — block-validity rule was
+  already broken; the fix is what makes IL-bearing blocks actually
+  acceptable).
+- **Mempool fee-per-byte ranking uses STORED bytes.** Pre-fix
+  `_fee_per_byte` divided by `len(tx.message)`, which over-stated
+  MessageTransaction density by ~50× (witness bytes invisible to the
+  comparator) and collapsed non-message kinds (Transfer, Stake,
+  Unstake, Governance, Authority, Slash, React) to absolute-fee
+  ranking via the `getattr(tx, "message", b"")` fallback.  Switches
+  to `len(tx.to_bytes())` with a per-tx_hash cache populated on
+  insert and torn down on remove.  Active immediately — node-local
+  ranking change, not consensus.
+
+### Changed
+- **Tier 30 — honest-operator insurance for soft-slash paths.**
+  CLAUDE.md anchors "honest operators are insured against accidents";
+  catastrophic burns are reserved for unambiguous, intentional
+  violations.  Two soft-slash paths violated the anchor:
+  `_apply_censorship_slash` burned a flat `CENSORSHIP_SLASH_BPS`
+  (10%) without consulting the honesty curve, and
+  `process_inclusion_list_violation` classified first offenses as
+  `Unambiguity.UNAMBIGUOUS` (50%/100% slash on a single missed
+  include — plausibly honest mempool churn).  Tier 30 routes both
+  paths through `slashing_severity` with `Unambiguity.AMBIGUOUS` on
+  first offense; subsequent offenses (read off
+  `slash_offense_counts`, persisted from Tier 24) escalate via the
+  existing curve mechanics.  Adds `OffenseKind.CENSORSHIP` to the
+  honesty-curve enum and `HONESTY_CURVE_INSURANCE_HEIGHT = 756`
+  (rides above Tier 29 with the standard runway buffer).  Pre-Tier-30
+  behavior on both paths is byte-identical to legacy for historical
+  replay determinism.
+
 ## [1.32.0] — 2026-04-28
 
 ### Changed
