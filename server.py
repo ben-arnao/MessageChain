@@ -310,27 +310,24 @@ def _hash(data: bytes) -> bytes:
 # restart.  The keypair is deterministic (same private key + tree height
 # always yields the same tree), so the cached result is safe to reuse.
 #
-# On-disk format:
-#     [4 B magic "MCKC"] [32 B HMAC-SHA3-256] [JSON payload]
-#
-# The HMAC is keyed on the validator's private key.  Any tamper — byte
-# flip, swapped file, stale format — fails authentication and the
-# cache is treated as corrupt (deleted, regenerated).  This replaced an
-# earlier pickle-based cache: pickle.load on an attacker-planted file
-# is arbitrary code execution as the validator user, the worst
-# possible blast radius for a file sitting next to hot-key material.
+# Format + HMAC encode / decode helpers live in
+# ``messagechain.identity.keypair_cache`` so the daemon and the personal-
+# wallet CLI share one on-disk shape.  Module-level aliases below preserve
+# the historical ``_keypair_cache_path`` / ``_encode_keypair_cache`` /
+# ``_decode_keypair_cache`` symbols other call sites import.
 # ---------------------------------------------------------------------------
 
 
-def _keypair_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
-    """Return the filesystem path for a cached keypair.
-
-    The filename embeds a truncated SHA3-256 digest of (private_key ||
-    tree_height) so that different keys or heights never collide, and the
-    raw private key never appears in the filename.
-    """
-    h = _hashlib.sha3_256(private_key + tree_height.to_bytes(4, "big")).hexdigest()[:16]
-    return os.path.join(data_dir, f"keypair_cache_{h}.bin")
+from messagechain.identity.keypair_cache import (
+    keypair_cache_path as _keypair_cache_path,
+    encode_keypair_cache as _encode_keypair_cache,
+    decode_keypair_cache as _decode_keypair_cache,
+    CACHE_MAGIC as _CACHE_MAGIC,
+    CACHE_FORMAT_VERSION as _CACHE_FORMAT_VERSION,
+    HMAC_SIZE as _HMAC_SIZE,
+    CACHE_HMAC_DOMAIN as _CACHE_HMAC_DOMAIN,
+    _cache_mac_key as _keypair_cache_mac_key,
+)
 
 
 def _merkle_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> str:
@@ -343,93 +340,6 @@ def _merkle_cache_path(private_key: bytes, tree_height: int, data_dir: str) -> s
     """
     h = _hashlib.sha3_256(private_key + tree_height.to_bytes(4, "big")).hexdigest()[:16]
     return os.path.join(data_dir, f"merkle_cache_{h}.bin")
-
-
-_CACHE_MAGIC = b"MCKC"  # MessageChain Keypair Cache (HMAC-authenticated)
-_CACHE_FORMAT_VERSION = 1
-_HMAC_SIZE = 32
-_CACHE_HMAC_DOMAIN = b"messagechain-keypair-cache-v1|"
-
-
-def _keypair_cache_mac_key(private_key: bytes) -> bytes:
-    """Derive the HMAC key used to authenticate the cache payload.
-
-    Domain-separated from any other use of the private key so that a
-    future reuse of the key in a different context cannot produce a
-    matching MAC.
-    """
-    return _hashlib.sha3_256(_CACHE_HMAC_DOMAIN + private_key).digest()
-
-
-def _encode_keypair_cache(
-    entity: Entity, private_key: bytes, tree_height: int
-) -> bytes:
-    payload_obj = {
-        "version": _CACHE_FORMAT_VERSION,
-        "tree_height": tree_height,
-        "public_key": entity.keypair.public_key.hex(),
-        "entity_id": entity.entity_id.hex(),
-    }
-    payload = json.dumps(
-        payload_obj, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    mac = hmac.new(
-        _keypair_cache_mac_key(private_key), payload, _hashlib.sha3_256
-    ).digest()
-    return _CACHE_MAGIC + mac + payload
-
-
-def _decode_keypair_cache(
-    data: bytes, private_key: bytes, tree_height: int
-) -> "Entity | None":
-    """Return a reconstructed Entity, or None for any malformed / unauthenticated blob.
-
-    Every rejection path returns None silently: the caller deletes the
-    file and regenerates.  No partial or differential information
-    leaks from the loader.
-    """
-    header_len = len(_CACHE_MAGIC) + _HMAC_SIZE
-    if len(data) < header_len:
-        return None
-    if not data.startswith(_CACHE_MAGIC):
-        return None
-    mac = data[len(_CACHE_MAGIC):header_len]
-    payload = data[header_len:]
-    expected = hmac.new(
-        _keypair_cache_mac_key(private_key), payload, _hashlib.sha3_256
-    ).digest()
-    if not hmac.compare_digest(mac, expected):
-        return None
-    try:
-        obj = json.loads(payload.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("version") != _CACHE_FORMAT_VERSION:
-        return None
-    if obj.get("tree_height") != tree_height:
-        return None
-    try:
-        public_key = bytes.fromhex(obj["public_key"])
-        entity_id = bytes.fromhex(obj["entity_id"])
-    except (KeyError, ValueError, TypeError):
-        return None
-    if len(public_key) != 32 or len(entity_id) != 32:
-        return None
-
-    from messagechain.identity.identity import (
-        _derive_signing_seed, derive_entity_id,
-    )
-    # Cross-check: even after the HMAC passes, the entity_id stored in
-    # the payload must match what derive_entity_id(public_key) would
-    # produce.  Cheap and catches any future format drift between the
-    # two fields.
-    if derive_entity_id(public_key) != entity_id:
-        return None
-    seed = _derive_signing_seed(private_key)
-    keypair = KeyPair._from_trusted_root(seed, tree_height, public_key)
-    return Entity(entity_id=entity_id, keypair=keypair, _seed=seed)
 
 
 def _bind_leaf_index_path(entity: Entity, data_dir: str | None) -> None:
