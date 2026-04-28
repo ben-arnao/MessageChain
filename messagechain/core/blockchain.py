@@ -12847,6 +12847,49 @@ class Blockchain:
             # carry nested dicts/sets.
             "finality": copy.deepcopy(self.finality),
             "escrow": copy.deepcopy(self._escrow),
+            # Evidence-tracking dedup state.  ``_apply_block_state``
+            # mutates these collections every time it admits a
+            # NonResponseEvidenceTx, BogusRejectionEvidenceTx, or
+            # CensorshipEvidenceTx, and every time it observes a
+            # SubmissionAck.  A block that passes structural
+            # validation but whose post-apply state_root mismatches
+            # ours rolls back via ``_restore_memory_snapshot`` —
+            # without these fields the rollback leaves the dedup
+            # state bumped, so a later honest resubmission of the
+            # same evidence is silently dropped at the dedup gate
+            # (e.g. ``non_response_evidence.py:463``) and the
+            # offender escapes slashing forever.  Same defect class
+            # as the receipt-subtree-roots / finality / escrow
+            # snapshot fields above; mirrors the security-ratchet
+            # carve-out for ``_processed_evidence`` in the docstring.
+            #
+            # The ``processed`` sets carry only ``bytes`` — shallow
+            # set() copy is sufficient (entries are immutable).
+            #
+            # ``censorship_processor.pending`` maps ``bytes`` to a
+            # mutable ``_PendingEvidence`` dataclass.  An apply path
+            # that admits a new evidence inserts a new record; an
+            # apply path that re-bases an existing entry would mutate
+            # the inner record in place.  copy.deepcopy isolates
+            # both the mapping AND the inner records so a post-
+            # snapshot mutation cannot leak through the captured copy.
+            #
+            # ``witness_ack_registry`` maps ``bytes`` to ``int`` —
+            # shallow dict() copy is sufficient (values are immutable).
+            #
+            # No-fork: snapshot/restore is purely in-memory; the
+            # chaindb mirror runs only after the state-root check
+            # passes, so historical replay is byte-identical.
+            "non_response_processed": set(
+                self.non_response_processor.processed,
+            ),
+            "bogus_rejection_processed": set(
+                self.bogus_rejection_processor.processed,
+            ),
+            "censorship_pending": copy.deepcopy(
+                self.censorship_processor.pending,
+            ),
+            "witness_ack_registry": dict(self.witness_ack_registry),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -13059,6 +13102,35 @@ class Blockchain:
             self.finality = copy.deepcopy(snapshot["finality"])
         if "escrow" in snapshot:
             self._escrow = copy.deepcopy(snapshot["escrow"])
+        # Evidence-tracking dedup state.  See the snapshot-side
+        # comment for the security rationale: a bad-state-root block
+        # whose apply mutated these collections must have those
+        # mutations reverted, otherwise a coerced validator can
+        # poison the dedup gate by crafting an evidence-bundling
+        # block with a deliberately-wrong state_root, and the
+        # offender then escapes slashing forever when an honest peer
+        # later resubmits the same evidence.  Defaults match a
+        # freshly-initialised Blockchain so older snapshots that
+        # predate these fields restore cleanly.  deepcopy on the way
+        # out so the snapshot itself is not aliased with live state —
+        # a subsequent failed reorg could otherwise mutate the stored
+        # dict through the restored reference.
+        if "non_response_processed" in snapshot:
+            self.non_response_processor.processed = set(
+                snapshot["non_response_processed"],
+            )
+        if "bogus_rejection_processed" in snapshot:
+            self.bogus_rejection_processor.processed = set(
+                snapshot["bogus_rejection_processed"],
+            )
+        if "censorship_pending" in snapshot:
+            self.censorship_processor.pending = copy.deepcopy(
+                snapshot["censorship_pending"],
+            )
+        if "witness_ack_registry" in snapshot:
+            self.witness_ack_registry = dict(
+                snapshot["witness_ack_registry"],
+            )
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
         """Return the WOTS+ Merkle tree height recorded for `entity_id`.
