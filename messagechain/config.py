@@ -4345,6 +4345,46 @@ assert HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT > CENSORSHIP_SLASH_PENDING_UNSTAK
     "soft-slash paths Tier 30 missed (witness-non-response and "
     "bogus-rejection)."
 )
+# ─── Tier 33: pending-unstake drain for non-response + bogus-rejection ──
+# Tier 31 widened the slash basis from `staked` to `(staked +
+# pending_unstakes)` for `_apply_censorship_slash` and
+# `process_inclusion_list_violation`, closing the censor-then-unstake
+# evasion: a coerced/colluding validator could censor a high-fee-per-byte
+# tx, immediately submit an unstake, and ride out the unbonding queue
+# with ≥90% of the would-be slashed stake intact (EVIDENCE_MATURITY_BLOCKS
+# is ~16 blocks ≈ 2.7h vs UNBONDING_PERIOD >14 days).
+#
+# Tier 32 routed the witness-non-response and bogus-rejection paths
+# through the honesty curve — but those two paths still drained `staked`
+# only.  Same evasion still works against silent-drop censorship and
+# bogus-REJECT_INVALID_SIG censorship: drop the witnessed submission (or
+# sign the bogus rejection), unstake, and the slash hits a tiny
+# remainder while the rest releases at unbond maturity.  Tier 33 closes
+# both, mirroring Tier 31 exactly: route the apply through
+# `burn_slash_proportional` so the slash bites both buckets
+# proportionally.  Pre-activation: legacy staked-only basis preserved
+# byte-for-byte for replay determinism.
+NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT = 762  # Tier 33
+assert (
+    NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
+    > HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT
+), (
+    "NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT must follow "
+    "HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT — Tier 33 widens the slash "
+    "basis to (staked + pending_unstakes) for the same two paths Tier "
+    "32 routed through the curve; the curve must already be live so "
+    "`sev_pct` is well-defined when Tier 33 dispatches."
+)
+assert (
+    NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
+    > CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT
+), (
+    "NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT must follow "
+    "CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT — Tier 33 is the sibling "
+    "of Tier 31 for the two slash paths Tier 31 missed; the operator "
+    "upgrade window for the pending-drain shape opens at Tier 31 and "
+    "this fork closes it for the remaining offense classes."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "

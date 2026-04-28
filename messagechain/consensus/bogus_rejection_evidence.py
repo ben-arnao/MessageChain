@@ -404,20 +404,53 @@ class BogusRejectionProcessor:
                         "fails to verify under on-chain pubkey"
                     ),
                 )
-            # Bogus rejection — apply the slash.  Pre-fork: legacy
-            # flat CENSORSHIP_SLASH_BPS path (byte-identical to
-            # historical replay).  Post-fork (Tier 30 sibling): route
-            # through the honesty curve with AMBIGUOUS classification
-            # so a long-tenured issuer's first borderline rejection
-            # (fee-rule fork-edge race, etc.) is not punished the
-            # same as deliberate forged-rejection censorship; repeat
-            # offenders escalate via slash_offense_counts.
+            # Bogus rejection — apply the slash.  Three regimes:
+            #
+            #   * Pre-Tier-32 (legacy): flat CENSORSHIP_SLASH_BPS,
+            #     drained from `staked` only.  Byte-identical to
+            #     historical replay.
+            #   * Tier 32 ≤ height < Tier 33: curve-graded severity
+            #     (so a long-tenured issuer's first borderline rejection
+            #     is not punished the same as deliberate forged
+            #     rejection), still drained from `staked` only.
+            #   * Tier 33+: curve-graded severity, drained
+            #     proportionally from `(staked + pending_unstakes)` via
+            #     `burn_slash_proportional`.  Closes the censor-then-
+            #     unstake evasion — a coerced/colluding issuer who
+            #     signs a forged REJECT_INVALID_SIG and immediately
+            #     initiates an unstake cannot ride out the unbonding
+            #     window with most of their stake intact.  Mirrors the
+            #     Tier 31 patch on `_apply_censorship_slash` /
+            #     `process_inclusion_list_violation`.
             from messagechain.config import (
-                HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T30S_H,
+                HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T32_H,
+                NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT as _T33_H,
             )
-            use_curve = int(block_height) >= _T30S_H
+            use_curve = int(block_height) >= _T32_H
+            use_pending_basis = int(block_height) >= _T33_H
             current_stake = blockchain.supply.staked.get(offender_id, 0)
-            if use_curve:
+            if use_pending_basis:
+                from messagechain.consensus.honesty_curve import (
+                    OffenseKind, Unambiguity, slashing_severity,
+                )
+                sev_pct = slashing_severity(
+                    offender_id,
+                    OffenseKind.BOGUS_REJECTION,
+                    Unambiguity.AMBIGUOUS,
+                    blockchain,
+                )
+                if sev_pct > 0:
+                    slash_amount = (
+                        blockchain.supply.burn_slash_proportional(
+                            offender_id, sev_pct,
+                        )
+                    )
+                else:
+                    # Curve amnesty: no burn, but the evidence is still
+                    # recorded and the offense counter still bumps so
+                    # the next incident escalates.
+                    slash_amount = 0
+            elif use_curve:
                 from messagechain.consensus.honesty_curve import (
                     OffenseKind, Unambiguity, slashing_severity,
                 )
@@ -428,14 +461,20 @@ class BogusRejectionProcessor:
                     blockchain,
                 )
                 slash_amount = (current_stake * sev_pct) // 100
+                if slash_amount > 0:
+                    blockchain.supply.staked[offender_id] = (
+                        current_stake - slash_amount
+                    )
+                    blockchain.supply.total_supply -= slash_amount
+                    blockchain.supply.total_burned += slash_amount
             else:
                 slash_amount = compute_slash_amount(current_stake)
-            if slash_amount > 0:
-                blockchain.supply.staked[offender_id] = (
-                    current_stake - slash_amount
-                )
-                blockchain.supply.total_supply -= slash_amount
-                blockchain.supply.total_burned += slash_amount
+                if slash_amount > 0:
+                    blockchain.supply.staked[offender_id] = (
+                        current_stake - slash_amount
+                    )
+                    blockchain.supply.total_supply -= slash_amount
+                    blockchain.supply.total_burned += slash_amount
             self.processed.add(tx.evidence_hash)
             # Post-fork: bump slash_offense_counts so the next bogus
             # rejection from the same issuer escalates via the curve.

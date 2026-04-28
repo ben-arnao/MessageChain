@@ -529,30 +529,69 @@ class NonResponseEvidenceProcessor:
                 ),
             )
 
-        # All gates passed — apply the slash.  Pre-fork: legacy flat
-        # WITNESS_NON_RESPONSE_SLASH_BPS (byte-identical to historical
-        # replay).  Post-fork: route through the honesty curve with
-        # AMBIGUOUS classification + slash_offense_counts escalation
-        # so a long-tenured operator's first transient drop does not
-        # eat a flat 5% on the same line as a deliberate silent-drop
-        # censoring node.
+        # All gates passed — apply the slash.  Three regimes:
+        #
+        #   * Pre-Tier-32 (legacy): flat WITNESS_NON_RESPONSE_SLASH_BPS,
+        #     drained from `staked` only.  Byte-identical to historical
+        #     replay.
+        #   * Tier 32 ≤ height < Tier 33: curve-graded severity (so a
+        #     long-tenured operator's first transient drop is not slashed
+        #     the same as a deliberate silent-drop), still drained from
+        #     `staked` only.
+        #   * Tier 33+: curve-graded severity, drained proportionally
+        #     from `(staked + pending_unstakes)` via
+        #     `burn_slash_proportional`.  Closes the censor-then-unstake
+        #     evasion — a coerced/colluding validator who silently drops
+        #     a witnessed submission and immediately initiates an
+        #     unstake cannot ride out the unbonding window with most of
+        #     their stake intact.  Mirrors the Tier 31 patch on
+        #     `_apply_censorship_slash` / `process_inclusion_list_violation`.
         from messagechain.config import (
-            HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T30S_H,
+            HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T32_H,
+            NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT as _T33_H,
         )
-        use_curve = int(current_height) >= _T30S_H
+        use_curve = int(current_height) >= _T32_H
+        use_pending_basis = int(current_height) >= _T33_H
         current_stake = blockchain.supply.staked.get(offender_id, 0)
-        if use_curve:
+        if use_pending_basis:
+            # Tier 33: curve-graded percent against (staked + pending).
+            from messagechain.consensus.honesty_curve import (
+                OffenseKind, Unambiguity, slashing_severity,
+            )
+            sev_pct = slashing_severity(
+                offender_id,
+                OffenseKind.WITNESS_NON_RESPONSE,
+                Unambiguity.AMBIGUOUS,
+                blockchain,
+            )
+            if sev_pct > 0:
+                slash_amount = blockchain.supply.burn_slash_proportional(
+                    offender_id, sev_pct,
+                )
+            else:
+                # Curve amnesty (perfect-record veteran on first
+                # offense): no burn, but the evidence is still recorded
+                # and the offense counter still bumps so the next
+                # incident escalates.
+                slash_amount = 0
+        elif use_curve:
             slash_amount = _compute_non_response_slash_amount_curve(
                 current_stake, offender_id, blockchain,
             )
+            if slash_amount > 0:
+                blockchain.supply.staked[offender_id] = (
+                    current_stake - slash_amount
+                )
+                blockchain.supply.total_supply -= slash_amount
+                blockchain.supply.total_burned += slash_amount
         else:
             slash_amount = compute_non_response_slash_amount(current_stake)
-        if slash_amount > 0:
-            blockchain.supply.staked[offender_id] = (
-                current_stake - slash_amount
-            )
-            blockchain.supply.total_supply -= slash_amount
-            blockchain.supply.total_burned += slash_amount
+            if slash_amount > 0:
+                blockchain.supply.staked[offender_id] = (
+                    current_stake - slash_amount
+                )
+                blockchain.supply.total_supply -= slash_amount
+                blockchain.supply.total_burned += slash_amount
         self.processed.add(tx.evidence_hash)
         # Post-fork: bump slash_offense_counts so the next offense
         # escalates via the curve's repeat-multiplier ramp.  Pre-fork
