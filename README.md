@@ -228,8 +228,8 @@ messagechain proposals                          # open proposals + tallies
 ### Validator operations
 
 ```bash
-messagechain stake --amount 10000               # lock as validator stake
-messagechain unstake --amount 5000              # ~15-day unbonding
+messagechain stake --amount 200                 # lock as validator stake
+messagechain unstake --amount 200               # ~15-day unbonding
 messagechain start --mine                       # run a validator
 messagechain key-status                         # WOTS+ leaf usage
 messagechain rotate-key                         # fresh keypair, old key retired
@@ -238,9 +238,9 @@ messagechain upgrade                            # install the latest mainnet tag
 
 ## Run a validator
 
-You need 10,000 tokens to stake and an always-on Linux host (Python
-3.10+, ~2 GB RAM) with inbound TCP **9333 + 9334** open in your
-cloud firewall.
+You need 300 tokens (one faucet drip — 200 stays staked, 100 covers
+the stake-tx fee) and an always-on Linux host (Python 3.10+, ~2 GB
+RAM) with inbound TCP **9333 + 9334** open in your cloud firewall.
 
 ```bash
 # 1. on the host (as root) — installs MessageChain, generates the validator's
@@ -255,11 +255,13 @@ curl -fsSL -o install-validator.sh \
 less install-validator.sh                  # review before running as root
 sudo bash install-validator.sh
 
-# 2. from a wallet with tokens, fund the address printed above:
-messagechain transfer --to mc1... --amount 10000
+# 2. fund the address printed above with one faucet drip from
+#    messagechain.org, or transfer 300 tokens from any wallet:
+messagechain transfer --to mc1... --amount 300
 
-# 3. back on the host, lock the funds as stake:
-sudo -u messagechain messagechain stake --amount 10000
+# 3. back on the host, lock 200 of those tokens as stake (the
+#    remaining 100 covers the stake-tx fee):
+sudo -u messagechain messagechain stake --amount 200
 
 # 4. start
 systemctl enable --now messagechain-validator messagechain-upgrade.timer messagechain-rotate-key.timer
@@ -279,9 +281,12 @@ leaves to be re-used and the chain will slash 100% of your stake on
 detection.
 
 Rewards = block reward + tx fees + attester pool share, pro-rata by
-stake. Unbonding takes ~15 days (2176 blocks) — slashing windows
-extend past departure, so don't shut a validator down inside the
-unbonding window.
+stake. The 200-token floor is a true minimum — there is no capital
+wall on validator entry, and rewards scale linearly with stake at
+this end of the curve. `messagechain validators` shows the live set
+and per-validator share. Unbonding takes ~15 days (2176 blocks) —
+slashing windows extend past departure, so don't shut a validator
+down inside the unbonding window.
 
 <details>
 <summary>Operating a live validator (backups, migration, retirement, monitoring)</summary>
@@ -345,10 +350,11 @@ start the validator — instead, reach out to a peer for a chain-state
 inspection of your entity's existing on-chain signatures so you can
 recover the high-water-mark leaf index before signing again.
 
-**Drain & retire.** `messagechain unstake --amount 10000`, wait the
-full ~15-day unbonding window so the slashing window closes, *then*
-shut the host down. Bringing a validator down with stake still bonded
-risks downtime slashing.
+**Drain & retire.** `messagechain unstake --amount 200` (or whatever
+your current stake is — `messagechain status --entity YOUR_ID`
+prints it), wait the full ~15-day unbonding window so the slashing
+window closes, *then* shut the host down. Bringing a validator down
+with stake still bonded risks downtime slashing.
 
 **What gets you slashed.** Double-signing or equivocating — signing
 two competing blocks at the same height — or WOTS+ leaf reuse, which
