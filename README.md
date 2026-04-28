@@ -107,42 +107,36 @@ messagechain read --last 20
 
 ### 5. Back up your wallet
 
-Two files together make a complete wallet backup:
+**Your 24-word recovery phrase is your backup.** Write it down on
+paper (or stamp it into metal) and store it offline. Anyone with
+those words controls the account; lose them and the funds are gone
+with no recovery. Don't put it in cloud sync, don't email it to
+yourself, don't photograph it.
 
-1. **The keyfile** — your hex private key. Lose this and the funds
-   are gone with no recovery.
-2. **`~/.messagechain/leaves/<entity_id_hex>.idx`** — the WOTS+
-   leaf cursor. Records which one-time signature leaves your key
-   has already burned.
+That's it. Restoring on a new machine just means feeding the phrase
+back to any signing command (`--keyfile <path>` to a file containing
+the phrase, or paste it at the prompt) — the wallet re-derives the
+keypair and queries the network for your highest-used leaf so it can
+resume signing safely.
 
-**Restoring the keyfile without the matching leaf-cursor file
-re-signs already-used WOTS+ leaves**, which mathematically discloses
-the WOTS+ private key for those leaves and produces equivocation
-evidence on chain — 100% slash on detection. Treat the leaf cursor
-as security-critical state, not as a regenerable cache. Back up both
-files together; never restore one without the other; both are
-security-critical.
+#### Offline-signing power users only
 
-The CLI ships a one-shot helper that bundles them:
+If you sign on an air-gapped machine and broadcast later, the
+network can't see leaves you've used until you broadcast them. In
+that workflow the local leaf cursor at
+`~/.messagechain/leaves/<entity_id_hex>.idx` IS security-critical
+between signings: re-signing at a leaf you've already burned offline
+discloses that leaf's WOTS+ private key and produces equivocation
+evidence on chain (100% slash on detection). Bundle the cursor with
+your keyfile when moving the offline signer to new hardware:
 
 ```bash
 messagechain backup-wallet --keyfile /path/to/keyfile
 # writes <entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz in CWD
 ```
 
-Or roll your own:
-
-```bash
-tar czf wallet-backup.tgz \
-    -C / path/to/keyfile \
-    "$HOME/.messagechain/leaves/<entity_id_hex>.idx"
-```
-
-Store the archive offline (encrypted USB in a safe, not cloud sync).
-If you have a keyfile but no leaf-cursor file (disk loss after a
-keyfile-only paper backup), do NOT sign anything — the first sign
-will reuse leaves and slash. Recover the high-water-mark leaf index
-from chain state first.
+For online wallets — the default path — ignore this section. The
+cursor is rebuilt from chain state on restore.
 
 ## CLI reference
 
@@ -159,7 +153,8 @@ messagechain react <tx_hash> --choice up        # up/down/clear vote on a messag
 messagechain transfer --to mc1… --amount 100    # send tokens
 messagechain read --last 50                     # recent messages
 messagechain estimate-fee --message "hi"        # fee preview
-messagechain backup-wallet --keyfile <path>     # tar keyfile + leaf cursor
+messagechain backup-wallet --keyfile <path>     # offline-signers only:
+                                                # bundle keyfile + leaf cursor
 ```
 
 ### Chain & validator info

@@ -1138,16 +1138,18 @@ def build_parser() -> argparse.ArgumentParser:
     # --- backup-wallet -------------------------------------------------
     backup = sub.add_parser(
         "backup-wallet",
-        help="Tar up keyfile + leaf-cursor into a single offline archive.",
+        help="Offline-signers only: tar keyfile + leaf-cursor into one archive.",
         description=(
-            "Bundle the two files that together make a complete wallet "
-            "backup -- the keyfile (your hex secret) and the matching "
-            "~/.messagechain/leaves/<entity_id_hex>.idx (the WOTS+ leaf "
-            "cursor) -- into a single .tar.gz.  Restoring a keyfile "
-            "without the matching leaf cursor re-uses one-time WOTS+ "
-            "leaves and produces equivocation evidence on chain (100% "
-            "slash on detection).  Local-only: this command never "
-            "touches the chain or the network."
+            "OFFLINE-SIGNING POWER USERS ONLY.  For online wallets, your "
+            "24-word recovery phrase is your backup -- the leaf cursor "
+            "is rebuilt from chain state on restore and you do not need "
+            "this command.  Use this only if you sign on an air-gapped "
+            "machine and broadcast later: in that workflow leaves you've "
+            "burned offline aren't visible on chain yet, so the local "
+            "~/.messagechain/leaves/<entity_id_hex>.idx cursor is "
+            "security-critical between signings.  This command bundles "
+            "the keyfile + matching cursor into a single .tar.gz.  "
+            "Local-only: never touches the chain or the network."
         ),
     )
     backup.add_argument(
@@ -1774,11 +1776,6 @@ def _bind_persistent_leaf_index(
     """
     path = _resolve_leaf_index_path(entity.entity_id_hex, data_dir=data_dir)
     parent = path.parent
-    # Snapshot existence BEFORE we touch the file so the create-hint
-    # below fires exactly once -- the first time this wallet's cursor
-    # is materialized on this host.  Subsequent signing calls find the
-    # file already present and stay silent.
-    existed_before = os.path.exists(str(path))
     try:
         os.makedirs(parent, exist_ok=True)
     except OSError:
@@ -1818,22 +1815,13 @@ def _bind_persistent_leaf_index(
             pass
 
     # 3. First-create hint.  If the cursor file did not exist before
-    #    this call, the user is one block-sign away from a persisted
-    #    leaf cursor that is now security-critical state -- restoring
-    #    a keyfile without this file re-uses one-time WOTS+ leaves and
-    #    produces equivocation evidence on chain (see README "Wallet
-    #    backups").  Print exactly one stderr line so wallet users
-    #    learn the file exists.  Subsequent calls (file already there)
-    #    stay silent -- this is not a per-sign nag.
-    if not existed_before:
-        try:
-            sys.stderr.write(
-                f"Note: leaf cursor created at {path_str}. "
-                f"Back this up alongside your keyfile, or you risk "
-                f"slashing on next sign.\n"
-            )
-        except Exception:
-            pass
+    #    this call, materialize a single stderr line so users know
+    #    the file exists -- but DON'T frame it as something they
+    #    must back up.  For online wallets the cursor is rebuilt
+    #    from chain state on restore (this very helper does that
+    #    via chain_leaf above).  The cursor is only security-
+    #    critical state for the offline-signing workflow, which the
+    #    README's offline-signers section calls out separately.
 
     return path
 
