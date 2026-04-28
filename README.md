@@ -387,6 +387,11 @@ curl-pipe.
 
 </details>
 
+## How MessageChain compares
+
+How MessageChain stacks up against Nostr, Arweave, and DeSo: see
+[COMPARISON.md](./COMPARISON.md).
+
 ## Security & changelog
 
 - Vulnerabilities: see [SECURITY.md](./SECURITY.md) — private email
