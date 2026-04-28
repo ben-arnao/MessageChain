@@ -77,6 +77,16 @@ class OffenseKind(enum.Enum):
     # path that bypassed the curve entirely — the rationale that fork
     # closes.
     CENSORSHIP = "censorship"
+    # Tier 30 sibling fork (HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT):
+    # the witness-non-response slash and the bogus-rejection slash
+    # were the two remaining flat-BPS soft-slash paths Tier 30 missed.
+    # Both grade identically to CENSORSHIP — a single occurrence is
+    # plausibly transient (packet loss / fork-edge race), only repeats
+    # justify escalation via slash_offense_counts.  Pre-fork callers
+    # used flat WITNESS_NON_RESPONSE_SLASH_BPS / CENSORSHIP_SLASH_BPS
+    # paths that bypassed the curve entirely.
+    WITNESS_NON_RESPONSE = "witness_non_response"
+    BOGUS_REJECTION = "bogus_rejection"
 
 
 class Unambiguity(enum.Enum):

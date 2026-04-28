@@ -29,6 +29,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pure-burn proportional-drain shape so future slash paths can reuse
   it without reinventing the loop.
 
+### Changed
+- **Tier 30 sibling — honesty curve closes the last two flat-BPS
+  soft-slash paths.**  Tier 30 (1.33.0) routed `_apply_censorship_slash`
+  and `process_inclusion_list_violation` through the honesty curve,
+  but two siblings kept burning flat BPS on first offense:
+  `compute_non_response_slash_amount` /
+  `NonResponseEvidenceProcessor.process` burned a flat
+  `WITNESS_NON_RESPONSE_SLASH_BPS` (5%) on every silent-drop slash —
+  a long-tenured validator dropping one witnessed submission under
+  transient packet loss paid the same as a deliberate silent-drop
+  censoring node.  `BogusRejectionProcessor.process` burned a flat
+  `CENSORSHIP_SLASH_BPS` (10%) on every bogus REJECT_INVALID_SIG —
+  a borderline rejection racing a fee-rule fork edge cost the same
+  as deliberate forged-rejection censorship.  This fork adds
+  `OffenseKind.WITNESS_NON_RESPONSE` and `OffenseKind.BOGUS_REJECTION`
+  to the curve and routes both apply paths through `slashing_severity`
+  with `Unambiguity.AMBIGUOUS` on first offense; subsequent offenses
+  escalate via `slash_offense_counts`.  Gated on
+  `HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT` (Tier 32, height 761);
+  pre-fork behavior is byte-identical to legacy for replay determinism.
+
+## [1.33.0] — 2026-04-28
+
 ### Fixed
 - **State-root sim mirrors inclusion-list mutations.** A block carrying
   a non-empty `inclusion_list` or any
