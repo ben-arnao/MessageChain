@@ -5054,9 +5054,11 @@ class Blockchain:
                     as _ARCB,
                     FINALITY_INTERVAL as _FI,
                     REWARD_CURVE_HEIGHT as _RCH,
+                    REWARD_CURVE_LARGE_BAND_HEIGHT as _RCLBH,
                 )
                 from messagechain.economics.inflation import (
                     reward_curve_multiplier as _reward_curve_multiplier,
+                    reward_curve_multiplier_v2 as _reward_curve_multiplier_v2,
                 )
                 _cap_active = block_height >= _ARCH
                 _cap_fix_active = block_height >= _ACFH
@@ -5068,6 +5070,11 @@ class Blockchain:
                 # Curve runs BEFORE the per-entity cap so the cap
                 # remains a strict upper bound — same order as apply.
                 _curve_active = block_height >= _RCH
+                # Tier 37 sim-mirror: swap in v2 helper at/after
+                # REWARD_CURVE_LARGE_BAND_HEIGHT so the apply path's
+                # saturating-large slope is reproduced bit-for-bit by
+                # the sim that drives the state-root commitment.
+                _curve_v2_active = block_height >= _RCLBH
                 _sim_total_stake = (
                     sum(sim_staked.values()) if _curve_active else 0
                 )
@@ -5115,7 +5122,14 @@ class Blockchain:
                             sim_staked.get(eid, 0) * 10_000
                             // _sim_total_stake
                         )
-                        _num, _den = _reward_curve_multiplier(_stake_bps)
+                        if _curve_v2_active:
+                            _num, _den = _reward_curve_multiplier_v2(
+                                _stake_bps,
+                            )
+                        else:
+                            _num, _den = _reward_curve_multiplier(
+                                _stake_bps,
+                            )
                         _reward_amount = _reward_amount * _num // _den
                     if _cap_active and per_slot_reward > 0:
                         _earned = _sim_epoch_earnings.get(eid, 0)
