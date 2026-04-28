@@ -153,6 +153,16 @@ def build_parser() -> argparse.ArgumentParser:
              "blocks (default), low = ~10 blocks.  Ignored when "
              "--fee is set.",
     )
+    send.add_argument(
+        "--community-id", dest="community_id", type=str, default=None,
+        metavar="NAME",
+        help=(
+            "Tag the message with a community handle (Reddit-style "
+            "topic grouping).  The on-chain id is sha256(name)[:16]; "
+            "any human-readable name maps deterministically.  "
+            "Activates at COMMUNITY_ID_HEIGHT."
+        ),
+    )
 
     # --- send-multi ---
     send_multi = sub.add_parser(
@@ -2288,6 +2298,26 @@ def cmd_send(args):
             print("Error: --prev is not valid hex.")
             sys.exit(1)
 
+    # --community-id: hash the human-readable name into the 16-byte
+    # on-chain id (sha256(name)[:16] -- the convention documented in
+    # config.py).  Names are normalized to NFC + lowercase ASCII so
+    # "MyCommunity" / "mycommunity" / "MYCOMMUNITY" all map to the
+    # same on-chain handle.  No registry, no claim -- first-poster
+    # semantics; the (id, name) mapping lives in indexers.
+    community_id_arg: bytes | None = None
+    if getattr(args, "community_id", None):
+        import hashlib, unicodedata
+        from messagechain.config import COMMUNITY_ID_BYTES
+        normalized = unicodedata.normalize(
+            "NFC", args.community_id.strip(),
+        ).lower()
+        if not normalized:
+            print("Error: --community-id must not be empty.")
+            sys.exit(1)
+        community_id_arg = hashlib.sha256(
+            normalized.encode("utf-8"),
+        ).digest()[:COMMUNITY_ID_BYTES]
+
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
     # always take max(local_min, server_suggestion) to avoid silently
@@ -2325,6 +2355,9 @@ def cmd_send(args):
     prev_overhead = (
         PREV_POINTER_STORED_BYTES if prev_bytes_arg is not None else 0
     )
+    if community_id_arg is not None:
+        from messagechain.core.transaction import COMMUNITY_ID_STORED_BYTES
+        prev_overhead += COMMUNITY_ID_STORED_BYTES
     if target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
         # Signature size is deterministic for the scheme parameters baked
         # into the keypair, so compute it without actually signing (a
@@ -2431,9 +2464,15 @@ def cmd_send(args):
         entity, message, fee=fee, nonce=nonce,
         current_height=target_height, prev=prev_bytes_arg,
         include_pubkey=include_pubkey,
+        community_id=community_id_arg,
     )
     if prev_bytes_arg is not None:
         print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
+    if community_id_arg is not None:
+        print(
+            f"Community: {args.community_id.strip()} "
+            f"(id {community_id_arg.hex()[:8]}...)"
+        )
     print("Submitting...")
 
     response = rpc_call(host, port, "submit_transaction", {

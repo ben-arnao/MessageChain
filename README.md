@@ -75,27 +75,73 @@ MessageChain uses a **receive-to-exist** model: you do not need to
 register anything on-chain to receive tokens. Your account appears in
 chain state the moment someone sends you a transfer.
 
-### 3. Send a message
+### 3. Post
+
+**Fees.** Every CLI submission auto-prices by default. The picker
+samples fee-per-byte across the last 50 blocks and bids the
+percentile that matches your urgency rung — `high` (~1 block, 90th
+pct), `normal` (~3 blocks, 75th pct, default), `low` (~10 blocks,
+25th pct) — then multiplies by the tx's stored byte count, never
+dropping below the protocol floor. Override with `--fee N` for a
+specific bid. `messagechain estimate-fee --tx-type <kind> ...`
+previews the cost of any tx without submitting.
+
+**Post a message.**
 
 ```bash
-messagechain send "hello world"                 # auto-priced (default)
-messagechain send "hello world" --fee 500       # pay a specific amount
-messagechain send "reply" --prev <tx_hash_hex>  # reference a prior message
-messagechain estimate-fee --message "hello world"   # preview cost
+messagechain send "hello world"
+messagechain send "hello world" --fee 500          # manual fee
+messagechain send "hi" --urgency high              # ~1-block target
 ```
 
-Your first outgoing transaction reveals your public key on-chain
-(the "first-spend pubkey install" path). After that, every
-subsequent transaction is verified against the installed key.
+**Tag a community.** `--community-id NAME` groups the message under
+a Reddit-style topic. The on-chain id is `sha256(name)[:16]`; any
+human-readable name maps deterministically. No registry, no claim —
+first-poster semantics; moderation is an app/indexer concern.
 
-The optional `--prev` flag attaches a 32-byte pointer to a prior
-on-chain message (by its `tx_hash`), forming a single-linked list —
-protocol-agnostic: apps can render this as a reply thread, a chained
-long-form document, a citation, etc. The referenced tx must already
-be on-chain in a strictly earlier block. The pointer adds 33 bytes
-to the fee basis but does NOT count against the 1024-char message
-cap, so you keep the full text budget. (Activates at
-`PREV_POINTER_HEIGHT`.)
+```bash
+messagechain send "build report" --community-id mc-dev
+```
+
+**Reply to a message.** `--prev <tx_hash>` attaches a 32-byte
+pointer to a prior on-chain message — apps render this as a reply,
+chained long-form, citation, etc. The referenced tx must already
+be in a strictly earlier block.
+
+```bash
+messagechain send "good point" --prev <tx_hash>
+```
+
+**Long-form posts (>1024 chars).** A single message is capped at
+1024 chars. For longer content, send a sequence and chain each
+piece with `--prev` pointing at the previous tx_hash. The chain
+requires each `--prev` target to be in a strictly earlier block,
+so you'll wait one block (~10 min) between pieces.
+
+**Up/down-vote a message.** `react <tx_hash> --choice up|down|clear`
+votes on a message. Re-voting supersedes; `--choice clear` retracts.
+Each (voter, target) pair has a single latest choice in consensus
+state.
+
+```bash
+messagechain react <tx_hash> --choice up
+messagechain react <tx_hash> --choice clear
+```
+
+**Trust/flag a user.** Same `react` command with
+`--target-type user`, passing the target's entity_id (raw hex).
+`--choice up` = trust, `--choice down` = flag, `--choice clear` =
+retract. Self-trust is rejected by the protocol.
+
+```bash
+messagechain react <entity_id> --target-type user --choice up    # vouch
+messagechain react <entity_id> --target-type user --choice down  # flag
+```
+
+**First send.** Your first outgoing transaction reveals your
+public key on-chain (the "first-spend pubkey install" path).
+Subsequent transactions verify against the installed key — the CLI
+handles this automatically.
 
 ### 4. Read messages back
 
@@ -148,11 +194,13 @@ messagechain verify-key                         # confirm backup
 messagechain account                            # print your address + entity_id
 messagechain balance                            # liquid + staked tokens
 messagechain send "hello"                       # post a message
+messagechain send "hi" --community-id mc-dev    # tag with a community
 messagechain send "reply" --prev <tx_hash>      # reply/chain to a prior message
-messagechain react <tx_hash> --choice up        # up/down/clear vote on a message (or --target-type user)
+messagechain react <tx_hash> --choice up        # up/down/clear-vote a message
+messagechain react <entity_id> --target-type user --choice up   # trust/flag a user
 messagechain transfer --to mc1… --amount 100    # send tokens
 messagechain read --last 50                     # recent messages
-messagechain estimate-fee --message "hi"        # fee preview
+messagechain estimate-fee --tx-type message --message "hi"  # fee preview
 messagechain backup-wallet --keyfile <path>     # offline-signers only:
                                                 # bundle keyfile + leaf cursor
 ```
