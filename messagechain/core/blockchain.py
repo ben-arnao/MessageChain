@@ -3645,6 +3645,9 @@ class Blockchain:
         from messagechain.consensus.censorship_evidence import (
             compute_slash_amount,
         )
+        from messagechain.config import (
+            HONESTY_CURVE_INSURANCE_HEIGHT as _T30_H,
+        )
         offender_id = matured.offender_id
         # Slash basis is stake AT ADMISSION, not current stake.  An
         # accused validator would otherwise unstake during the
@@ -3655,6 +3658,24 @@ class Blockchain:
         # admission time — see submit() in censorship_evidence.py.
         staked_at_admission = getattr(matured, "staked_at_admission", 0)
         current_stake = self.supply.staked.get(offender_id, 0)
+        # Tier 30 honest-operator insurance: route through the honesty
+        # curve with AMBIGUOUS classification.  A single missed include
+        # is plausibly honest mempool churn — only repeat patterns
+        # (slash_offense_counts via the curve) justify escalation.
+        # Pre-Tier-30: legacy flat CENSORSHIP_SLASH_BPS path,
+        # byte-identical to historical replay.
+        if self.height >= _T30_H:
+            from messagechain.consensus.honesty_curve import (
+                OffenseKind as _OK,
+                Unambiguity as _Un,
+                slashing_severity as _sev,
+            )
+            sev_pct = _sev(
+                offender_id, _OK.CENSORSHIP, _Un.AMBIGUOUS, self,
+            )
+            base_slash = (staked_at_admission * sev_pct) // 100
+        else:
+            base_slash = compute_slash_amount(staked_at_admission)
         # Cap at current: the unstaked-to-pending portion already
         # left `staked` for `pending_unstakes`, which this slash path
         # deliberately does not touch.  Debiting more than current
@@ -3663,7 +3684,7 @@ class Blockchain:
         # effectively, because their `pending_unstakes` is not slashed
         # by censorship (it still sits for UNBONDING_PERIOD) — only
         # the maximum we can take from `staked` right now.
-        slash_amount = min(compute_slash_amount(staked_at_admission), current_stake)
+        slash_amount = min(base_slash, current_stake)
         if slash_amount <= 0:
             # No slash to apply — still record the evidence as
             # processed so it cannot be re-submitted.
@@ -3682,6 +3703,13 @@ class Blockchain:
 
         # Record as processed to prevent double-slashing.
         self._processed_evidence.add(matured.evidence_hash)
+
+        # Tier 30: bump slash_offense_counts so the next censorship
+        # slash on the same offender escalates via the curve's
+        # repeat-offense ramp.  Pre-Tier-30 the counter is untouched
+        # (legacy replay byte-identity).
+        if self.height >= _T30_H:
+            self._bump_slash_offense_count(offender_id)
 
         logger.info(
             f"CENSORSHIP-SLASHED validator {offender_id.hex()[:16]}: "

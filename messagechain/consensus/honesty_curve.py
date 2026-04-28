@@ -69,6 +69,14 @@ class OffenseKind(enum.Enum):
     # `main` currently emits it; declaring it here lets that branch
     # rebase cleanly without an enum-extension diff.
     INCLUSION_LIST_VIOLATION = "inclusion_list_violation"
+    # Tier 30: matured censorship-evidence routes through the curve
+    # with AMBIGUOUS classification on first offense.  A single missed
+    # include is plausibly honest mempool churn; only repeat patterns
+    # escalate (the existing curve handles that via slash_offense_
+    # counts).  Pre-Tier-30 callers used a flat CENSORSHIP_SLASH_BPS
+    # path that bypassed the curve entirely — the rationale that fork
+    # closes.
+    CENSORSHIP = "censorship"
 
 
 class Unambiguity(enum.Enum):

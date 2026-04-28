@@ -1214,10 +1214,29 @@ def process_inclusion_list_violation(
             Unambiguity,
             slashing_severity,
         )
+        # Tier 30 honest-operator insurance: a single missed include
+        # is plausibly honest mempool churn, NOT proof of intent.
+        # Reclassify first offenses as AMBIGUOUS — only repeat
+        # patterns (slash_offense_counts ≥ 1) escalate to UNAMBIGUOUS.
+        # Pre-Tier-30 callers fall through to the legacy UNAMBIGUOUS-
+        # first-offense classification.
+        from messagechain.config import (
+            HONESTY_CURVE_INSURANCE_HEIGHT as _T30_H,
+        )
+        if current_height >= _T30_H:
+            prior = blockchain.slash_offense_counts.get(
+                etx.accused_proposer_id, 0,
+            ) if hasattr(blockchain, "slash_offense_counts") else 0
+            if prior >= 1:
+                _unamb = Unambiguity.UNAMBIGUOUS
+            else:
+                _unamb = Unambiguity.AMBIGUOUS
+        else:
+            _unamb = Unambiguity.UNAMBIGUOUS
         sev_pct = slashing_severity(
             etx.accused_proposer_id,
             OffenseKind.INCLUSION_LIST_VIOLATION,
-            Unambiguity.UNAMBIGUOUS,
+            _unamb,
             blockchain,
         )
         slash_amount = (current_stake * sev_pct) // 100
