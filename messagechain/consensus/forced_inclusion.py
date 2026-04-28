@@ -94,6 +94,14 @@ _BLOCK_TX_LIST_ATTRS: tuple[str, ...] = (
     "unstake_transactions",
     "governance_txs",
     "authority_txs",
+    # Tier 35 — non-response evidence first-class block slot.  Listing
+    # the field here means a forced NonResponseEvidenceTx placed in
+    # its correct slot is recognized as included by Tier 34's multi-
+    # list censorship-resistance gate, rather than flagged as omitted.
+    # Pre-Tier-35 blocks carry an empty list here (the field defaults
+    # to []), which iterates as a no-op — so listing the slot
+    # unconditionally does not perturb the gate's pre-fork behavior.
+    "non_response_evidence_txs",
 )
 
 

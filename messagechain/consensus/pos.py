@@ -360,6 +360,7 @@ class ProofOfStake:
         react_transactions: list | None = None,
         inclusion_list_violation_evidence_txs: list | None = None,
         inclusion_list=None,
+        non_response_evidence_txs: list | None = None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -402,6 +403,7 @@ class ProofOfStake:
         acks_observed = list(acks_observed_this_block or [])
         react_txs = list(react_transactions or [])
         il_violation_txs = list(inclusion_list_violation_evidence_txs or [])
+        nre_txs = list(non_response_evidence_txs or [])
         # Optional scalar — None means "no list this block".
         included_inclusion_list = inclusion_list
 
@@ -479,6 +481,7 @@ class ProofOfStake:
             react_transactions=react_txs,
             inclusion_list_violation_evidence_txs=il_violation_txs,
             inclusion_list=included_inclusion_list,
+            non_response_evidence_txs=nre_txs,
         )
         from messagechain.core.block import canonical_block_tx_hashes
         tx_hashes = canonical_block_tx_hashes(_block_like)
@@ -646,6 +649,7 @@ class ProofOfStake:
                 react_transactions=react_txs,
                 inclusion_list_violation_evidence_txs=il_violation_txs,
                 inclusion_list=included_inclusion_list,
+                non_response_evidence_txs=nre_txs,
             )
             block.block_hash = block._compute_hash()
             return block
