@@ -138,10 +138,15 @@ class TestFreshValidatorAtFaucetDrip(unittest.TestCase):
             alice, amount=FAUCET_DRIP - 1, nonce=0,
             fee=calculate_min_fee(b"", signature_bytes=4096),
         )
+        # Use exactly MIN_STAKE_FAUCET_DRIP_HEIGHT — the post-Tier-28
+        # window between activation heights for Tier 28 and Tier 29 may
+        # be as narrow as one block, so don't add an offset that could
+        # land us in the Tier 29 era (where the floor drops below
+        # FAUCET_DRIP - 1 and the rejection no longer fires).
+        h = config.MIN_STAKE_FAUCET_DRIP_HEIGHT
         ok = verify_stake_transaction(
             tx, alice.public_key,
-            block_height=config.MIN_STAKE_FAUCET_DRIP_HEIGHT + 1,
-            current_height=config.MIN_STAKE_FAUCET_DRIP_HEIGHT + 1,
+            block_height=h, current_height=h,
         )
         self.assertFalse(
             ok,

@@ -778,7 +778,7 @@ MIN_STAKE_RAISE_HEIGHT = 701  # Tier 2 — fast-forwarded for 1.26.0 hard fork s
 # proportionally.  Pinned to FAUCET_DRIP by an assert below so the two
 # constants cannot drift.
 VALIDATOR_MIN_STAKE_FAUCET_DRIP = 300
-MIN_STAKE_FAUCET_DRIP_HEIGHT = 14_000  # Tier 28
+MIN_STAKE_FAUCET_DRIP_HEIGHT = 754  # Tier 28 — fast-forwarded for 1.32.0 hard fork sweep
 
 # Tier 29: a single faucet drip funds a full validator end-to-end.
 # Tier 28 set the stake floor to FAUCET_DRIP, but a wallet holding
@@ -796,7 +796,7 @@ MIN_STAKE_FAUCET_DRIP_HEIGHT = 14_000  # Tier 28
 # assert further down (after MIN_FEE is defined above us, FAUCET_DRIP
 # is imported lazily by the assert helper).
 VALIDATOR_MIN_STAKE_TIER29 = 200  # = FAUCET_DRIP (300) - MIN_FEE (100)
-VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT = 16_000  # Tier 29
+VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT = 755  # Tier 29 — fast-forwarded for 1.32.0 hard fork sweep
 
 
 def get_validator_min_stake(block_height: int) -> int:
@@ -3987,7 +3987,7 @@ assert HONESTY_CURVE_RESTART_DRIFT_SECS > 0, (
 # as Tier 23 left it — byte-for-byte preservation across the fork
 # boundary so historical slashes replay under the rule current at
 # their height.
-HONESTY_CURVE_RATE_HEIGHT = 5000  # Tier 24
+HONESTY_CURVE_RATE_HEIGHT = 750  # Tier 24 — fast-forwarded for 1.32.0 hard fork sweep
 
 # Each prior recorded offense subtracts this much from the raw
 # track_record before the relief multiplier is computed.  Default
@@ -4096,7 +4096,7 @@ def get_honesty_curve_active(current_block: int) -> bool:
 # left parsing the new v5 layout against stale rules.  Pre-activation
 # at the time of the bump (mainnet tip well below 5_000), so the
 # height change is operationally costless.
-COMMUNITY_ID_HEIGHT = 8_000  # Tier 25
+COMMUNITY_ID_HEIGHT = 751  # Tier 25 — fast-forwarded for 1.32.0 hard fork sweep
 # Maximum length in ASCII bytes (= chars, since charset is ASCII).
 # Anchored as part of the wire format — see _validate_community_id
 # in messagechain.core.transaction for the structural rules.
@@ -4140,7 +4140,7 @@ MAX_COMMUNITY_ID_LEN = 32
 # so no in-flight pre-signed revoke is invalidated by the fork itself
 # -- operators have the full pre-activation window to refresh their
 # stored hexes to the post-fork format.
-REVOKE_TX_WINDOW_HEIGHT = 10_000  # Tier 26
+REVOKE_TX_WINDOW_HEIGHT = 752  # Tier 26 — fast-forwarded for 1.32.0 hard fork sweep
 
 # Default re-sign cadence for the CLI's --print-only path: ~90 days
 # at 600 s/block.  90 days matches a reasonable quarterly cold-key
@@ -4190,7 +4190,7 @@ REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS = 13_140
 # pre-signed message-react is invalidated by the fork itself —
 # operators upgrade through the prior fork before the new admission
 # rule starts.
-REACT_NO_SELF_MESSAGE_HEIGHT = 12_000  # Tier 27
+REACT_NO_SELF_MESSAGE_HEIGHT = 753  # Tier 27 — fast-forwarded for 1.32.0 hard fork sweep
 
 assert PROPOSAL_FEE_TIER19_HEIGHT > TIER_18_HEIGHT, (
     "PROPOSAL_FEE_TIER19_HEIGHT must follow TIER_18_HEIGHT — Tier 19 "
