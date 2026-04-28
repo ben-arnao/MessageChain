@@ -4,6 +4,19 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.32.1] — 2026-04-28
+
+### Docs
+- **README — validator stake floor reflects Tier 28/29.** Bring the
+  validator-stake number in `README.md` in line with the Tier 28
+  drop from 10_000 to `FAUCET_DRIP` (300) and the Tier 29
+  faucet-drip retune to 200. (942cec0, 5def863)
+- **COMPARISON.md — keep stake-curve and content-cap framing at
+  intent level.** Strip implementation-specific phrasing (exact
+  curve constants, byte counts) so the public comparison stays
+  durable across tuning changes; matches CLAUDE.md's "intent, not
+  implementation" rule for public-facing docs. (9de1fcd, 55151da)
+
 ## [1.32.0] — 2026-04-28
 
 ### Changed
