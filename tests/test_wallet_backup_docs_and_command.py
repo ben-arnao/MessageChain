@@ -1,31 +1,28 @@
-"""Wallet backup ergonomics: hint on first leaf-cursor create + backup-wallet CLI.
+"""Wallet backup ergonomics: silent leaf-cursor bind + backup-wallet CLI.
 
-Audit finding (closed by this commit):
+The original audit closed a silent self-slash trap by printing a
+"back up your leaf cursor or you'll be slashed" stderr hint on first
+cursor create.  That hint has since been retired: every signing
+surface now routes through ``_bind_persistent_leaf_index`` with a
+chain-fetched watermark, and the keypair's monotonic
+``advance_to_leaf`` recovers the high-water mark from chain state on
+any fresh restore (lost laptop, OS reinstall, cursor-file deletion).
+For online wallets the cursor is regenerable cache, not security-
+critical user-managed state, and the README's wallet-backup section
+now treats the 24-word recovery phrase as the sole backup artifact
+the user is asked to record.
 
-  End-user ``~/.messagechain/leaves/<entity_id_hex>.idx`` was a silent
-  self-slash trap with zero documentation.  ``cli._bind_persistent_leaf_index``
-  defaults that file to the user's home dir for any non-``--data-dir``
-  signing call, but the README only documented the operator path
-  (``/var/lib/messagechain/leaf_index.json``) and only operators were
-  warned that restoring a keyfile without the matching leaf state
-  re-uses one-time WOTS+ leaves and produces equivocation evidence on
-  chain (100% slash on detection).
+These tests pin down the resulting invariants:
 
-  A user who staked from a laptop, re-installed the OS without
-  preserving ``~/.messagechain/``, and re-ran ``messagechain stake``
-  with the same keyfile would self-slash on the first sign --
-  exactly the disaster the README warns operators about, but invisible
-  to wallet users.
-
-These tests pin down the three coupled mitigations:
-
-1. First-time creation of a leaf-cursor file prints a one-line stderr
-   hint pointing at the path and naming the slashing risk.
-2. Subsequent calls (file already present) do NOT spam the hint.
-3. ``messagechain backup-wallet`` is a local-only command that
-   tarballs the keyfile + the matching leaves/<entity_id_hex>.idx
-   into a single archive, fails clean if either input is missing, and
-   defaults the output path to a dated, entity-id-keyed name.
+1. ``_bind_persistent_leaf_index`` does NOT emit the old
+   slash-fear stderr nag on first cursor create -- that wording has
+   been retired, and reintroducing it would contradict the README.
+2. Subsequent calls (file already present) are also silent.
+3. ``messagechain backup-wallet`` still works for the offline-
+   signing power-user workflow: tarball the keyfile + the matching
+   leaves/<entity_id_hex>.idx into a single archive, fail clean if
+   either input is missing, default the output path to a dated,
+   entity-id-keyed name.
 """
 
 from __future__ import annotations
@@ -71,12 +68,18 @@ class _FakeKeypair:
             f.write('{"next_leaf": 0}')
 
 
-class TestFirstBindPrintsHint(unittest.TestCase):
-    """First time _bind_persistent_leaf_index creates the cursor file,
-    it prints a one-line stderr hint pointing at the path and the
-    backup risk.  Path must be the resolved one so the user can find it."""
+class TestFirstBindIsSilent(unittest.TestCase):
+    """First-time bind must NOT emit the retired slash-fear stderr nag.
 
-    def test_first_bind_persistent_leaf_index_prints_hint(self) -> None:
+    The chain-watermark backstop in ``_bind_persistent_leaf_index``
+    (``advance_to_leaf(chain_leaf)``) recovers the high-water mark
+    from chain state on any fresh restore, so the cursor file is
+    regenerable cache for online wallets.  Reintroducing the
+    "back this up or you'll be slashed" message would contradict the
+    seed-phrase-only backup model the README now documents.
+    """
+
+    def test_first_bind_does_not_print_slash_nag(self) -> None:
         from messagechain import cli as cli_mod
 
         with tempfile.TemporaryDirectory() as fake_home:
@@ -88,21 +91,18 @@ class TestFirstBindPrintsHint(unittest.TestCase):
             buf = io.StringIO()
             with patch("pathlib.Path.home", return_value=Path(fake_home)):
                 with redirect_stderr(buf):
-                    path = cli_mod._bind_persistent_leaf_index(
+                    cli_mod._bind_persistent_leaf_index(
                         entity, chain_leaf=0, data_dir=None,
                     )
 
-            err = buf.getvalue()
-            # Exactly one hint line, pointing at the resolved path,
-            # and naming the slashing risk so the user can't miss it.
-            self.assertIn(str(path), err)
-            self.assertIn("Back this up", err)
-            self.assertIn("slashing", err.lower())
+            err = buf.getvalue().lower()
+            self.assertNotIn("back this up", err)
+            self.assertNotIn("slashing", err)
+            self.assertNotIn("risk slashing", err)
 
 
 class TestSubsequentBindIsSilent(unittest.TestCase):
-    """The hint must NOT spam every signing call -- only the first
-    create, when the cursor file did not previously exist."""
+    """Subsequent binds (file already present) must also stay silent."""
 
     def test_subsequent_bind_persistent_leaf_index_silent(self) -> None:
         from messagechain import cli as cli_mod
@@ -110,7 +110,6 @@ class TestSubsequentBindIsSilent(unittest.TestCase):
         with tempfile.TemporaryDirectory() as fake_home:
             entity_hex = "bb" * 32
 
-            # First call -- creates the file (and prints, we don't care here).
             with patch("pathlib.Path.home", return_value=Path(fake_home)):
                 e1 = MagicMock()
                 e1.entity_id_hex = entity_hex
@@ -135,8 +134,8 @@ class TestSubsequentBindIsSilent(unittest.TestCase):
                     )
 
             self.assertNotIn(
-                "Back this up", second_buf.getvalue(),
-                "subsequent binds must NOT re-print the create hint",
+                "back this up", second_buf.getvalue().lower(),
+                "subsequent binds must not print any backup nag",
             )
 
 
