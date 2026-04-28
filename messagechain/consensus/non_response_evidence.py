@@ -74,10 +74,42 @@ def _h(data: bytes) -> bytes:
 
 
 def compute_non_response_slash_amount(stake: int) -> int:
-    """5% of stake at WITNESS_NON_RESPONSE_SLASH_BPS = 500.  Integer math."""
+    """Legacy flat WITNESS_NON_RESPONSE_SLASH_BPS (5%) of stake.
+
+    Pre-Tier-30-sibling (HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT) the
+    processor's slash path consults this directly.  Post-fork the
+    processor routes through `slashing_severity` instead — see
+    `_compute_non_response_slash_amount_curve` below for the curve
+    path that closes the flat-BPS first-offense penalty on long-
+    tenured honest operators.
+    """
     if stake <= 0:
         return 0
     return (stake * WITNESS_NON_RESPONSE_SLASH_BPS) // 10_000
+
+
+def _compute_non_response_slash_amount_curve(
+    stake: int, offender_id: bytes, blockchain,
+) -> int:
+    """Honesty-curve slash amount for a witness-non-response offense.
+
+    Routes through `slashing_severity` with `Unambiguity.AMBIGUOUS` —
+    a single dropped witnessed submission is plausibly transient
+    packet loss, not proof of intent.  Repeat patterns escalate via
+    the curve's existing slash_offense_counts ramp.
+    """
+    if stake <= 0:
+        return 0
+    from messagechain.consensus.honesty_curve import (
+        OffenseKind, Unambiguity, slashing_severity,
+    )
+    sev_pct = slashing_severity(
+        offender_id,
+        OffenseKind.WITNESS_NON_RESPONSE,
+        Unambiguity.AMBIGUOUS,
+        blockchain,
+    )
+    return (stake * sev_pct) // 100
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -497,9 +529,24 @@ class NonResponseEvidenceProcessor:
                 ),
             )
 
-        # All gates passed — apply the slash.
+        # All gates passed — apply the slash.  Pre-fork: legacy flat
+        # WITNESS_NON_RESPONSE_SLASH_BPS (byte-identical to historical
+        # replay).  Post-fork: route through the honesty curve with
+        # AMBIGUOUS classification + slash_offense_counts escalation
+        # so a long-tenured operator's first transient drop does not
+        # eat a flat 5% on the same line as a deliberate silent-drop
+        # censoring node.
+        from messagechain.config import (
+            HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T30S_H,
+        )
+        use_curve = int(current_height) >= _T30S_H
         current_stake = blockchain.supply.staked.get(offender_id, 0)
-        slash_amount = compute_non_response_slash_amount(current_stake)
+        if use_curve:
+            slash_amount = _compute_non_response_slash_amount_curve(
+                current_stake, offender_id, blockchain,
+            )
+        else:
+            slash_amount = compute_non_response_slash_amount(current_stake)
         if slash_amount > 0:
             blockchain.supply.staked[offender_id] = (
                 current_stake - slash_amount
@@ -507,6 +554,19 @@ class NonResponseEvidenceProcessor:
             blockchain.supply.total_supply -= slash_amount
             blockchain.supply.total_burned += slash_amount
         self.processed.add(tx.evidence_hash)
+        # Post-fork: bump slash_offense_counts so the next offense
+        # escalates via the curve's repeat-multiplier ramp.  Pre-fork
+        # the counter is untouched (legacy replay byte-identity).
+        # Route through `_bump_slash_offense_count` chokepoint when
+        # available so the chaindb mirror tracks the bump (cold
+        # restart determinism — see _bump_slash_offense_count
+        # docstring).
+        if use_curve and hasattr(blockchain, "slash_offense_counts"):
+            if hasattr(blockchain, "_bump_slash_offense_count"):
+                blockchain._bump_slash_offense_count(offender_id)
+            else:
+                cur = blockchain.slash_offense_counts.get(offender_id, 0)
+                blockchain.slash_offense_counts[offender_id] = cur + 1
         return NonResponseResult(
             accepted=True, slashed=True,
             offender_id=offender_id,

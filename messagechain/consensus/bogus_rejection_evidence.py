@@ -404,9 +404,32 @@ class BogusRejectionProcessor:
                         "fails to verify under on-chain pubkey"
                     ),
                 )
-            # Bogus rejection — apply the slash.
+            # Bogus rejection — apply the slash.  Pre-fork: legacy
+            # flat CENSORSHIP_SLASH_BPS path (byte-identical to
+            # historical replay).  Post-fork (Tier 30 sibling): route
+            # through the honesty curve with AMBIGUOUS classification
+            # so a long-tenured issuer's first borderline rejection
+            # (fee-rule fork-edge race, etc.) is not punished the
+            # same as deliberate forged-rejection censorship; repeat
+            # offenders escalate via slash_offense_counts.
+            from messagechain.config import (
+                HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _T30S_H,
+            )
+            use_curve = int(block_height) >= _T30S_H
             current_stake = blockchain.supply.staked.get(offender_id, 0)
-            slash_amount = compute_slash_amount(current_stake)
+            if use_curve:
+                from messagechain.consensus.honesty_curve import (
+                    OffenseKind, Unambiguity, slashing_severity,
+                )
+                sev_pct = slashing_severity(
+                    offender_id,
+                    OffenseKind.BOGUS_REJECTION,
+                    Unambiguity.AMBIGUOUS,
+                    blockchain,
+                )
+                slash_amount = (current_stake * sev_pct) // 100
+            else:
+                slash_amount = compute_slash_amount(current_stake)
             if slash_amount > 0:
                 blockchain.supply.staked[offender_id] = (
                     current_stake - slash_amount
@@ -414,6 +437,21 @@ class BogusRejectionProcessor:
                 blockchain.supply.total_supply -= slash_amount
                 blockchain.supply.total_burned += slash_amount
             self.processed.add(tx.evidence_hash)
+            # Post-fork: bump slash_offense_counts so the next bogus
+            # rejection from the same issuer escalates via the curve.
+            # Pre-fork the counter is untouched (replay byte-identity).
+            if use_curve and hasattr(
+                blockchain, "slash_offense_counts",
+            ):
+                if hasattr(blockchain, "_bump_slash_offense_count"):
+                    blockchain._bump_slash_offense_count(offender_id)
+                else:
+                    cur = blockchain.slash_offense_counts.get(
+                        offender_id, 0,
+                    )
+                    blockchain.slash_offense_counts[offender_id] = (
+                        cur + 1
+                    )
             return BogusRejectionResult(
                 accepted=True, slashed=True,
                 offender_id=offender_id,

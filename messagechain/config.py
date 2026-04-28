@@ -4271,6 +4271,33 @@ assert HONESTY_CURVE_INSURANCE_HEIGHT > VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT, (
     "buffer so callers between the two heights see the legacy flat-BPS "
     "censorship slash and UNAMBIGUOUS-first IL violation classification."
 )
+# ─── Tier 30 sibling: honesty curve for non-response + bogus-rejection ─
+# Tier 30 routed _apply_censorship_slash and process_inclusion_list_
+# violation through the honesty curve, but two more soft-slash paths
+# kept burning flat BPS on first offense:
+#
+#   * `compute_non_response_slash_amount` → flat
+#     WITNESS_NON_RESPONSE_SLASH_BPS (5%) on every silent-drop
+#     evidence acceptance.  A long-tenured validator who missed one
+#     witnessed submission under transient packet loss paid the same
+#     as a deliberate silent-drop censoring node.
+#   * `BogusRejectionProcessor.process` → flat CENSORSHIP_SLASH_BPS
+#     (10%) on every bogus REJECT_INVALID_SIG.  A borderline rejection
+#     racing a fee-rule fork edge cost the issuer the same as
+#     deliberate forged-rejection censorship.
+#
+# This fork closes both, mirroring Tier 30's pattern: route through
+# `slashing_severity` with new `OffenseKind.WITNESS_NON_RESPONSE` /
+# `OffenseKind.BOGUS_REJECTION` entries + `Unambiguity.AMBIGUOUS` on
+# first offense; subsequent offenses escalate via the curve's
+# repeat-offense ramp.  Pre-activation: byte-identical to legacy.
+HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT = 761  # Tier 30 sibling — 761 leaves 758-760 free for parallel security forks
+assert HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT > HONESTY_CURVE_INSURANCE_HEIGHT, (
+    "HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT must follow "
+    "HONESTY_CURVE_INSURANCE_HEIGHT — this fork rides on top of the "
+    "Tier 30 cluster, closing the two remaining flat-BPS soft-slash "
+    "paths Tier 30 missed (witness-non-response and bogus-rejection)."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
