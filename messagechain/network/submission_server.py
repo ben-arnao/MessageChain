@@ -73,6 +73,67 @@ from messagechain.network.submission_receipt import (
 logger = logging.getLogger("messagechain.submission")
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Global receipt-subtree cap (defense against botnet / IPv6-rotation
+# drain that defeats the per-IP gate).
+# ─────────────────────────────────────────────────────────────────────
+# Audit (2026-04-27): the per-IP rejection / ack buckets defend
+# against single-IP drain, but a botnet rotating through fresh
+# source IPs (e.g. an IPv6 /64 cycling through addresses) gets a
+# fresh per-IP burst on every IP.  At the round-8 settings
+# (SUBMISSION_REJECTION_BURST=3, _max_tracked_ips=4096), 4096
+# distinct IPs each consume their burst → 12,288 leaves drained in
+# the burst alone, plus ~205 leaves/sec sustained (4096 buckets
+# refilling at 0.05/sec each).  The 65,536-leaf RECEIPT_SUBTREE
+# (height 16) drains in ~4-5 minutes.  Once drained, every receipt /
+# rejection / ack issuance silently breaks until the operator
+# rotates the on-chain subtree (~9 min keygen) — defeating the
+# censorship-evidence framework, the chain's primary defense
+# against the primary anchored adversary (validator collusion /
+# coerced suppression — see CLAUDE.md "Validator collusion").
+#
+# Layered global cap on top of the per-IP gate closes this:
+#
+#   * Per-IP first  — keeps fairness for honest opt-in clients;
+#     a single IP cannot drain more than SUBMISSION_REJECTION_BURST
+#     leaves (or SUBMISSION_ACK_BURST on the ack path) before its
+#     own bucket runs dry, regardless of global state.
+#   * Global second — caps network-wide leaf-issuance rate at a
+#     level honest workload never reaches but a botnet cannot
+#     sustain.
+#
+# Sizing math:
+#   * Subtree size:   2 ** RECEIPT_SUBTREE_HEIGHT(=16) = 65,536 leaves
+#   * Burst budget:   10% of subtree = 6,553 leaves.  Generous enough
+#                     that no honest workload spike ever hits it; a
+#                     drain of this size takes ~4 minutes off the
+#                     subtree even in the worst case.
+#   * Refill rate:    0.05 leaves/sec ≈ 4,320/day.  Sustained drain
+#                     after burst depletion takes
+#                     65,536 / 4,320 ≈ 15 days to consume one full
+#                     subtree — well above the operator rotation
+#                     cadence (which the comment in config.py pegs at
+#                     ~22 days at full network capacity, with
+#                     exhaustion-warning logs firing at 80% / 95%
+#                     usage long before a forced rotation).
+#   * Honest steady: realistic mainnet honest opt-in receipt traffic
+#                    is on the order of tens of receipts/day total
+#                    (most clients don't request receipts; the opt-in
+#                    is for slash-evidence-grade callers).  Even a
+#                    100x overestimate (1k/day) is far below
+#                    ~6.5k burst + 4.3k/day refill, so the cap never
+#                    fires for honest workload.
+#
+# When the global cap kicks in, callers respond by dropping the
+# receipt issuer to None — the underlying submission still
+# processes; the client just doesn't get a signed receipt.  An
+# operator-visible warning is emitted (rate-limited to one per
+# minute) so the operator can correlate complaints with a possible
+# drain attack and consider rotating the receipt subtree manually.
+RECEIPT_GLOBAL_BURST = 6_553
+RECEIPT_GLOBAL_REFILL_PER_SEC = 0.05
+
+
 __all__ = [
     "ReceiptIssuer",
     "SubmissionServer",
@@ -1328,7 +1389,8 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ReceiptBudgetTracker:
-    """Per-IP receipt-subtree leaf-budget tracker — shared across surfaces.
+    """Per-IP + global receipt-subtree leaf-budget tracker — shared
+    across surfaces.
 
     Owns the dedicated rejection-budget and ack-budget token buckets
     that gate WOTS+ leaf consumption from the validator's
@@ -1338,13 +1400,33 @@ class ReceiptBudgetTracker:
     pipeline (receipts, rejections, acks all draw from the same
     subtree).
 
+    Two layers of defense:
+
+      * Per-IP — fairness for honest opt-in clients.  A single IP
+        cannot drain more than its per-IP burst before its bucket
+        runs dry, regardless of global state.  This is what keeps an
+        honest receipt-requesting client from being starved by a
+        misbehaving neighbor on the same network.
+      * Global — defense against botnet / IPv6-rotation drain.  An
+        attacker rotating through fresh source IPs (e.g. an IPv6 /64
+        cycling addresses) defeats per-IP fairness because every
+        fresh IP gets a fresh burst.  At round-8 settings a 4096-IP
+        rotation drains 12,288 leaves in seconds — enough to wipe
+        out the whole 65k-leaf subtree in ~4 minutes.  The global
+        cap (RECEIPT_GLOBAL_BURST + RECEIPT_GLOBAL_REFILL_PER_SEC,
+        defined at module level) bounds total network-wide issuance
+        well above any honest workload but well below any sustainable
+        drain.  See module-level commentary for the sizing math.
+
     Critical invariant: HTTPS and RPC submission surfaces MUST consult
     the SAME tracker instance.  If each surface had its own bucket
     dict, an attacker would split traffic across both surfaces and
-    drain twice the per-IP burst before any gate fired.  Hosting the
-    tracker on the top-level Server (or Node) and passing the same
-    instance into every surface that issues receipts/rejections/acks
-    keeps the invariant.
+    drain twice the per-IP burst before any gate fired.  The global
+    bucket is on the same instance for the same reason — splitting
+    surfaces must NEVER let traffic bypass the global cap.  Hosting
+    the tracker on the top-level Server (or Node) and passing the
+    same instance into every surface that issues receipts /
+    rejections / acks keeps the invariant.
 
     Methods:
       * `rejection_budget_check(ip)` — gates SignedRejection issuance
@@ -1353,6 +1435,11 @@ class ReceiptBudgetTracker:
         because either path consumes one leaf from the same subtree.
       * `ack_budget_check(ip)` — gates SubmissionAck issuance on the
         witnessed-submission path.
+
+    Both methods apply per-IP first, then global; either failure
+    returns False with no token consumed from the gate that did NOT
+    fail (keeps the gate-ordering predictable and avoids an attacker
+    free-spending a per-IP token to probe the global state).
 
     The bucket dicts are LRU-evicted at `max_tracked_ips` to prevent
     an attacker rotating IPs from blowing memory with one-shot buckets.
@@ -1376,9 +1463,51 @@ class ReceiptBudgetTracker:
         # families for LRU eviction.
         self._last_active: dict[str, float] = {}
         self._max_tracked_ips = max_tracked_ips
+        # Global cap (botnet / IPv6-rotation defense).  ONE bucket
+        # shared across rejection + ack paths, both surfaces (HTTPS
+        # and RPC), and all source IPs.  See module-level comment
+        # for sizing math.  Initialized at full burst — operators
+        # don't pay a cold-start cost on first issuance.
+        self._global_bucket = TokenBucket(
+            rate=RECEIPT_GLOBAL_REFILL_PER_SEC,
+            max_tokens=RECEIPT_GLOBAL_BURST,
+        )
+        # Last-warning timestamp for global-cap exhaustion (rate-limit
+        # the operator-visible warning to one per minute).
+        self._global_warn_last: float = 0.0
+
+    def _consume_global_locked(self) -> bool:
+        """Try to consume one token from the global bucket.
+
+        Caller MUST hold `self._buckets_lock` (the global bucket lives
+        in the same critical section as the per-IP buckets — not a
+        separate lock — so the per-IP+global decision is atomic and an
+        attacker cannot race the gate).  Returns True iff a global
+        token was consumed.  On False, NO token is consumed and an
+        operator-visible warning is logged at most once per minute.
+        """
+        self._global_bucket._refill()
+        if self._global_bucket.tokens >= 1.0:
+            self._global_bucket.tokens -= 1.0
+            return True
+        # Drained.  Rate-limit the warning so a sustained drain doesn't
+        # fill the journal — a single line per minute is plenty signal
+        # for an operator deciding whether to rotate the subtree.
+        import time as _time
+        now = _time.time()
+        if now - self._global_warn_last >= 60.0:
+            self._global_warn_last = now
+            logger.warning(
+                "receipt-subtree global cap exhausted; submissions "
+                "still processing without receipt — possible drain "
+                "attack.  Consider rotating the receipt subtree if "
+                "sustained.",
+            )
+        return False
 
     def rejection_budget_check(self, ip: str) -> bool:
-        """Consume one token from `ip`'s REJECTION bucket; True iff allowed.
+        """Consume one token from `ip`'s REJECTION bucket AND the
+        global bucket; True iff both pass.
 
         Gates both:
           * the HTTPS opt-in SignedRejection issuance path
@@ -1391,6 +1520,12 @@ class ReceiptBudgetTracker:
         surfaces.  Exhausting the budget does NOT block the
         underlying submission — it only prevents the receipt /
         rejection from being issued for that request.
+
+        Gate order: per-IP first, then global.  Per-IP failure
+        consumes nothing.  Global failure (per-IP would have passed)
+        also consumes nothing — the per-IP token is not burned for a
+        request that the global cap denied.  This keeps an attacker
+        from probing global state by spending per-IP tokens.
         """
         import time as _time
         with self._buckets_lock:
@@ -1419,18 +1554,35 @@ class ReceiptBudgetTracker:
                     max_tokens=SUBMISSION_REJECTION_BURST,
                 )
                 self._rejection_buckets[ip] = bucket
+            # Peek per-IP first WITHOUT consuming.  If global denies,
+            # we must NOT have spent a per-IP token.
+            bucket._refill()
+            if bucket.tokens < 1.0:
+                # Per-IP gate fails; consume nothing.
+                return False
+            # Per-IP would pass; check global.  On global failure
+            # neither bucket is decremented.
+            if not self._consume_global_locked():
+                return False
+            # Both pass — consume per-IP and record activity.
+            bucket.tokens -= 1.0
             self._last_active[ip] = _time.time()
-            return bucket.consume()
+            return True
 
     def ack_budget_check(self, ip: str) -> bool:
-        """Consume one token from `ip`'s ACK bucket; True iff allowed.
+        """Consume one token from `ip`'s ACK bucket AND the global
+        bucket; True iff both pass.
 
         Each SubmissionAck consumes a WOTS+ leaf from the validator's
         receipt subtree.  Without a dedicated cap, an attacker
         spamming `X-MC-Witnessed-Submission` headers from a /24
-        drains the whole subtree in minutes.  Exhausting the ack
-        budget does NOT block the underlying submission -- it only
-        prevents an ack from being issued for that request.
+        drains the whole subtree in minutes.  Exhausting either gate
+        does NOT block the underlying submission -- it only prevents
+        an ack from being issued for that request.
+
+        Gate order is the same as rejection_budget_check: per-IP
+        first, then global.  See that method for the no-double-spend
+        rationale.
         """
         import time as _time
         with self._buckets_lock:
@@ -1457,8 +1609,15 @@ class ReceiptBudgetTracker:
                     max_tokens=SUBMISSION_ACK_BURST,
                 )
                 self._ack_buckets[ip] = bucket
+            # Peek per-IP, then global; consume both only on full pass.
+            bucket._refill()
+            if bucket.tokens < 1.0:
+                return False
+            if not self._consume_global_locked():
+                return False
+            bucket.tokens -= 1.0
             self._last_active[ip] = _time.time()
-            return bucket.consume()
+            return True
 
 
 class _HandlerContext:
