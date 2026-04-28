@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "messagechain"
-version = "1.30.2"
+version = "1.31.0"
 description = "Quantum-resistant proof-of-stake message chain"
 requires-python = ">=3.10"
 readme = "README.md"

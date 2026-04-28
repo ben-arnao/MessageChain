@@ -4,6 +4,35 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.31.0] — 2026-04-28
+
+### Changed
+- **Tier 28 — validator min stake = one faucet drip.**
+  `VALIDATOR_MIN_STAKE` drops from 10_000 to `FAUCET_DRIP` (300) at
+  `MIN_STAKE_FAUCET_DRIP_HEIGHT = 14_000`. Tier 2's 10k floor turned
+  permissionless validator entry into a capital wall; Tier 28 makes
+  "minimum stake = one faucet grab" the new floor. Sybil cost
+  collapses to ~one drip plus the faucet's per-/24 + PoW limits;
+  slashing still bites proportionally. Pre-fork callers continue to
+  see the legacy floor for replay determinism. The new constant is
+  pinned to `FAUCET_DRIP` via a module-level assert so the two cannot
+  drift. (55563b3, 4bef326)
+- **Tier 29 — a single faucet drip funds a full validator
+  end-to-end.** `VALIDATOR_REGISTRATION_BURN` drops to 0 and the
+  stake floor drops from `FAUCET_DRIP` (300) to
+  `FAUCET_DRIP - MIN_FEE` (200) so a 300-token drip covers stake
+  (200) + fee (100) + burn (0) end-to-end. Closes the gap left by
+  Tier 28 where `MIN_FEE` plus Tier 6's 10_000 registration burn
+  meant a single drip couldn't actually fund a fresh validator.
+  Activation at `VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT = 16_000`
+  (rides above Tier 28). Pre-Tier-6 / Tier-6..Tier-29 / Tier-29+
+  all return the right burn via `get_validator_registration_burn(height)`.
+  (c306f5a, 0d0a1c0)
+
+### Docs
+- Add `COMPARISON.md` (vs Nostr / Arweave / DeSo). Linked from
+  `README.md`. (6b08ae6)
+
 ## [1.30.2] — 2026-04-28
 
 Cleanup-only.  Removes the temporary state_root diagnostic
