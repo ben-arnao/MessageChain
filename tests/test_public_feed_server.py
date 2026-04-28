@@ -305,9 +305,10 @@ class TestGitHubRedirect(PublicFeedTestBase):
 
     def test_gh_start_returns_302_to_getting_started(self):
         """`/gh/start` deep-links to the README's getting-started anchor
-        instead of the repo top, so the hero CTA on the landing page
-        drops casual visitors at the install + first-message walkthrough
-        rather than the install-from-source weeds."""
+        instead of the repo top, so the "send a message" CTA on the
+        landing page drops casual visitors at the install +
+        first-message walkthrough rather than the install-from-source
+        weeds."""
         status, headers, _ = self._get("/gh/start")
         self.assertEqual(status, 302)
         self.assertEqual(
@@ -317,6 +318,20 @@ class TestGitHubRedirect(PublicFeedTestBase):
 
     def test_gh_start_post_returns_405(self):
         status, _, _ = self._get("/gh/start", method="POST")
+        self.assertEqual(status, 405)
+
+    def test_gh_node_returns_302_to_run_a_validator(self):
+        """`/gh/node` deep-links to the README's run-a-validator anchor
+        for the "run a node to earn tokens" CTA on the landing page."""
+        status, headers, _ = self._get("/gh/node")
+        self.assertEqual(status, 302)
+        self.assertEqual(
+            headers.get("Location"),
+            self.GITHUB_URL + "#run-a-validator",
+        )
+
+    def test_gh_node_post_returns_405(self):
+        status, _, _ = self._get("/gh/node", method="POST")
         self.assertEqual(status, 405)
 
 

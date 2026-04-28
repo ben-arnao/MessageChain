@@ -75,6 +75,12 @@ _GITHUB_GETTING_STARTED_URL = (
     "#getting-started--your-first-message"
 )
 
+# Deeper link for `/gh/node` — README's "Run a validator" anchor.
+_GITHUB_RUN_VALIDATOR_URL = (
+    "https://github.com/ben-arnao/MessageChain"
+    "#run-a-validator"
+)
+
 
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
@@ -338,17 +344,18 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             # branch trivial; client-side validates the hex.
             self._serve_static_entity()
             return
-        if path == "/gh" or path == "/gh/start":
+        if path == "/gh" or path == "/gh/start" or path == "/gh/node":
             # 302 to the public repo so outbound clicks land in the
             # access log (a bare anchor href would let the browser
             # navigate away with no record on our side).  `/gh/start`
-            # deep-links to the README's "Getting started" anchor for
-            # visitors landing from the hero CTA.
-            target = (
-                _GITHUB_GETTING_STARTED_URL
-                if path == "/gh/start"
-                else _GITHUB_REPO_URL
-            )
+            # deep-links to README's "Getting started" anchor; `/gh/node`
+            # to the "Run a validator" anchor.
+            if path == "/gh/start":
+                target = _GITHUB_GETTING_STARTED_URL
+            elif path == "/gh/node":
+                target = _GITHUB_RUN_VALIDATOR_URL
+            else:
+                target = _GITHUB_REPO_URL
             self.send_response(302)
             self.send_header("Location", target)
             self.send_header("Content-Length", "0")
