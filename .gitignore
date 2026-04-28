@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 .env
 CLAUDE.md
 messagechain/config_local.py

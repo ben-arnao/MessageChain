@@ -4,6 +4,97 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.35.0] — 2026-04-28
+
+Audit-driven security cluster — three findings landed together
+because the upgrade window naturally couples the slashing-basis
+extension (Tier 33) and the attester-side gate change (Tier 34) with
+the consensus-determinism cleanup.
+
+### Security (active immediately, no fork gate)
+
+- **Honesty-curve severity is computed in pure integer arithmetic.**
+  `slashing_severity` previously built `raw = base * escalation *
+  float_relief` where `float_relief = HONEST_TRACK_THRESHOLD / track`,
+  then truncated via `int(raw)`.  IEEE-754 division of small bounded
+  integers is exact-rounded on every conformant platform, so in
+  practice the float form was deterministic — but the function's
+  output drives the slash percentage that mutates `staked` /
+  `total_supply` (consensus state), and "in practice deterministic"
+  is a weaker bar than the chain's permanent ledger demands.  Rewrites
+  the relief as an exact rational `(num, den)` and computes
+  `sev_int = (base * esc * num) // den` in pure integer arithmetic.
+  Mathematically identical to the float form on the curve's input
+  range — every existing honesty-curve test passes byte-identically —
+  but auditably deterministic without depending on float semantics.
+  Adds a determinism golden-table test pinning severity outputs across
+  representative `(track_record, prior)` cells, plus a `_NoFloatInt`
+  sentinel that proves the consensus hot-path never promotes any
+  input through `float()` (catches accidental reintroduction of
+  float relief in a future refactor).
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 33 — non-response + bogus-rejection slashes drain
+  `pending_unstakes`.** Tier 31 (1.34.0) widened the slash basis on
+  `_apply_censorship_slash` and `process_inclusion_list_violation`
+  from `staked` only to `(staked + pending_unstakes)`, closing the
+  censor-then-unstake evasion.  Tier 32 (1.34.0 sibling) routed the
+  witness-non-response and bogus-rejection apply paths through the
+  honesty curve — but those two paths still drained `staked` only.
+  Same evasion still worked: a coerced/colluding validator could
+  silently drop a witnessed submission (or sign a forged
+  REJECT_INVALID_SIG), immediately submit an unstake, and ride out the
+  unbonding queue (EVIDENCE_MATURITY_BLOCKS ~ 2.7h vs UNBONDING_PERIOD
+  > 14 days) with ≥ 90% of the would-be slashed stake intact.  Tier
+  33 closes both, mirroring Tier 31 exactly: the apply path computes
+  `sev_pct` via `slashing_severity` (always live by Tier 32) and
+  applies via `supply.burn_slash_proportional(offender_id, sev_pct)`.
+  Pre-Tier-33 paths preserved byte-for-byte.  Activation at
+  `NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT = 762`.
+
+- **Tier 34 — forced-inclusion gate covers all block tx-list
+  fields.** `check_forced_inclusion` (the attester-enforced soft
+  censorship-resistance gate) was scoped to message-only txs from day
+  one: it built `included_hashes` from `block.transactions` only and
+  accounted for byte budget via `len(tx.message)` (payload bytes,
+  not stored bytes).  Two correctness gaps: (a) honest blocks placing
+  a forced TransferTransaction in `block.transfer_transactions` had
+  the legacy gate raise `AttributeError` on the path (production has
+  not bitten because mainnet rarely keeps a transfer pending for
+  FORCED_INCLUSION_WAIT_BLOCKS, but the trap was armed); (b) the
+  CLAUDE.md "high-fpb tx cannot be suppressed without slashable
+  evidence" anchor silently exempted every non-message tx kind from
+  the gate — a colluding proposer dropping a forced transfer walked
+  free.  Tier 34 closes both: post-fork the gate walks every known
+  block tx-list field (`_BLOCK_TX_LIST_ATTRS` registry) and accounts
+  for stored bytes via `len(ftx.to_bytes())` — the same axis the
+  mempool's fee-per-byte ranking already uses.  Pre-fork: legacy
+  message-only path preserved, but defensively filtered to message
+  kinds at the top so the legacy AttributeError crash on transfers
+  is avoided (liveness-safe).  Activation at
+  `FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT = 764`.  Scope: covers tx
+  kinds the consensus mempool already tracks (Message + Transfer);
+  Stake / Unstake / Governance / Authority / React live in
+  server-local pools today and require a follow-up architectural
+  lift to bring them under the gate — Tier 34 is the prerequisite
+  that makes the broader expansion mechanical (one tuple-extension +
+  matching mempool surface).
+
+### Operator notes
+
+- All validators must upgrade to 1.35.0 within the runway window
+  (current tip → 762).  Pre-1.35.0 nodes will continue to apply Tier
+  31's pending-drain only on censorship + IL paths, missing the
+  same protection on the witness-non-response and bogus-rejection
+  paths; they will also continue to enforce the legacy
+  message-only forced-inclusion check.  Roll validators with
+  `messagechain upgrade --yes`.
+- The honesty-curve integer-rewrite is active immediately on upgrade
+  (no fork gate).  Outputs are byte-identical to the prior float
+  form for every `(base, escalation, prior, track)` cell within the
+  curve's input range, so historical replay is unchanged.
+
 ## [1.34.0] — 2026-04-28
 
 ### Fixed
