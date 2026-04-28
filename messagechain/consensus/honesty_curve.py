@@ -283,7 +283,8 @@ def slashing_severity(
         HONESTY_CURVE_AMBIGUOUS_BASE_PCT,
         HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER,
         HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD,
-        HONESTY_CURVE_HONEST_TRACK_FLOOR,
+        HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN,
+        HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM,
         HONESTY_CURVE_HONEST_TRACK_THRESHOLD,
         HONESTY_CURVE_MIN_PCT,
         HONESTY_CURVE_RATE_HEIGHT,
@@ -341,25 +342,38 @@ def slashing_severity(
     # Honest-history relief: scales severity DOWN for established
     # operators.  Applied AFTER escalation so a long-history operator
     # who has already piled up offenses still escalates — they just
-    # escalate from a lower base.
+    # escalate from a lower base.  Computed as an exact rational
+    # (relief_num / relief_den) so the final severity comes out of
+    # one floor-division rather than `int(float)` — IEEE-754 rounding
+    # at the boundaries cannot fork two replayers on different
+    # platforms.  Mathematically identical to the float form for the
+    # input ranges this function sees: multiplications of small
+    # bounded integers ⇒ same result either way, but the integer form
+    # is auditably deterministic without depending on IEEE 754.
     if track >= HONESTY_CURVE_HONEST_TRACK_THRESHOLD:
-        # relief in (HONEST_TRACK_FLOOR, 1.0]: tiny when track ≫
-        # threshold, capped at floor so even a "perfect" operator
-        # cannot escape every slash.
-        relief = max(
-            HONESTY_CURVE_HONEST_TRACK_FLOOR,
-            HONESTY_CURVE_HONEST_TRACK_THRESHOLD / track,
-        )
+        # relief = max(FLOOR_NUM/FLOOR_DEN, THRESHOLD/track).  The
+        # max picks whichever ratio is larger.  Equivalent comparison
+        # by cross-multiply (all positive integers): floor binds iff
+        # THRESHOLD * FLOOR_DEN <= FLOOR_NUM * track.
+        if (
+            HONESTY_CURVE_HONEST_TRACK_THRESHOLD
+            * HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+            <= HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM * track
+        ):
+            relief_num = HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM
+            relief_den = HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+        else:
+            relief_num = HONESTY_CURVE_HONEST_TRACK_THRESHOLD
+            relief_den = track
     else:
-        relief = 1.0  # No relief for under-tenure operators.
+        relief_num = 1
+        relief_den = 1  # No relief for under-tenure operators.
 
-    raw = base * escalation * relief
-    # Convert to integer percent.  Use int() (truncation toward zero)
-    # for byte-stable consensus determinism — every replayer agrees
-    # on the same integer.  Floats are deterministic for the
-    # operations involved here (multiplications of rationals with
-    # bounded magnitudes) but we explicitly clamp+int at the end.
-    sev_int = int(raw)
+    # raw_pct = base * escalation * relief = (base * esc * num) / den
+    # Floor-divide for byte-stable consensus determinism — every
+    # replayer agrees on the same integer regardless of float
+    # implementation, intermediate rounding, or platform.
+    sev_int = (base * escalation * relief_num) // relief_den
     return _clamp_pct(sev_int, HONESTY_CURVE_MIN_PCT, 100)
 
 

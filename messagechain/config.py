@@ -3902,7 +3902,19 @@ HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER = 2
 # the threshold, full base percent applies (no relief — fresh
 # validator is already at the soft-slash baseline).
 HONESTY_CURVE_HONEST_TRACK_THRESHOLD = 100
-HONESTY_CURVE_HONEST_TRACK_FLOOR = 0.2  # never relieve below 1/5 of base
+# Floor expressed as an exact rational (NUM/DEN) so the curve can do
+# integer-only severity arithmetic.  A pure-float floor would push
+# `slashing_severity` through `int(base * escalation * float_relief)`,
+# whose output is IEEE-754-dependent at the boundaries — adequate in
+# practice but a latent consensus-determinism trap on a permanent
+# ledger.  Keeping the float form for any external caller that reads
+# the human-readable ratio.
+HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM = 1
+HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN = 5
+HONESTY_CURVE_HONEST_TRACK_FLOOR = (
+    HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM
+    / HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+)  # 0.2 — never relieve below 1/5 of base
 
 # Weight on accepted block proposals when computing track_record.
 # A successful block proposal is a stronger signal of operator quality
@@ -3936,6 +3948,15 @@ assert 0 < HONESTY_CURVE_HONEST_TRACK_FLOOR <= 1.0, (
     "HONEST_TRACK_FLOOR must be in (0, 1.0] — at 0 the relief is "
     "unbounded (a long-history validator could escape any slash); at "
     "1.0 there is no relief at all and the fork is pointless"
+)
+assert (
+    HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM > 0
+    and HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN > 0
+    and HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM
+    <= HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+), (
+    "HONEST_TRACK_FLOOR_NUM/DEN must form a positive ratio in (0, 1] — "
+    "the integer-rational form must agree with the float form's bound"
 )
 assert HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT >= HONESTY_CURVE_AMBIGUOUS_BASE_PCT, (
     "UNAMBIGUOUS_FIRST_PCT must be ≥ AMBIGUOUS_BASE_PCT — deliberate "
