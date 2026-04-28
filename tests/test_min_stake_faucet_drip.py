@@ -79,10 +79,17 @@ class TestMinStakeFaucetDripGate(unittest.TestCase):
         )
 
     def test_post_activation_returns_drip(self):
+        # Sample inside the Tier 28 era (between Tier 28 activation and
+        # Tier 29 activation).  Tier 29 lowers the floor again so a
+        # height at "+ 50_000" past Tier 28 would already be in Tier 29
+        # territory and return the Tier 29 floor instead.
+        h = (
+            config.MIN_STAKE_FAUCET_DRIP_HEIGHT
+            + (config.VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT
+               - config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2
+        )
         self.assertEqual(
-            config.get_validator_min_stake(
-                config.MIN_STAKE_FAUCET_DRIP_HEIGHT + 50_000,
-            ),
+            config.get_validator_min_stake(h),
             FAUCET_DRIP,
         )
 
