@@ -11314,44 +11314,6 @@ class Blockchain:
                 simulated_root = None
 
             if simulated_root is not None and block.header.state_root != simulated_root:
-                # Pre-apply diagnostic: the proposer's committed
-                # state_root and the validator's re-simulated state_root
-                # disagree on a block neither has applied yet.  Both
-                # paths run compute_post_state_root over identical
-                # block contents, so a divergence here means the input
-                # state visible to the two callers differs (e.g., a
-                # mutation between propose_block and add_block).  Dump
-                # what we can see about the inputs.
-                try:
-                    diffs = []
-                    react_txs = getattr(block, "react_transactions", []) or []
-                    diffs.append(
-                        f"block #{block.header.block_number} "
-                        f"msg={len(block.transactions)} "
-                        f"transfer={len(block.transfer_transactions)} "
-                        f"react={len(react_txs)} "
-                        f"proposer={block.header.proposer_id.hex()[:16]} "
-                        f"proposer_leaf={block.header.proposer_signature.leaf_index if block.header.proposer_signature else 'none'}"
-                    )
-                    for rtx in react_txs:
-                        diffs.append(
-                            f"  rtx voter={rtx.voter_id.hex()[:16]} "
-                            f"target={rtx.target.hex()[:16]} "
-                            f"choice={rtx.choice} "
-                            f"nonce={rtx.nonce} "
-                            f"leaf={rtx.signature.leaf_index}"
-                        )
-                    diffs.append(
-                        f"committed={block.header.state_root.hex()[:16]} "
-                        f"simulated={simulated_root.hex()[:16]} "
-                        f"current_reaction_choices={len(self.reaction_state.choices)}"
-                    )
-                    logger.warning(
-                        "pre-apply state_root diagnostic: %s",
-                        " | ".join(diffs),
-                    )
-                except Exception:
-                    logger.exception("pre-apply state_root diagnostic failed")
                 return False, "Invalid state_root — state commitment mismatch"
 
         # Round-9 fix: wrap apply + state-root verify + persist in a
@@ -11404,43 +11366,6 @@ class Blockchain:
             # in-memory snapshot AND the chaindb transaction.
             expected_state_root = self.compute_current_state_root()
             if block.header.state_root != expected_state_root:
-                # Diagnostic: dump per-leaf state for the entities a
-                # block of this shape would touch, so the next
-                # mismatch logs exactly which mutation the sim is
-                # missing without forcing another bisection.
-                try:
-                    diffs = []
-                    react_txs = getattr(block, "react_transactions", []) or []
-                    for rtx in react_txs:
-                        eid = rtx.voter_id
-                        live = self.state_tree.get(eid)
-                        diffs.append(
-                            f"react voter {eid.hex()[:16]}: tree={live} "
-                            f"bal={self.supply.balances.get(eid, 0)} "
-                            f"nonce={self.nonces.get(eid, 0)} "
-                            f"wm={self.leaf_watermarks.get(eid, 0)}"
-                        )
-                    proposer_id = block.header.proposer_id
-                    diffs.append(
-                        f"proposer {proposer_id.hex()[:16]}: "
-                        f"tree={self.state_tree.get(proposer_id)} "
-                        f"bal={self.supply.balances.get(proposer_id, 0)} "
-                        f"wm={self.leaf_watermarks.get(proposer_id, 0)}"
-                    )
-                    diffs.append(
-                        f"reaction_state choices={len(self.reaction_state.choices)} "
-                        f"contrib={self.reaction_state.state_root_contribution().hex()[:16]}"
-                    )
-                    diffs.append(
-                        f"block.state_root={block.header.state_root.hex()[:16]} "
-                        f"expected={expected_state_root.hex()[:16]}"
-                    )
-                    logger.warning(
-                        "state_root diagnostic: %s",
-                        " | ".join(diffs[:8]),
-                    )
-                except Exception:
-                    logger.exception("state_root diagnostic failed")
                 self._restore_memory_snapshot(snapshot)
                 self._rebuild_state_tree()
                 if self.db is not None:

@@ -4,6 +4,19 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.30.2] — 2026-04-28
+
+Cleanup-only.  Removes the temporary state_root diagnostic
+logging blocks added in 1.29.1 and 1.29.2 from `_append_block`.
+Their job (localizing the validator-side `compute_post_state_root`
+missing `react_transactions=` kwarg) is done; the actual root
+cause was fixed in 1.29.3.  Both rejection sites now return
+`Invalid state_root — state commitment mismatch` directly, with
+no per-leaf dump and no try/except diagnostic wrapper.
+
+No consensus or behavioral change — these were `logger.warning`
+side-effects only.
+
 ## [1.30.1] — 2026-04-27
 
 Patch release.  Internal refactor that closes a latent dirty-set
