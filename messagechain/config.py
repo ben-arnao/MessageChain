@@ -4706,6 +4706,90 @@ assert (
     "is an unevaluable multiplier and would crash the consensus path"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 37 — Reward-curve large band saturates downward
+# ─────────────────────────────────────────────────────────────────────
+# The Tier-20 curve was piecewise-constant 0.80 / 1.25 / 1.00 — a 5%-
+# stake mid-tier validator and a 40%-stake whale earned at the SAME per-
+# token rate.  CLAUDE.md's anchored shape is "small < middle > large,
+# large saturating to flat/linear past a cap point" — large should earn
+# at a LOWER per-unit-stake rate than middle-tier, never at parity.  At
+# parity, a whale's reward share grows linearly with stake forever and
+# concentration ossifies past 5%.
+#
+# Tier 37 adds a fourth band on top of the existing three:
+#   share <  SMALL_THRESHOLD                           → 0.80   (unchanged)
+#   SMALL_THRESHOLD ≤ share < MID_THRESHOLD            → 1.25   (unchanged)
+#   MID_THRESHOLD   ≤ share < LARGE_THRESHOLD          → 1.00   (unchanged)
+#   LARGE_THRESHOLD ≤ share < LARGE_FLOOR_THRESHOLD    → linear interp
+#                                                        from 1.00 down
+#                                                        to LARGE_FLOOR
+#   share ≥ LARGE_FLOOR_THRESHOLD                      → LARGE_FLOOR
+#
+# The 5%→15% range is preserved at 1.0 so real-network behavior in the
+# active stake range is unchanged; only the upper tail (15%+) compresses.
+#
+# Conservative tuning: LARGE_THRESHOLD = 1500 bp (15%), LARGE_FLOOR_
+# THRESHOLD = 3000 bp (30%), floor = 50/100 (0.5).  Past 30% stake the
+# multiplier sits at 0.5 — large stakers still earn (incentive to keep
+# 24/7 uptime), still earn proportionally more in absolute tokens than
+# anyone smaller, but no longer at the same per-stake-unit rate as a
+# 5%-stake mid-tier validator.  Distribution compresses upward over time.
+#
+# All arithmetic is exact-rational integer; mirror the 1.35.0 honesty-
+# curve treatment.  The new helper `reward_curve_multiplier_v2` in
+# inflation.py interpolates with `(1 - t) * DEN + t * NUM` over an
+# integer span and returns a (num, den) tuple — no float anywhere.
+#
+# Activation rides above Tier 36 with a runway buffer well clear of the
+# current ~1300 mainnet tip so operators upgrade through prior forks
+# before the new curve bites.
+REWARD_CURVE_LARGE_BAND_HEIGHT = 800  # Tier 37
+
+# Stake-share thresholds in basis points for the new saturating tail.
+# 1500 bp = 15% (slope start), 3000 bp = 30% (slope end / floor).
+REWARD_CURVE_LARGE_THRESHOLD_BPS = 1_500
+REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS = 3_000
+
+# Multiplier at and past LARGE_FLOOR_THRESHOLD_BPS.  50/100 = 0.5 — a
+# 30%-stake validator earns at half the per-token rate of a 5%-stake
+# mid-tier validator (1.25 × 2 = 2.5× compression ratio mid-vs-floor).
+REWARD_CURVE_LARGE_FLOOR_NUM = 50
+REWARD_CURVE_LARGE_FLOOR_DEN = 100
+
+assert REWARD_CURVE_LARGE_BAND_HEIGHT > ATTESTER_DYNAMIC_COMMITTEE_HEIGHT, (
+    "REWARD_CURVE_LARGE_BAND_HEIGHT must follow Tier 36 — Tier 37 "
+    "rides on top of the most recent established fork with the "
+    "standard runway buffer; pre-activation callers see the legacy "
+    "Tier-20 piecewise-constant curve byte-for-byte"
+)
+assert REWARD_CURVE_LARGE_BAND_HEIGHT > REWARD_CURVE_HEIGHT, (
+    "REWARD_CURVE_LARGE_BAND_HEIGHT must follow REWARD_CURVE_HEIGHT — "
+    "the new saturating-large band is an extension of the Tier-20 "
+    "small/mid/large curve; activating it before Tier 20 would make "
+    "the slope path apply to history that never had even the legacy "
+    "multiplier"
+)
+assert (
+    REWARD_CURVE_MID_THRESHOLD_BPS
+    < REWARD_CURVE_LARGE_THRESHOLD_BPS
+    < REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS
+    < 10_000
+), (
+    "Reward-curve large-band thresholds must satisfy "
+    "MID < LARGE < LARGE_FLOOR < 10_000 (=100%) — anything else "
+    "collapses or inverts the slope and makes the piecewise-linear "
+    "function ill-defined"
+)
+assert (
+    0 < REWARD_CURVE_LARGE_FLOOR_NUM < REWARD_CURVE_LARGE_FLOOR_DEN
+), (
+    "REWARD_CURVE_LARGE_FLOOR_NUM/DEN must encode a multiplier "
+    "strictly between 0 and 1 — a floor at or above 1 leaves the "
+    "large band at parity with mid (the bug), a floor at 0 nukes "
+    "large stakers entirely (eliminating the uptime incentive)"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

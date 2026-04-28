@@ -49,6 +49,11 @@ from messagechain.config import (
     REWARD_CURVE_SMALL_DENOMINATOR,
     REWARD_CURVE_MID_NUMERATOR,
     REWARD_CURVE_MID_DENOMINATOR,
+    REWARD_CURVE_LARGE_BAND_HEIGHT,
+    REWARD_CURVE_LARGE_THRESHOLD_BPS,
+    REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS,
+    REWARD_CURVE_LARGE_FLOOR_NUM,
+    REWARD_CURVE_LARGE_FLOOR_DEN,
 )
 
 
@@ -91,6 +96,81 @@ def reward_curve_multiplier(stake_bps: int) -> tuple[int, int]:
             REWARD_CURVE_MID_DENOMINATOR,
         )
     return (1, 1)
+
+
+def reward_curve_multiplier_v2(stake_bps: int) -> tuple[int, int]:
+    """Tier 37 — saturating-large reward curve.
+
+    Adds a fourth band on top of the Tier 20 piecewise-constant curve:
+
+        bps <  SMALL_THRESHOLD                            → SMALL  (<1.0)
+        SMALL ≤ bps <  MID_THRESHOLD                       → MID    (>1.0)
+        MID   ≤ bps <  LARGE_THRESHOLD                     → 1/1    (baseline)
+        LARGE ≤ bps <  LARGE_FLOOR_THRESHOLD               → linear-interp
+                                                             from 1.0 down
+                                                             to FLOOR
+        bps ≥ LARGE_FLOOR_THRESHOLD                        → FLOOR  (<1.0)
+
+    The 5%–15% range stays at 1.0 so real-network behavior in the
+    active stake range is unchanged; only the upper tail (>=15%)
+    compresses downward, restoring CLAUDE.md's anchored "large
+    saturating to less than middle" property.
+
+    Linear interpolation in pure-integer arithmetic.  We compute the
+    slope at fixed precision = LARGE_FLOOR_DEN * (LARGE_FLOOR_THRESHOLD
+    - LARGE_THRESHOLD) so every multiplication and floor-division stays
+    int-only.  Result is a (num, den) pair sharing a common denominator
+    big enough to preserve every distinct slope point.
+
+    Caller (mint_block_reward + sim mirror) gates this helper on
+    block_height >= REWARD_CURVE_LARGE_BAND_HEIGHT.  Pre-fork callers
+    invoke `reward_curve_multiplier` (the legacy helper) byte-for-byte.
+
+    Mirrors the integer-rational pattern from the 1.35.0 honesty-curve
+    rewrite (`slashing_severity` AMBIGUOUS branch) — no `float()` on the
+    consensus hot path.
+    """
+    if stake_bps < REWARD_CURVE_SMALL_THRESHOLD_BPS:
+        return (
+            REWARD_CURVE_SMALL_NUMERATOR,
+            REWARD_CURVE_SMALL_DENOMINATOR,
+        )
+    if stake_bps < REWARD_CURVE_MID_THRESHOLD_BPS:
+        return (
+            REWARD_CURVE_MID_NUMERATOR,
+            REWARD_CURVE_MID_DENOMINATOR,
+        )
+    if stake_bps < REWARD_CURVE_LARGE_THRESHOLD_BPS:
+        return (1, 1)
+    if stake_bps >= REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS:
+        return (
+            REWARD_CURVE_LARGE_FLOOR_NUM,
+            REWARD_CURVE_LARGE_FLOOR_DEN,
+        )
+    # Linear-interp band: at LARGE_THRESHOLD multiplier = 1.0, at
+    # LARGE_FLOOR_THRESHOLD multiplier = FLOOR_NUM/FLOOR_DEN.  Express
+    # both endpoints over a common denominator FLOOR_DEN:
+    #   start = FLOOR_DEN     / FLOOR_DEN  (= 1.0)
+    #   end   = FLOOR_NUM     / FLOOR_DEN
+    # Linearly interpolate:
+    #   span_bps = LARGE_FLOOR_THRESHOLD - LARGE_THRESHOLD
+    #   t_bps    = stake_bps               - LARGE_THRESHOLD
+    #   raw_num  = (FLOOR_DEN * (span_bps - t_bps) + FLOOR_NUM * t_bps)
+    #   raw_den  =  FLOOR_DEN * span_bps
+    # Both raw_num and raw_den are positive ints; result is the rational
+    # multiplier exactly (no rounding) — caller applies as
+    # `reward * raw_num // raw_den`.
+    span_bps = (
+        REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS
+        - REWARD_CURVE_LARGE_THRESHOLD_BPS
+    )
+    t_bps = stake_bps - REWARD_CURVE_LARGE_THRESHOLD_BPS
+    raw_num = (
+        REWARD_CURVE_LARGE_FLOOR_DEN * (span_bps - t_bps)
+        + REWARD_CURVE_LARGE_FLOOR_NUM * t_bps
+    )
+    raw_den = REWARD_CURVE_LARGE_FLOOR_DEN * span_bps
+    return (raw_num, raw_den)
 
 
 class SupplyTracker:
@@ -609,6 +689,14 @@ class SupplyTracker:
             # post-block staking state — same value the sim mirror
             # in blockchain.py reads from sim_staked.
             curve_active = block_height >= REWARD_CURVE_HEIGHT
+            # Tier 37 — saturating-large band: at heights >=
+            # REWARD_CURVE_LARGE_BAND_HEIGHT, swap in
+            # `reward_curve_multiplier_v2` which interpolates the
+            # multiplier linearly from 1.0 down to LARGE_FLOOR between
+            # LARGE_THRESHOLD and LARGE_FLOOR_THRESHOLD.  Pre-Tier-37
+            # callers continue to invoke the legacy helper byte-for-
+            # byte; replay determinism preserved.
+            curve_v2_active = block_height >= REWARD_CURVE_LARGE_BAND_HEIGHT
             total_active_stake = (
                 sum(self.staked.values()) if curve_active else 0
             )
@@ -663,7 +751,10 @@ class SupplyTracker:
                         self.staked.get(eid, 0) * 10_000
                         // total_active_stake
                     )
-                    num, den = reward_curve_multiplier(stake_bps)
+                    if curve_v2_active:
+                        num, den = reward_curve_multiplier_v2(stake_bps)
+                    else:
+                        num, den = reward_curve_multiplier(stake_bps)
                     reward_amount = reward_amount * num // den
                 if cap_active and per_slot_reward > 0:
                     earned = self.attester_epoch_earnings.get(eid, 0)
