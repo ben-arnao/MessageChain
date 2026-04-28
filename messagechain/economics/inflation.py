@@ -1345,6 +1345,118 @@ class SupplyTracker:
 
         return slashed_amount, finder_reward
 
+    def burn_slash_proportional(
+        self,
+        offender_id: bytes,
+        slash_pct: int,
+        admission_basis: int | None = None,
+    ) -> int:
+        """Pure-burn slash drawing from `staked` AND `pending_unstakes`.
+
+        Tier 31: censorship and inclusion-list-violation apply paths
+        share this shape — the slash basis is (staked + pending) and
+        the burn is proportional across both buckets.  Mirrors the
+        partial-burn loop in ``slash_validator`` but with no finder
+        reward (those paths burn the full slashed amount).
+
+        ``admission_basis`` (optional) caps the slash at the basis
+        snapshotted when the evidence was admitted — protects against
+        an offender topping up post-evidence to inflate the slash, and
+        matches the censorship-evidence "snapshot at admission"
+        anchor.  Pass ``None`` to skip the cap (IL violation path,
+        which has no admission snapshot).
+
+        Returns the total amount burned (sum of stake_burn +
+        pending_burn).
+        """
+        if not 0 < slash_pct <= 100:
+            raise ValueError(
+                f"slash_pct must be in (0, 100], got {slash_pct}"
+            )
+
+        staked_amount = self.staked.get(offender_id, 0)
+        pending_amount = self.get_pending_unstake(offender_id)
+        basis = staked_amount + pending_amount
+        if admission_basis is not None and admission_basis < basis:
+            # Slash basis cannot exceed the admission snapshot — an
+            # offender who restakes after evidence admission must not
+            # see a larger slash than the censorship rule originally
+            # claimed against them.
+            basis = admission_basis
+        if basis == 0:
+            return 0
+
+        # Compute the requested total slash on the (capped) basis,
+        # then apportion proportionally to current staked vs pending.
+        # Apportioning AFTER capping ensures the cap binds the total
+        # burn, not the pre-cap fractions.
+        target_total = basis * slash_pct // 100
+        if target_total <= 0:
+            return 0
+
+        bucket_total = staked_amount + pending_amount
+        if bucket_total <= 0:
+            return 0
+        # Stake burn = floor(target_total × staked_amount / bucket_total).
+        # Pending burn picks up the remainder so the total burn equals
+        # target_total exactly (no rounding loss).
+        stake_burn = (target_total * staked_amount) // bucket_total
+        pending_burn = target_total - stake_burn
+        # Defensive clamps — never debit more than the bucket holds.
+        if stake_burn > staked_amount:
+            stake_burn = staked_amount
+        if pending_burn > pending_amount:
+            pending_burn = pending_amount
+        slashed_amount = stake_burn + pending_burn
+        if slashed_amount == 0:
+            return 0
+
+        db = self.db if hasattr(self, "db") else None
+        # Drain stake.
+        self.staked[offender_id] = staked_amount - stake_burn
+
+        # Drain pending — proportional rewrite of every entry, same
+        # shape as `slash_validator`'s partial-burn branch so the DB
+        # mirror logic is identical.
+        if pending_burn > 0 and offender_id in self.pending_unstakes:
+            # Apportion pending_burn across the offender's pending
+            # entries proportional to each entry's amount.  Last entry
+            # picks up the rounding remainder so the total drained
+            # equals pending_burn exactly.
+            entries = self.pending_unstakes[offender_id]
+            total_pending = sum(amt for amt, _ in entries)
+            rebuilt = []
+            running = 0
+            for idx, (amount, release_block) in enumerate(entries):
+                if idx == len(entries) - 1:
+                    drain = pending_burn - running
+                else:
+                    drain = (pending_burn * amount) // total_pending
+                    running += drain
+                # Defensive clamp.
+                if drain > amount:
+                    drain = amount
+                new_amount = amount - drain
+                if new_amount > 0:
+                    rebuilt.append((new_amount, release_block))
+            if rebuilt:
+                self.pending_unstakes[offender_id] = rebuilt
+            else:
+                del self.pending_unstakes[offender_id]
+            if db is not None and hasattr(db, "clear_all_pending_unstakes"):
+                db.clear_all_pending_unstakes(offender_id)
+            if db is not None and hasattr(db, "add_pending_unstake"):
+                for new_amount, release_block in rebuilt:
+                    db.add_pending_unstake(
+                        offender_id, new_amount, release_block,
+                    )
+
+        # Pure burn: no finder reward, no recipient — total burn
+        # leaves total_supply by the slashed amount.
+        self.total_supply -= slashed_amount
+        self.total_burned += slashed_amount
+        return slashed_amount
+
     def get_supply_stats(self, current_block_height: int = 0) -> dict:
         return {
             "total_supply": self.total_supply,

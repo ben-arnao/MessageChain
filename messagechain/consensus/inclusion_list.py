@@ -1239,15 +1239,39 @@ def process_inclusion_list_violation(
             _unamb,
             blockchain,
         )
+        slash_pct_for_basis = sev_pct
         slash_amount = (current_stake * sev_pct) // 100
     else:
         slash_amount = compute_violation_slash_amount(current_stake)
-    if slash_amount > 0:
+        # Pre-curve path: derive the equivalent percentage so Tier 31
+        # can apply the same percent against (staked + pending) when
+        # active.  ``compute_violation_slash_amount`` is a flat
+        # INCLUSION_VIOLATION_SLASH_BPS rate; expressing it as an
+        # integer percent matches the curve's output domain.
+        from messagechain.config import INCLUSION_VIOLATION_SLASH_BPS
+        slash_pct_for_basis = INCLUSION_VIOLATION_SLASH_BPS // 100
+    # Tier 31: widen slash basis to (staked + pending_unstakes).
+    # Closes the censor-then-unstake evasion — a colluding proposer
+    # who omits an inclusion-list-mandated tx and immediately unstakes
+    # cannot ride out the unbonding wait with stake intact.  Pre-
+    # Tier-31: legacy staked-only basis preserved byte-for-byte.
+    use_pending_basis = False
+    if current_height is not None:
+        from messagechain.config import (
+            CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT as _T31_H,
+        )
+        use_pending_basis = current_height >= _T31_H
+    if use_pending_basis and slash_pct_for_basis > 0:
+        slash_amount = blockchain.supply.burn_slash_proportional(
+            etx.accused_proposer_id, slash_pct_for_basis,
+        )
+    elif slash_amount > 0:
         blockchain.supply.staked[etx.accused_proposer_id] = (
             current_stake - slash_amount
         )
         blockchain.supply.total_supply -= slash_amount
         blockchain.supply.total_burned += slash_amount
+    if slash_amount > 0:
         # Tier 24: increment offense counter so the curve sees this
         # violation in subsequent severity calls (escalation +
         # rate-factor erosion both read it).  Pre-curve path skips

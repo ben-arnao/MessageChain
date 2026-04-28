@@ -4,7 +4,30 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.33.0] — 2026-04-28
+## [Unreleased]
+
+### Fixed
+- **Censorship & inclusion-list slashes now drain `pending_unstakes`
+  too — closes the unstake-evasion attack on the validator-collusion
+  defense (security).** Pre-fix, both `_apply_censorship_slash` and
+  `process_inclusion_list_violation` computed the slash percentage
+  against `staked` only and capped the burn at the post-unstake
+  remainder.  `EVIDENCE_MATURITY_BLOCKS` (~16 blocks ~ 2.7h) is far
+  shorter than `UNBONDING_PERIOD` (>14 days), so a coerced/colluding
+  validator could censor a high-fee-per-byte tx, immediately submit
+  an `unstake`, and ride out the unbonding queue with ≥90% of the
+  would-be slashed stake intact — the protocol's anchored top-priority
+  defense (validator collusion) was effectively gutted on mainnet.
+  Both apply paths now scale severity (curve-graded percentage from
+  Tier 30) against `staked + pending_unstakes` and drain
+  proportionally from BOTH buckets, mirroring the canonical pattern
+  at `validate_slash_transaction` and the equivocation-slash loop in
+  `slash_validator()`.  The change is hard-fork gated on the new
+  `CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT` (Tier 31, height 760) so
+  pre-fork replay is byte-identical.  A new
+  `SupplyTracker.burn_slash_proportional` helper centralizes the
+  pure-burn proportional-drain shape so future slash paths can reuse
+  it without reinventing the loop.
 
 ### Fixed
 - **State-root sim mirrors inclusion-list mutations.** A block carrying
