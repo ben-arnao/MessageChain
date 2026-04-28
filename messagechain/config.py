@@ -4324,6 +4324,52 @@ assert HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT > CENSORSHIP_SLASH_PENDING_UNSTAK
     "soft-slash paths Tier 30 missed (witness-non-response and "
     "bogus-rejection)."
 )
+# ─── Tier 34: forced-inclusion check covers all block tx-list fields ──
+# `check_forced_inclusion` (the attester-enforced soft censorship-
+# resistance gate) was scoped to message-only txs from day one: it
+# built `included_hashes` from `block.transactions` (the message-tx
+# list) only, and it accounted for byte budget via `len(tx.message)`
+# (payload bytes, not stored bytes).  Two correctness gaps fall out:
+#
+#   * **False positive on honest blocks carrying transfers.** Transfers
+#     share `mempool.pending` with messages — `get_forced_inclusion_set`
+#     returns them — but a proposer who correctly placed a forced
+#     transfer in `block.transfer_transactions` had its tx_hash absent
+#     from `included_hashes`, so attesters voted NO on an honest block.
+#     In production the gate has not bitten because mainnet traffic
+#     rarely keeps a transfer pending for FORCED_INCLUSION_WAIT_BLOCKS,
+#     but the trap is armed and would fire as transfer volume grows.
+#   * **False negative on the audit's anchored concern.** The CLAUDE.md
+#     anchor "a tx that is well-formed, pays at least the per-byte
+#     floor, and fits the byte budget cannot be suppressed by anything
+#     weaker than a full validator-set majority actively colluding AND
+#     willing to absorb slashing risk" silently exempted every non-
+#     message tx kind because the gate didn't enforce against them.
+#     A colluding proposer dropping high-fee transfers walked free.
+#
+# Tier 34 closes both: post-fork `included_hashes` walks every known
+# block tx-list field, and the byte budget uses stored bytes
+# (`len(tx.to_bytes())`) — the same axis the mempool already ranks
+# fee-per-byte by.  Pre-fork: byte-identical to legacy attester
+# behavior so any block accepted under the old rule still attests.
+#
+# Scope: this fork extends the gate to the tx kinds that the consensus
+# mempool already tracks (Message + Transfer).  Stake / Unstake /
+# Governance / Authority / React live in server-local pools or
+# separate sub-pools today and require a follow-up architectural lift
+# to bring them into the attester-shared mempool before the gate can
+# enforce against them.  That work is tracked separately; Tier 34 is
+# the prerequisite that makes the broader expansion mechanical.
+FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT = 763  # Tier 34
+assert (
+    FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
+    > HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT
+), (
+    "FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT must follow Tier 32 — the "
+    "attester-side rule change rides on top of the most recent "
+    "honesty-curve cluster so a single coordinated upgrade window "
+    "covers both."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
