@@ -165,6 +165,77 @@ def _decode_acks_observed(data: bytes, off: int):
     return acks, off
 
 
+def _encode_non_response_evidence_slot(
+    txs: list, block_number: int, tx_bytes_fn,
+) -> bytes:
+    """Wire encoding for ``Block.non_response_evidence_txs`` (Tier 35).
+
+    Strictly gated on ``NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT``:
+
+      * Pre-fork: emit ZERO bytes — no length prefix, no marker.  This
+        keeps the encoded blob byte-identical to the historical
+        encoding so blocks already on disk re-hash through the new
+        decoder unchanged.
+      * Post-fork: emit ``u32 count + N × (u32 len + tx_blob)`` like
+        every other tx-list slot.
+
+    ``tx_bytes_fn`` is the parent's per-tx encoder (so the optional
+    ``state=`` kwarg passes through cleanly).
+    """
+    import struct as _struct
+    from messagechain.config import (
+        NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT,
+    )
+    if int(block_number) < NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT:
+        return b""
+    parts = [_struct.pack(">I", len(txs))]
+    for tx in txs:
+        b = tx_bytes_fn(tx)
+        parts.append(_struct.pack(">I", len(b)))
+        parts.append(b)
+    return b"".join(parts)
+
+
+def _decode_non_response_evidence_slot(
+    data: bytes, off: int, block_number: int, tx_klass, state,
+):
+    """Inverse of :func:`_encode_non_response_evidence_slot`.
+
+    Returns ``(txs, new_off)``.  Pre-fork: returns ``([], off)``
+    without consuming any bytes — there is no slot to read.  Post-fork:
+    decodes a u32 count + N length-prefixed blobs.
+    """
+    import struct as _struct
+    from messagechain.config import (
+        NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT,
+    )
+    if int(block_number) < NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT:
+        return [], off
+    if off + 4 > len(data):
+        raise ValueError(
+            "Block blob truncated at non_response_evidence_txs count"
+        )
+    n = _struct.unpack_from(">I", data, off)[0]; off += 4
+    out: list = []
+    for _ in range(n):
+        if off + 4 > len(data):
+            raise ValueError(
+                "Block blob truncated at non_response_evidence_txs entry length"
+            )
+        ln = _struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + ln > len(data):
+            raise ValueError(
+                "Block blob truncated mid-non_response_evidence_txs entry"
+            )
+        blob = bytes(data[off:off + ln])
+        off += ln
+        try:
+            out.append(tx_klass.from_bytes(blob, state=state))
+        except TypeError:
+            out.append(tx_klass.from_bytes(blob))
+    return out, off
+
+
 def compute_merkle_root(tx_hashes: list[bytes]) -> bytes:
     """Compute Merkle root from a list of transaction hashes.
 
@@ -235,6 +306,7 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     cust_proofs  = list(getattr(block, "custody_proofs", []) or [])
     cens_txs     = list(getattr(block, "censorship_evidence_txs", []) or [])
     bogus_txs    = list(getattr(block, "bogus_rejection_evidence_txs", []) or [])
+    nre_txs      = list(getattr(block, "non_response_evidence_txs", []) or [])
     ilv_txs      = list(
         getattr(block, "inclusion_list_violation_evidence_txs", []) or []
     )
@@ -261,6 +333,13 @@ def canonical_block_tx_hashes(block) -> list[bytes]:
     out.extend(p.tx_hash for p in cust_proofs)
     out.extend(tx.tx_hash for tx in cens_txs)
     out.extend(tx.tx_hash for tx in bogus_txs)
+    # NonResponseEvidenceTx (Tier 35) commits via tx_hash.  Order
+    # follows the wire-format slot position (post-fork: trailing the
+    # react_transactions slot).  Pre-fork blocks carry an empty list
+    # here so this contributes zero hashes — the merkle commitment is
+    # byte-identical to the historical ordering when the slot is
+    # unused.
+    out.extend(tx.tx_hash for tx in nre_txs)
     # InclusionListViolationEvidenceTx commits via tx_hash.  Order
     # follows the wire-format slot order — append-only, never reorder.
     out.extend(tx.tx_hash for tx in ilv_txs)
@@ -775,6 +854,17 @@ class Block:
     # the issuer if the rejection was bogus.  One-phase, no maturity
     # window — see messagechain.consensus.bogus_rejection_evidence.
     bogus_rejection_evidence_txs: list = field(default_factory=list)
+    # Non-response evidence txs: first-class block slot, sibling to
+    # bogus_rejection_evidence_txs.  An entry carries a SubmissionRequest
+    # + WITNESS_QUORUM signed WitnessObservations as evidence that the
+    # request's target validator silently dropped a witnessed
+    # submission.  Apply path mirrors bogus-rejection exactly:
+    # one-phase admission gate + curve-graded slash drained
+    # proportionally from (staked + pending_unstakes).  Slot is wire-
+    # gated on NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT — pre-activation
+    # blocks emit no bytes for this field (byte-identical to historical
+    # encoding).  See messagechain.consensus.non_response_evidence.
+    non_response_evidence_txs: list = field(default_factory=list)
     # Inclusion-list violation evidence txs: first-class block slot.
     # An entry carries the full InclusionList that mandated a tx + the
     # omitted tx_hash + the accused proposer's height + entity_id.  At
@@ -902,6 +992,10 @@ class Block:
         if self.bogus_rejection_evidence_txs:
             result["bogus_rejection_evidence_txs"] = [
                 tx.serialize() for tx in self.bogus_rejection_evidence_txs
+            ]
+        if self.non_response_evidence_txs:
+            result["non_response_evidence_txs"] = [
+                tx.serialize() for tx in self.non_response_evidence_txs
             ]
         if self.inclusion_list_violation_evidence_txs:
             result["inclusion_list_violation_evidence_txs"] = [
@@ -1152,6 +1246,24 @@ class Block:
             # change: pre-Tier-17 binaries cannot decode blocks
             # emitted with this slot populated.
             enc_list(self.react_transactions),
+            # non_response_evidence_txs (Tier 35) — appended after
+            # react_transactions and STRICTLY GATED on
+            # NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT.  Pre-fork blocks
+            # emit ZERO bytes for this slot (NOT a u32 count of zero,
+            # not a marker, nothing); the encoded blob is byte-
+            # identical to the legacy encoding so historical blocks
+            # already on disk re-hash unchanged through the new
+            # decoder.  Post-fork blocks emit a u32 count + N entries
+            # like every other tx-list slot.  The decoder mirrors this
+            # gate by reading the header's block_number first and
+            # consulting the same height threshold.  Wire-format hard
+            # fork: pre-Tier-35 binaries cannot decode blocks emitted
+            # with this slot populated.
+            _encode_non_response_evidence_slot(
+                self.non_response_evidence_txs,
+                self.header.block_number,
+                _tx_bytes,
+            ),
             self.block_hash,
         ])
 
@@ -1385,6 +1497,21 @@ class Block:
         else:
             react_transactions = dec_list(ReactTransaction)
 
+        # non_response_evidence_txs (Tier 35) — height-gated.  Pre-fork
+        # this consumes zero bytes (no slot exists); post-fork it
+        # decodes a u32 count + N length-prefixed blobs.  The header's
+        # block_number was decoded above, so the decoder consults the
+        # same activation gate the encoder did.
+        from messagechain.consensus.non_response_evidence import (
+            NonResponseEvidenceTx,
+        )
+        non_response_evidence_txs, off = (
+            _decode_non_response_evidence_slot(
+                data, off, header.block_number,
+                NonResponseEvidenceTx, state,
+            )
+        )
+
         declared_hash = take(32)
         if off != len(data):
             raise ValueError("Block blob has trailing bytes")
@@ -1403,6 +1530,7 @@ class Block:
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+            non_response_evidence_txs=non_response_evidence_txs,
             inclusion_list_violation_evidence_txs=(
                 inclusion_list_violation_evidence_txs
             ),
@@ -1484,6 +1612,15 @@ class Block:
                 BogusRejectionEvidenceTx.deserialize(e)
                 for e in data["bogus_rejection_evidence_txs"]
             ]
+        non_response_evidence_txs = []
+        if data.get("non_response_evidence_txs"):
+            from messagechain.consensus.non_response_evidence import (
+                NonResponseEvidenceTx,
+            )
+            non_response_evidence_txs = [
+                NonResponseEvidenceTx.deserialize(e)
+                for e in data["non_response_evidence_txs"]
+            ]
         inclusion_list_violation_evidence_txs = []
         if data.get("inclusion_list_violation_evidence_txs"):
             from messagechain.consensus.inclusion_list import (
@@ -1530,6 +1667,7 @@ class Block:
                     custody_proofs=custody_proofs,
                     censorship_evidence_txs=censorship_evidence_txs,
                     bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
+                    non_response_evidence_txs=non_response_evidence_txs,
                     inclusion_list_violation_evidence_txs=(
                         inclusion_list_violation_evidence_txs
                     ),

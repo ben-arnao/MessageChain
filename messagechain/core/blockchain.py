@@ -221,6 +221,16 @@ def compute_block_sig_cost(block) -> int:
         # Each bogus-rejection-evidence tx carries one submitter
         # signature + one rejection signature — cost both.
         + 2 * len(getattr(block, "bogus_rejection_evidence_txs", []))
+        # Each non-response-evidence tx carries one submitter signature
+        # + one client signature on the embedded SubmissionRequest +
+        # WITNESS_QUORUM witness signatures.  Bound the per-tx cost at
+        # a small constant (the witness loop is bounded by quorum which
+        # is itself a small constant) so a same-block flood of NRE txs
+        # doesn't blow the per-block sig budget out of proportion.  We
+        # use 3 here (submitter + client + amortised witnesses) which
+        # tracks the audited verification cost a constant within ~2× of
+        # the actual quorum-bounded count.
+        + 3 * len(getattr(block, "non_response_evidence_txs", []))
         # Each inclusion-list violation evidence tx carries ONE
         # submitter signature.  The bundled InclusionList carries
         # variable-many attester report sigs, but those are amortised
@@ -7506,6 +7516,13 @@ class Blockchain:
             )
             if not ok:
                 return False, reason
+        for etx in getattr(block, "non_response_evidence_txs", []):
+            ok, reason = _check_leaf(
+                etx.submitter_id, etx.signature.leaf_index,
+                "non-response evidence tx",
+            )
+            if not ok:
+                return False, reason
         for etx in getattr(
             block, "inclusion_list_violation_evidence_txs", [],
         ):
@@ -9213,6 +9230,7 @@ class Blockchain:
         "custody_proofs",
         "censorship_evidence_txs",
         "bogus_rejection_evidence_txs",
+        "non_response_evidence_txs",
         "inclusion_list_violation_evidence_txs",
     )
 
@@ -9945,6 +9963,65 @@ class Blockchain:
                     f"stake_burned={result.slash_amount}, "
                     f"evidence={etx.evidence_hash.hex()[:16]}"
                 )
+
+        # Non-response evidence — one-phase apply mirroring the
+        # bogus-rejection loop above.  STRICTLY GATED on
+        # NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT: pre-fork the slot
+        # cannot exist on the wire (encoder emits zero bytes for it),
+        # so re-applying a historical block must skip the loop
+        # entirely — replay determinism.  Post-fork:
+        #   1. Re-run admission gate (validate_non_response_evidence_tx).
+        #   2. If accepted, hand to processor.process(); processor
+        #      checks deadline + ack registry + active-set + dedupe
+        #      and either slashes or no-ops.
+        #   3. On apply-time refusal (deadline not passed, obligation
+        #      met, etc.): NO fee, NO watermark bump — the evidence_tx
+        #      is rejected as if it never landed (matches bogus-
+        #      rejection's honest-rejection posture).
+        #   4. On admission: fee paid + watermark bumped; the slash
+        #      itself was applied inside process() against
+        #      `staked + pending_unstakes` via Tier 33's
+        #      `burn_slash_proportional` path.
+        from messagechain.config import (
+            NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT as _T35_H,
+        )
+        if block.header.block_number >= _T35_H:
+            for etx in getattr(block, "non_response_evidence_txs", []):
+                ok, reason = self.validate_non_response_evidence_tx(etx)
+                if not ok:
+                    logger.warning(
+                        f"NonResponseEvidenceTx {etx.tx_hash.hex()[:16]} "
+                        f"rejected at apply-time: {reason}"
+                    )
+                    continue
+                result = self.non_response_processor.process(
+                    etx, self, block.header.block_number,
+                )
+                if not result.accepted:
+                    # Apply-time refusal — no fee, no watermark bump.
+                    logger.info(
+                        f"NonResponseEvidenceTx {etx.tx_hash.hex()[:16]} "
+                        f"refused at apply-time: {result.reason}"
+                    )
+                    continue
+                if not self.supply.pay_fee_with_burn(
+                    etx.submitter_id, proposer_id, etx.fee, current_base_fee,
+                ):
+                    logger.error(
+                        f"NonResponseEvidenceTx {etx.tx_hash.hex()[:16]} fee "
+                        f"payment failed — skipping (state may drift)"
+                    )
+                    continue
+                self._bump_watermark(
+                    etx.submitter_id, etx.signature.leaf_index,
+                )
+                if result.slashed:
+                    logger.info(
+                        f"NON-RESPONSE-SLASHED validator "
+                        f"{result.offender_id.hex()[:16]}: "
+                        f"stake_burned={result.slash_amount}, "
+                        f"evidence={etx.evidence_hash.hex()[:16]}"
+                    )
 
         # ── InclusionListProcessor wiring (consensus-objective censorship
         # defence).  Three lifecycle hooks fire on every block apply:

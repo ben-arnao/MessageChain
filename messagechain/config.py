@@ -4431,6 +4431,47 @@ assert (
     "cluster so a single coordinated upgrade window covers both the "
     "slashing-basis (Tier 31/33) and attester-gate (Tier 34) changes."
 )
+# ─── Tier 35: NonResponseEvidenceTx block slot wired in ─────────────────
+# Audit finding #1 (2026-04-28).  Every prior NonResponseEvidenceTx
+# admission/processor change shipped dead code: ``Block`` had no
+# ``non_response_evidence_txs`` field, the canonical
+# ``_BLOCK_TX_LIST_ATTRS`` registries didn't list it, and
+# ``_apply_block_state`` never invoked ``NonResponseEvidenceProcessor``.
+# A coerced validator who silently dropped a witnessed POST could lose
+# nothing — categorical bypass of the validator-collusion anchor in
+# CLAUDE.md ("a tx that is well-formed, pays at least the per-byte
+# floor, and fits the byte budget cannot be suppressed by anything
+# weaker than a full validator-set majority actively colluding...").
+#
+# Tier 35 wires the slot end-to-end: dataclass field on ``Block``,
+# slot in both ``to_bytes`` / ``from_bytes`` (gated on this height),
+# entry in both forced-inclusion and Blockchain ``_BLOCK_TX_LIST_ATTRS``
+# registries, and an apply loop in ``_apply_block_state`` that mirrors
+# the bogus-rejection apply path exactly (Tier 32 curve + Tier 33
+# pending-unstake drain via ``burn_slash_proportional``).  Pre-fork:
+# the slot is not emitted on the wire (byte-identical to the historical
+# encoding) and the apply loop is skipped (replay determinism).
+NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT = 766  # Tier 35
+assert (
+    NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT
+    > NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
+), (
+    "NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT must follow Tier 33 — the "
+    "apply path consumes Tier 33's curve + pending-unstake drain shape, "
+    "so the prerequisite slashing-basis change must already be live "
+    "when the block slot first carries traffic."
+)
+assert (
+    NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT
+    > FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
+), (
+    "NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT must follow Tier 34 — the "
+    "forced-inclusion gate's multi-list path is what makes the new slot "
+    "visible to the censorship-resistance attester check; the gate must "
+    "already be in multi-list mode by the time the slot starts carrying "
+    "traffic so a forced NRE in its correct slot is not flagged as "
+    "censored."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
