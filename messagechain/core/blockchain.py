@@ -4609,10 +4609,11 @@ class Blockchain:
         # the sim set from self.supply.staked (same logic as
         # _apply_registration_grandfather).
         from messagechain.config import (
-            VALIDATOR_REGISTRATION_BURN as _VRB,
             VALIDATOR_REGISTRATION_BURN_HEIGHT as _VRBH,
+            get_validator_registration_burn,
         )
         _reg_burn_active = block_height >= _VRBH
+        _reg_burn_amount = get_validator_registration_burn(block_height)
         sim_registered = set(self.supply.registered_validators)
         if (
             _reg_burn_active
@@ -4628,23 +4629,28 @@ class Blockchain:
                 and stx.entity_id not in sim_public_keys
             ):
                 sim_public_keys[stx.entity_id] = stx.sender_pubkey
-            # Registration burn mirror.  Aborts the sim for this tx
-            # when the entity lacks balance for stake + burn — matches
-            # _apply_validator_registration_burn's False return in the
-            # apply path, which skips fee + stake + nonce.
+            # Registration mirror.  Tier 6 .. Tier 29: charge the burn
+            # against entity balance and add to ``sim_registered``;
+            # aborts the sim for this tx when the entity lacks balance
+            # for stake + burn — matches _apply_validator_registration_burn's
+            # False return in the apply path, which skips fee + stake +
+            # nonce.  Tier 29+: burn=0, the entity still gets added to
+            # ``sim_registered`` so a future re-introduction of a burn
+            # cannot double-charge.
             if (
                 _reg_burn_active
                 and stx.entity_id not in sim_registered
             ):
-                _required = stx.amount + _VRB
+                _required = stx.amount + _reg_burn_amount
                 if sim_balances.get(stx.entity_id, 0) < _required:
                     # Apply path skips the tx wholesale — no sim state
                     # change here either (no balance, nonce, stake, or
                     # watermark mutation).
                     continue
-                sim_balances[stx.entity_id] = (
-                    sim_balances.get(stx.entity_id, 0) - _VRB
-                )
+                if _reg_burn_amount:
+                    sim_balances[stx.entity_id] = (
+                        sim_balances.get(stx.entity_id, 0) - _reg_burn_amount
+                    )
                 sim_registered.add(stx.entity_id)
             effective_base_fee = min(current_base_fee, stx.fee)
             tip = stx.fee - effective_base_fee
@@ -8306,16 +8312,13 @@ class Blockchain:
         # tx that would drop at apply-time never lands in a validated
         # block.  Pre-activation: burn=0; grandfathered/re-stake:
         # already-registered entities pay no burn.
-        from messagechain.config import (
-            VALIDATOR_REGISTRATION_BURN as _VRB_VALIDATE,
-            VALIDATOR_REGISTRATION_BURN_HEIGHT as _VRBH_VALIDATE,
-        )
+        # Tier 29 zeroes the burn at activation; Tier 6 set it to 10_000.
+        # The helper resolves the right value per height; an entity already
+        # in registered_validators pays nothing regardless.
+        from messagechain.config import get_validator_registration_burn
         reg_burn = 0
-        if (
-            apply_height >= _VRBH_VALIDATE
-            and stx.entity_id not in self.supply.registered_validators
-        ):
-            reg_burn = _VRB_VALIDATE
+        if stx.entity_id not in self.supply.registered_validators:
+            reg_burn = get_validator_registration_burn(apply_height)
         needed = spent_so_far + stx.fee + stx.amount + reg_burn
         available = self.get_spendable_balance(stx.entity_id) + credited_so_far
         if available < needed:
@@ -9155,30 +9158,41 @@ class Blockchain:
         deliberately do not clear the mark on full unstake.
         """
         from messagechain.config import (
-            VALIDATOR_REGISTRATION_BURN,
             VALIDATOR_REGISTRATION_BURN_HEIGHT,
+            get_validator_registration_burn,
         )
+        # Pre-Tier-6: the burn fork hasn't activated; the set never
+        # populates (preserves byte-for-byte legacy replay semantics).
         if block_height < VALIDATOR_REGISTRATION_BURN_HEIGHT:
             return True
         if stx.entity_id in self.supply.registered_validators:
             return True
-        # First registration post-activation: require enough balance for
-        # BOTH stake and the registration burn (validate_stake_tx_in_block
-        # has its own fork-aware pre-check; this is the apply-time
-        # guard that makes the burn safe against a validator that
-        # bypassed validation).
-        required = stx.amount + VALIDATOR_REGISTRATION_BURN
+        burn = get_validator_registration_burn(block_height)
+        if burn == 0:
+            # Tier 29+: first-time registration carries no burn.  Still
+            # add to ``registered_validators`` so any future re-introduction
+            # of a non-zero burn cannot double-charge already-tracked
+            # validators.  Reachable only at/post Tier 29 — pre-Tier-29
+            # the helper returns the non-zero Tier 6 burn (and pre-Tier-6
+            # this code path short-circuits above).
+            self.supply.registered_validators.add(stx.entity_id)
+            return True
+        # First registration in the Tier-6 .. Tier-29 era: require
+        # enough balance for BOTH stake and the registration burn
+        # (validate_stake_tx_in_block has its own fork-aware pre-check;
+        # this is the apply-time guard that makes the burn safe against
+        # a validator that bypassed validation).
+        required = stx.amount + burn
         if self.supply.get_balance(stx.entity_id) < required:
             return False
         # Burn the registration fee from the entity's balance.  This is
         # a pure burn (not diverted to the attester pool or proposer);
         # it exists to raise the sybil cost of spawning validators.
         self.supply.balances[stx.entity_id] = (
-            self.supply.get_balance(stx.entity_id)
-            - VALIDATOR_REGISTRATION_BURN
+            self.supply.get_balance(stx.entity_id) - burn
         )
-        self.supply.total_supply -= VALIDATOR_REGISTRATION_BURN
-        self.supply.total_burned += VALIDATOR_REGISTRATION_BURN
+        self.supply.total_supply -= burn
+        self.supply.total_burned += burn
         self.supply.registered_validators.add(stx.entity_id)
         return True
 

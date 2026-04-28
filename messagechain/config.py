@@ -780,6 +780,24 @@ MIN_STAKE_RAISE_HEIGHT = 701  # Tier 2 — fast-forwarded for 1.26.0 hard fork s
 VALIDATOR_MIN_STAKE_FAUCET_DRIP = 300
 MIN_STAKE_FAUCET_DRIP_HEIGHT = 14_000  # Tier 28
 
+# Tier 29: a single faucet drip funds a full validator end-to-end.
+# Tier 28 set the stake floor to FAUCET_DRIP, but a wallet holding
+# exactly one drip still cannot pay the stake-tx fee floor
+# (``MIN_FEE`` = 100; the Tier-16 protocol floor is 1, but stake-tx
+# admission carries its own type-specific 100-token floor) without
+# dipping below the stake floor — and Tier 6's
+# VALIDATOR_REGISTRATION_BURN=10_000 dominates first-time registration
+# regardless.  Tier 29 closes both gaps: the stake floor drops by one
+# MIN_FEE (so 300 drip = 100 fee + 200 stake works) and first-time
+# registration carries no burn at/post activation.  Sybil floor stays
+# at one drip per validator + the faucet's per-/24 + PoW limits — same
+# posture as Tier 28, just actually achievable from a single drip.
+# VALIDATOR_MIN_STAKE_TIER29 is pinned to FAUCET_DRIP - MIN_FEE by an
+# assert further down (after MIN_FEE is defined above us, FAUCET_DRIP
+# is imported lazily by the assert helper).
+VALIDATOR_MIN_STAKE_TIER29 = 200  # = FAUCET_DRIP (300) - MIN_FEE (100)
+VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT = 16_000  # Tier 29
+
 
 def get_validator_min_stake(block_height: int) -> int:
     """Return the validator minimum stake in effect at ``block_height``.
@@ -787,7 +805,9 @@ def get_validator_min_stake(block_height: int) -> int:
     Hard-fork-gated:
       * pre-Tier-2: legacy 100-token floor.
       * Tier 2 .. Tier 28: 10_000-token post-raise floor.
-      * Tier 28+: one-faucet-drip floor (VALIDATOR_MIN_STAKE_FAUCET_DRIP).
+      * Tier 28 .. Tier 29: one-faucet-drip floor (300).
+      * Tier 29+: drip-minus-fee-floor (299), so a single drip funds
+        stake + fee end to end.
 
     Used by every fresh-stake / partial-unstake enforcement site.
     The apply-time active-set filter (proposer-selection, validator-
@@ -796,11 +816,33 @@ def get_validator_min_stake(block_height: int) -> int:
     participation rights indefinitely; only NEW stake ops see the
     raised bar.
     """
+    if block_height >= VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT:
+        return VALIDATOR_MIN_STAKE_TIER29
     if block_height >= MIN_STAKE_FAUCET_DRIP_HEIGHT:
         return VALIDATOR_MIN_STAKE_FAUCET_DRIP
     if block_height >= MIN_STAKE_RAISE_HEIGHT:
         return VALIDATOR_MIN_STAKE_POST_RAISE
     return VALIDATOR_MIN_STAKE
+
+
+def get_validator_registration_burn(block_height: int) -> int:
+    """Return the first-time validator-registration burn at ``block_height``.
+
+    Hard-fork-gated:
+      * pre-Tier-6: 0 (the burn fork hasn't activated).
+      * Tier 6 .. Tier 29: ``VALIDATOR_REGISTRATION_BURN`` (10_000).
+      * Tier 29+: 0 — Tier 28 collapsed sybil-defense to the stake
+        floor itself; the additional burn no longer pulls its weight
+        once one drip is supposed to fund a fresh validator.
+
+    Already-registered entities pay nothing regardless; this helper
+    only governs the FIRST-time registration cost.
+    """
+    if block_height >= VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT:
+        return 0
+    if block_height >= VALIDATOR_REGISTRATION_BURN_HEIGHT:
+        return VALIDATOR_REGISTRATION_BURN
+    return 0
 
 
 assert _MAINNET_FOUNDER_STAKE >= VALIDATOR_MIN_STAKE_POST_RAISE, (
@@ -4192,6 +4234,18 @@ assert MIN_STAKE_FAUCET_DRIP_HEIGHT > REACT_NO_SELF_MESSAGE_HEIGHT, (
     "MIN_STAKE_FAUCET_DRIP_HEIGHT must follow REACT_NO_SELF_MESSAGE_HEIGHT — "
     "Tier 28 rides above the highest established fork (Tier 27 react-self-"
     "rule) with the standard runway buffer."
+)
+assert VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT > MIN_STAKE_FAUCET_DRIP_HEIGHT, (
+    "VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT must follow "
+    "MIN_STAKE_FAUCET_DRIP_HEIGHT — Tier 29 lowers the floor below Tier 28's "
+    "and zeroes the Tier 6 registration burn, so the order matters: callers "
+    "between the two heights still see the Tier 28 floor + Tier 6 burn."
+)
+assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
+    "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
+    "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
+    "where MIN_FEE is the stake-tx fee floor; if either FAUCET_DRIP or "
+    "MIN_FEE moves, this constant moves with them"
 )
 # Pin VALIDATOR_MIN_STAKE_FAUCET_DRIP to FAUCET_DRIP so the two cannot drift.
 # Imported lazily below to avoid a top-of-module import cycle if any future
