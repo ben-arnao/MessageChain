@@ -547,6 +547,48 @@ def build_parser() -> argparse.ArgumentParser:
              "when --fee is set.",
     )
 
+    # --- react ---
+    react = sub.add_parser(
+        "react",
+        help="React (up/down/clear) to a message or user",
+        description=(
+            "Cast a signed reaction vote against a message tx_hash "
+            "(default) or another entity_id (--target-type user).  "
+            "Each (voter, target) pair has a single latest choice on "
+            "chain; submitting again with --choice clear retracts the "
+            "prior vote.  Self-trust votes are rejected; reacting to "
+            "your own message is allowed."
+        ),
+    )
+    react.add_argument(
+        "target", type=str,
+        help="64-hex-char target (message tx_hash by default, or "
+             "entity_id when --target-type=user)",
+    )
+    react.add_argument(
+        "--choice", choices=("up", "down", "clear"), required=True,
+        help="up = +1, down = -1, clear = retract prior vote",
+    )
+    react.add_argument(
+        "--target-type", dest="target_type",
+        choices=("message", "user"), default="message",
+        help="message = react to a message tx_hash (default); user = "
+             "user-trust vote against an entity_id",
+    )
+    react.add_argument(
+        "--fee", type=int, default=None,
+        help="Transaction fee (auto-detected if omitted)",
+    )
+    react.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port (default: 127.0.0.1:9334)",
+    )
+    react.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
+             "when --fee is set.",
+    )
+
     # --- generate-key ---
     sub.add_parser(
         "generate-key",
@@ -4067,6 +4109,117 @@ def cmd_vote(args):
         sys.exit(1)
 
 
+def cmd_react(args):
+    """Cast an up/down/clear reaction against a message tx_hash or entity_id."""
+    from messagechain.identity.identity import Entity
+    from messagechain.core.reaction import (
+        create_react_transaction,
+        REACT_CHOICE_CLEAR,
+        REACT_CHOICE_UP,
+        REACT_CHOICE_DOWN,
+    )
+
+    choice_map = {
+        "up": REACT_CHOICE_UP,
+        "down": REACT_CHOICE_DOWN,
+        "clear": REACT_CHOICE_CLEAR,
+    }
+    choice = choice_map[args.choice]
+    target_is_user = (args.target_type == "user")
+
+    target_hex = args.target.strip()
+    if len(target_hex) != 64:
+        print(
+            f"Error: target must be exactly 64 hex chars "
+            f"(got {len(target_hex)})."
+        )
+        sys.exit(1)
+    try:
+        target_bytes = bytes.fromhex(target_hex)
+    except ValueError:
+        print("Error: target is not valid hex.")
+        sys.exit(1)
+
+    label = "user-trust" if target_is_user else "message-react"
+    print(f"=== React ({label}, {args.choice.upper()}) ===\n")
+    print(f"  Target: {target_hex[:16]}...")
+
+    private_key = _resolve_private_key(args)
+    entity = Entity.create(private_key)
+    print(f"\nReacting as: {entity.entity_id_hex[:16]}...")
+
+    if target_is_user and target_bytes == entity.entity_id:
+        print("Error: cannot cast a user-trust vote on yourself.")
+        sys.exit(1)
+
+    host, port = _parse_server(args.server)
+    from client import rpc_call
+
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": entity.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    nonce = nonce_resp["result"]["nonce"]
+    watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=watermark,
+        data_dir=getattr(args, "data_dir", None),
+    )
+
+    fee = args.fee
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee as auto_fee_helper,
+            urgency_to_target_blocks,
+        )
+        urgency = getattr(args, "urgency", "normal")
+        info_resp = rpc_call(host, port, "get_chain_info", {})
+        target_height = None
+        if info_resp.get("ok"):
+            count = info_resp["result"].get("height", 0) or 0
+            target_height = max(count - 1, 0) + 1
+        est_resp = rpc_call(host, port, "estimate_fee", {
+            "kind": "react",
+            "target_blocks": urgency_to_target_blocks(urgency),
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            est_resp["result"].get("mempool_fee", 0)
+            if est_resp.get("ok") else 0
+        )
+        fee = auto_fee_helper(
+            "react",
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+
+    tx = create_react_transaction(
+        entity,
+        target=target_bytes,
+        target_is_user=target_is_user,
+        choice=choice,
+        nonce=nonce,
+        fee=fee,
+    )
+
+    response = rpc_call(host, port, "submit_react", {
+        "transaction": tx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print(f"\nReaction submitted!")
+        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  Fee:     {result.get('fee', fee)} tokens")
+    else:
+        print(f"\nFailed: {response.get('error')}")
+        sys.exit(1)
+
+
 def cmd_generate_key(_args):
     """Generate a full key pair offline (private key, public key, entity ID)."""
     import os
@@ -6525,6 +6678,7 @@ def main():
         "key-status": cmd_key_status,
         "propose": cmd_propose,
         "vote": cmd_vote,
+        "react": cmd_react,
         "generate-key": cmd_generate_key,
         "verify-key": cmd_verify_key,
         "read": cmd_read,
