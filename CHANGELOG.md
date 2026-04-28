@@ -4,6 +4,25 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.32.0] — 2026-04-28
+
+### Changed
+- **Hard fork sweep — Tier 24-29 activation heights compressed to
+  750-755.** The long-runway tier schedule (`HONESTY_CURVE_RATE_HEIGHT`
+  5000, `COMMUNITY_ID_HEIGHT` 8000, `REVOKE_TX_WINDOW_HEIGHT` 10000,
+  `REACT_NO_SELF_MESSAGE_HEIGHT` 12000, `MIN_STAKE_FAUCET_DRIP_HEIGHT`
+  14000, `VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT` 16000) is fast-forwarded
+  to land back-to-back at 750/751/752/753/754/755 — immediately above
+  the existing Tier 20-23 cluster (716-720). Mirrors the 1.26.0 sweep
+  convention: one block per tier, monotone ordering, both validators
+  upgrade in lockstep. Mainnet tip at cut was ~716, so the pack lands
+  ~34 blocks ahead — buffer covers the rolling-upgrade window during
+  which one validator keeps producing under old code while the other
+  is being upgraded. Test fixtures that sampled fixed offsets past
+  prior fork heights are tightened to mid-band of the relevant fork
+  era so they don't accidentally cross into a later tier as gaps
+  shrink. (f2fa300, 77698bd)
+
 ## [1.31.0] — 2026-04-28
 
 ### Changed
