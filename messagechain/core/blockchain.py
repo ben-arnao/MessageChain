@@ -5864,9 +5864,21 @@ class Blockchain:
             authority_txs or [],
             stake_transactions or [],
             unstake_transactions or [],
+            # Tier 17: ReactTransactions MUST be walked here too — the
+            # apply path bumps the voter's leaf_watermark via
+            # _bump_watermark, so a proposer who signed their own react
+            # earlier (now in mempool) needs _next_leaf advanced past
+            # the react's leaf BEFORE expected_proposer_leaf is read.
+            # ReactTransaction uses `voter_id`, not `entity_id`, so the
+            # generic getattr below also falls back to voter_id.
+            # Symmetric to the 1.29.3 validator-side _append_block fix.
+            react_transactions or [],
         ):
             for tx in tx_list:
-                tx_entity = getattr(tx, "entity_id", None)
+                tx_entity = (
+                    getattr(tx, "entity_id", None)
+                    or getattr(tx, "voter_id", None)
+                )
                 if tx_entity == proposer_id:
                     sig = getattr(tx, "signature", None)
                     if sig is not None and hasattr(sig, "leaf_index"):
