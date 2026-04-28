@@ -4,6 +4,31 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.29.3] — 2026-04-28
+
+Critical consensus hotfix — `_append_block`'s pre-apply
+state_root simulation was missing `react_transactions=` in its
+`compute_post_state_root` call.  The proposer side
+(`Blockchain.propose_block`) passes the react list so the sim
+mirrors the voter's fee/nonce/leaf-watermark bumps and the
+`reaction_state.choices` delta; the validator-side re-sim in
+`_append_block` did not.  Result: proposer commits a state_root
+computed WITH react TXs in scope, validator re-simulates WITHOUT
+them, the two diverge, and any honest block carrying even one
+react tx self-rejects at the pre-apply check with `Invalid
+state_root — state commitment mismatch`.
+
+This was the actual root cause behind the entire 1.27/1.28/1.29
+react-TX-stalls-the-chain saga.  Pinpointed via the per-leaf
+diagnostic added in 1.29.1/1.29.2 — the diagnostic showed
+`committed=1fed22fc... simulated=9024cbb1... react=1
+current_reaction_choices=0`, which is exactly the signature of
+the validator sim seeing zero react TXs while the proposer's sim
+saw one.
+
+Fix is one kwarg.  No on-chain consequences for pre-fix history
+(no react tx ever landed; the bug prevented it).
+
 ## [1.29.2] — 2026-04-28
 
 Diagnostic-only.  Adds a pre-apply state_root mismatch diagnostic

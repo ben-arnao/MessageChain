@@ -11239,6 +11239,24 @@ class Blockchain:
                     bogus_rejection_evidence_txs=getattr(
                         block, "bogus_rejection_evidence_txs", [],
                     ),
+                    # Tier 17 ReactTransactions MUST be threaded
+                    # through the validator-side re-simulation too —
+                    # propose_block passes them when computing the
+                    # committed state_root, so an add_block that
+                    # omits them here re-simulates without the react
+                    # voter's nonce / balance / leaf-watermark bumps
+                    # AND without the reaction_state.choices delta.
+                    # Both contributions miss → simulated_root
+                    # diverges from the proposer's committed root,
+                    # and any honest block with a react tx
+                    # self-rejects at the pre-apply check.  Mainnet
+                    # symptom: every block with a react tx logged
+                    # "Invalid state_root — state commitment
+                    # mismatch" until the chain-tip mempool was
+                    # drained.
+                    react_transactions=getattr(
+                        block, "react_transactions", []
+                    ),
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and
