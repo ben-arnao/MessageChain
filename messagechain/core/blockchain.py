@@ -4891,6 +4891,7 @@ class Blockchain:
         from messagechain.config import (
             ATTESTER_REWARD_SPLIT_HEIGHT,
             ATTESTER_COMMITTEE_TARGET_SIZE,
+            ATTESTER_DYNAMIC_COMMITTEE_HEIGHT,
             PROPOSER_CAP_HALVING_HEIGHT,
         )
         reward = self.supply.calculate_block_reward(block_height)
@@ -4948,10 +4949,22 @@ class Blockchain:
         # Committee-size policy: pre-activation, the committee is
         # implicitly capped at what the pool can afford at 1 token per
         # slot (permanently 3 at BLOCK_REWARD_FLOOR — a decentralization
-        # failure).  Post-activation we decouple: the committee is
-        # sized by consensus policy (ATTESTER_COMMITTEE_TARGET_SIZE)
-        # and the pool is divided pro-rata across the full committee.
-        if block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
+        # failure).  Post-Tier-4 (ATTESTER_REWARD_SPLIT_HEIGHT) we
+        # decouple: committee sized by consensus policy
+        # (ATTESTER_COMMITTEE_TARGET_SIZE) and pool divided pro-rata.
+        # Post-Tier-35 (ATTESTER_DYNAMIC_COMMITTEE_HEIGHT) the committee
+        # SHRINKS when the pool can't afford 1 token per target slot:
+        # `committee_size = min(target, attester_pool)`.  Selection
+        # rule, randomness, and stake-weighted blending unchanged —
+        # only the paid prefix length shrinks so per_slot >= 1 once
+        # the pool is non-zero.  Closes the floor-era zero-issuance
+        # failure (3 // 128 = 0 forever) and the genesis-era 116-slot
+        # waste (12 // 128 = 0 for 116 slots).
+        if block_height >= ATTESTER_DYNAMIC_COMMITTEE_HEIGHT:
+            committee_size = min(
+                ATTESTER_COMMITTEE_TARGET_SIZE, attester_pool
+            )
+        elif block_height >= ATTESTER_REWARD_SPLIT_HEIGHT:
             committee_size = ATTESTER_COMMITTEE_TARGET_SIZE
         else:
             committee_size = attester_pool // ATTESTER_REWARD_PER_SLOT
@@ -10238,12 +10251,21 @@ class Blockchain:
             PROPOSER_REWARD_NUMERATOR, PROPOSER_REWARD_DENOMINATOR,
             ATTESTER_REWARD_SPLIT_HEIGHT,
             ATTESTER_COMMITTEE_TARGET_SIZE,
+            ATTESTER_DYNAMIC_COMMITTEE_HEIGHT,
         )
         block_reward = self.supply.calculate_block_reward(block.header.block_number)
         attester_pool_tokens = block_reward - (
             block_reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
         )
-        if block.header.block_number >= ATTESTER_REWARD_SPLIT_HEIGHT:
+        # Tier 35: dynamic committee shrinks when the pool can't afford
+        # 1 token per target slot.  Mirrors the sim path in
+        # _simulate_block_reward_distribution; both must compute the
+        # same committee_size or state_root diverges.
+        if block.header.block_number >= ATTESTER_DYNAMIC_COMMITTEE_HEIGHT:
+            committee_size = min(
+                ATTESTER_COMMITTEE_TARGET_SIZE, attester_pool_tokens
+            )
+        elif block.header.block_number >= ATTESTER_REWARD_SPLIT_HEIGHT:
             committee_size = ATTESTER_COMMITTEE_TARGET_SIZE
         else:
             committee_size = attester_pool_tokens // ATTESTER_REWARD_PER_SLOT
