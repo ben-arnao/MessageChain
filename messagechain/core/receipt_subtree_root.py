@@ -100,6 +100,17 @@ class SetReceiptSubtreeRootTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path records (entity_id -> root_public_key) in the
+        receipt-subtree-roots map and pays the fee.  Nonce-free /
+        leaf-free on the hot side (signed by cold key); the
+        receipt_subtree_root field is NOT inside the per-entity SMT
+        leaf commitment, but the fee debit + balance change IS.  So
+        entity_id's state_tree row must refresh on apply.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

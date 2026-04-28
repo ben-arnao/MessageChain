@@ -81,6 +81,15 @@ class SetAuthorityKeyTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path installs the new authority key on entity_id and
+        bumps the entity's nonce + leaf_watermark + balance (fee).
+        new_authority_key is a raw public key, not a registered entity,
+        so only entity_id needs its state_tree row refreshed.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

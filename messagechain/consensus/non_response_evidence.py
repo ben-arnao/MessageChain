@@ -127,6 +127,14 @@ class NonResponseEvidenceTx:
         """
         return _h(_DOMAIN_TAG + self.request.request_hash)
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the submitter's fee + bumps their
+        leaf_watermark; on accepted slash the target validator
+        (offender) is burned in the same block.  Both mutate in the
+        admission block.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.submitter_id, self.offender_id}
+
     def _signable_data(self) -> bytes:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         # Bind the observation_hash list (sorted for determinism) so a

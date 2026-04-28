@@ -295,6 +295,15 @@ class CustodyProof:
     # proofs before signing) but will FAIL verify_custody_proof.
     signature: object = None
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path credits archive-reward payouts to the prover's
+        balance and (when the prover has an on-chain pubkey) bumps
+        their leaf_watermark.  Both are inside the per-entity SMT leaf
+        commitment, so prover_id's state_tree row must refresh.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.prover_id}
+
     def serialize(self) -> dict:
         return {
             "version": ARCHIVE_CHALLENGE_VERSION,

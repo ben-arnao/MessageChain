@@ -138,6 +138,16 @@ class RevokeTransaction:
             int(self.valid_to_height),
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path flips entity_id into the revoked set and pays the
+        fee from entity_id's balance.  Nonce-free / leaf-free on the
+        hot side (signed by cold key, leaf consumed in cold tree's
+        namespace), but the revoked flag IS in the per-entity leaf
+        commitment, so entity_id's state_tree row must refresh.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

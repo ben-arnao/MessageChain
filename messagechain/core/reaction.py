@@ -213,6 +213,22 @@ class ReactTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """React apply mutates the voter's nonce, balance (fee), and
+        leaf_watermark.  The target's per-entity state_tree row is NOT
+        touched — `target` (whether a user entity_id or a message
+        tx_hash) is only used to key into the separate
+        ReactionState.choices map, whose contribution to state_root
+        mixes via reaction_state.state_root_contribution(), not via
+        the per-entity SMT.  So the only state_tree row that needs
+        refreshing is the voter's.
+
+        This is the exact mutation set the 1.28.6 fix taught the
+        sweep — see Blockchain._block_affected_entities pre-refactor
+        for the historical hand-rolled equivalent.
+        """
+        return {self.voter_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

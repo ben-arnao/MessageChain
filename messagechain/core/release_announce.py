@@ -129,6 +129,15 @@ class ReleaseAnnounceTransaction:
         if not self.tx_hash:
             self.tx_hash = self._compute_hash()
 
+    def affected_entities(self) -> set[bytes]:
+        """ReleaseAnnounce is committee-signed, not per-entity.  No fee,
+        no nonce, no entity to debit.  Apply path only updates the
+        ``latest_release_manifest`` scalar (NOT inside the per-entity
+        SMT leaf commitment).  Empty set — no state_tree rows touched.
+        See CLAUDE.md canonical registry contract.
+        """
+        return set()
+
     # ──────────────────────────────────────────────────────────────
     # Signable data
     # ──────────────────────────────────────────────────────────────

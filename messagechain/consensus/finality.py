@@ -112,6 +112,18 @@ class FinalityVote:
     signed_at_height: int
     signature: Signature
 
+    def affected_entities(self) -> set[bytes]:
+        """Finality-vote apply bumps signer_entity_id's leaf_watermark
+        (consumes a WOTS+ leaf) and either mints the inclusion reward
+        to the proposer or transfers it from treasury (depends on
+        FINALITY_REWARD_FROM_ISSUANCE_HEIGHT activation).  The
+        leaf_watermark mutation is inside the per-entity SMT leaf
+        commitment, so signer_entity_id's state_tree row must refresh.
+        Proposer + treasury are added by the block-level sweep.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.signer_entity_id}
+
     def _signable_data(self) -> bytes:
         """Bytes the signer commits to.
 

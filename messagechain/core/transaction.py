@@ -312,6 +312,23 @@ class MessageTransaction:
     def _compute_hash(self) -> bytes:
         return default_hash(self._signable_data())
 
+    def affected_entities(self) -> set[bytes]:
+        """Entities whose state_tree row this tx mutates on apply.
+
+        Canonical "tx -> touched entities" registration consumed by
+        Blockchain._block_affected_entities.  See CLAUDE.md "every new
+        tx kind registers itself" — the per-tx-class method is the
+        single source of truth so a new tx kind can't half-land in the
+        sweep.
+
+        For MessageTransaction, the only mutated entity is the sender
+        (entity_id): nonce++, balance debit (fee), leaf_watermark bump,
+        plus first-send pubkey install on a v3+ tx with sender_pubkey.
+        community_id is metadata, not an entity reference.  prev is a
+        structural pointer, not an entity reference.
+        """
+        return {self.entity_id}
+
     def _compute_witness_hash(self) -> bytes:
         """Hash covering both transaction data AND signature.
 

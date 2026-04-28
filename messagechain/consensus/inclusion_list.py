@@ -948,6 +948,14 @@ class InclusionListViolationEvidenceTx:
             + struct.pack(">Q", int(self.accused_height))
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the submitter's fee + bumps their
+        leaf_watermark; on accepted slash the accused proposer's stake
+        is burned in the same block.  Both mutate in the admission
+        block.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.submitter_id, self.accused_proposer_id}
+
     def _signable_data(self) -> bytes:
         sig_version = getattr(
             self.signature, "sig_version", SIG_VERSION_CURRENT,

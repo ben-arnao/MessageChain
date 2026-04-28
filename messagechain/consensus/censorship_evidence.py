@@ -110,6 +110,17 @@ class CensorshipEvidenceTx:
             + self.message_tx.tx_hash
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the submitter's fee + bumps their
+        leaf_watermark, and on maturity (a later block) burns the
+        offender's stake.  At admission time only the submitter's
+        state_tree row mutates; the offender's mutation lands in the
+        block where the evidence matures (caller passes a
+        non-evidence sweep there).  See CLAUDE.md canonical registry
+        contract.
+        """
+        return {self.submitter_id}
+
     def _signable_data(self) -> bytes:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return b"".join([
