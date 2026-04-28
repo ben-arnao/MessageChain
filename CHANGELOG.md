@@ -4,6 +4,51 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.30.1] — 2026-04-27
+
+Patch release.  Internal refactor that closes a latent dirty-set
+scoping miss across several tx kinds, plus a homepage UX cleanup.
+No consensus / state-root behavior change vs 1.30.0.
+
+### Changed
+
+- **Affected-entities sweep collapsed into a per-tx-class canonical
+  registry** (29d6301, 15c2f07).  `_block_affected_entities` now
+  walks a canonical `_BLOCK_TX_LIST_ATTRS` tuple and dispatches to a
+  single `affected_entities() -> set[bytes]` method on each tx
+  class, replacing the N hand-rolled per-kind branches that were
+  the structural shape behind the 1.27/1.28/1.29 react-tx-stalls
+  saga.  A structural-guard test walks every tx-like class in
+  `messagechain/core`, `messagechain/consensus`, and
+  `messagechain/governance` and asserts the method exists, so
+  adding a new tx kind without registering it now fails loudly
+  instead of silently mis-scoping `_persist_state` dirty sets.
+
+### Fixed
+
+- **Latent dirty-set scoping miss for several tx kinds** (29d6301).
+  The legacy sweep silently omitted `governance_txs`,
+  `finality_votes`, `custody_proofs`, `censorship_evidence_txs`,
+  `bogus_rejection_evidence_txs`, and
+  `inclusion_list_violation_evidence_txs` from
+  `_block_affected_entities`, all of which DO mutate per-entity
+  state on apply.  No state_root output change at any height
+  (`compute_current_state_root` re-syncs ALL live entities via
+  `_rebuild_state_tree`); the gap was a `_persist_state` dirty-set
+  scoping concern only.  Picked up automatically by the new
+  per-class registry.
+
+### Changed (UX)
+
+- **Homepage hero + entity-id lookup bar removed; replaced with a
+  two-path next-step CTA** (ddd4bfa).  After the faucet section the
+  page now offers "Send a message →" and "Run a node to earn
+  tokens →" side-by-side, mirroring the funnel: get tokens → choose
+  a path.  Poster ids in feed cards remain clickable for entity-
+  profile navigation, so the standalone lookup bar was redundant.
+  New `/gh/node` redirect deep-links to the README's "Run a
+  validator" anchor for click-tracking parity with `/gh/start`.
+
 ## [1.30.0] — 2026-04-27
 
 Minor release.  Adds the `messagechain react` CLI subcommand,
