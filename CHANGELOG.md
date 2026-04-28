@@ -4,6 +4,96 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.37.0] — 2026-04-28
+
+Second multi-axis audit pass against current `origin/main` surfaced 41
+findings; the cumulative top-3 by severity × leverage × ROI land here.
+One no-fork security correctness fix and two new hard-fork tiers.
+
+### Security (active immediately, no fork gate)
+
+- **Block-rollback now snapshots the four evidence-tracking
+  collections that `_apply_block_state` mutates.**  `_snapshot_memory_
+  state` and `_restore_memory_snapshot` captured `_processed_evidence`
+  but NOT `non_response_processor.processed`,
+  `bogus_rejection_processor.processed`, `censorship_processor.pending`,
+  or `witness_ack_registry`.  When a block failed the post-apply
+  state_root check at `_append_block` and unwound via
+  `_restore_memory_snapshot`, those four mutations stayed bumped — so
+  a coerced/colluding proposer crafting a block with a valid evidence
+  tx + a deliberately-wrong `state_root` could permanently poison the
+  evidence-dedup state.  A later honest resubmission of the same
+  evidence then hit `has_processed` (e.g. `non_response_evidence.py`'s
+  dedup gate) and the slash never landed; same shape lets a
+  rolled-back ack-registry insert silently kill any future
+  NonResponseEvidenceTx whose `request_hash` matches.  The fix
+  extends snapshot/restore to deep-copy the four collections (deepcopy
+  for `censorship_processor.pending` since the values are mutable
+  `_PendingEvidence` records; shallow `dict(...)` / `set(...)` for the
+  rest).  No-fork: snapshot/restore is purely in-memory; chaindb
+  mirror runs only after the state_root check passes, so historical
+  replay is byte-identical.  Adversary defended: validator collusion
+  (the primary anchored adversary).
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 37 — forced-inclusion entity-cap excuse no longer counts
+  same-entity lower-fpb txs toward the cap.**  Tier 34 (1.35.0) wired
+  the forced-inclusion gate to walk every block tx-list field, but
+  excuse #3 ("entity already at `MAX_TXS_PER_ENTITY_PER_BLOCK`")
+  accepted a colluding proposer filling the quota with deliberately-
+  cheap lower-fpb txs from a single victim entity at sequential
+  nonces — and then "excusing" the higher-fpb forced tx of the same
+  entity.  Because nonces must be sequential the forced tx IS the
+  next one after the included ones, so it always fits structurally;
+  the cap was an artifact of the proposer's own selection, not a real
+  inclusion blocker.  Net effect: the CLAUDE.md "high-fpb tx cannot
+  be suppressed without slashable evidence" anchor was bypassable
+  with no slashing risk for the colluding proposer.  Tier 37
+  tightens excuse #3: a same-entity block tx whose fee-per-byte is
+  STRICTLY lower than the forced tx's fpb does not contribute to
+  that forced tx's `entity_count` for the excuse calculation.  fpb
+  comparison is integer cross-multiplication
+  (`other_fee * ref_bytes < ref_fee * other_bytes`) — no float on
+  the consensus path, mirroring the 1.35.0 honesty-curve cleanliness.
+  Strict `<` (not `≤`) means same-fpb same-entity txs still count, so
+  a proposer's right to choose among equal-density alternatives is
+  preserved.  Activation at `FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT
+  = 800`.  Pre-fork behavior preserved byte-identically.  Adversary
+  defended: validator collusion (primary anchored adversary), at the
+  inclusion-rule abuse surface.
+
+- **Tier 38 — reward-curve large band saturates downward, restoring
+  the anchored sigmoid shape.**  CLAUDE.md anchors a stake-reward
+  shape where small < middle > large with large stakers earning at a
+  STRICTLY LOWER per-unit-stake rate than mid-tier, so distributions
+  compress upward over time and never ossify into permanent
+  plutocracy.  The live curve was piecewise-constant 0.80 / 1.25 /
+  1.00 — a 5% mid-tier validator and a 40% whale earned at the SAME
+  per-token rate (1.0× both), missing the saturation property
+  entirely.  Tier 38 adds a fourth band: the 0.80 / 1.25 / 1.00
+  small/mid/flat-large bands stay byte-identical for stake share <
+  15%, then between 15% and 30% the multiplier interpolates linearly
+  from 1.00 down to a floor of 0.5 (50/100), and stays at 0.5 past
+  30%.  Sample yield curve: 0.1%→0.80, 1%→1.25, 5%→1.00, 10%→1.00,
+  15%→1.00, 20%→0.83, 25%→0.67, 30%→0.50, 40%→0.50.  Mid-vs-floor
+  compression ratio is 2.5× (1.25 / 0.50) — large stakers still earn
+  proportionally more in absolute tokens than smaller validators,
+  still preferring 24/7 uptime, but no longer compounding their
+  share at the same per-token rate as mid-tier.  All arithmetic is
+  exact-rational integer (mirrors the 1.35.0 honesty-curve technique;
+  pinned by a `_NoFloatInt` sentinel test).  Activation at
+  `REWARD_CURVE_LARGE_BAND_HEIGHT = 801`.  Pre-fork behavior
+  preserved byte-identically.  Anchor protected: stake-concentration
+  cap (sigmoid shape) and the bootstrap→community handoff arc.
+
+### Operator notes
+
+- All validators must upgrade to 1.37.0 within the runway window
+  (current tip → 800/801).  Tier 37 + Tier 38 ride one block apart;
+  the in-memory snapshot/restore fix is active immediately on
+  upgrade.  Roll validators with `messagechain upgrade --yes`.
+
 ## [1.36.0] — 2026-04-28
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
