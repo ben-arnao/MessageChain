@@ -3646,6 +3646,8 @@ class Blockchain:
             compute_slash_amount,
         )
         from messagechain.config import (
+            CENSORSHIP_SLASH_BPS,
+            CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT as _T31_H,
             HONESTY_CURVE_INSURANCE_HEIGHT as _T30_H,
         )
         offender_id = matured.offender_id
@@ -3673,18 +3675,30 @@ class Blockchain:
             sev_pct = _sev(
                 offender_id, _OK.CENSORSHIP, _Un.AMBIGUOUS, self,
             )
-            base_slash = (staked_at_admission * sev_pct) // 100
         else:
-            base_slash = compute_slash_amount(staked_at_admission)
-        # Cap at current: the unstaked-to-pending portion already
-        # left `staked` for `pending_unstakes`, which this slash path
-        # deliberately does not touch.  Debiting more than current
-        # would underflow the staked balance and break the supply
-        # invariant.  The offender still loses the larger slash amount
-        # effectively, because their `pending_unstakes` is not slashed
-        # by censorship (it still sits for UNBONDING_PERIOD) — only
-        # the maximum we can take from `staked` right now.
-        slash_amount = min(base_slash, current_stake)
+            # Pre-Tier-30: legacy flat 10% path.  Express as a percent
+            # so the same downstream apply path can carry both the
+            # legacy and curve-graded paths.
+            sev_pct = CENSORSHIP_SLASH_BPS // 100  # 1000 bps = 10%
+        if self.height >= _T31_H:
+            # Tier 31: drain proportionally from staked + pending.
+            # Closes the "censor-then-unstake" evasion — the offender
+            # cannot move stake to pending_unstakes during the
+            # EVIDENCE_MATURITY_BLOCKS window to dodge the slash.
+            slash_amount = self.supply.burn_slash_proportional(
+                offender_id, sev_pct,
+                admission_basis=staked_at_admission,
+            )
+        else:
+            # Pre-Tier-31: legacy staked-only basis.  Cap at current
+            # so the unstaked-to-pending portion is not double-charged
+            # against `staked`.
+            base_slash = (staked_at_admission * sev_pct) // 100
+            slash_amount = min(base_slash, current_stake)
+            if slash_amount > 0:
+                self.supply.staked[offender_id] = current_stake - slash_amount
+                self.supply.total_supply -= slash_amount
+                self.supply.total_burned += slash_amount
         if slash_amount <= 0:
             # No slash to apply — still record the evidence as
             # processed so it cannot be re-submitted.
@@ -3695,11 +3709,6 @@ class Blockchain:
                 f"(admission_stake={staked_at_admission}, current_stake={current_stake})"
             )
             return
-
-        # Debit stake + burn (reduce total_supply, bump total_burned).
-        self.supply.staked[offender_id] = current_stake - slash_amount
-        self.supply.total_supply -= slash_amount
-        self.supply.total_burned += slash_amount
 
         # Record as processed to prevent double-slashing.
         self._processed_evidence.add(matured.evidence_hash)
@@ -3714,7 +3723,7 @@ class Blockchain:
         logger.info(
             f"CENSORSHIP-SLASHED validator {offender_id.hex()[:16]}: "
             f"stake_burned={slash_amount}, "
-            f"stake_after={current_stake - slash_amount}, "
+            f"stake_after={self.supply.staked.get(offender_id, 0)}, "
             f"evidence={matured.evidence_hash.hex()[:16]}"
         )
 

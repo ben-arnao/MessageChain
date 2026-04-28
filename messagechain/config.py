@@ -4271,6 +4271,31 @@ assert HONESTY_CURVE_INSURANCE_HEIGHT > VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT, (
     "buffer so callers between the two heights see the legacy flat-BPS "
     "censorship slash and UNAMBIGUOUS-first IL violation classification."
 )
+# ─── Tier 31: censorship/IL slash basis includes pending_unstakes ─────
+# CLAUDE.md "validator collusion" anchor: a coerced/colluding validator
+# who censors a tx must not escape the slash by immediately unstaking.
+# EVIDENCE_MATURITY_BLOCKS (~16 blocks ~2.7h) is far shorter than
+# UNBONDING_PERIOD (>14 days), so pre-Tier-31 a censoring validator
+# could move ≥90% of stake from `staked` to `pending_unstakes` before
+# evidence matured, gutting the slash.  Both apply paths
+# (`_apply_censorship_slash` and `process_inclusion_list_violation`)
+# computed the slash on `staked` only and capped it at the post-unstake
+# remainder, leaving the pending bucket intact.
+#
+# Tier 31 changes the BASIS to (staked + pending_unstakes) — matching
+# the canonical pattern at `validate_slash_transaction` and the
+# equivocation-slash path in `slash_validator()` — and drains
+# proportionally from BOTH buckets.  The percentage is unchanged
+# (Tier 30's curve still grades severity).  Pre-activation: legacy
+# staked-only basis preserved byte-for-byte for replay determinism.
+CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT = 760
+assert CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT > HONESTY_CURVE_INSURANCE_HEIGHT, (
+    "CENSORSHIP_SLASH_PENDING_UNSTAKE_HEIGHT must follow "
+    "HONESTY_CURVE_INSURANCE_HEIGHT — Tier 31 extends the curve-graded "
+    "severity introduced in Tier 30 by widening the slash basis to "
+    "(staked + pending_unstakes); callers between the two heights see "
+    "the curve-graded percentage applied to staked only."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
