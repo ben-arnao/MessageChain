@@ -4717,7 +4717,7 @@ assert (
 # parity, a whale's reward share grows linearly with stake forever and
 # concentration ossifies past 5%.
 #
-# Tier 37 adds a fourth band on top of the existing three:
+# Tier 38 adds a fourth band on top of the existing three:
 #   share <  SMALL_THRESHOLD                           → 0.80   (unchanged)
 #   SMALL_THRESHOLD ≤ share < MID_THRESHOLD            → 1.25   (unchanged)
 #   MID_THRESHOLD   ≤ share < LARGE_THRESHOLD          → 1.00   (unchanged)
@@ -4744,7 +4744,7 @@ assert (
 # Activation rides above Tier 36 with a runway buffer well clear of the
 # current ~1300 mainnet tip so operators upgrade through prior forks
 # before the new curve bites.
-REWARD_CURVE_LARGE_BAND_HEIGHT = 800  # Tier 37
+REWARD_CURVE_LARGE_BAND_HEIGHT = 801  # Tier 38
 
 # Stake-share thresholds in basis points for the new saturating tail.
 # 1500 bp = 15% (slope start), 3000 bp = 30% (slope end / floor).
@@ -4758,10 +4758,16 @@ REWARD_CURVE_LARGE_FLOOR_NUM = 50
 REWARD_CURVE_LARGE_FLOOR_DEN = 100
 
 assert REWARD_CURVE_LARGE_BAND_HEIGHT > ATTESTER_DYNAMIC_COMMITTEE_HEIGHT, (
-    "REWARD_CURVE_LARGE_BAND_HEIGHT must follow Tier 36 — Tier 37 "
+    "REWARD_CURVE_LARGE_BAND_HEIGHT must follow Tier 36 — Tier 38 "
     "rides on top of the most recent established fork with the "
     "standard runway buffer; pre-activation callers see the legacy "
     "Tier-20 piecewise-constant curve byte-for-byte"
+)
+assert REWARD_CURVE_LARGE_BAND_HEIGHT > FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT, (
+    "REWARD_CURVE_LARGE_BAND_HEIGHT must follow Tier 37 — Tier 38 "
+    "rides above the forced-inclusion entity-cap fix to preserve "
+    "monotone tier ordering; the two are independent forks but the "
+    "ladder is one-block-per-tier by convention"
 )
 assert REWARD_CURVE_LARGE_BAND_HEIGHT > REWARD_CURVE_HEIGHT, (
     "REWARD_CURVE_LARGE_BAND_HEIGHT must follow REWARD_CURVE_HEIGHT — "

@@ -1,4 +1,4 @@
-"""Tier 37 — reward-curve large band saturates downward.
+"""Tier 38 — reward-curve large band saturates downward.
 
 CLAUDE.md anchors the stake reward curve as small < middle > large, with
 "large saturating to flat/linear past a cap point."  The pre-Tier-37
@@ -7,7 +7,7 @@ validator and a 40%-stake whale earned at the *same* per-token rate, so
 the "large saturating" anchor was not satisfied.  The large band was
 just a flat extension of the baseline, never compressing downward.
 
-Tier 37 adds a fourth band: between LARGE_THRESHOLD_BPS and
+Tier 38 adds a fourth band: between LARGE_THRESHOLD_BPS and
 LARGE_FLOOR_THRESHOLD_BPS the multiplier interpolates linearly from
 1.00 down to LARGE_FLOOR_NUM / LARGE_FLOOR_DEN, then flat at the floor
 past LARGE_FLOOR_THRESHOLD_BPS.  Pre-fork the legacy 0.80/1.25/1.00
@@ -67,7 +67,7 @@ _STAKE_GRID_BPS = [10, 100, 500, 1000, 1500, 2000, 2500, 3000, 4000]
 
 
 class TestActivationOrdering(unittest.TestCase):
-    """Tier 37 must follow the existing reward-curve fork (Tier 20)."""
+    """Tier 38 must follow the existing reward-curve fork (Tier 20)."""
 
     def test_activation_after_tier_20(self):
         # The new large-band gate cannot fire before the original
