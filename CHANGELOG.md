@@ -4,6 +4,68 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.30.0] — 2026-04-27
+
+Minor release.  Adds the `messagechain react` CLI subcommand,
+closes the symmetric proposer-side react leaf-advance bug, and
+layers a global cap on top of the per-IP receipt-subtree gate to
+defend the censorship-evidence framework against botnet /
+IPv6-rotation drain.
+
+### Added
+
+- **`messagechain react` CLI subcommand** (aa64d6b).  Surfaces the
+  existing Tier 17 `ReactTransaction` as a first-class CLI verb
+  instead of hiding it behind `estimate-fee --tx-type react`.
+  Mirrors `cmd_vote`: resolves the keyfile, fetches nonce +
+  leaf-watermark, binds the persistent leaf cursor, auto-prices via
+  the unified `auto_fee` helper, signs via
+  `create_react_transaction`, and POSTs to `submit_react`.
+  Pre-flight rejects malformed target hex and self-targeted
+  user-trust votes before a WOTS+ leaf is consumed.
+
+### Fixed
+
+- **Proposer leaf-advance loop now includes `react_transactions`**
+  (f118446).  Symmetric to the 1.29.3 validator-side fix.
+  `propose_block`'s leaf-advance loop walked the proposer's own
+  message / transfer / slash / governance / authority / stake /
+  unstake txs but omitted react_transactions, so an honest
+  proposer who signed a react then experienced a keypair reload
+  (e.g. systemd restart) before the slot would compute
+  `expected_proposer_leaf` against a stale watermark, reuse the
+  same WOTS+ leaf in the header signature, and lose the slot to
+  "Block contains duplicate WOTS+ leaf use".  ReactTransaction
+  uses `voter_id` (not `entity_id`) for the signer, so the per-tx
+  entity-id resolver also falls back to `voter_id`.
+
+### Security
+
+- **Receipt-subtree global cap layered on top of per-IP gate**
+  (677c306).  The round-8 ReceiptBudgetTracker defends single-IP
+  drain via a per-IP token bucket but admitted a botnet /
+  IPv6-rotation drain: at `SUBMISSION_REJECTION_BURST=3` and
+  `_max_tracked_ips=4096`, 4096 distinct IPs each got a fresh
+  burst — 12,288 leaves drained in the burst alone, plus ~205/sec
+  sustained.  The 65,536-leaf RECEIPT_SUBTREE drained in ~4-5
+  minutes, after which every receipt / rejection / ack issuance
+  silently broke until the operator rotated the on-chain subtree
+  (~9 min keygen).  During that gap a colluding validator could
+  ignore submissions with no chain-level evidence — defeating
+  the censorship-evidence framework, the chain's primary defense
+  against the primary anchored adversary (validator collusion).
+  Now layered: per-IP first (fairness for honest opt-in clients),
+  global second (`RECEIPT_GLOBAL_BURST=6_553`,
+  `RECEIPT_GLOBAL_REFILL_PER_SEC=0.05` — sustained drain after
+  burst depletion takes ~15 days to consume one full subtree, well
+  above the ~22-day natural rotation cadence).  Atomic gate
+  ordering: peek per-IP, peek global, consume both only on full
+  pass — failures consume nothing, so attackers cannot probe
+  global state by spending per-IP tokens.  Operator-visible
+  warning logged at most once per minute when the global cap kicks
+  in.  Shared bucket across HTTPS + RPC surfaces and across
+  rejection + ack paths (per the cross-surface invariant).
+
 ## [1.29.3] — 2026-04-28
 
 Critical consensus hotfix — `_append_block`'s pre-apply
