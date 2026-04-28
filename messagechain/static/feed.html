@@ -47,15 +47,37 @@
     font-size: 0.9rem;
   }
   header .sub a { color: var(--accent); }
-  .next-steps {
+  ol.quickstart {
+    list-style: none;
+    counter-reset: step;
+    padding: 0;
+    margin: 0.8rem 0 1.4rem;
+  }
+  ol.quickstart > li { margin: 0.55rem 0; }
+  ol.quickstart > li:not([hidden]) {
+    counter-increment: step;
+    position: relative;
+    padding-left: 2.6rem;
+  }
+  ol.quickstart > li:not([hidden])::before {
+    content: counter(step);
+    position: absolute;
+    left: 0;
+    top: 0.55rem;
+    width: 1.8rem;
+    height: 1.8rem;
+    border-radius: 50%;
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 700;
+    font-size: 0.9rem;
     display: flex;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 0.6rem;
-    margin: 0.6rem 0 1rem;
+    justify-content: center;
+    line-height: 1;
   }
-  .next-steps .cta {
-    flex: 1 1 auto;
+  ol.quickstart .cta {
+    display: block;
     text-align: center;
     padding: 0.55rem 0.9rem;
     background: var(--accent);
@@ -63,9 +85,16 @@
     border-radius: 4px;
     font-weight: 600;
     text-decoration: none;
-    font-size: 0.9rem;
+    font-size: 0.95rem;
   }
-  .next-steps .next-steps-or {
+  ol.quickstart > li.choice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  ol.quickstart > li.choice .cta { flex: 1 1 auto; }
+  ol.quickstart > li.choice .or {
     color: var(--muted);
     font-size: 0.85rem;
     text-transform: uppercase;
@@ -311,7 +340,12 @@
   </p>
 </header>
 <main>
-  <details class="faucet" id="faucetBox" hidden>
+  <ol class="quickstart">
+    <li>
+      <a class="cta" href="/gh/start">Generate a wallet →</a>
+    </li>
+    <li id="faucetStep" hidden>
+  <details class="faucet" id="faucetBox">
     <summary>Get starter tokens (<span id="faucetRemaining">…</span> left this window)</summary>
     <div class="body">
       <p>
@@ -349,11 +383,13 @@
       </p>
     </div>
   </details>
-  <div class="next-steps">
-    <a class="cta" href="/gh/start">Send a message →</a>
-    <span class="next-steps-or">or</span>
-    <a class="cta" href="/gh/node">Run a node to earn tokens →</a>
-  </div>
+    </li>
+    <li class="choice">
+      <a class="cta" href="/gh/start">Send a message →</a>
+      <span class="or">or</span>
+      <a class="cta" href="/gh/node">Run a node, earn tokens →</a>
+    </li>
+  </ol>
   <p class="status" id="status">Loading…</p>
   <div id="feed"></div>
 </main>
@@ -535,6 +571,7 @@
   // Only render the form when the validator advertises faucet_enabled=true
   // on /v1/info.  Servers without --faucet-keyfile keep the feed read-only
   // and the box stays hidden (no surprise 405 from a stale UI element).
+  const faucetStep = document.getElementById("faucetStep");
   const faucetBox = document.getElementById("faucetBox");
   const faucetBtn = document.getElementById("faucetBtn");
   const faucetAddr = document.getElementById("faucetAddr");
@@ -550,14 +587,14 @@
       const r = await fetch("/v1/info", { cache: "no-store" });
       const data = await r.json();
       if (data.ok && data.faucet_enabled && data.faucet) {
-        faucetBox.hidden = false;
+        faucetStep.hidden = false;
         faucetAmount.textContent = data.faucet.drip_amount;
         faucetRemaining.textContent = data.faucet.remaining_window;
       } else {
-        faucetBox.hidden = true;
+        faucetStep.hidden = true;
       }
     } catch (e) {
-      faucetBox.hidden = true;
+      faucetStep.hidden = true;
     }
   }
 
