@@ -767,13 +767,27 @@ VALIDATOR_MIN_STAKE = 100                # LEGACY — see get_validator_min_stak
 VALIDATOR_MIN_STAKE_POST_RAISE = 10_000  # 0.007% of 140M supply
 MIN_STAKE_RAISE_HEIGHT = 701  # Tier 2 — fast-forwarded for 1.26.0 hard fork sweep
 
+# Tier 28: validator minimum stake collapses to one faucet drip.
+# Tier 2 raised the floor to 10_000 to give validator entry a meaningful
+# capital cost; in practice that capital wall ($X-equivalent at any real
+# token price) made permissionless entry "permissionless on paper."
+# Tier 28 drops the floor to exactly one faucet grab so any user who can
+# solve the faucet PoW can spin up a validator from a single drip.
+# Sybil cost collapses to ~one faucet drip + the per-/24 + PoW limits the
+# faucet enforces; slashing still bites but the absolute burn shrinks
+# proportionally.  Pinned to FAUCET_DRIP by an assert below so the two
+# constants cannot drift.
+VALIDATOR_MIN_STAKE_FAUCET_DRIP = 300
+MIN_STAKE_FAUCET_DRIP_HEIGHT = 14_000  # Tier 28
+
 
 def get_validator_min_stake(block_height: int) -> int:
     """Return the validator minimum stake in effect at ``block_height``.
 
-    Hard-fork-gated: pre-activation returns the legacy 100-token value
-    so pre-fork chain state is reproducible; at/after activation
-    returns the post-raise 10_000-token floor.
+    Hard-fork-gated:
+      * pre-Tier-2: legacy 100-token floor.
+      * Tier 2 .. Tier 28: 10_000-token post-raise floor.
+      * Tier 28+: one-faucet-drip floor (VALIDATOR_MIN_STAKE_FAUCET_DRIP).
 
     Used by every fresh-stake / partial-unstake enforcement site.
     The apply-time active-set filter (proposer-selection, validator-
@@ -782,6 +796,8 @@ def get_validator_min_stake(block_height: int) -> int:
     participation rights indefinitely; only NEW stake ops see the
     raised bar.
     """
+    if block_height >= MIN_STAKE_FAUCET_DRIP_HEIGHT:
+        return VALIDATOR_MIN_STAKE_FAUCET_DRIP
     if block_height >= MIN_STAKE_RAISE_HEIGHT:
         return VALIDATOR_MIN_STAKE_POST_RAISE
     return VALIDATOR_MIN_STAKE
@@ -4172,6 +4188,23 @@ assert REACT_NO_SELF_MESSAGE_HEIGHT > REVOKE_TX_WINDOW_HEIGHT, (
     "rules); at/above, message-react admission rejects when the "
     "target's authoring sender_id equals the voter_id."
 )
+assert MIN_STAKE_FAUCET_DRIP_HEIGHT > REACT_NO_SELF_MESSAGE_HEIGHT, (
+    "MIN_STAKE_FAUCET_DRIP_HEIGHT must follow REACT_NO_SELF_MESSAGE_HEIGHT — "
+    "Tier 28 rides above the highest established fork (Tier 27 react-self-"
+    "rule) with the standard runway buffer."
+)
+# Pin VALIDATOR_MIN_STAKE_FAUCET_DRIP to FAUCET_DRIP so the two cannot drift.
+# Imported lazily below to avoid a top-of-module import cycle if any future
+# faucet code grows a back-reference to config.
+def _assert_faucet_drip_equality() -> None:
+    from messagechain.network.faucet import FAUCET_DRIP as _FAUCET_DRIP
+    assert VALIDATOR_MIN_STAKE_FAUCET_DRIP == _FAUCET_DRIP, (
+        "VALIDATOR_MIN_STAKE_FAUCET_DRIP must equal FAUCET_DRIP byte-for-byte "
+        "— Tier 28's whole intent is 'minimum stake = one faucet grab'; if "
+        "FAUCET_DRIP moves, this constant moves with it"
+    )
+
+_assert_faucet_drip_equality()
 assert REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS > 0, (
     "REVOKE_TX_DEFAULT_VALID_FOR_BLOCKS must be positive — a zero "
     "default makes valid_from_height == valid_to_height, which is a "
