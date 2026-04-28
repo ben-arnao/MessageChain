@@ -368,6 +368,14 @@ class SlashTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Slash apply mutates the offender (stake burned + slashed
+        flag set, both in the leaf commitment) and the submitter
+        (fee debit + leaf_watermark bump).  Both must refresh.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.evidence.offender_id, self.submitter_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

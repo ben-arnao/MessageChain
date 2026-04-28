@@ -48,6 +48,16 @@ class Attestation:
     block_number: int
     signature: Signature
 
+    def affected_entities(self) -> set[bytes]:
+        """Attestation apply bumps the validator's attestation_sig_count
+        and leaf_watermark, plus credits committee-pool reward to the
+        validator's balance (when selected).  Both leaf_watermark and
+        balance are inside the per-entity SMT leaf commitment, so
+        validator_id's state_tree row must refresh.  See CLAUDE.md
+        canonical registry contract.
+        """
+        return {self.validator_id}
+
     def signable_data(self) -> bytes:
         """Data that the validator signs to create this attestation.
 

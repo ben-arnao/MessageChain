@@ -5855,6 +5855,17 @@ class Blockchain:
         # advanced past those txs' leaves.  Advance past any such leaves
         # BEFORE reading expected_proposer_leaf — otherwise the state
         # root is computed with a stale leaf index and validators reject.
+        #
+        # ReactTransactions MUST be in this iteration tuple too — the
+        # apply path bumps the voter's leaf_watermark via
+        # `_bump_watermark`, so a proposer who signed their own react
+        # earlier (now in mempool) needs `_next_leaf` advanced past
+        # the react's leaf BEFORE `expected_proposer_leaf` is read.
+        # ReactTransaction uses `voter_id`, not `entity_id`, so the
+        # signer-id resolver below also falls back to `voter_id`.
+        # Symmetric to the 1.29.3 validator-side `_append_block` fix
+        # and the sibling `fix/proposer-react-leaf-advance` branch
+        # this refactor subsumes.
         proposer_id = proposer_entity.entity_id
         for tx_list in (
             transactions,
@@ -5864,9 +5875,13 @@ class Blockchain:
             authority_txs or [],
             stake_transactions or [],
             unstake_transactions or [],
+            react_transactions or [],
         ):
             for tx in tx_list:
-                tx_entity = getattr(tx, "entity_id", None)
+                tx_entity = (
+                    getattr(tx, "entity_id", None)
+                    or getattr(tx, "voter_id", None)
+                )
                 if tx_entity == proposer_id:
                     sig = getattr(tx, "signature", None)
                     if sig is not None and hasattr(sig, "leaf_index"):
@@ -8976,51 +8991,84 @@ class Blockchain:
         self.supply.total_fees_collected += tx.fee
         self.nonces[tx.entity_id] = tx.nonce + 1
 
-    def _block_affected_entities(self, block: Block) -> set[bytes]:
-        """Collect every entity_id whose balance/nonce/stake a block might touch.
+    # Canonical "what tx-list slots live on a Block" registry.  The
+    # block-level affected-entities sweep walks each slot and asks the
+    # tx class itself ("affected_entities()") which entity rows it
+    # mutates.  Adding a new tx kind anywhere on the chain is now a
+    # two-step gesture:
+    #
+    #   1. Implement `affected_entities() -> set[bytes]` on the tx class
+    #      (single source of truth for "what entities does this kind
+    #      touch on apply").  The structural-guard test in
+    #      tests/test_affected_entities_canonical_registry.py FAILS at
+    #      CI time if step 1 is missed.
+    #
+    #   2. Add the new block slot's attribute name to this tuple.
+    #
+    # Pre-refactor the same logic lived in N hand-rolled per-kind
+    # branches inside `_block_affected_entities`.  Three releases in
+    # seven hours (1.29.1 / 1.29.2 / 1.29.3) all chased the same
+    # "developer forgot to add the tx kind to one of the N sweeps"
+    # divergence.  See CLAUDE.md "every new tx kind registers itself."
+    _BLOCK_TX_LIST_ATTRS: tuple[str, ...] = (
+        "transactions",
+        "transfer_transactions",
+        "slash_transactions",
+        "attestations",
+        "authority_txs",
+        "stake_transactions",
+        "unstake_transactions",
+        "react_transactions",
+        "governance_txs",
+        "finality_votes",
+        "custody_proofs",
+        "censorship_evidence_txs",
+        "bogus_rejection_evidence_txs",
+        "inclusion_list_violation_evidence_txs",
+    )
 
-        Used after _apply_block_state to incrementally refresh only the
-        affected rows in state_tree, keeping the commitment update cost
-        O(touched * TREE_DEPTH) rather than O(N * TREE_DEPTH).
+    def _block_affected_entities(self, block: Block) -> set[bytes]:
+        """Collect every entity_id whose state_tree leaf this block
+        might touch on apply.
+
+        Single canonical sweep: walks every block-included tx kind in
+        ``_BLOCK_TX_LIST_ATTRS`` and unions their per-tx
+        ``affected_entities()`` registrations.  The per-class methods
+        own the "what does this tx kind touch" knowledge — the
+        block-level sweep just dispatches.
 
         Includes:
-          * the proposer (block reward, fees)
-          * every tx sender (nonce + balance)
-          * every transfer recipient (balance)
-          * every attestor (attestation reward)
-          * every slashed validator (stake zeroed)
-          * every slash submitter (finder's reward)
-          * TREASURY_ENTITY_ID (reward-cap overflow)
+          * the proposer (block reward, fees, leaf_watermark bump on
+            block-sig)
+          * TREASURY_ENTITY_ID (reward-cap overflow / governance)
+          * every entity any block-included tx touches via its
+            ``affected_entities()`` method
+          * seed_entity_ids (seed-divestment runs every block in the
+            divestment window — cheap to always include)
+
+        Used after `_apply_block_state` to incrementally refresh only
+        the affected rows in state_tree, keeping the commitment update
+        cost O(touched * TREE_DEPTH) rather than O(N * TREE_DEPTH),
+        and to scope `_persist_state`'s dirty-set so cold-restart
+        durability tracks every same-block mutation.
         """
         from messagechain.config import TREASURY_ENTITY_ID
         affected: set[bytes] = {block.header.proposer_id, TREASURY_ENTITY_ID}
-        for tx in block.transactions:
-            affected.add(tx.entity_id)
-        for ttx in block.transfer_transactions:
-            affected.add(ttx.entity_id)
-            affected.add(ttx.recipient_id)
-        for stx in block.slash_transactions:
-            affected.add(stx.evidence.offender_id)
-            affected.add(stx.submitter_id)
-        for att in block.attestations:
-            affected.add(att.validator_id)
-        for atx in getattr(block, "authority_txs", []):
-            affected.add(atx.entity_id)
-        for stx in getattr(block, "stake_transactions", []):
-            affected.add(stx.entity_id)
-        for utx in getattr(block, "unstake_transactions", []):
-            affected.add(utx.entity_id)
-        # Tier 17 ReactTransaction voters: the apply path bumps the
-        # voter's nonce, balance, and leaf_watermark via
-        # `pay_fee_with_burn` + `_bump_watermark` (see the react-tx loop
-        # in `_apply_block_state`), so the voter's state_tree row MUST
-        # be in the touched set or `compute_current_state_root` reads
-        # stale data while `compute_post_state_root` mirrors the
-        # mutation — and the two diverge.  Symptom on mainnet: a fresh
-        # voter's first react tx made the proposer self-reject the
-        # block with "Invalid state_root — state commitment mismatch".
-        for rtx in getattr(block, "react_transactions", []) or []:
-            affected.add(rtx.voter_id)
+        for attr in self._BLOCK_TX_LIST_ATTRS:
+            for tx in getattr(block, attr, None) or ():
+                # Tx kinds whose home class predates the canonical
+                # registry MUST implement affected_entities() — the
+                # structural-guard test in
+                # tests/test_affected_entities_canonical_registry.py
+                # fails at CI when a new tx kind ships without it.
+                # The getattr fallback below is defensive only: a
+                # rogue object (e.g., a malformed serialization round-
+                # trip in a test) lands as a no-op rather than an
+                # AttributeError that would mask the real bug.
+                tx_affected = getattr(tx, "affected_entities", None)
+                if tx_affected is None:
+                    continue
+                affected.update(tx_affected())
         # Seed divestment mutates seed stake + treasury every block within
         # the divestment window.  Cheap to always include (small set, often
         # a single seed); guarantees the incremental state-tree refresh

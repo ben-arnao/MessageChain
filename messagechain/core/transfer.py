@@ -77,6 +77,14 @@ class TransferTransaction:
             + struct.pack(">H", len(pk)) + pk
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Sender + recipient.  Apply path mutates sender's nonce /
+        balance / leaf_watermark and recipient's balance (the
+        receive-to-exist primitive) so both entities' state_tree rows
+        must be refreshed.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id, self.recipient_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 

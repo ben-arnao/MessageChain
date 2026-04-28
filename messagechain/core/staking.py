@@ -166,6 +166,15 @@ class StakeTransaction:
             + struct.pack(">H", len(pk)) + pk
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Stake apply mutates the staker's nonce, balance (fee), staked
+        amount, and leaf_watermark — all in the leaf commitment.  No
+        recipient in stake (tokens move from balance to staked under
+        the same entity_id), so entity_id is the sole touched row.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 
@@ -312,6 +321,14 @@ class UnstakeTransaction:
             + struct.pack(">Q", int(self.timestamp))
             + struct.pack(">Q", self.fee)
         )
+
+    def affected_entities(self) -> set[bytes]:
+        """Unstake apply mutates the entity's nonce, balance (fee),
+        staked amount (queues into pending unbond), and possibly
+        leaf_watermark (when signed by hot key, not cold).  Single
+        affected entity.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.entity_id}
 
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())

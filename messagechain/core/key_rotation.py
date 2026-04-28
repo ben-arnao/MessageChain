@@ -62,6 +62,16 @@ class KeyRotationTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path rotates entity_id's public_key, bumps
+        rotation_count + leaf_watermark, and pays the fee from
+        entity_id's balance.  Both old_public_key and new_public_key
+        are raw key material (not entity references) — only entity_id's
+        state_tree row needs refreshing.  See CLAUDE.md canonical
+        registry contract.
+        """
+        return {self.entity_id}
+
     def _compute_hash(self) -> bytes:
         return default_hash(self._signable_data())
 

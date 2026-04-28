@@ -156,6 +156,16 @@ class ProposalTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the proposer's fee (+ Tier-22 voter-reward
+        surcharge) and bumps their leaf_watermark.  Single touched
+        entity at proposal-admission time.  Treasury is mutated only
+        when a proposal closes/auto-executes — that is captured by
+        the block-level sweep, not the proposal tx itself.
+        See CLAUDE.md canonical registry contract.
+        """
+        return {self.proposer_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 
@@ -329,6 +339,15 @@ class VoteTransaction:
             + struct.pack(">Q", self.fee)
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the voter's fee and bumps their
+        leaf_watermark.  Single touched entity per vote tx.  Voter
+        rewards (Tier 22) are credited when the proposal closes —
+        captured by a separate proposal-close sweep, not the vote
+        tx itself.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.voter_id}
+
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())
 
@@ -473,6 +492,16 @@ class TreasurySpendTransaction:
             + struct.pack(">d", self.timestamp)
             + struct.pack(">Q", self.fee)
         )
+
+    def affected_entities(self) -> set[bytes]:
+        """Apply path debits the proposer's fee (proposal-admission
+        time).  recipient_id receives funds only on auto-execute when
+        the proposal CLOSES — that mutation is captured by the
+        proposal-close sweep, not the spend-tx admission.  Single
+        touched entity at admission.  See CLAUDE.md canonical registry
+        contract.
+        """
+        return {self.proposer_id}
 
     def _compute_hash(self) -> bytes:
         return _hash(self._signable_data())

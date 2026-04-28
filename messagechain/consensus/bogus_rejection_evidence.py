@@ -125,6 +125,15 @@ class BogusRejectionEvidenceTx:
             + self.message_tx.tx_hash
         )
 
+    def affected_entities(self) -> set[bytes]:
+        """Apply path is one-phase: when admitted, the submitter pays
+        the fee and bumps their leaf_watermark; if the rejection is
+        provably bogus, the offender's stake is slashed (in the same
+        block).  Both submitter and offender mutate in the block of
+        admission.  See CLAUDE.md canonical registry contract.
+        """
+        return {self.submitter_id, self.offender_id}
+
     def _signable_data(self) -> bytes:
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return b"".join([
