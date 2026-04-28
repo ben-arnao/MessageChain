@@ -565,8 +565,17 @@ class NonResponseEvidenceProcessor:
                 blockchain,
             )
             if sev_pct > 0:
+                # ``blockchain=blockchain`` threads the structural
+                # guard for the ``_touch_state`` contract.  Non-
+                # response evidence's ``affected_entities()`` already
+                # covers the offender, so the in-band refresh is a
+                # no-op double-refresh — kept on principle so a
+                # future refactor cannot silently regress into the
+                # same defect-class bug as the matured-censorship
+                # slash path.
                 slash_amount = blockchain.supply.burn_slash_proportional(
                     offender_id, sev_pct,
+                    blockchain=blockchain,
                 )
             else:
                 # Curve amnesty (perfect-record veteran on first

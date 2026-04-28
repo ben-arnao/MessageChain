@@ -1262,8 +1262,16 @@ def process_inclusion_list_violation(
         )
         use_pending_basis = current_height >= _T31_H
     if use_pending_basis and slash_pct_for_basis > 0:
+        # ``blockchain=blockchain`` threads the structural guard for
+        # the ``_touch_state`` contract.  IL violation evidence's
+        # ``affected_entities()`` already covers the accused proposer,
+        # so the in-band refresh is a no-op double-refresh — but the
+        # guard is what keeps a future caller (or future refactor of
+        # ``affected_entities()``) from silently regressing into the
+        # same defect-class bug as the matured-censorship slash path.
         slash_amount = blockchain.supply.burn_slash_proportional(
             etx.accused_proposer_id, slash_pct_for_basis,
+            blockchain=blockchain,
         )
     elif slash_amount > 0:
         blockchain.supply.staked[etx.accused_proposer_id] = (
