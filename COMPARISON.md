@@ -91,8 +91,9 @@ is half of MessageChain's pitch.
   stays runnable on commodity hardware even if cost declines stall.
   Storage-cost optimism is allowed to be wrong without the protocol
   collapsing.
-- **Purpose-built primitives for messages.** Per-byte fees, 1024-char
-  cap, prev-pointers for threading, key-rotation continuity, fee-per-byte
+- **Purpose-built primitives for messages.** Per-byte fees, a
+  short-post content cap that chunks speech to a reasonable size,
+  prev-pointers for threading, key-rotation continuity, fee-per-byte
   selection, anti-bloat byte budgets — every primitive is tuned for
   human speech. A messaging app on Arweave reinvents these app-side
   every time, with no shared discipline across apps.
@@ -139,15 +140,19 @@ validators.
 - **Sharper headline promise.** DeSo's pitch is "decentralized social
   network" — vague, drift-prone. MessageChain's is "your message can
   never be deleted" — testable, falsifiable, hard to drift away from.
-- **Shaped reward curve.** The sigmoid stake-curve shaping (small <0.5%
-  of stake earns ~0.80×, mid 0.5–5% earns ~1.25×, large ≥5% earns
-  ~1.00×) prevents whale ossification. DeSo has not shaped the curve
-  this way — token concentration has been a real problem there.
-- **Slashing-with-leniency model.** MessageChain's slashing is informed
-  by track record (length of service, volume of good behavior,
-  good-vs-bad rate), so honest operators are not nuked by single
-  accidents. DeSo's slashing is harsher and noisier, which raises the
-  effective floor for who can run a validator.
+- **Sublinear reward growth in stake.** Reward-per-unit-stake is
+  shaped so it grows sublinearly with stake size — large validators
+  still earn more in absolute terms (rich do get richer), but the
+  *gap* compresses over time, with smaller validators catching up
+  in percentage terms faster than whales widen their lead. DeSo has
+  not shaped the curve this way — token concentration has been a
+  real problem there.
+- **Slashing-with-leniency model.** MessageChain's slashing is
+  weighted by an operator's track record, so honest long-running
+  validators are not nuked by single accidents while a thin-history
+  node misbehaving repeatedly gets no such cover. DeSo's slashing is
+  harsher and flatter, which raises the effective floor for who can
+  run a validator.
 
 ### Where DeSo wins
 
