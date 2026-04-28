@@ -4,6 +4,121 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.36.0] — 2026-04-28
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+surfaced 45 findings across origin/main at 1.35.0; the top-3 by
+severity × leverage × ROI are landed in this release.  Two new hard
+forks (Tier 35 + Tier 36) plus one hot consensus-correctness fix.
+
+### Security (active immediately, no fork gate)
+
+- **Matured censorship slash now refreshes the offender's state_tree
+  leaf — closes a latent state_root-drift / chain-stall bug.**
+  `_apply_censorship_slash` mutated `supply.staked[offender]` and
+  `pending_unstakes` via `burn_slash_proportional` but never called
+  `_touch_state({offender_id})`; the censorship evidence tx's
+  `affected_entities()` returned only `{submitter_id}`, leaving no
+  path that refreshed the offender's leaf when the offender wasn't
+  also the proposer.  Net effect: when censorship matured with
+  `offender ≠ proposer`, the proposer's signed `state_root` committed
+  to the stale leaf while any peer recomputing from `supply.staked`
+  produced a different root → block rejected → chain stall.  Fix:
+  direct refresh at the apply site PLUS a structural guard inside
+  `SupplyTracker.burn_slash_proportional` that takes an optional
+  `blockchain=` kwarg and refreshes the offender leaf itself, so
+  every existing call site (censorship, IL violation, bogus rejection,
+  witness non-response) is covered AND no future caller can
+  re-introduce the same gap.  No fork needed (no historical replay
+  could have reached a divergent root without already being broken)
+  (c22a7aa).
+- **Proposer-side `compute_post_state_root` simulator now mirrors the
+  apply path for ALL evidence kinds — closes silent
+  proposer-self-rejection on bogus_rejection / censorship-mature /
+  IL-violation slashes that have shipped curve-graded apply since
+  Tier 30/31/32.**  Pre-fix the simulator burned a flat
+  `CENSORSHIP_SLASH_BPS` against `staked` only on every evidence
+  kind, while the apply path post-Tier-30/31/32 used the honesty
+  curve and drained `(staked + pending_unstakes)`.  A proposer
+  building a block carrying any of those evidence kinds since Tier
+  32 activated would compute a sim root that diverged from the
+  apply root and the block would self-reject.  Bogus_rejection
+  evidence has been silently un-buildable from `propose_block` for
+  the entire post-Tier-32 mainnet history; censorship-mature and
+  IL-violation since their respective tier activations.  This fix
+  replays byte-identically pre-fork on each path; post-fork the
+  simulator routes through the same curve-graded computation as
+  apply.  A shared `_sim_burn_slash_proportional_stake_delta` helper
+  inside `compute_post_state_root` apportions burns against sim
+  dicts and is reused at all four slash sites for the
+  Tier-31/33/IL/Censorship pending-drain path (e07dcb7).
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 35 — `NonResponseEvidenceTx` block slot wired in, closing
+  a categorical bypass of the validator-collusion defense.**
+  Audit finding #1.  Every prior NonResponseEvidenceTx admission /
+  processor change shipped dead code: `Block` had no
+  `non_response_evidence_txs` field, the canonical
+  `_BLOCK_TX_LIST_ATTRS` registries didn't list it, and
+  `_apply_block_state` never invoked `NonResponseEvidenceProcessor`.
+  A coerced validator who silently dropped a witnessed POST could
+  lose nothing — the entire silent-drop arm of censorship
+  resistance was unprotected on mainnet.  Tier 35 wires the slot
+  end-to-end: dataclass field on `Block`, slot in both `to_bytes` /
+  `from_bytes` (gated on this height — pre-fork blocks emit zero
+  bytes for the slot, byte-identical to historical encoding), entry
+  in both forced-inclusion and Blockchain `_BLOCK_TX_LIST_ATTRS`
+  registries (so Tier 34's multi-list gate sees forced NREs in
+  their correct slot), and an apply loop in `_apply_block_state`
+  that mirrors the bogus-rejection apply path exactly (Tier 32
+  curve + Tier 33 pending-unstake drain via
+  `burn_slash_proportional`).  Activation at
+  `NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT = 766`.  Pre-fork replay
+  byte-identical (c813cec, e07dcb7).
+
+- **Tier 36 — dynamic attester committee shrinks below pool size,
+  restoring floor-era validator P&L.**  Audit finding #3.  Tier 4's
+  fixed 128-slot committee + integer pool division produced a
+  silent zero-payout regime: at floor era (BLOCK_REWARD_FLOOR=4,
+  proposer_share=1, attester_pool=3), `3 // 128 == 0` — every
+  attester earned 0 from issuance forever once the floor binds (~year
+  8 onward).  Even at genesis (`pool=12`) only the first 12 slots
+  were paid; the remaining 116 burned (~90% leak of intended
+  budget).  Two CLAUDE.md anchors violated at once: "validator
+  profitability over decades" (issuance income → 0 forever) and
+  "stake concentration is capped — sigmoid mid-tier compression
+  band closes the gap fastest" (the 1.25× mid multiplier on a base
+  of 0 is still 0; entire compression mechanism inert at floor era).
+  Tier 36 fixes both with a dynamic committee: when `attester_pool
+  < ATTESTER_COMMITTEE_TARGET_SIZE`, the caller shrinks
+  `committee_size` to `min(target, pool)` so every paid slot
+  receives ≥ 1 token.  Selection rule, randomness, stake-weighted
+  blending, and the underlying inflation curve are unchanged —
+  only the paid prefix length shrinks.  Liveness unchanged (every
+  committee member still attests for finality; only payout
+  eligibility changes).  Activation at
+  `ATTESTER_DYNAMIC_COMMITTEE_HEIGHT = 768`.  Pre-fork replay
+  byte-identical (e52f5a2).
+
+### Operator notes
+
+- All validators must upgrade to 1.36.0 within the runway window
+  (current tip → 766).  Pre-1.36.0 nodes will continue to silently
+  lose the witness-non-response slashing arm; will continue to
+  self-reject any block they propose carrying a bogus_rejection /
+  censorship-mature / IL-violation evidence tx; and will continue
+  to burn the entire attester pool at floor era.  Roll validators
+  with `messagechain upgrade --yes`.
+- The censorship-slash `_touch_state` refresh and the
+  `compute_post_state_root` evidence-mirror are active immediately
+  on upgrade (no fork gate).  Both are correctness fixes against
+  bugs that mask each other on the live 2-validator topology
+  (offender == proposer in the censorship case; no propose_block
+  path has been carrying bogus_rejection / IL evidence yet because
+  it would self-reject) — but a third validator joining the network
+  would have hit one of these on the first matured slash.
+
 ## [1.35.0] — 2026-04-28
 
 Audit-driven security cluster — three findings landed together
