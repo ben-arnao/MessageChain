@@ -4,6 +4,13 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.29.2] — 2026-04-28
+
+Diagnostic-only.  Adds a pre-apply state_root mismatch diagnostic
+in `_append_block` (the post-apply diagnostic from 1.29.1 doesn't
+fire because the proposer's own `add_block` rejects at the
+pre-apply simulation check before reaching the apply path).
+
 ## [1.29.1] — 2026-04-27
 
 Diagnostic-only release.  Adds a per-leaf state diagnostic at the

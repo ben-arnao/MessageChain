@@ -11248,6 +11248,44 @@ class Blockchain:
                 simulated_root = None
 
             if simulated_root is not None and block.header.state_root != simulated_root:
+                # Pre-apply diagnostic: the proposer's committed
+                # state_root and the validator's re-simulated state_root
+                # disagree on a block neither has applied yet.  Both
+                # paths run compute_post_state_root over identical
+                # block contents, so a divergence here means the input
+                # state visible to the two callers differs (e.g., a
+                # mutation between propose_block and add_block).  Dump
+                # what we can see about the inputs.
+                try:
+                    diffs = []
+                    react_txs = getattr(block, "react_transactions", []) or []
+                    diffs.append(
+                        f"block #{block.header.block_number} "
+                        f"msg={len(block.transactions)} "
+                        f"transfer={len(block.transfer_transactions)} "
+                        f"react={len(react_txs)} "
+                        f"proposer={block.header.proposer_id.hex()[:16]} "
+                        f"proposer_leaf={block.header.proposer_signature.leaf_index if block.header.proposer_signature else 'none'}"
+                    )
+                    for rtx in react_txs:
+                        diffs.append(
+                            f"  rtx voter={rtx.voter_id.hex()[:16]} "
+                            f"target={rtx.target.hex()[:16]} "
+                            f"choice={rtx.choice} "
+                            f"nonce={rtx.nonce} "
+                            f"leaf={rtx.signature.leaf_index}"
+                        )
+                    diffs.append(
+                        f"committed={block.header.state_root.hex()[:16]} "
+                        f"simulated={simulated_root.hex()[:16]} "
+                        f"current_reaction_choices={len(self.reaction_state.choices)}"
+                    )
+                    logger.warning(
+                        "pre-apply state_root diagnostic: %s",
+                        " | ".join(diffs),
+                    )
+                except Exception:
+                    logger.exception("pre-apply state_root diagnostic failed")
                 return False, "Invalid state_root — state commitment mismatch"
 
         # Round-9 fix: wrap apply + state-root verify + persist in a
