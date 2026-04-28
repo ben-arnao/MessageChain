@@ -358,6 +358,8 @@ class ProofOfStake:
         state_root_checkpoint: bytes = b"\x00" * 32,
         acks_observed_this_block: list[bytes] | None = None,
         react_transactions: list | None = None,
+        inclusion_list_violation_evidence_txs: list | None = None,
+        inclusion_list=None,
     ) -> Block:
         """Create a new block as the selected proposer.
 
@@ -399,6 +401,9 @@ class ProofOfStake:
         bogus_rej_txs = list(bogus_rejection_evidence_txs or [])
         acks_observed = list(acks_observed_this_block or [])
         react_txs = list(react_transactions or [])
+        il_violation_txs = list(inclusion_list_violation_evidence_txs or [])
+        # Optional scalar — None means "no list this block".
+        included_inclusion_list = inclusion_list
 
         # Tier 18: enforce the unified per-block byte budget across
         # Message + Transfer + React.  Without this trim, an honest
@@ -472,6 +477,8 @@ class ProofOfStake:
             bogus_rejection_evidence_txs=bogus_rej_txs,
             acks_observed_this_block=acks_observed,
             react_transactions=react_txs,
+            inclusion_list_violation_evidence_txs=il_violation_txs,
+            inclusion_list=included_inclusion_list,
         )
         from messagechain.core.block import canonical_block_tx_hashes
         tx_hashes = canonical_block_tx_hashes(_block_like)
@@ -637,6 +644,8 @@ class ProofOfStake:
                 bogus_rejection_evidence_txs=bogus_rej_txs,
                 acks_observed_this_block=acks_observed,
                 react_transactions=react_txs,
+                inclusion_list_violation_evidence_txs=il_violation_txs,
+                inclusion_list=included_inclusion_list,
             )
             block.block_hash = block._compute_hash()
             return block
