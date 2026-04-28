@@ -76,10 +76,16 @@ class TestMinStakeRaiseConstants(unittest.TestCase):
         )
 
     def test_post_activation_returns_new(self):
+        # Sample inside the [Tier 2, Tier 28) era — Tier 28 lowers the
+        # floor again, so we pick a height strictly below
+        # MIN_STAKE_FAUCET_DRIP_HEIGHT to exercise the post-raise band.
+        h = (
+            config.MIN_STAKE_RAISE_HEIGHT
+            + (config.MIN_STAKE_FAUCET_DRIP_HEIGHT
+               - config.MIN_STAKE_RAISE_HEIGHT) // 2
+        )
         self.assertEqual(
-            config.get_validator_min_stake(
-                config.MIN_STAKE_RAISE_HEIGHT + 10_000,
-            ),
+            config.get_validator_min_stake(h),
             10_000,
         )
 
@@ -179,7 +185,7 @@ class TestGrandfatherTopUp(unittest.TestCase):
             alice, amount=1_000, nonce=chain.nonces.get(alice.entity_id, 0),
             fee=_fee_for_wots_sig(),
         )
-        post_fork_h = config.MIN_STAKE_RAISE_HEIGHT + 100
+        post_fork_h = (config.MIN_STAKE_RAISE_HEIGHT + config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2
         with patch.object(
             Blockchain, "height",
             new=property(lambda self: post_fork_h),
@@ -208,7 +214,7 @@ class TestGrandfatherTopUp(unittest.TestCase):
             alice, amount=9_500, nonce=chain.nonces.get(alice.entity_id, 0),
             fee=_fee_for_wots_sig(),
         )
-        post_fork_h = config.MIN_STAKE_RAISE_HEIGHT + 100
+        post_fork_h = (config.MIN_STAKE_RAISE_HEIGHT + config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2
         with patch.object(
             Blockchain, "height",
             new=property(lambda self: post_fork_h),
@@ -230,7 +236,7 @@ class TestGrandfatherFullExit(unittest.TestCase):
         chain_supply.staked[eid] = 500
         ok = chain_supply.unstake(
             eid, 500,
-            current_block=config.MIN_STAKE_RAISE_HEIGHT + 100,
+            current_block=(config.MIN_STAKE_RAISE_HEIGHT + config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2,
         )
         self.assertTrue(ok, "full exit (remaining == 0) must be allowed")
         self.assertEqual(chain_supply.get_staked(eid), 0)
@@ -242,7 +248,7 @@ class TestGrandfatherFullExit(unittest.TestCase):
         chain_supply.staked[eid] = 500
         ok = chain_supply.unstake(
             eid, 200,
-            current_block=config.MIN_STAKE_RAISE_HEIGHT + 100,
+            current_block=(config.MIN_STAKE_RAISE_HEIGHT + config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2,
         )
         self.assertFalse(ok, "partial exit leaving 300 < 10k floor must reject")
         # Stake unchanged.
@@ -296,7 +302,7 @@ class TestLegacyValidatorCanAttest(unittest.TestCase):
         # sync_consensus_stakes pulls from supply into consensus.stakes;
         # the hook we're adding must honor grandfathering (floor = legacy).
         chain.sync_consensus_stakes(
-            pos, block_height=config.MIN_STAKE_RAISE_HEIGHT + 100,
+            pos, block_height=(config.MIN_STAKE_RAISE_HEIGHT + config.MIN_STAKE_FAUCET_DRIP_HEIGHT) // 2,
         )
         self.assertIn(
             alice.entity_id, pos.stakes,
