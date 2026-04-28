@@ -1727,6 +1727,39 @@ def _load_cached_entity(private_key, data_dir):
     return None
 
 
+def _resolve_signing_entity(private_key, args=None, *, tree_height=None):
+    """Return an Entity for *private_key*, using whichever cache is available.
+
+    Two paths share the same on-disk cache shape (HMAC-authenticated
+    MCKC blob, format from ``messagechain.identity.keypair_cache``):
+
+      * ``--data-dir`` set: the daemon's keypair cache under
+        ``<data_dir>/keypair_cache_*.bin`` is reused via
+        ``_load_cached_entity``.
+      * ``--data-dir`` unset (the README's personal-wallet flow): the
+        per-user cache under ``~/.messagechain/wallet_cache/`` is
+        reused via ``load_or_create_personal_wallet_entity``.
+
+    Both paths fall through to ``Entity.create`` on cache miss, which
+    pays the one-time WOTS+ Merkle keygen cost and writes the cache
+    so subsequent invocations are warm.  Without this helper the
+    personal-wallet flow regenerates the tree on every command -- a
+    ~20-30 minute wedge per signing call at the production tree
+    height that makes the README's first-message walkthrough unusable.
+    """
+    from messagechain.identity.keypair_cache import (
+        load_or_create_personal_wallet_entity,
+    )
+    data_dir = getattr(args, "data_dir", None) if args is not None else None
+    if data_dir:
+        entity = _load_cached_entity(private_key, data_dir)
+        if entity is not None:
+            return entity
+    return load_or_create_personal_wallet_entity(
+        private_key, tree_height=tree_height,
+    )
+
+
 def _resolve_leaf_index_path(entity_id_hex: str, *, data_dir: str | None = None):
     """Return the on-disk path for this signer's WOTS+ leaf cursor.
 
@@ -2128,7 +2161,7 @@ def cmd_account(args):
     print("=== Create Account ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
 
     print(f"\nAccount derived from your private key.")
     print(f"  Entity ID:  {entity.entity_id_hex}")
@@ -2161,7 +2194,7 @@ def _cmd_account_sigs_remaining(args=None):
     print("=== Signatures Remaining ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
 
     total = entity.keypair.num_leaves
     remaining = entity.keypair.remaining_signatures
@@ -2243,13 +2276,7 @@ def cmd_send(args):
     # Authenticate
     private_key = _resolve_private_key(args)
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -2583,7 +2610,7 @@ def cmd_send_multi_submit(args) -> int:
     except ValueError:
         print("Error: keyfile must contain a 64-char hex private key")
         return 1
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
 
     nonce = int(getattr(args, "nonce", 0) or 0)
     leaf_index = getattr(args, "leaf_index", None)
@@ -2747,13 +2774,7 @@ def cmd_transfer(args):
 
     private_key = _resolve_private_key(args)
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
 
     nonce_resp = rpc_call(host, port, "get_nonce", {
@@ -2879,7 +2900,7 @@ def cmd_balance(args):
     print("=== Account Balance ===\n")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
 
     host, port = _parse_server(args.server)
 
@@ -2911,13 +2932,7 @@ def cmd_stake(args):
 
     private_key = _resolve_private_key(args)
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nStaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -3011,19 +3026,12 @@ def cmd_unstake(args):
     print("=== Unstake Tokens ===\n")
 
     private_key = _resolve_private_key(args)
-    # Mirror cmd_stake / cmd_transfer: when --data-dir points at a
-    # running validator's data_dir, reuse the daemon's cached WOTS+
-    # keypair instead of regenerating the Merkle tree from scratch
-    # (~20-30 min on production tree_height=16/20 wallets; observed to
-    # wedge a CLI invocation for 10+ min on an e2-small mainnet node).
+    # WOTS+ Merkle keygen takes ~20-30 min at the production tree
+    # height -- both --data-dir (daemon-coresident) and personal-wallet
+    # paths route through the shared HMAC-authenticated cache via
+    # _resolve_signing_entity so subsequent invocations are warm.
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nUnstaking as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -3146,7 +3154,7 @@ def cmd_bootstrap_seed(args):
         sys.exit(1)
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nSeed entity: {entity.entity_id_hex}")
     print(f"Cold authority: {authority_pubkey.hex()}")
     print(f"Stake amount: {args.stake_amount}\n")
@@ -3279,20 +3287,12 @@ def cmd_set_authority_key(args):
         sys.exit(1)
 
     private_key = _resolve_private_key(args)
-    # Mirror cmd_stake / cmd_unstake / cmd_transfer: when --data-dir
-    # points at a running validator's data_dir, reuse the daemon's
-    # cached WOTS+ keypair instead of regenerating the Merkle tree
-    # from scratch (~20-30 min on production tree_height=16/20
-    # wallets; observed to wedge a CLI invocation for 10+ min on an
-    # e2-small mainnet node).
+    # WOTS+ Merkle keygen takes ~20-30 min at the production tree
+    # height -- both --data-dir (daemon-coresident) and personal-wallet
+    # paths route through the shared HMAC-authenticated cache via
+    # _resolve_signing_entity so subsequent invocations are warm.
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -3363,19 +3363,14 @@ def cmd_rotate_key(args):
     print("Your entity ID, balance, and stake are preserved.\n")
 
     private_key = _resolve_private_key(args)
-    # Mirror cmd_stake / cmd_unstake / cmd_set_authority_key: when
-    # --data-dir is co-resident with a daemon, prefer the cached
-    # WOTS+ keypair to avoid a 20-30 min Merkle regen at production
-    # tree height. Note: this only saves regen of the CURRENT tree;
-    # the new (post-rotation) tree still has to be derived below.
+    # WOTS+ Merkle keygen takes ~20-30 min at the production tree
+    # height -- both --data-dir (daemon-coresident) and personal-wallet
+    # paths route through the shared HMAC-authenticated cache via
+    # _resolve_signing_entity so subsequent invocations are warm.  Note:
+    # this only saves regen of the CURRENT tree; the new (post-rotation)
+    # tree still has to be derived below.
     data_dir = getattr(args, "data_dir", None)
-    entity = None
-    if data_dir:
-        entity = _load_cached_entity(private_key, data_dir)
-        if entity is not None:
-            print(f"\nUsing cached keypair from {data_dir} (fast path)")
-    if entity is None:
-        entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -3476,7 +3471,7 @@ def cmd_key_status(args):
     from messagechain.config import MERKLE_TREE_HEIGHT
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
 
     # Operator-introspection: query the leaf watermark of THIS
     # entity from the LOCAL node.  Default to localhost so the
@@ -3529,7 +3524,7 @@ def cmd_emergency_revoke(args):
         sys.exit(1)
 
     private_key = _resolve_private_key(args)
-    cold = Entity.create(private_key)
+    cold = _resolve_signing_entity(private_key, args)
 
     # Cold-key cross-process leaf-reuse defense.  The cold key has no
     # chain-side leaf watermark RPC (revoke is nonce-free), so the
@@ -3797,7 +3792,7 @@ def cmd_set_receipt_subtree_root(args):
     print("the censorship-evidence pipeline collapses for this validator.\n")
 
     private_key = _resolve_private_key(args)
-    cold = Entity.create(private_key)
+    cold = _resolve_signing_entity(private_key, args)
 
     # Advance past prior cold-key uses.  Cold-key leaf state is NOT
     # tracked on chain (only the hot-key watermark is updated by
@@ -3973,7 +3968,7 @@ def cmd_propose(args):
     print(f"  Description: {args.description}")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nProposing as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -4066,7 +4061,7 @@ def cmd_vote(args):
     print(f"  Proposal: {args.proposal[:16]}...")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nVoting as: {entity.entity_id_hex[:16]}...")
 
     host, port = _parse_server(args.server)
@@ -4172,7 +4167,7 @@ def cmd_react(args):
     print(f"  Target: {target_hex[:16]}...")
 
     private_key = _resolve_private_key(args)
-    entity = Entity.create(private_key)
+    entity = _resolve_signing_entity(private_key, args)
     print(f"\nReacting as: {entity.entity_id_hex[:16]}...")
 
     if target_is_user and target_bytes == entity.entity_id:
@@ -6566,7 +6561,7 @@ def cmd_backup_wallet(args):
                 keyfile,
                 accept_raw_hex=bool(getattr(args, "data_dir", None)),
             )
-            entity = Entity.create(private_key)
+            entity = _resolve_signing_entity(private_key, args)
             entity_hex = entity.entity_id_hex
         except KeyFileError as e:
             print(f"Error: {e}")

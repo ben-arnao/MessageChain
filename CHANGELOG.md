@@ -4,6 +4,32 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Personal-wallet keypair cache closes the 30-minute keygen cliff on
+  the README's first-message walk-through.** Every `messagechain send`
+  (and the five sibling spending commands -- `transfer`, `stake`,
+  `unstake`, `set-authority-key`, `rotate-key`, plus `account`,
+  `balance`, `propose`, `vote`, `react`, `key-status`,
+  `emergency-revoke`, `set-receipt-subtree-root`, `bootstrap-seed`,
+  `multi-submit`) used to call `Entity.create(private_key)`, which
+  re-derives the 1,048,576-leaf WOTS+ Merkle tree from scratch on
+  every invocation -- ~20-30 minutes per command on real hardware at
+  the production tree height.  The validator daemon already had a
+  working HMAC-keyed encrypted keypair cache; personal wallets just
+  didn't use it.  Refactored the daemon's encode / decode helpers
+  into the shared `messagechain.identity.keypair_cache` module and
+  added a transparent personal-wallet path rooted at
+  `~/.messagechain/wallet_cache/` -- same on-disk shape, same HMAC
+  authentication, no flag required.  Cold first send writes the
+  cache; warm subsequent sends are ~3000x faster (~11 ms vs ~35 s
+  at test height=14; the speedup scales with `2^height`).  A stolen
+  cache file alone is useless without the seed phrase (HMAC keyed
+  on a domain-separated derivation of the private key).  Fixes the
+  first-impression UX wedge that made the README's "send your first
+  message" instruction unusable for newcomers.
+
 ## [1.33.0] — 2026-04-28
 
 ### Fixed
