@@ -3685,9 +3685,19 @@ class Blockchain:
             # Closes the "censor-then-unstake" evasion — the offender
             # cannot move stake to pending_unstakes during the
             # EVIDENCE_MATURITY_BLOCKS window to dodge the slash.
+            #
+            # ``blockchain=self`` threads the structural guard through:
+            # the helper refreshes the offender's state_tree leaf in
+            # band, closing the gap left by ``CensorshipEvidenceTx.
+            # affected_entities`` (which registers only the submitter
+            # because the slash lands at maturity, several blocks
+            # after admission, in a slot the per-tx sweep cannot
+            # reach).  The explicit ``_touch_state`` below is
+            # idempotent with the in-band refresh.
             slash_amount = self.supply.burn_slash_proportional(
                 offender_id, sev_pct,
                 admission_basis=staked_at_admission,
+                blockchain=self,
             )
         else:
             # Pre-Tier-31: legacy staked-only basis.  Cap at current
@@ -3719,6 +3729,23 @@ class Blockchain:
         # (legacy replay byte-identity).
         if self.height >= _T30_H:
             self._bump_slash_offense_count(offender_id)
+
+        # Refresh the offender's state_tree leaf so the canonical
+        # incremental contract holds: every per-entity mutation that
+        # lives inside the leaf commitment (here, ``staked``) must end
+        # in a ``_touch_state`` call before block-end.  The block-level
+        # sweep ``_block_affected_entities`` walks the per-tx
+        # ``affected_entities()`` registrations, but
+        # ``CensorshipEvidenceTx.affected_entities`` returns only
+        # ``{submitter_id}`` — the offender's mutation lands at
+        # MATURITY, several blocks after evidence admission, in a slot
+        # the per-tx sweep cannot reach.  Without this refresh the
+        # leaf is stale whenever ``offender_id != proposer_id`` (the
+        # proposer is always in ``_block_affected_entities``); the
+        # bug is masked today only by ``compute_current_state_root``'s
+        # full-walk rebuild, which the docstring explicitly flags as
+        # transitional.  See ``test_censorship_slash_touch_state.py``.
+        self._touch_state({offender_id})
 
         logger.info(
             f"CENSORSHIP-SLASHED validator {offender_id.hex()[:16]}: "

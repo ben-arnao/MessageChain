@@ -1350,6 +1350,7 @@ class SupplyTracker:
         offender_id: bytes,
         slash_pct: int,
         admission_basis: int | None = None,
+        blockchain=None,
     ) -> int:
         """Pure-burn slash drawing from `staked` AND `pending_unstakes`.
 
@@ -1365,6 +1366,21 @@ class SupplyTracker:
         matches the censorship-evidence "snapshot at admission"
         anchor.  Pass ``None`` to skip the cap (IL violation path,
         which has no admission snapshot).
+
+        ``blockchain`` (optional) is the structural guard for the
+        ``_touch_state`` contract.  When passed, the helper itself
+        calls ``blockchain._touch_state({offender_id})`` after the
+        burn lands so the offender's state_tree leaf reflects the new
+        ``staked`` value — even if the caller's ``affected_entities()``
+        registration omits the offender.  Existing call sites whose
+        block-level sweep already covers the offender (IL violation,
+        bogus rejection, non-response) are no-op double-refreshes;
+        the censorship-evidence call site relies on this in-band
+        refresh because evidence matures several blocks after the
+        admission tx and the per-tx sweep cannot reach the offender.
+        Future call sites that forget to refresh the offender are
+        protected by this guard rather than silently regressing into
+        the same defect-class bug.
 
         Returns the total amount burned (sum of stake_burn +
         pending_burn).
@@ -1455,6 +1471,15 @@ class SupplyTracker:
         # leaves total_supply by the slashed amount.
         self.total_supply -= slashed_amount
         self.total_burned += slashed_amount
+
+        # Structural guard for the ``_touch_state`` contract.  When the
+        # caller threads the blockchain through, the helper refreshes
+        # the offender's state_tree leaf in-band so a forgotten per-
+        # call-site refresh cannot leave the leaf stale.  The check
+        # is defensive (``hasattr`` rather than a hard import) so test
+        # stubs that pass a stripped-down blockchain still work.
+        if blockchain is not None and hasattr(blockchain, "_touch_state"):
+            blockchain._touch_state({offender_id})
         return slashed_amount
 
     def get_supply_stats(self, current_block_height: int = 0) -> dict:
