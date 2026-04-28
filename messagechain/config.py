@@ -4431,6 +4431,60 @@ assert (
     "cluster so a single coordinated upgrade window covers both the "
     "slashing-basis (Tier 31/33) and attester-gate (Tier 34) changes."
 )
+# ─── Tier 35: dynamic attester committee shrinks below pool size ──────
+# Tier 4 (`ATTESTER_REWARD_SPLIT_HEIGHT`) decoupled committee size
+# from reward budget — fixed-target 128-slot committee, pool divided
+# pro-rata, integer remainder burns.  That solved the legacy "only 3
+# paid forever at floor" failure but introduced a worse one: when
+# `attester_pool < ATTESTER_COMMITTEE_TARGET_SIZE`, integer division
+# rounds to 0 and EVERY attester earns 0 from issuance.
+#
+# Concretely, once halvings drive `BLOCK_REWARD` to `BLOCK_REWARD_FLOOR
+# = 4`, `proposer_share = 1`, `attester_pool = 3`, and
+# `3 // 128 == 0` — every attester's issuance income is permanently 0
+# from year ~8 onward.  Even at genesis (`pool = 12`) only the first 12
+# committee slots get 1 token; the remaining 116 burn (~90% leak of
+# the pool's intended budget across the entire pre-floor regime).
+#
+# Two CLAUDE.md anchors are violated at once:
+#   * "Validator profitability over decades" — issuance income drops to
+#     0 forever once the floor binds.
+#   * "Stake concentration is capped — sigmoid mid-tier compression
+#     band closes the gap fastest" (Settled Design Decisions, reward
+#     curve) — the Tier 20 multiplier (1.25× mid) on a base of 0 is
+#     still 0; the entire compression mechanism is inert at floor era.
+#
+# Tier 35 fixes both with a dynamic committee: when `attester_pool <
+# ATTESTER_COMMITTEE_TARGET_SIZE`, the caller shrinks committee_size
+# to `min(target, attester_pool)` BEFORE invoking
+# `select_attester_committee`.  Selection rule, randomness, and
+# stake-weighted blending are unchanged — only the paid prefix length
+# shrinks so every paid slot receives >= 1 token.  The remaining
+# stake-set still attests for finality liveness; they just don't draw
+# issuance for THIS block.  Stake-weighted committee selection rotates
+# them through paid blocks at their stake-weighted frequency.
+#
+# Why this preserves anchors:
+#   * Reward-curve multiplier reactivates because `per_slot_reward` is
+#     now non-zero; mid-tier compression band actually applies.
+#   * No change to proposer reward, base inflation curve, fee
+#     distribution, or selection rule — pure attester-side parameter.
+#   * Liveness unchanged: every committee member still attests for
+#     finality; only payout eligibility changes.
+#
+# Pre-activation: `committee_size = ATTESTER_COMMITTEE_TARGET_SIZE`
+# (Tier 4 behavior) so any block accepted under the old rule still
+# replays byte-identically.  Post-activation: dynamic shrink active.
+ATTESTER_DYNAMIC_COMMITTEE_HEIGHT = 768  # Tier 35
+assert (
+    ATTESTER_DYNAMIC_COMMITTEE_HEIGHT
+    > FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
+), (
+    "ATTESTER_DYNAMIC_COMMITTEE_HEIGHT must follow Tier 34 — Tier 35 "
+    "rides on top of the most recent established fork (Tier 34) with "
+    "the standard runway buffer so callers between the two heights "
+    "see the legacy fixed-target committee path."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "
