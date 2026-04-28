@@ -3645,6 +3645,9 @@ class Blockchain:
         from messagechain.consensus.censorship_evidence import (
             compute_slash_amount,
         )
+        from messagechain.config import (
+            HONESTY_CURVE_INSURANCE_HEIGHT as _T30_H,
+        )
         offender_id = matured.offender_id
         # Slash basis is stake AT ADMISSION, not current stake.  An
         # accused validator would otherwise unstake during the
@@ -3655,6 +3658,24 @@ class Blockchain:
         # admission time — see submit() in censorship_evidence.py.
         staked_at_admission = getattr(matured, "staked_at_admission", 0)
         current_stake = self.supply.staked.get(offender_id, 0)
+        # Tier 30 honest-operator insurance: route through the honesty
+        # curve with AMBIGUOUS classification.  A single missed include
+        # is plausibly honest mempool churn — only repeat patterns
+        # (slash_offense_counts via the curve) justify escalation.
+        # Pre-Tier-30: legacy flat CENSORSHIP_SLASH_BPS path,
+        # byte-identical to historical replay.
+        if self.height >= _T30_H:
+            from messagechain.consensus.honesty_curve import (
+                OffenseKind as _OK,
+                Unambiguity as _Un,
+                slashing_severity as _sev,
+            )
+            sev_pct = _sev(
+                offender_id, _OK.CENSORSHIP, _Un.AMBIGUOUS, self,
+            )
+            base_slash = (staked_at_admission * sev_pct) // 100
+        else:
+            base_slash = compute_slash_amount(staked_at_admission)
         # Cap at current: the unstaked-to-pending portion already
         # left `staked` for `pending_unstakes`, which this slash path
         # deliberately does not touch.  Debiting more than current
@@ -3663,7 +3684,7 @@ class Blockchain:
         # effectively, because their `pending_unstakes` is not slashed
         # by censorship (it still sits for UNBONDING_PERIOD) — only
         # the maximum we can take from `staked` right now.
-        slash_amount = min(compute_slash_amount(staked_at_admission), current_stake)
+        slash_amount = min(base_slash, current_stake)
         if slash_amount <= 0:
             # No slash to apply — still record the evidence as
             # processed so it cannot be re-submitted.
@@ -3682,6 +3703,13 @@ class Blockchain:
 
         # Record as processed to prevent double-slashing.
         self._processed_evidence.add(matured.evidence_hash)
+
+        # Tier 30: bump slash_offense_counts so the next censorship
+        # slash on the same offender escalates via the curve's
+        # repeat-offense ramp.  Pre-Tier-30 the counter is untouched
+        # (legacy replay byte-identity).
+        if self.height >= _T30_H:
+            self._bump_slash_offense_count(offender_id)
 
         logger.info(
             f"CENSORSHIP-SLASHED validator {offender_id.hex()[:16]}: "
@@ -4303,6 +4331,8 @@ class Blockchain:
         censorship_evidence_txs: list | None = None,
         bogus_rejection_evidence_txs: list | None = None,
         react_transactions: list | None = None,
+        inclusion_list_violation_evidence_txs: list | None = None,
+        inclusion_list=None,
     ) -> bytes:
         """Compute the state root AFTER applying a set of transactions.
 
@@ -5725,6 +5755,143 @@ class Blockchain:
             _bump_wm(etx.submitter_id, etx.signature.leaf_index)
             sim_br_processed.add(etx.evidence_hash)
 
+        # ── Inclusion-list violation evidence: mirror the apply path ──
+        # _apply_block_state's IL-violation loop:
+        #
+        #   for etx in inclusion_list_violation_evidence_txs:
+        #     validate_inclusion_list_violation_evidence_tx(...)
+        #     process_inclusion_list_violation(...) → drain stake +
+        #       burn total_supply / total_burned; bump
+        #       slash_offense_counts (the latter does NOT live in the
+        #       SMT leaf, so it doesn't affect the committed root —
+        #       we still mirror it for sim-internal correctness).
+        #     pay_fee_with_burn(submitter → proposer)
+        #     _bump_watermark(submitter)
+        #
+        # The validation gate reads chain state directly (processor
+        # registries, public_keys, etc.).  We can call the live
+        # validator since validation is read-only.  The slash drain
+        # is mirrored against sim_staked.
+        from messagechain.consensus.inclusion_list import (
+            process_inclusion_list_violation as _proc_il_violation,
+            compute_violation_slash_amount as _il_slash_flat,
+        )
+        from messagechain.config import (
+            HONESTY_CURVE_RATE_HEIGHT as _IL_HC_RATE_H,
+        )
+        sim_il_processed_violations = set(
+            self.inclusion_list_processor.processed_violations
+        )
+        sim_slash_offense_counts: dict[bytes, int] = dict(
+            getattr(self, "slash_offense_counts", {}) or {}
+        )
+        for etx in (inclusion_list_violation_evidence_txs or []):
+            # Mirror admission check — same gate the apply loop runs.
+            ok, _reason = self.validate_inclusion_list_violation_evidence_tx(
+                etx, chain_height=block_height,
+            )
+            if not ok:
+                continue
+            # Dedupe gate — sim-local so a same-block duplicate is
+            # rejected just like the apply path's processor would.
+            key = (
+                etx.inclusion_list.list_hash,
+                etx.omitted_tx_hash,
+                etx.accused_proposer_id,
+            )
+            if key in sim_il_processed_violations:
+                continue
+            current_stake = sim_staked.get(etx.accused_proposer_id, 0)
+            # Severity: post-Tier-24 routes through the curve, pre-fork
+            # uses the flat-BPS path.  Mirror exactly.
+            if block_height >= _IL_HC_RATE_H:
+                from messagechain.consensus.honesty_curve import (
+                    OffenseKind as _OK,
+                    Unambiguity as _Un,
+                    slashing_severity as _sev,
+                )
+                # The curve reads slash_offense_counts off the live
+                # blockchain object; route through a sim-shadow that
+                # transparently shadows reads against our local
+                # sim_slash_offense_counts.  Simplest correct route:
+                # compute via _sev with a temporary swap.  The shadow
+                # only mutates a Python attribute, never disk.
+                _live_counts = self.slash_offense_counts
+                self.slash_offense_counts = sim_slash_offense_counts
+                try:
+                    sev_pct = _sev(
+                        etx.accused_proposer_id,
+                        _OK.INCLUSION_LIST_VIOLATION,
+                        _Un.UNAMBIGUOUS,
+                        self,
+                    )
+                finally:
+                    self.slash_offense_counts = _live_counts
+                slash_amount = (current_stake * sev_pct) // 100
+            else:
+                slash_amount = _il_slash_flat(current_stake)
+            if slash_amount > 0:
+                sim_staked[etx.accused_proposer_id] = (
+                    current_stake - slash_amount
+                )
+                # Bump offense count in sim shadow only.
+                if block_height >= _IL_HC_RATE_H:
+                    sim_slash_offense_counts[etx.accused_proposer_id] = (
+                        sim_slash_offense_counts.get(
+                            etx.accused_proposer_id, 0,
+                        ) + 1
+                    )
+            sim_il_processed_violations.add(key)
+            # Mirror the post-process accounting: pay_fee_with_burn +
+            # bump submitter watermark.  pay_fee_with_burn debits the
+            # submitter, credits proposer with the tip, accumulates
+            # attester-pool share (post-activation), burns base_fee.
+            effective_base_fee = min(current_base_fee, etx.fee)
+            tip = etx.fee - effective_base_fee
+            sim_balances[etx.submitter_id] = (
+                sim_balances.get(etx.submitter_id, 0) - etx.fee
+            )
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + tip
+            )
+            _accumulate_attester_fee(effective_base_fee)
+            _bump_wm(etx.submitter_id, etx.signature.leaf_index)
+
+        # ── Inclusion-list coverage-divergence leak: mirror apply ──
+        # _apply_block_state runs _apply_inclusion_list_coverage_leak
+        # whenever block.inclusion_list is non-empty.  apply_coverage_
+        # leak drains stake from active attesters whose
+        # quorum_attestation reports failed to cover any listed tx.
+        # We mirror against sim_staked.
+        if (
+            inclusion_list is not None
+            and getattr(inclusion_list, "entries", None)
+        ):
+            from messagechain.consensus.inactivity import (
+                apply_coverage_leak as _apply_cov_leak,
+            )
+            from messagechain.config import (
+                VALIDATOR_MIN_STAKE as _COV_MIN_STAKE,
+            )
+            # Mirror apply's "active attesters" set: validators with
+            # stake > 0 in sim_staked (after preceding tx mutations
+            # this block).
+            sim_active = {
+                eid for eid, amt in sim_staked.items() if amt > 0
+            }
+            if sim_active:
+                # apply_coverage_leak mutates `staked` AND
+                # `misses_counter` in place.  Use a local shadow so
+                # the live counter dict is untouched.
+                sim_misses = dict(self.attester_coverage_misses)
+                _apply_cov_leak(
+                    staked=sim_staked,
+                    misses_counter=sim_misses,
+                    active_attesters=sim_active,
+                    inclusion_list=inclusion_list,
+                    min_stake=_COV_MIN_STAKE,
+                )
+
         # Incremental state-root commitment via the live state_tree.
         # The old path called ``compute_state_root(sim_*)`` which built a
         # fresh SparseMerkleTree from scratch: O(N_accounts * TREE_DEPTH)
@@ -5840,6 +6007,8 @@ class Blockchain:
         bogus_rejection_evidence_txs: list | None = None,
         acks_observed_this_block: list | None = None,
         react_transactions: list | None = None,
+        inclusion_list_violation_evidence_txs: list | None = None,
+        inclusion_list=None,
     ) -> Block:
         """Create a block with the correct post-state root.
 
@@ -5915,6 +6084,10 @@ class Blockchain:
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
             react_transactions=react_transactions,
+            inclusion_list_violation_evidence_txs=(
+                inclusion_list_violation_evidence_txs
+            ),
+            inclusion_list=inclusion_list,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -5998,6 +6171,10 @@ class Blockchain:
             state_root_checkpoint=state_root_checkpoint,
             acks_observed_this_block=acks_observed_this_block,
             react_transactions=react_transactions,
+            inclusion_list_violation_evidence_txs=(
+                inclusion_list_violation_evidence_txs
+            ),
+            inclusion_list=inclusion_list,
         )
 
     def _derive_observed_acks_for_block(self) -> list:
@@ -11318,6 +11495,12 @@ class Blockchain:
                     # drained.
                     react_transactions=getattr(
                         block, "react_transactions", []
+                    ),
+                    inclusion_list_violation_evidence_txs=getattr(
+                        block, "inclusion_list_violation_evidence_txs", [],
+                    ),
+                    inclusion_list=getattr(
+                        block, "inclusion_list", None,
                     ),
                 )
             except Exception:

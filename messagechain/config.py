@@ -4241,6 +4241,36 @@ assert VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT > MIN_STAKE_FAUCET_DRIP_HEIGHT, (
     "and zeroes the Tier 6 registration burn, so the order matters: callers "
     "between the two heights still see the Tier 28 floor + Tier 6 burn."
 )
+# ─── Tier 30: honest-operator insurance for soft slashes ──────────────
+# CLAUDE.md anchors "honest operators are insured against accidents" —
+# slashing must reserve catastrophic burn for provable malicious intent
+# and ramp severity by track record (length of service + volume + good-
+# vs-bad rate).  Two soft-slash paths violate this anchor pre-Tier-30:
+#
+#   * `_apply_censorship_slash` burns flat CENSORSHIP_SLASH_BPS (10%)
+#     and never consults the honesty curve — a long-tenured validator
+#     who happened to omit one tx during honest mempool churn pays the
+#     same as a deliberate censoring proposer.
+#   * `process_inclusion_list_violation` classifies first offenses as
+#     UNAMBIGUOUS, producing a 50%/100% slash on a single missed
+#     include.  An IL violation CAN be honest mempool divergence — only
+#     a repeat pattern, or evidence of distinct mempool views proving
+#     the proposer saw the tx, justifies UNAMBIGUOUS classification.
+#
+# Tier 30 routes both paths through `slashing_severity` with
+# `Unambiguity.AMBIGUOUS` on first offense; subsequent offenses (read
+# off slash_offense_counts, persisted from Tier 24) escalate.
+# A new `OffenseKind.CENSORSHIP` entry slots into the existing curve.
+# Pre-activation: byte-identical to legacy behavior (flat 10% +
+# UNAMBIGUOUS first-offense for IL violations).
+HONESTY_CURVE_INSURANCE_HEIGHT = 756  # Tier 30 — fast-forwarded for 1.33.0 hard fork sweep
+assert HONESTY_CURVE_INSURANCE_HEIGHT > VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT, (
+    "HONESTY_CURVE_INSURANCE_HEIGHT must follow "
+    "VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT — Tier 30 rides on top of the "
+    "highest established fork (Tier 29) with the standard runway "
+    "buffer so callers between the two heights see the legacy flat-BPS "
+    "censorship slash and UNAMBIGUOUS-first IL violation classification."
+)
 assert VALIDATOR_MIN_STAKE_TIER29 == VALIDATOR_MIN_STAKE_FAUCET_DRIP - MIN_FEE, (
     "VALIDATOR_MIN_STAKE_TIER29 must equal FAUCET_DRIP - MIN_FEE — "
     "Tier 29's whole intent is 'one drip = stake + fee + burn' end-to-end "

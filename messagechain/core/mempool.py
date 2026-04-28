@@ -33,24 +33,62 @@ from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 
 
-def _fee_per_byte(tx) -> float:
-    """Selection priority: fee divided by stored bytes.
+def _stored_bytes(tx, *, cache: dict[bytes, int] | None = None) -> int:
+    """Return ``len(tx.to_bytes())``, optionally cached by tx_hash.
+
+    Mempool sorts and re-sorts often (every ``get_transactions``,
+    every full-pool eviction probe, every RBF replace).  Recomputing
+    the encoding on every comparison is expensive — the canonical
+    encoding pulls a fresh signature blob serialization each call.
+    Cache hint dict (when provided) keys by ``tx_hash`` so insert /
+    eviction can populate / drop entries.
+    """
+    if cache is not None:
+        h = getattr(tx, "tx_hash", None)
+        if h is not None:
+            cached = cache.get(h)
+            if cached is not None:
+                return cached
+    try:
+        n = len(tx.to_bytes())
+    except Exception:
+        # Defensive: a malformed tx whose to_bytes() raises shouldn't
+        # crash ranking — fall back to a sentinel of 1 so ranking
+        # collapses to absolute fee for that single tx instead of
+        # killing the whole sort.
+        return 1
+    if cache is not None:
+        h = getattr(tx, "tx_hash", None)
+        if h is not None:
+            cache[h] = n
+    return n
+
+
+def _fee_per_byte(tx, *, cache: dict[bytes, int] | None = None) -> float:
+    """Selection priority: fee divided by STORED bytes.
 
     The block byte budget is the binding constraint on inclusion, so
-    revenue-per-byte is the right ranking — not absolute fee.
+    revenue-per-stored-byte is the right ranking — not absolute fee,
+    and not fee-per-payload-byte either.  Stored bytes for any tx
+    kind = ``len(tx.to_bytes())``: the actual on-disk encoding the
+    chain pins forever.  This includes the WOTS+ witness, which
+    dominates per-tx storage cost regardless of kind.
 
-    `pending` may contain both MessageTransaction (which stores a
-    `.message` payload that is its only variable-size field) and
-    other tx kinds routed through the same pool (TransferTransaction,
-    StakeTransaction, …).  For non-message tx types the human-content
-    payload is empty by definition, so we fall back to a length of 1
-    — they're charged at flat-fee scale and the ranking just collapses
-    to absolute fee, which is the right behavior.  Empty messages
-    cannot occur in practice (validator rejects len==0); the
-    `max(1, …)` guard is defensive.
+    Pre-fix this divided by ``len(tx.message)``, which:
+      * Over-stated MessageTransaction density by ~50× (witness was
+        invisible to the comparator), and
+      * Collapsed non-message kinds (Transfer, Stake, Unstake,
+        Governance, Authority, Slash, React) to absolute-fee ranking
+        because ``getattr(tx, "message", b"")`` falls back to empty.
+
+    A ``cache`` dict (Mempool's ``_stored_bytes`` field) memoizes
+    ``len(tx.to_bytes())`` by tx_hash so the sort/comparator path
+    doesn't pay the full encoding cost on every comparison.  Module-
+    level callers that omit the cache (test helpers, ad-hoc
+    introspection) recompute on each call — correct, just slower.
     """
-    payload = getattr(tx, "message", b"")
-    return tx.fee / max(1, len(payload))
+    n = _stored_bytes(tx, cache=cache)
+    return tx.fee / max(1, n)
 
 
 class Mempool:
@@ -131,6 +169,13 @@ class Mempool:
         # react_transactions slot via `get_react_transactions`.
         self.react_pool: dict[bytes, object] = {}
         self.react_pool_max_size: int = 10_000
+        # Stored-byte cache for ``_fee_per_byte`` ranking.  Keys by
+        # tx_hash so a single ``len(tx.to_bytes())`` call is enough
+        # per tx no matter how many sort / RBF / eviction passes the
+        # mempool runs over it.  Populated on insert
+        # (``add_transaction`` / ``try_replace_by_fee``) and torn
+        # down on remove.
+        self._stored_bytes: dict[bytes, int] = {}
 
     def add_transaction(
         self,
@@ -190,8 +235,9 @@ class Mempool:
                 # Evict the lowest fee-per-byte tx — same priority axis used
                 # for block inclusion, so a tx admitted here is one the next
                 # proposer would actually pick over what's being kicked out.
-                min_tx = min(self.pending.values(), key=_fee_per_byte)
-                if _fee_per_byte(tx) <= _fee_per_byte(min_tx):
+                _key = lambda t: _fee_per_byte(t, cache=self._stored_bytes)
+                min_tx = min(self.pending.values(), key=_key)
+                if _key(tx) <= _key(min_tx):
                     return False  # new tx doesn't beat the worst density in pool
                 self._remove_tx(min_tx)
 
@@ -200,6 +246,9 @@ class Mempool:
             self.arrival_heights[tx.tx_hash] = (
                 arrival_block_height if arrival_block_height is not None else 0
             )
+            # Pre-populate the stored-bytes cache so the next ranking
+            # pass over this tx skips the recompute.
+            _stored_bytes(tx, cache=self._stored_bytes)
             return True
 
     def get_transactions(self, max_count: int) -> list[MessageTransaction]:
@@ -213,7 +262,11 @@ class Mempool:
         fee=200 because it claims fewer bytes of the budget per unit fee.
         """
         with self._lock:
-            txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
+            txs = sorted(
+                self.pending.values(),
+                key=lambda t: _fee_per_byte(t, cache=self._stored_bytes),
+                reverse=True,
+            )
             return txs[:max_count]
 
     def get_transactions_with_entity_cap(
@@ -227,7 +280,11 @@ class Mempool:
         higher fee density than txs from other entities.
         """
         with self._lock:
-            txs = sorted(self.pending.values(), key=_fee_per_byte, reverse=True)
+            txs = sorted(
+                self.pending.values(),
+                key=lambda t: _fee_per_byte(t, cache=self._stored_bytes),
+                reverse=True,
+            )
             selected: list[MessageTransaction] = []
             entity_counts: dict[bytes, int] = {}
             for tx in txs:
@@ -264,7 +321,7 @@ class Mempool:
             ]
             qualifying.sort(
                 key=lambda t: (
-                    -_fee_per_byte(t),
+                    -_fee_per_byte(t, cache=self._stored_bytes),
                     self.arrival_heights.get(t.tx_hash, 0),
                     t.tx_hash,
                 )
@@ -303,6 +360,10 @@ class Mempool:
                 if self._sender_counts[tx.entity_id] == 0:
                     del self._sender_counts[tx.entity_id]
             self.arrival_heights.pop(tx.tx_hash, None)
+            # Tear down the stored-bytes cache entry — keeping stale
+            # entries here would slowly leak memory across the
+            # mempool's lifetime.
+            self._stored_bytes.pop(tx.tx_hash, None)
 
     def remove_transactions(self, tx_hashes: list[bytes]):
         """Remove transactions after they've been included in a block."""
@@ -365,7 +426,10 @@ class Mempool:
             if existing is None:
                 return False  # nothing to replace
 
-            if _fee_per_byte(new_tx) <= _fee_per_byte(existing):
+            if (
+                _fee_per_byte(new_tx, cache=self._stored_bytes)
+                <= _fee_per_byte(existing, cache=self._stored_bytes)
+            ):
                 return False  # new fee-per-byte density must be strictly higher
 
             # Verify signature on the replacement (prevents censorship via
@@ -391,6 +455,8 @@ class Mempool:
             self.pending[new_tx.tx_hash] = new_tx
             self._sender_counts[new_tx.entity_id] += 1
             self.arrival_heights[new_tx.tx_hash] = prior_arrival
+            # Pre-populate the stored-bytes cache for the replacement.
+            _stored_bytes(new_tx, cache=self._stored_bytes)
             return True
 
     def get_fee_estimate(self, message_bytes: int = 0) -> int:
@@ -413,7 +479,10 @@ class Mempool:
         with self._lock:
             if not self.pending or message_bytes <= 0:
                 return MARKET_FEE_FLOOR
-            densities = sorted(_fee_per_byte(tx) for tx in self.pending.values())
+            densities = sorted(
+                _fee_per_byte(tx, cache=self._stored_bytes)
+                for tx in self.pending.values()
+            )
             median_density = densities[len(densities) // 2]
             estimate = int(median_density * message_bytes)
             return max(MARKET_FEE_FLOOR, estimate)
