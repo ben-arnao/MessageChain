@@ -130,9 +130,11 @@ class TestGetTxStatusRPC(unittest.TestCase):
         att_a = MagicMock()
         att_a.validator_id = b"\x01" * 32
         att_a.block_hash = block_0.block_hash
+        att_a.block_number = 0
         att_b = MagicMock()
         att_b.validator_id = b"\x02" * 32
         att_b.block_hash = block_0.block_hash
+        att_b.block_number = 0
         block_1 = _FakeBlock(
             block_hash=b"\xb0" * 32,
             header=_FakeBlockHeader(
@@ -177,6 +179,174 @@ class TestGetTxStatusRPC(unittest.TestCase):
         self.assertIn("merkle_proof", r)
         self.assertEqual(r["merkle_proof"]["tx_hash"], tx_hash_hex)
         self.assertEqual(r["merkle_proof"]["tx_index"], 0)
+
+    def test_included_tx_uses_successor_block_attestations(self):
+        """Regression: receipt-page finality must read attestations from
+        the successor block (durable) rather than the in-memory
+        FinalityTracker (rebuilt only since the last restart).
+
+        Simulates a node that has restarted since the queried block was
+        finalized: the in-memory tracker is empty for block 0, but block
+        1 still carries the on-disk attestation record.  The receipt
+        must report `attesters` and `finality_threshold_met` from that
+        durable record, not silently downgrade to "awaiting finality".
+        """
+        from server import Server
+
+        tx_hash = bytes(range(32))
+        tx_hash_hex = tx_hash.hex()
+
+        block_0 = _FakeBlock(
+            block_hash=b"\xa0" * 32,
+            header=_FakeBlockHeader(
+                merkle_root=b"\xff" * 32, block_number=0, timestamp=1000,
+            ),
+            txs=[_FakeTx(tx_hash)],
+        )
+        att_a = MagicMock()
+        att_a.validator_id = b"\x01" * 32
+        att_a.block_hash = block_0.block_hash
+        att_a.block_number = 0
+        att_b = MagicMock()
+        att_b.validator_id = b"\x02" * 32
+        att_b.block_hash = block_0.block_hash
+        att_b.block_number = 0
+        block_1 = _FakeBlock(
+            block_hash=b"\xb0" * 32,
+            header=_FakeBlockHeader(
+                merkle_root=b"\xee" * 32, block_number=1, timestamp=1600,
+            ),
+            txs=[],
+            attestations=[att_a, att_b],
+        )
+
+        # Empty FinalityTracker — the post-restart state.
+        finality = _FakeFinality()
+        db = _FakeChainDB(locations={tx_hash: (0, 0)})
+        bc = _FakeBlockchain(
+            height=2, db=db, finality=finality,
+            chain=[block_0, block_1],
+            staked={b"\x01" * 32: 400, b"\x02" * 32: 400, b"\x03" * 32: 200},
+        )
+        self.server.blockchain = bc
+        self.server.mempool = _FakeMempool()
+
+        result = Server._rpc_get_tx_status(
+            self.server, {"tx_hash": tx_hash_hex},
+        )
+
+        self.assertTrue(result["ok"], f"got: {result}")
+        r = result["result"]
+        self.assertEqual(r["attesters"], 2,
+                         "must read durable attesters from successor block")
+        self.assertEqual(r["attesting_stake"], 800)
+        self.assertTrue(
+            r["finality_threshold_met"],
+            "block was finalized at proposal time; restart must not "
+            "downgrade the verdict",
+        )
+
+    def test_included_tx_at_tip_falls_back_to_in_memory_tracker(self):
+        """When the queried block is the chain tip, no successor block
+        exists yet — fall back to the in-memory FinalityTracker so a
+        freshly-included tx still reports the live attestation count
+        gathered since the last restart."""
+        from server import Server
+
+        tx_hash = bytes(range(32))
+        tx_hash_hex = tx_hash.hex()
+
+        block_0 = _FakeBlock(
+            block_hash=b"\xa0" * 32,
+            header=_FakeBlockHeader(
+                merkle_root=b"\xff" * 32, block_number=0, timestamp=1000,
+            ),
+            txs=[_FakeTx(tx_hash)],
+        )
+
+        finality = _FakeFinality(
+            attesters={block_0.block_hash: {b"\x01" * 32}},
+        )
+        db = _FakeChainDB(locations={tx_hash: (0, 0)})
+        bc = _FakeBlockchain(
+            height=1, db=db, finality=finality,
+            chain=[block_0],
+            staked={b"\x01" * 32: 700, b"\x02" * 32: 300},
+        )
+        self.server.blockchain = bc
+        self.server.mempool = _FakeMempool()
+
+        result = Server._rpc_get_tx_status(
+            self.server, {"tx_hash": tx_hash_hex},
+        )
+
+        self.assertTrue(result["ok"], f"got: {result}")
+        r = result["result"]
+        self.assertEqual(r["attesters"], 1,
+                         "tip-block fallback must use in-memory tracker")
+        self.assertEqual(r["attesting_stake"], 700)
+        self.assertTrue(r["finality_threshold_met"])
+
+    def test_db_finalization_overrides_when_attesters_unrecoverable(self):
+        """If the persistent finalized_blocks table says the block is
+        finalized, the verdict is finalized regardless of whether the
+        in-memory tracker or successor-block walk yields any attesters
+        — the DB row is the long-range-attack-resistant commitment."""
+        from server import Server
+
+        tx_hash = bytes(range(32))
+        tx_hash_hex = tx_hash.hex()
+
+        block_0 = _FakeBlock(
+            block_hash=b"\xa0" * 32,
+            header=_FakeBlockHeader(
+                merkle_root=b"\xff" * 32, block_number=0, timestamp=1000,
+            ),
+            txs=[_FakeTx(tx_hash)],
+        )
+        # Block 1 carries no matching attestations (e.g., late attesters
+        # that never made it on chain, but a FinalityVote later sealed
+        # the block).
+        block_1 = _FakeBlock(
+            block_hash=b"\xb0" * 32,
+            header=_FakeBlockHeader(
+                merkle_root=b"\xee" * 32, block_number=1, timestamp=1600,
+            ),
+            txs=[],
+            attestations=[],
+        )
+
+        class _FakeChainDBFinalized(_FakeChainDB):
+            def __init__(self, locations, finalized):
+                super().__init__(locations=locations)
+                self._finalized = set(finalized)
+
+            def is_block_finalized(self, bh):
+                return bh in self._finalized
+
+        db = _FakeChainDBFinalized(
+            locations={tx_hash: (0, 0)},
+            finalized={block_0.block_hash},
+        )
+        bc = _FakeBlockchain(
+            height=2, db=db, finality=_FakeFinality(),
+            chain=[block_0, block_1],
+            staked={b"\x01" * 32: 700, b"\x02" * 32: 300},
+        )
+        self.server.blockchain = bc
+        self.server.mempool = _FakeMempool()
+
+        result = Server._rpc_get_tx_status(
+            self.server, {"tx_hash": tx_hash_hex},
+        )
+
+        self.assertTrue(result["ok"], f"got: {result}")
+        r = result["result"]
+        self.assertTrue(
+            r["finality_threshold_met"],
+            "DB-persistent finalization checkpoint must override an "
+            "empty attestation cache",
+        )
 
     def test_pending_tx_in_mempool(self):
         from server import Server

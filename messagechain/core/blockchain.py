@@ -13805,27 +13805,16 @@ class Blockchain:
             except Exception:  # noqa: BLE001 — best-effort
                 proof_dict = None
 
+        from messagechain.consensus.attestation import durable_block_finality
         block_hash = block.block_hash
-        finality = getattr(self, "finality", None)
-        attester_set = set()
-        attesting_stake = 0
-        if finality is not None:
-            attester_set = set(
-                getattr(finality, "attestations", {}).get(block_hash, set())
-            )
-            attesting_stake = int(
-                getattr(finality, "attested_stake", {}).get(block_hash, 0)
-            )
+        attester_set, attesting_stake, threshold_met = (
+            durable_block_finality(self, int(block_height), block_hash)
+        )
 
         supply = getattr(self, "supply", None)
         staked = dict(getattr(supply, "staked", {}) or {}) if supply else {}
         total_stake = sum(int(v) for v in staked.values())
         total_validators = sum(1 for v in staked.values() if int(v) > 0)
-        threshold_met = (
-            total_stake > 0
-            and attesting_stake * FINALITY_THRESHOLD_DENOMINATOR
-            >= total_stake * FINALITY_THRESHOLD_NUMERATOR
-        )
 
         result = {
             "status": "included",
