@@ -13078,6 +13078,51 @@ class Blockchain:
             "il_processed_violations": set(
                 self.inclusion_list_processor.processed_violations,
             ),
+            # Archive-duty state.  Same defect class as the IL-processor
+            # / four-evidence-collection / receipt-subtree-roots fixes
+            # above: ``_apply_archive_duty`` mutates these every block —
+            # ``validator_first_active_block`` is bumped on every newly-
+            # observed-above-threshold validator, ``archive_active_snapshot``
+            # is captured at every challenge block and cleared at epoch
+            # close, and the miss / streak maps are folded with new
+            # deltas at every epoch close.  A bad-state-root block
+            # whose apply path mutated any of these must have those
+            # mutations reverted by ``_restore_memory_snapshot`` —
+            # otherwise the leak surface mirrors the prior incidents:
+            #
+            #   * miss-counter poisoning: an attacker-bumped entry
+            #     feeds a phantom withhold tier into the next reward
+            #     payout, diverging supply.staked from honest peers;
+            #   * first-active poisoning: a brand-new validator's
+            #     bootstrap-grace window is anchored to an attacker-
+            #     chosen height, so they exit grace earlier or later
+            #     than honest peers (divergent miss accounting);
+            #   * active-snapshot poisoning: a forged
+            #     ``ActiveValidatorSnapshot`` from a bad-state-root
+            #     challenge block is consumed at the next epoch close,
+            #     producing miss updates the canonical chain never
+            #     agreed to.  The dual case (a bad-state-root block at
+            #     epoch close clearing the snapshot) silently drops
+            #     the canonical chain's still-open epoch.
+            #
+            # ``ActiveValidatorSnapshot`` is a frozen dataclass with
+            # frozenset / tuple inner fields (immutable); a direct
+            # reference is sufficient since its identity is replaced
+            # wholesale by the apply path, never mutated in place.
+            # The three int-valued maps need only ``dict(...)`` shallow
+            # copies (values are immutable ints).
+            #
+            # No-fork: snapshot/restore is purely in-memory; the
+            # chaindb mirror runs only after the state-root check
+            # passes, so historical replay is byte-identical.
+            "validator_archive_misses": dict(self.validator_archive_misses),
+            "validator_archive_success_streak": dict(
+                self.validator_archive_success_streak,
+            ),
+            "validator_first_active_block": dict(
+                self.validator_first_active_block,
+            ),
+            "archive_active_snapshot": self.archive_active_snapshot,
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -13347,6 +13392,32 @@ class Blockchain:
             self.inclusion_list_processor.processed_violations = set(
                 snapshot["il_processed_violations"],
             )
+        # Archive-duty state.  See the snapshot-side comment for the
+        # security rationale: a bad-state-root block whose apply
+        # mutated any of these must have those mutations reverted, or
+        # an attacker can poison the miss counter, the first-active
+        # stamp, or the active-snapshot epoch state.  Defaults match
+        # a freshly-initialised Blockchain (empty maps + None
+        # snapshot) so older snapshots that predate these fields
+        # round-trip cleanly.  The maps are re-wrapped in fresh
+        # ``dict(...)`` so the snapshot's stored copy is not aliased
+        # with live state — a subsequent failed reorg could otherwise
+        # mutate the captured snapshot through the live reference.
+        # ``archive_active_snapshot`` is a frozen dataclass; assigning
+        # the reference directly is safe (no in-place mutation
+        # surface).
+        self.validator_archive_misses = dict(
+            snapshot.get("validator_archive_misses", {}),
+        )
+        self.validator_archive_success_streak = dict(
+            snapshot.get("validator_archive_success_streak", {}),
+        )
+        self.validator_first_active_block = dict(
+            snapshot.get("validator_first_active_block", {}),
+        )
+        self.archive_active_snapshot = snapshot.get(
+            "archive_active_snapshot", None,
+        )
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
         """Return the WOTS+ Merkle tree height recorded for `entity_id`.
