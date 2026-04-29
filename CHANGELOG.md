@@ -4,6 +4,66 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.0] — 2026-04-29
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+against `origin/main` at 1.44.1 surfaced 47 findings; the cumulative
+top-1 by severity × leverage × ROI lands here.  One new hard fork
+(Tier 46) closes a structural authority-key defense gap that
+predated the recent fix cadence: a hot-key compromise was, until
+now, equivalent to a cold-key compromise.
+
+### Security (consensus, gated by activation height)
+
+- **Tier 46 — `SetAuthorityKey` rebind requires a cold-key
+  counter-signature once an authority key is already installed.**
+  Pre-fix, `Blockchain.validate_set_authority_key` verified the tx
+  against `self.public_keys[entity_id]` (the hot signing key) only.
+  An attacker with the hot key could broadcast
+  `SetAuthorityKey(new_authority_key=ATTACKER_COLD)` and inherit
+  unstake + emergency-revoke rights; Revoke is signed by
+  `authority_keys[entity_id]` (now attacker-controlled), so the
+  legitimate operator could no longer revoke their own compromised
+  hot identity, and the attacker could sign Unstake to liquidate
+  the entire bonded stake on the 7-day unbond.  The hot/cold split
+  that the design document promises was not actually enforced.
+  Tier 46 introduces an optional `cold_signature` field on
+  `SetAuthorityKeyTransaction`: at and above
+  `AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234` (riding +700
+  cohort spacing above Tier 45's 4534), if `authority_keys[entity_id]`
+  is already set, the tx must carry a valid signature under the
+  currently-installed cold key over the same canonical bytes the
+  hot key signs.  First-time install (no installed cold) and
+  pre-fork rebind paths remain byte-identical for replay
+  determinism — the new field is appended via a `0x01`-marker
+  trailer (mirrors Tier 26 RevokeTransaction window pattern).
+  `tx_hash` commits to the cold signature so it cannot be silently
+  dropped by an intermediary.  CLI gains `--cold-key-path` on
+  `set-authority-key`; `cmd_set_authority_key` detects rebind via
+  RPC and routes through the new helper, with a clear error when
+  `--cold-key-path` is missing on a rebind.  Adversary defended:
+  validator collusion / coerced operator (PRIMARY).  Tests:
+  `tests/test_authority_key_rebind_cold_signature.py` — 11 tests
+  covering activation-height pinning, pre-fork acceptance,
+  post-fork first-install acceptance, post-fork rebind hot-only
+  rejection, valid cold counter-sig acceptance, wrong/forged
+  cold-sig rejection, binary + dict round-trip for both legacy
+  and cold-signed forms, byte-identical legacy encoding.  Source:
+  `2b83b6e` (audit fix #1, merged via `5f91070`).
+
+### Operator notes
+
+- **One new activation height rides in this release.**  Tier 46 at
+  `AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234` — well above
+  current tip with comfortable runway.  All validators must
+  upgrade to 1.45.0 before the runway closes.  Operators who
+  currently rely on rebinding their authority key from the hot
+  key alone must, at and above the activation height, have the
+  cold private key available locally to sign the counter-sig.
+  Pass `--cold-key-path <path>` to `messagechain set-authority-key`
+  for the rebind flow; first-time install path is unchanged.
+  Roll validators with `messagechain upgrade --yes`.
+
 ## [1.44.1] — 2026-04-29
 
 Static-asset-only patch.  Public feed (`https://messagechain.org`)
