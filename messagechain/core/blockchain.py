@@ -5116,6 +5116,9 @@ class Blockchain:
                     REWARD_CURVE_SMOOTH_V2_HEIGHT as _RCSV2H,
                 )
                 from messagechain.economics.inflation import (
+                    _attester_cap_bps_per_epoch as _att_cap_bps,
+                )
+                from messagechain.economics.inflation import (
                     reward_curve_multiplier as _reward_curve_multiplier,
                     reward_curve_multiplier_v2 as _reward_curve_multiplier_v2,
                     reward_curve_multiplier_v3 as _reward_curve_multiplier_v3,
@@ -5177,8 +5180,16 @@ class Blockchain:
                         if _cap_fix_active
                         else attester_pool
                     )
+                    # Tier 45 sim-mirror: dispatch on height so the bps
+                    # constant matches the apply path's
+                    # _attester_cap_bps_per_epoch return at and above
+                    # PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT.  Pre-fork
+                    # path returns the legacy _ARCB value so the sim is
+                    # byte-identical to legacy mint behavior below the
+                    # activation height.
+                    _cap_bps = _att_cap_bps(block_height)
                     _cap_per_entity = (
-                        _cap_pool_basis * _ARCB * _FI // 10_000
+                        _cap_pool_basis * _cap_bps * _FI // 10_000
                     )
                 for eid in attester_committee:
                     _reward_amount = per_slot_reward
@@ -5596,6 +5607,9 @@ class Blockchain:
                     as _ARCB2,
                     FINALITY_INTERVAL as _FI2,
                 )
+                from messagechain.economics.inflation import (
+                    _attester_cap_bps_per_epoch as _att_cap_bps2,
+                )
                 _cap_active2 = block_height >= _ARCH2
                 _cap_fix_active2 = block_height >= _ACFH2
                 # ATTESTER_CAP_FIX_HEIGHT: post-fix, cap basis is
@@ -5607,8 +5621,17 @@ class Blockchain:
                     if _cap_fix_active2
                     else attester_pool
                 )
+                # Tier 45 sim-mirror: same height-conditional dispatch
+                # as the primary sim block — at and above
+                # PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT the cap bps
+                # lifts from the legacy _ARCB2 to the Tier 45 value.
+                # Withhold runs on the post-cap credit, so this mirror
+                # MUST track the apply-side cap bps exactly.
+                _cap_bps2 = (
+                    _att_cap_bps2(block_height) if _cap_active2 else _ARCB2
+                )
                 _gross_cap_per_entity = (
-                    _gross_cap_pool_basis * _ARCB2 * _FI2 // 10_000
+                    _gross_cap_pool_basis * _cap_bps2 * _FI2 // 10_000
                     if _cap_active2 else 0
                 )
                 _gross_live_earnings: dict[bytes, int] = {}

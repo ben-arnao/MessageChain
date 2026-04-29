@@ -2890,6 +2890,51 @@ assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
 )
 
 # ─────────────────────────────────────────────────────────────────────
+# Tier 45 — per-validator attester cap retune (5000 bps post-activation)
+# ─────────────────────────────────────────────────────────────────────
+# Defect the Tier 4 cap was sized for committees of ~128 members, where
+# each validator's per-slot reward is small and 100 bps (1%) of the
+# epoch pool is plenty of headroom for an honest, broadly-distributed
+# attester to earn its full pro-rata share across a 100-block epoch.
+# At today's mainnet committee size of 2 (`min(eligible_validators,
+# 128)` resolves to 2 with two staked validators), per-slot reward is
+# roughly half the attester pool.  That hits the 100 bps cap by block
+# ~3 of every 100-block epoch and burns the rest of the validator's
+# legitimate rewards for the next 97 blocks.  ~79% of attester issuance
+# evaporates per epoch under the legacy constant.
+#
+# Fix raise the cap to 5000 bps (50% of the epoch pool per entity) at
+# a coordinated fork height.  At committee=2, that gives each honest
+# validator headroom to earn its pro-rata ~50% share across the full
+# epoch without burning.  At committee=128, the cap is still well below
+# any individual entity's reachable share (each member earns ~1/128 of
+# the pool = ~0.78%, far under 50%) so the sybil/concentration defense
+# the Tier 4 cap was designed for is preserved at its target committee
+# size — the cap remains a strict upper bound, just one that doesn't
+# trip during legitimate bootstrap operation.
+#
+# Reward-curve SHAPE is unchanged this is a single-knob retune of the
+# per-entity cap, not a touch on smooth-V2 / floor / halving / any
+# anchored economics constant.
+#
+# Pre-activation byte-identical to the legacy 100 bps path.
+PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45 = 5000  # 50% of epoch pool
+PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT = 4534  # Tier 45 — +700 spacing above Tier 44 (3834)
+
+assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45 <= 10_000, (
+    "Tier 45 cap must be a positive basis-point fraction <= 100%"
+)
+assert (
+    PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45
+    > PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+), (
+    "Tier 45 retune must RAISE (not lower) the per-validator cap — the "
+    "legacy 100 bps was sized for committees of 128 and starves "
+    "validators at today's committee size of 2; lowering it under the "
+    "fork would deepen the bug the tier is designed to fix"
+)
+
+# ─────────────────────────────────────────────────────────────────────
 # Finality-vote reward from issuance (hard fork)
 # ─────────────────────────────────────────────────────────────────────
 # Latent economic failure in the shipped code: the
@@ -5251,6 +5296,17 @@ assert CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT > FORCED_INCLUSION_ALL_POOLS
     "covering the censorship-evidence pool; rolling Tier 44 before "
     "Tier 43 leaves the new transfer/react-receipt evidences "
     "vulnerable to the same source-side drop the prior tier closed"
+)
+
+assert (
+    PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT
+    > CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT
+), (
+    "PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT must follow Tier 44 — "
+    "the cap retune is an economics-only knob change that has nothing "
+    "to do with the Tier 44 evidence wire format, but height ordering "
+    "is enforced in tier order so operators upgrade through prior "
+    "forks before the new cap binds"
 )
 
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
