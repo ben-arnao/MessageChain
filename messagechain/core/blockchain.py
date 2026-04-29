@@ -2108,6 +2108,48 @@ class Blockchain:
         ):
             return False, "Invalid signature"
 
+        # Tier 46: at/above AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, a
+        # rebind (authority key already installed for this entity)
+        # additionally requires a counter-signature verified under the
+        # CURRENTLY-installed cold key.  Without this, hot-key
+        # compromise was operationally equivalent to cold-key
+        # compromise — an attacker with the hot key could rebind the
+        # cold role to their own key and inherit Unstake / Revoke.
+        # First-install (no authority key yet installed) is unchanged
+        # — there is no existing cold key to counter-sign with.
+        # Pre-activation: behavior unchanged for replay determinism.
+        from messagechain.config import (
+            AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT as _ARRCH,
+        )
+        from messagechain.core.authority_key import (
+            verify_set_authority_key_cold_countersig,
+        )
+        chain_h = self.height + 1
+        if (
+            chain_h >= _ARRCH
+            and tx.entity_id in self.authority_keys
+        ):
+            existing_cold_pk = self.authority_keys[tx.entity_id]
+            if not tx.has_cold_signature():
+                return False, (
+                    "Missing cold-key counter-signature — at or above "
+                    f"AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT={_ARRCH} a "
+                    "rebind of an already-installed authority key must "
+                    "carry a second signature from the existing cold "
+                    "key (Tier 46).  A SetAuthorityKey signed only by "
+                    "the hot key cannot rebind the cold role — that "
+                    "was the path a stolen-hot-key attacker used to "
+                    "escalate to cold-key powers."
+                )
+            if not verify_set_authority_key_cold_countersig(
+                tx, existing_cold_pk,
+            ):
+                return False, (
+                    "Invalid cold-key counter-signature — the attached "
+                    "second signature does not verify under the "
+                    "currently-installed authority key (Tier 46)."
+                )
+
         # Reject the cold == hot no-op.  Operators legitimately share a
         # single cold wallet across multiple validators they control (the
         # standard cluster pattern), so we do NOT reject cross-entity
