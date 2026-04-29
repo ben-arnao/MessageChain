@@ -2736,6 +2736,36 @@ def cmd_send(args):
         print(f"\nMessage sent!")
         print(f"  TX hash: {tx_hash_hex}")
         print(f"  Fee:     {result['fee']} tokens")
+        # Audit-#2 fix (round 7): persist the validator-issued
+        # SubmissionReceipt to the canonical default location so the
+        # user has the evidence bundle on disk if their tx is later
+        # censored.  Pre-fix, cmd_send read tx_hash + fee and silently
+        # dropped result["receipt"] -- the slashing-backed permanence
+        # promise is the chain's headline guarantee, but the
+        # default-send path didn't save the artifact needed to
+        # actually escalate.  Bundle shape matches _load_receipt_bundle
+        # so `submit-evidence censorship --receipt <path>` consumes
+        # the file directly without translation.  Best-effort: a write
+        # failure is logged but does NOT fail the send (the tx is
+        # already on the wire; surfacing a confusing error after the
+        # accept message would erode the headline UX promise).
+        receipt_hex = result.get("receipt")
+        bundle_path = None
+        if receipt_hex:
+            try:
+                bundle_path = _save_receipt_bundle(
+                    tx_hash_hex=tx_hash_hex,
+                    receipt_hex=receipt_hex,
+                    tx=tx,
+                    tx_kind="message",
+                )
+            except OSError as e:
+                print(
+                    f"  (warning: could not save receipt bundle to disk: {e})"
+                )
+                bundle_path = None
+        if bundle_path:
+            print(f"  Receipt saved: {bundle_path}")
         # Round-6 audit fix: name the headline promise of the project at
         # the exact moment the user just paid for it, and point at the
         # receipt CLI -- the verification surface that grounds the
@@ -5542,14 +5572,94 @@ def _print_not_found_receipt(tx_hash_hex: str) -> int:
     print("    (c) the tx was malformed and rejected at submission")
     print("        time (bad signature, exhausted leaf, fee below floor).")
     print()
+    # Audit-#2 fix (round 7): point at the LIVE submit-evidence form,
+    # not the deprecated `--tx <hash>` stub.  The legacy form is now a
+    # migration prompt that refuses to submit anything, so a user who
+    # ran the printed command pre-fix bounced off a wall at the exact
+    # moment they needed the slashing pipeline most.  The new form
+    # names the canonical bundle path that cmd_send writes on success
+    # (~/.messagechain/receipts/<tx_hash>.json) so the user can
+    # copy-paste the path verbatim.
+    bundle_path = os.path.join(
+        _default_receipts_dir(), f"{tx_hash_hex}.json",
+    )
     print(
         "  MessageChain's headline guarantee: a well-formed message\n"
         "  paying the fee floor is permanent and can never be deleted\n"
         "  once on chain.  If a validator coalition is suppressing\n"
         "  this tx, the slashing-backed evidence path is your remedy:\n"
-        f"    messagechain submit-evidence --tx {tx_hash_hex}"
+        f"    messagechain submit-evidence censorship --receipt {bundle_path}\n"
+        "  (`messagechain send` saves the receipt bundle there\n"
+        "  automatically on submit; pass --receipt to point at a\n"
+        "  different path if you saved it elsewhere.)"
     )
     return 0
+
+
+def _default_receipts_dir() -> str:
+    """The canonical on-disk location for SubmissionReceipt bundles.
+
+    This is the SAME path `submit-evidence censorship --receipt
+    <bundle.json>` reads from when the user pastes
+    `~/.messagechain/receipts/<tx_hash>.json` -- so a user who hits
+    the receipt-CLI's NOT_FOUND escalation hint and copies the
+    suggested path can submit the evidence without any further
+    translation.
+    """
+    return os.path.join(
+        os.path.expanduser("~"), ".messagechain", "receipts",
+    )
+
+
+def _save_receipt_bundle(
+    *,
+    tx_hash_hex: str,
+    receipt_hex: str,
+    tx,
+    tx_kind: str = "message",
+    receipts_dir: str | None = None,
+) -> str:
+    """Write a SubmissionReceipt + receipted-tx pair to the user's
+    receipts directory and return the file path.
+
+    Bundle shape matches what `_load_receipt_bundle` accepts, so
+    `submit-evidence censorship --receipt <path>` can consume the
+    file directly with no translation step.
+
+    The write is idempotent: an existing file at the same path is
+    overwritten (a re-send of the same tx_hash should not crash).
+    The directory is created with mkdir -p semantics so the user
+    doesn't have to seed it first.
+
+    Returns the absolute path of the written file.  Raises OSError
+    on unrecoverable write failure -- callers should treat this as
+    best-effort and continue (the tx is already on the wire).
+    """
+    import json
+
+    target_dir = receipts_dir or _default_receipts_dir()
+    os.makedirs(target_dir, exist_ok=True)
+    bundle_path = os.path.join(target_dir, f"{tx_hash_hex}.json")
+    bundle = {
+        # The validator returns the receipt as hex of to_bytes() in
+        # the submit_transaction RPC response; _load_receipt_bundle
+        # accepts both the hex form and the dict form, so passing
+        # the hex through unchanged is the minimum-translation
+        # option and survives a future schema bump on the dict form.
+        "receipt": receipt_hex,
+        "message_tx": tx.serialize(),
+        "tx_kind": tx_kind,
+    }
+    # Atomic-ish write: write to a tempfile in the same dir, then
+    # rename.  Avoids leaving a half-written bundle if the process
+    # is killed mid-write -- the rename is atomic on every OS we
+    # support, and if the rename itself fails the original file
+    # (or absence thereof) is preserved.
+    tmp_path = bundle_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(bundle, f)
+    os.replace(tmp_path, bundle_path)
+    return bundle_path
 
 
 def _load_receipt_bundle(path: str) -> tuple[object, object]:
