@@ -4796,6 +4796,77 @@ assert (
     "large stakers entirely (eliminating the uptime incentive)"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 39 — Submission-ack backdating defense
+# ─────────────────────────────────────────────────────────────────────
+# Pre-Tier-39 the validator-collusion threat surface had a two-validator
+# escape hatch on the witness-non-response slashing arm: a coerced target
+# validator could sign a SubmissionAck whose ``commit_height`` was set
+# to any past height (e.g. ``earliest_observation_height - 1``), and a
+# colluding proposer could embed that ack in
+# ``block.acks_observed_this_block``.  The chain recorded
+# ``ack.commit_height`` verbatim into ``witness_ack_registry``, the
+# non-response apply gate then saw
+# ``ack_h <= earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS`` →
+# "obligation met" → no slash.  Two validators (target + proposer) was
+# enough to neutralise the silent-drop arm of the validator-collusion
+# defense entirely.
+#
+# Tier 39 lands two complementary defenses on the same activation
+# height:
+#
+#   (a) ``_validate_acks_observed_this_block`` rejects an ack whose
+#       ``commit_height`` is in the future
+#       (``> block.header.block_number``) or too far in the past
+#       (``block.header.block_number - commit_height >
+#       WITNESS_RESPONSE_DEADLINE_BLOCKS + ACK_INCLUSION_GRACE``).
+#   (b) ``apply_block`` records ``block.header.block_number`` (the
+#       inclusion height the chain first observed the ack at) in
+#       ``witness_ack_registry``, NOT ``ack.commit_height``.
+#
+# (a) is defense-in-depth — it bounds the issuer's claim window to a
+# small range around the inclusion height.  (b) is the real teeth: the
+# stored discharge height is no longer issuer-controlled at all, so
+# even if a future bug widens (a), the registry-source change still
+# binds the discharge to actual on-chain observation.
+#
+# Pre-activation: legacy behavior preserved byte-for-byte for replay
+# determinism — the registry continues to store
+# ``ack.commit_height`` and the inclusion-window bound is skipped.
+#
+# Activation rides above Tier 38 with the standard runway buffer well
+# clear of the current ~1300 mainnet tip.
+ACK_BACKDATING_DEFENSE_HEIGHT = 802  # Tier 39
+
+# Slack between an ack's signed ``commit_height`` and the height the
+# proposer first lands the ack on chain.  An ack legitimately created
+# at the moment a witness gossip arrives may take a few blocks to
+# reach the next proposer's mempool and land in a block; the grace
+# absorbs that propagation delay so honest acks are not rejected at
+# the bound.  Small enough that it cannot itself be used to backdate
+# meaningfully (DEADLINE = 8 + GRACE = 4 = 12 blocks ≈ 2 hours, vs.
+# the censorship deadline the obligation is anchored to anyway).
+ACK_INCLUSION_GRACE = 4
+
+assert ACK_BACKDATING_DEFENSE_HEIGHT > REWARD_CURVE_LARGE_BAND_HEIGHT, (
+    "ACK_BACKDATING_DEFENSE_HEIGHT must follow Tier 38 — Tier 39 rides "
+    "on top of the most recent established fork with the standard "
+    "runway buffer; pre-activation callers see the legacy "
+    "registry-stores-commit_height path byte-for-byte"
+)
+assert ACK_INCLUSION_GRACE >= 0, (
+    "ACK_INCLUSION_GRACE must be non-negative — a negative grace would "
+    "reject acks whose commit_height landed at the same block they "
+    "were signed at, which is the legitimate fast-path"
+)
+assert ACK_INCLUSION_GRACE < WITNESS_RESPONSE_DEADLINE_BLOCKS, (
+    "ACK_INCLUSION_GRACE must be smaller than "
+    "WITNESS_RESPONSE_DEADLINE_BLOCKS — a grace at or above the "
+    "deadline would let an issuer backdate an ack to before the "
+    "earliest legitimate observation height, defeating the whole "
+    "point of the bound"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

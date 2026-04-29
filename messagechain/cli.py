@@ -246,6 +246,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Show your account balance, staked amount, and nonce.",
     )
     balance.add_argument("--server", type=str, default=None, help="Server address host:port")
+    # Read-only lookup paths so a user can check a balance with no
+    # private-key access at all.  Address (mc1...) is the human-paste
+    # form; --entity-id keeps the legacy 64-char hex form working for
+    # tooling.  When either is set we skip the personal-wallet cache
+    # / Entity.create round-trip entirely and just do the RPC.
+    balance.add_argument(
+        "--address", type=str, default=None,
+        help="Look up an address (mc1...) WITHOUT prompting for a "
+             "private key. Useful before you have a wallet, or for "
+             "checking somebody else's balance.",
+    )
+    balance.add_argument(
+        "--entity-id", type=str, default=None,
+        help="Look up by raw entity ID hex (64 chars). Same read-only "
+             "behavior as --address, kept for legacy tooling.",
+    )
 
     # --- stake ---
     stake = sub.add_parser(
@@ -377,6 +393,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--server", type=str, default=None,
         help="Server address host:port (default: 127.0.0.1:9334 -- "
              "queries YOUR local node for YOUR entity's leaf watermark)",
+    )
+    # Read-only lookup paths -- same shape as balance.  Skips the
+    # personal-wallet cache / Entity.create roundtrip entirely.
+    key_status.add_argument(
+        "--address", type=str, default=None,
+        help="Look up an address (mc1...) WITHOUT prompting for a "
+             "private key.",
+    )
+    key_status.add_argument(
+        "--entity-id", type=str, default=None,
+        help="Look up by raw entity ID hex (64 chars). Same read-only "
+             "behavior as --address.",
     )
 
     # --- set-receipt-subtree-root ---
@@ -1727,6 +1755,58 @@ def _load_cached_entity(private_key, data_dir):
     return None
 
 
+def _read_only_entity_id_hex(args):
+    """Return a 64-char entity_id hex when the caller provided one of
+    the read-only lookup flags (``--address`` / ``--entity-id``), else
+    ``None``.
+
+    Used by RPC-only commands (``balance``, ``key-status``) to skip
+    the personal-wallet cache / Entity.create roundtrip entirely when
+    the user just wants to look up a published address without
+    proving ownership.  No keyfile, no seed phrase, no cache -- just
+    "decode the address, send the RPC."
+
+    Validation is strict: an invalid checksum on ``--address`` is a
+    fatal error rather than silently falling through to the
+    private-key prompt, since the only way that lookup could "work"
+    against a typoed address is to query a chain entity that does
+    not exist.
+    """
+    address = getattr(args, "address", None) if args is not None else None
+    entity_id = getattr(args, "entity_id", None) if args is not None else None
+    if address is None and entity_id is None:
+        return None
+    if address is not None and entity_id is not None:
+        print(
+            "Error: pass --address OR --entity-id, not both.",
+        )
+        sys.exit(1)
+    if address is not None:
+        from messagechain.identity.address import (
+            decode_address,
+            InvalidAddressError,
+        )
+        try:
+            entity_id_bytes = decode_address(address)
+        except InvalidAddressError as e:
+            print(f"Error: invalid --address: {e}")
+            sys.exit(1)
+        return entity_id_bytes.hex()
+    # Raw hex form.
+    try:
+        entity_id_bytes = bytes.fromhex(entity_id.strip())
+    except ValueError as e:
+        print(f"Error: invalid --entity-id hex: {e}")
+        sys.exit(1)
+    if len(entity_id_bytes) != 32:
+        print(
+            f"Error: --entity-id must decode to 32 bytes, got "
+            f"{len(entity_id_bytes)}",
+        )
+        sys.exit(1)
+    return entity_id_bytes.hex()
+
+
 def _resolve_signing_entity(private_key, args=None, *, tree_height=None):
     """Return an Entity for *private_key*, using whichever cache is available.
 
@@ -2053,8 +2133,18 @@ def cmd_start(args):
             print("(tip: use --keyfile <path> for unattended restart)\n")
             private_key = _resolve_private_key(args)
         from messagechain.config import MERKLE_TREE_HEIGHT
-        progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Loading key tree")
-        entity = Entity.create(private_key, progress=progress)
+        # Route through the same on-disk keypair cache the daemon uses
+        # so a validator restart is a cache HIT (~ms) instead of a
+        # full WOTS+ keygen (~20-30 minutes at production tree height).
+        # ``server._load_or_create_entity`` writes the cache under
+        # ``<data_dir>/keypair_cache_*.bin`` on first run and reads it
+        # on every subsequent start; both paths fall through to a
+        # fresh ``Entity.create`` on cache miss / corruption so a
+        # first-ever start still produces the right entity.
+        from server import _load_or_create_entity as _srv_load_entity
+        entity = _srv_load_entity(
+            private_key, MERKLE_TREE_HEIGHT, args.data_dir,
+        )
 
         # Advance keypair past used leaves
         leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
@@ -2899,14 +2989,23 @@ def cmd_balance(args):
 
     print("=== Account Balance ===\n")
 
-    private_key = _resolve_private_key(args)
-    entity = _resolve_signing_entity(private_key, args)
+    # Read-only lookup branch: --address (mc1...) or --entity-id (hex)
+    # shortcuts the keygen/cache roundtrip entirely.  This is the
+    # README first-touch path -- the user may not even have a wallet
+    # yet, just wants to confirm a published address resolves.  No
+    # getpass, no Entity.create, no cache write, no leaf-index
+    # binding.
+    entity_id_hex = _read_only_entity_id_hex(args)
+    if entity_id_hex is None:
+        private_key = _resolve_private_key(args)
+        entity = _resolve_signing_entity(private_key, args)
+        entity_id_hex = entity.entity_id_hex
 
     host, port = _parse_server(args.server)
 
     from client import rpc_call
     response = rpc_call(host, port, "get_entity", {
-        "entity_id": entity.entity_id_hex,
+        "entity_id": entity_id_hex,
     })
 
     if response.get("ok"):
@@ -3258,7 +3357,14 @@ def cmd_bootstrap_seed(args):
     print("\n=== All three steps submitted ===")
     print("Stake and set-authority-key take effect when the next block is produced.")
     print(f"\nVerify with:")
-    print(f"  messagechain info --entity-id {entity.entity_id_hex} --server {host}:{port}")
+    # ``info`` does NOT take ``--entity-id``; ``balance --address`` is
+    # the read-only lookup path that ships with this CLI (and accepts
+    # the ``mc1...`` checksummed form so a paste typo is caught).
+    from messagechain.identity.address import encode_address as _enc_addr
+    print(
+        f"  messagechain balance --address "
+        f"{_enc_addr(entity.entity_id)} --server {host}:{port}"
+    )
     print("\nThe verification must show:")
     print(f"  staked         >= {args.stake_amount}")
     print(f"  authority_key  == {authority_pubkey.hex()}")
@@ -3470,8 +3576,14 @@ def cmd_key_status(args):
     from messagechain.identity.identity import Entity
     from messagechain.config import MERKLE_TREE_HEIGHT
 
-    private_key = _resolve_private_key(args)
-    entity = _resolve_signing_entity(private_key, args)
+    # Read-only lookup branch: same logic as cmd_balance.  Lets an
+    # operator inspect another validator's leaf-consumption without
+    # holding their private key.
+    entity_id_hex = _read_only_entity_id_hex(args)
+    if entity_id_hex is None:
+        private_key = _resolve_private_key(args)
+        entity = _resolve_signing_entity(private_key, args)
+        entity_id_hex = entity.entity_id_hex
 
     # Operator-introspection: query the leaf watermark of THIS
     # entity from the LOCAL node.  Default to localhost so the
@@ -3481,7 +3593,7 @@ def cmd_key_status(args):
     from client import rpc_call
 
     status = rpc_call(host, port, "get_key_status", {
-        "entity_id": entity.entity_id_hex,
+        "entity_id": entity_id_hex,
     })
     if not status.get("ok"):
         print(f"Error: {status.get('error')}")
@@ -3494,7 +3606,7 @@ def cmd_key_status(args):
     pct_used = (used * 100) // capacity if capacity else 0
 
     print("\n=== Key Status ===\n")
-    print(f"  Entity ID:       {entity.entity_id_hex}")
+    print(f"  Entity ID:       {entity_id_hex}")
     print(f"  Public key:      {result['public_key']}")
     print(f"  Rotation #:      {result['rotation_number']}")
     print(f"  Leaves used:     {used} / {capacity} ({pct_used}%)")
@@ -4253,6 +4365,28 @@ def cmd_generate_key(_args):
     key = os.urandom(32)
     progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
     entity = Entity.create(key, progress=progress)
+    # Warm the personal-wallet cache so the README's next two
+    # commands (`verify-key` then `balance`) are cache HITS instead of
+    # full re-derivations.  Without this, the user pays the
+    # ~20-30 minute WOTS+ keygen cost three times before they've
+    # done anything useful.  Best-effort: a permission error / full
+    # disk must NOT crash key generation -- the key was generated
+    # successfully and the cache is purely a UX optimization for the
+    # next command on this machine.
+    try:
+        from messagechain.identity.keypair_cache import (
+            personal_wallet_cache_path,
+            personal_wallet_cache_dir,
+            encode_keypair_cache,
+            _atomic_write,
+        )
+        cache_dir = personal_wallet_cache_dir()
+        cache_path = personal_wallet_cache_path(key, MERKLE_TREE_HEIGHT)
+        os.makedirs(cache_dir, exist_ok=True)
+        blob = encode_keypair_cache(entity, key, MERKLE_TREE_HEIGHT)
+        _atomic_write(cache_path, blob)
+    except Exception:  # noqa: BLE001 -- cache is best-effort
+        pass
     mnemonic = encode_to_mnemonic(key)
     encoded_hex = encode_private_key(key)
 
@@ -4291,12 +4425,16 @@ def cmd_verify_key(args):
     print("=== Verify Key Backup ===\n")
     print("Enter your private key to verify it derives the expected identity.\n")
 
-    from messagechain.config import MERKLE_TREE_HEIGHT
     private_key = _resolve_private_key(args)
-    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Rebuilding key tree")
-
+    # Route through the shared cache resolver so a verify-key call
+    # immediately after generate-key is a cache HIT rather than a
+    # second 20-minute keygen.  The shared helper falls through to
+    # ``Entity.create`` on cache miss, so a fresh-machine verify-key
+    # of an externally-generated key still produces the right
+    # identity -- it just pays the keygen once and warms the cache
+    # for the next command.
     try:
-        entity = Entity.create(private_key, progress=progress)
+        entity = _resolve_signing_entity(private_key, args)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
