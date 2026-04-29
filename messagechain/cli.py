@@ -3220,10 +3220,13 @@ def cmd_stake(args):
     # Default fee: drive through the unified auto-fee helper so the
     # "stake" picker matches every other tx-submitting command
     # (CLAUDE.md anchor: "When the fee model shifts, every auto-fee
-    # path shifts with it").  Floor is MIN_FEE post-Tier-16; the
-    # urgency-driven percentile estimate lifts the bid above the
-    # floor under load.
-    from messagechain.config import MIN_FEE_POST_FLAT
+    # path shifts with it").  ``auto_fee`` already enforces the live
+    # admission floor -- post-Tier-16 that's max(MIN_FEE,
+    # MARKET_FEE_FLOOR) = MIN_FEE = 100 -- and never returns 0.  Do
+    # NOT re-clamp here against a pre-Tier-16 ``MIN_FEE_POST_FLAT``
+    # constant: that 1000-token clamp was a stale artifact that
+    # broke the Tier 29 anchored "1 faucet drip funds an end-to-end
+    # validator stake" flow (drip=300 = 200 stake + 100 fee).
     fee = args.fee
     if fee is None:
         from messagechain.economics.auto_fee import (
@@ -3250,9 +3253,6 @@ def cmd_stake(args):
             current_height=target_height,
             mempool_estimate=mempool_estimate,
         )
-        # Pre-Tier-16 chains historically required MIN_FEE_POST_FLAT;
-        # never drop below that for backwards compatibility.
-        fee = max(fee, MIN_FEE_POST_FLAT)
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
@@ -3314,9 +3314,10 @@ def cmd_unstake(args):
     _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
     # Default fee: route through the unified auto-fee helper.  Mirrors
-    # cmd_stake; the type-specific floor (MIN_FEE) binds and the
-    # urgency-driven percentile estimate sits above it under load.
-    from messagechain.config import MIN_FEE_POST_FLAT
+    # cmd_stake; ``auto_fee`` already enforces the live admission floor
+    # (post-Tier-16: MIN_FEE=100), and the urgency-driven percentile
+    # estimate sits above it under load.  Do NOT re-clamp against
+    # ``MIN_FEE_POST_FLAT`` -- same stale-floor bug as cmd_stake.
     fee = args.fee
     if fee is None:
         from messagechain.economics.auto_fee import (
@@ -3343,7 +3344,6 @@ def cmd_unstake(args):
             current_height=target_height,
             mempool_estimate=mempool_estimate,
         )
-        fee = max(fee, MIN_FEE_POST_FLAT)
     tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")

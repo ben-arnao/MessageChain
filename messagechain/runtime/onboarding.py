@@ -635,7 +635,7 @@ class InitPlan:
     keyfile_exists: bool
     systemd_units: dict = field(default_factory=dict)
 
-    def next_steps_text(self) -> str:
+    def next_steps_text(self, tip_height: int | None = None) -> str:
         au = "ON " if self.auto_upgrade else "OFF"
         ar = "ON " if self.auto_rotate else "OFF"
         address = ""
@@ -645,6 +645,26 @@ class InitPlan:
                 address = encode_address(bytes.fromhex(self.entity_id_hex))
             except Exception:
                 address = ""
+
+        # Live, tip-aware floor for the operator's network -- never a
+        # hardcoded literal.  When ``tip_height`` is unknown (no seed
+        # probe handy), fall back to a far-future height so the
+        # current/latest hard fork's floor is what the operator sees.
+        # The Tier 29 anchor ("1 faucet drip funds an end-to-end
+        # validator stake") only holds when the message reflects the
+        # 200-token Tier 29 floor -- the previous 10000-token literal
+        # contradicted both the README "no capital wall" anchor and
+        # the live admission rule.
+        from messagechain.config import MIN_FEE, get_validator_min_stake
+        h = tip_height if tip_height is not None else (1 << 31) - 1
+        live_min_stake = get_validator_min_stake(h)
+        # Stake-tx fee floor mirrors auto_fee._stake_floor -- flat
+        # MIN_FEE post-Tier-16.  No need to import the helper; the
+        # constant binds at every height the operator sees.
+        live_fee = MIN_FEE
+        # The operator needs to RECEIVE enough to cover stake + fee.
+        live_transfer_amount = live_min_stake + live_fee
+
         lines = [
             "Done. Your validator is configured.",
             f"  Data dir:  {self.data_dir}",
@@ -659,9 +679,9 @@ class InitPlan:
             "",
             "Fund this validator (the keyfile above is its identity — back it up):",
             "  1. From a wallet with tokens:",
-            f"       messagechain transfer --to {address or 'mc1...'} --amount 10000",
+            f"       messagechain transfer --to {address or 'mc1...'} --amount {live_transfer_amount}",
             "  2. Back on this host, lock the funds as stake:",
-            "       sudo -u messagechain messagechain stake --amount 10000",
+            f"       sudo -u messagechain messagechain stake --amount {live_min_stake}",
             "",
             "Then start the validator:",
             "  sudo systemctl daemon-reload",

@@ -141,6 +141,50 @@ def test_next_steps_prints_full_address_and_stake_hint(tmp_path):
     )
 
 
+def test_next_steps_uses_live_validator_min_stake_not_hardcoded(tmp_path):
+    """post-install message must show the LIVE per-tip
+    validator min stake (Tier 29: 200 tokens at runnable-from-drip
+    heights, anchored to the 1-drip onboarding flow), NOT a stale
+    hardcoded 10000-token literal.
+
+    The 10000 literal would mislead the operator into thinking they
+    need 10k tokens to fund a validator and 10k more to stake — both
+    contradict the README "no capital wall" anchor and the Tier 29
+    "1 drip funds an end-to-end validator stake" hard-fork.
+    """
+    from messagechain.config import (
+        get_validator_min_stake,
+        VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT,
+    )
+
+    plan = onboarding.plan_init(
+        data_dir=str(tmp_path / "d"),
+        keyfile=str(tmp_path / "k"),
+        systemd=True,
+        auto_upgrade=True,
+        auto_rotate=True,
+        onboard_config_path=str(tmp_path / "o.toml"),
+        key_override=b"\x77" * 32,
+    )
+
+    # Pin a tip at/after Tier 29 → live floor must be the post-Tier-29
+    # value (200 tokens).
+    live_height = VALIDATOR_RUNNABLE_FROM_DRIP_HEIGHT + 100
+    expected_stake = get_validator_min_stake(live_height)
+    text = plan.next_steps_text(tip_height=live_height)
+
+    # The hardcoded 10000 literal must not appear; the live floor must.
+    assert "10000" not in text, (
+        "next_steps_text must NOT hardcode a stale 10000-token amount; "
+        "it should read get_validator_min_stake(tip).  Got:\n" + text
+    )
+    assert str(expected_stake) in text, (
+        f"next_steps_text must reflect the live "
+        f"get_validator_min_stake({live_height})={expected_stake}; "
+        f"got:\n{text}"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Chain-identity pre-flight (probe a seed BEFORE the ~90-min keygen)
 # ─────────────────────────────────────────────────────────────────────
