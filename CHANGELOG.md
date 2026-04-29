@@ -4,6 +4,103 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.42.0] — 2026-04-29
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+against `origin/main` at 1.41.0 surfaced 48 findings; the cumulative
+top-3 by severity × leverage × ROI land here.  One new hard fork plus
+two no-fork hardenings against the censorship-evidence pipeline and the
+wallet/CLI auto-fee path.
+
+### Security (active immediately, no fork gate)
+
+- **Default-success receipt issuance is now per-IP + global rate-capped
+  via a dedicated `ReceiptBudgetTracker` bucket.**  Pre-fix, the
+  HTTPS submission success path called `receipt_issuer.issue(tx_hash)`
+  with NO budget consultation — only the opt-in
+  `rejection_budget_check` / `ack_budget_check` paths gated against
+  the global cap.  A drainer paying `MIN_FEE × 65k` floor-fee txs at
+  the standard `SUBMISSION_RATE_LIMIT_PER_SEC` could exhaust the
+  receipt subtree's WOTS+ leaves from a single /24 in minutes.  Once
+  exhausted, `KeyPair.sign` raises `Key exhausted` (caught silently)
+  and the validator can never issue another censorship-evidence
+  receipt for the rest of that subtree's natural lifespan —
+  neutralizing the only working remedy in the Tier 30→41 evidence
+  stack.  Fix gates the success-path issuance through a new
+  `_receipt_buckets` per-IP map + shared global cap (tunables
+  `SUBMISSION_RECEIPT_RATE_LIMIT_PER_SEC = 0.1` and
+  `SUBMISSION_RECEIPT_BURST = 5` in `messagechain/config.py`,
+  matching the canonical pattern of every other submission-budget
+  constant).  Fail-open semantics preserved: when the budget refuses,
+  no leaf is consumed and the tx is still admitted with empty
+  `receipt_hex`.  Adversary defended: validator collusion (PRIMARY).
+  Tests: `tests/test_audit_critical_2026_04_28_r14.py`.
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 43 — forced-inclusion source-side gate covers all tx pools.**
+  Tier 34 (1.35.0) wired the *block-side* gate to walk every block
+  tx-list field via the `_BLOCK_TX_LIST_ATTRS` registry, but the
+  *mempool source* still only fed it from `mempool.pending` (Message
+  + Transfer).  Server-local pools (`_pending_stake_txs`,
+  `_pending_unstake_txs`, `_pending_authority_txs`,
+  `_pending_governance_txs`) and the on-mempool censorship-evidence
+  pool were not in `get_forced_inclusion_set`'s source.  Net effect:
+  the CLAUDE.md "high-fpb tx cannot be suppressed without slashable
+  evidence" anchor was honored only for Message and Transfer — a
+  colluding proposer could silently drop the very
+  `CensorshipEvidenceTx` filed against them, plus governance votes,
+  unstake exits, stake-rebalances, etc., with zero slashable
+  evidence.  Tier 43 closes this by extending the mempool's
+  forced-inclusion source to consult registered external pools (a new
+  registration surface on `Mempool` that the server uses to plug
+  stake / unstake / authority / governance pools in) plus the
+  on-mempool censorship-evidence pool.  Per-byte ranking and Tier 37's
+  same-entity entity-cap excuse semantics apply across the expanded
+  source set.  Activation at
+  `FORCED_INCLUSION_ALL_POOLS_HEIGHT = 3134` (comfortable +734 cohort
+  spacing above Tier 42's 2400; current tip ≈ 850).  Pre-fork
+  behavior preserved byte-identically.  Adversary defended: validator
+  collusion (PRIMARY), at the inclusion-rule abuse surface that Tier
+  34 left half-closed.  Tests:
+  `tests/test_forced_inclusion_all_pools.py` (15 tests).
+
+### Changed (node-local, no fork)
+
+- **Wallet/CLI auto-fee estimator now percentiles over fee-per-byte
+  density, not absolute fees.**  Pre-fix `FeeEstimator.estimate_fee`
+  percentiled `all_fees` directly, and `mempool_percentile_estimate`
+  divided every observed fee by the *caller's quoting* `stored_size`
+  then re-multiplied — divide-and-re-multiply cancel; result was a
+  percentile of absolute fees, not densities, despite the docstring
+  claim.  Worked example: mempool with 1×(5_000-byte tx @ fee 5_000,
+  density 1/B) and 10×(50-byte txs @ fee 100, density 2/B) — true
+  75th-pct fee/byte = 2/B; quoting a 100-byte tx should return ~200,
+  but pre-fix returned either 100 or 5000 depending on the
+  `stored_size`-cancel artifact.  Every wallet/CLI auto-fee call
+  systematically mis-priced by the ratio of typical-tx-size to
+  current-tx-size, directly violating the CLAUDE.md anchor "any
+  wallet/CLI helper that picks a fee for the user computes a target
+  fee-per-byte from current mempool conditions and multiplies by the
+  tx's stored byte count."  Fix: `record_block_fees` now accepts
+  `(fee, stored_size)` pairs (legacy bare-int still accepted with
+  size=1 for back-compat); `estimate_fee` ranks densities and returns
+  `percentile_density × quoting_stored_size`; server's
+  `_rpc_estimate_fee` now passes the quoting tx's full
+  `stored_bytes` (not just `message_bytes`) so non-message kinds also
+  benefit from density-correct percentile pricing under pressure.
+  All `rpc_call(..."estimate_fee"...)` CLI sites flow through the
+  fixed path.  Tests: `tests/test_fee_estimator_density.py` (9 tests).
+
+### Operator notes
+
+- **One activation height rides in this release.**  Tier 43 at
+  `FORCED_INCLUSION_ALL_POOLS_HEIGHT = 3134` — well above current tip
+  with comfortable runway.  All validators must upgrade to 1.42.0
+  before the runway closes.  The receipt-issuance cap and the
+  fee-per-byte estimator fix are active immediately on upgrade (no
+  fork gate).  Roll validators with `messagechain upgrade --yes`.
+
 ## [1.41.0] — 2026-04-28
 
 Tier 42 hard fork retunes the smooth concave reward-curve constants
