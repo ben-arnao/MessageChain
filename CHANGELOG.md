@@ -4,6 +4,61 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.38.1] — 2026-04-28
+
+Hotfix release.  Re-runways the Tier 33–40 activation heights so an
+existing chain that advanced past the original heights under an older
+binary (specifically: 1.34.0, which contains Tiers 0–32 and was the
+last version live-deployed on mainnet validators) can be upgraded
+without crashing on cold-load.
+
+### Why
+
+The 1.38.0 cold-load attempt on validator-1 (mainnet, height ≈ 840)
+crashed in `_decode_non_response_evidence_slot` with `Block blob
+truncated mid-non_response_evidence_txs entry`.  Diagnosis: the chain
+was produced entirely under 1.34.0, which lacks Tier 35's wire-format
+slot.  When 1.38.0 cold-loaded those same blocks, its decoder saw
+`block_number >= NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT (766)` and
+tried to read a slot that was never encoded — interpreting the
+trailing `declared_hash` bytes as a count + length-prefixed entries,
+crashing on the (garbage) entry length.
+
+The chain has been running honestly under 1.34.0's rules the whole
+time; the activation heights for Tiers 33–40 simply passed without
+the corresponding code being live on the network.
+
+### Changed (consensus)
+
+- **Tier 33 (NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT)**:
+  762 → 1496.
+- **Tier 34 (FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT)**: 764 → 1498.
+- **Tier 35 (NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT)**: 766 → 1500.
+  This is the wire-format slot whose missed activation crashed the
+  1.38.0 cold-load.
+- **Tier 36 (ATTESTER_DYNAMIC_COMMITTEE_HEIGHT)**: 768 → 1502.
+- **Tier 37 (FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT)**: 800 → 1534.
+- **Tier 38 (REWARD_CURVE_LARGE_BAND_HEIGHT)**: 801 → 1535.
+- **Tier 39 (ACK_BACKDATING_DEFENSE_HEIGHT)**: 802 → 1536.
+- **Tier 40 (REWARD_CURVE_SMOOTH_HEIGHT)**: 900 → 1634.  Already in
+  the future, but moved to preserve the +734 spacing across the
+  cohort and to satisfy the `Tier 40 > Tier 39` ordering assertion.
+
+The +734 shift preserves every relative-ordering assertion in
+`config.py`.  All `assert X_HEIGHT > Y_HEIGHT` checks that hold on
+the original heights also hold on the shifted ones.
+
+### Operator notes
+
+- All validators must upgrade to 1.38.1.  The new heights give
+  ~660 blocks of runway from the current tip (~840) to Tier 35's
+  new activation at 1500 — comfortably more than a full cold-restart
+  cycle of both validators.
+- The 1.38.0 tag remains on GitHub for history, but **do not
+  deploy 1.38.0 to a node whose chain.db has blocks past height
+  766** — it will crash on cold-load.  1.38.1 obsoletes 1.38.0
+  for any operator with a live chain.
+
 ## [1.38.0] — 2026-04-28
 
 Two new hard forks plus a no-fork wallet UX pass, an internal state-

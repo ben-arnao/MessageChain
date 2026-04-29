@@ -4364,7 +4364,7 @@ assert HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT > CENSORSHIP_SLASH_PENDING_UNSTAK
 # `burn_slash_proportional` so the slash bites both buckets
 # proportionally.  Pre-activation: legacy staked-only basis preserved
 # byte-for-byte for replay determinism.
-NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT = 762  # Tier 33
+NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT = 1496  # Tier 33 — re-runwayed in 1.38.1 (was 762; chain advanced past original height under 1.34.0 which lacked this code; +734 preserves relative spacing)
 assert (
     NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
     > HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT
@@ -4421,7 +4421,7 @@ assert (
 # to bring them into the attester-shared mempool before the gate can
 # enforce against them.  That work is tracked separately; Tier 34 is
 # the prerequisite that makes the broader expansion mechanical.
-FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT = 764  # Tier 34
+FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT = 1498  # Tier 34 — re-runwayed in 1.38.1 (was 764)
 assert (
     FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT
     > NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
@@ -4451,7 +4451,7 @@ assert (
 # pending-unstake drain via ``burn_slash_proportional``).  Pre-fork:
 # the slot is not emitted on the wire (byte-identical to the historical
 # encoding) and the apply loop is skipped (replay determinism).
-NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT = 766  # Tier 35
+NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT = 1500  # Tier 35 — re-runwayed in 1.38.1 (was 766; this is the wire-format slot whose missed activation crashed validator-1 cold-load on the 1.38.0 upgrade attempt)
 assert (
     NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT
     > NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT
@@ -4517,7 +4517,7 @@ assert (
 # Pre-activation: `committee_size = ATTESTER_COMMITTEE_TARGET_SIZE`
 # (Tier 4 behavior) so any block accepted under the old rule still
 # replays byte-identically.  Post-activation: dynamic shrink active.
-ATTESTER_DYNAMIC_COMMITTEE_HEIGHT = 768  # Tier 36
+ATTESTER_DYNAMIC_COMMITTEE_HEIGHT = 1502  # Tier 36 — re-runwayed in 1.38.1 (was 768)
 assert (
     ATTESTER_DYNAMIC_COMMITTEE_HEIGHT
     > NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT
@@ -4566,7 +4566,7 @@ assert (
 # Pre-activation: legacy excuse #3 preserved byte-for-byte for replay
 # determinism.  Post-activation: same-entity lower-fpb fill is no
 # longer a valid excuse; the gate flags the omission as censorship.
-FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT = 800  # Tier 37
+FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT = 1534  # Tier 37 — re-runwayed in 1.38.1 (was 800)
 assert (
     FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT
     > ATTESTER_DYNAMIC_COMMITTEE_HEIGHT
@@ -4744,7 +4744,7 @@ assert (
 # Activation rides above Tier 36 with a runway buffer well clear of the
 # current ~1300 mainnet tip so operators upgrade through prior forks
 # before the new curve bites.
-REWARD_CURVE_LARGE_BAND_HEIGHT = 801  # Tier 38
+REWARD_CURVE_LARGE_BAND_HEIGHT = 1535  # Tier 38 — re-runwayed in 1.38.1 (was 801)
 
 # Stake-share thresholds in basis points for the new saturating tail.
 # 1500 bp = 15% (slope start), 3000 bp = 30% (slope end / floor).
@@ -4836,7 +4836,7 @@ assert (
 #
 # Activation rides above Tier 38 with the standard runway buffer well
 # clear of the current ~1300 mainnet tip.
-ACK_BACKDATING_DEFENSE_HEIGHT = 802  # Tier 39
+ACK_BACKDATING_DEFENSE_HEIGHT = 1536  # Tier 39 — re-runwayed in 1.38.1 (was 802)
 
 # Slack between an ack's signed ``commit_height`` and the height the
 # proposer first lands the ack on chain.  An ack legitimately created
@@ -4908,7 +4908,7 @@ assert ACK_INCLUSION_GRACE < WITNESS_RESPONSE_DEADLINE_BLOCKS, (
 # Activation height comfortably above Tier 39 (height 802) and current
 # tip (~835 at 1.37.0) with several hours of runway for operator
 # rollout before the new shape bites.
-REWARD_CURVE_SMOOTH_HEIGHT = 900  # Tier 40
+REWARD_CURVE_SMOOTH_HEIGHT = 1634  # Tier 40 — re-runwayed in 1.38.1 (was 900; preserves +734 spacing across the entire 33-40 cohort)
 
 # Multiplier shape parameters.  All in the same MULT_DEN basis so the
 # helper composes them with a single common denominator.
