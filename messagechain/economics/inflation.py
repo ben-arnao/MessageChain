@@ -288,6 +288,38 @@ def reward_curve_multiplier_v4(stake_bps: int) -> tuple[int, int]:
     return (raw_num, raw_den)
 
 
+def _attester_cap_bps_per_epoch(current_block_height: int) -> int:
+    """Return the active per-validator attester-reward cap (bps of pool)
+    at the given block height.
+
+    Tier 4 set the cap at 100 bps (1%) of the per-block attester-pool
+    basis, scaled across FINALITY_INTERVAL.  That value was sized for
+    committees of ~128 members where each validator's per-slot reward
+    is small.  At today's mainnet committee size of 2, per-slot reward
+    is ~half the attester pool — the 100 bps cap is hit by block 3 of
+    every 100-block epoch and ~79% of attester issuance evaporates per
+    epoch.
+
+    Tier 45 raises the cap to 5000 bps (50%) at and above
+    PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT.  At committee=2 each
+    honest validator can earn its pro-rata ~50% share without burning;
+    at committee=128 each member's reachable share is ~0.78%, far below
+    the cap so the sybil/concentration defense is preserved.
+
+    Helper exists so the dispatch logic is in one place and unit-
+    testable directly without crafting a full mint_block_reward call.
+    Pre-fork path returns the legacy constant byte-for-byte.
+    """
+    from messagechain.config import (
+        PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT,
+        PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH,
+        PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45,
+    )
+    if current_block_height >= PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT:
+        return PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45
+    return PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+
+
 class SupplyTracker:
     """Tracks total supply, minting, and per-entity balances."""
 
@@ -867,9 +899,16 @@ class SupplyTracker:
                     if cap_fix_active
                     else attester_pool
                 )
+                # Tier 45 — per-validator attester cap retune.  At and
+                # above PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT the bps
+                # constant lifts from 100 (1%) to 5000 (50%) so today's
+                # 2-validator committee doesn't cap-and-burn at block 3
+                # of every 100-block epoch.  Pre-fork path is byte-
+                # identical to the legacy 100 bps read.
+                cap_bps = _attester_cap_bps_per_epoch(block_height)
                 cap_per_entity = (
                     cap_pool_basis
-                    * PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH
+                    * cap_bps
                     * FINALITY_INTERVAL
                     // 10_000
                 )
