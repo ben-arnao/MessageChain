@@ -59,6 +59,10 @@ from messagechain.config import (
     REWARD_CURVE_SMOOTH_FLOOR_NUM,
     REWARD_CURVE_SMOOTH_MULT_DEN,
     REWARD_CURVE_SMOOTH_SCALE_BPS,
+    REWARD_CURVE_SMOOTH_V2_HEIGHT,
+    REWARD_CURVE_SMOOTH_V2_PEAK_NUM,
+    REWARD_CURVE_SMOOTH_V2_FLOOR_NUM,
+    REWARD_CURVE_SMOOTH_V2_SCALE_BPS,
 )
 
 
@@ -225,6 +229,61 @@ def reward_curve_multiplier_v3(stake_bps: int) -> tuple[int, int]:
     raw_den = (
         REWARD_CURVE_SMOOTH_MULT_DEN
         * (REWARD_CURVE_SMOOTH_SCALE_BPS + stake_bps)
+    )
+    return (raw_num, raw_den)
+
+
+def reward_curve_multiplier_v4(stake_bps: int) -> tuple[int, int]:
+    """Tier 42 — smooth concave reward curve V2 retune.
+
+    Same rational form as v3 (Tier 40); only the tuning knobs change:
+
+        multiplier(stake_bps) =
+          (FLOOR_V2_NUM * stake_bps + PEAK_V2_NUM * SCALE_V2_BPS)
+          /
+          (MULT_DEN     * (SCALE_V2_BPS + stake_bps))
+
+    The CLAUDE.md-anchored shape (concave / monotonically diminishing
+    per-unit yield / asymptotic soft cap / no hard cap / strictly-
+    increasing absolute reward / concave absolute reward / pure-int) is
+    preserved bit-for-bit because the formula shape is identical to v3
+    — only the constants differ.  CLAUDE.md explicitly leaves the
+    parameters as tuning knobs ("exact constants ... are tuning knobs").
+
+    Why retune: at today's mainnet bootstrap concentrations (2
+    validators ≈ 50% each, stake_bps≈5000), v3's PEAK=150/FLOOR=40/
+    SCALE=300 puts the multiplier at ~0.46×, burning ~50–67% of the
+    attester pool every block (integer-rounding short of the pool at
+    mint_block_reward's `attester_tokens_paid<attester_pool` branch).
+    That violates two CLAUDE.md anchors at once: the bootstrap-arc
+    anchor (issuance must be calibrated so the founder can credibly
+    secure the network solo while it has only a handful of nodes) AND
+    the "low steady perpetual inflation funds the security budget
+    forever" anchor.  The v3 curve-bend point (3% stake) sits below
+    every realistic bootstrap concentration, so a bootstrap-era
+    validator effectively earns at the asymptote.
+
+    Tier 42 lifts the bootstrap-era multiplier to ~0.88× (50% stake)
+    by widening the curve-bend point to 10% stake and raising both peak
+    and floor; whales still hit diminishing returns, but the floor is
+    high enough to keep block-by-block burn from gating away the bulk
+    of issuance during bootstrap.
+
+    Caller (mint_block_reward + sim mirror) gates this helper on
+    block_height >= REWARD_CURVE_SMOOTH_V2_HEIGHT.  Pre-Tier-42 callers
+    invoke `reward_curve_multiplier_v3` (Tier 40) byte-for-byte for
+    pre-fork blocks, preserving consensus determinism on replay.
+
+    Mirrors the integer-rational pattern from v3 — no `float()` on the
+    consensus hot path.
+    """
+    raw_num = (
+        REWARD_CURVE_SMOOTH_V2_FLOOR_NUM * stake_bps
+        + REWARD_CURVE_SMOOTH_V2_PEAK_NUM * REWARD_CURVE_SMOOTH_V2_SCALE_BPS
+    )
+    raw_den = (
+        REWARD_CURVE_SMOOTH_MULT_DEN
+        * (REWARD_CURVE_SMOOTH_V2_SCALE_BPS + stake_bps)
     )
     return (raw_num, raw_den)
 
@@ -764,6 +823,17 @@ class SupplyTracker:
             # invoke v2 (or v1 below v2's height) byte-for-byte; replay
             # determinism preserved across the entire fork ladder.
             curve_v3_active = block_height >= REWARD_CURVE_SMOOTH_HEIGHT
+            # Tier 42 — smooth-curve V2 retune: at heights >=
+            # REWARD_CURVE_SMOOTH_V2_HEIGHT, swap in
+            # `reward_curve_multiplier_v4` which uses the same rational
+            # form as v3 with retuned constants (PEAK=130, FLOOR=80,
+            # SCALE_BPS=1000) — anchored shape preserved, only the
+            # tuning knobs change.  Lifts the bootstrap-era multiplier
+            # at 50% stake from ~0.46× (v3) to ~0.88× so the attester
+            # pool isn't ~half-burned every block during bootstrap.
+            # Pre-Tier-42 callers continue to invoke v3 byte-for-byte;
+            # replay determinism preserved across the fork ladder.
+            curve_v4_active = block_height >= REWARD_CURVE_SMOOTH_V2_HEIGHT
             total_active_stake = (
                 sum(self.staked.values()) if curve_active else 0
             )
@@ -818,7 +888,9 @@ class SupplyTracker:
                         self.staked.get(eid, 0) * 10_000
                         // total_active_stake
                     )
-                    if curve_v3_active:
+                    if curve_v4_active:
+                        num, den = reward_curve_multiplier_v4(stake_bps)
+                    elif curve_v3_active:
                         num, den = reward_curve_multiplier_v3(stake_bps)
                     elif curve_v2_active:
                         num, den = reward_curve_multiplier_v2(stake_bps)

@@ -4,6 +4,98 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.40.0] — 2026-04-28
+
+Tier 42 hard fork retunes the smooth concave reward-curve constants
+(peak / floor / curve-bend point).  The CLAUDE.md-anchored *shape*
+of the curve (concave, monotonically diminishing per-unit yield,
+asymptotic soft cap, no hard cap, strictly-increasing absolute reward,
+concave absolute reward, pure-int) is preserved bit-for-bit — only the
+tuning knobs change, per the explicit CLAUDE.md anchor that "exact
+constants … are tuning knobs."
+
+### Why
+
+At today's mainnet bootstrap concentrations (2 validators ≈ 50%
+each, stake_bps≈5000), the Tier 40 V1 constants
+(PEAK=150 / FLOOR=40 / SCALE_BPS=300) put the multiplier at ~0.46×,
+which means ~50–67% of the attester pool burns every block (integer-
+rounding short of the pool at the `attester_tokens_paid<attester_pool`
+branch in `inflation.mint_block_reward`).  That violates two CLAUDE.md
+anchors at once:
+
+  - **Bootstrap-arc anchor** (issuance is calibrated so the founder can
+    credibly secure the network solo while it has only a handful of
+    nodes): a multiplier that flattens to 0.40× at every realistic
+    bootstrap concentration silently halves the founder's incentive
+    against the schedule.
+  - **"Low steady perpetual inflation funds the security budget
+    forever"**: half-burning the attester pool every block is not the
+    perpetual issuance the schedule was calibrated for.
+
+The V1 curve-bend point (3% stake) sits below every realistic
+bootstrap concentration, so a bootstrap-era validator effectively
+earns at the asymptote rather than in the curve's working range.
+
+### Tier 42 — Smooth-curve V2 retune (hard fork, height 2400)
+
+- **`reward_curve_multiplier_v4(stake_bps)`** in
+  `messagechain/economics/inflation.py`.  Same rational form as v3
+  (anchored shape preserved); only the tuning knobs change:
+
+      multiplier(s) = (FLOOR_V2·s + PEAK_V2·SCALE_V2) /
+                      (MULT_DEN  · (SCALE_V2 + s))
+
+- **Tuning constants in `messagechain/config.py`**:
+  `REWARD_CURVE_SMOOTH_V2_PEAK_NUM = 130` (1.30× near-zero peak; was
+  1.50× under V1), `REWARD_CURVE_SMOOTH_V2_FLOOR_NUM = 80` (0.80×
+  asymptote; was 0.40× under V1),
+  `REWARD_CURVE_SMOOTH_V2_SCALE_BPS = 1000` (curve-bend point at 10%
+  stake — midpoint multiplier 1.05× at 10% stake; was 3% under V1).
+  `MULT_DEN` shared with V1.
+- **Resulting target shape** (multiplier at given stake share):
+
+  | stake share | V1 (Tier 40) | V2 (Tier 42) |
+  | ----------: | ----------:  | ----------:  |
+  | near-zero   | 1.50×        | 1.30×        |
+  |  5%  (500)  | 1.27×        | 1.13×        |
+  | 10% (1000)  | 1.13×        | 1.05×        |
+  | 25% (2500)  | 0.79×        | 0.94×        |
+  | 50% (5000)  | 0.46×        | 0.88×        |
+
+  At the bootstrap concentration the V2 multiplier is **~0.88×** — the
+  attester pool now stays largely intact instead of half-burning every
+  block.  Whales at very large concentrations still hit diminishing
+  returns; the floor is just high enough to keep block-by-block burn
+  from gating away the bulk of issuance during bootstrap.
+- **Anchored shape preserved; only the tuning knobs change.**  Every
+  shape invariant pinned for V1 (Tier 40) — concave, monotonically
+  decreasing per-unit yield, floor strictly between 0 and peak, soft
+  cap (asymptote never reached for any finite stake), strictly
+  increasing absolute reward, concave absolute reward, pure-int
+  determinism — is re-asserted on V2 in
+  `tests/test_reward_curve_smooth_tier_v2.py`.
+- **Activation: `REWARD_CURVE_SMOOTH_V2_HEIGHT = 2400`**, riding above
+  Tier 41 (1640) with multi-day runway above the current ~840 mainnet
+  tip.  Pre-activation: V1 (`reward_curve_multiplier_v3`) preserved
+  byte-for-byte for replay determinism.
+- **Dispatcher**: `mint_block_reward` and the `_apply_block_state` sim
+  mirror in `core/blockchain.py` both gate on
+  `REWARD_CURVE_SMOOTH_V2_HEIGHT`; pre-fork callers continue to invoke
+  v3 / v2 / v1 in their respective height bands byte-for-byte.
+
+### Tests
+
+- New `tests/test_reward_curve_smooth_tier_v2.py` mirrors the
+  `test_reward_curve_smooth_tier40.py` invariant suite on v4
+  (activation ordering, target-shape table at canonical stake levels,
+  monotonicity, asymptote-never-reached, midpoint-at-SCALE algebraic
+  identity, absolute-reward strictly increasing + concave,
+  `_NoFloatInt` pure-int determinism, pre-fork legacy byte-identical
+  pin, dispatcher source-level wiring check).
+- Existing `tests/test_reward_curve_smooth_tier40.py` continues to pin
+  V1 byte-for-byte — V1 constants are unchanged.
+
 ## [1.39.1] — 2026-04-29
 
 Hotfix on top of 1.39.0.  The cold-load smoke test introduced in
