@@ -4867,6 +4867,85 @@ assert ACK_INCLUSION_GRACE < WITNESS_RESPONSE_DEADLINE_BLOCKS, (
     "point of the bound"
 )
 
+# Tier 40 — smooth concave reward curve.  Replaces the piecewise
+# small/mid/baseline/saturating-tail shape of Tiers 20+38 with a single
+# monotonically-diminishing function whose per-unit-stake yield decays
+# smoothly from PEAK at near-zero stake toward FLOOR as stake grows
+# without bound, but never reaches FLOOR — the asymptotic "soft cap"
+# that CLAUDE.md anchors as the new reward-curve shape.
+#
+# The function is rational and pure-int (no float on consensus path):
+#
+#     multiplier(stake_bps) =
+#       (FLOOR_NUM * stake_bps + PEAK_NUM * SCALE_BPS)
+#       /
+#       (MULT_DEN  * (SCALE_BPS + stake_bps))
+#
+# Properties (all derivable from the formula; documented here so a future
+# reader doesn't have to re-derive them when touching parameters):
+#   - At stake_bps=0:        multiplier = PEAK_NUM/MULT_DEN     (peak)
+#   - As stake_bps→∞:        multiplier → FLOOR_NUM/MULT_DEN    (asymptote)
+#   - Strictly decreasing in stake_bps (per-unit yield diminishes).
+#   - Absolute reward (= stake_bps * multiplier) is strictly increasing
+#     and concave in stake_bps — adding stake always pays more in
+#     absolute terms, but each additional unit pays less than the last
+#     (the "diminishing returns" the user wanted, and the "always earn
+#     more" property that keeps the uptime incentive intact).
+#   - Smooth: no kinks, no boundary-gaming incentives at piecewise
+#     transitions (the Tier 20/38 curves had four).
+#
+# The single tuning knob with the most leverage on shape is SCALE_BPS:
+# at stake_bps = SCALE_BPS the multiplier is exactly the midpoint of
+# PEAK and FLOOR — i.e., (PEAK+FLOOR)/(2*MULT_DEN).  Smaller SCALE_BPS
+# bends the curve harder in the small-stake region; larger SCALE_BPS
+# pushes the bend out toward the whale region.  Current 300 puts the
+# midpoint at 3% stake and yields a 0.5x multiplier exactly at 30%
+# stake (algebraically equal to the old Tier 38 hard floor — chosen so
+# the smoothed curve roughly preserves whale-tier compression at the
+# height of activation, then continues to compress past it instead of
+# flat-lining).
+#
+# Activation height comfortably above Tier 39 (height 802) and current
+# tip (~835 at 1.37.0) with several hours of runway for operator
+# rollout before the new shape bites.
+REWARD_CURVE_SMOOTH_HEIGHT = 900  # Tier 40
+
+# Multiplier shape parameters.  All in the same MULT_DEN basis so the
+# helper composes them with a single common denominator.
+REWARD_CURVE_SMOOTH_PEAK_NUM = 150    # 1.50x at stake_bps=0 (tiny-validator yield)
+REWARD_CURVE_SMOOTH_FLOOR_NUM = 40    # 0.40x asymptote as stake_bps→∞
+REWARD_CURVE_SMOOTH_MULT_DEN = 100    # common denominator for PEAK/FLOOR
+REWARD_CURVE_SMOOTH_SCALE_BPS = 300   # midpoint-multiplier point: at 3% stake the multiplier is (PEAK+FLOOR)/(2*MULT_DEN) = 0.95
+
+assert REWARD_CURVE_SMOOTH_HEIGHT > ACK_BACKDATING_DEFENSE_HEIGHT, (
+    "REWARD_CURVE_SMOOTH_HEIGHT must follow Tier 39 — Tier 40 rides "
+    "on top of the most recent established fork; pre-activation "
+    "callers continue to see the v2 saturating-tail curve byte-for-byte"
+)
+assert REWARD_CURVE_SMOOTH_HEIGHT > REWARD_CURVE_LARGE_BAND_HEIGHT, (
+    "REWARD_CURVE_SMOOTH_HEIGHT must follow Tier 38 — Tier 40 replaces "
+    "the piecewise-tail v2 helper with a smooth concave function and "
+    "must not activate before the v2 shape it supersedes"
+)
+assert (
+    0 < REWARD_CURVE_SMOOTH_FLOOR_NUM
+    < REWARD_CURVE_SMOOTH_PEAK_NUM
+), (
+    "REWARD_CURVE_SMOOTH_FLOOR_NUM must be strictly between 0 and PEAK — "
+    "FLOOR>=PEAK inverts or flattens the curve (no diminishing returns), "
+    "FLOOR<=0 lets the asymptote nuke whale yield entirely, breaking the "
+    "anchored 'always earn more for more stake' property"
+)
+assert REWARD_CURVE_SMOOTH_MULT_DEN > 0, (
+    "REWARD_CURVE_SMOOTH_MULT_DEN must be positive — it is the common "
+    "denominator for PEAK and FLOOR; zero is undefined"
+)
+assert REWARD_CURVE_SMOOTH_SCALE_BPS > 0, (
+    "REWARD_CURVE_SMOOTH_SCALE_BPS must be positive — it sets where the "
+    "curve bends and is the divisor in the rational form; zero would "
+    "collapse the formula at stake_bps=0"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

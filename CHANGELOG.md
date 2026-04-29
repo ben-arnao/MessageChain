@@ -4,6 +4,71 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.38.0] — 2026-04-28
+
+CLAUDE.md anchor revision: the reward-curve shape changes from a
+piecewise sigmoid (small < middle > large, large = saturating-linear)
+to a single smooth concave function whose per-unit-stake yield
+diminishes monotonically from a peak at near-zero stake toward a floor
+as stake grows large, asymptotically approaching the floor without
+ever reaching it.  Replaces the entire small/mid/baseline/saturating-
+tail piecewise machinery of Tiers 20+38 with one continuous rational
+function; preserves the "always earn more for more stake" property
+(absolute reward strictly increasing and concave in stake) while
+mitigating PoS's natural rich-get-richer drift more aggressively.
+
+### Tier 40 — Smooth concave reward curve (hard fork, height 900)
+
+- **`reward_curve_multiplier_v3(stake_bps)`** in
+  `messagechain/economics/inflation.py`.  Pure-int rational form:
+
+      multiplier(s) = (FLOOR_NUM·s + PEAK_NUM·SCALE) /
+                      (MULT_DEN  · (SCALE + s))
+
+  Properties (all derivable from the formula, asserted by
+  `tests/test_reward_curve_smooth_tier39.py`): peak at stake_bps=0 is
+  exactly PEAK_NUM/MULT_DEN; asymptote at stake_bps→∞ is FLOOR_NUM/
+  MULT_DEN, never reached for any finite stake; multiplier strictly
+  decreasing in stake_bps (no kinks, no flat region, no hump);
+  absolute reward (= stake · multiplier) strictly increasing AND
+  concave in stake (always pays more, but each marginal unit pays
+  less — diminishing returns).
+- **Tuning constants in `messagechain/config.py`**:
+  `REWARD_CURVE_SMOOTH_PEAK_NUM = 150` (1.50x at near-zero stake),
+  `REWARD_CURVE_SMOOTH_FLOOR_NUM = 40` (0.40x asymptote),
+  `REWARD_CURVE_SMOOTH_MULT_DEN = 100`,
+  `REWARD_CURVE_SMOOTH_SCALE_BPS = 300` (curve-bend point: at 3%
+  stake the multiplier is exactly the midpoint between peak and
+  floor, 0.95x; at 30% stake the multiplier is exactly 0.5x —
+  algebraically equal to the old Tier 38 hard floor as a continuity
+  sanity check, and the curve continues to compress past it instead
+  of flat-lining).
+- **Dispatcher in `mint_block_reward` and its sim mirror in
+  `_apply_block_state`**: at heights >=
+  `REWARD_CURVE_SMOOTH_HEIGHT (900)` swap in v3.  Pre-Tier-40 callers
+  continue to invoke v2 (Tier 38) or v1 (Tier 20) byte-for-byte;
+  replay determinism preserved across the entire fork ladder.
+- **CLAUDE.md anchor rewritten** ("Stake concentration is softly
+  capped via diminishing returns") to reflect the new shape.  The old
+  shape (small < middle > large, large = linear cap) is retired; the
+  new shape (concave, monotonically diminishing per-unit yield,
+  asymptotic soft cap, no hard cap, no special small-end depression,
+  no per-validator anti-sybil gate) is anchored.  Sybil-splitting a
+  whale into many honest validators is recognized as desirable
+  (decentralization-positive); operational infrastructure cost under
+  each identity is the natural sybil tax.
+- **Tests** (`tests/test_reward_curve_smooth_tier40.py`): activation
+  ordering (40 > 38 > 20, also > 39), peak-at-zero, asymptote-never-reached
+  across a dense stake-share grid, strict monotonic decrease at every
+  consecutive grid pair, midpoint-at-SCALE algebraic identity,
+  absolute-reward strictly-increasing, absolute-reward concavity (via
+  non-increasing marginal-reward differences over an evenly-spaced
+  triple), pure-int determinism (`_NoFloatInt` sentinel — helper
+  must not coerce any input through `float()`), pre-fork v1/v2 byte-
+  identical pinning (guards against accidental edits), dispatcher
+  source-level wiring check (apply path + sim mirror both gate v3 on
+  `REWARD_CURVE_SMOOTH_HEIGHT`).  103 subtest assertions in 2.1s.
+
 ## [1.37.0] — 2026-04-28
 
 Second multi-axis audit pass against current `origin/main` surfaced 41

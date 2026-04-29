@@ -54,6 +54,11 @@ from messagechain.config import (
     REWARD_CURVE_LARGE_FLOOR_THRESHOLD_BPS,
     REWARD_CURVE_LARGE_FLOOR_NUM,
     REWARD_CURVE_LARGE_FLOOR_DEN,
+    REWARD_CURVE_SMOOTH_HEIGHT,
+    REWARD_CURVE_SMOOTH_PEAK_NUM,
+    REWARD_CURVE_SMOOTH_FLOOR_NUM,
+    REWARD_CURVE_SMOOTH_MULT_DEN,
+    REWARD_CURVE_SMOOTH_SCALE_BPS,
 )
 
 
@@ -170,6 +175,57 @@ def reward_curve_multiplier_v2(stake_bps: int) -> tuple[int, int]:
         + REWARD_CURVE_LARGE_FLOOR_NUM * t_bps
     )
     raw_den = REWARD_CURVE_LARGE_FLOOR_DEN * span_bps
+    return (raw_num, raw_den)
+
+
+def reward_curve_multiplier_v3(stake_bps: int) -> tuple[int, int]:
+    """Tier 40 — smooth concave reward curve.
+
+    Replaces the piecewise small/mid/baseline/saturating-tail shape of
+    Tiers 20+38 with a single monotonically-diminishing rational
+    function whose per-unit-stake yield decays smoothly from
+    PEAK at near-zero stake toward FLOOR as stake grows large, but
+    never reaches FLOOR.  This is the asymptotic "soft cap" CLAUDE.md
+    anchors as the new reward-curve shape: rich-get-richer in absolute
+    terms (adding stake always pays more), but the *share* of issuance
+    compresses over time because each additional unit of stake earns
+    less than the last.
+
+    Formula (rational, pure-int):
+
+        multiplier(stake_bps) =
+          (FLOOR_NUM * stake_bps + PEAK_NUM * SCALE_BPS)
+          /
+          (MULT_DEN  * (SCALE_BPS + stake_bps))
+
+    Both numerator and denominator are positive ints for any
+    stake_bps >= 0; the result is the rational multiplier exactly with
+    no rounding.  Caller applies as `reward * num // den`.
+
+    Properties (all derivable from the formula):
+      - At stake_bps=0:        multiplier = PEAK_NUM/MULT_DEN
+      - As stake_bps→∞:        multiplier → FLOOR_NUM/MULT_DEN
+      - Strictly decreasing in stake_bps (per-unit yield diminishes).
+      - Absolute reward (= stake * multiplier) is strictly increasing
+        and concave in stake — adds always pay something, but the
+        delta shrinks.
+
+    Caller (mint_block_reward + sim mirror) gates this helper on
+    block_height >= REWARD_CURVE_SMOOTH_HEIGHT.  Pre-Tier-40 callers
+    invoke `reward_curve_multiplier_v2` (Tier 38) byte-for-byte for
+    pre-fork blocks, preserving consensus determinism on replay.
+
+    Mirrors the integer-rational pattern from Tier 38's
+    linear-interpolation band — no `float()` on the consensus hot path.
+    """
+    raw_num = (
+        REWARD_CURVE_SMOOTH_FLOOR_NUM * stake_bps
+        + REWARD_CURVE_SMOOTH_PEAK_NUM * REWARD_CURVE_SMOOTH_SCALE_BPS
+    )
+    raw_den = (
+        REWARD_CURVE_SMOOTH_MULT_DEN
+        * (REWARD_CURVE_SMOOTH_SCALE_BPS + stake_bps)
+    )
     return (raw_num, raw_den)
 
 
@@ -697,6 +753,17 @@ class SupplyTracker:
             # callers continue to invoke the legacy helper byte-for-
             # byte; replay determinism preserved.
             curve_v2_active = block_height >= REWARD_CURVE_LARGE_BAND_HEIGHT
+            # Tier 40 — smooth concave curve: at heights >=
+            # REWARD_CURVE_SMOOTH_HEIGHT, swap in
+            # `reward_curve_multiplier_v3` which replaces the entire
+            # piecewise shape with a single rational function.  Per-unit
+            # yield diminishes monotonically from PEAK at near-zero
+            # stake toward FLOOR as stake grows large; absolute reward
+            # remains strictly increasing in stake (so adding stake
+            # always pays more).  Pre-Tier-40 callers continue to
+            # invoke v2 (or v1 below v2's height) byte-for-byte; replay
+            # determinism preserved across the entire fork ladder.
+            curve_v3_active = block_height >= REWARD_CURVE_SMOOTH_HEIGHT
             total_active_stake = (
                 sum(self.staked.values()) if curve_active else 0
             )
@@ -751,7 +818,9 @@ class SupplyTracker:
                         self.staked.get(eid, 0) * 10_000
                         // total_active_stake
                     )
-                    if curve_v2_active:
+                    if curve_v3_active:
+                        num, den = reward_curve_multiplier_v3(stake_bps)
+                    elif curve_v2_active:
                         num, den = reward_curve_multiplier_v2(stake_bps)
                     else:
                         num, den = reward_curve_multiplier(stake_bps)
