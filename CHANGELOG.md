@@ -4,6 +4,119 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.44.0] — 2026-04-29
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+against `origin/main` at 1.43.1 surfaced 46 findings; the cumulative
+top-3 by severity × leverage × ROI land here.  One new hard fork
+(Tier 45) closes a continuously-bleeding economics defect on the
+attester reward path; one no-fork security fix closes a silent-fork
+primitive on the bad-state-root rollback path; one no-fork UX fix
+unblocks the public faucet for every newcomer.
+
+### Security (active immediately, no fork gate)
+
+- **Snapshot/restore `reaction_state` and `archive_reward_pool` on
+  bad-state-root rollback.**  `Blockchain._snapshot_memory_state`
+  / `_restore_memory_snapshot` omitted two consensus-relevant
+  mutable collections that `_apply_block_state` writes on every
+  React-bearing or archive-duty block.  `self.reaction_state` is
+  mixed into `compute_current_state_root` via
+  `state_root_contribution()`; `self.archive_reward_pool` is mixed
+  into the snapshot root.  A bad-state-root block was rolled back
+  via `_restore_memory_snapshot` but both mutations leaked,
+  opening a silent-fork primitive: a coerced proposer crafts a
+  block with deliberately-wrong `state_root` whose apply path
+  still runs `reaction_state.apply` on attacker-chosen React txs
+  (or fires `archive_reward_pool` mutations).  The block is
+  rejected, but in-memory state is now diverged from honest
+  peers' replayed state — the next legitimate block's
+  `compute_current_state_root` mixes in the diverged contribution
+  and silently forks the chain at the next React-touching or
+  archive-duty block.  Same defect class as the four-processor
+  rollback fixes shipped 1.37.0–1.39.2 (non_response,
+  bogus_rejection, censorship_pending, IL-processor, archive-duty
+  miss/streak/first-active/active-snapshot); these two were
+  simply missed from the structural sweep.  Pure in-memory
+  rollback path; chaindb mirror runs only after the state-root
+  check passes, so no fork or activation gate.  Adversary
+  defended: validator collusion (PRIMARY).  Tests:
+  `tests/test_reaction_state_rollback_snapshot.py` (new) +
+  `tests/test_archive_reward_pool_rollback_snapshot.py` (new) —
+  13 regression tests across the two files.  Source: `7ebe061`
+  (audit fix #1, merged via `30b4217`).
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 45 — per-validator attester reward cap retune from
+  100 bps to 5000 bps post-activation.**  Pre-fix
+  `PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH = 100` was
+  sized for committees of size 128 (per-slot reward ≈ 0.05) but
+  mainnet runs at committee size 2 (per-slot reward = 6 at
+  BLOCK_REWARD=16).  Net effect: each validator hit the 12-token
+  per-epoch cap by block ~3 of every 100-block epoch and burned
+  ~5 tokens/block on the remaining 97 — **~79% of attester
+  issuance evaporated every epoch under live mainnet
+  conditions**.  Floor era (BLOCK_REWARD=4) is worse: per-slot=1,
+  cap=3, burn rate ~97%.  Anchored "low steady perpetual
+  inflation funds the security budget forever" was bleeding every
+  block; the bootstrap-arc anchor (founder credibly secures the
+  network solo while it has only a handful of nodes) was
+  silently halved.  Tier 45 introduces a new constant
+  `PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45 = 5000`
+  and a height gate
+  `PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT = 4534` (riding above
+  Tier 44's 3834 with comfortable +700 cohort spacing above the
+  current ~850 mainnet tip).  Post-activation cap = 600
+  tokens/entity/epoch — well above expected per-validator
+  earnings of ~500 at any committee size.  Pre-fork wire format
+  byte-identical for replay determinism; the legacy 100-bps
+  branch is preserved byte-for-byte.  Anchor protected: low
+  steady perpetual inflation; honest-operator insurance;
+  bootstrap-arc.  Tests:
+  `tests/test_attester_cap_retune_tier45.py` — pre-fork
+  byte-identical pin, post-fork retune assertion, activation
+  ordering, constants visibility.  Source: `fe7a7bb` (audit fix
+  #2, merged via `7ca9dec`).
+
+### Fixed (UX / public funnel, no fork)
+
+- **Public faucet `issue_challenge` and `try_drip` accept `mc1…`
+  bech32 addresses in addition to 64-char hex.**  Pre-fix the
+  faucet's server-side handlers and `feed.html`'s client-side
+  regex hard-required hex form, but `messagechain account` and
+  `messagechain generate-key` print `Address: mc1…` and
+  explicitly tell users *"Share the 'Address' form when receiving
+  funds — it has a built-in checksum."*  Net effect: every
+  newcomer who lands on https://messagechain.org → CTA "Get
+  starter tokens" → pastes the `mc1…` they were just told to
+  share → gets bounced with `"Address must be exactly 64 hex
+  characters."`  The mission's headline funnel ("post your first
+  message") died at step 1 on the only public-facing surface.
+  Fix decodes `mc1…` via the existing `decode_address` helper in
+  `messagechain/identity/address.py` (no new bech32 codec —
+  reuses the live one); checksum-failed `mc1…` returns a clear
+  `"Invalid mc1 address (bad checksum)"` error.  `feed.html`
+  placeholder updated to `"mc1… address (or 64-char
+  entity_id)"` and the regex relaxed to accept either form;
+  client passes the typed string to the server unchanged so the
+  server is the single source of truth for address validity.
+  Hex form continues to work (regression-tested).  Tests:
+  `tests/test_faucet_accepts_mc1_address.py` — 7 new
+  mc1-acceptance tests covering challenge issuance, drip,
+  tampered-checksum rejection, and hex-form regression.  Source:
+  `bce0481` (audit fix #3, merged via `e013741`).
+
+### Operator notes
+
+- **One new activation height rides in this release.**  Tier 45 at
+  `PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT = 4534` — well above
+  current tip with comfortable runway.  All validators must
+  upgrade to 1.44.0 before the runway closes.  The rollback-leak
+  fix and the faucet mc1 acceptance are active immediately on
+  upgrade (no fork gate).  Roll validators with
+  `messagechain upgrade --yes`.
+
 ## [1.43.1] — 2026-04-29
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
