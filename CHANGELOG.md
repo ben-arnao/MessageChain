@@ -4,6 +4,112 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.39.0] — 2026-04-28
+
+Tier 41 hard fork closes the last known honest-acker mis-slash gap
+in the non-response evidence pipeline, and the `submit-evidence`
+CLI is wired end-to-end so the censorship-evidence path is live
+from user surface through mempool to block inclusion.  Also a
+defect-class bugfix on inclusion-list-processor rollback.
+
+### Added (consensus — Tier 41 hard fork)
+
+- **Tier 41 — ack-deadline GRACE defense on slash-decision
+  comparator** (3858a01). Tier 39 closed the issuer-side ack
+  backdating attack but introduced an asymmetry: validate-side
+  tolerated `ACK_INCLUSION_GRACE` of slack on the inclusion height,
+  but `NonResponseEvidenceProcessor.process` /
+  `compute_post_state_root` mirror compared
+  `ack_h <= earliest_obs + DEADLINE` with NO grace.  An honest
+  acker landing one block past the bare deadline (because a
+  colluding next-proposer dropped the ack for one block before
+  the next honest proposer included it) was mis-slashed as
+  "obligation not met" — a two-validator collusion (Q witnesses
+  + 1 deadline-tip proposer) was enough to fabricate a non-response
+  slash against an honest target.  Tier 41 widens the
+  slash-decision comparator to
+  `ack_h <= earliest_obs + DEADLINE + ACK_INCLUSION_GRACE`,
+  restoring symmetry with the validate-side bound and mirroring
+  the same change in `compute_post_state_root` so propose-time
+  and apply-time non-response decisions stay byte-identical
+  post-activation.  Activation:
+  `ACK_DEADLINE_GRACE_DEFENSE_HEIGHT = 1640`, riding above Tier
+  40 (1634) with comfortable runway above the current ~840
+  mainnet tip.  Pre-activation: legacy comparator preserved
+  byte-for-byte for replay determinism.
+
+### Added (CLI / RPC — censorship evidence wired end-to-end)
+
+- **`messagechain submit-evidence censorship --receipt
+  <bundle.json>`** (5f836ec). Pre-fix the subcommand was a
+  print-only stub; every Tier 30-35 hardening of the slashing
+  apply paths shipped a back end whose user-facing entry point
+  did not actually sign or submit a tx, defeating the
+  censorship-evidence pipeline at the user surface.  The wired
+  command reads a receipt-bundle (SubmissionReceipt + the
+  receipted MessageTransaction), cross-checks via
+  `get_tx_status` that the tx is NOT on chain, signs a
+  `CensorshipEvidenceTx` through the personal-wallet keypair
+  cache, and submits via the new `submit_censorship_evidence`
+  RPC.  Auto-fee + auto-nonce + auto-discover-endpoint, same
+  single-line invocation shape as `cmd_send` / `cmd_transfer`.
+- **New server RPC `submit_censorship_evidence`** (5f836ec).
+  Validates the tx via the live `validate_censorship_evidence_tx`
+  gate, runs the cross-pool WOTS+ leaf-reuse check, and admits
+  to the existing mempool censorship-evidence pool.
+- **Block producer drains
+  `mempool.censorship_evidence_pool`** (5f836ec) into proposed
+  blocks and removes admitted evidence on success.  Without this
+  drain, every submission would sit in the mempool unmineable.
+- **`submit-evidence bogus-rejection` / `non-response`
+  diagnostics** (5f836ec). Both subcommands now print clear
+  "not yet wired" messages naming the consensus-layer module so
+  the CLI surface always resolves to a real command (no more
+  "Unknown command" from the receipt CLI's escalation hint).
+  Legacy `--tx <hash>` invocation prints a migration message
+  naming the new subcommand surface.
+
+### Added (CLI / UX — first-command keygen tractable)
+
+- **First-command keygen returns in seconds, not minutes**
+  (451059e).  Three stacked wins: (1) personal-wallet default
+  tree height drops from 20 (~1M leaves, ~90 min serial) to 16
+  (~65k leaves, ~5 min serial); per-entity heights are stored on
+  chain so different entities at different heights coexist, and
+  validators stay at h=20 to amortize keygen across ~2 years of
+  slot signing.  Fallback probes the legacy h=20 cache first so
+  existing wallets keep their identity.  (2) `cmd_generate_key`
+  prints the 24-word recovery phrase BEFORE running keygen and
+  flushes stdout, so the user can back up the phrase during the
+  keygen wait instead of staring at a silent progress bar.  (3)
+  Parallel WOTS+ leaf derivation via `multiprocessing.Pool`,
+  gated by `KEYGEN_PARALLEL_MIN_LEAVES = 16384` so small trees
+  stay serial (subprocess-spawn overhead would dominate).
+  `KEYGEN_WORKERS` env: `0`=auto (cap 8), `1`=serial, `N`=fixed.
+  Stacked impact at h=16, 8 cores: first-command address arrives
+  in <1 min instead of ~90 min.
+
+### Fixed
+
+- **Snapshot/restore inclusion-list-processor state on
+  block-rollback** (96400dc). `Blockchain._snapshot_memory_state`
+  / `_restore_memory_snapshot` omitted the four mutable
+  collections owned by `inclusion_list_processor`
+  (`active_lists`, `inclusions_seen`, `proposers_by_height`,
+  `processed_violations`).  A bad-state-root block was rolled
+  back via `_restore_memory_snapshot` but the IL-processor
+  mutations leaked, opening two attacks: dedup poisoning (bumped
+  `processed_violations` triple silently blocks honest
+  resubmission of the same violation evidence), and
+  `active_lists` poisoning (forged list registration persists
+  past rollback, grounding phantom InclusionListViolation slashes
+  against honest proposers).  Mirrors the 1.37.0 fix for
+  non_response / bogus_rejection processors.  Pure in-memory
+  rollback path; chaindb mirror runs only after the state-root
+  check passes, so no fork or activation gate.  Adds a
+  structural symmetry guard test that catches the next defect
+  of this class at CI time.
+
 ## [1.38.2] — 2026-04-28
 
 Operational hardening: the `upgrade` CLI now runs a cold-load
