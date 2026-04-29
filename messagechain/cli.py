@@ -795,14 +795,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- submit-evidence ---
     # The natural next step from a `receipt` that turned up NOT FOUND
-    # or stale-PENDING.  Today this is a stub that points the user at
-    # the on-chain evidence types; full wiring (sign + submit) lands in
-    # a follow-up branch.  The CLI surface itself ships in this branch
-    # so the receipt's escalation hint resolves to a real command, not
-    # a "Unknown command" error.
+    # or stale-PENDING.  Constructs, signs, and submits a real
+    # CensorshipEvidenceTx for the most-promised path; the
+    # bogus-rejection / non-response variants are accepted at the
+    # parser level but currently print a "not yet wired" diagnostic
+    # so the receipt CLI's escalation hint always resolves to a real
+    # command.
     submit_ev = sub.add_parser(
         "submit-evidence",
-        help="Submit slashable censorship evidence for a tx (stub)",
+        help="Submit slashable censorship evidence for a receipted tx",
         description=(
             "Construct and submit a CensorshipEvidenceTx (or related "
             "evidence type) for a tx whose validator-issued submission "
@@ -810,18 +811,106 @@ def build_parser() -> argparse.ArgumentParser:
             "EVIDENCE_INCLUSION_WINDOW.  When matured, the issuing "
             "validator is slashed by CENSORSHIP_SLASH_BPS.  See "
             "messagechain.consensus.censorship_evidence for the "
-            "consensus-layer pipeline.  This CLI surface ships as a "
-            "stub: the evidence-tx construction path lands in a "
-            "follow-up branch."
+            "consensus-layer pipeline."
         ),
     )
+    submit_ev_sub = submit_ev.add_subparsers(
+        dest="evidence_kind",
+        # Don't `required=True` so older invocations that pass --tx
+        # straight to submit-evidence print a helpful diagnostic
+        # instead of an argparse "must choose subcommand" error.
+        required=False,
+    )
+
+    # The censorship subcommand is the real wiring.
+    submit_ev_cens = submit_ev_sub.add_parser(
+        "censorship",
+        help=(
+            "Submit a CensorshipEvidenceTx for a receipt-bundle whose "
+            "tx never landed within EVIDENCE_INCLUSION_WINDOW."
+        ),
+        description=(
+            "Reads a receipt bundle (the SubmissionReceipt the "
+            "validator returned at submit time + the original "
+            "MessageTransaction the receipt covers), confirms the tx "
+            "is NOT on chain via get_tx_status, then signs and submits "
+            "a CensorshipEvidenceTx.  The accused validator's stake is "
+            "slashed by CENSORSHIP_SLASH_BPS once the evidence matures, "
+            "unless the receipted tx lands first (which voids the "
+            "evidence with no slash)."
+        ),
+    )
+    submit_ev_cens.add_argument(
+        "--receipt", type=str, required=True,
+        help=(
+            "Path to the receipt-bundle JSON file (preferred) "
+            "containing both the SubmissionReceipt and the receipted "
+            "MessageTransaction.  See `messagechain submit-evidence "
+            "censorship --help` for the bundle schema."
+        ),
+    )
+    submit_ev_cens.add_argument(
+        "--server", type=str, default=None,
+        help="Server address host:port",
+    )
+    submit_ev_cens.add_argument(
+        "--urgency", type=str, default="normal",
+        choices=("low", "normal", "high"),
+        help=(
+            "Auto-fee urgency: 'high' bids the 90th percentile of "
+            "recent fees, 'normal' the 75th, 'low' the 25th."
+        ),
+    )
+
+    # Bogus-rejection -- accepted but not yet wired.
+    submit_ev_br = submit_ev_sub.add_parser(
+        "bogus-rejection",
+        help="(NOT YET WIRED) Submit a BogusRejectionEvidenceTx",
+        description=(
+            "Submit a BogusRejectionEvidenceTx for a SignedRejection "
+            "whose claimed reason is provably false (e.g. "
+            "REJECT_INVALID_SIG against a tx whose signature actually "
+            "verifies).  This subcommand is a stub: only the "
+            "censorship-evidence path is wired in this release.  The "
+            "consensus-layer pipeline already exists at "
+            "messagechain.consensus.bogus_rejection_evidence."
+        ),
+    )
+    submit_ev_br.add_argument(
+        "--rejection", type=str, default=None,
+        help="(reserved) Path to a SignedRejection bundle.",
+    )
+
+    # Non-response -- accepted but not yet wired.
+    submit_ev_nr = submit_ev_sub.add_parser(
+        "non-response",
+        help="(NOT YET WIRED) Submit a NonResponseEvidenceTx",
+        description=(
+            "Submit a NonResponseEvidenceTx when a witnessed-submission "
+            "request was never acked within "
+            "WITNESS_RESPONSE_DEADLINE_BLOCKS.  This subcommand is a "
+            "stub: only the censorship-evidence path is wired in this "
+            "release.  The consensus-layer pipeline already exists at "
+            "messagechain.consensus.non_response_evidence."
+        ),
+    )
+    submit_ev_nr.add_argument(
+        "--witness-bundle", dest="witness_bundle",
+        type=str, default=None,
+        help="(reserved) Path to a witness-submission bundle.",
+    )
+
+    # Back-compat: legacy callers passed `--tx <hash>` directly to
+    # submit-evidence.  Keep the flag at the top level so an old
+    # invocation prints a clear migration message instead of an
+    # argparse error.
     submit_ev.add_argument(
-        "--tx", dest="tx_hash", type=str, required=True,
-        help="Hex tx hash that was receipted-then-censored",
+        "--tx", dest="tx_hash", type=str, default=None,
+        help=argparse.SUPPRESS,
     )
     submit_ev.add_argument(
         "--server", type=str, default=None,
-        help="Server address host:port",
+        help=argparse.SUPPRESS,
     )
 
     # --- cut-checkpoint ---
@@ -5288,50 +5377,346 @@ def _print_not_found_receipt(tx_hash_hex: str) -> int:
     return 0
 
 
-def cmd_submit_evidence(args) -> int:
-    """Submit a censorship-evidence transaction (stub).
+def _load_receipt_bundle(path: str) -> tuple[object, object]:
+    """Read a receipt-bundle JSON file from disk.
 
-    Full evidence-tx construction (sign + submit) lands in a follow-up
-    branch.  The stub exists so the receipt CLI's escalation hint
-    resolves to a real command rather than a "Unknown command" error.
+    The bundle pairs a SubmissionReceipt (the validator's commitment
+    that it accepted a tx at a given height) with the original
+    MessageTransaction the receipt covers.  Both fields are needed:
+    the receipt alone proves admission, the message_tx is what
+    every node compares against the next block's tx_hashes to decide
+    whether to void the evidence (i.e. the tx finally landed) or
+    apply the slash on maturity.
 
-    Coordination note: a sibling worktree wires the inclusion-list
-    processor; once that lands the full evidence path should ALSO
-    surface InclusionListViolationEvidenceTx as a slashable type,
-    alongside the existing CensorshipEvidenceTx,
-    BogusRejectionEvidenceTx, NonResponseEvidenceTx pipeline.
+    Bundle schema (JSON):
+
+        {
+          "receipt":    <SubmissionReceipt.serialize() dict>
+                        OR <hex of receipt.to_bytes()>,
+          "message_tx": <MessageTransaction.serialize() dict>
+                        OR <hex of message_tx.to_bytes()>
+        }
+
+    Both `dict` and `hex-string` forms are accepted so an operator
+    can either save the JSON the RPC returned (which serializes to
+    dict) or the hex blob (which is what the validator returns in
+    `result.receipt_hex` from submit_transaction).
+
+    Returns ``(SubmissionReceipt, MessageTransaction)``.
+    Raises ``ValueError`` on malformed input.
     """
-    tx_hash_hex = _validate_tx_hash_arg(args.tx_hash)
-    if tx_hash_hex is None:
+    import json
+    from messagechain.core.transaction import MessageTransaction
+    from messagechain.network.submission_receipt import SubmissionReceipt
+
+    with open(path, "r", encoding="utf-8") as f:
+        bundle = json.load(f)
+    if not isinstance(bundle, dict):
+        raise ValueError(
+            "receipt bundle must be a JSON object with `receipt` and "
+            "`message_tx` keys"
+        )
+    if "receipt" not in bundle:
+        raise ValueError("receipt bundle missing `receipt` field")
+    if "message_tx" not in bundle:
+        raise ValueError("receipt bundle missing `message_tx` field")
+
+    r_field = bundle["receipt"]
+    if isinstance(r_field, dict):
+        receipt = SubmissionReceipt.deserialize(r_field)
+    elif isinstance(r_field, str):
+        try:
+            receipt = SubmissionReceipt.from_bytes(bytes.fromhex(r_field))
+        except ValueError as e:
+            raise ValueError(f"`receipt` hex string is not parseable: {e}")
+    else:
+        raise ValueError(
+            "`receipt` field must be a dict (serialize form) or a "
+            "hex string (to_bytes form)"
+        )
+
+    mtx_field = bundle["message_tx"]
+    if isinstance(mtx_field, dict):
+        message_tx = MessageTransaction.deserialize(mtx_field)
+    elif isinstance(mtx_field, str):
+        try:
+            message_tx = MessageTransaction.from_bytes(
+                bytes.fromhex(mtx_field),
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"`message_tx` hex string is not parseable: {e}"
+            )
+    else:
+        raise ValueError(
+            "`message_tx` field must be a dict (serialize form) or a "
+            "hex string (to_bytes form)"
+        )
+
+    if receipt.tx_hash != message_tx.tx_hash:
+        raise ValueError(
+            "receipt.tx_hash does NOT match message_tx.tx_hash -- the "
+            "bundle pairs a receipt with the wrong transaction"
+        )
+
+    return receipt, message_tx
+
+
+def _cmd_submit_censorship_evidence(args) -> int:
+    """Wire the censorship-evidence subcommand: load bundle, sign, submit.
+
+    The user side of the slashing pipeline.  The flow:
+
+      1. Load and parse the receipt-bundle JSON (receipt + message_tx).
+      2. Cross-check via get_tx_status that the message_tx is NOT on
+         chain (the entire premise of evidence is "validator promised
+         inclusion, never delivered" -- if it IS on chain we refuse
+         to submit a no-op evidence that the validator can no longer
+         be slashed for).
+      3. Resolve the user's signing entity through the personal-wallet
+         keypair cache so this command doesn't pay the multi-minute
+         keygen cliff a fresh Entity.create would.
+      4. Auto-fetch nonce + leaf-watermark, auto-pick fee.
+      5. Build, sign, submit the CensorshipEvidenceTx via the new
+         `submit_censorship_evidence` RPC.
+    """
+    import time
+
+    from client import rpc_call
+    from messagechain.consensus.censorship_evidence import (
+        CensorshipEvidenceTx,
+    )
+    from messagechain.crypto.hashing import default_hash
+    from messagechain.crypto.keys import Signature
+    from messagechain.economics.auto_fee import (
+        auto_fee, urgency_to_target_blocks,
+    )
+
+    # -- Load + validate the bundle --
+    try:
+        receipt, message_tx = _load_receipt_bundle(args.receipt)
+    except FileNotFoundError:
+        print(f"Error: receipt bundle file not found: {args.receipt!r}")
+        sys.exit(1)
+    except (ValueError, OSError) as e:
+        print(f"Error: could not load receipt bundle: {e}")
+        sys.exit(1)
+
+    tx_hash_hex = receipt.tx_hash.hex()
+    print(
+        f"=== MessageChain submit-evidence (censorship) for "
+        f"{tx_hash_hex[:16]}... ==="
+    )
+    print(f"  Receipt issuer:    {receipt.issuer_id.hex()[:16]}...")
+    print(f"  Commit height:     {receipt.commit_height}")
+    print()
+
+    host, port = _parse_server(args.server)
+
+    # -- Refuse if the receipted tx is already on chain --
+    status_resp = rpc_call(host, port, "get_tx_status", {
+        "tx_hash": tx_hash_hex,
+    })
+    if not status_resp.get("ok"):
         print(
-            f"Error: invalid tx hash '{args.tx_hash}'.\n"
-            f"  Expected: 64 hex characters (32 bytes)."
+            f"Error: could not query tx status: "
+            f"{status_resp.get('error', 'unknown')}"
+        )
+        sys.exit(1)
+    status = status_resp["result"].get("status", "?")
+    if status == "included":
+        block_height = status_resp["result"].get("block_height", "?")
+        print(
+            f"Refusing to submit evidence: tx {tx_hash_hex[:16]}... is "
+            f"already on chain at block {block_height}.\n"
+            f"  CensorshipEvidenceTx is the remedy ONLY when a validator "
+            f"issued a receipt and then never included the tx.  Since "
+            f"the tx is on chain, no censorship occurred.\n"
+            f"  If you suspect inclusion happened only after a long "
+            f"delay (past EVIDENCE_INCLUSION_WINDOW), the slash window "
+            f"already closed -- nothing to escalate."
         )
         sys.exit(1)
 
-    print(f"=== MessageChain submit-evidence for {tx_hash_hex[:16]}... ===\n")
-    print(
-        "  Coming soon: the CensorshipEvidenceTx / "
-        "BogusRejectionEvidenceTx /\n"
-        "  NonResponseEvidenceTx construction + signing path.\n"
-        "  The consensus-layer evidence pipelines already exist:\n"
-        "    - messagechain.consensus.censorship_evidence\n"
-        "    - messagechain.consensus.bogus_rejection_evidence\n"
-        "    - messagechain.consensus.non_response_evidence\n"
-        "    - messagechain.consensus.forced_inclusion\n"
-        "  When matured, evidence slashes the issuing validator by\n"
-        "  CENSORSHIP_SLASH_BPS of their stake."
+    # -- Resolve signing wallet (cache-warm path) --
+    private_key = _resolve_private_key(args)
+    data_dir = getattr(args, "data_dir", None)
+    submitter = _resolve_signing_entity(private_key, args)
+    print(f"Signing as: {submitter.entity_id_hex[:16]}...")
+
+    # -- Auto-fetch nonce + advance leaf watermark --
+    nonce_resp = rpc_call(host, port, "get_nonce", {
+        "entity_id": submitter.entity_id_hex,
+    })
+    if not nonce_resp.get("ok"):
+        print(f"Error: {nonce_resp.get('error', 'Could not fetch nonce')}")
+        sys.exit(1)
+    leaf = _reserve_leaf_via_rpc(host, port, submitter.entity_id_hex)
+    if leaf is None:
+        leaf = nonce_resp["result"].get(
+            "leaf_watermark", nonce_resp["result"]["nonce"],
+        )
+    _bind_persistent_leaf_index(submitter, chain_leaf=leaf, data_dir=data_dir)
+
+    # -- Auto-fee --
+    info_resp = rpc_call(host, port, "get_chain_info", {})
+    tip_height = 0
+    if info_resp.get("ok"):
+        count = info_resp["result"].get("height", 0) or 0
+        tip_height = max(count - 1, 0)
+    target_height = tip_height + 1
+
+    # CensorshipEvidenceTx envelope is small (no message payload), so
+    # it's floor-dominated.  Use the unified auto-fee helper with a
+    # representative stored size and let the floor bind.
+    urgency = getattr(args, "urgency", "normal")
+    target_blocks = urgency_to_target_blocks(urgency)
+    # The evidence tx uses MIN_FEE (the per-tx flat floor) by default;
+    # auto_fee never returns 0 and clamps to the floor.  We pick the
+    # `stake` rep size as a reasonable proxy for an envelope-only tx.
+    fee = auto_fee(
+        "stake",
+        stored_size=64,
+        urgency=urgency,
+        current_height=target_height,
+        mempool_estimate=0,
     )
-    print()
     print(
-        "  Until the CLI wiring lands you can:\n"
-        "    1. Save the SubmissionReceipt your validator returned at\n"
-        "       send-time (the `receipt` field of submit_transaction).\n"
-        "    2. After EVIDENCE_INCLUSION_WINDOW blocks of non-inclusion,\n"
-        "       hand the receipt to a node operator who can construct\n"
-        "       and submit the on-chain evidence transaction directly.\n"
+        f"Fee: {fee} tokens (auto, target ~{target_blocks} blocks, "
+        f"urgency={urgency})"
     )
-    return 0
+
+    # -- Construct + sign --
+    placeholder = Signature([], 0, [], b"", b"")
+    etx = CensorshipEvidenceTx(
+        receipt=receipt,
+        message_tx=message_tx,
+        submitter_id=submitter.entity_id,
+        timestamp=int(time.time()),
+        fee=int(fee),
+        signature=placeholder,
+    )
+    msg_hash = default_hash(etx._signable_data())
+    etx.signature = submitter.keypair.sign(msg_hash)
+    etx.tx_hash = etx._compute_hash()
+
+    print("Submitting evidence...")
+    response = rpc_call(host, port, "submit_censorship_evidence", {
+        "transaction": etx.serialize(),
+    })
+
+    if response.get("ok"):
+        result = response["result"]
+        print()
+        print(f"Evidence submitted!")
+        print(f"  Evidence tx hash: {result['tx_hash']}")
+        print(f"  Evidence hash:    {result['evidence_hash']}")
+        print(f"  Accused:          {result['offender_id'][:16]}...")
+        print(f"  Fee paid:         {result['fee']} tokens")
+        print()
+        print(
+            "  When this evidence lands in a block and matures past\n"
+            "  EVIDENCE_MATURITY_BLOCKS without the receipted tx being\n"
+            "  included on chain, the accused validator's stake is\n"
+            "  slashed by CENSORSHIP_SLASH_BPS and burned.  If the tx\n"
+            "  is included before maturity (by anyone -- not just the\n"
+            "  accused), the evidence voids with no slash."
+        )
+        return 0
+
+    err = response.get("error", "")
+    print(f"\nFailed to submit evidence: {err}")
+    sys.exit(1)
+
+
+def cmd_submit_evidence(args) -> int:
+    """Dispatch the submit-evidence subcommand.
+
+    Three evidence kinds exist on the consensus layer:
+
+      * censorship       -- CensorshipEvidenceTx (validator issued
+                            receipt, then never included the tx).
+                            REAL wiring (signs + submits).
+      * bogus-rejection  -- BogusRejectionEvidenceTx (validator
+                            forged a REJECT_INVALID_SIG).  Stub:
+                            consensus pipeline exists; CLI wiring
+                            lands in a follow-up branch.
+      * non-response     -- NonResponseEvidenceTx (validator
+                            silently dropped a witnessed submission).
+                            Stub: same status as bogus-rejection.
+
+    The censorship path is the most-promised on the public surface
+    (README + COMPARISON.md), so it's the one wired first.  The
+    other two print clear "not yet wired" messages so the receipt
+    CLI's escalation hint always resolves to a real command.
+
+    Back-compat: a legacy `--tx <hash>` invocation (no subcommand)
+    prints a migration diagnostic naming the new flag.
+    """
+    kind = getattr(args, "evidence_kind", None)
+
+    if kind == "censorship":
+        return _cmd_submit_censorship_evidence(args)
+
+    if kind == "bogus-rejection":
+        print("=== MessageChain submit-evidence (bogus-rejection) ===\n")
+        print(
+            "  This subcommand is NOT YET WIRED.  Only the\n"
+            "  censorship-evidence path is signed-and-submittable in\n"
+            "  this release; the consensus-layer pipeline at\n"
+            "  messagechain.consensus.bogus_rejection_evidence is\n"
+            "  ready and the CLI wiring will land in a follow-up.\n"
+            "\n"
+            "  In the meantime: keep your SignedRejection bundle and\n"
+            "  hand it to a node operator who can construct and submit\n"
+            "  the BogusRejectionEvidenceTx directly."
+        )
+        return 0
+
+    if kind == "non-response":
+        print("=== MessageChain submit-evidence (non-response) ===\n")
+        print(
+            "  This subcommand is NOT YET WIRED.  Only the\n"
+            "  censorship-evidence path is signed-and-submittable in\n"
+            "  this release; the consensus-layer pipeline at\n"
+            "  messagechain.consensus.non_response_evidence is ready\n"
+            "  and the CLI wiring will land in a follow-up.\n"
+            "\n"
+            "  In the meantime: keep your witnessed-submission bundle\n"
+            "  and hand it to a node operator who can construct and\n"
+            "  submit the NonResponseEvidenceTx directly."
+        )
+        return 0
+
+    # Legacy / no-subcommand path.  Existing receipts in the wild
+    # name `messagechain submit-evidence --tx <hash>` -- print a
+    # clear migration message rather than an argparse error.
+    legacy_tx = getattr(args, "tx_hash", None)
+    if legacy_tx is not None:
+        print("=== MessageChain submit-evidence ===\n")
+        print(
+            "  The submit-evidence command now takes a subcommand:\n"
+            "    messagechain submit-evidence censorship --receipt <bundle.json>\n"
+            "    messagechain submit-evidence bogus-rejection ...\n"
+            "    messagechain submit-evidence non-response ...\n"
+            "\n"
+            "  The legacy `--tx <hash>` form was a stub that did not\n"
+            "  actually submit anything.  Use the censorship\n"
+            "  subcommand with a receipt bundle instead -- save the\n"
+            "  validator's SubmissionReceipt at send-time (returned\n"
+            "  in the `receipt` field of submit_transaction) along\n"
+            "  with the original MessageTransaction, and pass the\n"
+            "  bundle path via --receipt."
+        )
+        return 0
+
+    print(
+        "Error: submit-evidence requires a subcommand.\n"
+        "  messagechain submit-evidence censorship --receipt <bundle.json>\n"
+        "  messagechain submit-evidence bogus-rejection ...\n"
+        "  messagechain submit-evidence non-response ..."
+    )
+    sys.exit(1)
 
 
 def cmd_cut_checkpoint(args):
