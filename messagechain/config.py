@@ -4946,6 +4946,60 @@ assert REWARD_CURVE_SMOOTH_SCALE_BPS > 0, (
     "collapse the formula at stake_bps=0"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 41 — Ack-deadline grace defense on the slash-decision comparator
+# ─────────────────────────────────────────────────────────────────────
+# Tier 39 (ACK_BACKDATING_DEFENSE_HEIGHT) re-pinned the registry's
+# recorded ack discharge height to ``block.header.block_number`` (the
+# chain-observed inclusion height), closing the issuer-side backdating
+# attack on witness-non-response slashing.  That fix introduced an
+# asymmetry on the OTHER side of the same gate: an honest acker who
+# publishes a valid SubmissionAck just before the deadline can be
+# slashed if the next-proposer (colluding) declines to include it and
+# the next honest proposer includes it at
+# ``block_number = observed + DEADLINE + 1`` (one block past the
+# deadline).  The slash-decision comparator
+# ``ack_h <= earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS``
+# returns False → "obligation not met" → curve-graded slash against
+# the honest validator.  A two-validator collusion (Q witnesses +
+# 1 deadline-tip proposer that drops the honest ack for one block)
+# fabricates a non-response slash against an honest target.
+#
+# The validate-side path (``_validate_acks_observed_this_block``)
+# already tolerates ``ACK_INCLUSION_GRACE`` of slack on the inclusion
+# height; the slash-decision path must do the same so propose-side and
+# apply-side stay in sync about what counts as "in window".
+#
+# Tier 41 widens the slash-decision comparator to:
+#   ``ack_h <= earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS +
+#              ACK_INCLUSION_GRACE``
+# AND the same change is mirrored in ``compute_post_state_root`` so the
+# propose-time sim and the apply-time non-response processor reach the
+# same byte-identical decision on every block.
+#
+# Pre-activation: legacy comparator preserved byte-for-byte for replay
+# determinism — historical mainnet blocks reapply unchanged.
+#
+# Activation rides above Tier 40 with a comfortable runway buffer
+# above the current ~840 mainnet tip so operators upgrade through
+# prior forks before the new comparator bites.
+ACK_DEADLINE_GRACE_DEFENSE_HEIGHT = 1640  # Tier 41 — runway above Tier 40 (1634) and current ~840 mainnet tip
+
+assert ACK_DEADLINE_GRACE_DEFENSE_HEIGHT > REWARD_CURVE_SMOOTH_HEIGHT, (
+    "ACK_DEADLINE_GRACE_DEFENSE_HEIGHT must follow Tier 40 — Tier 41 "
+    "rides on top of the most recent established fork; pre-activation "
+    "callers continue to see the legacy slash-decision comparator "
+    "(no GRACE) byte-for-byte"
+)
+assert ACK_DEADLINE_GRACE_DEFENSE_HEIGHT > ACK_BACKDATING_DEFENSE_HEIGHT, (
+    "ACK_DEADLINE_GRACE_DEFENSE_HEIGHT must follow Tier 39 — Tier 41 "
+    "is the symmetric counterpart to the Tier-39 backdating defense "
+    "on the slash-decision side; the registry-source change Tier 39 "
+    "lands must already be live before the wider comparator activates "
+    "or the comparator widens against issuer-controlled discharge "
+    "heights instead of inclusion-controlled ones"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
