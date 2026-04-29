@@ -5109,6 +5109,75 @@ assert REWARD_CURVE_SMOOTH_V2_SCALE_BPS > 0, (
     "would collapse the formula at stake_bps=0"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 43 — Forced-inclusion source-side covers ALL tx pools.
+# ─────────────────────────────────────────────────────────────────────
+# Tier 34 closed the BLOCK-side gap of the forced-inclusion attester
+# duty: post-Tier-34 the gate walks every block tx-list field via
+# `_BLOCK_TX_LIST_ATTRS` so a forced TransferTransaction placed in
+# `block.transfer_transactions` is recognized as included rather than
+# flagged as omitted.  The corresponding SOURCE-side gap was left as a
+# follow-up: `Mempool.get_forced_inclusion_set` walked only
+# `self.pending` (Message + Transfer), so every other tx kind —
+# server-local stake / unstake / authority / governance pools, AND
+# the on-mempool censorship-evidence pool — was silently exempt from
+# the rule.  A colluding proposer could drop the very
+# CensorshipEvidenceTx filed against itself, an honest stake-rebalance
+# or unstake-exit, or a governance vote that threatened its position,
+# all with zero slashable evidence.  That violates the CLAUDE.md
+# anchor "a tx that is well-formed, pays at least the per-byte floor,
+# and fits the byte budget cannot be suppressed by anything weaker
+# than a full validator-set majority actively colluding."
+#
+# Tier 43 closes the source-side symmetrically:
+#   * Mempool gains a `register_forced_inclusion_source(callable)` API
+#     so server-local pools can plug in without circular imports.
+#     Pre-fork the registered sources are silently ignored to keep
+#     historical attester behavior byte-identical.
+#   * Mempool registers its on-board censorship_evidence_pool
+#     internally — that pool already lives here so no plumbing across
+#     module boundaries is needed.
+#   * Server registers each of its four pending-tx pools (stake /
+#     unstake / authority / governance) with arrival-height
+#     bookkeeping so the wait-gate works the same way it does for
+#     messages.
+#   * Block-side: `censorship_evidence_txs` is added to
+#     `_BLOCK_TX_LIST_ATTRS` so a forced evidence tx placed in its
+#     correct slot is recognized as included.
+#
+# Pre-fork: byte-identical to legacy attester behavior — extra
+# sources are NOT consulted, so any block accepted under the old
+# rule still attests.  Post-fork: a forced governance / stake /
+# unstake / authority / censorship-evidence tx left out of an
+# otherwise-empty block fails the gate.
+#
+# Activation height comfortably above Tier 42 (REWARD_CURVE_SMOOTH_V2
+# = 2400) with multi-day runway so operators upgrade through the
+# prior fork ladder before the new source-side rule bites.  +734
+# spacing matches the cohort the 1.38.1 re-runway used.
+FORCED_INCLUSION_ALL_POOLS_HEIGHT = 3134  # Tier 43 — comfortable runway above Tier 42 (2400) with the standard +734 cohort spacing
+
+assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > REWARD_CURVE_SMOOTH_V2_HEIGHT, (
+    "FORCED_INCLUSION_ALL_POOLS_HEIGHT must follow Tier 42 — the "
+    "source-side rule rides on top of the most recent established "
+    "fork ladder; rolling Tier 43 before Tier 42 risks a "
+    "mid-fork-ladder restart leaving the chain on the extended "
+    "source set without the curve-tuning fork active"
+)
+assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT, (
+    "FORCED_INCLUSION_ALL_POOLS_HEIGHT must follow Tier 34 — the "
+    "block-side multi-list walk is the prerequisite for the source-"
+    "side extension; the gate cannot enforce against a tx kind whose "
+    "block slot is not yet recognized"
+)
+assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT, (
+    "FORCED_INCLUSION_ALL_POOLS_HEIGHT must follow Tier 37 — the "
+    "entity-cap excuse fix is part of the same fee-per-byte ranking "
+    "machinery the extended source set feeds into; activating the "
+    "extended source before the cap-fix would re-open a same-entity "
+    "lower-fpb fill loophole on the new tx kinds"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

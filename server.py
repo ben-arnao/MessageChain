@@ -1059,6 +1059,26 @@ class Server(SharedRuntimeMixin):
 
         self.blockchain = Blockchain(db=self.db)
         self.mempool = Mempool()
+        # Tier 43: arrival-height bookkeeping for the server-local
+        # pending pools (stake / unstake / authority / governance).
+        # Keyed by tx_hash across ALL four pools — the dict is small
+        # (bounded by aggregate PENDING_POOL_MAX_SIZE × 5) and lets the
+        # forced-inclusion source-side wait-gate work the same way it
+        # does for messages.  Populated on `_admit_to_pool`; entries
+        # are torn down by every code path that removes from one of
+        # the pools (block-production drain, RPC eviction, sweep).
+        # An entry missing here defaults to height-0 in the source
+        # walk, matching the legacy "always been here" semantics.
+        self._pending_pool_arrival_heights: dict[bytes, int] = {}
+        # Register the four server-local pools as a forced-inclusion
+        # source so the Tier 43 source-side gate covers them too.  The
+        # mempool ignores registered sources pre-fork (see
+        # FORCED_INCLUSION_ALL_POOLS_HEIGHT) so this registration is
+        # safe at construction time even on a cold-loaded node that
+        # restarts before the activation height.
+        self.mempool.register_forced_inclusion_source(
+            self._iter_server_pools_with_arrivals,
+        )
         self.consensus = ProofOfStake()
         self.peers: dict[str, Peer] = {}
         # In-flight outbound dials, keyed by "host:port".  A Peer only
@@ -2251,6 +2271,9 @@ class Server(SharedRuntimeMixin):
                 h for h, tx in pool.items() if _is_stale(tx)
             ]:
                 del pool[h]
+                # Tier 43: drop the swept tx's arrival-height entry
+                # so the tracker doesn't accumulate stale keys.
+                self._pending_pool_arrival_heights.pop(h, None)
                 dropped += 1
         return dropped
 
@@ -2347,6 +2370,8 @@ class Server(SharedRuntimeMixin):
             ev_pool = getattr(self, ev_attr, None)
             if ev_pool is not None and ev_hash in ev_pool:
                 del ev_pool[ev_hash]
+                # Tier 43: drop the evicted tx's arrival-height entry.
+                self._pending_pool_arrival_heights.pop(ev_hash, None)
 
         if len(pool) >= PENDING_POOL_MAX_SIZE:
             min_tx = min(
@@ -2356,8 +2381,39 @@ class Server(SharedRuntimeMixin):
             if incoming_fee <= getattr(min_tx, "fee", 0):
                 return False
             del pool[min_tx.tx_hash]
+            self._pending_pool_arrival_heights.pop(min_tx.tx_hash, None)
         pool[tx.tx_hash] = tx
+        # Tier 43: record arrival height so the forced-inclusion
+        # source-side wait-gate works.  `blockchain.height` is the
+        # current chain tip; this tx is being seen at the next block
+        # height onward.
+        self._pending_pool_arrival_heights[tx.tx_hash] = (
+            self.blockchain.height
+        )
         return True
+
+    def _iter_server_pools_with_arrivals(self):
+        """Yield `(tx, arrival_height)` pairs for the four server-local
+        pending pools so the mempool's Tier-43 forced-inclusion source-
+        side walk can rank them alongside its own pending.
+
+        The tracking dict (`_pending_pool_arrival_heights`) covers all
+        pools by tx_hash; missing entries default to 0 ("always been
+        here" — immediately eligible for forced inclusion), matching
+        the legacy semantics of `Mempool.add_transaction` when no
+        arrival height is supplied.
+        """
+        for pool_attr in (
+            "_pending_stake_txs", "_pending_unstake_txs",
+            "_pending_authority_txs", "_pending_governance_txs",
+        ):
+            pool = getattr(self, pool_attr, None)
+            if not pool:
+                continue
+            # Snapshot keys so a concurrent admit / drain doesn't
+            # mutate the iteration shape mid-walk.
+            for h, tx in list(pool.items()):
+                yield tx, self._pending_pool_arrival_heights.get(h, 0)
 
     def _has_pending_stake_from(self, entity_id: bytes) -> bool:
         """Return True iff any pending stake tx in the local pool belongs
@@ -3895,18 +3951,25 @@ class Server(SharedRuntimeMixin):
                 self.mempool.remove_react_transactions(
                     [r.tx_hash for r in react_txs]
                 )
+            # Tier 43: arrival-height tracker is keyed by tx_hash
+            # across ALL four server pools, so every drain path must
+            # also pop from the tracker to keep it bounded.
             if authority_txs:
                 for ah in [a.tx_hash for a in authority_txs]:
                     pending_authority.pop(ah, None)
+                    self._pending_pool_arrival_heights.pop(ah, None)
             if stake_txs:
                 for sh in [s.tx_hash for s in stake_txs]:
                     pending_stake.pop(sh, None)
+                    self._pending_pool_arrival_heights.pop(sh, None)
             if unstake_txs:
                 for uh in [u.tx_hash for u in unstake_txs]:
                     pending_unstake.pop(uh, None)
+                    self._pending_pool_arrival_heights.pop(uh, None)
             if governance_txs:
                 for gh in [g.tx_hash for g in governance_txs]:
                     pending_gov.pop(gh, None)
+                    self._pending_pool_arrival_heights.pop(gh, None)
             if ce_txs:
                 self.mempool.remove_censorship_evidence_txs(
                     [e.tx_hash for e in ce_txs]

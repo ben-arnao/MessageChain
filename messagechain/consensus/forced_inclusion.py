@@ -103,6 +103,17 @@ _BLOCK_TX_LIST_ATTRS: tuple[str, ...] = (
     # to []), which iterates as a no-op — so listing the slot
     # unconditionally does not perturb the gate's pre-fork behavior.
     "non_response_evidence_txs",
+    # Tier 43 — censorship-evidence first-class block slot.  Pre-Tier-43
+    # the gate's source side did not consult the censorship-evidence
+    # pool, so an omitted evidence tx never triggered the gate's
+    # block-side check either; placing the slot here unconditionally
+    # is safe because every pre-Tier-43 block carries an empty list
+    # (or the field is missing entirely; `getattr(..., None) or ()`
+    # handles both).  Post-Tier-43 a forced evidence tx placed in
+    # this slot is recognized as included rather than flagged as
+    # omitted — the same false-positive-resistant pattern Tier 34
+    # established for transfers and Tier 35 for non-response.
+    "censorship_evidence_txs",
 )
 
 
@@ -111,6 +122,26 @@ def _iter_all_block_txs(block):
     for attr in _BLOCK_TX_LIST_ATTRS:
         for tx in getattr(block, attr, None) or ():
             yield tx
+
+
+def _entity_id_of(tx) -> bytes | None:
+    """Return the per-entity-cap key for `tx`.
+
+    Tier 34 read `entity_id` / `voter_id` (Message + Vote).  Tier 43
+    extends source-side coverage to tx kinds whose primary identifier
+    uses a different name: `proposer_id` (governance proposals) and
+    `submitter_id` (censorship-evidence).  Reading them here keeps the
+    per-entity tally consistent across every kind the gate now sees.
+    Pre-Tier-43 this is reached only with kinds that already exposed
+    `entity_id` or `voter_id`, so the additional fallbacks are silent
+    no-ops on every legacy code path.
+    """
+    return (
+        getattr(tx, "entity_id", None)
+        or getattr(tx, "voter_id", None)
+        or getattr(tx, "proposer_id", None)
+        or getattr(tx, "submitter_id", None)
+    )
 
 
 def _is_strictly_lower_fpb(other_tx, ref_tx) -> bool:
@@ -252,9 +283,7 @@ def check_forced_inclusion(
         used_count = sum(1 for _ in _iter_all_block_txs(block))
         entity_counts: dict[bytes, int] = {}
         for tx in _iter_all_block_txs(block):
-            eid = getattr(tx, "entity_id", None) or getattr(
-                tx, "voter_id", None,
-            )
+            eid = _entity_id_of(tx)
             if eid is not None:
                 entity_counts[eid] = entity_counts.get(eid, 0) + 1
                 if apply_entity_cap_fix:
@@ -293,10 +322,7 @@ def check_forced_inclusion(
             continue
 
         # Valid excuse #3: per-entity cap reached for this tx's sender.
-        ftx_eid = (
-            getattr(ftx, "entity_id", None)
-            or getattr(ftx, "voter_id", None)
-        )
+        ftx_eid = _entity_id_of(ftx)
         if ftx_eid is not None:
             if apply_entity_cap_fix:
                 # Tier 37: only same-entity block txs at >= the forced
