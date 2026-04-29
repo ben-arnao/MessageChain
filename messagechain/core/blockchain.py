@@ -5107,11 +5107,13 @@ class Blockchain:
                     REWARD_CURVE_HEIGHT as _RCH,
                     REWARD_CURVE_LARGE_BAND_HEIGHT as _RCLBH,
                     REWARD_CURVE_SMOOTH_HEIGHT as _RCSH,
+                    REWARD_CURVE_SMOOTH_V2_HEIGHT as _RCSV2H,
                 )
                 from messagechain.economics.inflation import (
                     reward_curve_multiplier as _reward_curve_multiplier,
                     reward_curve_multiplier_v2 as _reward_curve_multiplier_v2,
                     reward_curve_multiplier_v3 as _reward_curve_multiplier_v3,
+                    reward_curve_multiplier_v4 as _reward_curve_multiplier_v4,
                 )
                 _cap_active = block_height >= _ARCH
                 _cap_fix_active = block_height >= _ACFH
@@ -5134,6 +5136,13 @@ class Blockchain:
                 # must call the same helper as the apply path so the
                 # state-root commitment matches bit-for-bit.
                 _curve_v3_active = block_height >= _RCSH
+                # Tier 42 sim-mirror: swap in v4 helper at/after
+                # REWARD_CURVE_SMOOTH_V2_HEIGHT.  v4 retunes v3's tuning
+                # knobs (peak / floor / curve-bend point) while
+                # preserving the anchored shape; sim must call the same
+                # helper as the apply path so the state-root commitment
+                # matches bit-for-bit across the curve change.
+                _curve_v4_active = block_height >= _RCSV2H
                 _sim_total_stake = (
                     sum(sim_staked.values()) if _curve_active else 0
                 )
@@ -5181,7 +5190,11 @@ class Blockchain:
                             sim_staked.get(eid, 0) * 10_000
                             // _sim_total_stake
                         )
-                        if _curve_v3_active:
+                        if _curve_v4_active:
+                            _num, _den = _reward_curve_multiplier_v4(
+                                _stake_bps,
+                            )
+                        elif _curve_v3_active:
                             _num, _den = _reward_curve_multiplier_v3(
                                 _stake_bps,
                             )

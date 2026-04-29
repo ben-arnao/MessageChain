@@ -5030,6 +5030,85 @@ assert ACK_DEADLINE_GRACE_DEFENSE_HEIGHT > ACK_BACKDATING_DEFENSE_HEIGHT, (
     "heights instead of inclusion-controlled ones"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 42 — Smooth-curve V2 retune (tuning-knob change, anchored shape
+# preserved)
+# ─────────────────────────────────────────────────────────────────────
+# Tier 40 (REWARD_CURVE_SMOOTH_HEIGHT) introduced the smooth concave
+# multiplier helper with constants PEAK=150 / FLOOR=40 / SCALE_BPS=300.
+# At today's mainnet bootstrap concentrations (2 validators ≈ 50% each,
+# stake_bps≈5000) those constants put the multiplier at ~0.46×, which
+# means ~50–67% of the attester pool burns every block (integer-rounding
+# short of the pool at the attester_tokens_paid<attester_pool branch in
+# inflation.mint_block_reward).  That violates two CLAUDE.md anchors at
+# once: the bootstrap-arc anchor (issuance must be calibrated so the
+# founder can credibly secure the network solo while it has only a
+# handful of nodes) AND the "low steady perpetual inflation funds the
+# security budget forever" anchor.  The Tier-40 curve-bend point (3%
+# stake) sits below every realistic bootstrap concentration, so a
+# bootstrap-era validator effectively earns at the asymptote.
+#
+# Tier 42 retunes the V1 constants to a wider curve-bend point and a
+# higher floor:
+#   PEAK_V2  = 130  (1.30× near-zero peak; was 1.50× under V1)
+#   FLOOR_V2 =  80  (0.80× asymptote;   was 0.40× under V1)
+#   SCALE_V2 = 1000 (curve-bend point at 10% stake; was 3% under V1)
+# Resulting target shape (multiplier at given stake share):
+#   50% (5000 bps): ~0.88×  (was ~0.46× under V1)
+#   25% (2500 bps): ~0.94×
+#   10% (1000 bps): ~1.05×
+#    5% ( 500 bps): ~1.13×
+#   near-zero peak: 1.30×
+#
+# CLAUDE.md anchors the SHAPE of this curve (concave, monotonically
+# diminishing per-unit yield, asymptotic soft cap, no hard cap, no per-
+# validator anti-sybil gate, strictly-increasing absolute reward,
+# concave absolute reward, pure-int) but explicitly leaves the
+# parameters as tuning knobs: "exact constants ... are tuning knobs."
+# All shape invariants asserted by the V1 (Tier 40) test file continue
+# to hold under V2 — see tests/test_reward_curve_smooth_tier_v2.py.
+#
+# Activation height comfortably above Tier 41 (1640) with multi-day
+# runway above the current ~840 mainnet tip so operators upgrade
+# through the prior fork ladder before the new shape bites.
+REWARD_CURVE_SMOOTH_V2_HEIGHT = 2400  # Tier 42 — comfortable runway above Tier 41 (1640) and current ~840 mainnet tip
+
+# Multiplier shape parameters for the V2 retune.  Same MULT_DEN basis
+# (REWARD_CURVE_SMOOTH_MULT_DEN, shared with V1) so the v4 helper
+# composes them with a single common denominator, matching v3.
+REWARD_CURVE_SMOOTH_V2_PEAK_NUM = 130    # 1.30x at stake_bps=0 (was 1.50x under V1)
+REWARD_CURVE_SMOOTH_V2_FLOOR_NUM = 80    # 0.80x asymptote as stake_bps→∞ (was 0.40x under V1)
+REWARD_CURVE_SMOOTH_V2_SCALE_BPS = 1000  # midpoint at 10% stake: (130+80)/(2*100) = 1.05 (was 3% under V1)
+
+assert REWARD_CURVE_SMOOTH_V2_HEIGHT > REWARD_CURVE_SMOOTH_HEIGHT, (
+    "REWARD_CURVE_SMOOTH_V2_HEIGHT must follow Tier 40 — Tier 42 retunes "
+    "the V1 helper's tuning knobs (peak / floor / curve-bend point) "
+    "while preserving the anchored CLAUDE.md shape; pre-activation "
+    "callers continue to see the V1 helper byte-for-byte for replay "
+    "determinism"
+)
+assert REWARD_CURVE_SMOOTH_V2_HEIGHT > ACK_DEADLINE_GRACE_DEFENSE_HEIGHT, (
+    "REWARD_CURVE_SMOOTH_V2_HEIGHT must follow Tier 41 — Tier 42 rides "
+    "on top of the most recent established fork; rolling the retune "
+    "before the most recent comparator widening lands risks a "
+    "mid-fork-ladder restart leaving the chain in an inconsistent "
+    "comparator state across the curve change"
+)
+assert (
+    0 < REWARD_CURVE_SMOOTH_V2_FLOOR_NUM
+    < REWARD_CURVE_SMOOTH_V2_PEAK_NUM
+), (
+    "REWARD_CURVE_SMOOTH_V2_FLOOR_NUM must be strictly between 0 and "
+    "PEAK — FLOOR>=PEAK inverts or flattens the V2 curve (no diminishing "
+    "returns); FLOOR<=0 lets the asymptote nuke whale yield entirely, "
+    "breaking the anchored 'always earn more for more stake' property"
+)
+assert REWARD_CURVE_SMOOTH_V2_SCALE_BPS > 0, (
+    "REWARD_CURVE_SMOOTH_V2_SCALE_BPS must be positive — it sets where "
+    "the V2 curve bends and is the divisor in the rational form; zero "
+    "would collapse the formula at stake_bps=0"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"
