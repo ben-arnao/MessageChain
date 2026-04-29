@@ -4,6 +4,36 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.1] — 2026-04-29
+
+Bugfix release.  The receipt-page tx-status RPC was reading
+attester counts and the finality verdict from the in-memory
+`FinalityTracker`, which is rebuilt only for blocks observed
+since the most recent restart.  After any node restart
+(including a routine `upgrade`), every previously-included
+block silently downgraded to "0 attesters / awaiting finality"
+on https://messagechain.org, even when long-finalized on
+chain.
+
+### Fixed
+
+- **Receipt-page finality now resolves from durable on-disk
+  sources.**  A new `durable_block_finality` helper reads
+  attester counts from block N+1's `attestations` list (the
+  chain's permanent record of who attested to block N — the
+  apply path rejects any attestation with
+  `block_number != parent - 1`, so the successor block's list
+  is complete by construction) and the finality verdict from
+  the `finalized_blocks` table (which persists FinalityVote-
+  driven finalization across restarts).  The in-memory tracker
+  remains the fallback for the chain tip, where no successor
+  block exists yet.  Both call sites
+  (`Server._rpc_get_tx_status` and
+  `Blockchain.get_tx_status_public`) delegate to the helper.
+  Adds regression tests covering post-restart, tip-block-
+  fallback, and DB-finalization-override paths.  (6e410f8,
+  a9049c5)
+
 ## [1.45.0] — 2026-04-29
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
