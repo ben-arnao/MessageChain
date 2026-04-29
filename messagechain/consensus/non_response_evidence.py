@@ -475,18 +475,38 @@ class NonResponseEvidenceProcessor:
         # as the binding deadline reference (strictest case for the
         # offender — if any honest peer saw the gossip early, the ack
         # had to land soon after).
+        #
+        # Tier 41: the comparator widens by ``ACK_INCLUSION_GRACE`` so
+        # an honest acker who lands one or two blocks past the bare
+        # DEADLINE — because a colluding next-proposer drops the ack
+        # for one block before an honest later proposer includes it —
+        # is NOT mis-slashed.  Mirrors the symmetric grace already
+        # applied on the validate-side ack-window bound.  Pre-fork:
+        # legacy comparator (no GRACE) for replay determinism.  See
+        # ACK_DEADLINE_GRACE_DEFENSE_HEIGHT in config.py for the threat
+        # model.
+        from messagechain.config import (
+            ACK_DEADLINE_GRACE_DEFENSE_HEIGHT as _T41_H,
+            ACK_INCLUSION_GRACE as _T41_GRACE,
+        )
+        _ack_grace = (
+            _T41_GRACE if int(current_height) >= _T41_H else 0
+        )
         ack_h = blockchain.witness_ack_registry.get(request_hash)
         if ack_h is not None and tx.witness_observations:
             earliest_obs = min(
                 o.observed_height for o in tx.witness_observations
             )
-            if ack_h <= earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS:
+            deadline_h = (
+                earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS + _ack_grace
+            )
+            if ack_h <= deadline_h:
                 return NonResponseResult(
                     accepted=False, slashed=False,
                     reason=(
                         f"obligation met: chain recorded ack at "
                         f"height {ack_h} within deadline "
-                        f"{earliest_obs + WITNESS_RESPONSE_DEADLINE_BLOCKS}"
+                        f"{deadline_h}"
                     ),
                 )
 

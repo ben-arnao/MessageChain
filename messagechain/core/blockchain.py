@@ -6214,6 +6214,8 @@ class Blockchain:
             from messagechain.config import (
                 HONESTY_CURVE_NON_RESPONSE_BOGUS_HEIGHT as _NRE_T32_H,
                 NON_RESPONSE_BOGUS_PENDING_UNSTAKE_HEIGHT as _NRE_T33_H,
+                ACK_DEADLINE_GRACE_DEFENSE_HEIGHT as _NRE_T41_H,
+                ACK_INCLUSION_GRACE as _NRE_T41_GRACE,
                 WITNESS_RESPONSE_DEADLINE_BLOCKS as _NRE_DDL,
                 VALIDATOR_MIN_STAKE as _NRE_MIN_STAKE,
                 WITNESS_QUORUM as _NRE_QUORUM,
@@ -6232,6 +6234,16 @@ class Blockchain:
             )
             _nre_use_curve = block_height >= _NRE_T32_H
             _nre_use_pending = block_height >= _NRE_T33_H
+            # Tier 41: widen the slash-decision comparator by
+            # ACK_INCLUSION_GRACE so an honest acker landing 1-GRACE
+            # blocks past the bare deadline (because of one colluding
+            # proposer dropping a single block) is NOT mis-slashed.
+            # Pre-Tier-41: zero grace → byte-identical legacy path for
+            # replay.  Mirrors the apply-side change in
+            # non_response_evidence.py.
+            _nre_ack_grace = (
+                _NRE_T41_GRACE if block_height >= _NRE_T41_H else 0
+            )
             for etx in (non_response_evidence_txs or []):
                 # ── Admission gate (read-only on chain state) ──
                 ok, _reason = self.validate_non_response_evidence_tx(etx)
@@ -6253,7 +6265,7 @@ class Blockchain:
                     earliest_obs = min(
                         o.observed_height for o in etx.witness_observations
                     )
-                    if ack_h <= earliest_obs + _NRE_DDL:
+                    if ack_h <= earliest_obs + _NRE_DDL + _nre_ack_grace:
                         continue  # obligation met
                 # Deadline + active-set + sig filter.  Mirrors
                 # process()'s observation walk byte-for-byte; any
