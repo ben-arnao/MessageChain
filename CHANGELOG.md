@@ -4,6 +4,45 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.39.2] — 2026-04-28
+
+Defect-class bugfix: snapshot/restore symmetry for the archive-duty
+in-memory state.  Same shape as the 1.37.0 evidence-collection fix
+and the 1.39.0 inclusion-list-processor fix — purely closes an
+in-memory leak on the bad-state-root rollback path.
+
+### Security (active immediately, no fork gate)
+
+- **Snapshot/restore archive-duty state on block-rollback.**
+  `Blockchain._snapshot_memory_state` / `_restore_memory_snapshot`
+  omitted the four mutable collections owned by the archive-duty
+  subsystem: `validator_archive_misses`,
+  `validator_archive_success_streak`,
+  `validator_first_active_block`, and `archive_active_snapshot`.
+  `_apply_archive_duty` mutates these every block — first-active
+  stamps on every newly-observed-above-threshold validator, an
+  `ActiveValidatorSnapshot` capture at every challenge block, a
+  clear at every epoch close, and miss/streak deltas folded at
+  every epoch close.  A bad-state-root block was rolled back via
+  `_restore_memory_snapshot` but the archive-duty mutations leaked,
+  opening three symmetric attacks: miss-counter poisoning (an
+  attacker-bumped entry feeds a phantom withhold tier into the next
+  reward payout), first-active poisoning (a brand-new validator's
+  bootstrap-grace window anchored to an attacker-chosen height,
+  exiting grace earlier or later than honest peers), and
+  active-snapshot poisoning (a forged `ActiveValidatorSnapshot` is
+  consumed at the next epoch close, producing miss updates the
+  canonical chain never agreed to; the dual case clears a
+  still-open canonical epoch).  These four fields ARE serialized
+  into the on-disk state-snapshot blob, so cold-restart recovery
+  was always correct — the gap was purely in-memory rollback.
+  Mirrors the 1.39.0 fix for the inclusion-list processor and the
+  1.37.0 fix for non_response / bogus_rejection processors.  Pure
+  in-memory rollback path; chaindb mirror runs only after the
+  state-root check passes, so no fork or activation gate.  Adds a
+  structural symmetry guard test that catches the next defect of
+  this class at CI time.
+
 ## [1.39.1] — 2026-04-29
 
 Hotfix on top of 1.39.0.  The cold-load smoke test introduced in
