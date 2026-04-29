@@ -3773,30 +3773,23 @@ class Server(SharedRuntimeMixin):
                 proof_dict = None
 
         # Attester count + attesting stake.  Pull from the chain's
-        # FinalityTracker — the same source the consensus layer uses
-        # to decide finality.  This means a "permanent" verdict in the
-        # CLI exactly tracks consensus-layer finality, not some
-        # secondary heuristic.
+        # Resolve the verdict from durable on-disk sources (successor
+        # block's attestations + finalized_blocks checkpoint), not from
+        # the in-memory FinalityTracker — that cache is rebuilt only for
+        # blocks observed since the most recent restart, so historical
+        # blocks would otherwise show "0 attesters / awaiting finality"
+        # despite being long-finalized on chain.
+        from messagechain.consensus.attestation import durable_block_finality
         block_hash = block.block_hash
-        finality = getattr(self.blockchain, "finality", None)
-        attester_set = set()
-        attesting_stake = 0
-        if finality is not None:
-            attester_set = set(getattr(finality, "attestations", {}).get(block_hash, set()))
-            attesting_stake = int(
-                getattr(finality, "attested_stake", {}).get(block_hash, 0)
-            )
+        attester_set, attesting_stake, threshold_met = (
+            durable_block_finality(self.blockchain, int(block_height), block_hash)
+        )
 
         staked = dict(getattr(self.blockchain.supply, "staked", {}) or {})
         total_stake = sum(int(v) for v in staked.values())
         # Total validator count = staked validators with non-zero
         # stake (the committee a 2/3 threshold is measured against).
         total_validators = sum(1 for v in staked.values() if int(v) > 0)
-        threshold_met = (
-            total_stake > 0
-            and attesting_stake * FINALITY_THRESHOLD_DENOMINATOR
-            >= total_stake * FINALITY_THRESHOLD_NUMERATOR
-        )
 
         result = {
             "status": "included",

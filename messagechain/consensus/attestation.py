@@ -373,3 +373,77 @@ class FinalityTracker:
         if total_stake == 0:
             return 0.0
         return self.attested_stake.get(block_hash, 0) / total_stake
+
+
+def durable_block_finality(
+    blockchain, block_height: int, block_hash: bytes,
+) -> tuple[set[bytes], int, bool]:
+    """Resolve attester set + finalized verdict for a known-included block
+    from durable on-disk sources.
+
+    The in-memory FinalityTracker is rebuilt only for blocks observed
+    after a node start; if used as the sole source, every block
+    included before the most recent restart silently downgrades to
+    "0 attesters, awaiting finality" on the receipt page.  Two durable
+    sources cover that gap:
+
+      * Block N+1's `attestations` list is the chain's permanent record
+        of who attested to block N (the apply path rejects any
+        attestation with `block_number != parent - 1`, so the successor
+        block's list is complete by construction).
+      * The `finalized_blocks` table persists FinalityVote-driven
+        finalization across restarts.
+
+    Falls back to the in-memory tracker only for the chain tip, where
+    no successor block exists yet.
+
+    Returns (attester_set, attesting_stake, threshold_met).
+    """
+    attester_set: set[bytes] = set()
+
+    successor = blockchain.get_block(int(block_height) + 1)
+    if successor is not None:
+        for att in getattr(successor, "attestations", []) or []:
+            if (
+                getattr(att, "block_number", None) == int(block_height)
+                and getattr(att, "block_hash", None) == block_hash
+            ):
+                vid = getattr(att, "validator_id", None)
+                if isinstance(vid, (bytes, bytearray)):
+                    attester_set.add(bytes(vid))
+    else:
+        finality = getattr(blockchain, "finality", None)
+        if finality is not None:
+            attester_set = set(
+                getattr(finality, "attestations", {}).get(block_hash, set())
+            )
+
+    supply = getattr(blockchain, "supply", None)
+    staked = dict(getattr(supply, "staked", {}) or {}) if supply else {}
+    attesting_stake = sum(int(staked.get(vid, 0)) for vid in attester_set)
+
+    # Persistent FinalityVote checkpoint is authoritative when it fires
+    # — a block whose attesters have since unstaked is still finalized
+    # historically.
+    db = getattr(blockchain, "db", None)
+    if db is not None and hasattr(db, "is_block_finalized"):
+        try:
+            if db.is_block_finalized(block_hash):
+                return attester_set, attesting_stake, True
+        except Exception:  # noqa: BLE001 — DB errors fall through
+            pass
+    checkpoints = getattr(blockchain, "finalized_checkpoints", None)
+    if checkpoints is not None:
+        try:
+            if checkpoints.is_finalized(block_hash):
+                return attester_set, attesting_stake, True
+        except Exception:  # noqa: BLE001
+            pass
+
+    total_stake = sum(int(v) for v in staked.values())
+    threshold_met = (
+        total_stake > 0
+        and attesting_stake * FINALITY_THRESHOLD_DENOMINATOR
+        >= total_stake * FINALITY_THRESHOLD_NUMERATOR
+    )
+    return attester_set, attesting_stake, bool(threshold_met)
