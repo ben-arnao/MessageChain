@@ -1090,20 +1090,37 @@ class Block:
             ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
         )
 
-        def _tx_bytes(item):
+        # Block height drives Tier 44's polymorphic CensorshipEvidenceTx
+        # wire format.  Tx types that ignore `chain_height` continue to
+        # work via the TypeError fallback path.
+        block_height_for_encoding = self.header.block_number
+
+        def _tx_bytes(item, *, chain_height: int | None = None):
             # Every participating tx type now accepts an optional state
             # arg; fall back to the no-arg form for any legacy types
             # that don't yet take one (slash txs carry no entity_id at
             # top level — they nest evidence that is block-internal).
+            #
+            # `chain_height` is threaded through for the small set of
+            # tx kinds whose wire format is height-gated (Tier 44+
+            # CensorshipEvidenceTx).  Most tx types don't accept it
+            # and fall back to the state-only path.
+            if chain_height is not None:
+                try:
+                    return item.to_bytes(
+                        state=state, chain_height=chain_height,
+                    )
+                except TypeError:
+                    pass
             try:
                 return item.to_bytes(state=state)
             except TypeError:
                 return item.to_bytes()
 
-        def enc_list(items):
+        def enc_list(items, *, chain_height: int | None = None):
             parts = [struct.pack(">I", len(items))]
             for item in items:
-                b = _tx_bytes(item)
+                b = _tx_bytes(item, chain_height=chain_height)
                 parts.append(struct.pack(">I", len(b)))
                 parts.append(b)
             return b"".join(parts)
@@ -1204,7 +1221,17 @@ class Block:
             # the combined wire layout (archive-rewards + submission-
             # receipts).  Empty list is a single u32 zero on blocks
             # without evidence traffic.
-            enc_list(self.censorship_evidence_txs),
+            #
+            # Tier 44: thread the block's own height down so each
+            # CensorshipEvidenceTx selects pre-fork (legacy
+            # MessageTransaction-only) vs post-fork (polymorphic
+            # receipted-tx) layout based on its block, not the chain
+            # tip.  Pre-fork blocks replay byte-identically; post-
+            # fork blocks may carry transfer/react-receipted evidence.
+            enc_list(
+                self.censorship_evidence_txs,
+                chain_height=block_height_for_encoding,
+            ),
             # bogus_rejection_evidence_txs trails censorship_evidence_txs
             # — newest participating tx type.  Empty list is a single u32
             # zero on blocks without evidence traffic.  This is a

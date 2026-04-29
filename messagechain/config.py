@@ -5205,6 +5205,54 @@ assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGH
     "lower-fpb fill loophole on the new tx kinds"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 44 — Polymorphic receipted-tx in CensorshipEvidenceTx.
+# ─────────────────────────────────────────────────────────────────────
+# CensorshipEvidenceTx hard-coded `MessageTransaction` for the receipted
+# tx field, but `submit_transaction_to_mempool` issues
+# `SubmissionReceipt`s for MessageTransaction AND TransferTransaction
+# AND ReactTransaction.  A user holding a receipt for a Transfer or
+# React that was silently dropped could NOT package it as evidence —
+# `CensorshipEvidenceTx.from_bytes` / `.deserialize` called
+# `MessageTransaction.from_bytes(...)` which fails on transfer / react
+# payloads.  Net: receipts on transfer/react were slash-theatre — a
+# coerced validator could issue them (looks fully accountable on the
+# wire) and silently drop, with NO slashing path.
+#
+# Tier 44 closes this by extending the CensorshipEvidenceTx wire
+# format to carry a single-byte kind-tag (0=Message, 1=Transfer,
+# 2=React) immediately before the receipted-tx blob.  Decoder
+# dispatches on the tag to the appropriate `*Transaction.from_bytes` /
+# `.deserialize`.
+#
+# Pre-fork: byte-identical to legacy MessageTransaction-only format
+# (no leading discriminator byte; receipts always lead with 4-byte
+# u32 receipt-len whose high byte is 0x00).  Post-fork: a leading
+# byte of 0x01 marks the new layout; the next byte is the kind tag.
+# This is a wire-format change for blocks at/after the activation
+# height; pre-fork blobs replay byte-identically.
+#
+# Also extends `CensorshipEvidenceProcessor.observe_block` to walk
+# Message + Transfer + React tx lists when voiding pending evidence
+# whose receipted tx lands on-chain.  Pre-fork observe_block only
+# walked `block.transactions` — a transfer or react that WAS included
+# would not void a (legacy) evidence, but legacy evidence couldn't
+# target transfer/react in the first place, so the pre-fork
+# observation is consistent with the pre-fork wire format.
+#
+# Activation height comfortably above Tier 43 (FORCED_INCLUSION_ALL_
+# POOLS = 3134) with the standard +700-block runway so operators
+# upgrade through the prior fork before the new wire format binds.
+CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT = 3834  # Tier 44 — +700 spacing above Tier 43 (3134); current tip ≈ 850
+
+assert CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT > FORCED_INCLUSION_ALL_POOLS_HEIGHT, (
+    "CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT must follow Tier 43 — "
+    "polymorphic receipted-tx rides on top of the source-side gate "
+    "covering the censorship-evidence pool; rolling Tier 44 before "
+    "Tier 43 leaves the new transfer/react-receipt evidences "
+    "vulnerable to the same source-side drop the prior tier closed"
+)
+
 assert BLOCK_BYTES_RAISE_HEIGHT > LINEAR_FEE_HEIGHT, (
     "BLOCK_BYTES_RAISE_HEIGHT must follow LINEAR_FEE_HEIGHT — the "
     "throughput raise rides on top of the linear fee formula; pre-"

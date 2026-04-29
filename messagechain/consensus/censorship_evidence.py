@@ -50,7 +50,7 @@ from messagechain.config import (
     HASH_ALGO, CHAIN_ID, SIG_VERSION_CURRENT,
     EVIDENCE_INCLUSION_WINDOW, EVIDENCE_MATURITY_BLOCKS,
     EVIDENCE_EXPIRY_BLOCKS, CENSORSHIP_SLASH_BPS,
-    MIN_FEE,
+    MIN_FEE, CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT,
 )
 from messagechain.crypto.keys import Signature, verify_signature
 from messagechain.core.transaction import MessageTransaction
@@ -64,15 +64,120 @@ def _h(data: bytes) -> bytes:
     return default_hash(data)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Polymorphic receipted-tx kind tags (Tier 44 wire format).
+# ─────────────────────────────────────────────────────────────────────
+# A new block-height-gated wire format lets CensorshipEvidenceTx carry
+# a Transfer or React tx as the receipted_tx, not just a Message.
+# Pre-fork: the legacy layout starts with `[u32 receipt_len]` whose
+# high byte is always 0x00 (receipts are well under 16 MB).  The new
+# layout uses a leading byte of 0x01 as the wire-format-version
+# discriminator, followed by a u8 kind tag.  Decoder dispatches on
+# the discriminator: 0x00 → legacy / MessageTransaction-only;
+# anything else → new format.
+#
+# Tag values are stable wire constants — never renumber, only append.
+RECEIPTED_TX_KIND_MESSAGE = 0   # MessageTransaction (legacy + post-fork)
+RECEIPTED_TX_KIND_TRANSFER = 1  # TransferTransaction (post-fork)
+RECEIPTED_TX_KIND_REACT = 2     # ReactTransaction (post-fork)
+
+# Wire-format version for the polymorphic layout.  0x00 is reserved
+# for the legacy MessageTransaction-only layout (its leading byte is
+# always 0x00 because that's the high byte of the receipt-len u32 and
+# receipts are never that large).
+_POLY_WIRE_VERSION = 0x01
+
+
+def _detect_kind(receipted_tx) -> int:
+    """Return the wire-format kind tag for a receipted tx instance."""
+    # Lazy imports to avoid circular-dependency landmines: the transfer
+    # and reaction modules pull config + transaction internals that
+    # should not touch the censorship-evidence module at import time.
+    from messagechain.core.transfer import TransferTransaction
+    from messagechain.core.reaction import ReactTransaction
+    if isinstance(receipted_tx, MessageTransaction):
+        return RECEIPTED_TX_KIND_MESSAGE
+    if isinstance(receipted_tx, TransferTransaction):
+        return RECEIPTED_TX_KIND_TRANSFER
+    if isinstance(receipted_tx, ReactTransaction):
+        return RECEIPTED_TX_KIND_REACT
+    raise ValueError(
+        f"Unsupported receipted_tx type: {type(receipted_tx).__name__} — "
+        "CensorshipEvidenceTx accepts MessageTransaction, "
+        "TransferTransaction, or ReactTransaction"
+    )
+
+
+def _kind_to_class(kind: int):
+    """Map a wire-format kind tag back to its tx class."""
+    from messagechain.core.transfer import TransferTransaction
+    from messagechain.core.reaction import ReactTransaction
+    if kind == RECEIPTED_TX_KIND_MESSAGE:
+        return MessageTransaction
+    if kind == RECEIPTED_TX_KIND_TRANSFER:
+        return TransferTransaction
+    if kind == RECEIPTED_TX_KIND_REACT:
+        return ReactTransaction
+    raise ValueError(
+        f"Unknown receipted_tx kind tag: {kind} — must be one of "
+        f"{{0=Message, 1=Transfer, 2=React}}"
+    )
+
+
+def _kind_str(kind: int) -> str:
+    """Stable JSON-friendly tag for serialize() / deserialize()."""
+    return {
+        RECEIPTED_TX_KIND_MESSAGE: "message",
+        RECEIPTED_TX_KIND_TRANSFER: "transfer",
+        RECEIPTED_TX_KIND_REACT: "react",
+    }[kind]
+
+
+def _str_to_kind(name: str) -> int:
+    """Inverse of `_kind_str` for deserialize()."""
+    return {
+        "message": RECEIPTED_TX_KIND_MESSAGE,
+        "transfer": RECEIPTED_TX_KIND_TRANSFER,
+        "react": RECEIPTED_TX_KIND_REACT,
+    }[name]
+
+
+def receipted_tx_entity_id(receipted_tx) -> bytes:
+    """Return the 32-byte signer/owner id of a receipted tx, regardless
+    of kind.  Message and Transfer use `entity_id`; React uses
+    `voter_id`.  This is the canonical accessor for any code path that
+    needs to reason about the receipted tx's signer (nonce / pubkey
+    lookup, fee debit, etc.) without dispatching on type.
+    """
+    voter = getattr(receipted_tx, "voter_id", None)
+    if voter is not None:
+        return voter
+    return receipted_tx.entity_id
+
+
 @dataclass
 class CensorshipEvidenceTx:
     """Tx type that submits a receipt + the censored tx as evidence.
 
-    The `message_tx` field carries the RECEIPTED tx.  Including the
+    The `receipted_tx` field carries the RECEIPTED tx.  Including the
     full tx (not just its hash) is what lets observe_block void the
     evidence when any peer lands the tx on-chain: every node can
     compare the tx_hash of a freshly-applied block tx against the
     pending-evidence map.
+
+    Polymorphic kind dispatch (Tier 44):
+      * Pre-fork the receipted_tx is always a MessageTransaction
+        (legacy wire format).
+      * Post-fork the receipted_tx may be a MessageTransaction,
+        TransferTransaction, or ReactTransaction — every tx kind that
+        `submit_transaction_to_mempool` issues a SubmissionReceipt
+        for.  The wire format carries a 1-byte kind tag immediately
+        before the receipted-tx blob; the decoder dispatches on that
+        tag to the correct `*Transaction.from_bytes`.
+
+    `message_tx` is preserved as a backward-compatibility alias for
+    `receipted_tx` so existing call sites that read
+    `etx.message_tx.tx_hash` keep working unchanged.
 
     Any registered entity can submit.  Submission fee = MIN_FEE
     (small, flat, non-scaling) — just high enough to make bulk
@@ -80,17 +185,41 @@ class CensorshipEvidenceTx:
     """
     receipt: SubmissionReceipt
     # The receipted tx.  Including it here lets every node know which
-    # tx needs to appear on-chain for this evidence to void.
-    message_tx: MessageTransaction
-    submitter_id: bytes
-    timestamp: int  # integer seconds (consensus hashing)
-    fee: int
-    signature: Signature
+    # tx needs to appear on-chain for this evidence to void.  May be
+    # any of MessageTransaction / TransferTransaction / ReactTransaction
+    # post-fork; pre-fork callers always pass MessageTransaction.
+    # Field name kept as `message_tx` for backward compatibility with
+    # the long tail of call sites that read `etx.message_tx`; see the
+    # `receipted_tx` property below for the new canonical name.
+    message_tx: object = None
+    submitter_id: bytes = b""
+    timestamp: int = 0  # integer seconds (consensus hashing)
+    fee: int = 0
+    signature: Signature = None
     tx_hash: bytes = b""
 
     def __post_init__(self):
         if not self.tx_hash:
             self.tx_hash = self._compute_hash()
+
+    @property
+    def receipted_tx(self):
+        """Canonical accessor for the embedded receipted tx (any kind).
+
+        `message_tx` is kept as an alias for the long tail of code
+        that grew up around the MessageTransaction-only field name.
+        New code should prefer `receipted_tx`.
+        """
+        return self.message_tx
+
+    @receipted_tx.setter
+    def receipted_tx(self, value):
+        self.message_tx = value
+
+    @property
+    def receipted_tx_kind(self) -> int:
+        """Wire-format kind tag for the embedded tx (Tier 44+)."""
+        return _detect_kind(self.message_tx)
 
     @property
     def offender_id(self) -> bytes:
@@ -122,6 +251,12 @@ class CensorshipEvidenceTx:
         return {self.submitter_id}
 
     def _signable_data(self) -> bytes:
+        # Note: signable bytes commit only to the receipted-tx HASH,
+        # not the kind tag.  The hash is independent of tx kind, and
+        # the receipt itself binds tx_hash via `receipt.tx_hash`.
+        # This keeps pre-fork tx_hashes byte-identical post-fork —
+        # an evidence built before activation still hashes the same
+        # way, and replay across the fork boundary is deterministic.
         sig_version = getattr(self.signature, "sig_version", SIG_VERSION_CURRENT)
         return b"".join([
             CHAIN_ID,
@@ -138,7 +273,12 @@ class CensorshipEvidenceTx:
         return _h(self._signable_data())
 
     def serialize(self) -> dict:
-        return {
+        # `tx_kind` is included whenever the receipted_tx is NOT a
+        # MessageTransaction (i.e., post-fork transfer/react).  When
+        # absent on decode, we default to "message" — preserves
+        # byte-identical JSON for legacy MessageTransaction evidences.
+        kind = _detect_kind(self.message_tx)
+        d = {
             "type": "censorship_evidence",
             "receipt": self.receipt.serialize(),
             "message_tx": self.message_tx.serialize(),
@@ -148,8 +288,52 @@ class CensorshipEvidenceTx:
             "signature": self.signature.serialize(),
             "tx_hash": self.tx_hash.hex(),
         }
+        if kind != RECEIPTED_TX_KIND_MESSAGE:
+            d["tx_kind"] = _kind_str(kind)
+        return d
 
-    def to_bytes(self, state=None) -> bytes:
+    def to_bytes(self, state=None, chain_height: int | None = None) -> bytes:
+        """Encode to wire format.
+
+        `chain_height` selects pre/post-fork layout:
+          * `None` or `< CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT`
+            → legacy MessageTransaction-only layout (byte-identical
+            to pre-Tier-44 encoder).  Raises if `receipted_tx` is not
+            a MessageTransaction — pre-fork the wire format physically
+            cannot represent transfer/react.
+          * `>=` activation → polymorphic layout with leading version
+            byte (0x01) + kind tag (0=Message, 1=Transfer, 2=React).
+
+        The legacy layout starts with `[u32 receipt_len]` whose high
+        byte is always 0x00 (receipts << 16 MB), so the post-fork
+        layout's leading `0x01` byte unambiguously distinguishes the
+        two without a heuristic.  Decoder dispatches on that byte.
+        """
+        kind = _detect_kind(self.message_tx)
+        post_fork = (
+            chain_height is not None
+            and chain_height >= CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT
+        )
+        if not post_fork:
+            # Pre-fork: legacy layout.  Raise on any non-Message
+            # receipted_tx — the wire format cannot represent it and
+            # silently down-converting would produce a hash mismatch
+            # the receiver couldn't diagnose.
+            if kind != RECEIPTED_TX_KIND_MESSAGE:
+                raise ValueError(
+                    "Pre-fork CensorshipEvidenceTx wire format only "
+                    "supports MessageTransaction; transfer/react "
+                    "evidences require chain_height >= "
+                    "CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT "
+                    f"(={CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT})"
+                )
+            return self._to_bytes_legacy(state=state)
+        return self._to_bytes_poly(state=state, kind=kind)
+
+    def _to_bytes_legacy(self, state=None) -> bytes:
+        """Legacy MessageTransaction-only wire format.  Byte-identical
+        to the pre-Tier-44 encoder so historical blocks replay exactly.
+        """
         r_blob = self.receipt.to_bytes()
         # MessageTransaction encodes with an optional `state` for the
         # varint-index form.  Pass through for on-chain embedding.
@@ -171,8 +355,68 @@ class CensorshipEvidenceTx:
             self.tx_hash,
         ])
 
+    def _to_bytes_poly(self, state=None, kind: int = RECEIPTED_TX_KIND_MESSAGE) -> bytes:
+        """Polymorphic post-fork wire format.
+
+        Layout (big-endian):
+            u8   wire_version  (0x01 = poly v1)
+            u8   kind          (0=Message, 1=Transfer, 2=React)
+            u32  receipt_len + receipt_blob
+            u32  rtx_len + rtx_blob
+            32   submitter_id
+            u64  timestamp
+            u64  fee
+            u32  sig_len + sig_blob
+            32   tx_hash
+
+        The leading `0x01` byte is what makes the new format
+        distinguishable from the legacy one (whose leading byte —
+        the high byte of receipt_len u32 — is always 0x00).
+        """
+        r_blob = self.receipt.to_bytes()
+        try:
+            rtx_blob = self.message_tx.to_bytes(state=state)
+        except TypeError:
+            rtx_blob = self.message_tx.to_bytes()
+        sig_blob = self.signature.to_bytes()
+        return b"".join([
+            struct.pack(">B", _POLY_WIRE_VERSION),
+            struct.pack(">B", kind),
+            struct.pack(">I", len(r_blob)),
+            r_blob,
+            struct.pack(">I", len(rtx_blob)),
+            rtx_blob,
+            self.submitter_id,
+            struct.pack(">Q", int(self.timestamp)),
+            struct.pack(">Q", int(self.fee)),
+            struct.pack(">I", len(sig_blob)),
+            sig_blob,
+            self.tx_hash,
+        ])
+
     @classmethod
     def from_bytes(cls, data: bytes, state=None) -> "CensorshipEvidenceTx":
+        """Decode either the legacy or the polymorphic wire format.
+
+        Dispatch is by leading byte:
+          * 0x00 → legacy / MessageTransaction-only
+          * 0x01 → poly v1 (Tier 44+) with explicit kind tag
+          * other → unknown wire-format version, reject
+        """
+        if len(data) < 1:
+            raise ValueError("CensorshipEvidenceTx blob too short")
+        leading = data[0]
+        if leading == 0x00:
+            return cls._from_bytes_legacy(data, state=state)
+        if leading == _POLY_WIRE_VERSION:
+            return cls._from_bytes_poly(data, state=state)
+        raise ValueError(
+            f"CensorshipEvidenceTx: unknown wire-format version "
+            f"0x{leading:02x}"
+        )
+
+    @classmethod
+    def _from_bytes_legacy(cls, data: bytes, state=None) -> "CensorshipEvidenceTx":
         off = 0
         if len(data) < 4 + 4 + 32 + 8 + 8 + 4 + 32:
             raise ValueError("CensorshipEvidenceTx blob too short")
@@ -218,10 +462,72 @@ class CensorshipEvidenceTx:
         return tx
 
     @classmethod
+    def _from_bytes_poly(cls, data: bytes, state=None) -> "CensorshipEvidenceTx":
+        off = 0
+        # 1 (ver) + 1 (kind) + 4 (r_len) + 4 (rtx_len) + 32 (submitter)
+        # + 8 (ts) + 8 (fee) + 4 (sig_len) + 32 (tx_hash) = 94 minimum
+        if len(data) < 1 + 1 + 4 + 4 + 32 + 8 + 8 + 4 + 32:
+            raise ValueError("CensorshipEvidenceTx (poly) blob too short")
+        wire_ver = struct.unpack_from(">B", data, off)[0]; off += 1
+        if wire_ver != _POLY_WIRE_VERSION:
+            raise ValueError(
+                f"CensorshipEvidenceTx (poly): unsupported wire "
+                f"version {wire_ver}"
+            )
+        kind = struct.unpack_from(">B", data, off)[0]; off += 1
+        rtx_class = _kind_to_class(kind)
+        r_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + r_len > len(data):
+            raise ValueError("CensorshipEvidenceTx (poly) truncated at receipt")
+        receipt = SubmissionReceipt.from_bytes(bytes(data[off:off + r_len]))
+        off += r_len
+        rtx_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + rtx_len > len(data):
+            raise ValueError("CensorshipEvidenceTx (poly) truncated at receipted_tx")
+        rtx_blob = bytes(data[off:off + rtx_len])
+        try:
+            receipted = rtx_class.from_bytes(rtx_blob, state=state)
+        except TypeError:
+            receipted = rtx_class.from_bytes(rtx_blob)
+        off += rtx_len
+        submitter_id = bytes(data[off:off + 32]); off += 32
+        timestamp = struct.unpack_from(">Q", data, off)[0]; off += 8
+        fee = struct.unpack_from(">Q", data, off)[0]; off += 8
+        sig_len = struct.unpack_from(">I", data, off)[0]; off += 4
+        if off + sig_len + 32 > len(data):
+            raise ValueError("CensorshipEvidenceTx (poly) truncated at sig/hash")
+        sig = Signature.from_bytes(bytes(data[off:off + sig_len]))
+        off += sig_len
+        declared = bytes(data[off:off + 32]); off += 32
+        if off != len(data):
+            raise ValueError("CensorshipEvidenceTx (poly) has trailing bytes")
+        tx = cls(
+            receipt=receipt, message_tx=receipted,
+            submitter_id=submitter_id, timestamp=timestamp, fee=fee,
+            signature=sig,
+        )
+        expected = tx._compute_hash()
+        if expected != declared:
+            raise ValueError(
+                f"CensorshipEvidenceTx (poly) hash mismatch: declared "
+                f"{declared.hex()[:16]}, computed {expected.hex()[:16]}"
+            )
+        return tx
+
+    @classmethod
     def deserialize(cls, data: dict) -> "CensorshipEvidenceTx":
+        """Decode from JSON-friendly dict form.
+
+        `tx_kind` defaults to "message" when absent so legacy JSON
+        (no `tx_kind` key) round-trips byte-identically.  Post-fork
+        callers serializing transfer/react evidences emit `tx_kind`.
+        """
+        kind = _str_to_kind(data.get("tx_kind", "message"))
+        rtx_class = _kind_to_class(kind)
+        receipted = rtx_class.deserialize(data["message_tx"])
         tx = cls(
             receipt=SubmissionReceipt.deserialize(data["receipt"]),
-            message_tx=MessageTransaction.deserialize(data["message_tx"]),
+            message_tx=receipted,
             submitter_id=bytes.fromhex(data["submitter_id"]),
             timestamp=int(data["timestamp"]),
             fee=int(data["fee"]),
@@ -423,13 +729,30 @@ class CensorshipEvidenceProcessor:
         Voiding also records the evidence_hash in `processed` so a
         future submission of the SAME evidence is rejected — once an
         evidence has been "spent" (voided), it cannot be reused.
+
+        Walks every receipted-kind tx slot in the block (Message,
+        Transfer, React) so a tx that was actually included as a
+        Transfer or React still voids the matching pending evidence.
+        Pre-Tier-44 only MessageTransaction-targeting evidence could
+        be admitted (the legacy wire format physically prevented
+        transfer/react), so the pre-fork chain only ever populated
+        `block.transactions`-keyed pending entries; the wider walk
+        is a strict superset of the pre-fork behavior and is
+        consensus-safe at every height.
         """
         if not self.pending:
             return []
-        # Collect tx_hashes in this block.  Block.transactions is the
-        # only list CensorshipEvidenceTx's message_tx can target (we
-        # only receipt MessageTransactions).
-        seen_tx_hashes = {tx.tx_hash for tx in block.transactions}
+        # Collect tx_hashes from every receipted-kind slot.  Tier 44
+        # lets pending entries target Transfer / React too; including
+        # all three slots in the void walk is what closes the void-on-
+        # include path for those kinds.  Slots are read defensively
+        # (`getattr ... or ()`) so test fixtures / mock blocks that
+        # only populate `transactions` continue to work.
+        seen_tx_hashes: set[bytes] = set()
+        for slot in ("transactions", "transfer_transactions",
+                     "react_transactions"):
+            for tx in getattr(block, slot, None) or ():
+                seen_tx_hashes.add(tx.tx_hash)
         voided: list[bytes] = []
         for ev_hash, pending in list(self.pending.items()):
             if pending.tx_hash in seen_tx_hashes:
