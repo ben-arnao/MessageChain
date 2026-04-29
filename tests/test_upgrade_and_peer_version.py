@@ -511,6 +511,69 @@ class TestUpgradeRollback(unittest.TestCase):
         self.assertLess(clone_idx, verify_idx,
                         f"verify must follow git clone; got {events}")
 
+    def test_smoke_test_sudo_strips_group_from_service_user(self):
+        """`--service-user` carries a user:group spec for chown, but
+        `sudo -u` only accepts a user.  The smoke-test invocation MUST
+        strip the group portion before passing it to sudo, otherwise
+        the upgrade aborts with ``sudo: unknown user user:group``
+        before the stop/install/restart sequence even starts.
+
+        Regression: 1.39.0's first rollout hit this — the smoke test
+        passed ``messagechain:messagechain`` verbatim to ``sudo -u``,
+        which sudo parses as a literal username and rejects.
+        """
+        from messagechain import cli as cli_mod
+
+        args = _make_args(
+            tag="v99.99.99-mainnet",
+            skip_migrate=True,
+            service_user="messagechain:messagechain",
+        )
+
+        sudo_calls: list[list[str]] = []
+
+        def fake_run(cmd, *a, **kw):
+            if isinstance(cmd, list) and cmd and cmd[0] == "sudo":
+                sudo_calls.append(list(cmd))
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = "cold-load OK: blocks=0"
+            result.stderr = ""
+            return result
+
+        with patch("shutil.which", return_value="/usr/bin/anything"), \
+             patch.object(os, "geteuid", return_value=0, create=True), \
+             patch("subprocess.run", side_effect=fake_run), \
+             patch("shutil.rmtree"), \
+             patch("shutil.move"), \
+             patch("shutil.copytree"), \
+             patch("os.path.exists", return_value=True), \
+             patch.object(cli_mod, "_upgrade_verify_tag_signature"), \
+             patch.object(cli_mod, "_upgrade_health_check", return_value=True):
+            cli_mod.cmd_upgrade(args)
+
+        smoke_invocations = [
+            c for c in sudo_calls
+            if "-u" in c and "python3" in c
+        ]
+        self.assertTrue(
+            smoke_invocations,
+            f"expected at least one `sudo -u ... python3 ...` invocation; "
+            f"got {sudo_calls}",
+        )
+        for call in smoke_invocations:
+            u_index = call.index("-u")
+            sudo_user = call[u_index + 1]
+            self.assertEqual(
+                sudo_user, "messagechain",
+                f"sudo -u must receive bare user, not user:group; "
+                f"got {sudo_user!r} in {call}",
+            )
+            self.assertNotIn(
+                ":", sudo_user,
+                f"sudo -u must not contain ':' separator; got {sudo_user!r}",
+            )
+
     def test_no_rollback_flag_leaves_new_code_in_place(self):
         """With --no-rollback, a failed health check must NOT move the
         backup back — operator recovers by hand using the printed

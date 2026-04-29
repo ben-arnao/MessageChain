@@ -4,6 +4,27 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.39.1] — 2026-04-29
+
+Hotfix on top of 1.39.0.  The cold-load smoke test introduced in
+1.38.2 passed `--service-user`'s default value
+(`messagechain:messagechain`, a user:group spec for chown) verbatim
+to `sudo -u`, which only accepts a bare user.  Every upgrade
+attempt aborted at the smoke-test step with
+`sudo: unknown user messagechain:messagechain` before the running
+service was ever touched — net-correct from a downtime perspective
+(service stays up, the abort is the smoke test doing its job),
+but blocks every new release rollout until fixed.
+
+### Fixed
+
+- **`messagechain upgrade` strips the group portion from
+  `--service-user` before invoking `sudo -u`** for the cold-load
+  smoke test.  `chown` still receives the full `user:group` form
+  (correct).  Adds a structural regression test asserting that
+  the `sudo -u` slot in the smoke-test invocation never contains
+  a `:` separator.
+
 ## [1.39.0] — 2026-04-28
 
 Tier 41 hard fork closes the last known honest-acker mis-slash gap

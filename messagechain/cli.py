@@ -6586,10 +6586,13 @@ def cmd_upgrade(args):
         "n = len(bc.chain) if hasattr(bc, 'chain') else 0; "
         "print('cold-load OK: blocks=' + str(n))"
     )
+    # `--service-user` carries a user:group spec for chown, but `sudo -u`
+    # only accepts a user.  Strip the group portion before invoking sudo.
+    smoke_user = args.service_user.split(":", 1)[0]
     try:
         smoke = subprocess.run(
             [
-                "sudo", "-n", "-u", args.service_user,
+                "sudo", "-n", "-u", smoke_user,
                 "python3", "-c", smoke_code,
                 clone_dir, args.data_dir,
             ],
