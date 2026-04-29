@@ -5,15 +5,17 @@ Audit (2026-04-27): the just-shipped 1.28.4 fix made the RPC
 attacker over RPC carrying `request_receipt: True` burns one WOTS+
 leaf per submission from the validator's RECEIPT_SUBTREE (65,536
 leaves at height 16).  The HTTPS surface already defends this
-vector via `_HandlerContext.rejection_budget_check(ip)` — RPC must
+vector via `_HandlerContext.receipt_budget_check(ip)` — RPC must
 mirror the same budget, sharing the same buckets so an attacker
 cannot drain twice by splitting traffic across HTTPS+RPC.
 
-Fix: thread `client_ip` from `_process_rpc` into
-`_rpc_submit_transaction`; consult the shared rejection-budget
-bucket when `request_receipt=True`; on exhaustion, drop the
-issuer to None and proceed (submission still processes; the
-attacker just doesn't get a receipt and no leaf burns).
+Audit (2026-04-29 / #1): the RPC success-path receipt gate consults
+the dedicated `_receipt_buckets` (success-path receipt issuance)
+NOT the `_rejection_buckets` (SignedRejection issuance).  Earlier
+revs of this file targeted the rejection bucket because the RPC
+code wrongly called `rejection_budget_check`; the bucket-correct-
+ness regression test lives in
+`tests/test_rpc_receipt_budget_correct_bucket.py`.
 
 These tests pin:
   * fresh-IP within-budget submits return a receipt;
@@ -33,7 +35,7 @@ import messagechain.config as _config_mod
 import messagechain.core.mempool as _mempool_mod
 from tests import register_entity_for_test
 from messagechain.config import (
-    SUBMISSION_REJECTION_BURST,
+    SUBMISSION_RECEIPT_BURST,
 )
 from messagechain.core.blockchain import Blockchain
 from messagechain.core.mempool import Mempool
@@ -181,7 +183,7 @@ class TestRpcReceiptBudgetWithinLimit(_BudgetTestBase):
 
 
 class TestRpcReceiptBudgetSilentDowngrade(_BudgetTestBase):
-    """When the per-IP rejection-budget bucket is exhausted, the
+    """When the per-IP receipt-budget bucket is exhausted, the
     submission MUST still process but NO receipt is issued and NO
     leaf is consumed.  Mirrors the HTTPS silent-downgrade semantics."""
 
@@ -189,14 +191,14 @@ class TestRpcReceiptBudgetSilentDowngrade(_BudgetTestBase):
         srv, alice = _make_server_with_chain(b"r-budget-over".ljust(32, b"\x00"))
         ip = "10.0.0.2"
 
-        # Burn through the burst.  SUBMISSION_REJECTION_BURST tokens
+        # Burn through the burst.  SUBMISSION_RECEIPT_BURST tokens
         # available; we send N+2 submissions to make sure we cross
         # the depleted threshold.  All from alice (genesis-funded);
         # the test mempool was constructed with a roomy per-sender
         # cap so this doesn't bounce on a separate defense.
         receipt_count = 0
         nonce = 0
-        for i in range(SUBMISSION_REJECTION_BURST + 2):
+        for i in range(SUBMISSION_RECEIPT_BURST + 2):
             tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
             nonce += 1
             resp = srv._rpc_submit_transaction(
@@ -207,14 +209,14 @@ class TestRpcReceiptBudgetSilentDowngrade(_BudgetTestBase):
             if resp["result"].get("receipt"):
                 receipt_count += 1
 
-        # The first ≤ SUBMISSION_REJECTION_BURST submits issued a
+        # The first ≤ SUBMISSION_RECEIPT_BURST submits issued a
         # receipt; the rest fell through to the silent-downgrade path.
         # Allow +1 slack for the bucket's fractional refill across the
         # test's wall time.
-        self.assertLessEqual(receipt_count, SUBMISSION_REJECTION_BURST + 1)
+        self.assertLessEqual(receipt_count, SUBMISSION_RECEIPT_BURST + 1)
         # And we definitely saw at least one budget-drop (last submit
         # in the loop must have hit the empty bucket).
-        self.assertLess(receipt_count, SUBMISSION_REJECTION_BURST + 2)
+        self.assertLess(receipt_count, SUBMISSION_RECEIPT_BURST + 2)
 
         # Final probe: one more from the SAME IP returns no receipt.
         tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
@@ -240,7 +242,7 @@ class TestRpcAttackerCannotDrainReceiptSubtree(_BudgetTestBase):
 
         # Spam N=15 receipted submits from one IP.  Pre-fix this
         # consumed 15 leaves.  Post-fix, only the first
-        # SUBMISSION_REJECTION_BURST consume leaves; the rest are
+        # SUBMISSION_RECEIPT_BURST consume leaves; the rest are
         # budget-dropped (issuer=None, no leaf consumption).
         n_spam = 15
         for nonce in range(n_spam):
@@ -255,7 +257,7 @@ class TestRpcAttackerCannotDrainReceiptSubtree(_BudgetTestBase):
         leaves_consumed = leaves_after - leaves_before
 
         # Strict cap: leaves consumed cannot exceed
-        # SUBMISSION_REJECTION_BURST + a small slack (the bucket may
+        # SUBMISSION_RECEIPT_BURST + a small slack (the bucket may
         # refill ~0.05/sec * test wall time).  Definitely fewer than
         # the n_spam attempts.
         self.assertLess(
@@ -264,15 +266,15 @@ class TestRpcAttackerCannotDrainReceiptSubtree(_BudgetTestBase):
             f"spam submits — budget gate is not effective",
         )
         self.assertLessEqual(
-            leaves_consumed, SUBMISSION_REJECTION_BURST + 1,
+            leaves_consumed, SUBMISSION_RECEIPT_BURST + 1,
             f"leaves consumed ({leaves_consumed}) exceeds "
-            f"rejection-burst ceiling ({SUBMISSION_REJECTION_BURST})",
+            f"receipt-burst ceiling ({SUBMISSION_RECEIPT_BURST})",
         )
 
 
 class TestHttpsAndRpcShareBudgetBuckets(_BudgetTestBase):
     """The HTTPS `_HandlerContext` and the RPC `Server` MUST consult
-    the SAME per-IP rejection-budget buckets — otherwise an attacker
+    the SAME per-IP receipt-budget buckets — otherwise an attacker
     can split traffic across both surfaces and drain twice.  The
     invariant: alternating HTTPS-style budget consumption with RPC
     submission decrements one shared counter."""
@@ -298,9 +300,14 @@ class TestHttpsAndRpcShareBudgetBuckets(_BudgetTestBase):
             budget_tracker=srv.receipt_budget_tracker,
         )
 
-        # Drain the bucket from the HTTPS side.
-        for _ in range(SUBMISSION_REJECTION_BURST):
-            ctx.rejection_budget_check(ip)
+        # Drain the bucket from the HTTPS side.  HTTPS success-path
+        # receipt issuance consults `receipt_budget_check`; the RPC
+        # success path now does the same (audit 2026-04-29 / #1), so
+        # both surfaces share `_receipt_buckets`.  Pre-fix the RPC
+        # path consulted `_rejection_buckets` instead, defeating
+        # cross-surface drain defense.
+        for _ in range(SUBMISSION_RECEIPT_BURST):
+            ctx.receipt_budget_check(ip)
 
         # The same bucket should now be empty when consulted from the
         # RPC side.  Probe by attempting one receipted RPC submit and
@@ -339,14 +346,20 @@ class TestRequestReceiptFalseUnchanged(_BudgetTestBase):
             self.assertTrue(resp["ok"], resp)
             self.assertNotIn("receipt", resp["result"])
 
-        # The bucket for this IP must still be at full burst — we did
-        # not touch it.  Probe by reading the tracker directly.
+        # Neither the receipt nor the rejection bucket for this IP
+        # may have been touched — we never set `request_receipt`, so
+        # the gate was never consulted.  Probe by reading the tracker
+        # directly.
         tracker = srv.receipt_budget_tracker
-        bucket = tracker._rejection_buckets.get(ip)
         self.assertIsNone(
-            bucket,
+            tracker._receipt_buckets.get(ip),
             "request_receipt=False traffic must NOT create or consume "
-            "a rejection-budget bucket — bucket should be absent.",
+            "a receipt-budget bucket — bucket should be absent.",
+        )
+        self.assertIsNone(
+            tracker._rejection_buckets.get(ip),
+            "request_receipt=False traffic must NOT create or consume "
+            "a rejection-budget bucket either.",
         )
 
 
@@ -363,7 +376,7 @@ class TestWarningLogOnBudgetExhaustion(_BudgetTestBase):
         # Exhaust budget first — alice with sequential nonces, the
         # roomy mempool per-sender cap from the test helper allows
         # >5 pending pre-confirmation submits.
-        for nonce in range(SUBMISSION_REJECTION_BURST):
+        for nonce in range(SUBMISSION_RECEIPT_BURST):
             tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
             srv._rpc_submit_transaction(
                 {"transaction": tx_blob, "request_receipt": True},
@@ -375,7 +388,7 @@ class TestWarningLogOnBudgetExhaustion(_BudgetTestBase):
         # `logger = logging.getLogger("messagechain.server")`).
         with self.assertLogs("messagechain.server", level="WARNING") as cm:
             tx_blob = _new_signed_tx(
-                alice, srv.blockchain, nonce=SUBMISSION_REJECTION_BURST,
+                alice, srv.blockchain, nonce=SUBMISSION_RECEIPT_BURST,
             )
             resp = srv._rpc_submit_transaction(
                 {"transaction": tx_blob, "request_receipt": True},
@@ -404,7 +417,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
 
     A single shared bucket per IP guards all three surfaces: even an
     attacker alternating between message + transfer + react submits
-    can't get more than SUBMISSION_REJECTION_BURST receipts before
+    can't get more than SUBMISSION_RECEIPT_BURST receipts before
     the silent-downgrade kicks in.
     """
 
@@ -416,7 +429,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
         ip = "10.0.0.7"
 
         # Exhaust budget via the MESSAGE surface.
-        for nonce in range(SUBMISSION_REJECTION_BURST):
+        for nonce in range(SUBMISSION_RECEIPT_BURST):
             tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
             resp = srv._rpc_submit_transaction(
                 {"transaction": tx_blob, "request_receipt": True},
@@ -437,7 +450,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
             recipient_id=bob.entity_id,
             amount=100,
             fee=10_000,
-            nonce=SUBMISSION_REJECTION_BURST,
+            nonce=SUBMISSION_RECEIPT_BURST,
         )
         resp = srv._rpc_submit_transfer(
             {"transaction": transfer.serialize(), "request_receipt": True},
@@ -472,7 +485,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
             ip = "10.0.0.8"
 
             # Exhaust budget via MESSAGE.
-            for nonce in range(SUBMISSION_REJECTION_BURST):
+            for nonce in range(SUBMISSION_RECEIPT_BURST):
                 tx_blob = _new_signed_tx(alice, srv.blockchain, nonce=nonce)
                 resp = srv._rpc_submit_transaction(
                     {"transaction": tx_blob, "request_receipt": True},
@@ -487,7 +500,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
                 target_is_user=True,
                 choice=REACT_CHOICE_UP,
                 fee=10_000,
-                nonce=SUBMISSION_REJECTION_BURST,
+                nonce=SUBMISSION_RECEIPT_BURST,
             )
             resp = srv._rpc_submit_react(
                 {"transaction": react.serialize(), "request_receipt": True},
