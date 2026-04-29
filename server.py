@@ -1806,6 +1806,14 @@ class Server(SharedRuntimeMixin):
         elif method == "submit_vote":
             return self._rpc_submit_vote(request["params"])
 
+        elif method == "submit_censorship_evidence":
+            # WOTS+ verification + receipt-signature verification under
+            # validate_censorship_evidence_tx is CPU-bound; isolate from
+            # the event loop the same way submit_transaction does.
+            return await asyncio.to_thread(
+                self._rpc_submit_censorship_evidence, request["params"],
+            )
+
         elif method == "get_messages":
             raw = request.get("params", {}).get("count", 10)
             # Coerce + clamp: a bare `min(count, 100)` neither rejected
@@ -2884,6 +2892,83 @@ class Server(SharedRuntimeMixin):
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
+    def _rpc_submit_censorship_evidence(self, params: dict) -> dict:
+        """Accept a signed CensorshipEvidenceTx from a client.
+
+        Wires the user-side path to the slashing pipeline: a wallet
+        holding a SubmissionReceipt for a tx the validator never
+        included can now construct, sign, and submit a
+        CensorshipEvidenceTx via this RPC.  Without this surface,
+        every Tier 30-35 hardening of the slashing apply paths ships
+        a back end whose CLI entry point (`messagechain submit-evidence`)
+        was a print-only stub -- the end-to-end remedy the README
+        and COMPARISON.md promise was theatre.
+
+        Validates the tx via the same `validate_censorship_evidence_tx`
+        gate the apply path uses, then admits to the mempool's
+        censorship-evidence pool.  The proposer-side drain in
+        `_try_produce_block_sync` carries it into the next block
+        proposed by this node; gossiped peers see the same tx via
+        the P2P pending-tx relay.
+
+        Mutation discipline mirrors `_rpc_submit_proposal` /
+        `_rpc_submit_vote`: NEVER mutates chain state directly --
+        admission lands in the mempool only, and apply-time slashing
+        runs through the standard block-application path so every
+        node reaches the same outcome.
+        """
+        try:
+            from messagechain.consensus.censorship_evidence import (
+                CensorshipEvidenceTx,
+            )
+            tx = CensorshipEvidenceTx.deserialize(params["transaction"])
+
+            # Run the live admission gate -- mirrors apply-time so a
+            # client gets the same answer mempool admission gives,
+            # without waiting for a block to land.
+            ok, reason = self.blockchain.validate_censorship_evidence_tx(
+                tx, chain_height=self.blockchain.height + 1,
+            )
+            if not ok:
+                return {"ok": False, "error": reason}
+
+            # Check WOTS+ leaf reuse across all pools (consistent with
+            # other tx types that consume hot-key leaves).
+            if not self._check_leaf_across_all_pools(tx):
+                return {
+                    "ok": False,
+                    "error": (
+                        "WOTS+ leaf already used by another pending tx — "
+                        "leaf reuse rejected"
+                    ),
+                }
+
+            # Admit to the mempool's evidence pool (already shipped in
+            # 1.x; previously only writeable from in-process tests).
+            if not self.mempool.add_censorship_evidence_tx(tx):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Censorship-evidence pool rejected tx "
+                        "(duplicate, full, or under-fee)"
+                    ),
+                }
+
+            return {"ok": True, "result": {
+                "tx_hash": tx.tx_hash.hex(),
+                "evidence_hash": tx.evidence_hash.hex(),
+                "offender_id": tx.offender_id.hex(),
+                "fee": tx.fee,
+                "status": (
+                    "pending — will be included in next block; slash "
+                    "matures after EVIDENCE_MATURITY_BLOCKS unless "
+                    "the receipted tx lands in the meantime (which "
+                    "voids the evidence with no slash)"
+                ),
+            }}
+        except Exception as e:
+            return {"ok": False, "error": sanitize_error(str(e))}
+
     def _rpc_estimate_fee(self, params: dict) -> dict:
         """Price a prospective tx of any kind without submitting.
 
@@ -3770,6 +3855,17 @@ class Server(SharedRuntimeMixin):
         pending_gov = getattr(self, "_pending_governance_txs", {})
         governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
 
+        # Drain the censorship-evidence pool so user-submitted slashing
+        # claims actually land in blocks.  Without this drain, every
+        # `messagechain submit-evidence` invocation would admit to the
+        # mempool and then sit unmineable, defeating the entire user-
+        # side path to the slashing pipeline (the threat model anchor
+        # for validator collusion in CLAUDE.md).  Cap matches the other
+        # auxiliary tx pools.
+        ce_txs = self.mempool.get_censorship_evidence_txs(
+            max_count=MAX_TXS_PER_BLOCK,
+        )
+
         # Serialize block sign with reserve_leaf RPC via the same lock
         # — see _rpc_reserve_leaf / self._wallet_leaf_lock for the full
         # rationale.  Without this, an operator CLI running on the same
@@ -3784,6 +3880,7 @@ class Server(SharedRuntimeMixin):
                 unstake_transactions=unstake_txs,
                 governance_txs=governance_txs,
                 react_transactions=react_txs,
+                censorship_evidence_txs=ce_txs,
             )
 
         success, reason = self.blockchain.add_block(block)
@@ -3810,6 +3907,10 @@ class Server(SharedRuntimeMixin):
             if governance_txs:
                 for gh in [g.tx_hash for g in governance_txs]:
                     pending_gov.pop(gh, None)
+            if ce_txs:
+                self.mempool.remove_censorship_evidence_txs(
+                    [e.tx_hash for e in ce_txs]
+                )
             total_fees = sum(tx.fee for tx in all_pending)
             balance = self.blockchain.supply.get_balance(self.wallet_id)
             logger.info(

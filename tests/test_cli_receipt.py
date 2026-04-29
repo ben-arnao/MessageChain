@@ -273,12 +273,19 @@ class TestReceiptInputValidation(unittest.TestCase):
 
 
 class TestSubmitEvidenceStub(unittest.TestCase):
-    """`submit-evidence` lands in CLI surface even as a stub.
+    """`submit-evidence` is wired and surfaces a real signed tx path.
 
-    The full evidence-tx-construction pipeline is large enough that the
-    receipt half ships first (per audit guidance).  But the stub MUST
-    exist in the CLI so users who follow the receipt's escalation hint
-    don't hit "Unknown command".
+    Pre-1.39 this command was a print-only stub.  As of 1.39 the
+    censorship subcommand actually constructs, signs, and submits a
+    CensorshipEvidenceTx; the bogus-rejection / non-response
+    subcommands print "not yet wired" diagnostics; and a legacy
+    `--tx <hash>` invocation prints a migration message naming the
+    new subcommand surface.
+
+    Detailed wiring is covered in
+    test_cmd_submit_evidence_wired.py; this class just pins the
+    backwards-compat surface (the legacy `--tx` form still parses
+    and the resulting handler does not crash).
     """
 
     def test_submit_evidence_command_exists(self):
@@ -289,19 +296,35 @@ class TestSubmitEvidenceStub(unittest.TestCase):
         self.assertEqual(ns.command, "submit-evidence")
         self.assertEqual(ns.tx_hash, _FAKE_TX_HASH)
 
-    def test_submit_evidence_stub_prints_actionable_message(self):
+    def test_submit_evidence_legacy_tx_form_prints_migration(self):
         from messagechain import cli as cli_mod
 
         buf = io.StringIO()
+        # The legacy form (--tx without a subcommand) is now a
+        # migration prompt, not a do-nothing stub.  Pin the
+        # plain-language migration message so a user who ran the
+        # old form sees an actionable next step.
+        args = argparse.Namespace(
+            command="submit-evidence",
+            evidence_kind=None,
+            tx_hash=_FAKE_TX_HASH,
+            receipt=None,
+            urgency="normal",
+            server="127.0.0.1:9334",
+            keyfile="/dev/null",
+            data_dir=None,
+        )
         with redirect_stdout(buf):
-            cli_mod.cmd_submit_evidence(_evidence_args(_FAKE_TX_HASH))
+            cli_mod.cmd_submit_evidence(args)
         out = buf.getvalue()
-        # The stub at least names the user action and the slashing target.
-        self.assertIn(_FAKE_TX_HASH[:16], out,
-            "stub must echo the tx hash so the user sees their input was parsed")
-        self.assertTrue(
-            "evidence" in out.lower(),
-            "stub must name what it would do",
+        # The migration message names the new surface.
+        self.assertIn(
+            "censorship --receipt", out,
+            "migration message must name the new subcommand surface",
+        )
+        self.assertIn(
+            "evidence", out.lower(),
+            "diagnostic must still name what it would do",
         )
 
 
