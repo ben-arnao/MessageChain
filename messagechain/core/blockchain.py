@@ -13523,13 +13523,24 @@ class Blockchain:
         )
 
     def get_entity_stats(self, entity_id: bytes) -> dict:
-        return {
+        # Surface the per-entity WOTS+ tree_height so operator-facing
+        # CLI commands (status, key-status, rotate-key) can compute
+        # leaf-usage % against the right denominator.  Personal wallets
+        # at h=16 and validators at h=20 coexist on the same chain, so
+        # any single global constant is wrong for at least one of them.
+        # Omitted when the entity has no recorded height yet (first-
+        # touch state); callers fall back to the wallet default.
+        result = {
             "entity_id": entity_id.hex(),
             "balance": self.supply.get_balance(entity_id),
             "staked": self.supply.get_staked(entity_id),
             "messages_posted": self.entity_message_count.get(entity_id, 0),
             "nonce": self.nonces.get(entity_id, 0),
         }
+        recorded_height = self.wots_tree_heights.get(entity_id)
+        if recorded_height is not None:
+            result["tree_height"] = int(recorded_height)
+        return result
 
     def get_recent_messages(self, count: int) -> list[dict]:
         """Get the most recent messages from the chain, newest first.
