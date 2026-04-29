@@ -392,31 +392,52 @@ def auto_fee(
 
 
 def mempool_percentile_estimate(
-    fees_by_block: Iterable[Iterable[int]],
+    fees_by_block: Iterable[Iterable[int | tuple[int, int]]],
     *,
     target_blocks: int,
     stored_size: int,
 ) -> int:
-    """Compute a percentile-of-recent-block-fees estimate.
+    """Compute a percentile-of-recent-block-densities estimate.
 
-    Mirrors `messagechain.economics.fee_estimator.FeeEstimator.estimate_fee`'s
-    percentile rungs but operates on raw fee-per-byte densities rather
-    than absolute fees, so the value scales with ``stored_size`` and
-    matches the proposer's selection axis.
+    Each per-block entry is a ``(fee, observed_stored_size)`` pair
+    (preferred, density-correct) or a bare ``int`` fee (legacy / size
+    unknown — counted at ``observed_stored_size = stored_size`` so the
+    legacy caller still sees a fee-per-byte ranking that doesn't change
+    its bid).  The percentile is computed in fee-per-byte across the
+    observed densities, then multiplied by the *quoting* ``stored_size``
+    so the bid scales linearly with the user's tx size — matching the
+    proposer's selection axis (CLAUDE.md anchor: "Selection priority is
+    fee-per-byte, never absolute fee.").
+
+    Important: the prior version of this helper divided observed fees by
+    the *quoting* ``stored_size`` and then re-multiplied the chosen
+    percentile by the same ``stored_size``.  The divide and re-multiply
+    cancelled — the result was a percentile of *absolute fees*, not
+    densities.  This implementation observes each tx's *own* size to
+    rank densities correctly.
 
     Used by the server's `_rpc_estimate_fee` path to drive the
     estimator from the actual pending-mempool fee distribution at the
     urgency-derived ``target_blocks`` rung.
 
-    Returns 0 when there's no demand signal (empty / zero-byte input)
-    so the caller falls back to ``tx_floor``.
+    Returns 0 when there's no demand signal (empty input or
+    ``stored_size <= 0``) so the caller falls back to ``tx_floor``.
     """
     if stored_size <= 0:
         return 0
     densities: list[float] = []
-    for block_fees in fees_by_block:
-        for fee in block_fees:
-            densities.append(float(fee) / max(1, stored_size))
+    for block_entries in fees_by_block:
+        for entry in block_entries:
+            if isinstance(entry, tuple):
+                fee, observed_size = entry
+            else:
+                # Legacy bare-int input: assume the observed size
+                # matches the quoting size, so the density is the
+                # right shape for ranking but doesn't bias relative
+                # to a uniform-size mempool.
+                fee, observed_size = entry, stored_size
+            observed_size = max(1, int(observed_size))
+            densities.append(float(fee) / observed_size)
     if not densities:
         return 0
     densities.sort()

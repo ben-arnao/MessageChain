@@ -3070,18 +3070,24 @@ class Server(SharedRuntimeMixin):
             return {"ok": False, "error": f"Unknown fee kind: {kind}"}
 
         # Drive the mempool percentile estimator at the urgency-derived
-        # rung.  For kinds where density doesn't apply (no stored bytes,
-        # or the kind isn't in the mempool's pending pool), the
-        # estimator returns the floor and the type-specific min_fee
-        # binds.
+        # rung.  Per the auto-fee anchor we pass the QUOTING tx's stored
+        # byte count so the returned bid is density × stored_bytes — for
+        # message kinds this is the message size; for transfer/stake/etc.
+        # it's the representative envelope size (`stored_size_for(kind)`).
+        # The mempool helper percentiles densities internally; the
+        # legacy `message_bytes` kwarg name is preserved for back-compat
+        # but the value semantics are "stored bytes of the tx being
+        # quoted."  When the mempool is empty the helper returns the
+        # floor and the type-specific min_fee binds.
+        quoting_bytes = stored_bytes if stored_bytes > 0 else message_bytes
         try:
             mempool_fee = self.mempool.get_fee_estimate(
-                message_bytes=message_bytes, target_blocks=target_blocks,
+                message_bytes=quoting_bytes, target_blocks=target_blocks,
             )
         except TypeError:
             # Older mempool implementations without target_blocks.
             mempool_fee = self.mempool.get_fee_estimate(
-                message_bytes=message_bytes,
+                message_bytes=quoting_bytes,
             )
 
         recommended = max(int(min_fee), int(mempool_fee))
