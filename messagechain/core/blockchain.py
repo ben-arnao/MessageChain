@@ -13018,6 +13018,54 @@ class Blockchain:
                 self.censorship_processor.pending,
             ),
             "witness_ack_registry": dict(self.witness_ack_registry),
+            # Inclusion-list processor state.  Same defect class as the
+            # other evidence-processor collections above:
+            # ``_apply_block_state`` mutates these every time it
+            # registers a new InclusionList, observes a block in an
+            # active window, or admits an InclusionListViolation.  A
+            # bad-state-root block whose apply path mutated them must
+            # have those mutations reverted by the rollback, otherwise:
+            #
+            #   * a poisoned ``processed_violations`` entry silently
+            #     blocks honest resubmission of the same (list_hash,
+            #     tx_hash, proposer_id) triple — the offender escapes
+            #     slashing forever (mirror of the NRE/BR dedup attack);
+            #   * a forged ``active_lists`` entry persists past the
+            #     rollback, making honest validators slash proposers
+            #     for omitting txs from a list the canonical chain
+            #     never published — symmetric poisoning vector.
+            #
+            # ``active_lists`` is dict[int, InclusionList] — InclusionList
+            # carries mutable inner fields (entries list,
+            # quorum_attestation list), so copy.deepcopy is required to
+            # isolate post-snapshot mutations.
+            #
+            # ``inclusions_seen`` is dict[tuple, list[int]] — values are
+            # mutable lists (apply path appends heights), so deepcopy
+            # to keep the captured copy isolated.
+            #
+            # ``proposers_by_height`` is dict[bytes, dict[int, bytes]]
+            # — outer dict's values are mutable inner dicts that the
+            # apply path writes per-block; deepcopy to isolate.
+            #
+            # ``processed_violations`` is set[tuple[bytes, bytes, bytes]]
+            # of immutable tuples — shallow set() copy is sufficient.
+            #
+            # No-fork: snapshot/restore is purely in-memory; the
+            # chaindb mirror runs only after the state-root check
+            # passes, so historical replay is byte-identical.
+            "il_active_lists": copy.deepcopy(
+                self.inclusion_list_processor.active_lists,
+            ),
+            "il_inclusions_seen": copy.deepcopy(
+                self.inclusion_list_processor.inclusions_seen,
+            ),
+            "il_proposers_by_height": copy.deepcopy(
+                self.inclusion_list_processor.proposers_by_height,
+            ),
+            "il_processed_violations": set(
+                self.inclusion_list_processor.processed_violations,
+            ),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -13258,6 +13306,34 @@ class Blockchain:
         if "witness_ack_registry" in snapshot:
             self.witness_ack_registry = dict(
                 snapshot["witness_ack_registry"],
+            )
+        # Inclusion-list processor state.  See the snapshot-side
+        # comment for the security rationale: a bad-state-root block
+        # whose apply mutated these collections must have those
+        # mutations reverted, or an attacker can poison the
+        # ``processed_violations`` dedup gate (mirror of NRE/BR) AND/OR
+        # plant a forged entry into ``active_lists`` that the canonical
+        # chain never published.  Defaults match a freshly-initialised
+        # ``InclusionListProcessor`` so older snapshots (pre-field)
+        # round-trip cleanly.  deepcopy on the way out so the snapshot
+        # itself is not aliased with live state — a subsequent failed
+        # reorg could otherwise mutate the stored dict through the
+        # restored reference.
+        if "il_active_lists" in snapshot:
+            self.inclusion_list_processor.active_lists = copy.deepcopy(
+                snapshot["il_active_lists"],
+            )
+        if "il_inclusions_seen" in snapshot:
+            self.inclusion_list_processor.inclusions_seen = copy.deepcopy(
+                snapshot["il_inclusions_seen"],
+            )
+        if "il_proposers_by_height" in snapshot:
+            self.inclusion_list_processor.proposers_by_height = copy.deepcopy(
+                snapshot["il_proposers_by_height"],
+            )
+        if "il_processed_violations" in snapshot:
+            self.inclusion_list_processor.processed_violations = set(
+                snapshot["il_processed_violations"],
             )
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
