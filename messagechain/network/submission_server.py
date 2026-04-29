@@ -895,7 +895,12 @@ def _submit_react_to_mempool(
             ),
         )
 
-    if not mempool.add_react_transaction(tx):
+    # Tier 43 (audit fix #4): pass current chain height as the
+    # arrival height so the forced-inclusion source-side wait-gate
+    # can distinguish a long-waited react from a fresh arrival.
+    if not mempool.add_react_transaction(
+        tx, arrival_block_height=blockchain.height,
+    ):
         mempool_reason = "react pool full or duplicate"
         return SubmissionResult(
             ok=False, error=mempool_reason,

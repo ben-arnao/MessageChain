@@ -430,16 +430,25 @@ class TestServerPoolForcedInclusionIntegration(unittest.TestCase):
     the mempool's forced set post-fork."""
 
     def test_mempool_self_registers_evidence_source_at_init(self):
-        """Mempool MUST self-register exactly one source (the on-board
-        censorship-evidence pool) at construction so the source-side
-        rule covers it without requiring server cooperation.  A
-        cold-loaded standalone Mempool (e.g. in tests, in light-client
-        scenarios) must still honor the evidence-pool source."""
+        """Mempool MUST self-register its on-board pools (censorship-
+        evidence + react) as forced-inclusion sources at construction
+        so the source-side rule covers them without requiring server
+        cooperation.  A cold-loaded standalone Mempool (e.g. in tests,
+        in light-client scenarios) must still honor both sources.
+
+        Tier 43 audit fix #2 added the evidence pool; audit fix #4
+        added the react pool — for two internal sources total.  A
+        future on-mempool pool (e.g. a future first-class tx kind)
+        added here will bump this count again, which is fine — the
+        invariant being pinned is "EVERY on-mempool tx pool must be
+        a forced-inclusion source," not the literal count.
+        """
         pool = Mempool(max_size=10, fee_policy=_STATIC_FEE)
         self.assertEqual(
-            len(pool._external_forced_sources), 1,
-            "Mempool must self-register exactly one forced-inclusion "
-            "source (the censorship-evidence pool) at construction.",
+            len(pool._external_forced_sources), 2,
+            "Mempool must self-register both on-board pools "
+            "(censorship-evidence + react) as forced-inclusion "
+            "sources at construction.",
         )
 
     def test_server_registers_pool_source_at_init(self):
@@ -458,14 +467,15 @@ class TestServerPoolForcedInclusionIntegration(unittest.TestCase):
         srv = Server(
             p2p_port=0, rpc_port=0, seed_nodes=[], data_dir=None,
         )
-        # 2+ sources: one from Mempool's self-registered evidence
-        # pool + one from Server's registered server-pools walk.
+        # 3+ sources: two internal (evidence pool + react pool) +
+        # one from Server's registered server-pools walk.
         self.assertGreaterEqual(
-            len(srv.mempool._external_forced_sources), 2,
+            len(srv.mempool._external_forced_sources), 3,
             "Server must register its four server-local pending "
             "pools (stake / unstake / authority / governance) as "
             "an additional forced-inclusion source so the Tier 43 "
-            "source-side gate covers them.",
+            "source-side gate covers them — on top of the two "
+            "internal Mempool sources (evidence + react).",
         )
         # And the tracker dict must exist so `_admit_to_pool` can
         # populate it.

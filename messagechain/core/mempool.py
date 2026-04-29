@@ -179,6 +179,18 @@ class Mempool:
         # react_transactions slot via `get_react_transactions`.
         self.react_pool: dict[bytes, object] = {}
         self.react_pool_max_size: int = 10_000
+        # Tier 43 (audit fix #4): arrival-height tracking for react
+        # txs so the forced-inclusion source-side can apply the same
+        # wait-gate used for messages and evidence.  Keyed by tx_hash;
+        # populated on `add_react_transaction` admission, torn down on
+        # every removal path (full-pool fee-density eviction inside
+        # `add_react_transaction`, and `remove_react_transactions` on
+        # block-include drain).  An entry missing here defaults to
+        # height-0 in the source walk, matching the legacy "always
+        # been here" semantics — this is what makes the pre-Tier-43
+        # carve-out below behave identically to the pre-fork attester
+        # rule even when the source is registered.
+        self._react_pool_arrival_heights: dict[bytes, int] = {}
         # Stored-byte cache for ``_fee_per_byte`` ranking.  Keys by
         # tx_hash so a single ``len(tx.to_bytes())`` call is enough
         # per tx no matter how many sort / RBF / eviction passes the
@@ -201,6 +213,16 @@ class Mempool:
         # activation gate in `get_forced_inclusion_set`.)
         self._external_forced_sources.append(
             self._iter_evidence_pool_with_arrivals,
+        )
+        # Tier 43 (audit fix #4): the on-mempool react pool is also
+        # registered as an internal source so the source-side gate
+        # covers React votes (Tier 17 trust signals) post-fork.  This
+        # closes the canonical CLAUDE.md threat — a colluding majority
+        # suppressing negative-review React DOWN txs without leaving
+        # slashable evidence.  Pre-fork the registration is silently
+        # ignored by the activation gate in `get_forced_inclusion_set`.
+        self._external_forced_sources.append(
+            self._iter_react_pool_with_arrivals,
         )
 
     def add_transaction(
@@ -364,6 +386,25 @@ class Mempool:
         # which already holds the lock — this access is safe.
         for h, tx in list(self.censorship_evidence_pool.items()):
             yield tx, self._evidence_arrival_heights.get(h, 0)
+
+    def _iter_react_pool_with_arrivals(self):
+        """Yield `(tx, arrival_height)` pairs for the on-mempool
+        ReactTransaction pool.
+
+        Tier 43 (audit fix #4): React votes live in `react_pool`,
+        separate from `pending`.  Without this source-side hook a
+        colluding majority could drop arbitrarily-high-fpb React
+        DOWN votes (Tier 17 trust signals) without slashable
+        evidence — directly enabling the canonical CLAUDE.md threat
+        of a corporation suppressing negative reviews.
+
+        Missing arrival heights default to 0 (legacy "always been
+        here" semantics — immediately eligible for forced inclusion
+        once the activation gate opens).  Caller is
+        `get_forced_inclusion_set`, which already holds the lock.
+        """
+        for h, tx in list(self.react_pool.items()):
+            yield tx, self._react_pool_arrival_heights.get(h, 0)
 
     def get_forced_inclusion_set(
         self, current_block_height: int,
@@ -863,7 +904,9 @@ class Mempool:
             # ranks correctly relative to its peers.
             return float(tx.fee)
 
-    def add_react_transaction(self, tx) -> bool:
+    def add_react_transaction(
+        self, tx, arrival_block_height: int | None = None,
+    ) -> bool:
         """Admit a ReactTransaction into the pool with fee-density eviction.
 
         At capacity, accepts the incoming tx iff its fee density
@@ -882,6 +925,15 @@ class Mempool:
         gate checks before this call (see `verify_react_transaction`
         + the chain-side checks in `validate_block`); the mempool
         enforces dedup, the protocol fee floor, and the cap.
+
+        Tier 43 (audit fix #4): `arrival_block_height` records the
+        block height at which this node first saw the react tx so the
+        forced-inclusion source-side wait-gate works the same way it
+        does for messages.  Defaults to 0 (legacy "always been here"
+        — immediately eligible for forced inclusion once the
+        activation gate opens); production callers (RPC submit,
+        gossip relay) should pass the current chain height so a
+        long-waited react can be distinguished from a fresh arrival.
         """
         with self._lock:
             if tx.tx_hash in self.react_pool:
@@ -896,8 +948,12 @@ class Mempool:
             from messagechain.config import MARKET_FEE_FLOOR
             if tx.fee < MARKET_FEE_FLOOR:
                 return False
+            arrival = (
+                arrival_block_height if arrival_block_height is not None else 0
+            )
             if len(self.react_pool) < self.react_pool_max_size:
                 self.react_pool[tx.tx_hash] = tx
+                self._react_pool_arrival_heights[tx.tx_hash] = arrival
                 return True
             # Pool is full — fee-density eviction.  Find the lowest-density
             # pending entry; admit the incoming tx only if it beats it.
@@ -910,7 +966,14 @@ class Mempool:
             if incoming_density <= worst_density:
                 return False
             del self.react_pool[worst_hash]
+            # Tier 43: drop the evicted tx's arrival-tracker entry so
+            # the dict cannot leak unboundedly across the chain's
+            # lifetime.  A leaked entry would also risk misclassifying
+            # a re-arrived tx as "aged from genesis" once the source
+            # side starts walking this pool post-fork.
+            self._react_pool_arrival_heights.pop(worst_hash, None)
             self.react_pool[tx.tx_hash] = tx
+            self._react_pool_arrival_heights[tx.tx_hash] = arrival
             return True
 
     def get_react_transactions(self, max_count: int | None = None) -> list:
@@ -931,10 +994,17 @@ class Mempool:
             return items
 
     def remove_react_transactions(self, tx_hashes: list[bytes]):
-        """Remove react txs after inclusion in a block."""
+        """Remove react txs after inclusion in a block.
+
+        Tier 43 (audit fix #4): also pops the arrival-tracker entry
+        so `_react_pool_arrival_heights` cannot leak across the
+        chain's lifetime.  Symmetric with the evidence-pool teardown
+        in `remove_censorship_evidence_txs`.
+        """
         with self._lock:
             for h in tx_hashes:
                 self.react_pool.pop(h, None)
+                self._react_pool_arrival_heights.pop(h, None)
 
     @property
     def size(self) -> int:
