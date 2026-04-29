@@ -2935,6 +2935,48 @@ assert (
 )
 
 # ─────────────────────────────────────────────────────────────────────
+# Tier 46: SetAuthorityKey rebind requires cold-key counter-signature
+# ─────────────────────────────────────────────────────────────────────
+# Defends against the validator-collusion / coerced-operator threat
+# (PRIMARY adversary in CLAUDE.md) when the lever is the validator's
+# own hot key.
+#
+# The shipped code path makes SetAuthorityKey signed by the entity's
+# HOT signing key only, with no requirement that the EXISTING cold
+# authority key counter-sign a re-binding to a new cold key. Result:
+# a hot-key compromise is operationally equivalent to a cold-key
+# compromise. An attacker who steals the hot key (which lives on the
+# 24/7 online validator) can broadcast SetAuthorityKey with
+# new_authority_key=ATTACKER_COLD and inherit all cold-key powers
+# (Unstake, Revoke). The legitimate operator can no longer revoke
+# (Revoke is signed by the now-attacker cold key) or unstake. The
+# defense-in-depth that the hot/cold split is supposed to provide
+# does not actually exist.
+#
+# Fix: at/above AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, a
+# SetAuthorityKey that *re-binds* an entity's already-installed
+# authority key MUST carry a second signature, verified under the
+# CURRENTLY-installed cold key. The first-time install path
+# (authority_keys[entity_id] not yet set) is unchanged — that path is
+# the bootstrap, the user is authenticating "as themselves" with the
+# only key they have.
+#
+# Wire format (post-activation): the existing primary signature field
+# is byte-identical; the new cold counter-signature appends as an
+# optional trailer disambiguated by a 0x01 marker (mirrors the
+# Tier 26 RevokeTransaction window-marker pattern). Pre-activation
+# blobs (no trailer) round-trip byte-identically to the pre-fork
+# encoding; replay determinism on historical blocks is preserved.
+#
+# Activation: AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234 — +700
+# spacing above Tier 45 (4534), matching the cohort spacing used
+# throughout the recent fork ladder. Current mainnet tip is ~860, so
+# every live operator has multiple weeks of runway to upgrade their
+# cmd_set_authority_key invocation to attach a cold-key counter-sig
+# before the gate binds.
+AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234  # Tier 46 — +700 spacing above Tier 45 (4534)
+
+# ─────────────────────────────────────────────────────────────────────
 # Finality-vote reward from issuance (hard fork)
 # ─────────────────────────────────────────────────────────────────────
 # Latent economic failure in the shipped code: the

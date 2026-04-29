@@ -356,6 +356,13 @@ def build_parser() -> argparse.ArgumentParser:
     set_auth.add_argument("--fee", type=int, default=None, help="Transaction fee")
     set_auth.add_argument("--server", type=str, default=None, help="Server address host:port")
     set_auth.add_argument(
+        "--cold-key-path", type=str, default=None,
+        help="Path to the EXISTING cold private-key file (required only "
+             "when re-binding an already-installed authority key -- Tier 46. "
+             "First-time install: omit. The file may contain raw bytes or "
+             "a hex-encoded private key.",
+    )
+    set_auth.add_argument(
         "--yes", "-y", action="store_true",
         help="Skip the confirmation prompt (for scripts / CI).",
     )
@@ -3540,7 +3547,10 @@ def cmd_bootstrap_seed(args):
 def cmd_set_authority_key(args):
     """Promote a cold authority key for this entity."""
     from messagechain.identity.identity import Entity
-    from messagechain.core.authority_key import create_set_authority_key_transaction
+    from messagechain.core.authority_key import (
+        create_set_authority_key_transaction,
+        create_set_authority_key_rebind_transaction,
+    )
 
     print("=== Set Authority Key ===\n")
     print("This designates a cold public key that will gate your unstake and")
@@ -3582,9 +3592,77 @@ def cmd_set_authority_key(args):
     # Default fee: post-flat floor is safe pre- and post-activation.
     from messagechain.config import MIN_FEE_POST_FLAT
     fee = args.fee if args.fee is not None else MIN_FEE_POST_FLAT
-    tx = create_set_authority_key_transaction(
-        entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee,
+
+    # Tier 46: post AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, a SetAuthorityKey
+    # that REBINDS an already-installed authority key must carry a second
+    # signature from the existing cold key.  Discover whether this entity
+    # already has a cold key installed via the get_authority_key RPC.
+    auth_resp = rpc_call(host, port, "get_authority_key", {
+        "entity_id": entity.entity_id_hex,
+    })
+    existing_authority_pk = None
+    if auth_resp.get("ok"):
+        ak_hex = auth_resp["result"].get("authority_key")
+        if ak_hex:
+            existing_authority_pk = bytes.fromhex(ak_hex)
+    # The authority key defaults to the hot signing key for entities
+    # that have never run SetAuthorityKey -- get_authority_key returns
+    # the hot key in that case, NOT None.  So "rebind" is signaled by
+    # the on-chain authority_key differing from the hot signing key.
+    is_rebind = (
+        existing_authority_pk is not None
+        and existing_authority_pk != entity.public_key
     )
+
+    if is_rebind:
+        cold_key_path = getattr(args, "cold_key_path", None)
+        if not cold_key_path:
+            print(
+                "\nError: this entity already has a cold authority key installed."
+            )
+            print(
+                "Re-binding it requires a counter-signature from the EXISTING "
+                "cold key (Tier 46)."
+            )
+            print(
+                "Re-run with --cold-key-path <path> pointing at the current "
+                "cold private-key file."
+            )
+            sys.exit(1)
+        try:
+            with open(cold_key_path, "rb") as f:
+                cold_seed = f.read().strip()
+        except OSError as e:
+            print(f"Error: could not read cold key file {cold_key_path!r}: {e}")
+            sys.exit(1)
+        # Hex-encoded private keys are also accepted (mirrors the
+        # personal-wallet keyfile convention used elsewhere).
+        try:
+            cold_seed = bytes.fromhex(cold_seed.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            pass  # already raw bytes
+        try:
+            cold_entity = Entity.create(cold_seed)
+        except Exception as e:
+            print(f"Error: cold key file did not yield a valid Entity: {e}")
+            sys.exit(1)
+        if cold_entity.public_key != existing_authority_pk:
+            print(
+                "Error: --cold-key-path public key does not match the "
+                "currently-installed authority key on chain."
+            )
+            print(f"  installed: {existing_authority_pk.hex()}")
+            print(f"  provided:  {cold_entity.public_key.hex()}")
+            sys.exit(1)
+        tx = create_set_authority_key_rebind_transaction(
+            entity, new_authority_key=authority_pubkey,
+            nonce=nonce, fee=fee,
+            existing_cold_keypair=cold_entity.keypair,
+        )
+    else:
+        tx = create_set_authority_key_transaction(
+            entity, new_authority_key=authority_pubkey, nonce=nonce, fee=fee,
+        )
 
     if not getattr(args, "yes", False):
         ak_hex = authority_pubkey.hex()
