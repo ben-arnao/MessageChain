@@ -4,6 +4,103 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.43.1] — 2026-04-29
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+against `origin/main` at 1.43.0 surfaced 48 findings; the cumulative
+top-3 by severity × leverage × ROI land here.  All three are
+no-fork hotfixes — one closes a live security regression on a
+defense that landed last release, two close UX/funnel gaps that
+made the headline censorship-resistance and validator-onboarding
+guarantees unreachable from the default user surface.
+
+### Security (active immediately, no fork gate)
+
+- **RPC success-receipt path now drains the dedicated receipt
+  bucket, not the rejection bucket.**  The `ReceiptBudgetTracker`
+  shipped in 1.42.0 was bypassed entirely on the JSON-RPC surface:
+  `Server._resolve_rpc_receipt_issuer` checked
+  `rejection_budget_check(client_ip)` to gate success-path receipt
+  issuance, while the HTTPS path correctly used
+  `receipt_budget_check`.  Net effect: an attacker rotating across
+  HTTPS+RPC drained both per-IP buckets, doubling the per-IP burst
+  before the global cap fired, and the dedicated `_receipt_buckets`
+  dict was dead code on the RPC surface.  Reopens the kill-switch
+  the 1.42.0 cap was specifically built to close — a drained
+  receipt subtree silently bricks the censorship-evidence
+  pipeline.  Fix: one-line bucket swap in
+  `Server._resolve_rpc_receipt_issuer`.  Adversary defended:
+  validator collusion (PRIMARY anchored adversary).  Tests:
+  `tests/test_rpc_receipt_budget_correct_bucket.py` (4 new TDD
+  regression tests asserting the correct bucket is drained, silent
+  downgrade fires when the receipt bucket is exhausted, the global
+  cap still fires, and the rejection bucket stays untouched on the
+  success path).  Source: `213cde8` (audit fix #1, merged via
+  `aa170fb`).
+
+### Fixed (CLI / UX, no fork)
+
+- **`messagechain send` saves the SubmissionReceipt; not-found
+  escalation hint points at the live `submit-evidence censorship
+  --receipt` form.**  The headline censorship-evidence funnel was
+  unreachable from the default `send` path: `cmd_send` read
+  `tx_hash` and `fee` from the RPC response and dropped the
+  signed `SubmissionReceipt` on the floor.  A user who later
+  found their tx was censored had nothing to escalate with.
+  Compounding, the receipt CLI's not-found hint
+  (`_print_not_found_receipt`) pointed at the deprecated
+  `submit-evidence --tx <hash>` form, which the live subcommand
+  rejects as a stub demanding `--receipt <bundle.json>`.
+  `cmd_send` now writes
+  `~/.messagechain/receipts/<tx_hash>.json` (mkdir -p, JSON shape
+  compatible with the live `submit-evidence censorship --receipt`
+  parser, atomic-rename) and prints `receipt saved: <path>` on
+  success.  `_print_not_found_receipt` now points the user at
+  that exact file with the live subcommand form.  Surfaces the
+  slashing-backed permanence guarantee at the default send
+  surface; the chain-side Tier 30+ pipeline was already shipped.
+  Tests: `tests/test_cli_send_saves_receipt.py` (round-trip
+  verifies the saved bundle is loadable by the live
+  `_load_receipt_bundle` helper) +
+  `tests/test_cli_not_found_hint.py` (asserts the deprecated
+  `--tx` form is gone).  Source: `73a4574` (audit fix #2, merged
+  via `8048ca4`).
+
+- **`messagechain stake` / `unstake` auto-fee no longer clamps to
+  a stale 1000-token floor; install next-steps text uses live
+  `get_validator_min_stake(tip)`.**  The chain admission floor
+  for stake/unstake post-Tier 16 (MARKET_FEE_FLOOR_HEIGHT=623,
+  long past on mainnet) is `max(MIN_FEE=100, MARKET_FEE_FLOOR=1)
+  = 100`, but `cmd_stake` / `cmd_unstake` clamped the
+  auto-computed fee to `MIN_FEE_POST_FLAT=1000`.  Net effect:
+  the anchored Tier 29 *"1 faucet drip funds end-to-end validator
+  stake"* flow (300 tokens = 200 staked + 100 fee) was broken at
+  the CLI surface.  Every fresh validator following the README
+  hit `Insufficient balance for staking + fee` because the CLI
+  demanded a 1000-token fee on top of the 200-token stake.
+  Compounding, `runtime/onboarding.py`'s on-host post-install
+  next-steps text hardcoded
+  `messagechain transfer --to {address} --amount 10000` and
+  `messagechain stake --amount 10000`, contradicting the live
+  `get_validator_min_stake(tip) = 200`.  Both lines now compute
+  the live min-stake at install time so the on-host text agrees
+  with the chain's actual rule.  Removed the redundant
+  `MIN_FEE_POST_FLAT` clamp in `cmd_stake` / `cmd_unstake`
+  (auto_fee already returns the correct floor of 100).  Tests:
+  `tests/test_cli_stake_fee_floor.py` (new) +
+  `tests/test_init_command.py` extension asserting the
+  next-steps text reflects the live floor, not a hardcoded
+  10000.  Source: `222ea80` (audit fix #3, merged via
+  `d8cbb80`).
+
+### Operator notes
+
+- **No new activation heights, no fork runway constraint.**  All
+  three fixes are active immediately on upgrade.  The fee-floor
+  CLI fix is invisible on already-funded operators — the CLI just
+  stops over-charging on stake/unstake.  Roll validators with
+  `messagechain upgrade --yes`.
+
 ## [1.43.0] — 2026-04-29
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
