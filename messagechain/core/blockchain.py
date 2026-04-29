@@ -13159,6 +13159,60 @@ class Blockchain:
                 self.validator_first_active_block,
             ),
             "archive_active_snapshot": self.archive_active_snapshot,
+            # Reaction-state in-memory dicts.  Same defect class as
+            # the IL-processor / four-evidence-collection / archive-
+            # duty fixes above: ``_apply_block_state`` calls
+            # ``self.reaction_state.apply(rtx)`` for every React tx in
+            # the block, mutating ``choices``, ``_user_trust_score``,
+            # and ``_message_score`` in lockstep.  The reaction
+            # state's ``state_root_contribution()`` is mixed into
+            # ``compute_current_state_root`` -- a bad-state-root
+            # block whose apply path mutated reaction_state must
+            # have those mutations reverted by
+            # ``_restore_memory_snapshot``, otherwise the in-memory
+            # state diverges from honest peers' replayed state and
+            # the next legitimate React-touching block produces a
+            # state-root mismatch (silent fork).
+            #
+            # Snapshot the three inner dicts via shallow ``dict(...)``
+            # copies so a post-snapshot ``apply`` cannot leak through
+            # the captured copy (values are immutable scalars; keys
+            # are immutable bytes/tuples).  We do NOT copy
+            # ``_dirty_keys`` -- it is purely a chaindb persistence-
+            # flush hint, not consensus state, and the next
+            # ``_persist_state`` flush rebuilds it from scratch.
+            #
+            # ``reaction_state`` is a marker key the structural-
+            # symmetry CI guard checks for.  Restore reads the three
+            # ``reaction_state_*`` keys; this entry exists so a future
+            # refactor that drops the rollback handling fails at
+            # ``"reaction_state" in snapshot`` time.
+            #
+            # No-fork: snapshot/restore is purely in-memory; the
+            # chaindb mirror runs only after the state-root check
+            # passes, so historical replay is byte-identical.
+            "reaction_state": True,
+            "reaction_state_choices": dict(
+                self.reaction_state.choices,
+            ),
+            "reaction_state_user_trust_score": dict(
+                self.reaction_state._user_trust_score,
+            ),
+            "reaction_state_message_score": dict(
+                self.reaction_state._message_score,
+            ),
+            # Archive-reward pool scalar.  Same defect class as the
+            # archive-duty maps above: ``_apply_block_state`` mutates
+            # ``self.archive_reward_pool`` on the withhold path
+            # (``+= _withheld``) and on the archive-rewards payout
+            # path (write-back from the ArchiveRewardPool wrapper).
+            # The pool is committed into the on-disk state-snapshot
+            # blob via ``_GLOBAL_ARCHIVE_REWARD_POOL`` (see
+            # ``state_snapshot.py``), so an in-memory drift past a
+            # rollback diverges total_supply accounting from honest
+            # peers at the next archive-touching block.  Scalar int
+            # is naturally immutable -- direct value capture is safe.
+            "archive_reward_pool": int(self.archive_reward_pool),
         }
         # Snapshot governance state if tracker is attached.
         # deepcopy the full proposals dict so that nested mutation on a
@@ -13453,6 +13507,51 @@ class Blockchain:
         )
         self.archive_active_snapshot = snapshot.get(
             "archive_active_snapshot", None,
+        )
+        # Reaction-state in-memory dicts.  See the snapshot-side
+        # comment for the security rationale: a bad-state-root block
+        # whose apply path called ``self.reaction_state.apply(rtx)``
+        # must have those mutations reverted, otherwise the
+        # in-memory state diverges from honest peers' replayed state
+        # and the next legitimate React-touching block silently
+        # forks at the ``state_root_contribution()`` mix-in.
+        # Defaults match a freshly-initialised ``ReactionState``
+        # (empty maps) so older snapshots that predate these fields
+        # round-trip cleanly.  The maps are re-wrapped in fresh
+        # ``dict(...)`` so the snapshot's stored copy is not aliased
+        # with live state — a subsequent failed reorg could
+        # otherwise mutate the captured snapshot through the live
+        # reference.  ``_dirty_keys`` is intentionally NOT restored
+        # (it is a chaindb persistence-flush hint, not consensus
+        # state); we clear it so the next ``_persist_state`` flush
+        # rebuilds it from observed mutations rather than carrying
+        # stale entries from a rolled-back apply.
+        if (
+            "reaction_state_choices" in snapshot
+            or "reaction_state_user_trust_score" in snapshot
+            or "reaction_state_message_score" in snapshot
+        ):
+            self.reaction_state.choices = dict(
+                snapshot.get("reaction_state_choices", {}),
+            )
+            self.reaction_state._user_trust_score = dict(
+                snapshot.get("reaction_state_user_trust_score", {}),
+            )
+            self.reaction_state._message_score = dict(
+                snapshot.get("reaction_state_message_score", {}),
+            )
+            self.reaction_state._dirty_keys = set()
+        # Archive-reward pool scalar.  See the snapshot-side comment
+        # for the security rationale: a bad-state-root block whose
+        # apply path mutated the pool (withhold-path increment OR
+        # archive-rewards-payout decrement) must have that mutation
+        # reverted, otherwise the in-memory pool diverges from
+        # honest peers' replayed state.  Default 0 so pre-field
+        # snapshots restore cleanly (matches a freshly-initialised
+        # Blockchain).  Scalar int is immutable -- direct value
+        # assignment is safe.
+        self.archive_reward_pool = int(
+            snapshot.get("archive_reward_pool", 0),
         )
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:
