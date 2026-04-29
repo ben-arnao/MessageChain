@@ -4,6 +4,107 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.43.0] — 2026-04-29
+
+Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
+against `origin/main` at 1.42.0 surfaced 42 findings; the cumulative
+top-3 by severity × leverage × ROI land here.  One new hard fork
+(Tier 44) closes the largest remaining hole in the
+censorship-evidence pipeline; one soft-fork extension under Tier 43's
+existing activation height closes its sibling react-pool gap; one
+no-fork CLI bugfix corrects an operator-facing leaf-usage indicator
+that was 16× wrong on every status check.
+
+### Changed (consensus, gated by activation height)
+
+- **Tier 44 — `CensorshipEvidenceTx` carries a polymorphic
+  receipted-tx field** covering Message / Transfer / React.  Pre-fix,
+  `CensorshipEvidenceTx` hard-coded `MessageTransaction` in its wire
+  format, but `submit_transaction_to_mempool` (Tier 1.34+) issues
+  `SubmissionReceipt`s for all three receipted tx kinds.  Net effect:
+  a coerced validator could issue a receipt for a Transfer or React
+  (looks fully accountable on the wire) and silently drop the tx,
+  with NO slashing path — the user holding the receipt could not
+  package it, because `CensorshipEvidenceTx.from_bytes` /
+  `.deserialize` called `MessageTransaction.from_bytes(...)` which
+  fails on transfer/react payloads.  Receipts on transfer/react were
+  slash-theatre; the CLAUDE.md "validator collusion" primary anchor
+  + "transfer is a first-class, fully supported tx type" anchor were
+  both half-violated.  Tier 44 introduces a single-byte kind tag
+  (0=Message, 1=Transfer, 2=React) preceding the receipted-tx blob;
+  the decoder dispatches to the appropriate `*Transaction.from_bytes`
+  / `.deserialize`.  `CensorshipEvidenceProcessor.observe_block` now
+  walks all three receipted-kind slots so a transfer-or-react
+  inclusion correctly voids matching pending evidence, preventing
+  mature-evidence slashes against validators whose tx WAS actually
+  included as a transfer or react.  Activation at
+  `CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT = 3834`, riding above
+  Tier 43's 3134 with comfortable +700 cohort spacing above the
+  current ~850 mainnet tip.  Pre-fork wire format byte-identical for
+  replay determinism.  `messagechain submit-evidence censorship`
+  CLI extended to read a `tx_kind` field from the receipt bundle,
+  packing the correct kind into the new wire-format slot.  Adversary
+  defended: validator collusion (PRIMARY).  Tests:
+  `tests/test_censorship_evidence_polymorphic_tier44.py` (14 tests).
+
+- **Tier 43 — forced-inclusion source-side gate now also covers
+  `mempool.react_pool`.**  Tier 43 (1.42.0) wired stake / unstake /
+  authority / governance + censorship-evidence pools as
+  forced-inclusion sources, but reactions live in
+  `mempool.react_pool` (separate from `pending`) and were NOT
+  registered.  Block-side `_BLOCK_TX_LIST_ATTRS` already covered
+  `react_transactions`, but attesters never pulled reacts into the
+  forced set — so a colluding majority could still suppress
+  arbitrarily-high-fpb React txs without slashable evidence.  This
+  is the canonical CLAUDE.md threat-example — *"a corporation
+  pressuring validators to suppress negative reviews of its
+  products"* — on MessageChain, "negative reviews" are React
+  vote-down txs (Tier 17 trust signal).  Fix adds an internal
+  `_iter_react_pool_with_arrivals` helper mirroring the existing
+  evidence-pool registration, with a sibling
+  `_react_pool_arrival_heights` dict torn down on every removal
+  path.  Per-entity-cap and Tier 37 same-entity entity-cap excuse
+  semantics apply across the expanded source set via the existing
+  `entity_id`/`voter_id` fallback in `_entity_id_of`.  **Soft fork
+  under the existing `FORCED_INCLUSION_ALL_POOLS_HEIGHT = 3134`
+  gate** — no new activation height; the registration expansion
+  ships before Tier 43 activates.  Pre-activation behavior preserved
+  byte-identically.  Adversary defended: validator collusion
+  (PRIMARY).  Tests: `tests/test_forced_inclusion_react_pool.py`
+  (new) + extensions to `tests/test_forced_inclusion_all_pools.py`.
+
+### Fixed (CLI / operator-UX, no fork)
+
+- **`messagechain status --entity` / `key-status` / `rotate-key`
+  leaf-usage % now uses the per-entity `tree_height` from the chain
+  rather than a hard-coded `1 << 16`.**  Validators run at
+  `MERKLE_TREE_HEIGHT = 20` (1,048,576 leaves) but the status math
+  was dividing by 65,536 — at 50% real capacity the operator saw
+  `524288/65536 (800.0%) ROTATE NOW`.  Drove premature rotations
+  (~90-min keygen + tx fee + leaf burn for the rotation itself) and
+  trained operators to ignore the YELLOW/RED traffic light because
+  it routinely blew past 100%.  Same class of bug at three sibling
+  CLI sites; all three resolved through a new
+  `_resolve_entity_tree_height()` helper that mirrors the
+  already-correct path in `cmd_rotate_key_if_needed`.
+  `Blockchain.get_entity_stats` now surfaces the per-entity
+  `tree_height` (additive RPC field; absent for first-touch
+  entities, which fall back to the personal-wallet default).
+  Tests: `tests/test_cli_status_leaf_pct_per_entity_tree_height.py`
+  (9 tests covering h=20 validator at 50%/85%, h=16 personal
+  wallet, and first-touch fallback).
+
+### Operator notes
+
+- **One new activation height rides in this release.**  Tier 44 at
+  `CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT = 3834` — well above
+  current tip with comfortable runway.  All validators must upgrade
+  to 1.43.0 before the runway closes.  The Tier 43 react_pool
+  extension rides under the existing Tier 43 height (3134, also
+  still in the future), so no second runway constraint.  The CLI
+  leaf-usage fix is active immediately on upgrade (no fork gate).
+  Roll validators with `messagechain upgrade --yes`.
+
 ## [1.42.0] — 2026-04-29
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
