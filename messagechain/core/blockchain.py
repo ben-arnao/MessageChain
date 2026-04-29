@@ -3820,12 +3820,18 @@ class Blockchain:
             return False, "Receipt expired — older than EVIDENCE_EXPIRY_BLOCKS"
 
         # The receipted tx MUST still be absent from chain state.  We
-        # detect presence via the entity's on-chain nonce: if
+        # detect presence via the signer's on-chain nonce: if
         # chain_nonce > receipt_tx.nonce, the tx has already been
         # applied (or a replacement with higher nonce has — either
-        # way the offender isn't censoring).
-        chain_nonce = self.nonces.get(tx.message_tx.entity_id, 0)
-        if chain_nonce > tx.message_tx.nonce:
+        # way the offender isn't censoring).  Uses the polymorphic
+        # `receipted_tx_entity_id` accessor so Message / Transfer
+        # (entity_id) and React (voter_id) all dispatch correctly.
+        from messagechain.consensus.censorship_evidence import (
+            receipted_tx_entity_id as _signer_id,
+        )
+        rtx = tx.receipted_tx
+        chain_nonce = self.nonces.get(_signer_id(rtx), 0)
+        if chain_nonce > rtx.nonce:
             return False, "Receipted tx already on-chain (nonce advanced)"
 
         # Registered-root check: the receipt's embedded root must
@@ -5758,7 +5764,7 @@ class Blockchain:
             _PendingEvidence,
         )
         # Step 1: mirror observe_block — any pending evidence whose
-        # tx appears in this block's `transactions` slot is voided.
+        # tx appears in this block's receipted-kind slots is voided.
         # Build a local copy of pending to simulate.
         sim_pending = {
             ev_hash: entry
@@ -5766,7 +5772,18 @@ class Blockchain:
         }
         sim_processed = set(self.censorship_processor.processed)
         sim_legacy_processed = set(self._processed_evidence)
-        block_tx_hashes = {tx.tx_hash for tx in transactions}
+        # Walk every receipted-kind slot — Tier 44 lets pending entries
+        # target Transfer / React, and observe_block walks all three.
+        # Mirror that exactly so the sim and apply paths agree on
+        # which evidences void in the same block.  Pre-Tier-44 the
+        # transfer/react slots can never carry an evidence-targeted
+        # tx_hash (the wire format prevented it), so the wider walk
+        # is a strict superset of pre-fork behavior at every height.
+        block_tx_hashes: set[bytes] = {tx.tx_hash for tx in transactions}
+        for tx in (transfer_transactions or []):
+            block_tx_hashes.add(tx.tx_hash)
+        for tx in (react_transactions or []):
+            block_tx_hashes.add(tx.tx_hash)
         for ev_hash in list(sim_pending.keys()):
             if sim_pending[ev_hash].tx_hash in block_tx_hashes:
                 del sim_pending[ev_hash]
@@ -5807,11 +5824,17 @@ class Blockchain:
             # so a same-block ordinary tx from the same submitter that
             # bumped the nonce past the receipted tx's nonce correctly
             # causes us to reject the evidence here (same as apply).
-            chain_nonce_sim = sim_nonces.get(
-                etx.message_tx.entity_id,
-                self.nonces.get(etx.message_tx.entity_id, 0),
+            # Uses the polymorphic signer-id accessor so Message /
+            # Transfer / React all dispatch correctly (Tier 44+).
+            from messagechain.consensus.censorship_evidence import (
+                receipted_tx_entity_id as _signer_id,
             )
-            if chain_nonce_sim > etx.message_tx.nonce:
+            _rtx = etx.receipted_tx
+            _signer = _signer_id(_rtx)
+            chain_nonce_sim = sim_nonces.get(
+                _signer, self.nonces.get(_signer, 0),
+            )
+            if chain_nonce_sim > _rtx.nonce:
                 continue
             # Registered-root gate — use the LIVE
             # receipt_root_admissible check so a rotation

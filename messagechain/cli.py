@@ -5494,8 +5494,8 @@ def _load_receipt_bundle(path: str) -> tuple[object, object]:
 
     The bundle pairs a SubmissionReceipt (the validator's commitment
     that it accepted a tx at a given height) with the original
-    MessageTransaction the receipt covers.  Both fields are needed:
-    the receipt alone proves admission, the message_tx is what
+    receipted tx the receipt covers.  Both fields are needed:
+    the receipt alone proves admission, the receipted tx is what
     every node compares against the next block's tx_hashes to decide
     whether to void the evidence (i.e. the tx finally landed) or
     apply the slash on maturity.
@@ -5505,8 +5505,10 @@ def _load_receipt_bundle(path: str) -> tuple[object, object]:
         {
           "receipt":    <SubmissionReceipt.serialize() dict>
                         OR <hex of receipt.to_bytes()>,
-          "message_tx": <MessageTransaction.serialize() dict>
-                        OR <hex of message_tx.to_bytes()>
+          "message_tx": <Transaction.serialize() dict>
+                        OR <hex of tx.to_bytes()>,
+          "tx_kind":    "message" | "transfer" | "react"   (optional;
+                        defaults to "message" for legacy bundles)
         }
 
     Both `dict` and `hex-string` forms are accepted so an operator
@@ -5514,11 +5516,19 @@ def _load_receipt_bundle(path: str) -> tuple[object, object]:
     dict) or the hex blob (which is what the validator returns in
     `result.receipt_hex` from submit_transaction).
 
-    Returns ``(SubmissionReceipt, MessageTransaction)``.
+    `tx_kind` defaults to "message" so pre-Tier-44 bundles round-trip
+    without any change.  Post-fork bundles for transfer/react carry
+    the explicit kind so the loader dispatches to the correct decoder.
+
+    Returns ``(SubmissionReceipt, receipted_tx)`` where the second
+    element is one of MessageTransaction / TransferTransaction /
+    ReactTransaction depending on `tx_kind`.
     Raises ``ValueError`` on malformed input.
     """
     import json
     from messagechain.core.transaction import MessageTransaction
+    from messagechain.core.transfer import TransferTransaction
+    from messagechain.core.reaction import ReactTransaction
     from messagechain.network.submission_receipt import SubmissionReceipt
 
     with open(path, "r", encoding="utf-8") as f:
@@ -5547,14 +5557,25 @@ def _load_receipt_bundle(path: str) -> tuple[object, object]:
             "hex string (to_bytes form)"
         )
 
+    tx_kind = bundle.get("tx_kind", "message")
+    kind_to_class = {
+        "message": MessageTransaction,
+        "transfer": TransferTransaction,
+        "react": ReactTransaction,
+    }
+    if tx_kind not in kind_to_class:
+        raise ValueError(
+            f"`tx_kind` must be one of {sorted(kind_to_class)}; "
+            f"got {tx_kind!r}"
+        )
+    rtx_class = kind_to_class[tx_kind]
+
     mtx_field = bundle["message_tx"]
     if isinstance(mtx_field, dict):
-        message_tx = MessageTransaction.deserialize(mtx_field)
+        message_tx = rtx_class.deserialize(mtx_field)
     elif isinstance(mtx_field, str):
         try:
-            message_tx = MessageTransaction.from_bytes(
-                bytes.fromhex(mtx_field),
-            )
+            message_tx = rtx_class.from_bytes(bytes.fromhex(mtx_field))
         except ValueError as e:
             raise ValueError(
                 f"`message_tx` hex string is not parseable: {e}"
