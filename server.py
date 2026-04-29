@@ -1919,27 +1919,33 @@ class Server(SharedRuntimeMixin):
         RECEIPT_SUBTREE in ~3 days, silently collapsing the
         censorship-evidence pipeline.
 
-        Logic mirrors the HTTPS `_should_request_rejection` shape:
+        Logic mirrors the HTTPS success-path receipt gate:
           * `request_receipt` false / unset           -> None (no leaf)
           * tracker missing / empty client_ip         -> issuer
             (test/legacy paths bypass the gate; production always
             constructs the tracker in Server.__init__ and threads
             client_ip from _process_rpc)
-          * `rejection_budget_check(ip)` returns True -> issuer
+          * `receipt_budget_check(ip)` returns True   -> issuer
             (token consumed, leaf will be issued)
-          * `rejection_budget_check(ip)` returns False -> None +
+          * `receipt_budget_check(ip)` returns False  -> None +
             rate-limited warning log (silent downgrade — submission
             still processes, client just doesn't get a receipt)
 
         The bucket is shared with the HTTPS surface so an attacker
-        can't split traffic across HTTPS+RPC and drain twice.
+        can't split traffic across HTTPS+RPC and drain twice.  The
+        success-path RPC receipt issuance MUST consult the dedicated
+        `_receipt_buckets` (via `receipt_budget_check`), NOT the
+        `_rejection_buckets` (which gates SignedRejection issuance);
+        an earlier rev called `rejection_budget_check` here, draining
+        the wrong bucket and leaving `_receipt_buckets` dead code on
+        the RPC surface — see audit 2026-04-29 / #1.
         """
         if not params.get("request_receipt"):
             return None
         budget_tracker = getattr(self, "receipt_budget_tracker", None)
         if budget_tracker is None or not client_ip:
             return self.receipt_issuer
-        if budget_tracker.rejection_budget_check(client_ip):
+        if budget_tracker.receipt_budget_check(client_ip):
             return self.receipt_issuer
         self._maybe_warn_receipt_budget_exhausted(client_ip)
         return None
