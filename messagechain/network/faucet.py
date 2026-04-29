@@ -50,7 +50,50 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
+from messagechain.identity.address import (
+    InvalidAddressChecksumError,
+    InvalidAddressError,
+    decode_address,
+    is_checksummed,
+)
+
 logger = logging.getLogger("messagechain.faucet")
+
+
+def _normalize_faucet_address(s: str) -> tuple[bytes | None, str]:
+    """Public-faucet address normalization.
+
+    Accepts EITHER the `mc1...` checksummed form (preferred — what the
+    CLI tells users to share) OR the raw 64-char hex `entity_id`
+    (backward compat).  Returns (entity_id_bytes, error).  On success
+    error is "" and entity_id_bytes is the 32-byte canonical form.
+
+    Public surface: messagechain.org pastes whatever the user typed in,
+    so this MUST surface a clear error on a typo'd `mc1...` (the whole
+    point of the bech32 form is to catch transcription errors before
+    they reach the chain).
+    """
+    if not isinstance(s, str):
+        return None, "address must be a string"
+    s = s.strip()
+    if not s:
+        return None, "address must be 64 hex characters (entity_id) or mc1... form"
+    try:
+        return decode_address(s), ""
+    except InvalidAddressChecksumError as e:
+        return None, f"Invalid mc1 address (bad checksum): {e}"
+    except InvalidAddressError:
+        if is_checksummed(s):
+            # Tampered prefix-bearing string — wrong length or non-hex body.
+            return None, "Invalid mc1 address — wrong length or non-hex body"
+        # Legacy path: input was meant to be raw hex.  Preserve the
+        # exact "must be 32 bytes (got N)" error for 16/64/etc. byte
+        # mistakes so the older client-side messaging keeps working.
+        try:
+            raw = bytes.fromhex(s.lower())
+        except (ValueError, AttributeError):
+            return None, "address must be 64 hex characters (entity_id) or mc1... form"
+        return None, f"address must be 32 bytes (got {len(raw)})"
 
 
 # Proof-of-work difficulty in leading zero bits of sha256(seed || nonce
@@ -250,14 +293,13 @@ class FaucetState:
         time, so a malicious requester cannot drain by hoarding
         challenges.
         """
-        try:
-            address = bytes.fromhex(address_hex.strip())
-        except (ValueError, AttributeError):
-            return False, "address must be 64 hex characters (entity_id)", {}
-        if len(address) != 32:
-            return False, (
-                f"address must be 32 bytes (got {len(address)})"
-            ), {}
+        # Public surface: accept either `mc1...` (checksummed, what the
+        # CLI tells users to share) or raw 64-char hex (backward compat).
+        # Internal storage stays bytes/hex; the form is only a UX detail
+        # at the wire boundary.
+        address, err = _normalize_faucet_address(address_hex)
+        if address is None:
+            return False, err, {}
 
         with self._lock:
             self._evict_expired_challenges_locked(time.time())
@@ -344,19 +386,12 @@ class FaucetState:
         set, window counter incremented) BEFORE the function returns,
         so a concurrent request cannot double-spend the same slot.
         """
-        # Address sanity outside the lock -- pure CPU work.
-        try:
-            recipient_bytes = bytes.fromhex(recipient_hex.strip())
-        except (ValueError, AttributeError):
-            return FaucetDripResult(
-                ok=False,
-                error="address must be 64 hex characters (entity_id)",
-            )
-        if len(recipient_bytes) != 32:
-            return FaucetDripResult(
-                ok=False,
-                error=f"address must be 32 bytes (got {len(recipient_bytes)})",
-            )
+        # Address sanity outside the lock -- pure CPU work.  Accept
+        # either `mc1...` (checksummed, what the CLI tells users to
+        # share) or raw 64-char hex (backward compat).
+        recipient_bytes, addr_err = _normalize_faucet_address(recipient_hex)
+        if recipient_bytes is None:
+            return FaucetDripResult(ok=False, error=addr_err)
 
         # Parse + validate the PoW solution outside the lock; the only
         # state read is the challenge dict, and we re-fetch under the
