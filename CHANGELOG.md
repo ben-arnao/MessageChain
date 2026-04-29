@@ -6,16 +6,41 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.38.0] — 2026-04-28
 
-CLAUDE.md anchor revision: the reward-curve shape changes from a
-piecewise sigmoid (small < middle > large, large = saturating-linear)
-to a single smooth concave function whose per-unit-stake yield
-diminishes monotonically from a peak at near-zero stake toward a floor
-as stake grows large, asymptotically approaching the floor without
-ever reaching it.  Replaces the entire small/mid/baseline/saturating-
-tail piecewise machinery of Tiers 20+38 with one continuous rational
-function; preserves the "always earn more for more stake" property
-(absolute reward strictly increasing and concave in stake) while
-mitigating PoS's natural rich-get-richer drift more aggressively.
+Two new hard forks plus a no-fork wallet UX pass, an internal state-
+root refactor, and a feed-page restyle.  The headline anchor revision
+is the reward-curve shape: from a piecewise sigmoid (small < middle >
+large, large = saturating-linear) to a single smooth concave function
+whose per-unit-stake yield diminishes monotonically from a peak at
+near-zero stake toward a floor as stake grows large, asymptotically
+approaching the floor without ever reaching it.  Replaces the entire
+small/mid/baseline/saturating-tail piecewise machinery of Tiers 20+38
+with one continuous rational function; preserves the "always earn
+more for more stake" property (absolute reward strictly increasing and
+concave in stake) while mitigating PoS's natural rich-get-richer drift
+more aggressively.  Tier 39 closes a residual collusion path against
+the Tier 35 silent-drop slashing arm before Tier 40 lands.
+
+### Tier 39 — Submission-ack backdating defense (hard fork, height 802)
+
+- A coerced target validator + colluding proposer could shift the
+  `witness_ack_registry`'s recorded discharge height to any past
+  block by signing an ack with `commit_height = earliest_obs - 1` and
+  landing it at the late tip.  The non-response apply gate then read
+  "obligation met" and skipped the slash — neutering Tier 35's
+  silent-drop arm under two-validator collusion.  Adversary defended:
+  validator collusion (the primary anchored adversary).
+- Two complementary defenses ride at
+  `ACK_BACKDATING_DEFENSE_HEIGHT = 802` (one above Tier 38):
+  (a) bound `ack.commit_height` to
+      `[block_height - (DEADLINE + ACK_INCLUSION_GRACE), block_height]`
+      so an ack landing at the tip cannot point arbitrarily far back;
+  (b) record `block.header.block_number` (the actual inclusion
+      height) in the `witness_ack_registry` instead of
+      `ack.commit_height`, removing issuer control over the deadline
+      reference entirely.
+- Pre-activation: byte-identical replay.  Tests:
+  `tests/test_ack_backdating_defense.py` (6 tests).
+- Source: `7821331` (audit top-3 branch, merged via `830209b`).
 
 ### Tier 40 — Smooth concave reward curve (hard fork, height 900)
 
@@ -26,7 +51,7 @@ mitigating PoS's natural rich-get-richer drift more aggressively.
                       (MULT_DEN  · (SCALE + s))
 
   Properties (all derivable from the formula, asserted by
-  `tests/test_reward_curve_smooth_tier39.py`): peak at stake_bps=0 is
+  `tests/test_reward_curve_smooth_tier40.py`): peak at stake_bps=0 is
   exactly PEAK_NUM/MULT_DEN; asymptote at stake_bps→∞ is FLOOR_NUM/
   MULT_DEN, never reached for any finite stake; multiplier strictly
   decreasing in stake_bps (no kinks, no flat region, no hump);
@@ -68,6 +93,54 @@ mitigating PoS's natural rich-get-richer drift more aggressively.
   identical pinning (guards against accidental edits), dispatcher
   source-level wiring check (apply path + sim mirror both gate v3 on
   `REWARD_CURVE_SMOOTH_HEIGHT`).  103 subtest assertions in 2.1s.
+- Source: `e7a0467` (merged via `1752736`).
+
+### Changed (UX — wallet first-touch, no fork)
+
+- **README first-touch path no longer pays full WOTS+ keygen on every
+  command.**  `cmd_generate_key` now warms the personal-wallet cache;
+  `cmd_verify_key` routes through the shared resolver;
+  `cmd_balance` / `cmd_key_status` accept a read-only `--address` flag
+  that skips key resolution entirely; `cmd_start --mine` consults the
+  daemon's `_load_or_create_entity` cache.  Also fixes a stale
+  `info --entity-id` printf in `cmd_bootstrap_seed` (the `info`
+  subcommand doesn't accept that flag) — now points at
+  `balance --address mc1...`.  Client-side only.  Tests:
+  `tests/test_wallet_cache_first_commands.py` (5 tests).
+- Source: `7821331` (merged via `830209b`).
+
+### Changed (internal — state-root computation, no fork)
+
+- **`compute_post_state_root_for_block(block)`** helper added.  The
+  legacy 18-explicit-kwarg `compute_post_state_root` signature shipped
+  two mainnet bugs already (1.29.x react-tx; the post-Tier-32 sim-vs-
+  apply mirroring campaign).  The new helper reads tx lists via the
+  canonical `_BLOCK_TX_LIST_ATTRS` registry — adding a new tx kind is
+  now a one-line append.  Both call sites (`propose_block` +
+  `add_block` pre-check) route through the helper; the legacy
+  `compute_post_state_root` signature is kept for tests.  A
+  structural-guard test pins the registry-walk pattern.  Byte-
+  identical state-root output for every historical block; no fork
+  required.  Tests:
+  `tests/test_compute_post_state_root_registry.py` (5 tests).
+- Source: `7821331` (merged via `830209b`).
+
+### Changed (UI — public feed)
+
+- **Feed call-to-action restyle** at `messagechain/static/feed.html`:
+  bare green numbers (no inline labels); faucet element styled as a
+  matching CTA tile with a caret affordance, lining up visually with
+  the GitHub / first-message / run-a-node tiles.  Static asset only;
+  no protocol or backend impact.
+- Source: `0a80c7f` (merged via `9c63b75`).
+
+### Operator notes
+
+- **Two activation heights ride in this release.**  Tier 39 at
+  `ACK_BACKDATING_DEFENSE_HEIGHT = 802` and Tier 40 at
+  `REWARD_CURVE_SMOOTH_HEIGHT = 900`.  All validators must upgrade to
+  1.38.0 within the runway window (current tip → 802).  Roll
+  validators with `messagechain upgrade --yes`.
 
 ## [1.37.0] — 2026-04-28
 
