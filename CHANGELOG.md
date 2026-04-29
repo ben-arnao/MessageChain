@@ -4,6 +4,34 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.38.2] — 2026-04-28
+
+Operational hardening: the `upgrade` CLI now runs a cold-load
+smoke test against the existing `chain.db` BEFORE stopping the
+running service.  Catches the failure mode that took down
+validator-1 during the 1.38.0 rollout (see 1.38.1 for context):
+a wire-format slot whose activation height was crossed under an
+older binary that lacked the slot, then encountered by a newer
+decoder that expects it — invisible to the warm running service,
+fatal on cold-load.
+
+### Changed (operations)
+
+- **`messagechain upgrade --yes`** now spawns a short-lived
+  subprocess that imports the new code from the verified clone
+  and attempts `Blockchain(db=ChainDB(...))` against the live
+  data dir.  If the smoke test fails (or hangs >120s), the
+  upgrade aborts with a clear diagnostic and the running
+  service is left untouched.  Only after the smoke test passes
+  does the CLI proceed to `systemctl stop`, backup, install,
+  and post-restart health check.  Net effect: the previous
+  failure mode (new binary can't read chain.db, but we only
+  discover this AFTER the running service was stopped, leaving
+  the operator to repair from the bak directory) cannot recur.
+- The smoke test is read-only against `chain.db` and runs as
+  the service user via `sudo -n -u <service_user>` so it
+  exercises the same path the post-restart service will use.
+
 ## [1.38.1] — 2026-04-28
 
 Hotfix release.  Re-runways the Tier 33–40 activation heights so an

@@ -6163,9 +6163,70 @@ def cmd_upgrade(args):
         )
     _say("Signature OK.")
 
+    # --- Pre-stop cold-load smoke test ---
+    # Spawn a short-lived subprocess that imports the NEW code from the
+    # clone directory and tries to cold-load chain.db.  Catches the
+    # failure mode where the new binary's block decoder can't read
+    # blocks the running binary wrote (e.g. a wire-format slot whose
+    # activation height was crossed under an older binary that lacked
+    # the slot, then encountered by a newer decoder that expects it).
+    # That class of bug is invisible to the warm running service --
+    # only manifests on cold-load -- so we MUST verify the new code
+    # can cold-load BEFORE we stop the service that's keeping the
+    # warm in-memory state alive.
+    _say("Pre-stop cold-load smoke test against existing chain.db...")
+    smoke_code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from messagechain.storage.chaindb import ChainDB; "
+        "from messagechain.core.blockchain import Blockchain; "
+        "db = ChainDB(sys.argv[2] + '/chain.db'); "
+        "bc = Blockchain(db=db); "
+        "n = len(bc.chain) if hasattr(bc, 'chain') else 0; "
+        "print('cold-load OK: blocks=' + str(n))"
+    )
+    try:
+        smoke = subprocess.run(
+            [
+                "sudo", "-n", "-u", args.service_user,
+                "python3", "-c", smoke_code,
+                clone_dir, args.data_dir,
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
+        _fail(
+            "cold-load smoke test timed out (>120s); service untouched "
+            "and still running on prior binary.  The new binary may "
+            "hang during chain replay -- investigate before retrying."
+        )
+    if smoke.returncode != 0:
+        try:
+            shutil.rmtree(clone_dir)
+        except OSError:
+            pass
+        _fail(
+            "cold-load smoke test FAILED -- service untouched and still "
+            "running on prior binary.  The new binary cannot decode "
+            "the existing chain.db.  Likely cause: a wire-format "
+            "activation height was crossed under an older binary that "
+            "lacked the corresponding code, and the new binary's "
+            "decoder expects the post-fork format.  Inspect the "
+            "stderr below, then either (a) cut a hotfix that pushes "
+            "activation heights past the current tip, or (b) restore "
+            "chain.db from a known-good checkpoint.\n"
+            f"--- smoke test stdout ---\n{smoke.stdout}\n"
+            f"--- smoke test stderr ---\n{smoke.stderr}"
+        )
+    _say(f"Cold-load smoke test passed: {smoke.stdout.strip()}")
+
     # --- Stop service ---
-    # Only reached after clone + verify succeed.  From here on we own
-    # the downtime window and any failure triggers backup restore.
+    # Only reached after clone + verify + smoke-test succeed.  From here
+    # on we own the downtime window and any failure triggers backup
+    # restore.
     _say(f"Stopping {args.service}...")
     try:
         subprocess.run(
