@@ -2294,6 +2294,33 @@ SUBMISSION_REJECTION_BURST = 3                   # up to 3 rejection proofs imme
 SUBMISSION_ACK_RATE_LIMIT_PER_SEC = 0.1   # 1 per 10 seconds steady
 SUBMISSION_ACK_BURST = 5                   # up to 5 acks immediately
 
+# Dedicated per-IP budget for SUCCESS-PATH receipt issuance.  Audit
+# (2026-04-28): pre-fix the message-path success branch in
+# `submit_transaction_to_mempool` always called `receipt_issuer.issue`
+# whenever an issuer was wired -- with NO budget gate.  An attacker
+# paying floor-fee txs at the standard SUBMISSION_RATE_LIMIT cap
+# (2/sec, 10-burst) drains the validator's receipt subtree in minutes
+# from a single /24, silently bricking the censorship-evidence
+# pipeline (the chain's primary defense against the PRIMARY anchored
+# adversary -- validator collusion).
+#
+# A dedicated bucket -- separate from rejection/ack -- means the
+# success-path leaf budget isn't competing with opt-in slash-evidence
+# issuance.  All three families share the SAME global cap (see
+# RECEIPT_GLOBAL_BURST) because all three burn from the same
+# RECEIPT_SUBTREE pool.
+#
+# Sized intentionally tighter than SUBMISSION_BURST=10: an honest
+# client typically submits one or two receipts per session (one per
+# message they want slash-evidence for); a 5-burst with 0.1/sec
+# refill (1 every 10s) covers honest workload generously while
+# capping single-IP drain to single digits per minute.  Exhaustion
+# falls open: the tx is still admitted, the response just doesn't
+# include a receipt_hex (same shape as the broken-issuer fail-open
+# path that already existed pre-fix).
+SUBMISSION_RECEIPT_RATE_LIMIT_PER_SEC = 0.1   # 1 per 10 seconds steady
+SUBMISSION_RECEIPT_BURST = 5                   # up to 5 receipts immediately
+
 # ─────────────────────────────────────────────────────────────────────
 # Public read-only feed (messagechain.network.public_feed_server)
 # ─────────────────────────────────────────────────────────────────────

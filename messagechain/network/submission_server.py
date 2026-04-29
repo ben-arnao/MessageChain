@@ -51,6 +51,8 @@ from messagechain.config import (
     SUBMISSION_BURST,
     SUBMISSION_FEE,
     SUBMISSION_RATE_LIMIT_PER_SEC,
+    SUBMISSION_RECEIPT_BURST,
+    SUBMISSION_RECEIPT_RATE_LIMIT_PER_SEC,
     SUBMISSION_REJECTION_BURST,
     SUBMISSION_REJECTION_RATE_LIMIT_PER_SEC,
 )
@@ -266,6 +268,7 @@ def submit_transaction_to_mempool(
     request_rejection: bool = False,
     witnessed_request_hash: Optional[bytes] = None,
     ack_allowed: bool = True,
+    receipt_allowed: bool = True,
     *,
     pending_nonce: Optional[int] = None,
 ) -> SubmissionResult:
@@ -321,6 +324,19 @@ def submit_transaction_to_mempool(
     a tx whose signature actually verifies), the validator is slashable
     via BogusRejectionEvidenceTx — closes the receipt-less censorship
     gap where a coerced validator answers honest submissions with a lie.
+
+    `receipt_allowed` (default True): per-IP success-path receipt
+    budget gate.  When False, NO success-path receipt is issued for
+    this submission (audit 2026-04-28: the success branch had no
+    budget gate at all, letting one /24 brick the censorship-evidence
+    pipeline in minutes by draining the receipt subtree's WOTS+
+    leaves).  Default True preserves the legacy behavior for callers
+    that don't have access to a per-IP source (RPC test harnesses,
+    direct-helper invocations).  The HTTP handler always computes
+    this from `_HandlerContext.receipt_budget_check(client_ip)` so
+    production paths are gated.  Fail-open: when False, the tx is
+    still admitted (receipt_hex empty) -- a fail-CLOSED gate would
+    itself become a censorship vector.
     """
     # Dispatch by tx class.  Keep the MessageTransaction path inline
     # below for byte-for-byte parity with 1.28.4; delegate Transfer
@@ -335,6 +351,7 @@ def submit_transaction_to_mempool(
             request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
             ack_allowed=ack_allowed,
+            receipt_allowed=receipt_allowed,
             pending_nonce=pending_nonce,
         )
     if isinstance(tx, ReactTransaction):
@@ -344,6 +361,7 @@ def submit_transaction_to_mempool(
             request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
             ack_allowed=ack_allowed,
+            receipt_allowed=receipt_allowed,
             pending_nonce=pending_nonce,
         )
     # Fall through to the MessageTransaction path.
@@ -468,8 +486,16 @@ def submit_transaction_to_mempool(
     # validator MUST commit to having seen it, on pain of
     # censorship-evidence slashing if the tx is not eventually
     # included.
+    #
+    # `receipt_allowed` gates leaf consumption (audit 2026-04-28).
+    # When False (per-IP receipt budget exhausted) we skip the
+    # issuer call entirely so NO leaf is burned -- otherwise an
+    # attacker draining the budget bucket would still drain the
+    # underlying WOTS+ subtree.  Fail-open semantics: the tx is
+    # still admitted, the response just has empty receipt_hex
+    # (same shape as a broken issuer).
     receipt_hex = ""
-    if receipt_issuer is not None:
+    if receipt_issuer is not None and receipt_allowed:
         try:
             receipt = receipt_issuer.issue(tx.tx_hash)
             receipt_hex = receipt.to_bytes().hex()
@@ -488,13 +514,19 @@ def submit_transaction_to_mempool(
 
 def _maybe_issue_receipt_for(
     receipt_issuer: Optional[ReceiptIssuer], tx_hash: bytes,
+    receipt_allowed: bool = True,
 ) -> str:
     """Best-effort receipt issuance.  Empty string if no issuer or
     the issuer raises (a broken issuer must NOT block submission
     success — the tx is already in the mempool, so the safe answer
     is "admitted, no receipt").
+
+    `receipt_allowed` (default True): per-IP success-path receipt
+    budget gate.  When False, returns "" without invoking the issuer
+    so NO WOTS+ leaf is consumed (audit 2026-04-28; mirrors the
+    inline gate in `submit_transaction_to_mempool`).
     """
-    if receipt_issuer is None:
+    if receipt_issuer is None or not receipt_allowed:
         return ""
     try:
         receipt = receipt_issuer.issue(tx_hash)
@@ -558,6 +590,7 @@ def _submit_transfer_to_mempool(
     request_rejection: bool = False,
     witnessed_request_hash: Optional[bytes] = None,
     ack_allowed: bool = True,
+    receipt_allowed: bool = True,
     pending_nonce: Optional[int] = None,
 ) -> SubmissionResult:
     """Validate-and-admit path for TransferTransaction.
@@ -639,7 +672,9 @@ def _submit_transfer_to_mempool(
 
     return SubmissionResult(
         ok=True, tx_hash=tx.tx_hash,
-        receipt_hex=_maybe_issue_receipt_for(receipt_issuer, tx.tx_hash),
+        receipt_hex=_maybe_issue_receipt_for(
+            receipt_issuer, tx.tx_hash, receipt_allowed=receipt_allowed,
+        ),
         ack_hex=_maybe_issue_ack_for(
             receipt_issuer, witnessed_request_hash,
             ack_allowed, ACK_ADMITTED,
@@ -655,6 +690,7 @@ def _submit_react_to_mempool(
     request_rejection: bool = False,
     witnessed_request_hash: Optional[bytes] = None,
     ack_allowed: bool = True,
+    receipt_allowed: bool = True,
     pending_nonce: Optional[int] = None,
 ) -> SubmissionResult:
     """Validate-and-admit path for ReactTransaction (Tier 17).
@@ -876,7 +912,9 @@ def _submit_react_to_mempool(
 
     return SubmissionResult(
         ok=True, tx_hash=tx.tx_hash,
-        receipt_hex=_maybe_issue_receipt_for(receipt_issuer, tx.tx_hash),
+        receipt_hex=_maybe_issue_receipt_for(
+            receipt_issuer, tx.tx_hash, receipt_allowed=receipt_allowed,
+        ),
         ack_hex=_maybe_issue_ack_for(
             receipt_issuer, witnessed_request_hash,
             ack_allowed, ACK_ADMITTED,
@@ -1221,11 +1259,28 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
             )
             ack_allowed = budget_ok and obs_ok
 
+        # Per-IP success-path receipt budget (audit 2026-04-28).
+        # Pre-fix the success branch in submit_transaction_to_mempool
+        # always called `receipt_issuer.issue` whenever an issuer was
+        # wired -- with NO budget gate.  An attacker paying floor-fee
+        # txs at the standard SUBMISSION_RATE_LIMIT cap (2/sec,
+        # 10-burst) drains the validator's 65k-leaf RECEIPT_SUBTREE
+        # in minutes from a single /24, silently bricking the
+        # censorship-evidence pipeline (the chain's primary defense
+        # against the PRIMARY anchored adversary -- validator
+        # collusion).  Computed BEFORE submit() so the token is
+        # consumed atomically with the decision to issue (mirror of
+        # _should_request_rejection / ack_allowed shape).  Fail-open:
+        # exhaustion drops the receipt issuance but the underlying
+        # submission still processes.
+        receipt_allowed = ctx.receipt_budget_check(self._client_ip())
+
         # Inject via the shared helper (same semantics as RPC ingress).
         result = ctx.submit(
             tx, request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
             ack_allowed=ack_allowed,
+            receipt_allowed=receipt_allowed,
         )
 
         # Defense-in-depth: if an ack was issued, fan it out to peers
@@ -1459,6 +1514,22 @@ class ReceiptBudgetTracker:
         # opt-in path.  Every SubmissionAck consumes one WOTS+ leaf
         # from the SAME receipt subtree as receipts and rejections.
         self._ack_buckets: dict[str, TokenBucket] = {}
+        # Dedicated per-IP budget for SUCCESS-PATH receipt issuance
+        # (audit 2026-04-28).  Pre-fix the success branch in
+        # `submit_transaction_to_mempool` always called
+        # `receipt_issuer.issue` whenever an issuer was wired -- with
+        # NO budget gate.  An attacker paying floor-fee txs at the
+        # standard SUBMISSION_RATE_LIMIT cap (2/sec, 10-burst) drains
+        # the validator's 65k-leaf RECEIPT_SUBTREE in minutes from a
+        # single /24, silently bricking the censorship-evidence
+        # pipeline (the chain's primary defense against the PRIMARY
+        # anchored adversary -- validator collusion).
+        #
+        # Separate bucket dict from rejection / ack so the success-
+        # path leaf budget isn't competing with opt-in slash-evidence
+        # issuance, but feeds the SAME global cap (every issuance
+        # path burns from the same RECEIPT_SUBTREE).
+        self._receipt_buckets: dict[str, TokenBucket] = {}
         # Shared last-active timestamp dict — used by both bucket
         # families for LRU eviction.
         self._last_active: dict[str, float] = {}
@@ -1619,6 +1690,69 @@ class ReceiptBudgetTracker:
             self._last_active[ip] = _time.time()
             return True
 
+    def receipt_budget_check(self, ip: str) -> bool:
+        """Consume one token from `ip`'s RECEIPT bucket AND the global
+        bucket; True iff both pass.
+
+        Gates the SUCCESS-PATH receipt issuance (the
+        `receipt_issuer.issue(tx_hash)` call inside
+        `submit_transaction_to_mempool` after a tx is admitted to the
+        mempool).  Pre-fix that call had no budget gate -- one /24
+        could drain the validator's 65k-leaf RECEIPT_SUBTREE in
+        minutes by paying floor-fee txs at the standard
+        SUBMISSION_RATE_LIMIT cap, silently bricking the
+        censorship-evidence pipeline.
+
+        Bucket sizing comes from SUBMISSION_RECEIPT_RATE_LIMIT_PER_SEC
+        / SUBMISSION_RECEIPT_BURST -- chosen to fit honest workload
+        (one or two receipts per session) while capping single-IP
+        drain to single digits per minute.
+
+        Exhaustion does NOT block the underlying submission -- the
+        caller observes False and skips the issuer call (fail-open;
+        same shape as the broken-issuer path).  The leaf is preserved
+        because the issuer is never invoked on this request.
+
+        Gate order: per-IP first, then global.  Per-IP failure
+        consumes nothing.  Global failure (per-IP would have passed)
+        also consumes nothing -- mirrors the rejection / ack methods'
+        no-double-spend rationale.
+        """
+        import time as _time
+        with self._buckets_lock:
+            bucket = self._receipt_buckets.get(ip)
+            if bucket is None:
+                if len(self._receipt_buckets) >= self._max_tracked_ips:
+                    to_drop = []
+                    for _ip, _b in self._receipt_buckets.items():
+                        _b._refill()
+                        if _b.tokens >= _b.max_tokens:
+                            to_drop.append(_ip)
+                    for _ip in to_drop:
+                        del self._receipt_buckets[_ip]
+                    if len(self._receipt_buckets) >= self._max_tracked_ips:
+                        oldest_ip = min(
+                            self._receipt_buckets,
+                            key=lambda k: self._last_active.get(k, 0.0),
+                        )
+                        del self._receipt_buckets[oldest_ip]
+                    if len(self._receipt_buckets) >= self._max_tracked_ips:
+                        return False
+                bucket = TokenBucket(
+                    rate=SUBMISSION_RECEIPT_RATE_LIMIT_PER_SEC,
+                    max_tokens=SUBMISSION_RECEIPT_BURST,
+                )
+                self._receipt_buckets[ip] = bucket
+            # Peek per-IP, then global; consume both only on full pass.
+            bucket._refill()
+            if bucket.tokens < 1.0:
+                return False
+            if not self._consume_global_locked():
+                return False
+            bucket.tokens -= 1.0
+            self._last_active[ip] = _time.time()
+            return True
+
 
 class _HandlerContext:
     """Shared state for all handlers on a single SubmissionServer.
@@ -1726,6 +1860,18 @@ class _HandlerContext:
         """
         return self._budget_tracker.ack_budget_check(ip)
 
+    def receipt_budget_check(self, ip: str) -> bool:
+        """Delegate to the shared `ReceiptBudgetTracker`.
+
+        Gates SUCCESS-PATH receipt issuance.  See
+        `ReceiptBudgetTracker.receipt_budget_check` for the audit
+        2026-04-28 threat model: pre-fix the success branch had no
+        budget gate at all, letting one /24 brick the censorship-
+        evidence pipeline by draining the receipt subtree's WOTS+
+        leaves.
+        """
+        return self._budget_tracker.receipt_budget_check(ip)
+
     # ── Compatibility shims for legacy tests ─────────────────────────
     # A handful of existing tests poke at the bucket dicts directly
     # (test_rejection_rate_limit.py introspection cases).  Expose
@@ -1739,6 +1885,10 @@ class _HandlerContext:
     @property
     def _ack_buckets(self):
         return self._budget_tracker._ack_buckets
+
+    @property
+    def _receipt_buckets(self):
+        return self._budget_tracker._receipt_buckets
 
     def _evict_inactive_locked(self):
         """Drop buckets that are fully refilled (peer hasn't posted in a while)."""
@@ -1765,6 +1915,7 @@ class _HandlerContext:
         request_rejection: bool = False,
         witnessed_request_hash: Optional[bytes] = None,
         ack_allowed: bool = True,
+        receipt_allowed: bool = True,
     ) -> SubmissionResult:
         return submit_transaction_to_mempool(
             tx, self.blockchain, self.mempool,
@@ -1772,6 +1923,7 @@ class _HandlerContext:
             request_rejection=request_rejection,
             witnessed_request_hash=witnessed_request_hash,
             ack_allowed=ack_allowed,
+            receipt_allowed=receipt_allowed,
         )
 
     def submit_proof(self, proof) -> SubmissionResult:
