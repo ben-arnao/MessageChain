@@ -5106,10 +5106,12 @@ class Blockchain:
                     FINALITY_INTERVAL as _FI,
                     REWARD_CURVE_HEIGHT as _RCH,
                     REWARD_CURVE_LARGE_BAND_HEIGHT as _RCLBH,
+                    REWARD_CURVE_SMOOTH_HEIGHT as _RCSH,
                 )
                 from messagechain.economics.inflation import (
                     reward_curve_multiplier as _reward_curve_multiplier,
                     reward_curve_multiplier_v2 as _reward_curve_multiplier_v2,
+                    reward_curve_multiplier_v3 as _reward_curve_multiplier_v3,
                 )
                 _cap_active = block_height >= _ARCH
                 _cap_fix_active = block_height >= _ACFH
@@ -5126,6 +5128,12 @@ class Blockchain:
                 # saturating-large slope is reproduced bit-for-bit by
                 # the sim that drives the state-root commitment.
                 _curve_v2_active = block_height >= _RCLBH
+                # Tier 40 sim-mirror: swap in v3 helper at/after
+                # REWARD_CURVE_SMOOTH_HEIGHT.  v3 supersedes v2's
+                # piecewise tail with a smooth concave function; sim
+                # must call the same helper as the apply path so the
+                # state-root commitment matches bit-for-bit.
+                _curve_v3_active = block_height >= _RCSH
                 _sim_total_stake = (
                     sum(sim_staked.values()) if _curve_active else 0
                 )
@@ -5173,7 +5181,11 @@ class Blockchain:
                             sim_staked.get(eid, 0) * 10_000
                             // _sim_total_stake
                         )
-                        if _curve_v2_active:
+                        if _curve_v3_active:
+                            _num, _den = _reward_curve_multiplier_v3(
+                                _stake_bps,
+                            )
+                        elif _curve_v2_active:
                             _num, _den = _reward_curve_multiplier_v2(
                                 _stake_bps,
                             )
