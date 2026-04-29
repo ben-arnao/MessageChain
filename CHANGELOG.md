@@ -4,6 +4,67 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.40.0] — 2026-04-28
+
+UX / value-prop release.  No consensus changes, no fork gate.  The
+public web feed at messagechain.org rendered a list of messages
+without any per-message permanence affordance — visually
+indistinguishable from a generic social feed despite the chain's
+defining property being slashing-backed permanence.  This release
+makes the headline guarantee visible at the read surface.
+
+### Added (UX / web feed)
+
+- **Per-message "Permanent · verify" link** on every card on the
+  live feed.  Each card links to `/r/<tx_hash>`, a new permanence-
+  receipt page that renders inclusion proof + attester count +
+  finality threshold and frames the message as "on-chain forever,
+  suppression is slashable."
+- **Chain-identity footer** on every page (feed, entity profile,
+  receipt page).  Surfaces `chain_id`, short `genesis_hash`, and
+  short `tip_hash` so a paranoid visitor on a hostile network can
+  cross-check the rendered values against the README's pinned
+  genesis hash without leaving the page.
+- **Tier 25 community handle surfaced end-to-end.**
+  `Blockchain.get_recent_messages` now includes the optional
+  `community_id` field on each message dict.  The feed UI renders
+  it as a `[handle]` chip; the CLI `read` listing renders it as
+  `[handle]` after the timestamp.
+- **`/v1/info` extended** with `genesis_hash`, `tip_hash`, and
+  `state_root` (the data already comes back from
+  `Blockchain.get_chain_info`; the public-feed endpoint just wasn't
+  forwarding it).
+- **`/v1/tx_status` JSON proxy** on the public-feed server,
+  inclusion-only.  Same schema as the `_rpc_get_tx_status`
+  "included" branch so the receipt-page UI consumes the same JSON
+  whether it talks to the JSON-RPC port or the public-feed shim.
+  Backed by a new `Blockchain.get_tx_status_public` helper.
+- **`/r/<tx_hash>` static permanence-receipt page** mirroring the
+  `/e/<entity_id>` pattern.  Renders inclusion proof, block hash,
+  attesters, finality threshold flag, and a "Permanent / awaiting
+  finality / not found" verdict line in plain language.
+
+### Changed (UX / web feed)
+
+- **Subhead rewrite** on the feed landing page and the README
+  headline.  "A permanent, censorship-resistant ledger for human
+  speech" reads as protocol jargon to a first-time visitor;
+  "An uncensorable public square. Posts, replies, communities,
+  votes — on-chain forever. Suppression is slashable." names the
+  product before the property.
+
+### Added (CLI)
+
+- **`messagechain read` shows tx_hash, prev pointer, community
+  chip, and vote totals** when present — pulling the same fields
+  the web feed already had.  Pre-fix, the CLI listing dropped most
+  of what the RPC was returning.
+- **`messagechain read --community-id <handle>`** filters the
+  listing client-side to a single Tier 25 community.
+- **`messagechain read --by-address <hex|mc1...>`** filters the
+  listing client-side to a single sender (accepts both bare hex and
+  bech32 form).
+
 ## [1.39.1] — 2026-04-29
 
 Hotfix on top of 1.39.0.  The cold-load smoke test introduced in

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MessageChain — message receipt</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #111;
+    --muted: #666;
+    --card: #f5f5f5;
+    --border: #ddd;
+    --accent: #0a5;
+    --pos: #0a5;
+    --neg: #c33;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0e10;
+      --fg: #eee;
+      --muted: #888;
+      --card: #1a1a1d;
+      --border: #2a2a2e;
+      --accent: #6c9;
+      --pos: #6c9;
+      --neg: #e88;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.45;
+  }
+  header {
+    padding: 1.2rem 1.2rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    margin: 0 0 0.25rem;
+    font-size: 1.35rem;
+    letter-spacing: -0.01em;
+  }
+  header h1 a { color: var(--fg); text-decoration: none; }
+  header .sub { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  header .sub a { color: var(--accent); }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1rem 1rem 4rem;
+  }
+  .verdict {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.9rem 1rem;
+    margin: 0.8rem 0 1rem;
+  }
+  .verdict.permanent {
+    border-color: var(--pos);
+    background: color-mix(in srgb, var(--pos) 8%, var(--card));
+  }
+  .verdict.pending {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 6%, var(--card));
+  }
+  .verdict.missing {
+    border-color: var(--neg);
+    background: color-mix(in srgb, var(--neg) 6%, var(--card));
+  }
+  .verdict h2 {
+    margin: 0 0 0.3rem;
+    font-size: 1rem;
+    letter-spacing: 0.02em;
+  }
+  .verdict .verdict-line {
+    font-size: 0.95rem;
+    margin-bottom: 0.5rem;
+  }
+  .verdict .narrative {
+    color: var(--muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+  }
+  .id-row {
+    margin: 0.4rem 0 1rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    color: var(--muted);
+    word-break: break-all;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.5rem;
+    margin: 0.6rem 0;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.7rem 0.85rem;
+  }
+  .stat .label {
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.25rem;
+  }
+  .stat .value {
+    font-size: 1.05rem;
+    font-weight: 600;
+    word-break: break-all;
+  }
+  .stat .value.mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+  .stat .value.pos { color: var(--pos); }
+  .stat .value.neg { color: var(--neg); }
+  .section { margin-top: 1.4rem; }
+  .section h2 {
+    font-size: 0.95rem;
+    margin: 0 0 0.5rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .status { font-size: 0.85rem; color: var(--muted); margin: 0.75rem 0; }
+  .status.error { color: var(--neg); }
+  pre.proof {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.7rem 0.85rem;
+    font-size: 0.78rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  footer {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-align: center;
+    border-top: 1px solid var(--border);
+  }
+  footer .row { margin: 0.15rem 0; }
+  footer code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+  }
+  footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">MessageChain</a></h1>
+  <p class="sub">Permanent message receipt</p>
+</header>
+<main>
+  <div class="id-row" id="idRow">…</div>
+  <div id="verdict" class="verdict" hidden>
+    <h2 id="verdictTitle">…</h2>
+    <div class="verdict-line" id="verdictLine"></div>
+    <div class="narrative" id="verdictNarrative"></div>
+  </div>
+  <p class="status" id="status">Loading…</p>
+  <div id="details" hidden>
+    <div class="section">
+      <h2>Block</h2>
+      <div class="grid" id="blockGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Attestation</h2>
+      <div class="grid" id="attestGrid"></div>
+    </div>
+    <div class="section" id="proofSection" hidden>
+      <h2>Inclusion proof</h2>
+      <pre class="proof" id="proofBlock"></pre>
+    </div>
+  </div>
+</main>
+<footer id="chainFooter">
+  <div class="row">chain_id <code id="chainId">…</code></div>
+  <div class="row">genesis <code id="footerGenesis">…</code></div>
+  <div class="row">tip <code id="footerTip">…</code> · height <span id="footerHeight">…</span></div>
+  <div class="row"><a href="/">Back to live feed</a></div>
+</footer>
+<script>
+(function () {
+  "use strict";
+  const statusEl = document.getElementById("status");
+  const idRow = document.getElementById("idRow");
+  const detailsEl = document.getElementById("details");
+  const verdictEl = document.getElementById("verdict");
+  const verdictTitle = document.getElementById("verdictTitle");
+  const verdictLine = document.getElementById("verdictLine");
+  const verdictNarrative = document.getElementById("verdictNarrative");
+
+  function shortHex(hex, head, tail) {
+    if (!hex) return "";
+    if (hex.length <= head + tail + 1) return hex;
+    return hex.slice(0, head) + "…" + hex.slice(-tail);
+  }
+
+  function txHashFromPath() {
+    const m = location.pathname.match(/^\/r\/([0-9a-fA-F]{64})$/);
+    return m ? m[1].toLowerCase() : "";
+  }
+
+  function addStat(gridId, label, value, opts) {
+    const card = document.createElement("div");
+    card.className = "stat";
+    const l = document.createElement("div");
+    l.className = "label";
+    l.textContent = label;
+    const v = document.createElement("div");
+    v.className = "value" + (opts && opts.mono ? " mono" : "")
+                          + (opts && opts.pos ? " pos" : "")
+                          + (opts && opts.neg ? " neg" : "");
+    v.textContent = value === null || value === undefined ? "—" : String(value);
+    card.appendChild(l);
+    card.appendChild(v);
+    document.getElementById(gridId).appendChild(card);
+  }
+
+  function clearGrids() {
+    for (const id of ["blockGrid", "attestGrid"]) {
+      const g = document.getElementById(id);
+      if (g) g.replaceChildren();
+    }
+  }
+
+  function renderIncluded(result, txHash) {
+    clearGrids();
+    const finalised = !!result.finality_threshold_met;
+
+    verdictEl.hidden = false;
+    verdictEl.classList.remove("pending", "missing");
+    verdictEl.classList.add("permanent");
+    if (finalised) {
+      verdictTitle.textContent = "Permanent";
+      verdictLine.textContent =
+        "This message is on-chain and can never be deleted.";
+      verdictNarrative.textContent =
+        "Recorded in block " + result.block_height +
+        " with " + result.attesters + " of " + result.total_validators +
+        " validators attesting (" +
+        Math.round(100 * result.attesting_stake /
+                   Math.max(1, result.total_stake)) +
+        "% of stake). Validators that drop or suppress a well-formed " +
+        "message that pays the per-byte floor lose stake on chain.";
+    } else {
+      verdictTitle.textContent = "Included — awaiting finality";
+      verdictLine.textContent =
+        "This message is on-chain. Finality threshold not yet reached.";
+      verdictNarrative.textContent =
+        "Recorded in block " + result.block_height +
+        " with " + result.attesters + " of " + result.total_validators +
+        " validators attesting. Once " + result.finality_numerator +
+        "/" + result.finality_denominator +
+        " of stake attests it becomes permanent and any reorg requires " +
+        "a coordinated majority absorbing slashing risk.";
+    }
+
+    addStat("blockGrid", "Block height", result.block_height);
+    addStat("blockGrid", "Block hash",
+            shortHex(result.block_hash, 10, 8), { mono: true });
+    addStat("blockGrid", "Tx index", result.tx_index);
+    addStat("blockGrid", "Block timestamp",
+            new Date(result.block_timestamp * 1000)
+              .toISOString().replace("T", " ").slice(0, 19) + " UTC");
+    addStat("blockGrid", "Merkle root",
+            shortHex(result.merkle_root, 10, 8), { mono: true });
+
+    const stakePct = result.total_stake > 0
+      ? (100 * result.attesting_stake / result.total_stake).toFixed(1) + "%"
+      : "—";
+    addStat("attestGrid", "Attesters",
+            result.attesters + " / " + result.total_validators);
+    addStat("attestGrid", "Attesting stake",
+            stakePct,
+            { pos: finalised });
+    addStat("attestGrid", "Finality threshold",
+            result.finality_numerator + "/" + result.finality_denominator,
+            { pos: finalised });
+    addStat("attestGrid", "Threshold met",
+            finalised ? "yes" : "not yet",
+            { pos: finalised, neg: !finalised });
+
+    if (result.merkle_proof) {
+      document.getElementById("proofSection").hidden = false;
+      document.getElementById("proofBlock").textContent =
+        JSON.stringify(result.merkle_proof, null, 2);
+    }
+
+    detailsEl.hidden = false;
+  }
+
+  function renderNotFound(txHash) {
+    verdictEl.hidden = false;
+    verdictEl.classList.remove("permanent", "pending");
+    verdictEl.classList.add("missing");
+    verdictTitle.textContent = "Not found on this node";
+    verdictLine.textContent =
+      "No block on this node carries this tx hash.";
+    verdictNarrative.textContent =
+      "This is one of three things: the message was never submitted, " +
+      "the node hasn't yet seen the block carrying it, or the tx hash " +
+      "is malformed. If you submitted recently, wait a block and " +
+      "refresh; if the message stays missing across multiple peers, " +
+      "see the receipt CLI for the slashable-evidence escalation.";
+    detailsEl.hidden = true;
+  }
+
+  async function loadInfo() {
+    try {
+      const r = await fetch("/v1/info", { cache: "no-store" });
+      const data = await r.json();
+      if (!data.ok) return;
+      document.getElementById("chainId").textContent = data.chain_id || "—";
+      document.getElementById("footerGenesis").textContent =
+        data.genesis_hash ? shortHex(data.genesis_hash, 12, 10) : "(loading)";
+      document.getElementById("footerTip").textContent =
+        data.tip_hash ? shortHex(data.tip_hash, 12, 10) : "(loading)";
+      document.getElementById("footerHeight").textContent =
+        data.height ?? "—";
+      // Full hash on hover so a paranoid visitor can copy + compare.
+      const fg = document.getElementById("footerGenesis");
+      const ft = document.getElementById("footerTip");
+      if (data.genesis_hash) fg.title = data.genesis_hash;
+      if (data.tip_hash) ft.title = data.tip_hash;
+    } catch (_) {
+      /* footer is best-effort; missing /v1/info is non-fatal here. */
+    }
+  }
+
+  async function loadStatus(txHash) {
+    statusEl.className = "status";
+    statusEl.textContent = "Looking up message receipt…";
+    try {
+      const r = await fetch(
+        "/v1/tx_status?tx_hash=" + encodeURIComponent(txHash),
+        { cache: "no-store" },
+      );
+      const data = await r.json();
+      if (!r.ok || !data.ok) {
+        statusEl.className = "status error";
+        statusEl.textContent =
+          "Lookup failed: " + (data.error || ("HTTP " + r.status));
+        return;
+      }
+      statusEl.textContent = "";
+      const result = data.result || {};
+      if (result.status === "included") {
+        renderIncluded(result, txHash);
+      } else {
+        renderNotFound(txHash);
+      }
+    } catch (e) {
+      statusEl.className = "status error";
+      statusEl.textContent = "Network error: " + e.message;
+    }
+  }
+
+  const tx = txHashFromPath();
+  if (!tx) {
+    statusEl.className = "status error";
+    statusEl.textContent = "URL must be /r/<64-char hex tx_hash>";
+    return;
+  }
+  idRow.textContent = tx;
+  loadInfo();
+  loadStatus(tx);
+})();
+</script>
+</body>
+</html>

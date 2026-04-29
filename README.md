@@ -3,10 +3,11 @@
 [![release](https://img.shields.io/github/v/release/ben-arnao/MessageChain)](https://github.com/ben-arnao/MessageChain/releases)
 [![license](https://img.shields.io/github/license/ben-arnao/MessageChain)](./LICENSE)
 
-A permanent, censorship-resistant ledger for human speech.
-**Your message can never be deleted.** A well-formed message that
-pays the fee floor is guaranteed inclusion — validators that drop or
-suppress it lose stake on chain.
+An uncensorable public square. Posts, replies, communities, votes —
+on-chain forever. **Your message can never be deleted.** A
+well-formed message that pays the fee floor is guaranteed inclusion;
+suppression is slashable — validators that drop or refuse to attest
+to such a message lose stake on chain.
 
 **Status:** mainnet live. Chain ID `messagechain-v1`, genesis block 0
 `4eeb9edaadb42f1a460e95919bc667a3173c4a84aa9b5488da040ac7a1c054f6`.

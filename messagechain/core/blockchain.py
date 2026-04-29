@@ -13480,10 +13480,132 @@ class Blockchain:
                 prev = getattr(tx, "prev", None)
                 if prev is not None:
                     entry["prev"] = prev.hex()
+                # Tier 25 community_id surface — when the message is a
+                # v5 tx that opted into a community handle, expose it
+                # to the public-feed UI / CLI listing so the topic
+                # grouping is visible end-to-end.  Omit the key
+                # entirely when absent (mirrors `prev`) so JSON stays
+                # compact and clients don't have to disambiguate
+                # "missing" from "explicit null".
+                community_id = getattr(tx, "community_id", None)
+                if community_id is not None:
+                    entry["community_id"] = community_id
                 messages.append(entry)
                 if len(messages) >= count:
                     return messages
         return messages
+
+    def get_tx_status_public(self, tx_hash: bytes) -> dict:
+        """Inclusion-only tx status, suitable for the public web feed.
+
+        Mirrors the shape of the `_rpc_get_tx_status` "included" branch
+        in server.py so the receipt-page UI can consume the same JSON
+        whether it talks to the JSON-RPC port (CLI path) or the public
+        feed's HTTP shim (browser path).  Mempool-side state is NOT
+        exposed here — the public feed never sees the mempool, and a
+        web visitor doesn't need pending-tx ETAs to evaluate a
+        permanence claim.
+
+        Returns a dict with `status` ∈ {"included", "not_found"}.  On
+        included, includes block_height, block_hash, attesters, total
+        validators, attesting/total stake, finality threshold flag,
+        merkle_root, tx_index, and (when available) merkle_proof.
+        """
+        # Locate the block holding this tx.  Prefer the persistent
+        # tx-location index (O(1)); fall back to a chain scan when the
+        # DB isn't wired (test fixture / pre-index migration).
+        location = None
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                location = db.get_tx_location(tx_hash)
+            except Exception:  # noqa: BLE001 — index errors fall through
+                location = None
+        if location is None:
+            for height_idx, blk in enumerate(getattr(self, "chain", [])):
+                for tx in getattr(blk, "transactions", []) or []:
+                    if getattr(tx, "tx_hash", None) == tx_hash:
+                        location = (height_idx, 0)
+                        break
+                if location is not None:
+                    break
+        if location is None:
+            return {"status": "not_found"}
+
+        from messagechain.config import (
+            FINALITY_THRESHOLD_NUMERATOR,
+            FINALITY_THRESHOLD_DENOMINATOR,
+        )
+        block_height, _ = location
+        block = self.get_block(block_height)
+        if block is None:
+            return {"status": "not_found"}
+
+        # Canonical merkle ordering of tx hashes for proof generation.
+        # If the tx isn't in the canonical merkle inputs (schema drift /
+        # non-message tx), surface what we can without a proof rather
+        # than crash.
+        canonical_index = None
+        try:
+            from messagechain.core.block import canonical_block_tx_hashes
+            canonical_hashes = canonical_block_tx_hashes(block)
+            try:
+                canonical_index = canonical_hashes.index(tx_hash)
+            except ValueError:
+                canonical_index = None
+        except Exception:  # noqa: BLE001
+            canonical_index = None
+
+        proof_dict = None
+        if canonical_index is not None:
+            try:
+                from messagechain.core.spv import generate_merkle_proof
+                proof = generate_merkle_proof(block, canonical_index)
+                proof_dict = proof.serialize()
+            except Exception:  # noqa: BLE001 — best-effort
+                proof_dict = None
+
+        block_hash = block.block_hash
+        finality = getattr(self, "finality", None)
+        attester_set = set()
+        attesting_stake = 0
+        if finality is not None:
+            attester_set = set(
+                getattr(finality, "attestations", {}).get(block_hash, set())
+            )
+            attesting_stake = int(
+                getattr(finality, "attested_stake", {}).get(block_hash, 0)
+            )
+
+        supply = getattr(self, "supply", None)
+        staked = dict(getattr(supply, "staked", {}) or {}) if supply else {}
+        total_stake = sum(int(v) for v in staked.values())
+        total_validators = sum(1 for v in staked.values() if int(v) > 0)
+        threshold_met = (
+            total_stake > 0
+            and attesting_stake * FINALITY_THRESHOLD_DENOMINATOR
+            >= total_stake * FINALITY_THRESHOLD_NUMERATOR
+        )
+
+        result = {
+            "status": "included",
+            "block_height": int(block_height),
+            "block_hash": block_hash.hex(),
+            "tx_index": int(canonical_index) if canonical_index is not None else -1,
+            "merkle_root": block.header.merkle_root.hex(),
+            "block_timestamp": int(block.header.timestamp),
+            "current_height": int(self.height),
+            "attesters": len(attester_set),
+            "total_validators": int(total_validators),
+            "attesting_stake": int(attesting_stake),
+            "total_stake": int(total_stake),
+            "finality_threshold_met": bool(threshold_met),
+            "finality_numerator": int(FINALITY_THRESHOLD_NUMERATOR),
+            "finality_denominator": int(FINALITY_THRESHOLD_DENOMINATOR),
+        }
+        if proof_dict is not None:
+            result["merkle_proof"] = proof_dict
+        return result
 
     def get_chain_info(self) -> dict:
         best_tip = self.fork_choice.get_best_tip()
