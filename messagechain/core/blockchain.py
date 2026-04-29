@@ -4359,6 +4359,57 @@ class Blockchain:
             )
         return entity_root
 
+    def compute_post_state_root_for_block(
+        self,
+        block,
+        *,
+        proposer_signature_leaf_index: int | None = None,
+    ) -> bytes:
+        """Block-shaped wrapper around ``compute_post_state_root``.
+
+        Reads tx lists via the canonical
+        ``Blockchain._BLOCK_TX_LIST_ATTRS`` registry rather than
+        hand-listing each kind by name.  Adding a new tx kind is now
+        a one-line gesture (append to the registry); the apply-time
+        sim picks it up automatically here, in
+        ``_block_affected_entities``, and in any other registry-
+        aware sweep.  Pre-refactor the same logic lived in two hand-
+        rolled call sites (``propose_block`` + the validator-side
+        pre-check inside ``_append_block`` / ``add_block``); both
+        now delegate to this helper so the two paths cannot drift.
+
+        Byte-identical contract: for any block whose attribute set
+        is the canonical Block dataclass, the root produced here
+        equals the root produced by passing the same lists into the
+        legacy ``compute_post_state_root`` signature.  See
+        ``tests/test_compute_post_state_root_registry.py`` for the
+        structural-guard pin and the byte-equivalence test.
+
+        Accepts a ``Block | BlockDraft``-equivalent — anything with
+        the canonical attributes via ``getattr`` / default-empty.
+        """
+        # Build the per-kind kwarg mapping from the registry.  The
+        # registry attr names match the legacy kwarg names byte-for-
+        # byte (deliberate — they share intent), so the dispatch is
+        # a straight rename.  Pre-existing semantics:
+        #   * `transactions` is positional in the legacy signature.
+        #   * `inclusion_list` is a non-list block attribute (a single
+        #      InclusionList | None) — read separately, not from the
+        #      registry.
+        kwargs: dict = {}
+        for attr in self._BLOCK_TX_LIST_ATTRS:
+            kwargs[attr] = list(getattr(block, attr, None) or [])
+        # `transactions` is positional in the legacy signature.
+        transactions = kwargs.pop("transactions")
+        return self.compute_post_state_root(
+            transactions=transactions,
+            proposer_id=block.header.proposer_id,
+            block_height=block.header.block_number,
+            proposer_signature_leaf_index=proposer_signature_leaf_index,
+            inclusion_list=getattr(block, "inclusion_list", None),
+            **kwargs,
+        )
+
     def compute_post_state_root(
         self,
         transactions: list[MessageTransaction],
@@ -6508,26 +6559,42 @@ class Blockchain:
         expected_proposer_leaf = getattr(
             proposer_entity.keypair, "_next_leaf", None,
         )
-        state_root = self.compute_post_state_root(
-            transactions, proposer_entity.entity_id, block_height,
+        # Compose a block-shaped draft for the registry-walking helper.
+        # We don't have the real Block yet (still building it), so we
+        # synthesize the minimum surface ``compute_post_state_root_for_block``
+        # touches: the per-kind tx-list attributes (read by attribute
+        # name) plus a ``header`` carrying ``proposer_id`` and
+        # ``block_number``.  Going through the helper instead of
+        # hand-listing 18 kwargs is what makes adding a new tx kind a
+        # one-line gesture (append to ``_BLOCK_TX_LIST_ATTRS``).
+        from types import SimpleNamespace as _NS
+        _draft = _NS(
+            transactions=transactions,
             transfer_transactions=transfer_transactions,
+            slash_transactions=slash_transactions,
             attestations=attestations,
             authority_txs=authority_txs,
             stake_transactions=stake_transactions,
             unstake_transactions=unstake_transactions,
+            react_transactions=react_transactions,
             governance_txs=governance_txs,
             finality_votes=finality_votes,
-            proposer_signature_leaf_index=expected_proposer_leaf,
-            slash_transactions=slash_transactions,
             custody_proofs=custody_proofs,
             censorship_evidence_txs=censorship_evidence_txs,
             bogus_rejection_evidence_txs=bogus_rejection_evidence_txs,
-            react_transactions=react_transactions,
+            non_response_evidence_txs=non_response_evidence_txs,
             inclusion_list_violation_evidence_txs=(
                 inclusion_list_violation_evidence_txs
             ),
             inclusion_list=inclusion_list,
-            non_response_evidence_txs=non_response_evidence_txs,
+            header=_NS(
+                proposer_id=proposer_entity.entity_id,
+                block_number=block_height,
+            ),
+        )
+        state_root = self.compute_post_state_root_for_block(
+            _draft,
+            proposer_signature_leaf_index=expected_proposer_leaf,
         )
         # Periodic state-root checkpoint commitment — zero on every block
         # except multiples of CHECKPOINT_INTERVAL.  At a checkpoint
@@ -7517,7 +7584,18 @@ class Blockchain:
             chain's currently-registered receipt-subtree root for
             ack.issuer_id
         """
-        from messagechain.config import MAX_ACKS_PER_BLOCK
+        # Lazy import: ACK_BACKDATING_DEFENSE_HEIGHT and
+        # ACK_INCLUSION_GRACE are read at call-time (not at module
+        # import) so test fixtures can monkeypatch the activation
+        # gate via `messagechain.config.ACK_BACKDATING_DEFENSE_HEIGHT`
+        # without re-importing this module.  Mirrors the Tier 37 /
+        # Tier 38 lazy-read pattern elsewhere in this file.
+        from messagechain.config import (
+            ACK_BACKDATING_DEFENSE_HEIGHT,
+            ACK_INCLUSION_GRACE,
+            MAX_ACKS_PER_BLOCK,
+            WITNESS_RESPONSE_DEADLINE_BLOCKS,
+        )
         from messagechain.consensus.witness_submission import (
             SubmissionAck, verify_submission_ack,
         )
@@ -7529,6 +7607,20 @@ class Blockchain:
                 f"Too many acks_observed_this_block entries: "
                 f"{len(acks)} > MAX_ACKS_PER_BLOCK={MAX_ACKS_PER_BLOCK}"
             )
+        # Tier 39: ack-backdating defense.  Pre-activation: legacy path
+        # accepted any non-negative commit_height (including ones in the
+        # future or far behind the inclusion height), letting a coerced
+        # issuer + colluding proposer record a fake "obligation met"
+        # marker for any past height of their choosing.  Post-activation:
+        # commit_height is bounded to ``[block_height -
+        # (DEADLINE + GRACE), block_height]``, removing both the
+        # forward-claim and the deep-backdating attack surfaces.  See
+        # ACK_BACKDATING_DEFENSE_HEIGHT in config.py for the threat
+        # model.
+        block_height = int(block.header.block_number)
+        apply_ack_window_bound = (
+            block_height >= ACK_BACKDATING_DEFENSE_HEIGHT
+        )
         prev_rh: bytes | None = None
         for ack in acks:
             if not isinstance(ack, SubmissionAck):
@@ -7554,6 +7646,30 @@ class Blockchain:
                         "ascending by request_hash"
                     )
             prev_rh = bytes(rh)
+            # Tier 39: bound the issuer-claimed commit_height to a small
+            # window around the inclusion height.  Cheap structural
+            # check — runs before the WOTS+ verify so a malformed-by-
+            # height ack is rejected without burning the full crypto
+            # cost.  See ACK_BACKDATING_DEFENSE_HEIGHT for the threat
+            # model.
+            if apply_ack_window_bound:
+                ack_h = int(ack.commit_height)
+                if ack_h > block_height:
+                    return False, (
+                        f"acks_observed_this_block entry request_hash "
+                        f"{rh.hex()[:16]} has commit_height {ack_h} > "
+                        f"block_height {block_height} (future-dated ack)"
+                    )
+                window_max = (
+                    WITNESS_RESPONSE_DEADLINE_BLOCKS + ACK_INCLUSION_GRACE
+                )
+                if block_height - ack_h > window_max:
+                    return False, (
+                        f"acks_observed_this_block entry request_hash "
+                        f"{rh.hex()[:16]} has commit_height {ack_h}, "
+                        f"more than {window_max} blocks behind block_height "
+                        f"{block_height} (backdated ack)"
+                    )
             # Stateless crypto + structural check.
             ok, reason = verify_submission_ack(ack)
             if not ok:
@@ -11142,16 +11258,37 @@ class Blockchain:
         # `validate_non_response_evidence_tx`).  First-write wins —
         # an earlier block's ack_height stays authoritative.
         block_acks = getattr(block, "acks_observed_this_block", None) or []
+        # Tier 39: post-activation we record the BLOCK INCLUSION height
+        # (block.header.block_number) instead of the issuer's signed
+        # commit_height.  The original "trust the signature" framing
+        # was wrong: a coerced issuer can sign any past height as
+        # commit_height (the signature still verifies), and a colluding
+        # proposer can land that ack at the late tip — turning the
+        # registry into a fake "obligation met" beacon for any
+        # gossip-visible request.  Recording the inclusion height
+        # removes issuer control over the deadline reference entirely;
+        # the only way to discharge a witnessed-submission obligation
+        # is to land the ack on chain inside the deadline window.  Pre-
+        # activation: legacy commit_height path preserved byte-for-byte
+        # so historical mainnet blocks reapply unchanged.
+        from messagechain.config import (
+            ACK_BACKDATING_DEFENSE_HEIGHT as _ACK_BD_H,
+        )
+        _use_inclusion_height = (
+            int(block.header.block_number) >= _ACK_BD_H
+        )
         for ack in block_acks:
             rh = ack.request_hash
             if rh not in self.witness_ack_registry:
-                # Record the ack's OWN commit_height (committed in the
-                # signed payload, so the issuer cannot lie about when
-                # they dispatched the ack).  Using block.header.
-                # block_number here would have let a colluding
-                # proposer shift the recorded discharge height
-                # arbitrarily, even though the ack signature is valid.
-                self.witness_ack_registry[rh] = int(ack.commit_height)
+                if _use_inclusion_height:
+                    self.witness_ack_registry[rh] = int(
+                        block.header.block_number,
+                    )
+                else:
+                    # Pre-Tier-39 legacy: record the issuer's signed
+                    # commit_height verbatim.  Kept for replay
+                    # determinism on historical blocks.
+                    self.witness_ack_registry[rh] = int(ack.commit_height)
         # Prune entries older than
         # WITNESS_OBSERVATION_RETENTION_BLOCKS + WITNESS_RESPONSE_DEADLINE_BLOCKS
         # — anything beyond that window is past evidence-assembly
@@ -11976,52 +12113,17 @@ class Blockchain:
                     if block.header.proposer_signature is not None
                     else None
                 )
-                simulated_root = self.compute_post_state_root(
-                    transactions=block.transactions,
-                    proposer_id=block.header.proposer_id,
-                    block_height=block.header.block_number,
-                    transfer_transactions=block.transfer_transactions,
-                    attestations=block.attestations,
-                    authority_txs=getattr(block, "authority_txs", []),
-                    stake_transactions=getattr(block, "stake_transactions", []),
-                    unstake_transactions=getattr(block, "unstake_transactions", []),
-                    governance_txs=getattr(block, "governance_txs", []),
-                    finality_votes=getattr(block, "finality_votes", []),
-                    custody_proofs=getattr(block, "custody_proofs", []),
+                # Single block-shaped call — the registry-walking
+                # helper reads every per-kind tx list (including
+                # forward-compatibly any new ones) via
+                # ``_BLOCK_TX_LIST_ATTRS``.  Pre-refactor this site
+                # hand-rolled 18 kwargs and silently dropped any new
+                # tx kind whose attribute hadn't been added here yet
+                # — the 1.29.x react-tx saga and the post-Tier-32 sim
+                # divergence both shipped from exactly that surface.
+                simulated_root = self.compute_post_state_root_for_block(
+                    block,
                     proposer_signature_leaf_index=proposer_sig_leaf,
-                    censorship_evidence_txs=getattr(
-                        block, "censorship_evidence_txs", [],
-                    ),
-                    bogus_rejection_evidence_txs=getattr(
-                        block, "bogus_rejection_evidence_txs", [],
-                    ),
-                    # Tier 17 ReactTransactions MUST be threaded
-                    # through the validator-side re-simulation too —
-                    # propose_block passes them when computing the
-                    # committed state_root, so an add_block that
-                    # omits them here re-simulates without the react
-                    # voter's nonce / balance / leaf-watermark bumps
-                    # AND without the reaction_state.choices delta.
-                    # Both contributions miss → simulated_root
-                    # diverges from the proposer's committed root,
-                    # and any honest block with a react tx
-                    # self-rejects at the pre-apply check.  Mainnet
-                    # symptom: every block with a react tx logged
-                    # "Invalid state_root — state commitment
-                    # mismatch" until the chain-tip mempool was
-                    # drained.
-                    react_transactions=getattr(
-                        block, "react_transactions", []
-                    ),
-                    inclusion_list_violation_evidence_txs=getattr(
-                        block, "inclusion_list_violation_evidence_txs", [],
-                    ),
-                    inclusion_list=getattr(
-                        block, "inclusion_list", None,
-                    ),
-                    non_response_evidence_txs=getattr(
-                        block, "non_response_evidence_txs", [],
-                    ),
                 )
             except Exception:
                 # Simulation may be a superset of the real apply logic and
