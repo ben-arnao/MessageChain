@@ -54,18 +54,22 @@
     margin: 0.8rem 0 1.4rem;
   }
   ol.quickstart > li { margin: 0.55rem 0; }
+  /* Each step is a flex row so the button (or details) fills the
+     column width and lines up flush with the message cards below.
+     The step number is rendered via ::before with a negative
+     margin-left so it hangs to the LEFT of the column rather than
+     indenting the button. */
   ol.quickstart > li:not([hidden]) {
     counter-increment: step;
-    position: relative;
-    padding-left: 2.2rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
   }
   ol.quickstart > li:not([hidden])::before {
     content: counter(step) ".";
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 1.6rem;
-    padding: 0.55rem 0;
+    flex: 0 0 1.6rem;
+    margin-left: -2.2rem;
     text-align: center;
     color: var(--accent);
     font-weight: 700;
@@ -73,6 +77,7 @@
     line-height: 1;
   }
   ol.quickstart .cta {
+    flex: 1 1 auto;
     display: block;
     text-align: center;
     padding: 0.55rem 0.9rem;
@@ -83,13 +88,6 @@
     text-decoration: none;
     font-size: 0.95rem;
   }
-  ol.quickstart > li.choice {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.6rem;
-  }
-  ol.quickstart > li.choice .cta { flex: 1 1 auto; }
   ol.quickstart > li.choice .or {
     color: var(--muted);
     font-size: 0.85rem;
@@ -216,6 +214,8 @@
   }
   details.faucet {
     margin: 0;
+    flex: 1 1 auto;
+    min-width: 0;
   }
   details.faucet summary {
     display: block;
@@ -393,7 +393,7 @@
   <h1>MessageChain</h1>
   <p class="sub">
     An uncensorable public square. Posts, replies, communities, votes —
-    on-chain forever. Suppression is slashable. ·
+    on-chain forever. ·
     <a href="/gh">github</a>
   </p>
 </header>

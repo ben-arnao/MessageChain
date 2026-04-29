@@ -4,6 +4,30 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.44.1] — 2026-04-29
+
+Static-asset-only patch.  Public feed (`https://messagechain.org`)
+quickstart-row CSS refactor + tagline edit.  No protocol, consensus,
+or runtime change; validators serve the new HTML on next boot.
+
+### UI
+
+- **Quickstart steps render with uniform layout.**  Every step in
+  the public feed's quickstart list now uses the same flex-row
+  layout — number hangs to the left, button (or faucet `<details>`)
+  fills the column width and lines up flush with the message cards
+  below.  Previously only the "github / first-message" choice row
+  was a flex row; the other steps were positioned via absolute
+  number + left-padded button, so the button visually under-shot
+  the column.  The `li.choice`-only flex rule is gone; flex is now
+  the universal step layout.
+
+- **Subhead tagline edit.**  Removed the "Suppression is slashable."
+  fragment from the H1 subhead.  The remaining copy ("on-chain
+  forever") carries the permanence promise without naming a specific
+  enforcement mechanism that doesn't read cleanly to first-time
+  visitors and isn't actionable from the landing page.
+
 ## [1.44.0] — 2026-04-29
 
 Multi-axis audit (UX / Security / Long-term / Value-prop / Economics)
