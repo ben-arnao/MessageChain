@@ -407,14 +407,14 @@
     <summary>Get starter tokens (<span id="faucetRemaining">…</span> left this window)</summary>
     <div class="body">
       <p>
-        Paste your <code>entity_id</code> to receive
-        <span id="faucetAmount">…</span> tokens (~1 message).
+        Paste your <code>mc1…</code> address (or raw <code>entity_id</code>)
+        to receive <span id="faucetAmount">…</span> tokens (~1 message).
         Refreshes every 15 min; one drip per network per window.
         No CLI yet? See <a href="/gh/start">getting started</a>.
       </p>
       <input id="faucetAddr" type="text" autocomplete="off"
-             placeholder="64-char hex entity_id"
-             aria-label="Wallet address (entity_id)">
+             placeholder="mc1… address (or 64-char entity_id)"
+             aria-label="Wallet address (mc1… or entity_id)">
       <button id="faucetBtn" type="button">Get tokens</button>
       <div id="faucetProgress" class="progress" hidden></div>
       <div id="faucetResult" class="result"></div>
@@ -871,11 +871,16 @@ self.onmessage = function (e) {
 
   async function requestDrip() {
     const addr = (faucetAddr.value || "").trim().toLowerCase();
-    // Cheap client-side guard so an obviously malformed address does
-    // not cost a round trip + slot of the per-IP cooldown bucket.
-    if (!/^[0-9a-f]{64}$/.test(addr)) {
+    // Permissive client-side guard: accept either the `mc1…` checksummed
+    // form (what the CLI tells users to share) or the raw 64-char hex
+    // entity_id.  The server is the source of truth for "is this a
+    // valid address" — including bech32-checksum verification — so we
+    // intentionally keep this pre-check loose and let the server
+    // produce the authoritative error on a typo'd `mc1…`.
+    if (!/^(mc1[0-9a-f]+|[0-9a-f]{64})$/.test(addr)) {
       faucetResult.className = "result error";
-      faucetResult.textContent = "Address must be exactly 64 hex characters.";
+      faucetResult.textContent =
+        "Paste your mc1… address or the 64-char entity_id.";
       return;
     }
     faucetBtn.disabled = true;
