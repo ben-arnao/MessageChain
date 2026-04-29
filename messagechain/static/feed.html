@@ -299,6 +299,49 @@
   }
   details.faucet ol { padding-left: 1.2rem; }
   details.faucet ol li { margin: 0.25rem 0; }
+  /* Chain-identity footer rendered on every page.  A paranoid
+     visitor on a hostile network can compare the rendered
+     genesis_hash here against their pinned copy (README ships
+     one) before trusting the feed above. */
+  footer#chainFooter {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1rem;
+    font-size: 0.78rem;
+    color: var(--muted);
+    text-align: center;
+    border-top: 1px solid var(--border);
+  }
+  footer#chainFooter .row { margin: 0.15rem 0; }
+  footer#chainFooter code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+  }
+  footer#chainFooter a { color: var(--accent); }
+  /* Per-card affordances: community chip + permanent verify link.
+     Sit alongside the meta row so they're visible without dragging
+     the eye away from the message body. */
+  .msg .community {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, var(--card));
+    border: 1px solid var(--accent);
+    border-radius: 12px;
+    padding: 0.05rem 0.45rem;
+    margin-right: 0.4rem;
+    text-decoration: none;
+    vertical-align: 1px;
+  }
+  .msg .community:hover { text-decoration: underline; }
+  .msg .meta .permalink {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.72rem;
+    margin-left: 0.4rem;
+  }
+  .msg .meta .permalink:hover { text-decoration: underline; }
   /* Structured "drip succeeded, here's what to do next" block.
      Replaces the ad-hoc one-line success string so the user can
      actually see the tx hash and the exact CLI command on separate
@@ -349,7 +392,8 @@
 <header>
   <h1>MessageChain</h1>
   <p class="sub">
-    A permanent, censorship-resistant ledger for human speech ·
+    An uncensorable public square. Posts, replies, communities, votes —
+    on-chain forever. Suppression is slashable. ·
     <a href="/gh">github</a>
   </p>
 </header>
@@ -407,6 +451,13 @@
   <p class="status" id="status">Loading…</p>
   <div id="feed"></div>
 </main>
+<footer id="chainFooter">
+  <div class="row">chain_id <code id="chainId">…</code></div>
+  <div class="row">genesis <code id="footerGenesis">…</code></div>
+  <div class="row">tip <code id="footerTip">…</code> · height <span id="footerHeight">…</span></div>
+  <div class="row">Cross-check the genesis hash against the
+    <a href="/gh">README</a> on a trusted device.</div>
+</footer>
 <script>
 (function () {
   "use strict";
@@ -462,9 +513,38 @@
     entity.appendChild(entityLink);
     const right = document.createElement("span");
     right.textContent = "block " + m.block_number + " · " + formatTs(m.timestamp);
+    // Per-card permanent-verify affordance.  Links to /r/<tx_hash>
+    // which renders inclusion proof + permanence framing — the
+    // first-time visitor's path from "is this a real social feed"
+    // to "this message can never be deleted, here's the proof."
+    if (m.tx_hash) {
+      const verify = document.createElement("a");
+      verify.className = "permalink";
+      verify.href = "/r/" + m.tx_hash;
+      verify.title = "Permanent · verify on chain";
+      verify.textContent = "Permanent ↗";
+      right.appendChild(document.createTextNode(" "));
+      right.appendChild(verify);
+    }
     meta.appendChild(entity);
     meta.appendChild(right);
     card.appendChild(meta);
+    // Tier 25 community chip — `[handle]` next to the message body
+    // when the tx opted into a community grouping.  Renders the
+    // handle exactly as committed (lowercase ASCII), so a reader
+    // can paste it into search.  L2 / app layer maps the handle to
+    // a display name; protocol surface stays handle-only.
+    if (m.community_id) {
+      const chip = document.createElement("a");
+      chip.className = "community";
+      chip.textContent = "[" + m.community_id + "]";
+      chip.title = "community " + m.community_id;
+      // No on-chain registry; clicking the chip filters the local
+      // feed via a URL fragment so the page can pick it up on
+      // refresh.  Server-side filter would require a new RPC param.
+      chip.href = "#community=" + encodeURIComponent(m.community_id);
+      card.appendChild(chip);
+    }
     // Optional `prev` ref: the Tier 10 pointer to a prior message.
     // Absence means "no predecessor" — render nothing, keep layout
     // identical to pre-fork cards.
@@ -567,6 +647,34 @@
       const target = document.getElementById(location.hash.slice(1));
       target.scrollIntoView({ block: "center", behavior: "instant" });
     }
+  }
+
+  // Chain-identity footer — renders genesis_hash + tip_hash + height
+  // in the page footer so a paranoid visitor on a hostile network can
+  // sanity-check against the README's pinned genesis hash before
+  // trusting the messages above.  Best-effort: a /v1/info miss leaves
+  // the placeholders visible but does not block the feed render.
+  async function refreshChainIdentityFooter() {
+    try {
+      const r = await fetch("/v1/info", { cache: "no-store" });
+      const data = await r.json();
+      if (!data || !data.ok) return;
+      const setText = (id, txt) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = txt;
+      };
+      setText("chainId", data.chain_id || "—");
+      setText("footerGenesis",
+              data.genesis_hash ? shortHex(data.genesis_hash, 12, 10) : "(loading)");
+      setText("footerTip",
+              data.tip_hash ? shortHex(data.tip_hash, 12, 10) : "(loading)");
+      setText("footerHeight",
+              (typeof data.height === "number") ? String(data.height) : "—");
+      const fg = document.getElementById("footerGenesis");
+      const ft = document.getElementById("footerTip");
+      if (fg && data.genesis_hash) fg.title = data.genesis_hash;
+      if (ft && data.tip_hash) ft.title = data.tip_hash;
+    } catch (_) { /* footer is best-effort */ }
   }
 
   async function poll() {
@@ -849,9 +957,13 @@ self.onmessage = function (e) {
   }
   faucetBtn.addEventListener("click", requestDrip);
   refreshFaucetInfo();
+  refreshChainIdentityFooter();
 
   poll();
   setInterval(poll, POLL_MS);
+  // Also refresh chain-identity footer on each poll so the tip hash
+  // and height keep up with new blocks while the visitor reads.
+  setInterval(refreshChainIdentityFooter, POLL_MS);
 
   // One-shot engagement beacon: fires the first time the visitor
   // scrolls more than a screen down from the top, so the operator

@@ -62,6 +62,7 @@ _STATIC_DIR = os.path.join(
 )
 _FEED_HTML_PATH = os.path.join(_STATIC_DIR, "feed.html")
 _ENTITY_HTML_PATH = os.path.join(_STATIC_DIR, "entity.html")
+_RECEIPT_HTML_PATH = os.path.join(_STATIC_DIR, "receipt.html")
 
 # Outbound link target for the `/gh` redirect (the public repo).
 _GITHUB_REPO_URL = "https://github.com/ben-arnao/MessageChain"
@@ -337,12 +338,26 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/entity":
             self._serve_entity(ctx, split.query)
             return
+        if path == "/v1/tx_status":
+            # JSON proxy for the per-message permanence-receipt page.
+            # Inclusion-only by design — the public feed has no
+            # mempool view, and a web visitor doesn't need pending-tx
+            # ETAs to evaluate a permanence claim.
+            self._serve_tx_status(ctx, split.query)
+            return
         if path.startswith("/e/"):
             # /e/<entity_id_hex>: static profile page.  The page reads
             # the id from its own URL and queries /v1/entity itself.
             # Serving the same HTML for any /e/* path keeps the server
             # branch trivial; client-side validates the hex.
             self._serve_static_entity()
+            return
+        if path.startswith("/r/"):
+            # /r/<tx_hash_hex>: static permanence-receipt page.  The
+            # page reads the tx_hash from its own URL and queries
+            # /v1/tx_status itself.  The "Permanent · verify" link on
+            # every message card on the feed lands here.
+            self._serve_static_receipt()
             return
         if path == "/gh" or path == "/gh/start" or path == "/gh/node":
             # 302 to the public repo so outbound clicks land in the
@@ -418,6 +433,57 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send_html(body)
 
+    def _serve_static_receipt(self):
+        try:
+            with open(_RECEIPT_HTML_PATH, "rb") as f:
+                body = f.read()
+        except OSError:
+            self._send_text(500, "receipt page unavailable")
+            return
+        self._send_html(body)
+
+    def _serve_tx_status(self, ctx: "_FeedHandlerContext", query: str):
+        """JSON proxy for the per-message permanence-receipt page.
+
+        Routes through ``Blockchain.get_tx_status_public`` so the
+        result schema matches the JSON-RPC `_rpc_get_tx_status`
+        "included" branch — the receipt UI can render the same proof
+        whether it talks to the JSON-RPC port or the public-feed
+        HTTP shim.
+        """
+        params = parse_qs(query)
+        raw_hash = (params.get("tx_hash") or [""])[0].strip().lower()
+        if not raw_hash:
+            self._send_json(400, {
+                "ok": False,
+                "error": "tx_hash query parameter required",
+            })
+            return
+        # Accept an optional 0x prefix to match the CLI's input rules.
+        if raw_hash.startswith("0x"):
+            raw_hash = raw_hash[2:]
+        if len(raw_hash) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "tx_hash must be 64 hex characters",
+            })
+            return
+        try:
+            tx_hash = bytes.fromhex(raw_hash)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "tx_hash must be valid hex",
+            })
+            return
+        try:
+            result = ctx.blockchain.get_tx_status_public(tx_hash)
+        except Exception:
+            logger.exception("get_tx_status_public failed")
+            self._send_json(500, {"ok": False, "error": "chain read failed"})
+            return
+        self._send_json(200, {"ok": True, "result": result})
+
     def _serve_entity(self, ctx: "_FeedHandlerContext", query: str):
         from messagechain.network.entity_profile import compute_entity_profile
         params = parse_qs(query)
@@ -454,9 +520,41 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         latest_ts = (
             chain.chain[-1].header.timestamp if chain.chain else None
         )
+        # Chain-identity surface — the web UI renders these in a
+        # footer on every page so a paranoid visitor on a hostile
+        # network can sanity-check the rendered genesis_hash against
+        # their pinned copy (README ships one).  All three are public
+        # data already derivable from the chain.  Each lookup is
+        # defensive: legacy / partial blockchain stubs (test fixtures,
+        # pre-state-root migration) may lack one of the attributes;
+        # we render `None` rather than crash the whole /v1/info call.
+        def _hash_hex(b):
+            if b is None:
+                return None
+            try:
+                return b.hex()
+            except AttributeError:
+                return None
+
+        genesis_hash = (
+            _hash_hex(getattr(chain.chain[0], "block_hash", None))
+            if chain.chain else None
+        )
+        tip_hash = (
+            _hash_hex(getattr(chain.chain[-1], "block_hash", None))
+            if chain.chain else None
+        )
+        state_root = None
+        if chain.chain:
+            tip_header = getattr(chain.chain[-1], "header", None)
+            if tip_header is not None:
+                state_root = _hash_hex(getattr(tip_header, "state_root", None))
         body = {
             "ok": True,
             "chain_id": CHAIN_ID.decode("ascii", errors="replace"),
+            "genesis_hash": genesis_hash,
+            "tip_hash": tip_hash,
+            "state_root": state_root,
             "height": height,
             "last_block_timestamp": latest_ts,
             "faucet_enabled": ctx.faucet is not None,

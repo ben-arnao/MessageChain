@@ -147,9 +147,15 @@
     max-width: 720px;
     margin: 0 auto;
     padding: 1rem;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     color: var(--muted);
     text-align: center;
+    border-top: 1px solid var(--border);
+  }
+  footer .row { margin: 0.15rem 0; }
+  footer code {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
   }
   footer a { color: var(--accent); }
 </style>
@@ -188,9 +194,12 @@
     </div>
   </div>
 </main>
-<footer>
-  Read-only snapshot at chain height <span id="chainHeight">…</span>.
-  <a href="/">Back to live feed</a>
+<footer id="chainFooter">
+  <div class="row">Read-only snapshot at chain height <span id="chainHeight">…</span></div>
+  <div class="row">chain_id <code id="chainId">…</code></div>
+  <div class="row">genesis <code id="footerGenesis">…</code></div>
+  <div class="row">tip <code id="footerTip">…</code></div>
+  <div class="row"><a href="/">Back to live feed</a></div>
 </footer>
 <script>
 (function () {
@@ -380,6 +389,38 @@
   searchBox.addEventListener("keydown", (e) => {
     if (e.key === "Enter") gotoSearch();
   });
+
+  // Chain-identity footer.  Populated from /v1/info so a paranoid
+  // visitor on a hostile network can sanity-check the rendered
+  // genesis/tip hashes against the README's pinned values without
+  // leaving the page.  Best-effort: a /v1/info miss leaves the
+  // placeholders visible but does not block the profile render.
+  function shortHex(hex, head, tail) {
+    if (!hex) return "";
+    if (hex.length <= head + tail + 1) return hex;
+    return hex.slice(0, head) + "…" + hex.slice(-tail);
+  }
+  async function loadChainIdentityFooter() {
+    try {
+      const r = await fetch("/v1/info", { cache: "no-store" });
+      const data = await r.json();
+      if (!data || !data.ok) return;
+      const setText = (id, txt) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = txt;
+      };
+      setText("chainId", data.chain_id || "—");
+      setText("footerGenesis",
+              data.genesis_hash ? shortHex(data.genesis_hash, 12, 10) : "(loading)");
+      setText("footerTip",
+              data.tip_hash ? shortHex(data.tip_hash, 12, 10) : "(loading)");
+      const fg = document.getElementById("footerGenesis");
+      const ft = document.getElementById("footerTip");
+      if (fg && data.genesis_hash) fg.title = data.genesis_hash;
+      if (ft && data.tip_hash) ft.title = data.tip_hash;
+    } catch (_) { /* footer is best-effort */ }
+  }
+  loadChainIdentityFooter();
 
   const id = entityIdFromPath();
   if (!id) {

@@ -649,6 +649,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     read.add_argument("--last", type=int, default=10, help="Number of messages (default: 10)")
     read.add_argument("--server", type=str, default=None, help="Server address host:port")
+    # Client-side filters - applied to the messages returned by the
+    # `get_messages` RPC.  Server-side filter would require a new RPC
+    # param; at --last counts that fit one RPC response, client-side
+    # filtering is a free win.
+    read.add_argument(
+        "--community-id", dest="community_id", type=str, default=None,
+        help="Show only posts in this Tier 25 community handle",
+    )
+    read.add_argument(
+        "--by-address", dest="by_address", type=str, default=None,
+        help="Show only posts from this address (hex or mc1... form)",
+    )
 
     # --- info ---
     info = sub.add_parser(
@@ -4553,29 +4565,112 @@ def cmd_verify_key(args):
 
 
 def cmd_read(args):
-    """Read recent messages from the chain."""
+    """Read recent messages from the chain.
+
+    The CLI's `read` listing mirrors the public-feed UI surface so
+    the same affordances are available to a CLI user - short tx_hash
+    (paste-friendly into ``messagechain receipt``), `prev ->` arrow
+    when the message has a predecessor, ``[community-id]`` chip
+    when the post belongs to a Tier 25 community, and ASCII up/down
+    vote totals when at least one vote has been cast.
+
+    Optional client-side filters:
+      --community-id <handle>   only show posts in this community
+      --by-address <hex|mc1...> only show posts from this entity
+
+    Filters apply on the client; server-side filter would require a
+    new RPC param.  At --last counts that fit comfortably in a
+    single RPC response (default 10), client-side filtering is a
+    free win.
+    """
     host, port = _parse_server(args.server)
 
     from client import rpc_call
     response = rpc_call(host, port, "get_messages", {"count": args.last})
 
-    if response.get("ok"):
-        messages = response["result"]["messages"]
-        if not messages:
-            print("No messages on chain yet.")
-            return
-
-        print(f"=== Recent Messages ({len(messages)}) ===\n")
-        for msg in messages:
-            import datetime
-            ts = datetime.datetime.fromtimestamp(msg["timestamp"]).strftime("%Y-%m-%d %H:%M:%S")
-            entity = msg["entity_id"][:16]
-            print(f"  [{ts}] {entity}...")
-            print(f"  {msg['message']}")
-            print()
-    else:
+    if not response.get("ok"):
         print(f"Error: {response.get('error', 'Could not connect')}")
         sys.exit(1)
+
+    messages = response["result"]["messages"]
+    if not messages:
+        print("No messages on chain yet.")
+        return
+
+    # Resolve --by-address: accept both bare hex and mc1... bech32 form.
+    filter_address_hex = None
+    raw_addr = getattr(args, "by_address", None)
+    if raw_addr:
+        s = raw_addr.strip()
+        if s.lower().startswith("mc1"):
+            try:
+                from messagechain.identity.address import decode_address
+                filter_address_hex = decode_address(s).hex()
+            except Exception as e:
+                print(f"Error: invalid address '{raw_addr}': {e}")
+                sys.exit(1)
+        else:
+            filter_address_hex = s.lower()
+
+    filter_community = getattr(args, "community_id", None)
+
+    # Client-side filtering - keep the schema we sent to the server
+    # untouched.  Both filters are opt-in; absent flags are no-ops.
+    def _keep(msg):
+        if filter_community is not None:
+            if msg.get("community_id") != filter_community:
+                return False
+        if filter_address_hex is not None:
+            if (msg.get("entity_id") or "").lower() != filter_address_hex:
+                return False
+        return True
+
+    filtered = [m for m in messages if _keep(m)]
+    if not filtered:
+        if filter_community or filter_address_hex:
+            print("No matching messages on chain.")
+            return
+        print("No messages on chain yet.")
+        return
+
+    import datetime
+    print(f"=== Recent Messages ({len(filtered)}) ===\n")
+    for msg in filtered:
+        ts = datetime.datetime.fromtimestamp(
+            msg["timestamp"]
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        entity = (msg.get("entity_id") or "")[:16]
+        # First line: timestamp, sender prefix, optional community chip,
+        # short tx hash for `messagechain receipt` round-trip.
+        head = f"  [{ts}] {entity}..."
+        community_id = msg.get("community_id")
+        if community_id:
+            head += f"  [{community_id}]"
+        tx_hash = msg.get("tx_hash") or ""
+        if tx_hash:
+            head += f"  tx {tx_hash[:12]}"
+        print(head)
+        # Optional `prev` arrow on its own line so the eye can spot
+        # threaded replies / multi-tx continuations.  ASCII -> arrow
+        # to keep cli.py source ASCII-only (Windows cp1252 console
+        # encoding crashes on Unicode in argparse help output).
+        prev = msg.get("prev")
+        if prev:
+            print(f"  prev -> {prev[:12]}")
+        print(f"  {msg.get('message', '')}")
+        # Vote totals only when at least one vote has been cast.
+        # ASCII "up"/"down" labels (the web feed uses real triangle
+        # glyphs; the CLI source must stay in cp1252).
+        ups = int(msg.get("ups") or 0)
+        downs = int(msg.get("downs") or 0)
+        if ups + downs > 0:
+            up_pct = msg.get("up_pct")
+            pct_str = (
+                f"{up_pct:.0f}% up" if isinstance(up_pct, (int, float))
+                else "-% up"
+            )
+            print(f"  up {ups}  down {downs}  {pct_str}")
+        print()
 
 
 def cmd_info(args):
