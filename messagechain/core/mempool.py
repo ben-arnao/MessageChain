@@ -26,6 +26,7 @@ from messagechain.config import (
     MEMPOOL_MAX_ANCESTORS, MEMPOOL_MAX_ORPHAN_TXS,
     MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
     MIN_FEE,
+    FORCED_INCLUSION_ALL_POOLS_HEIGHT,
     FORCED_INCLUSION_WAIT_BLOCKS, FORCED_INCLUSION_SET_SIZE,
     MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
@@ -160,6 +161,15 @@ class Mempool:
         # the next block's censorship_evidence_txs slot.
         self.censorship_evidence_pool: dict[bytes, object] = {}
         self.censorship_evidence_pool_max_size: int = 1000
+        # Tier 43: arrival-height tracking for evidence txs so the
+        # forced-inclusion source-side can apply the same wait-gate
+        # used for messages.  Keyed by tx_hash.  Set on
+        # `add_censorship_evidence_tx`; torn down on remove.  An
+        # entry missing here defaults to height-0 in the source
+        # walk, matching the legacy "always been here" semantics
+        # of the messages-pool path when arrival_block_height is
+        # not provided.
+        self._evidence_arrival_heights: dict[bytes, int] = {}
         # Tier 17 ReactTransaction pool: keyed by tx_hash so identical
         # (voter, target, choice, nonce, timestamp) txs dedupe at the
         # mempool boundary.  Shape mirrors slash_pool — strict FIFO,
@@ -176,6 +186,22 @@ class Mempool:
         # (``add_transaction`` / ``try_replace_by_fee``) and torn
         # down on remove.
         self._stored_bytes: dict[bytes, int] = {}
+        # Tier 43: registered external sources for the forced-inclusion
+        # source-side walk.  Each entry is a zero-arg callable returning
+        # an iterable of `(tx, arrival_block_height)` pairs.  Used to
+        # plug server-local pools (stake / unstake / authority /
+        # governance) into the forced-inclusion rule without a circular
+        # import — the server registers its pools at construction time;
+        # mempool consults them post-Tier-43 only (pre-fork the list
+        # is not consulted, preserving byte-identical legacy behavior).
+        self._external_forced_sources: list = []
+        # Mempool's own censorship-evidence pool is registered as an
+        # internal source so the same code path covers it post-fork.
+        # (Pre-fork the registration is silently ignored by the
+        # activation gate in `get_forced_inclusion_set`.)
+        self._external_forced_sources.append(
+            self._iter_evidence_pool_with_arrivals,
+        )
 
     def add_transaction(
         self,
@@ -297,6 +323,48 @@ class Mempool:
                 entity_counts[tx.entity_id] = count + 1
             return selected
 
+    def register_forced_inclusion_source(self, source_fn) -> None:
+        """Register a callable as an extra source for the Tier-43
+        forced-inclusion source-side walk.
+
+        Tier 43 closes the source-side gap of the Tier 34 block-side
+        gate.  Pre-Tier-34 the gate covered Message + Transfer
+        (everything in `self.pending`); Tier 34 made the BLOCK-side
+        walk multi-list; Tier 43 makes the SOURCE-side walk multi-pool.
+        Server-local pools (stake / unstake / authority / governance)
+        live outside `self.pending` because their admission rules need
+        chain-state access the mempool deliberately does not have.
+        Plugging them in via a zero-arg callable that yields
+        `(tx, arrival_height)` pairs avoids a circular import at module
+        load time and lets every pool retain its own arrival-height
+        bookkeeping.
+
+        `source_fn` MUST return an iterable of `(tx, arrival_height)`
+        tuples each call.  Each `tx` MUST expose the same shape the
+        per-byte ranker requires: `tx_hash` (bytes), `fee` (int), and
+        a `to_bytes()` method (or fallback `len(tx.message)`).  Entity
+        ID is read from `entity_id`, falling back to `voter_id` /
+        `proposer_id` / `submitter_id` for tx kinds whose primary
+        identifier uses a different name.
+
+        Pre-Tier-43 the registered sources are silently ignored — the
+        gate continues to consult only `self.pending`, preserving
+        byte-identical attester behavior on every historical block.
+        """
+        with self._lock:
+            self._external_forced_sources.append(source_fn)
+
+    def _iter_evidence_pool_with_arrivals(self):
+        """Yield `(tx, arrival_height)` pairs for the on-mempool
+        censorship-evidence pool — the headline finding of the audit
+        Tier 43 closes.  Missing arrival heights default to 0 (legacy
+        "always been here" semantics)."""
+        # Snapshot under the lock so a concurrent admit doesn't change
+        # the iteration size.  Caller is `get_forced_inclusion_set`,
+        # which already holds the lock — this access is safe.
+        for h, tx in list(self.censorship_evidence_pool.items()):
+            yield tx, self._evidence_arrival_heights.get(h, 0)
+
     def get_forced_inclusion_set(
         self, current_block_height: int,
     ) -> list[MessageTransaction]:
@@ -312,17 +380,54 @@ class Mempool:
         Different nodes can see different mempools — that's fine.  Soft
         attester voting converges on the honest subset; see
         messagechain.consensus.forced_inclusion for the enforcement path.
+
+        Tier 43: post-fork the source set is the union of `self.pending`
+        AND every registered external source (server-local stake /
+        unstake / authority / governance pools, plus the on-mempool
+        censorship-evidence pool registered internally at construction).
+        Pre-fork the set is `self.pending` only — byte-identical to
+        legacy attester behavior so historical blocks attest under the
+        old rule.
         """
         with self._lock:
             cutoff = current_block_height - FORCED_INCLUSION_WAIT_BLOCKS
-            qualifying = [
+            qualifying: list = [
                 tx for tx in self.pending.values()
                 if self.arrival_heights.get(tx.tx_hash, 0) <= cutoff
             ]
+            arrival_for: dict = {
+                tx.tx_hash: self.arrival_heights.get(tx.tx_hash, 0)
+                for tx in qualifying
+            }
+            # Tier 43 source-side activation gate.  Pre-fork: short-
+            # circuit so the legacy single-pool path is byte-identical
+            # to the pre-fork attester rule.
+            if int(current_block_height) >= FORCED_INCLUSION_ALL_POOLS_HEIGHT:
+                seen_hashes: set = {tx.tx_hash for tx in qualifying}
+                for source_fn in self._external_forced_sources:
+                    try:
+                        items = list(source_fn())
+                    except Exception:
+                        # An external source that raises must not crash
+                        # the attester duty.  A misbehaving registered
+                        # callback degrades to "this source contributed
+                        # nothing this round" — the same effect as a
+                        # cold-loaded server with no pool entries yet.
+                        continue
+                    for tx, arrival in items:
+                        h = getattr(tx, "tx_hash", None)
+                        if h is None or h in seen_hashes:
+                            continue
+                        if (arrival or 0) > cutoff:
+                            continue  # still inside the wait window
+                        qualifying.append(tx)
+                        arrival_for[h] = arrival or 0
+                        seen_hashes.add(h)
+
             qualifying.sort(
                 key=lambda t: (
                     -_fee_per_byte(t, cache=self._stored_bytes),
-                    self.arrival_heights.get(t.tx_hash, 0),
+                    arrival_for.get(t.tx_hash, 0),
                     t.tx_hash,
                 )
             )
@@ -691,13 +796,23 @@ class Mempool:
 
     # ── Censorship-evidence pool ─────────────────────────────────
 
-    def add_censorship_evidence_tx(self, tx) -> bool:
+    def add_censorship_evidence_tx(
+        self, tx, arrival_block_height: int | None = None,
+    ) -> bool:
         """Admit a CensorshipEvidenceTx into the pool.
 
         Returns True on insertion, False if the tx is already present
         or the pool is full.  No fee-based eviction — evidence txs
         are small and rare.  Strict FIFO (refuse new entries when
         full).
+
+        Tier 43: `arrival_block_height` records the block height at
+        which this node first saw the evidence so the forced-
+        inclusion source-side wait-gate works the same way it does
+        for messages.  Defaults to 0 (legacy "always been here" —
+        immediately eligible for forced inclusion); production
+        callers should pass the current chain height so a long-
+        waited evidence is distinguishable from a fresh arrival.
         """
         with self._lock:
             if tx.tx_hash in self.censorship_evidence_pool:
@@ -707,6 +822,11 @@ class Mempool:
             if tx.fee < MIN_FEE:
                 return False
             self.censorship_evidence_pool[tx.tx_hash] = tx
+            self._evidence_arrival_heights[tx.tx_hash] = (
+                arrival_block_height
+                if arrival_block_height is not None
+                else 0
+            )
             return True
 
     def get_censorship_evidence_txs(self, max_count: int | None = None) -> list:
@@ -720,6 +840,7 @@ class Mempool:
         with self._lock:
             for h in tx_hashes:
                 self.censorship_evidence_pool.pop(h, None)
+                self._evidence_arrival_heights.pop(h, None)
 
     # ── Tier 17 ReactTransaction pool ────────────────────────────
 
