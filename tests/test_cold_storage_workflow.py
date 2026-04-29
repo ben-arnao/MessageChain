@@ -189,10 +189,18 @@ class TestRoundTrip(unittest.TestCase):
         self.assertIsNotNone(shown_entity_id)
         self.assertIsNotNone(shown_hex_key)
 
-        # Now simulate user typing the displayed key into a command
+        # Now simulate user typing the displayed key into a command.
+        # Real CLI commands route key resolution through
+        # ``_resolve_signing_entity``, which finds the cache file
+        # ``cmd_generate_key`` warmed at the personal-wallet default
+        # height -- so the derived entity must match the printed one.
+        # A bare ``Entity.create(key_bytes)`` here would default to
+        # ``MERKLE_TREE_HEIGHT`` (the validator default) and produce a
+        # DIFFERENT identity, which is not what real users see.
+        from messagechain.cli import _resolve_signing_entity
         with patch("getpass.getpass", return_value=shown_hex_key):
             key_bytes = _collect_private_key()
-        entity = Entity.create(key_bytes)
+        entity = _resolve_signing_entity(key_bytes)
 
         self.assertEqual(
             entity.entity_id_hex, shown_entity_id,

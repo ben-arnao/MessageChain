@@ -60,17 +60,19 @@ class TestGenerateKeyWarmsCache(unittest.TestCase):
         from messagechain.identity.keypair_cache import (
             personal_wallet_cache_path,
         )
-        from messagechain.config import MERKLE_TREE_HEIGHT
+        from messagechain.config import WALLET_DEFAULT_TREE_HEIGHT
 
         private_key = os.urandom(32)
         with patch("os.urandom", return_value=private_key):
             cmd_generate_key(None)
 
         # Cache file path is a deterministic function of (private_key,
-        # tree_height).  The freshly-generated key MUST have a cache
-        # file on disk after the command runs.
+        # tree_height).  ``cmd_generate_key`` runs at the personal-
+        # wallet default height (lower than the validator default to
+        # keep first-command keygen tractable), so the cache file
+        # lands at ``WALLET_DEFAULT_TREE_HEIGHT``.
         cache_path = personal_wallet_cache_path(
-            private_key, MERKLE_TREE_HEIGHT,
+            private_key, WALLET_DEFAULT_TREE_HEIGHT,
         )
         self.assertTrue(
             os.path.exists(cache_path),
