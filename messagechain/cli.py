@@ -1908,6 +1908,39 @@ def _read_only_entity_id_hex(args):
     return entity_id_bytes.hex()
 
 
+def _resolve_entity_tree_height(host, port, entity_id_hex):
+    """Resolve the per-entity WOTS+ tree_height for display math.
+
+    Mirrors the resolver pattern in ``cmd_rotate_key_if_needed``:
+    query ``get_entity`` and read the chain-recorded ``tree_height``;
+    fall back to the personal-wallet default when the entity is not
+    yet on chain (first-touch state) or the field is absent.
+
+    Personal wallets at h=16 and validators at h=20 coexist on the
+    same chain, so a single global constant cannot be correct for
+    both.  This helper exists so leaf-usage % displays compute
+    against the right denominator instead of hard-coding ``1 << 16``
+    or the local ``MERKLE_TREE_HEIGHT`` constant.
+
+    Returns a tuple ``(tree_height, is_fallback)`` where
+    ``is_fallback`` is True when the value came from the wallet
+    default instead of chain state -- callers can flag the display
+    so the operator knows the % is provisional.
+    """
+    from messagechain.config import WALLET_DEFAULT_TREE_HEIGHT
+    from client import rpc_call
+
+    try:
+        resp = rpc_call(host, port, "get_entity", {"entity_id": entity_id_hex})
+    except Exception:
+        return WALLET_DEFAULT_TREE_HEIGHT, True
+    if resp.get("ok"):
+        h = resp.get("result", {}).get("tree_height")
+        if isinstance(h, int) and h > 0:
+            return h, False
+    return WALLET_DEFAULT_TREE_HEIGHT, True
+
+
 def _resolve_signing_entity(private_key, args=None, *, tree_height=None):
     """Return an Entity for *private_key*, using whichever cache is available.
 
@@ -3595,8 +3628,15 @@ def cmd_rotate_key(args):
     # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
     _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
+    # Display the watermark against the entity's stored tree_height
+    # rather than the global config -- personal wallets at h=16 and
+    # validators at h=20 coexist, so a single constant produces a
+    # nonsensical denominator for one of them.
+    _disp_height, _ = _resolve_entity_tree_height(
+        host, port, entity.entity_id_hex,
+    )
     print(f"Current rotation number: {current_rotation}")
-    print(f"Current leaf watermark:  {watermark} / {1 << MERKLE_TREE_HEIGHT}")
+    print(f"Current leaf watermark:  {watermark} / {1 << _disp_height}")
     print(f"\nDeriving fresh Merkle tree (rotation {current_rotation})...")
     progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building new tree")
     new_kp = derive_rotated_keypair(
@@ -3675,7 +3715,6 @@ def cmd_rotate_key(args):
 def cmd_key_status(args):
     """Show the current key tree's rotation and leaf-consumption status."""
     from messagechain.identity.identity import Entity
-    from messagechain.config import MERKLE_TREE_HEIGHT
 
     # Read-only lookup branch: same logic as cmd_balance.  Lets an
     # operator inspect another validator's leaf-consumption without
@@ -3701,7 +3740,14 @@ def cmd_key_status(args):
         sys.exit(1)
     result = status["result"]
 
-    capacity = 1 << MERKLE_TREE_HEIGHT
+    # Resolve the per-entity tree_height from chain state -- personal
+    # wallets at h=16 and validators at h=20 coexist, so a single
+    # global constant gives the wrong denominator for at least one
+    # of them.
+    tree_height, th_fallback = _resolve_entity_tree_height(
+        host, port, entity_id_hex,
+    )
+    capacity = 1 << tree_height
     used = result["leaf_watermark"]
     remaining = capacity - used
     pct_used = (used * 100) // capacity if capacity else 0
@@ -3710,6 +3756,8 @@ def cmd_key_status(args):
     print(f"  Entity ID:       {entity_id_hex}")
     print(f"  Public key:      {result['public_key']}")
     print(f"  Rotation #:      {result['rotation_number']}")
+    print(f"  Tree height:     {tree_height}"
+          f"{'  (assumed; entity not on chain yet)' if th_fallback else ''}")
     print(f"  Leaves used:     {used} / {capacity} ({pct_used}%)")
     print(f"  Leaves left:     {remaining}")
     if pct_used >= 80:
@@ -4877,25 +4925,40 @@ def cmd_status(args):
             )
             if wm_resp.get("ok"):
                 wm = wm_resp["result"].get("leaf_watermark", 0)
-                # Assume tree_height=16 (65K leaves) as the default; we
-                # don't know the real tree height from an RPC response
-                # alone.  This is a heuristic warning, not a hard limit.
-                est_total = 1 << 16
+                # Compute leaf-usage % against the per-entity
+                # tree_height from chain state.  Personal wallets at
+                # h=16 and validators at h=20 coexist; a single
+                # global constant gives the wrong denominator for one
+                # of them and produces nonsensical >100% displays.
+                tree_height, _th_fallback = _resolve_entity_tree_height(
+                    host, port, entity_hex,
+                )
+                est_total = 1 << tree_height
                 pct = (wm / est_total) * 100
+                detail_suffix = ""
+                if _th_fallback:
+                    detail_suffix = (
+                        " (entity not on chain yet; "
+                        f"assuming tree_height={tree_height})"
+                    )
                 if pct < 50:
-                    mark(0, "leaf usage", f"{wm}/{est_total} ({pct:.1f}%)")
+                    mark(0, "leaf usage",
+                         f"{wm}/{est_total} ({pct:.1f}%)",
+                         detail_suffix.strip(" -()") or "")
                 elif pct < 80:
                     mark(0, "leaf usage",
                          f"{wm}/{est_total} ({pct:.1f}%)",
-                         "plenty of signatures remaining")
+                         "plenty of signatures remaining" + detail_suffix)
                 elif pct < 95:
                     mark(1, "leaf usage",
                          f"{wm}/{est_total} ({pct:.1f}%)",
-                         "plan a key rotation in the next few months")
+                         "plan a key rotation in the next few months"
+                         + detail_suffix)
                 else:
                     mark(2, "leaf usage",
                          f"{wm}/{est_total} ({pct:.1f}%)",
-                         "ROTATE NOW - signatures nearly exhausted")
+                         "ROTATE NOW - signatures nearly exhausted"
+                         + detail_suffix)
 
     # 5. Liveness - chain height advanced in the last 30s?  Not
     #    reliable from a single probe, but a block-time of 600s means
