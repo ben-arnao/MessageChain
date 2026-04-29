@@ -216,11 +216,70 @@ def load_or_create_personal_wallet_entity(
     cached keypair and then advancing to the current chain leaf is
     correct even if the cache was written long before the most recent
     sign.
-    """
-    if tree_height is None:
-        from messagechain.config import MERKLE_TREE_HEIGHT as _h
-        tree_height = _h
 
+    When ``tree_height`` is omitted, the resolver scans the cache
+    directory for any prior wallet at the candidate heights -- the
+    new wallet default first (cheap fast-keygen path), then the
+    legacy validator default (back-compat for wallets generated
+    before the default was lowered).  This prevents a default change
+    from silently regenerating a different public key for the same
+    seed and orphaning the user's on-chain identity.
+    """
+    if tree_height is not None:
+        return _load_or_create_at_height(private_key, tree_height)
+
+    # No explicit height: probe the cache at both the new wallet default
+    # AND the historical validator default.  This keeps existing wallets
+    # (cached at the validator default before the lowered wallet default
+    # shipped) bound to their on-chain identity instead of silently
+    # regenerating at a different height -- which would produce a
+    # different public key, a different entity_id, and orphan the
+    # account.  Both checks are cheap (file existence + HMAC verify on
+    # hit); the slow Entity.create path only runs if no cache file
+    # exists at any candidate height.
+    from messagechain.config import (
+        WALLET_DEFAULT_TREE_HEIGHT, MERKLE_TREE_HEIGHT,
+    )
+    candidate_heights = []
+    for h in (WALLET_DEFAULT_TREE_HEIGHT, MERKLE_TREE_HEIGHT):
+        if h not in candidate_heights:
+            candidate_heights.append(h)
+    for h in candidate_heights:
+        cache_path = personal_wallet_cache_path(private_key, h)
+        if not os.path.exists(cache_path):
+            continue
+        try:
+            with open(cache_path, "rb") as f:
+                blob = f.read()
+            entity = decode_keypair_cache(blob, private_key, h)
+        except OSError:
+            entity = None
+        if entity is not None:
+            logger.info(
+                "Loaded personal-wallet keypair from cache %s (h=%d)",
+                cache_path, h,
+            )
+            return entity
+    # No cache hit at any candidate height -- fall back to the historical
+    # validator-default height (``MERKLE_TREE_HEIGHT``).  The lowered
+    # ``WALLET_DEFAULT_TREE_HEIGHT`` is opt-in via ``cmd_generate_key``,
+    # which writes its cache at the new height so the probe above finds
+    # it on subsequent calls.  Defaulting the cache-miss path to the
+    # lower height would silently bind a DIFFERENT identity for any
+    # wallet whose owner ran a CLI command before ever running
+    # ``generate-key`` (e.g. importing an existing seed via verify-key
+    # on a fresh machine, or any test that constructs an Entity at the
+    # historical default and then drives a CLI command through this
+    # resolver).
+    return _load_or_create_at_height(
+        private_key, MERKLE_TREE_HEIGHT,
+    )
+
+
+def _load_or_create_at_height(
+    private_key: bytes, tree_height: int,
+) -> Entity:
+    """Cache-or-generate at a single specific tree height."""
     cache_path = personal_wallet_cache_path(private_key, tree_height)
     cache_dir = os.path.dirname(cache_path)
 

@@ -710,6 +710,36 @@ WOTS_CHAIN_LENGTH = 15  # max chain depth (W-1)
 # (h=16) or override individually via MESSAGECHAIN_MERKLE_TREE_HEIGHT.
 MERKLE_TREE_HEIGHT = _profile_int("MESSAGECHAIN_MERKLE_TREE_HEIGHT", "MERKLE_TREE_HEIGHT", 20)
 # Tests override this to 4 (16 leaves) via tests/__init__.py for fast execution.
+
+# Personal-wallet default tree height — strictly lower than MERKLE_TREE_HEIGHT
+# because the cost/benefit ratio differs from validators.  A validator
+# proposes / attests once per slot and burns ~530k leaves/year, so the
+# 90-minute keygen at h=20 amortizes across ~2 years of runtime.  A
+# personal wallet sends a few messages a day and will never approach 65k
+# signatures, so charging it the same upfront wait has no security benefit
+# and turns the README's first-message walkthrough into a 90-minute wedge.
+# h=16 (~65k leaves) gives an active personal user multiple lifetimes of
+# capacity at a fraction of the keygen cost.  Per-entity tree heights are
+# stored on chain (see Blockchain.set_wots_tree_height), so different
+# entities at different heights coexist on the same chain.
+WALLET_DEFAULT_TREE_HEIGHT = _profile_int(
+    "MESSAGECHAIN_WALLET_DEFAULT_TREE_HEIGHT", "WALLET_DEFAULT_TREE_HEIGHT", 16,
+)
+
+# Worker-process count for parallel WOTS+ leaf derivation during keygen.
+# Each leaf is independent so the work parallelizes across cores cleanly.
+# 0 = auto (os.cpu_count()).  1 = serial (the historical path).
+# Tests pin this to 1 in tests/__init__.py to avoid multiprocessing
+# overhead and to keep deterministic execution under pytest-xdist.
+KEYGEN_WORKERS = _profile_int(
+    "MESSAGECHAIN_KEYGEN_WORKERS", "KEYGEN_WORKERS", 0,
+)
+# Below this count, parallel keygen is slower than serial because of
+# subprocess spawn overhead (Windows uses 'spawn', not 'fork').  At
+# h=14 (16384 leaves) the per-worker payload is large enough that
+# the spawn cost amortizes; smaller trees stay serial regardless of
+# KEYGEN_WORKERS.
+KEYGEN_PARALLEL_MIN_LEAVES = 16384
 #
 # Leaf exhaustion cadence — an active validator consumes one leaf per
 # block proposed AND one leaf per attestation issued.  At BLOCK_TIME=600s

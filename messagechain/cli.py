@@ -4449,38 +4449,22 @@ def cmd_generate_key(_args):
     from messagechain.identity.identity import Entity
     from messagechain.identity.key_encoding import encode_private_key
     from messagechain.identity.mnemonic import encode_to_mnemonic
-    from messagechain.config import MERKLE_TREE_HEIGHT
+    from messagechain.config import WALLET_DEFAULT_TREE_HEIGHT
 
     key = os.urandom(32)
-    progress = _make_progress_reporter(1 << MERKLE_TREE_HEIGHT, "Building key tree")
-    entity = Entity.create(key, progress=progress)
-    # Warm the personal-wallet cache so the README's next two
-    # commands (`verify-key` then `balance`) are cache HITS instead of
-    # full re-derivations.  Without this, the user pays the
-    # ~20-30 minute WOTS+ keygen cost three times before they've
-    # done anything useful.  Best-effort: a permission error / full
-    # disk must NOT crash key generation -- the key was generated
-    # successfully and the cache is purely a UX optimization for the
-    # next command on this machine.
-    try:
-        from messagechain.identity.keypair_cache import (
-            personal_wallet_cache_path,
-            personal_wallet_cache_dir,
-            encode_keypair_cache,
-            _atomic_write,
-        )
-        cache_dir = personal_wallet_cache_dir()
-        cache_path = personal_wallet_cache_path(key, MERKLE_TREE_HEIGHT)
-        os.makedirs(cache_dir, exist_ok=True)
-        blob = encode_keypair_cache(entity, key, MERKLE_TREE_HEIGHT)
-        _atomic_write(cache_path, blob)
-    except Exception:  # noqa: BLE001 -- cache is best-effort
-        pass
+    tree_height = WALLET_DEFAULT_TREE_HEIGHT
+
+    # Print the recovery phrase FIRST -- before keygen runs.  At the
+    # production wallet height (h=16, ~65k leaves) keygen takes minutes
+    # even after parallelization; at any height it dominates the wall
+    # clock.  The phrase, the hex form, and the warning are all pure
+    # functions of `key` (no Merkle work needed), so we can show them
+    # immediately and let the user back up their 24 words DURING the
+    # keygen wait instead of staring at a silent progress bar.  The
+    # public key / address still require the Merkle root, so they
+    # land at the end -- but by then the user is done writing.
     mnemonic = encode_to_mnemonic(key)
     encoded_hex = encode_private_key(key)
-
-    # Format the 24 words as a 4x6 grid so it's easy to copy onto paper
-    # or stamp into metal without losing place.
     words = mnemonic.split()
     rows = []
     for row_idx in range(4):
@@ -4493,18 +4477,51 @@ def cmd_generate_key(_args):
     for row in rows:
         print(row)
     print(f"\n  Hex form (alternative): {encoded_hex}")
+    print(f"\n  The recovery phrase follows BIP-39 - every word comes from a")
+    print("  known 2048-word list, with a built-in checksum that detects")
+    print("  single-word transcription errors when you type it back.")
+    print(f"\n  WARNING: Anyone with these words controls your account.")
+    print("  There is no recovery. This phrase will NOT be shown again.")
+    print(f"\n  Back up your phrase NOW -- your wallet address is being")
+    print(f"  generated below ({1 << tree_height} one-time signing keys).")
+    # Force the phrase to disk before keygen kicks off, so an interrupt
+    # (Ctrl-C, SIGTERM, terminal close) during the long wait still leaves
+    # the user with the printed phrase.  Without flush() Python's stdout
+    # buffer can hold the phrase until process exit, defeating the point
+    # of printing it early.
+    sys.stdout.flush()
+
+    progress = _make_progress_reporter(1 << tree_height, "Building key tree")
+    entity = Entity.create(key, tree_height=tree_height, progress=progress)
+    # Warm the personal-wallet cache so the README's next two
+    # commands (`verify-key` then `balance`) are cache HITS instead of
+    # full re-derivations.  Without this, the user pays the keygen cost
+    # multiple times before they've done anything useful.  Best-effort:
+    # a permission error / full disk must NOT crash key generation --
+    # the key was generated successfully and the cache is purely a UX
+    # optimization for the next command on this machine.
+    try:
+        from messagechain.identity.keypair_cache import (
+            personal_wallet_cache_path,
+            personal_wallet_cache_dir,
+            encode_keypair_cache,
+            _atomic_write,
+        )
+        cache_dir = personal_wallet_cache_dir()
+        cache_path = personal_wallet_cache_path(key, tree_height)
+        os.makedirs(cache_dir, exist_ok=True)
+        blob = encode_keypair_cache(entity, key, tree_height)
+        _atomic_write(cache_path, blob)
+    except Exception:  # noqa: BLE001 -- cache is best-effort
+        pass
+
     from messagechain.identity.address import encode_address
     print(f"\n  Public key:  {entity.public_key.hex()}")
     print(f"  Entity ID:   {entity.entity_id_hex}")
     print(f"  Address:     {encode_address(entity.entity_id)}")
     print(f"               ^ share this `mc1...` form to receive funds")
-    print(f"\n  The recovery phrase follows BIP-39 - every word comes from a")
-    print("  known 2048-word list, with a built-in checksum that detects")
-    print("  single-word transcription errors when you type it back.")
     print(f"\n  IMPORTANT: Verify your backup before deleting this key.")
     print("  Run: messagechain verify-key")
-    print(f"\n  WARNING: Anyone with these words controls your account.")
-    print("  There is no recovery. This phrase will NOT be shown again.")
 
 
 def cmd_verify_key(args):

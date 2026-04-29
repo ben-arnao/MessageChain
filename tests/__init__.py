@@ -18,6 +18,15 @@ from messagechain.config import HASH_ALGO
 os.environ.setdefault("MESSAGECHAIN_SKIP_DATA_DIR_LOCK", "1")
 
 messagechain.config.MERKLE_TREE_HEIGHT = 4  # 16 leaves instead of 1M (production=20)
+# Personal-wallet default is normally 16 (~65k leaves) in production but tests
+# pin it to 2 (4 leaves) to keep cmd_generate_key cheap.  Distinct from
+# MERKLE_TREE_HEIGHT so tests can verify the personal-wallet path uses the
+# wallet default rather than the validator default.
+messagechain.config.WALLET_DEFAULT_TREE_HEIGHT = 2
+# Force serial keygen in tests: subprocess spawn overhead (Windows uses
+# 'spawn', not 'fork') would dwarf the work for a 4-leaf tree, and
+# nesting multiprocessing.Pool inside pytest-xdist workers is fragile.
+messagechain.config.KEYGEN_WORKERS = 1
 # Tests historically use 1-validator chains. The production threshold would
 # force every test to register N validators before finalization works;
 # override here so existing tests that stake a single validator continue

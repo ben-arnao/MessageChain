@@ -705,6 +705,113 @@ def _subtree_root(seed: bytes, start: int, count: int, progress=None) -> bytes:
     return _hash(left + right)
 
 
+def _subtree_root_chunk(args: tuple) -> bytes:
+    """Worker entry point for parallel keygen.
+
+    Module-level (not a closure) so it pickles cleanly under
+    ``multiprocessing.Pool`` on Windows ``spawn`` start method, where
+    each worker re-imports this module from scratch and resolves the
+    callable by qualified name.
+    """
+    seed, start, count = args
+    return _subtree_root(seed, start, count, progress=None)
+
+
+def _parallel_keygen_root(
+    seed: bytes,
+    height: int,
+    n_workers: int,
+    progress=None,
+) -> bytes:
+    """Compute the Merkle root by partitioning leaves across worker processes.
+
+    The tree is split into ``2^k`` chunks where ``k = floor(log2(n_workers))``,
+    so each chunk is itself a complete subtree of height ``height - k`` and
+    every chunk derives the same number of leaves.  Workers compute their
+    chunk's subtree root independently; the main process combines the
+    chunk roots with the top-k Merkle layers.
+
+    Determinism: chunk i ALWAYS covers leaves [i * chunk_size,
+    (i+1) * chunk_size).  Pool ordering does not affect the combine
+    step because we use ``starmap`` (preserves chunk order in the
+    returned list).
+
+    Progress reporting: each chunk's completion fires ``chunk_size``
+    progress ticks at once, so the reporter still sees every leaf
+    index but updates in batches of ``chunk_size`` rather than one
+    leaf at a time.  The throttled reporter handles the bursty
+    pattern fine — it prints at most one frame per cadence step
+    regardless of how many ticks arrive between frames.
+    """
+    import multiprocessing as mp
+
+    # Round n_workers DOWN to a power of two that's ≤ the leaf count.
+    # We want each chunk to be a complete subtree, which requires the
+    # chunk count to divide the total leaf count cleanly.
+    num_leaves = 1 << height
+    chunks_count = 1
+    while chunks_count * 2 <= n_workers and chunks_count * 2 <= num_leaves:
+        chunks_count *= 2
+    if chunks_count < 2:
+        # Worker count rounded down to 1 — no parallelism worth doing.
+        return _subtree_root(seed, 0, num_leaves, progress)
+
+    chunk_size = num_leaves // chunks_count
+    work_items = [
+        (seed, i * chunk_size, chunk_size) for i in range(chunks_count)
+    ]
+
+    with mp.Pool(processes=chunks_count) as pool:
+        # ``imap`` (ordered) so we can stream chunk-completion progress
+        # while preserving the deterministic chunk-index → root mapping
+        # that the combine step depends on.
+        chunk_roots = []
+        for i, root in enumerate(pool.imap(_subtree_root_chunk, work_items)):
+            chunk_roots.append(root)
+            if progress is not None:
+                base = i * chunk_size
+                # Fire one tick per leaf in this chunk so the reporter's
+                # throttling logic sees the same input it gets in serial
+                # mode.  At test heights this is a few dozen ticks total;
+                # at production heights (h=20, ~1M leaves, 8 chunks) it's
+                # ~131k ticks per chunk completion, but the reporter
+                # debounces to ~20 frames over the full keygen so the
+                # actual stderr write count is bounded.
+                for j in range(chunk_size):
+                    progress(base + j)
+
+    # Build the top-k Merkle layers from the chunk roots in the main
+    # process — same combine that ``_subtree_root`` would have done.
+    current = chunk_roots
+    while len(current) > 1:
+        nxt = []
+        for j in range(0, len(current), 2):
+            nxt.append(_hash(current[j] + current[j + 1]))
+        current = nxt
+    return current[0]
+
+
+def _resolve_keygen_workers() -> int:
+    """Resolve the effective worker count for keygen.
+
+    0 = auto (os.cpu_count(), capped at a sensible upper bound).
+    1 = serial (skip multiprocessing entirely).
+    N>1 = use exactly N workers.
+
+    Re-read at call time (not import time) so test patches of
+    ``messagechain.config.KEYGEN_WORKERS`` take effect.
+    """
+    import messagechain.config as _cfg
+    n = int(getattr(_cfg, "KEYGEN_WORKERS", 0))
+    if n > 0:
+        return n
+    # Auto: use up to 8 cores.  Beyond that we hit diminishing returns
+    # (Merkle combine + per-chunk overhead grow) and risk exhausting
+    # available memory on shared hosts.
+    cpu = os.cpu_count() or 1
+    return max(1, min(cpu, 8))
+
+
 def _compute_auth_path(seed: bytes, height: int, leaf_index: int) -> list[bytes]:
     """Compute the Merkle authentication path for a leaf on demand.
 
@@ -792,7 +899,26 @@ class KeyPair:
         # `progress`, if provided, is called with the leaf index each time a
         # leaf is derived. Long-running keygen (height >= 20) can show a
         # status indicator without the caller needing to know tree internals.
-        self.public_key = _subtree_root(seed, 0, self.num_leaves, progress)
+        #
+        # Parallel path: when ``KEYGEN_WORKERS`` resolves to >1 AND the
+        # tree is large enough to amortize subprocess spawn overhead
+        # (``num_leaves >= KEYGEN_PARALLEL_MIN_LEAVES``), partition the
+        # leaves across worker processes.  Below the threshold the
+        # single-thread serial path wins — multiprocessing on Windows
+        # uses 'spawn' which re-imports this module per worker, costing
+        # ~1-2 sec each.  Both paths produce identical Merkle roots
+        # (covered by ``test_parallel_keygen.TestParallelKeygenDeterminism``).
+        import messagechain.config as _cfg
+        threshold = int(getattr(_cfg, "KEYGEN_PARALLEL_MIN_LEAVES", 16384))
+        workers = _resolve_keygen_workers()
+        if workers > 1 and self.num_leaves >= threshold:
+            self.public_key = _parallel_keygen_root(
+                seed, height, workers, progress,
+            )
+        else:
+            self.public_key = _subtree_root(
+                seed, 0, self.num_leaves, progress,
+            )
 
     @classmethod
     def generate(
