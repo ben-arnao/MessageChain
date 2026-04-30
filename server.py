@@ -3927,6 +3927,29 @@ class Server(SharedRuntimeMixin):
             max_count=MAX_TXS_PER_BLOCK,
         )
 
+        # Drain in-memory attestations for the parent block so the
+        # produced block carries the chain's permanent record of who
+        # attested.  Without this drain, attestations live entirely in
+        # FinalityTracker memory: `_maybe_attest_accepted_block` and
+        # ANNOUNCE_ATTESTATION gossip both feed the tracker, but no
+        # proposer ever flushes them onto chain.  Result before the
+        # fix: every restart wiped attester history, so the receipt
+        # page on https://messagechain.org permanently showed
+        # "0 attesters / awaiting finality" for every block produced
+        # before the most recent restart.  validate_block_attestations
+        # already requires att.block_hash == prev_hash and
+        # att.block_number == block_number - 1, so the drain is
+        # cap-safe to MAX_ATTESTATIONS_PER_BLOCK by construction.
+        from messagechain.config import MAX_ATTESTATIONS_PER_BLOCK
+        parent_attestations = []
+        if self.blockchain.chain:
+            tip = self.blockchain.chain[-1]
+            finality = getattr(self.blockchain, "finality", None)
+            if finality is not None:
+                parent_attestations = finality.attestations_for(
+                    tip.block_hash, tip.header.block_number,
+                )[:MAX_ATTESTATIONS_PER_BLOCK]
+
         # Serialize block sign with reserve_leaf RPC via the same lock
         # — see _rpc_reserve_leaf / self._wallet_leaf_lock for the full
         # rationale.  Without this, an operator CLI running on the same
@@ -3942,6 +3965,7 @@ class Server(SharedRuntimeMixin):
                 governance_txs=governance_txs,
                 react_transactions=react_txs,
                 censorship_evidence_txs=ce_txs,
+                attestations=parent_attestations,
             )
 
         success, reason = self.blockchain.add_block(block)

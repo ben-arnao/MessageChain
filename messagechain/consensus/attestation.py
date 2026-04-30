@@ -374,6 +374,35 @@ class FinalityTracker:
             return 0.0
         return self.attested_stake.get(block_hash, 0) / total_stake
 
+    def attestations_for(
+        self, block_hash: bytes, block_number: int,
+    ) -> list[Attestation]:
+        """Return the in-memory Attestation objects collected for the
+        given (block_hash, block_number) pair, suitable for inclusion in
+        the next block by the proposer.
+
+        Without this drain step, attestations live entirely in volatile
+        memory: `_maybe_attest_accepted_block` adds to the tracker,
+        ANNOUNCE_ATTESTATION gossip adds to the tracker, but no
+        proposer ever flushes them onto the chain.  After a restart the
+        tracker is empty, so historical receipts permanently show
+        "0 attesters / awaiting finality".  Pairs with
+        `durable_block_finality`, which expects the proposer of block
+        N+1 to carry the attestations for block N.
+        """
+        out: list[Attestation] = []
+        seen: set[bytes] = set()
+        for (vid, h), att in self._attestation_objects.items():
+            if h != block_number:
+                continue
+            if att.block_hash != block_hash:
+                continue
+            if vid in seen:
+                continue
+            seen.add(vid)
+            out.append(att)
+        return out
+
 
 def durable_block_finality(
     blockchain, block_height: int, block_hash: bytes,

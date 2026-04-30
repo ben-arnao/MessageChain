@@ -2212,11 +2212,26 @@ class Node(SharedRuntimeMixin):
                 next_height,
                 selection_seed=parent_randao,
             )
+        # Drain in-memory attestations for the parent block — see the
+        # twin in server.py::_try_produce_block_sync for the full
+        # rationale.  Without this drain, the receipt page silently
+        # downgrades every block produced before the most recent
+        # restart to "0 attesters / awaiting finality".
+        from messagechain.config import MAX_ATTESTATIONS_PER_BLOCK
+        parent_attestations = []
+        if self.blockchain.chain:
+            tip = self.blockchain.chain[-1]
+            finality = getattr(self.blockchain, "finality", None)
+            if finality is not None:
+                parent_attestations = finality.attestations_for(
+                    tip.block_hash, tip.header.block_number,
+                )[:MAX_ATTESTATIONS_PER_BLOCK]
         block = self.blockchain.propose_block(
             self.consensus, self.entity, txs,
             slash_transactions=slash_txs,
             finality_votes=fin_votes,
             custody_proofs=cust_proofs,
+            attestations=parent_attestations,
         )
 
         success, reason = self.blockchain.add_block(block)
