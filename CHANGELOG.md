@@ -4,6 +4,33 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.46.0] — 2026-04-30
+
+Minor release. **Fixes the recurring chain-stall pattern observed on
+mainnet at heights 615 / 793 / 893 / 951 / 993 across versions
+1.25.1 through 1.45.2.** Root cause: the producer side and the
+validator side of proposer selection were using two different
+algorithms whenever `VRF_ENABLED=True`, so a producer would propose
+a block its own `validate_block` then rejected with "Wrong proposer
+for slot" — chain wedged. Each prior patch release temporarily
+unstuck the chain only because the restart bumped past the stuck
+slot; the divergent codepath itself was never touched.
+
+### Fixed
+
+- **Producer/validator proposer-selection divergence.**
+  `block_producer.should_propose` previously called
+  `ProofOfStake.select_proposer` (pre-VRF lottery seeded from parent
+  randao_mix), while `validate_block` called the VRF-aware
+  `Blockchain._selected_proposer_for_slot` (seeded from the lookahead
+  block's mix, 32 blocks back). With 2 validators the two algorithms
+  agreed ~50% of the time and disagreed the rest. `should_propose`
+  now routes through `_selected_proposer_for_slot` so the producer
+  and validator agree byte-for-byte on every (parent, round). Pinned
+  with a regression test in `test_block_production.py` that walks 50
+  slots in a 2-validator chain and asserts `should_propose` agrees
+  with `_selected_proposer_for_slot` for every (entity, slot).
+
 ## [1.45.2] — 2026-04-29
 
 Follow-up to 1.45.1.  That release fixed the receipt-page READ
