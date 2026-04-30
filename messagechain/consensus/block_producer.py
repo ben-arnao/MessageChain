@@ -143,14 +143,25 @@ def should_propose(
     if not slot.is_due:
         return False, 0, f"slot not due ({slot.seconds_until_due:.0f}s remaining)"
 
-    selected = consensus.select_proposer(
-        latest.block_hash,
-        randao_mix=latest.header.randao_mix,
-        round_number=slot.round_number,
+    # Use the chain's own selection function — same one validate_block
+    # enforces — so the producer and validator agree byte-for-byte on
+    # who is supposed to propose this slot. Calling consensus.select_proposer
+    # here would diverge once VRF_ENABLED is on, because the VRF path
+    # in Blockchain._selected_proposer_for_slot seeds from the lookahead
+    # block's randao_mix while consensus.select_proposer seeds from the
+    # parent's. That divergence would let a producer pick itself for a
+    # slot the validator side then rejects with "Wrong proposer for slot",
+    # wedging the chain at every disagreement (observed on mainnet
+    # 1.x at heights 615/793/893/951/993).
+    selected = blockchain._selected_proposer_for_slot(
+        latest, round_number=slot.round_number
     )
 
     if selected is None:
-        # No registered validators → bootstrap mode → any node may propose
+        # No validator meets the minimum-stake floor → bootstrap mode
+        # → any registered node may propose. Mirrors the validate_block
+        # behaviour: when _selected_proposer_for_slot returns None,
+        # add_block skips the proposer-match check.
         if consensus.validator_count > 0:
             return False, slot.round_number, "no proposer selected"
         return True, slot.round_number, "bootstrap (no validators)"
