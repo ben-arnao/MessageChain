@@ -4,6 +4,41 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.45.2] — 2026-04-29
+
+Follow-up to 1.45.1.  That release fixed the receipt-page READ
+path to consult durable on-disk sources, but the WRITE path was
+silently broken: no proposer ever flushed in-memory attestations
+onto chain, so the source the read path now consulted was empty
+by construction.  Result was unchanged from before 1.45.1 — every
+block produced before the most recent restart still showed
+"0 attesters / awaiting finality" on https://messagechain.org.
+
+### Fixed
+
+- **Proposer now drains parent-block attestations into the next
+  produced block.**  `_try_produce_block_sync` (server.py) and
+  `_try_produce_block` (node.py) called `propose_block(...)`
+  without `attestations=`, so every produced block carried zero
+  attestations even though `validate_block_attestations` and the
+  apply path already supported them (with the standing constraint
+  that `att.block_hash == prev_hash` and `att.block_number ==
+  block_number - 1`).  Both proposers now drain
+  `self.blockchain.finality.attestations_for(tip.block_hash,
+  tip.header.block_number)` and pass the result, capped at
+  `MAX_ATTESTATIONS_PER_BLOCK`, into `propose_block`.  Adds
+  `FinalityTracker.attestations_for(block_hash, block_number)` as
+  the helper.  Historical blocks 1..N produced before this fix
+  stay at 0 attesters forever — that data was never persisted
+  and cannot be recovered — but every block produced after
+  activation carries the attestations its peers cast in the prior
+  block period, which is what the 1.45.1 read path was designed
+  to surface.  Adds regression tests covering the helper
+  (block-hash filter, height filter, dedupe, empty case) and the
+  full proposer-drain → propose_block → add_block →
+  durable_block_finality(post-restart) integration path.
+  (a56a337)
+
 ## [1.45.1] — 2026-04-29
 
 Bugfix release.  The receipt-page tx-status RPC was reading
