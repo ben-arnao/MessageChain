@@ -21,7 +21,7 @@ from messagechain.consensus.pos import ProofOfStake
 from messagechain.consensus.randao import derive_randao_mix
 from messagechain.consensus import block_producer
 from messagechain.identity.identity import Entity
-from tests import register_entity_for_test
+from tests import register_entity_for_test, pick_selected_proposer
 
 
 def _make_chain_with_validators(num_validators: int):
@@ -319,6 +319,77 @@ class TestStrictProposerValidation(unittest.TestCase):
         self.assertGreater(len(seen), 1,
                            "round rotation must reach different validators with 5 staked")
 
+    def test_should_propose_agrees_with_validate_block(self):
+        """Regression for the mainnet 1.x chain-stall pattern.
+
+        `should_propose` (producer side) must say "yes" exactly for the
+        validator that `_selected_proposer_for_slot` (the function
+        `validate_block` enforces) expects to propose this slot.
+
+        Before the fix, `should_propose` called
+        `consensus.select_proposer` (pre-VRF lottery seeded from parent
+        randao_mix) while the validator called the VRF path seeded from
+        the lookahead block's mix. When they diverged, a producer that
+        thought it was its turn proposed a block its own
+        `validate_block` then rejected with "Wrong proposer for slot" —
+        chain wedges every time the schedules disagree. Observed on
+        mainnet at heights 615 / 793 / 893 / 951 / 993, all "fixed" by
+        patches that touched unrelated code and worked only because
+        the restart bumped past the stuck slot.
+        """
+        from messagechain.config import VRF_ENABLED
+        if not VRF_ENABLED:
+            self.skipTest("divergence only manifests when VRF_ENABLED")
+
+        chain, consensus, entities = _make_chain_with_validators(2)
+
+        # Build a few real blocks so chain length > 1 — that activates
+        # the VRF lookahead branch in `_selected_proposer_for_slot`.
+        # At small chain lengths VRF_LOOKAHEAD clamps to genesis
+        # (block 0), whose randao_mix differs from parent's — exactly
+        # the divergence surface this regression is about.
+        for _ in range(3):
+            proposer = pick_selected_proposer(chain, entities)
+            block = chain.propose_block(consensus, proposer, [])
+            ok, reason = chain.add_block(block)
+            self.assertTrue(ok, reason)
+
+        parent = chain.get_latest_block()
+        # Walk forward 50 slots. For each slot ask every validator
+        # whether it should propose, and assert the answer matches the
+        # validator-side authority. Empirically with this 2-validator
+        # setup the buggy code diverges on >50% of rounds; 50 rounds
+        # makes the regression deterministic.
+        mismatches = []
+        for r in range(50):
+            slot_ts = (
+                parent.header.timestamp + BLOCK_TIME_TARGET * (r + 1) + 1
+            )
+            validator_pick = chain._selected_proposer_for_slot(
+                parent, round_number=r,
+            )
+            if validator_pick is None:
+                continue  # bootstrap mode — no enforcement
+            for ent in entities:
+                ok, _round, _reason = block_producer.should_propose(
+                    chain, consensus, ent.entity_id, now=slot_ts,
+                )
+                expected = ent.entity_id == validator_pick
+                if ok != expected:
+                    mismatches.append((
+                        r,
+                        ent.entity_id.hex()[:16],
+                        ok,
+                        validator_pick.hex()[:16],
+                    ))
+        self.assertEqual(
+            mismatches, [],
+            "should_propose must agree with _selected_proposer_for_slot "
+            "for every (entity, slot); divergence stalls the chain. "
+            f"Got mismatches (round, entity, should_propose, "
+            f"validator_pick): {mismatches}",
+        )
+
     def test_no_enforcement_in_bootstrap(self):
         """When no one has staked, any registered proposer is allowed."""
         entities = [
@@ -460,7 +531,15 @@ class TestGrindingStakeFloor(unittest.TestCase):
         self.assertFalse(ok,
             f"1-token validator must not be allowed to propose "
             f"(grinding ROI would be positive); got reason={reason!r}")
-        self.assertIn("stake", reason.lower())
+        # The refusal can come from either the min-stake filter inside
+        # `_selected_proposer_for_slot` (which `should_propose` now
+        # delegates to so the producer and validator never disagree)
+        # or the explicit grinding-floor check further down. Both
+        # ultimately gate on stake — accept either.
+        self.assertTrue(
+            "stake" in reason.lower() or "no proposer selected" in reason.lower(),
+            f"refusal reason should be stake-related; got {reason!r}",
+        )
 
     def test_validator_at_min_stake_can_propose(self):
         """A validator who meets VALIDATOR_MIN_STAKE remains eligible —
