@@ -314,19 +314,14 @@ def _conflicting_headers(proposer, prev_block):
 
 
 class TestSlashingBlockParity(_ParityBase):
-    @unittest.expectedFailure
     def test_slash_block_sim_matches_apply(self):
-        """TODO: `compute_post_state_root` does not model slashing-
-        induced state mutations (stake zero-out, balance burn,
-        slashed_validators set).  Production short-circuits this in
-        `_append_block` (`if not block.slash_transactions: <sim
-        precheck>`) and falls back to the snapshot/rollback safety
-        net.  Once a sim mirror lands for the slashing path, flip
-        this from `@expectedFailure` to a real passing test (or
-        delete the decorator).
-
-        Until then, this xfail documents that the sim/apply parity
-        explicitly does NOT hold for slashing blocks today.
+        """``compute_post_state_root`` mirrors the apply-time slashing
+        mutations: fee burn + tip credit (pay_fee_with_burn), stake
+        burn (slash_validator), finder reward to the submitter, and
+        the ``slashed_validators`` set add on a 100% slash.  Closes
+        the long-standing short-circuit in ``_append_block`` that
+        skipped the sim pre-check whenever ``block.slash_transactions``
+        was non-empty.
         """
         chain, consensus, entities = _make_chain_with_validators(3)
         _build_a_real_block(chain, consensus, entities)

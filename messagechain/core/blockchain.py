@@ -5092,6 +5092,128 @@ class Blockchain:
             if (ak_sim == b"" and pk_sim != b"") or ak_sim == pk_sim:
                 _bump_wm(utx.entity_id, utx.signature.leaf_index)
 
+        # Simulate slash transactions — mirrors the apply-time loop in
+        # _apply_block_state (line ~10683).  Pre-fix, _append_block
+        # short-circuited the sim pre-check whenever
+        # ``block.slash_transactions`` was non-empty, so a slash block's
+        # state_root could only be checked AFTER mutation by the
+        # snapshot/rollback safety net — same defect class as 1.46.0
+        # (proposer divergence) and 1.47.0 (unstake-release divergence).
+        # Mutations mirrored here:
+        #   * pay_fee_with_burn(submitter → proposer): debit submitter
+        #     balance by fee, credit proposer by tip, accrue attester
+        #     share (post-ATTESTER_FEE_FUNDING_HEIGHT).
+        #   * escrow drain: debit offender balance by escrow_burned
+        #     (read-through self._escrow; sim does not mutate the
+        #     ledger).  Empty in the common case but mirrored for
+        #     correctness.
+        #   * slash_validator stake burn: per-bucket apportionment
+        #     against (sim_staked, pending_unstakes), credit finder
+        #     reward to the submitter's balance.  Pending-unstake
+        #     drain and total_supply mutations live outside the per-
+        #     entity SMT and so do not affect state_root.
+        #   * slashed_validators.add(offender) on a 100% slash —
+        #     directly visible in the leaf's is_slashed flag.
+        #   * leaf_watermark bump for the submitter (slash sig leaf).
+        # Slash-offense counter, reputation reset, and slash_sig_counts
+        # are NOT in the state-tree leaf, so we deliberately don't
+        # mirror them here.
+        from messagechain.config import (
+            SLASH_FINDER_REWARD_PCT as _SFRP,
+            get_honesty_curve_active as _ghca,
+            get_slash_pct as _gsp,
+        )
+        _slash_curve_active = _ghca(block_height)
+        _slash_pct_for_block = _gsp(block_height)
+        for _stx in (slash_transactions or []):
+            # Fee affordability + base-fee gate — apply-path skips
+            # the slash entirely when pay_fee_with_burn returns False.
+            if _stx.fee < current_base_fee:
+                continue
+            if sim_balances.get(_stx.submitter_id, 0) < _stx.fee:
+                continue
+            # pay_fee_with_burn: debit submitter, credit proposer tip.
+            effective_base_fee = min(current_base_fee, _stx.fee)
+            tip = _stx.fee - effective_base_fee
+            sim_balances[_stx.submitter_id] = (
+                sim_balances.get(_stx.submitter_id, 0) - _stx.fee
+            )
+            sim_balances[proposer_id] = (
+                sim_balances.get(proposer_id, 0) + tip
+            )
+            _accumulate_attester_fee(effective_base_fee)
+            # Per-tx slash percent.  Tier 23 honesty curve grades
+            # severity per offender; pre-Tier-23 it collapses to a
+            # single block-wide value.  Reads ``slash_offense_counts``
+            # off the live blockchain — fine in the sim because we
+            # don't mutate the offense counter here (it isn't in the
+            # state-tree leaf).
+            if _slash_curve_active:
+                _stx_slash_pct = self._compute_slash_pct(
+                    _stx, block_height,
+                )
+            else:
+                _stx_slash_pct = _slash_pct_for_block
+            if not (0 < _stx_slash_pct <= 100):
+                # Zero-severity (Tier 24 amnesty) skips the burn but
+                # the apply path still records processed/fee/watermark.
+                # Watermark bump runs unconditionally below.
+                _stx_slash_pct = 0
+            _offender = _stx.evidence.offender_id
+            # Escrow drain: only the offender's balance debit is
+            # state-tree-visible (total_supply / total_burned live
+            # outside the SMT).  Mirror the apply path's
+            # max(0, balance - escrow_burned).
+            if _stx_slash_pct > 0:
+                _escrow_burned = sum(
+                    e.amount * _stx_slash_pct // 100
+                    if _stx_slash_pct < 100 else e.amount
+                    for e in self._escrow._entries
+                    if e.entity_id == _offender
+                )
+                if _escrow_burned > 0:
+                    _cur_bal = sim_balances.get(_offender, 0)
+                    sim_balances[_offender] = max(
+                        0, _cur_bal - _escrow_burned,
+                    )
+                # slash_validator apportionment.  Stake bucket and
+                # pending bucket each take floor(amount * pct / 100);
+                # finder reward = slashed_amount * SFRP // 100 paid
+                # to the submitter.  Pending-unstake mutation lives
+                # outside the per-entity SMT, so the sim only tracks
+                # the staked-side delta plus the finder credit — same
+                # contract as ``_sim_burn_slash_proportional_stake_delta``.
+                _staked_amount = sim_staked.get(_offender, 0)
+                _pending_amount = self.supply.get_pending_unstake(_offender)
+                _basis = _staked_amount + _pending_amount
+                if _basis > 0:
+                    _stake_burn = _staked_amount * _stx_slash_pct // 100
+                    _pending_burn = (
+                        _pending_amount * _stx_slash_pct // 100
+                    )
+                    _slashed_amount = _stake_burn + _pending_burn
+                    if _slashed_amount > 0:
+                        _finder_reward = (
+                            _slashed_amount * _SFRP // 100
+                        )
+                        if _stx_slash_pct == 100:
+                            sim_staked[_offender] = 0
+                        else:
+                            sim_staked[_offender] = (
+                                _staked_amount - _stake_burn
+                            )
+                        sim_balances[_stx.submitter_id] = (
+                            sim_balances.get(_stx.submitter_id, 0)
+                            + _finder_reward
+                        )
+                if _stx_slash_pct == 100:
+                    sim_slashed.add(_offender)
+            # Watermark bump for the slash submitter — runs
+            # unconditionally (matches apply path's
+            # ``_bump_watermark(stx.submitter_id, ...)`` outside any
+            # per-pct gate).
+            _bump_wm(_stx.submitter_id, _stx.signature.leaf_index)
+
         # Receive-to-exist: no separate registration simulation needed.
         # The transfer simulation above already installs pubkeys via the
         # `sim_public_keys[ttx.entity_id] = ttx.sender_pubkey` branch
@@ -12422,38 +12544,44 @@ class Blockchain:
         # If the resulting state root doesn't match the header commitment,
         # reject immediately — no state changes have been applied yet.
         #
-        # compute_post_state_root doesn't model slashing state transitions
-        # (it simulates only transactions, transfers, and reward splits),
-        # so we skip the pre-check for blocks containing slashing txs and
-        # rely on the snapshot/rollback safety net further down.
-        if not block.slash_transactions:
-            try:
-                proposer_sig_leaf = (
-                    block.header.proposer_signature.leaf_index
-                    if block.header.proposer_signature is not None
-                    else None
-                )
-                # Single block-shaped call — the registry-walking
-                # helper reads every per-kind tx list (including
-                # forward-compatibly any new ones) via
-                # ``_BLOCK_TX_LIST_ATTRS``.  Pre-refactor this site
-                # hand-rolled 18 kwargs and silently dropped any new
-                # tx kind whose attribute hadn't been added here yet
-                # — the 1.29.x react-tx saga and the post-Tier-32 sim
-                # divergence both shipped from exactly that surface.
-                simulated_root = self.compute_post_state_root_for_block(
-                    block,
-                    proposer_signature_leaf_index=proposer_sig_leaf,
-                )
-            except Exception:
-                # Simulation may be a superset of the real apply logic and
-                # can legitimately fail on edge cases; fall through to the
-                # existing snapshot/rollback path rather than rejecting on
-                # simulation exceptions alone.
-                simulated_root = None
+        # The slashing-block short-circuit that previously lived here
+        # (``if not block.slash_transactions: ...``) is gone:
+        # ``compute_post_state_root`` now mirrors the apply-time slash
+        # mutations (fee burn, stake burn, finder reward, slashed-set
+        # add, watermark bump — see the slash sim block alongside the
+        # unstake mirror).  Slash blocks fall through the same pre-
+        # check as every other block type now, closing the wedge
+        # surface that landed the chain at exactly the slash height
+        # whenever sim-vs-apply diverged for slashing.  Same defect-
+        # class fix as 1.46.0 (proposer divergence) and 1.47.0
+        # (unstake-release divergence).
+        try:
+            proposer_sig_leaf = (
+                block.header.proposer_signature.leaf_index
+                if block.header.proposer_signature is not None
+                else None
+            )
+            # Single block-shaped call — the registry-walking
+            # helper reads every per-kind tx list (including
+            # forward-compatibly any new ones) via
+            # ``_BLOCK_TX_LIST_ATTRS``.  Pre-refactor this site
+            # hand-rolled 18 kwargs and silently dropped any new
+            # tx kind whose attribute hadn't been added here yet
+            # — the 1.29.x react-tx saga and the post-Tier-32 sim
+            # divergence both shipped from exactly that surface.
+            simulated_root = self.compute_post_state_root_for_block(
+                block,
+                proposer_signature_leaf_index=proposer_sig_leaf,
+            )
+        except Exception:
+            # Simulation may be a superset of the real apply logic and
+            # can legitimately fail on edge cases; fall through to the
+            # existing snapshot/rollback path rather than rejecting on
+            # simulation exceptions alone.
+            simulated_root = None
 
-            if simulated_root is not None and block.header.state_root != simulated_root:
-                return False, "Invalid state_root — state commitment mismatch"
+        if simulated_root is not None and block.header.state_root != simulated_root:
+            return False, "Invalid state_root — state commitment mismatch"
 
         # Round-9 fix: wrap apply + state-root verify + persist in a
         # SINGLE chaindb transaction.  Pre-fix multiple apply-time
