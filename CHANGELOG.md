@@ -4,6 +4,34 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.47.0] — 2026-05-03
+
+Minor release. **Fixes a deterministic chain stall at every
+unstake-release block.** First triggered on mainnet at height 1309
+(release of validator-1's 25M unstake initiated at block 301);
+chain wedged for 24+ hours with the producer rejecting its own
+candidate every 10 minutes. Same defect class as the proposer-
+selection divergence fixed in 1.46.0 — apply-only state mutation
+missing from the sim mirror.
+
+### Fixed
+
+- **`compute_post_state_root` now mirrors `process_pending_unstakes`.**
+  `_apply_block_state` calls `Supply.process_pending_unstakes(
+  block_height)` which credits matured pending-unstake entries
+  (release_block <= block_height) back into the unstaker's
+  spendable `balances`. The sim path used by both the producer
+  (via `propose_block`) and the validator's pre-check never modeled
+  this. The first time mainnet reached a release block, the
+  producer signed a state_root that omitted the +25M credit, the
+  validator's pre-check matched its own (equally wrong) sim, and
+  `_append_block`'s post-apply check (`compute_current_state_root`
+  vs the claimed root) failed deterministically. Mirror the credit
+  in `compute_post_state_root` before the touched-keys assembly;
+  pinned with a regression test in `test_block_production.py` that
+  injects a release-block-aligned pending unstake and asserts
+  `add_block` accepts the resulting candidate.
+
 ## [1.46.0] — 2026-04-30
 
 Minor release. **Fixes the recurring chain-stall pattern observed on
