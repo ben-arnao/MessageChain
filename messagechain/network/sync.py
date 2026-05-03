@@ -49,6 +49,29 @@ SYNC_TIMEOUT = 30  # seconds to wait for a response
 MAX_SYNC_PEERS = 3  # max peers to sync from simultaneously
 SYNC_STALE_TIMEOUT = 60  # restart sync if stuck for this long
 
+# Fork-resolution parameters (1.51.0).  When the peer's first header
+# does not extend our local tip (Header chain broken), the peer is on
+# a chain that diverges from ours at some recent height.  Walk back to
+# find the common ancestor by re-requesting headers from progressively
+# earlier heights; on the response, the LAST height whose header hash
+# matches ours locally is the ancestor, and everything after is the
+# peer's competing chain.  Feed those blocks through ``add_block``;
+# the existing fork-storage + cumulative-weight auto-reorg machinery
+# (Blockchain._reorganize) takes the chain to the heavier side
+# automatically.
+#
+# Without this, a partition that lasts long enough for both validators
+# to mint independent blocks on different forks leaves the recovering
+# node permanently stuck: every IBD attempt aborts at "Header chain
+# broken at #N" without ever pulling in the peer's chain to compare
+# weights.  Witnessed on mainnet 2026-05-03: validator-1 stuck post-
+# legacy-ban-clear because the partition produced ~5 divergent blocks
+# on each side.
+FORK_LOOKBACK_INITIAL = 16     # first probe goes back 16 blocks from divergence
+FORK_LOOKBACK_DOUBLING = 2     # double on each retry until cap
+FORK_LOOKBACK_CAP = 4096       # ~28 days at 600s/block; deeper than this is operator-territory
+FORK_RESOLUTION_MAX_RETRIES = 8  # bounded retries before we give up and try a different peer
+
 # Tolerance bands for ``ChainSyncer._maybe_validate_peer_weight``.
 # The verification compares ``our_weight + sum(stake_weight(hdr) for hdr
 # in delivered_headers)`` against the peer's handshake claim.
@@ -155,6 +178,22 @@ class ChainSyncer:
         # currently in flight from that peer. Used to reassign on stall and
         # to enforce per-peer inflight caps.
         self._inflight_by_peer: dict[str, list[bytes]] = {}
+
+        # ── Fork resolution state (1.51.0) ─────────────────────────────
+        # Set when the IBD detects the peer's first header doesn't extend
+        # our local tip ("Header chain broken at #N").  We then re-issue
+        # REQUEST_HEADERS from a deeper height looking for the common
+        # ancestor.  See FORK_LOOKBACK_* constants and
+        # _start_fork_resolution / _handle_fork_resolution_response.
+        self._fork_resolution_active: bool = False
+        self._fork_resolution_peer: str = ""
+        self._fork_resolution_lookback: int = 0
+        self._fork_resolution_retries: int = 0
+        # Headers that diverge from our chain (after the common ancestor),
+        # waiting to have their full blocks fetched + applied via the
+        # add_block fork-storage path.  Distinct from pending_headers
+        # which is for the linear-extension IBD path.
+        self._fork_resolution_competing_headers: list[dict] = []
 
     def _parse_block_hashes(self, headers: list[dict]) -> list[bytes]:
         """Safely parse block hashes from header dicts, skipping invalid ones."""
@@ -369,7 +408,15 @@ class ChainSyncer:
         # A flooding peer that ships oversized batches burns CPU on parse
         # + truncation; record an offense so repeat offenders accumulate
         # ban-score and get disconnected rather than getting a free pass.
-        max_allowed = HEADERS_BATCH_SIZE * 2
+        # When fork-resolution is active the same peer is allowed to ship
+        # a wider batch (lookback + HEADERS_BATCH_SIZE) so they can serve
+        # the walk-back probe in one round-trip; cap is widened to match
+        # the largest probe we ever issue.
+        max_allowed = (
+            FORK_LOOKBACK_CAP + HEADERS_BATCH_SIZE
+            if self._fork_resolution_active
+            else HEADERS_BATCH_SIZE * 2
+        )
         if len(headers_data) > max_allowed:
             logger.warning(
                 f"Peer {peer_addr} sent {len(headers_data)} headers "
@@ -380,6 +427,16 @@ class ChainSyncer:
                 f"header_batch_oversize:{len(headers_data)}>{max_allowed}",
             )
             headers_data = headers_data[:max_allowed]
+
+        # Fork-resolution path — separate handler because the validation
+        # contract is different (we WANT some headers to mismatch local;
+        # the divergence point IS the answer we're looking for).  Bail
+        # out of the linear-extension validation below entirely.
+        if self._fork_resolution_active:
+            await self._handle_fork_resolution_response(
+                headers_data, peer_addr,
+            )
+            return
 
         if not headers_data:
             # No more headers — switch to block download
@@ -402,9 +459,14 @@ class ChainSyncer:
         )
 
         checkpoint_violation = False
+        chain_broken_at: int | None = None
         for hdr in headers_data:
             if hdr["prev_hash"] != expected_prev:
-                logger.warning(f"Header chain broken at block #{hdr['block_number']}")
+                chain_broken_at = hdr.get("block_number", 0)
+                logger.warning(
+                    f"Header chain broken at block #{chain_broken_at} "
+                    f"(peer={peer_addr})"
+                )
                 break
             bh = parse_hex(hdr.get("block_hash", ""))
             if bh is None:
@@ -443,6 +505,25 @@ class ChainSyncer:
             # Abort the sync round entirely — do not extend pending_headers,
             # do not request more headers from this peer.
             self.state = SyncState.IDLE
+            return
+
+        # Header chain broken AND we have evidence the peer's chain has
+        # higher cumulative weight than ours -> the peer is on a
+        # divergent fork that's heavier than our local chain.  Switch to
+        # fork-resolution mode: walk back to find the common ancestor
+        # and feed the divergent chain through add_block's fork-storage
+        # path so the existing _reorganize machinery can swap tips.
+        # Without this branch the IBD aborts and retries identically
+        # forever, leaving the recovering node stuck on the lighter
+        # fork (witnessed on mainnet 2026-05-03 after a P2P partition
+        # produced ~5 divergent blocks on each side).  The retry
+        # IDENTICALLY-aborts case isn't an IBD bug per se -- it's the
+        # missing fork-recovery code path.
+        if (
+            chain_broken_at is not None
+            and self._peer_outweighs_local(peer_addr)
+        ):
+            await self._start_fork_resolution(peer_addr, chain_broken_at)
             return
 
         # Enforce header spam limit before extending
@@ -490,6 +571,311 @@ class ChainSyncer:
                 await self._request_next_blocks(peer_addr)
             else:
                 self.state = SyncState.COMPLETE
+
+    # ── Fork resolution (1.51.0) ─────────────────────────────────────
+
+    def _peer_outweighs_local(self, peer_addr: str) -> bool:
+        """Whether the peer's claimed cumulative weight strictly exceeds
+        ours.  Used to gate fork-resolution: there's no point chasing a
+        divergent chain that's lighter than what we already have, and
+        chasing it would give a sybil cheap bandwidth-burn against us.
+
+        Reads the peer's HANDSHAKE-claimed ``cumulative_weight`` (capped
+        by ``Node._accept_peer_weight``).  The claim itself isn't
+        cryptographically verified at this point -- the divergent
+        headers we're about to fetch are what verify it -- but the
+        claim is enough to decide it's worth doing the work.  If the
+        peer was lying, the divergent chain we collect will sum to less
+        than the claim and the eventual reorg-or-don't decision (made
+        by ``Blockchain._reorganize``-ing only when the new fork tip's
+        cumulative weight exceeds the current tip's) catches them.
+        """
+        info = self.peer_heights.get(peer_addr)
+        if info is None:
+            return False
+        return info.cumulative_weight > self._our_cumulative_weight()
+
+    async def _start_fork_resolution(
+        self, peer_addr: str, divergent_block_number: int,
+    ) -> None:
+        """Begin (or continue) fork resolution against ``peer_addr``.
+
+        Sequence:
+          1. First call sets _fork_resolution_active=True and probes
+             at lookback=FORK_LOOKBACK_INITIAL blocks below the
+             divergence height.
+          2. If the response shows the lookback wasn't deep enough
+             (every header in the response still matches our local
+             chain -- so the divergence is later than this probe),
+             this method is re-entered with a doubled lookback.
+          3. Bounded by FORK_LOOKBACK_CAP and FORK_RESOLUTION_MAX_RETRIES
+             so a peer that lies about diverging cannot pin us in an
+             infinite probe loop.
+        """
+        if not self._fork_resolution_active:
+            self._fork_resolution_active = True
+            self._fork_resolution_peer = peer_addr
+            self._fork_resolution_lookback = FORK_LOOKBACK_INITIAL
+            self._fork_resolution_retries = 0
+            self._fork_resolution_competing_headers = []
+        else:
+            # Already probing -- this is a "lookback wasn't deep
+            # enough" retry.  Double the window.
+            self._fork_resolution_lookback = min(
+                self._fork_resolution_lookback * FORK_LOOKBACK_DOUBLING,
+                FORK_LOOKBACK_CAP,
+            )
+            self._fork_resolution_retries += 1
+
+        if self._fork_resolution_retries > FORK_RESOLUTION_MAX_RETRIES:
+            logger.warning(
+                f"Fork resolution exhausted retries against {peer_addr} "
+                f"(lookback reached {self._fork_resolution_lookback}); "
+                f"abandoning.  Operator may need to manually inspect "
+                f"chain divergence."
+            )
+            self._reset_fork_resolution()
+            self.state = SyncState.IDLE
+            return
+
+        probe_start = max(
+            0,
+            divergent_block_number - self._fork_resolution_lookback - 1,
+        )
+        # Request lookback + headroom so we both find the ancestor AND
+        # collect at least HEADERS_BATCH_SIZE blocks of competing chain
+        # in one round trip.
+        probe_count = min(
+            self._fork_resolution_lookback + HEADERS_BATCH_SIZE,
+            FORK_LOOKBACK_CAP + HEADERS_BATCH_SIZE,
+        )
+        logger.info(
+            f"Fork resolution: probing peer={peer_addr} from height "
+            f"{probe_start} (lookback={self._fork_resolution_lookback}, "
+            f"retry={self._fork_resolution_retries})"
+        )
+        await self._send_request_headers(peer_addr, probe_start, probe_count)
+
+    async def _send_request_headers(
+        self, peer_addr: str, start_height: int, count: int,
+    ) -> None:
+        """Like ``_request_headers`` but with an explicit count, used by
+        fork resolution to fetch a wider window than the default
+        HEADERS_BATCH_SIZE.  Server caps internally at 500."""
+        result = self.get_peer_writer(peer_addr)
+        if result is None:
+            logger.warning(
+                f"Cannot request headers — peer {peer_addr} not connected"
+            )
+            self._reset_fork_resolution()
+            self.state = SyncState.IDLE
+            return
+        writer, _ = result
+        msg = NetworkMessage(
+            msg_type=MessageType.REQUEST_HEADERS,
+            payload={
+                "start_height": start_height,
+                "count": count,
+            },
+        )
+        try:
+            await write_message(writer, msg)
+        except Exception as e:
+            logger.warning(
+                f"Failed to send fork-resolution headers request to "
+                f"{peer_addr}: {e}"
+            )
+            self._reset_fork_resolution()
+            self.state = SyncState.IDLE
+
+    async def _handle_fork_resolution_response(
+        self, headers_data: list[dict], peer_addr: str,
+    ) -> None:
+        """Process headers received during fork resolution.
+
+        Walks the response looking for the LAST height where the peer's
+        header_hash matches our local block at that height (the common
+        ancestor) and the FIRST height where they diverge (the start of
+        the competing chain).
+
+        Outcomes:
+          * Found ancestor: extract competing headers, fetch more if the
+            peer's claimed tip is past our last header, otherwise
+            transition to block download.
+          * All headers in the response match local chain (lookback was
+            too shallow): retry _start_fork_resolution with doubled
+            lookback.
+          * No header matches local (probe went too far back into
+            history that we don't have, OR peer is on an entirely
+            unrelated chain): same retry path; if FORK_RESOLUTION_MAX
+            _RETRIES exhausts, give up.
+        """
+        if peer_addr != self._fork_resolution_peer:
+            # Stray response from a different peer -- ignore.
+            return
+
+        if not headers_data:
+            logger.warning(
+                f"Fork resolution: empty header response from "
+                f"{peer_addr}; retrying with deeper lookback"
+            )
+            await self._start_fork_resolution(
+                peer_addr,
+                # Use our own height as the reference point for the
+                # next probe -- the peer didn't give us a divergent
+                # block to anchor against.
+                self.blockchain.height,
+            )
+            return
+
+        common_ancestor_height = -1
+        divergence_index = -1
+        first_response_height = headers_data[0].get("block_number", -1)
+
+        for i, hdr in enumerate(headers_data):
+            bh = parse_hex(hdr.get("block_hash", ""))
+            if bh is None:
+                continue
+            bn = hdr.get("block_number", -1)
+            if not isinstance(bn, int) or bn < 0:
+                continue
+            # Checkpoint gate also applies here -- a peer cannot smuggle
+            # a checkpoint-violating header in via the fork-resolution
+            # path either.
+            cp = self._checkpoints.get(bn)
+            if cp is not None and bh != cp.block_hash:
+                logger.warning(
+                    f"Peer {peer_addr} served fork-resolution header at "
+                    f"checkpoint height {bn} with wrong hash "
+                    f"{bh.hex()[:16]} -- aborting fork resolution and "
+                    f"penalizing peer"
+                )
+                self._on_peer_offense(
+                    peer_addr, OFFENSE_CHECKPOINT_VIOLATION,
+                    f"checkpoint_mismatch_fork_resolution:block={bn}",
+                )
+                self._reset_fork_resolution()
+                self.state = SyncState.IDLE
+                return
+            local_block = self.blockchain.get_block(bn)
+            if local_block is not None and local_block.block_hash == bh:
+                common_ancestor_height = bn
+                continue
+            # First header that doesn't match local chain.
+            divergence_index = i
+            break
+
+        if divergence_index < 0:
+            # Every header in this response matches our local chain --
+            # the divergence point is later than the deepest height in
+            # this batch.  Need deeper lookback.
+            logger.info(
+                f"Fork resolution: lookback {self._fork_resolution_lookback} "
+                f"too shallow; all {len(headers_data)} probe headers "
+                f"match local chain.  Doubling lookback and re-probing."
+            )
+            # Anchor next probe at the FIRST_RESPONSE_HEIGHT so the
+            # walk-back continues from where this probe started.  If
+            # we've already hit the cap, _start_fork_resolution
+            # bumps retries and may abandon.
+            await self._start_fork_resolution(peer_addr, first_response_height)
+            return
+
+        if common_ancestor_height < 0:
+            # Probe went so far back that even the first header doesn't
+            # match our local chain at that height.  Either the peer is
+            # on an unrelated chain (different genesis or post-genesis
+            # divergence we can't bridge) or our local chain is missing
+            # that block range.  Treat as a lookback-not-helpful case
+            # and retry; if we've exhausted retries we give up.
+            logger.warning(
+                f"Fork resolution: no common ancestor in probe range "
+                f"(start={first_response_height}, len={len(headers_data)}); "
+                f"retrying"
+            )
+            await self._start_fork_resolution(peer_addr, first_response_height)
+            return
+
+        # Found the ancestor.  Everything from divergence_index onward
+        # is the peer's competing chain.
+        competing_in_response = headers_data[divergence_index:]
+        # Validate that the competing tail forms a valid chain (each
+        # header's prev_hash matches the previous header's hash).  The
+        # ancestor side already matched local hashes, so we only need
+        # to validate the divergent tail.
+        prev_hash = (
+            headers_data[divergence_index - 1]["block_hash"]
+            if divergence_index > 0
+            else None
+        )
+        for hdr in competing_in_response:
+            if prev_hash is not None and hdr["prev_hash"] != prev_hash:
+                logger.warning(
+                    f"Fork resolution: competing chain headers from "
+                    f"{peer_addr} are themselves not a valid chain "
+                    f"(prev_hash mismatch at #{hdr.get('block_number')}); "
+                    f"aborting"
+                )
+                self._on_peer_offense(
+                    peer_addr, OFFENSE_INVALID_HEADERS,
+                    "fork_resolution_chain_break",
+                )
+                self._reset_fork_resolution()
+                self.state = SyncState.IDLE
+                return
+            prev_hash = hdr["block_hash"]
+
+        self._fork_resolution_competing_headers.extend(competing_in_response)
+        last_collected_height = competing_in_response[-1].get("block_number", 0)
+        peer_info = self.peer_heights.get(peer_addr)
+        peer_tip_height = peer_info.chain_height if peer_info else 0
+
+        logger.info(
+            f"Fork resolution: common ancestor at height "
+            f"{common_ancestor_height}; collected "
+            f"{len(competing_in_response)} competing headers (now have "
+            f"{len(self._fork_resolution_competing_headers)} total, last="
+            f"{last_collected_height}, peer_tip={peer_tip_height})"
+        )
+
+        if last_collected_height < peer_tip_height:
+            # Need more competing headers to cover the rest of the
+            # peer's chain.  Continue forward without resetting the
+            # fork-resolution state -- we're still in the same probe.
+            await self._send_request_headers(
+                peer_addr,
+                last_collected_height + 1,
+                HEADERS_BATCH_SIZE,
+            )
+            return
+
+        # All competing headers collected.  Transition to block
+        # download for the divergent chain.  ``add_block`` handles each
+        # block as a fork extension and the existing fork_choice +
+        # _reorganize machinery swaps tips when the competing chain
+        # outweighs the canonical one.
+        logger.info(
+            f"Fork resolution: all competing headers collected "
+            f"({len(self._fork_resolution_competing_headers)} blocks "
+            f"to download from peer {peer_addr})"
+        )
+        self.state = SyncState.SYNCING_BLOCKS
+        self.blocks_needed = self._parse_block_hashes(
+            self._fork_resolution_competing_headers,
+        )
+        # Keep _fork_resolution_active=True through block download so
+        # handle_blocks_response routes via the fork path; reset on
+        # completion or failure.
+        await self._request_next_blocks(peer_addr)
+
+    def _reset_fork_resolution(self) -> None:
+        """Clear all fork-resolution state.  Called when resolution
+        succeeds, fails, or is abandoned."""
+        self._fork_resolution_active = False
+        self._fork_resolution_peer = ""
+        self._fork_resolution_lookback = 0
+        self._fork_resolution_retries = 0
+        self._fork_resolution_competing_headers = []
 
     def _eligible_sync_peers(self) -> list[str]:
         """Return sync-eligible peer addresses ordered by claimed weight."""
@@ -815,6 +1201,19 @@ class ChainSyncer:
             self.state = SyncState.COMPLETE
             self.pending_headers = []
             self._inflight_by_peer.clear()
+            # Fork-resolution wrap-up: every competing block was applied
+            # via add_block, which routes through the fork-storage path
+            # and triggers _reorganize when the fork outweighs the
+            # canonical chain.  By the time we reach here all those
+            # decisions have been made, so just clear the resolution
+            # state.  The chain tip now reflects whichever fork won.
+            if self._fork_resolution_active:
+                logger.info(
+                    f"Fork resolution complete: chain tip is now "
+                    f"#{self.blockchain.height} "
+                    f"({self.blockchain.get_latest_block().block_hash.hex()[:16]}...)"
+                )
+                self._reset_fork_resolution()
 
     async def check_sync_stale(self):
         """Check if sync has stalled and restart if needed.

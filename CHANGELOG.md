@@ -4,6 +4,91 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.0] — 2026-05-03
+
+Patch.  Closes the third defect surfaced by today's incident chain:
+the IBD's missing fork-recovery code path, which left validator-1
+permanently stuck on a lighter divergent chain after the 1.50.0
+ban-clear restored P2P peering between v1 and v2.
+
+### Root cause
+
+After the 1.50.0 legacy ban auto-clear restored peering, validator-1
+(at height 1354 on its own divergent fork) tried to sync from
+validator-2 (at height 1359 on a heavier divergent fork).  The IBD's
+``ChainSyncer.handle_headers_response`` only handles the linear case
+where the peer's chain extends our local tip.  When the peer's first
+header has a ``prev_hash`` that doesn't match our tip, it logs
+``Header chain broken at block #N`` and aborts -- with no fallback
+to walk back, find the common ancestor, and feed the divergent chain
+through ``Blockchain.add_block``'s existing fork-storage +
+``_reorganize`` machinery.  The result was a tight retry loop:
+
+    Starting IBD: our height=1354, target=1359, peer=v2
+    Header chain broken at block #1354
+    [10s later, identical retry, identical abort]
+
+The reorg machinery itself works -- it had been working since long
+before 1.50.0 -- but only fires when fork blocks reach
+``add_block``.  No code path ever fed the divergent blocks in.  This
+left validator-1 producing solo on the lighter chain while v2
+produced solo on the heavier one, indefinitely.
+
+### Added
+
+- **Fork-resolution walk-back in ``ChainSyncer``.**  When IBD detects
+  ``Header chain broken at #N`` AND the peer's claimed cumulative
+  weight strictly exceeds ours, the syncer now switches to fork-
+  resolution mode:
+
+    1. Re-issue ``REQUEST_HEADERS`` from
+       ``max(0, N - lookback - 1)`` with ``count = lookback +
+       HEADERS_BATCH_SIZE`` so a single round-trip can both find the
+       common ancestor AND collect a chunk of the competing chain.
+       Initial lookback is ``FORK_LOOKBACK_INITIAL = 16`` blocks.
+    2. Walk the response.  The LAST height whose header hash matches
+       the local block at that height is the common ancestor.  The
+       FIRST height that diverges is the start of the competing
+       chain.  All headers from that point onward are stored in
+       ``_fork_resolution_competing_headers``.
+    3. If the response contains only matching headers (lookback was
+       too shallow), double the lookback and re-probe.  Bounded by
+       ``FORK_LOOKBACK_CAP = 4096`` (~28 days at 600s/block) and
+       ``FORK_RESOLUTION_MAX_RETRIES = 8``; a peer that lies about
+       diverging cannot pin us in an infinite probe loop.
+    4. If competing headers don't yet cover up to the peer's claimed
+       tip, request more headers forward.
+    5. When all competing headers are collected, transition to
+       ``SYNCING_BLOCKS``.  Each competing block downloaded is
+       applied via ``Blockchain.add_block`` -- the existing fork-
+       storage path stores it, computes cumulative weight, and
+       triggers ``_reorganize`` automatically when the fork outweighs
+       canonical.  No new reorg machinery added; the missing code
+       was just the path that fed the divergent blocks in.
+
+  Gates:
+  * ``_peer_outweighs_local`` short-circuits the trigger when the
+    peer's weight is not strictly greater than ours -- chasing a
+    divergent-but-lighter chain is bandwidth burn for no consensus
+    benefit and a free attack vector for sybils.
+  * Weak-subjectivity checkpoint gate also runs against
+    fork-resolution headers; a peer cannot smuggle in a checkpoint-
+    violating header through the fork path either.
+
+  Pinned by ``tests/test_sync_fork_resolution.py`` (initial probe
+  uses correct lookback, common ancestor located correctly,
+  doubling on shallow probe, max-retries guard, peer-outweighs gate
+  in all four directions, reset clears every field).
+
+### Why this didn't bite earlier
+
+The case requires a P2P partition lasting long enough for both sides
+to mint independent blocks AND for both sides to recover network
+connectivity AFTER the partition.  Pre-1.50.0, the legacy ban-clear
+catch-22 prevented recovery from the most likely cause (cross-
+validator ban during a consensus stall), so this code path was
+never reached.  The 1.50.0 ban fix is what exposed it.
+
 ## [1.50.0] — 2026-05-03
 
 Minor release. Two structural defects surfaced by the 1.49.0 supply-
