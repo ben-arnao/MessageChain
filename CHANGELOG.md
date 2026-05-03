@@ -4,6 +4,83 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.48.0] — 2026-05-03
+
+Minor release. Six fixes in a single roll, addressing the structural
+issues surfaced by the 1309 stall and recovery: the recurring
+sim/apply parity bug class, the round-cap recovery trap, ban-list
+poisoning, undetected in-memory state drift, and two operator-tooling
+papercuts that ate hours of session time during the recovery.
+
+### Added
+
+- **Sim/apply parity property test** (`tests/test_sim_apply_parity.py`).
+  For a small 2-validator chain at every apply-time mutation we know
+  about (unstake-release, inclusion-list coverage leak, key rotation,
+  authority rebind, attester-fee funding), asserts
+  `compute_post_state_root_for_block(candidate)` equals
+  `compute_current_state_root()` after `_apply_block_state(candidate)`.
+  Six scenarios pass; one (`slash_transactions`) is `xfail` with a
+  TODO documenting that the production sim short-circuits and relies
+  on snapshot/rollback. Pins the contract so the next apply-path
+  mutation that lacks a sim mirror gets caught here instead of in
+  production at the first triggering height.
+
+- **Periodic in-memory ↔ disk drift check.** New
+  `Blockchain.check_state_drift()` opens a fresh ChainDB read handle
+  and diffs every consensus-critical dict (balances, staked,
+  pending_unstakes, nonces, authority_keys, public_keys,
+  leaf_watermarks, key_rotation_counts, revoked_entities,
+  slashed_validators) against in-memory. Wired into the proposer loop
+  every `--state-drift-check-interval` blocks (default 100). On
+  detection, defaults to `--state-drift-on-detect=log` (ERROR-level
+  record + counter); `crash` available for fail-fast operators.
+  Closes the gap that left v2's struct-overflow corruption invisible
+  until the next propose call surfaced it.
+
+- **`--yes` / `-y` flag on `transfer`.** Skips the "type 'yes' to
+  proceed" prompt for script-friendly use over `gcloud compute ssh`
+  / sudo / non-tty pipes, matching the existing `--yes` on `stake`,
+  `unstake`, `set-authority-key`, `rotate-key`, `emergency-revoke`,
+  `broadcast-revoke`, `set-receipt-subtree-root`, and `upgrade`.
+
+### Changed
+
+- **`MAX_PROPOSER_FALLBACK_ROUNDS` removed** from `messagechain/config.py`
+  and from both producer-side and validator-side enforcement. The cap
+  was load-bearing for the recurring chain-stall recovery trap (the
+  producer self-skipped past the very fix that would have unstuck the
+  chain), but redundant for grinding defense:
+  `MAX_BLOCK_FUTURE_DRIFT / BLOCK_TIME_TARGET = 120 / 600 = 0`, so
+  the cap added zero grinding bound above the timestamp-skew rule
+  the future-drift check already enforces.
+
+- **`_resolve_signing_entity` consults the validator's data-dir
+  keypair cache first** when `--data-dir` is set. CLI signing on a
+  validator host now hits the daemon's already-warmed cache instead
+  of hanging for minutes regenerating ~65k WOTS+ leaves at
+  tree_height=16. Calls `decode_keypair_cache` directly (read-only),
+  bypassing `server._load_or_create_entity` because that helper has
+  two destructive side-effects: it `os.remove`s the cache on any
+  decode error and triggers a multi-minute Merkle-node-cache
+  rebuild on a missing leaf-cache file. Falls through to the
+  personal-wallet cache and `Entity.create` on miss.
+
+### Fixed
+
+- **Stale peer bans no longer block post-fix recovery.** After the
+  1.46.0 + 1.47.0 + 1.47.1 sequence, validator-2 still rejected
+  validator-1 reconnects with `Rejected banned peer` for the
+  remainder of the ~3-hour ban window — the chain stayed split until
+  the operator manually edited `ban_scores.json`. Each `PeerScore`
+  now records the peer software version at ban time and auto-clears
+  on reconnect from a different version, on the reasoning that a
+  binary change means the offence-producing code may no longer
+  exist. Conservative gates (currently banned, both versions
+  non-empty + non-"unknown", versions actually differ) avoid
+  spurious clears. Legacy rows without the version field load as
+  `""` and won't auto-clear; first reconnect re-tags them.
+
 ## [1.47.1] — 2026-05-03
 
 Hotfix. The 1.47.0 state_root fix was correct, but by the time it
