@@ -1124,6 +1124,179 @@ class Blockchain:
 
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
 
+    def check_state_drift(self) -> list[tuple[str, bytes, object, object]]:
+        """Diff the live in-memory state dicts against on-disk truth.
+
+        Background: validator-2 silently diverged its in-memory chain
+        state from its on-disk ChainDB until ``compute_post_state_root``
+        crashed with ``struct.error: int too large to convert`` deep
+        inside ``_leaf_value`` — only the resulting overflow surfaced;
+        the drift itself ran undetected for an unknown number of
+        blocks.  A fresh restart pulled clean state from disk and the
+        node worked fine, confirming disk was the source of truth and
+        memory was the corrupted side.
+
+        This method is the periodic tripwire.  It opens a fresh,
+        read-only ChainDB handle on the same db_path, fetches the
+        consensus-critical `get_all_*` snapshots (the same ones
+        ``_load_from_db`` rehydrates from), and diffs each against the
+        in-memory equivalent.  Returns a list of
+        ``(dict_name, entity_id, in_memory_value, on_disk_value)``
+        records — empty list means lockstep.
+
+        Surfaces covered (the same set tracked in __init__ and
+        rehydrated in _load_from_db):
+
+        * ``balances``                 — supply.balances
+        * ``staked``                   — supply.staked
+        * ``pending_unstakes``         — supply.pending_unstakes
+        * ``nonces``                   — self.nonces
+        * ``public_keys``              — self.public_keys
+        * ``authority_keys``           — self.authority_keys
+        * ``leaf_watermarks``          — self.leaf_watermarks
+        * ``key_rotation_counts``      — self.key_rotation_counts
+        * ``revoked_entities``         — self.revoked_entities (set)
+        * ``slashed_validators``       — self.slashed_validators (set)
+
+        For ``set``-shaped surfaces (revoked / slashed) the per-record
+        ``in_memory_value`` / ``on_disk_value`` are bools (membership
+        on each side).
+
+        Behaviour notes:
+
+        * No-op when ``self.db is None`` (in-memory test Blockchains
+          have no disk to compare against — return empty list rather
+          than raise so the periodic call from the production loop is
+          safe to lift in tests).
+        * Opens a SECOND ChainDB handle at the same path with
+          ``skip_schema_check=True`` so the diff is against a freshly
+          loaded view rather than the live cache (the live handle
+          could in principle return cached values that match memory
+          even when the on-disk row diverges; SQLite's per-thread
+          connection model rules that out today, but the second
+          handle keeps the check honest under any future caching
+          changes).  The second handle is closed before return.
+        * Read-only by construction: this method NEVER writes to the
+          DB and NEVER mutates ``self``.  It is safe to call from any
+          thread that holds no DB-write locks.
+        """
+        # In-memory-only Blockchain (db=None): nothing to compare against.
+        # Many unit tests construct Blockchain() without a ChainDB, and
+        # the periodic call from _block_production_loop must be safe to
+        # lift into those harnesses without crashing.
+        if self.db is None:
+            return []
+
+        # Open a fresh handle so the comparison reads from a fresh
+        # view of the SQLite file rather than re-reading whatever
+        # cached snapshot the live handle holds.  skip_schema_check
+        # because the live handle has already validated schema; the
+        # tripwire should never refuse to run because of a
+        # tangentially-related schema check.
+        from messagechain.storage.chaindb import ChainDB as _ChainDB
+
+        db_path = getattr(self.db, "db_path", None)
+        if not db_path:
+            return []
+
+        fresh_db = _ChainDB(db_path, skip_schema_check=True)
+        try:
+            disk_balances = fresh_db.get_all_balances()
+            disk_staked = fresh_db.get_all_staked()
+            disk_pending_unstakes = (
+                fresh_db.get_all_pending_unstakes()
+                if hasattr(fresh_db, "get_all_pending_unstakes") else {}
+            )
+            disk_nonces = fresh_db.get_all_nonces()
+            disk_public_keys = fresh_db.get_all_public_keys()
+            disk_authority_keys = (
+                fresh_db.get_all_authority_keys()
+                if hasattr(fresh_db, "get_all_authority_keys") else {}
+            )
+            disk_leaf_watermarks = (
+                fresh_db.get_all_leaf_watermarks()
+                if hasattr(fresh_db, "get_all_leaf_watermarks") else {}
+            )
+            disk_key_rotation_counts = (
+                fresh_db.get_all_key_rotation_counts()
+                if hasattr(fresh_db, "get_all_key_rotation_counts") else {}
+            )
+            disk_revoked = (
+                fresh_db.get_all_revoked()
+                if hasattr(fresh_db, "get_all_revoked") else set()
+            )
+            disk_slashed = (
+                fresh_db.get_all_slashed()
+                if hasattr(fresh_db, "get_all_slashed") else set()
+            )
+        finally:
+            try:
+                fresh_db.close()
+            except Exception:
+                # Best-effort cleanup; the tripwire's job is to report
+                # drift, not to fail loudly if the auxiliary handle
+                # can't be torn down.
+                logger.exception("check_state_drift: fresh ChainDB close failed")
+
+        records: list[tuple[str, bytes, object, object]] = []
+
+        def _diff_dict(name: str, in_mem: dict, on_disk: dict, default):
+            """Compare two dicts entry-by-entry; emit a record per drift.
+
+            ``default`` is the value to substitute when a key is
+            present on one side and missing on the other (typically
+            0 for counters, b"" for byte fields).  Using a default
+            rather than treating missing-vs-zero as drift mirrors the
+            on-chain semantics: an entity with no row in the
+            ``balances`` table effectively has balance 0.
+            """
+            keys = set(in_mem.keys()) | set(on_disk.keys())
+            for k in keys:
+                v_mem = in_mem.get(k, default)
+                v_disk = on_disk.get(k, default)
+                if v_mem != v_disk:
+                    records.append((name, k, v_mem, v_disk))
+
+        _diff_dict("balances", self.supply.balances, disk_balances, 0)
+        _diff_dict("staked", self.supply.staked, disk_staked, 0)
+        _diff_dict(
+            "pending_unstakes",
+            self.supply.pending_unstakes,
+            disk_pending_unstakes,
+            [],
+        )
+        _diff_dict("nonces", self.nonces, disk_nonces, 0)
+        _diff_dict("public_keys", self.public_keys, disk_public_keys, b"")
+        _diff_dict(
+            "authority_keys", self.authority_keys, disk_authority_keys, b"",
+        )
+        _diff_dict(
+            "leaf_watermarks", self.leaf_watermarks, disk_leaf_watermarks, 0,
+        )
+        _diff_dict(
+            "key_rotation_counts",
+            self.key_rotation_counts,
+            disk_key_rotation_counts,
+            0,
+        )
+
+        # Set-shaped surfaces: emit one record per entity_id whose
+        # membership disagrees, with bool values on each side so an
+        # operator scrolling the journal sees True/False rather than
+        # a noisy {entity_id} formatting.
+        for eid in (self.revoked_entities | set(disk_revoked)):
+            in_mem = eid in self.revoked_entities
+            on_disk = eid in disk_revoked
+            if in_mem != on_disk:
+                records.append(("revoked_entities", eid, in_mem, on_disk))
+        for eid in (self.slashed_validators | set(disk_slashed)):
+            in_mem = eid in self.slashed_validators
+            on_disk = eid in disk_slashed
+            if in_mem != on_disk:
+                records.append(("slashed_validators", eid, in_mem, on_disk))
+
+        return records
+
     def _persist_state(self):
         """Write current in-memory state to database atomically.
 
