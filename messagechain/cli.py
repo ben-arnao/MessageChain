@@ -1804,51 +1804,93 @@ def _load_cached_entity(private_key, data_dir):
 
     Returns None if the cache is absent, stale, or the daemon was never
     started from *data_dir* -- the caller falls back to the slow path.
-    Cache authenticity is HMAC-verified by the daemon's loader, so a
-    corrupted or tampered cache file can't leak a wrong public key.
+    Cache authenticity is HMAC-verified, so a corrupted or tampered
+    cache file can't leak a wrong public key.
+
+    Implementation notes -- this loader deliberately does NOT route
+    through ``server._load_or_create_entity`` even though that helper
+    knows how to read the cache.  Two side effects of the daemon's
+    loader are fatal for the CLI:
+
+      1. On any decode failure it ``os.remove``s the cache file.  If
+         this CLI invocation tries the wrong height, an
+         HMAC-invalidating bit-flip, or a format-version mismatch, the
+         daemon's good cache is silently destroyed -- so the next
+         daemon restart also has to regenerate from scratch.  The
+         CLI MUST be read-only against the daemon's cache.
+
+      2. On cache hit it calls ``_attach_merkle_node_cache``, which on
+         a missing merkle-cache file calls
+         ``MerkleNodeCache.build_from_seed`` and re-derives every leaf
+         at the tree height -- a multi-minute wedge that completely
+         defeats the point of having a fast keypair-cache hit in the
+         first place.  The merkle node cache is a sign()-throughput
+         optimization for the long-running daemon; a one-shot CLI sign
+         just pays the slower auth-path computation and is still
+         orders of magnitude faster than rebuilding the cache.
+
+    We therefore call ``decode_keypair_cache`` directly and only bind
+    the leaf-index path so persist-before-sign keeps working.
 
     The on-disk tree_height must match the chain's stored height for
-    this entity, which for existing wallets is tracked via the
-    `--wallet` mechanism on the daemon.  We try 16 (prototype / the
-    operator-chosen height on mainnet bootstrap) then the config
-    default -- both are cheap misses since _load_or_create_entity falls
-    straight through on a bad cache path without touching keygen.
+    this entity.  We try the two most plausible heights (the prototype
+    /operator-chosen 16 and the compiled-in default), then sweep all
+    other plausible WOTS+ heights as a fallback so an operator who
+    booted at, say, h=18 still gets a cache hit instead of falling
+    through to a fresh ``Entity.create``.  Each probe is a stat() +
+    HMAC-verify on hit, both microsecond-cheap.
     """
-    try:
-        import importlib.util
-        import os as _os
-        spec = importlib.util.spec_from_file_location(
-            "_mc_server", _os.path.join(
-                _os.path.dirname(_os.path.dirname(__file__)), "server.py",
-            ),
-        )
-        if spec is None or spec.loader is None:
-            return None
-        srv = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(srv)
-    except Exception:
-        return None
-
-    from messagechain.config import MERKLE_TREE_HEIGHT, LEAF_INDEX_FILENAME
     import os as _os
-    # Try the two most plausible heights in priority order: operator
-    # override (16) then the compiled-in default.  _load_or_create_entity
-    # falls straight through to fresh keygen on cache miss, so speculating
-    # costs only a short file-stat / HMAC-verify per attempt.
-    candidate_heights = []
-    for h in (16, MERKLE_TREE_HEIGHT):
+
+    from messagechain.config import (
+        MERKLE_TREE_HEIGHT,
+        WALLET_DEFAULT_TREE_HEIGHT,
+        LEAF_INDEX_FILENAME,
+    )
+    from messagechain.identity.keypair_cache import (
+        decode_keypair_cache,
+        keypair_cache_path,
+    )
+
+    # Probe the most likely heights first (the compiled-in default and
+    # the personal-wallet default), then sweep the rest of the
+    # plausible WOTS+ range.  Filename digests differ per height, so a
+    # wrong-height probe is a cheap stat() miss -- never an HMAC-fail
+    # delete.
+    candidate_heights: list[int] = []
+    for h in (
+        MERKLE_TREE_HEIGHT,
+        WALLET_DEFAULT_TREE_HEIGHT,
+        16,
+        20,
+        18,
+        14,
+        12,
+        10,
+        8,
+        4,
+    ):
         if h not in candidate_heights:
             candidate_heights.append(h)
+
     for height in candidate_heights:
-        cache_path = srv._keypair_cache_path(private_key, height, data_dir)
+        cache_path = keypair_cache_path(private_key, height, data_dir)
         if not _os.path.exists(cache_path):
             continue
         try:
-            entity = srv._load_or_create_entity(
-                private_key, height, data_dir, no_cache=False,
-            )
-        except Exception:
+            with open(cache_path, "rb") as f:
+                blob = f.read()
+        except OSError:
             continue
+        # decode_keypair_cache returns None on any failure (bad MAC,
+        # bad magic, wrong height, malformed JSON) -- swallow it here
+        # so we keep probing OTHER heights instead of giving up.  And
+        # critically: do NOT delete the file on a None return.  The
+        # daemon owns this cache; the CLI is a read-only consumer.
+        entity = decode_keypair_cache(blob, private_key, height)
+        if entity is None:
+            continue
+
         # Bind leaf-index persistence so sign() durably burns the leaf
         # before the signature can escape the process -- same invariant
         # the daemon relies on.  load_leaf_index silently tolerates a
