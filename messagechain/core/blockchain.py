@@ -6506,6 +6506,24 @@ class Blockchain:
                     min_stake=_COV_MIN_STAKE,
                 )
 
+        # ── Unstake-release: mirror apply ─────────────────────────
+        # ``_apply_block_state`` calls ``Supply.process_pending_unstakes(
+        # block.header.block_number)`` which credits any matured
+        # entries (release_block <= block_height) back into the
+        # unstaker's spendable ``balances``. The sim must mirror this,
+        # otherwise the producer commits a state_root that omits the
+        # +amount credit, the validator's pre-check matches its own
+        # (equally wrong) sim, and the post-apply check at
+        # ``_append_block`` fails — wedging the chain at the release
+        # height. Observed on mainnet at the 1309 release block (25M
+        # unstake from validator-1 at block 301).
+        for _release_eid, _entries in self.supply.pending_unstakes.items():
+            for _amount, _release_block in _entries:
+                if block_height >= _release_block:
+                    sim_balances[_release_eid] = (
+                        sim_balances.get(_release_eid, 0) + _amount
+                    )
+
         # Incremental state-root commitment via the live state_tree.
         # The old path called ``compute_state_root(sim_*)`` which built a
         # fresh SparseMerkleTree from scratch: O(N_accounts * TREE_DEPTH)
