@@ -641,10 +641,19 @@ BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_T
 # and a corrupted height-guard ratchet were being patched).  Round
 # count (= ts_gap / BLOCK_TIME_TARGET ≈ 1 per 10 min) had run up to
 # ~12, so every recovery proposal was rejected by the round cap and
-# the chain couldn't self-heal until the cap was lifted.  100 covers
-# ~16 h of stall and still bounds slot-rotation grinding to a small
-# constant — well below the future-drift window's worst-case abuse.
-MAX_PROPOSER_FALLBACK_ROUNDS = 100
+# the chain couldn't self-heal until the cap was lifted.
+#
+# 1.47.1 raises the cap to 10_000 after the 1309 stall: by the time
+# 1.47.0 shipped the state_root fix, the round counter was already
+# at ~157 (post-1.46.0 producer/validator divergence had wedged the
+# chain for 24h+) and the 100-cap kept the producer self-skipping
+# every slot — fix landed but couldn't be exercised. 10_000 covers
+# ~70 days of stall recovery, comfortably absorbing any plausible
+# investigation+patch window. Slot-rotation grinding is still bounded
+# (10_000 rounds × BLOCK_TIME_TARGET = the only meaningful abuse
+# surface), and the future-drift defense still tightens the timestamp
+# itself via MAX_BLOCK_FUTURE_DRIFT.
+MAX_PROPOSER_FALLBACK_ROUNDS = 10_000
 # Cap on concurrently-active governance proposals.  Without this, an
 # attacker willing to pay PROPOSAL_FEE per proposal can spin up enough
 # proposals to balloon governance state (each snapshot copies the

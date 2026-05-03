@@ -94,11 +94,14 @@ class TestProposerRoundCap(unittest.TestCase):
     def test_max_fallback_rounds_constant_exists(self):
         from messagechain.config import MAX_PROPOSER_FALLBACK_ROUNDS
         self.assertGreaterEqual(MAX_PROPOSER_FALLBACK_ROUNDS, 1)
-        # 1.26.2 raised the cap from 5 to 100 after an operational
-        # chain-stall recovery exposed the original cap as too tight
-        # for honest restart scenarios.  Upper bound here is just a
-        # sanity check that we haven't accidentally disabled the cap.
-        self.assertLess(MAX_PROPOSER_FALLBACK_ROUNDS, 1000)
+        # 1.26.2 raised the cap from 5 → 100 after an operational
+        # chain-stall recovery exposed the original cap as too tight.
+        # 1.47.1 raised it again from 100 → 10_000 after the height-1309
+        # state_root stall: by the time the fix shipped the round
+        # counter was already at ~157 and the 100-cap kept the
+        # producer self-skipping every slot. Upper bound here is just
+        # a sanity check that we haven't accidentally disabled the cap.
+        self.assertLess(MAX_PROPOSER_FALLBACK_ROUNDS, 100_000)
 
     def test_round_cap_rejected_in_validate_block(self):
         # Source-level pin: the cap is enforced in validate_block.
