@@ -8365,19 +8365,23 @@ class Blockchain:
                 round_number = 0
             else:
                 round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
-                # Round cap.  Without this a proposer could push the
-                # timestamp forward by the full future-drift window
-                # (~2 hours) to claim a round where someone else is
-                # selected, skipping the honest round-0 proposer.  Cap
-                # at a small constant — legitimate missed-slot fallback
-                # rarely exceeds a handful of rounds, and any gap larger
-                # than that is either network pathology or abuse.
-                if round_number > _cfg.MAX_PROPOSER_FALLBACK_ROUNDS:
-                    return False, (
-                        f"Proposer round {round_number} exceeds cap "
-                        f"{_cfg.MAX_PROPOSER_FALLBACK_ROUNDS} — "
-                        f"timestamp-skew slot hijacking rejected"
-                    )
+                # No per-block round cap.  Grinding-via-timestamp-skew
+                # is already bounded: ``MAX_BLOCK_FUTURE_DRIFT`` caps
+                # how far in the future ``block.timestamp`` may sit, and
+                # ``parent.timestamp`` is fixed (already on chain), so
+                # the maximum extra round a malicious proposer can claim
+                # above what an honest proposer would claim is
+                # ``MAX_BLOCK_FUTURE_DRIFT / BLOCK_TIME_TARGET = 0`` at
+                # current parameters.  A separate per-block round cap
+                # added zero defense beyond future-drift but bounded
+                # the chain's recovery time from any stall longer than
+                # ``cap × BLOCK_TIME_TARGET`` (because the producer's
+                # natural recovery block computes a ``round_number``
+                # proportional to the wall-clock gap from the stale
+                # parent and would self-skip).  See
+                # ``config.MAX_BLOCK_FUTURE_DRIFT`` for the rationale
+                # and ``tests/test_round_cap_recovery.py`` for the
+                # recovery property pin.
 
             expected_proposer = self._selected_proposer_for_slot(latest, round_number)
             if expected_proposer != block.header.proposer_id:

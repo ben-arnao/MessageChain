@@ -3,7 +3,10 @@
 Covers:
 - Reputation + entity_id_to_index rolled back via reorg snapshot (iter 4)
 - Finality tracker + escrow rolled back via reorg snapshot (iter 10)
-- MAX_PROPOSER_FALLBACK_ROUNDS caps timestamp-skew proposer hijack (iter 7)
+- Timestamp-skew proposer hijack defense (iter 7) — now enforced
+  exclusively by ``MAX_BLOCK_FUTURE_DRIFT`` after the round-cap
+  decoupling change; recovery property pinned in
+  tests/test_round_cap_recovery.py
 - MAX_ACTIVE_PROPOSALS caps governance-spam memory DoS (iter 11)
 """
 
@@ -91,24 +94,57 @@ class TestReorgSnapshotCoversFinalityAndEscrow(unittest.TestCase):
 
 
 class TestProposerRoundCap(unittest.TestCase):
-    def test_max_fallback_rounds_constant_exists(self):
-        from messagechain.config import MAX_PROPOSER_FALLBACK_ROUNDS
-        self.assertGreaterEqual(MAX_PROPOSER_FALLBACK_ROUNDS, 1)
-        # 1.26.2 raised the cap from 5 → 100 after an operational
-        # chain-stall recovery exposed the original cap as too tight.
-        # 1.47.1 raised it again from 100 → 10_000 after the height-1309
-        # state_root stall: by the time the fix shipped the round
-        # counter was already at ~157 and the 100-cap kept the
-        # producer self-skipping every slot. Upper bound here is just
-        # a sanity check that we haven't accidentally disabled the cap.
-        self.assertLess(MAX_PROPOSER_FALLBACK_ROUNDS, 100_000)
+    """Iter-7 audit finding: timestamp-skew slot hijacking.
 
-    def test_round_cap_rejected_in_validate_block(self):
-        # Source-level pin: the cap is enforced in validate_block.
+    History: a per-block ``MAX_PROPOSER_FALLBACK_ROUNDS`` cap once
+    rejected blocks whose claimed ``round_number`` exceeded a small
+    constant.  The cap drifted reactively (5 → 100 → 10_000) chasing
+    chain-stall recovery scenarios.  In the round-cap-decoupling
+    change the cap was removed entirely:
+
+      * The grinding defense it was meant to provide is fully
+        subsumed by ``MAX_BLOCK_FUTURE_DRIFT`` — a malicious
+        proposer can claim at most
+        ``MAX_BLOCK_FUTURE_DRIFT / BLOCK_TIME_TARGET = 0`` extra
+        rounds beyond an honest proposer.
+      * The cap was load-bearing for stall recovery only, and
+        removing it makes recovery time unbounded.
+
+    These tests pin the post-removal invariants so the cap doesn't
+    silently come back without also being re-thought.
+    """
+
+    def test_max_fallback_rounds_constant_removed(self):
+        # The constant must NOT exist any more — its presence invites
+        # someone to wire enforcement back in without revisiting the
+        # decoupling rationale.
+        import messagechain.config as _cfg
+        self.assertFalse(
+            hasattr(_cfg, "MAX_PROPOSER_FALLBACK_ROUNDS"),
+            "MAX_PROPOSER_FALLBACK_ROUNDS was removed; restoring it "
+            "would re-couple grinding-resistance and recovery-time. "
+            "See config.MAX_BLOCK_FUTURE_DRIFT for where the grinding "
+            "defense now lives.",
+        )
+
+    def test_grinding_defense_documented_at_future_drift(self):
+        # Source-level pin: the grinding rationale lives at the
+        # ``MAX_BLOCK_FUTURE_DRIFT`` site (and the validate_block site
+        # references it).  Catches accidental removal of the comment
+        # that would otherwise leave future readers unable to find the
+        # defense argument.
         import pathlib
-        src = pathlib.Path("messagechain/core/blockchain.py").read_text(encoding="utf-8")
-        self.assertIn("MAX_PROPOSER_FALLBACK_ROUNDS", src)
-        self.assertIn("timestamp-skew slot hijacking rejected", src)
+        cfg_src = pathlib.Path("messagechain/config.py").read_text(encoding="utf-8")
+        self.assertIn("MAX_BLOCK_FUTURE_DRIFT", cfg_src)
+        # The decoupling rationale must be present somewhere in config.
+        self.assertIn("round-cap", cfg_src.lower())
+
+        bc_src = pathlib.Path("messagechain/core/blockchain.py").read_text(
+            encoding="utf-8"
+        )
+        # validate_block must NOT reference the removed cap any more.
+        self.assertNotIn("MAX_PROPOSER_FALLBACK_ROUNDS", bc_src)
+        self.assertNotIn("timestamp-skew slot hijacking rejected", bc_src)
 
 
 class TestGovernanceProposalCap(unittest.TestCase):

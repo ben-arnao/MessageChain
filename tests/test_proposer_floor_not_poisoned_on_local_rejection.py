@@ -1,19 +1,25 @@
 """Regression: a candidate block that would be rejected by the
-validator-side timestamp/round rules must NOT advance the height-guard
+validator-side timestamp rules must NOT advance the height-guard
 floor.
 
 Pre-fix (the live chain-stall incident on 2026-04-27, height 671),
 ``ProofOfStake.create_block`` reserved the floor BEFORE running any
-local validation.  A candidate at ``round_number >
-MAX_PROPOSER_FALLBACK_ROUNDS`` (which the validator-side rejects as
-"timestamp-skew slot hijacking rejected") still advanced the floor —
+local validation.  A candidate that the validator-side would reject
+(originally a round-cap violation, but the same property must hold for
+every locally-checkable timestamp rule) still advanced the floor —
 and every subsequent legitimate retry at the same height failed with
 ``HeightAlreadySignedError``.  The chain wedged with no recovery short
 of manual floor surgery.
 
 This regression pins the post-fix invariant: pre-sign rejection raises
 ``ProposerSkipSlotError``, the floor is unchanged, and a follow-up
-proposal at the same height with an in-cap timestamp succeeds.
+legitimate proposal at the same height succeeds.
+
+The original round-cap subtest was retired alongside the round-cap
+removal (see ``config.MAX_BLOCK_FUTURE_DRIFT`` and
+``tests/test_round_cap_recovery.py``).  The remaining subtests cover
+the two live pre-sign rules — timestamp-too-early and future-drift —
+which is what defends the floor-poisoning property going forward.
 """
 
 from __future__ import annotations
@@ -23,14 +29,8 @@ import shutil
 import tempfile
 import unittest
 
-from messagechain.config import (
-    BLOCK_TIME_TARGET,
-    MAX_PROPOSER_FALLBACK_ROUNDS,
-)
-from messagechain.consensus.height_guard import (
-    HeightAlreadySignedError,
-    HeightSignGuard,
-)
+from messagechain.config import BLOCK_TIME_TARGET
+from messagechain.consensus.height_guard import HeightSignGuard
 from messagechain.consensus.pos import ProofOfStake, ProposerSkipSlotError
 from messagechain.core.blockchain import Blockchain
 from messagechain.identity.identity import Entity
@@ -69,89 +69,6 @@ class TestProposerFloorNotPoisonedOnLocalRejection(unittest.TestCase):
         _cfg.ENFORCE_SLOT_TIMING = self._prior_enforce
         shutil.rmtree(self._tmp, ignore_errors=True)
 
-    def test_round_cap_violation_does_not_advance_floor(self):
-        """Round-cap rejection must NOT poison the floor.
-
-        Mirrors the live chain-stall scenario: wall-clock has marched
-        far past the parent's timestamp, so a naive
-        ``timestamp = time.time()`` choice yields a ``round_number``
-        that the validator-side rejects.  Pre-fix the floor was
-        advanced anyway; post-fix the slot is skipped and the floor
-        is preserved for a future legitimate retry.
-        """
-        import time as _time
-
-        consensus = ProofOfStake()
-        prev = self.chain.get_latest_block()
-        new_height = prev.header.block_number + 1
-
-        # Anchor the parent's timestamp far enough in the past that
-        # ``bad_ts`` (parent + (cap+2)*BLOCK_TIME_TARGET) falls within
-        # the future-drift window, so the round-cap rule — not future-
-        # drift — is the binding pre-sign rejection.  This is the
-        # scenario that produced the live chain stall: the chain went
-        # quiet long enough that a now-aligned proposer's natural
-        # timestamp implies round_number > cap relative to the older
-        # parent.
-        prev.header.timestamp = (
-            _time.time()
-            - (MAX_PROPOSER_FALLBACK_ROUNDS + 5) * BLOCK_TIME_TARGET
-        )
-
-        # Construct a timestamp that implies round_number > cap.
-        # Validator-side computes
-        #   round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
-        # so any ``ts_gap >= (cap + 2) * BLOCK_TIME_TARGET`` overshoots.
-        bad_ts = (
-            prev.header.timestamp
-            + (MAX_PROPOSER_FALLBACK_ROUNDS + 2) * BLOCK_TIME_TARGET
-        )
-        prior_floor = self.proposer.height_sign_guard.last_block_signed
-        self.assertEqual(
-            prior_floor, -1,
-            "fresh guard must start at -1 floor (any height >= 0 accepted)",
-        )
-
-        with self.assertRaises(ProposerSkipSlotError) as cm:
-            consensus.create_block(
-                self.proposer, [], prev, timestamp=bad_ts,
-            )
-        # Diagnostic must name the cap so an operator looking at the
-        # log can correlate with the validator-side rejection message.
-        self.assertIn("cap", str(cm.exception).lower())
-
-        # The load-bearing assertion: the floor MUST NOT have advanced.
-        # Pre-fix this is where the test would fail (floor would equal
-        # ``new_height``).  Post-fix the floor is untouched.
-        self.assertEqual(
-            self.proposer.height_sign_guard.last_block_signed,
-            prior_floor,
-            "ProposerSkipSlotError must NOT advance the height-guard "
-            "floor; pre-fix the floor was poisoned to new_height and "
-            "the chain wedged with no recovery",
-        )
-
-        # And a subsequent legitimate proposal at the SAME height (with
-        # an in-cap timestamp) MUST succeed.  This is the property the
-        # operator cared about: a transient bad-timestamp slot does not
-        # permanently lock out the height.
-        good_ts = prev.header.timestamp + BLOCK_TIME_TARGET + 1  # round 0
-        try:
-            blk = consensus.create_block(
-                self.proposer, [], prev, timestamp=good_ts,
-            )
-        except HeightAlreadySignedError as e:
-            self.fail(
-                f"Legitimate retry refused — floor was poisoned by the "
-                f"earlier rejection: {e}"
-            )
-        self.assertEqual(blk.header.block_number, new_height)
-        # Now the floor SHOULD have advanced (the second attempt actually signed).
-        self.assertEqual(
-            self.proposer.height_sign_guard.last_block_signed,
-            new_height,
-        )
-
     def test_timestamp_too_early_does_not_advance_floor(self):
         """Same property for the ``ts_gap < BLOCK_TIME_TARGET`` rule.
 
@@ -184,23 +101,18 @@ class TestProposerFloorNotPoisonedOnLocalRejection(unittest.TestCase):
 
         consensus = ProofOfStake()
         prev = self.chain.get_latest_block()
-        # In-cap on the round formula so future-drift is the binding
-        # rule (round_number = 0 if ts_gap is BLOCK_TIME_TARGET).  Then
-        # push the timestamp way past now + MAX_BLOCK_FUTURE_DRIFT.
+        # Push the timestamp way past now + MAX_BLOCK_FUTURE_DRIFT.
+        # With the round-cap removed, future-drift is now the only
+        # rule that fires for "far-future" timestamps.
         bad_ts = _time.time() + MAX_BLOCK_FUTURE_DRIFT * 1000
         prior_floor = self.proposer.height_sign_guard.last_block_signed
         with self.assertRaises(ProposerSkipSlotError) as cm:
             consensus.create_block(
                 self.proposer, [], prev, timestamp=bad_ts,
             )
-        # Either the round-cap or the future-drift rule may fire first
-        # depending on exactly how far in the future ``bad_ts`` is.
-        # Both are valid pre-sign rejections; assert we got SOME
-        # ProposerSkipSlotError and the floor is preserved.
-        self.assertTrue(
-            "future" in str(cm.exception).lower()
-            or "cap" in str(cm.exception).lower(),
-            f"expected future-drift or cap rejection, got: {cm.exception}",
+        self.assertIn(
+            "future", str(cm.exception).lower(),
+            f"expected future-drift rejection, got: {cm.exception}",
         )
         self.assertEqual(
             self.proposer.height_sign_guard.last_block_signed,
