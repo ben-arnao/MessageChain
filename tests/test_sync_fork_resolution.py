@@ -311,6 +311,158 @@ class TestForkResolutionWalkBack(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.syncer.state, SyncState.IDLE)
 
 
+class TestForkResolutionContinuation(unittest.IsolatedAsyncioTestCase):
+    """Once the common ancestor is located, subsequent forward-fetch
+    responses must be treated as competing-chain extensions, NOT as
+    fresh ancestor probes.
+
+    Regression: the first 1.51.0 deploy on validator-1 found the
+    ancestor at height 1333 and collected competing headers up to
+    1360, then asked v2 for headers from 1361.  v2 returned an empty
+    response (it was at height 1361, so anything above its tip is
+    empty).  The original implementation treated that as "lookback
+    too shallow" and retried with a deeper probe -- which kept
+    finding the same ancestor at 1333 and re-collecting the same
+    competing headers, doubling the buffer on every iteration until
+    FORK_RESOLUTION_MAX_RETRIES exhausted.
+
+    The fix routes responses through different sub-handlers based on
+    whether ``competing_headers`` is already populated:
+      - empty: initial probe path (walk back, doubling)
+      - non-empty: continuation path (extend or done)
+    """
+
+    def setUp(self):
+        self.local_height = 20
+        self.peer_height = 30
+        self.common_ancestor_height = 15
+        self.peer_addr = "10.0.0.99:9333"
+
+        self.blockchain = StubBlockchain(
+            height=self.local_height,
+            common_ancestor_height=self.common_ancestor_height,
+        )
+        self.writer_calls = []
+
+        async def _async_write(_writer, msg):
+            self.writer_calls.append(msg.payload)
+
+        import messagechain.network.sync as sync_mod
+        self._orig_write_message = sync_mod.write_message
+        sync_mod.write_message = _async_write
+        self.addCleanup(
+            lambda: setattr(sync_mod, "write_message", self._orig_write_message),
+        )
+
+        self.syncer = ChainSyncer(
+            blockchain=self.blockchain,
+            get_peer_writer=lambda _a: (MagicMock(), MagicMock()),
+        )
+        self.syncer.peer_heights[self.peer_addr] = PeerSyncInfo(
+            peer_address=self.peer_addr,
+            chain_height=self.peer_height,
+            best_block_hash=("P".encode() + self.peer_height.to_bytes(31, "big")).hex(),
+            cumulative_weight=10**12,
+        )
+        self.syncer._our_cumulative_weight = lambda: 0
+
+    async def test_continuation_empty_response_means_done_not_retry(self):
+        """An empty continuation response = peer's tip reached.  The
+        syncer must transition to block download, NOT loop back into
+        the initial-probe retry path (which is the prod bug)."""
+        # Pre-populate state as if initial probe already found ancestor
+        # and collected up to height 25 (5 short of peer's tip 30).
+        self.syncer._fork_resolution_active = True
+        self.syncer._fork_resolution_peer = self.peer_addr
+        self.syncer._fork_resolution_lookback = FORK_LOOKBACK_INITIAL
+        self.syncer._fork_resolution_competing_headers = [
+            _peer_header(h, self.common_ancestor_height)
+            for h in range(16, 26)
+        ]
+        self.syncer.state = SyncState.SYNCING_HEADERS
+        retries_before = self.syncer._fork_resolution_retries
+
+        # Empty response (peer has nothing past its current tip).
+        await self.syncer.handle_headers_response([], self.peer_addr)
+
+        # MUST NOT have incremented retry counter (would mean it
+        # routed through the initial-probe path).
+        self.assertEqual(
+            self.syncer._fork_resolution_retries, retries_before,
+            "empty continuation response must NOT trigger lookback "
+            "doubling -- it means peer's tip reached",
+        )
+        # MUST have transitioned to block download.
+        self.assertEqual(self.syncer.state, SyncState.SYNCING_BLOCKS)
+        self.assertEqual(
+            len(self.syncer.blocks_needed),
+            len(self.syncer._fork_resolution_competing_headers),
+        )
+
+    async def test_continuation_extends_competing_chain(self):
+        """A non-empty continuation response that properly chains from
+        the last collected header must be appended to the competing
+        chain.  After this we either continue forward or transition
+        depending on peer's tip."""
+        self.syncer._fork_resolution_active = True
+        self.syncer._fork_resolution_peer = self.peer_addr
+        self.syncer._fork_resolution_lookback = FORK_LOOKBACK_INITIAL
+        # Started with competing 16..25.
+        self.syncer._fork_resolution_competing_headers = [
+            _peer_header(h, self.common_ancestor_height)
+            for h in range(16, 26)
+        ]
+        self.syncer.state = SyncState.SYNCING_HEADERS
+
+        # Response: continuation 26..30 (covers up to peer's tip).
+        response = [
+            _peer_header(h, self.common_ancestor_height)
+            for h in range(26, 31)
+        ]
+        await self.syncer.handle_headers_response(response, self.peer_addr)
+
+        # All 15 headers (16..30) collected.
+        self.assertEqual(
+            len(self.syncer._fork_resolution_competing_headers), 15,
+        )
+        # Peer's tip reached -> SYNCING_BLOCKS.
+        self.assertEqual(self.syncer.state, SyncState.SYNCING_BLOCKS)
+
+    async def test_continuation_with_gap_is_rejected(self):
+        """A continuation response whose first header doesn't directly
+        follow the last collected one is malformed; abort cleanly
+        rather than splicing a hole into the competing chain."""
+        self.syncer._fork_resolution_active = True
+        self.syncer._fork_resolution_peer = self.peer_addr
+        self.syncer._fork_resolution_lookback = FORK_LOOKBACK_INITIAL
+        # Last collected ends at height 25.
+        self.syncer._fork_resolution_competing_headers = [
+            _peer_header(h, self.common_ancestor_height)
+            for h in range(16, 26)
+        ]
+        self.syncer.state = SyncState.SYNCING_HEADERS
+
+        # Bogus response: skips height 26, returns 27 first.
+        response = [
+            _peer_header(h, self.common_ancestor_height)
+            for h in range(27, 31)
+        ]
+        offenses_recorded = []
+        self.syncer._on_peer_offense = (
+            lambda addr, points, reason:
+                offenses_recorded.append((addr, points, reason))
+        )
+
+        await self.syncer.handle_headers_response(response, self.peer_addr)
+
+        # Resolution aborted, peer recorded an offense.
+        self.assertFalse(self.syncer._fork_resolution_active)
+        self.assertEqual(self.syncer.state, SyncState.IDLE)
+        self.assertTrue(any(
+            "continuation_gap" in r[2] for r in offenses_recorded
+        ))
+
+
 class TestPeerOutweighsLocalGate(unittest.TestCase):
     """The fork-resolution trigger must only fire when the peer's
     claimed weight exceeds ours.  Otherwise a sybil could redirect us
