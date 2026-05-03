@@ -693,27 +693,39 @@ class ChainSyncer:
     ) -> None:
         """Process headers received during fork resolution.
 
-        Walks the response looking for the LAST height where the peer's
-        header_hash matches our local block at that height (the common
-        ancestor) and the FIRST height where they diverge (the start of
-        the competing chain).
+        Two distinct sub-modes, dispatched here based on whether we
+        have already located the common ancestor:
 
-        Outcomes:
-          * Found ancestor: extract competing headers, fetch more if the
-            peer's claimed tip is past our last header, otherwise
-            transition to block download.
-          * All headers in the response match local chain (lookback was
-            too shallow): retry _start_fork_resolution with doubled
-            lookback.
-          * No header matches local (probe went too far back into
-            history that we don't have, OR peer is on an entirely
-            unrelated chain): same retry path; if FORK_RESOLUTION_MAX
-            _RETRIES exhausts, give up.
+          A. **Initial probe** (``competing_headers`` empty).  Walk the
+             response looking for the LAST height whose hash matches
+             our local block (= common ancestor) and the FIRST diverging
+             height (= start of competing chain).  If the entire batch
+             matches local, lookback was too shallow -- retry with
+             doubled lookback.
+
+          B. **Forward continuation** (``competing_headers`` already
+             populated from the initial probe's tail).  These responses
+             are headers AFTER the divergence point that the peer
+             returns when we ask for more to extend the competing chain
+             toward their claimed tip.  Just validate-and-append; do
+             NOT walk back looking for the ancestor again, and do NOT
+             treat an empty response as "lookback too shallow"
+             (interpreting an end-of-chain response as a probe failure
+             would loop forever, which is the bug witnessed on
+             validator-1 immediately after the 1.51.0 deploy).
         """
         if peer_addr != self._fork_resolution_peer:
             # Stray response from a different peer -- ignore.
             return
 
+        if self._fork_resolution_competing_headers:
+            # Sub-mode B: forward continuation.
+            await self._handle_fork_continuation_response(
+                headers_data, peer_addr,
+            )
+            return
+
+        # Sub-mode A: initial probe.
         if not headers_data:
             logger.warning(
                 f"Fork resolution: empty header response from "
@@ -842,6 +854,9 @@ class ChainSyncer:
             # Need more competing headers to cover the rest of the
             # peer's chain.  Continue forward without resetting the
             # fork-resolution state -- we're still in the same probe.
+            # Subsequent responses dispatch through
+            # _handle_fork_continuation_response (above) since
+            # competing_headers is now non-empty.
             await self._send_request_headers(
                 peer_addr,
                 last_collected_height + 1,
@@ -849,11 +864,142 @@ class ChainSyncer:
             )
             return
 
-        # All competing headers collected.  Transition to block
-        # download for the divergent chain.  ``add_block`` handles each
-        # block as a fork extension and the existing fork_choice +
-        # _reorganize machinery swaps tips when the competing chain
-        # outweighs the canonical one.
+        # All competing headers collected on the FIRST response (peer
+        # was close enough to ours that the initial probe covered the
+        # divergent tail completely).  Transition to block download.
+        await self._transition_to_competing_block_download(peer_addr)
+
+    async def _handle_fork_continuation_response(
+        self, headers_data: list[dict], peer_addr: str,
+    ) -> None:
+        """Process a forward-extension response after the common
+        ancestor has already been located.
+
+        This is the path that fixes the prod bug witnessed on the
+        first 1.51.0 deploy: the initial probe found ancestor at
+        height 1333 and collected competing headers up to 1360, then
+        asked the peer for headers from 1361 onward.  Treating that
+        forward response as another "search for ancestor" probe was
+        wrong -- the response either extends the competing chain (one
+        or more new headers) or signals end-of-chain (empty), it does
+        NOT need another walk-back.  An empty response here means
+        we've collected up to the peer's actual tip, transition to
+        block download.
+        """
+        if not headers_data:
+            # End of chain — download what we have.  This is the
+            # legitimate exit from forward-continuation mode; the
+            # initial-probe ``empty response`` retry path is wrong
+            # for this case (would loop forever at peer's tip).
+            logger.info(
+                f"Fork resolution: forward continuation reached "
+                f"peer {peer_addr}'s tip (collected "
+                f"{len(self._fork_resolution_competing_headers)} "
+                f"competing headers)"
+            )
+            await self._transition_to_competing_block_download(peer_addr)
+            return
+
+        # The first header in the continuation must immediately
+        # follow our last collected competing header.  A gap or
+        # mismatch means the peer is mis-serving (or has reorged
+        # mid-fetch); abort cleanly rather than trying to reconcile
+        # mid-flight.
+        last = self._fork_resolution_competing_headers[-1]
+        last_height = int(last.get("block_number", 0))
+        last_hash = last["block_hash"]
+        first_new = headers_data[0]
+        if (
+            int(first_new.get("block_number", -1)) != last_height + 1
+            or first_new.get("prev_hash") != last_hash
+        ):
+            logger.warning(
+                f"Fork resolution: continuation from {peer_addr} "
+                f"doesn't extend last collected header at "
+                f"#{last_height} (got #{first_new.get('block_number')} "
+                f"prev={first_new.get('prev_hash', '')[:16]}); aborting"
+            )
+            self._on_peer_offense(
+                peer_addr, OFFENSE_INVALID_HEADERS,
+                "fork_resolution_continuation_gap",
+            )
+            self._reset_fork_resolution()
+            self.state = SyncState.IDLE
+            return
+
+        # Validate continuation chain and apply checkpoint gate.
+        prev_hash = last_hash
+        for hdr in headers_data:
+            if hdr.get("prev_hash") != prev_hash:
+                logger.warning(
+                    f"Fork resolution: continuation chain breaks at "
+                    f"#{hdr.get('block_number')}; aborting"
+                )
+                self._on_peer_offense(
+                    peer_addr, OFFENSE_INVALID_HEADERS,
+                    "fork_resolution_continuation_chain_break",
+                )
+                self._reset_fork_resolution()
+                self.state = SyncState.IDLE
+                return
+            bh = parse_hex(hdr.get("block_hash", ""))
+            bn = hdr.get("block_number", 0)
+            cp = self._checkpoints.get(bn)
+            if cp is not None and bh != cp.block_hash:
+                logger.warning(
+                    f"Fork resolution: continuation header at "
+                    f"checkpoint height {bn} has wrong hash; aborting"
+                )
+                self._on_peer_offense(
+                    peer_addr, OFFENSE_CHECKPOINT_VIOLATION,
+                    f"checkpoint_mismatch_continuation:block={bn}",
+                )
+                self._reset_fork_resolution()
+                self.state = SyncState.IDLE
+                return
+            self._fork_resolution_competing_headers.append(hdr)
+            prev_hash = hdr["block_hash"]
+
+        last_collected_height = int(
+            self._fork_resolution_competing_headers[-1].get("block_number", 0)
+        )
+        peer_info = self.peer_heights.get(peer_addr)
+        peer_tip_height = peer_info.chain_height if peer_info else 0
+        logger.info(
+            f"Fork resolution: continuation extended competing chain to "
+            f"#{last_collected_height} ({len(headers_data)} new, "
+            f"{len(self._fork_resolution_competing_headers)} total, "
+            f"peer_tip={peer_tip_height})"
+        )
+
+        if last_collected_height < peer_tip_height:
+            # Keep extending forward.
+            await self._send_request_headers(
+                peer_addr,
+                last_collected_height + 1,
+                HEADERS_BATCH_SIZE,
+            )
+        else:
+            await self._transition_to_competing_block_download(peer_addr)
+
+    async def _transition_to_competing_block_download(
+        self, peer_addr: str,
+    ) -> None:
+        """Move from fork-resolution headers phase to competing-chain
+        block download.  Each block fetched is applied via
+        ``add_block``, which routes through the existing fork-storage
+        path; ``_reorganize`` fires automatically when the fork
+        outweighs canonical."""
+        if not self._fork_resolution_competing_headers:
+            # Nothing to download (bug catch -- should not happen, but
+            # don't leave the state machine wedged if it does).
+            logger.warning(
+                f"Fork resolution: transition to block download with "
+                f"empty competing chain; resetting"
+            )
+            self._reset_fork_resolution()
+            self.state = SyncState.IDLE
+            return
         logger.info(
             f"Fork resolution: all competing headers collected "
             f"({len(self._fork_resolution_competing_headers)} blocks "
@@ -864,8 +1010,8 @@ class ChainSyncer:
             self._fork_resolution_competing_headers,
         )
         # Keep _fork_resolution_active=True through block download so
-        # handle_blocks_response routes via the fork path; reset on
-        # completion or failure.
+        # handle_blocks_response can recognize the fork-path completion
+        # and reset cleanly.
         await self._request_next_blocks(peer_addr)
 
     def _reset_fork_resolution(self) -> None:

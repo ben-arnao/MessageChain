@@ -4,6 +4,40 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.1] — 2026-05-03
+
+Hotfix.  The 1.51.0 fork-resolution path correctly located the
+common ancestor and collected an initial batch of competing headers,
+but treated the FORWARD-CONTINUATION response (when asking the peer
+for more headers past the initial batch) as another initial probe.
+On the prod 1.51.0 deploy at 22:46:02, validator-1 found ancestor at
+height 1333 and collected competing headers up to 1360, then asked
+v2 for headers from 1361.  v2's response was empty (its tip was at
+1361), and the empty-response path retried with doubled lookback --
+which kept re-finding the same ancestor and re-collecting the same
+competing headers, doubling the buffer on every iteration until
+``FORK_RESOLUTION_MAX_RETRIES`` exhausted.
+
+### Fixed
+
+- **Forward-continuation responses route to a separate handler.**
+  ``ChainSyncer._handle_fork_resolution_response`` now dispatches to
+  either ``_handle_fork_continuation_response`` (when
+  ``competing_headers`` is non-empty -- meaning the ancestor was
+  located in a prior round) or the existing ancestor-search path.
+  The continuation handler treats an empty response as "peer's tip
+  reached, transition to block download," NOT as "lookback too
+  shallow, retry."  Validates that the continuation chain extends
+  the last-collected header (catches a peer mid-fetch reorging or
+  serving spliced headers) and runs the same checkpoint gate as
+  the initial probe.
+
+  Pinned by three new tests in
+  ``tests/test_sync_fork_resolution.py::TestForkResolutionContinuation``:
+  empty continuation is "done not retry," well-formed continuation
+  extends the chain to the peer's tip, and gap/malformed
+  continuation is rejected with an OFFENSE_INVALID_HEADERS.
+
 ## [1.51.0] — 2026-05-03
 
 Patch.  Closes the third defect surfaced by today's incident chain:
