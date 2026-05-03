@@ -132,12 +132,18 @@ class TestSupplyConservationCheck(unittest.TestCase):
     def test_breakdown_keys_are_complete(self):
         """The breakdown dict must surface every bucket so an operator
         can localize a divergence without having to instrument the
-        node."""
+        node.  1.50.0 added archive_reward_pool + lottery_prize_pool
+        to close the false-positive class where tokens redirected
+        into a scalar pool weren't summed into ``actual`` even though
+        ``total_supply`` had been bumped to account for them."""
         chain, _consensus, _entities = _make_chain_with_validators(1)
         _expected, _actual, breakdown = chain.check_supply_conservation()
         self.assertEqual(
             set(breakdown.keys()),
-            {"balances_sum", "staked_sum", "pending_unstakes_sum", "treasury"},
+            {
+                "balances_sum", "staked_sum", "pending_unstakes_sum",
+                "treasury", "archive_reward_pool", "lottery_prize_pool",
+            },
         )
         # All buckets are non-negative ints.
         for k, v in breakdown.items():

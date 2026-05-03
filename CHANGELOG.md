@@ -4,6 +4,132 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.50.0] — 2026-05-03
+
+Minor release. Two structural defects surfaced by the 1.49.0 supply-
+conservation invariant: (1) a catch-22 in the 1.48.0 ban auto-clear
+feature that prevented recovery from the very stall pattern the
+feature was designed for, and (2) a permanent ~47.5M phantom-supply
+residual on mainnet left behind by the 1.26.0 phantom-supply
+migration's incomplete repair, plus two false-positive sources in the
+1.49.0 conservation check itself (uncounted scalar pools).
+
+This is a consensus-breaking release (activation-height hard fork at
+`SUPPLY_RECONCILIATION_HEIGHT = 5000`). Roll both validators well
+before activation; current mainnet tip is ~1351 (2026-05-03), giving
+~25 days of runway at 600s/block.
+
+### Root causes
+
+- **Ban auto-clear catch-22 (2026-05-03 incident, P2P broken):**
+  validator-2 banned validator-1 at 14:26 today for `Invalid state_root
+  mismatch` (a bug 1.48.0's slashing-sim/apply parity fix addresses).
+  v2 was upgraded to 1.49.0 at 17:22 and reloaded the ban_scores.json
+  entry written by the pre-1.48 binary — that entry has no
+  `peer_version` field. The 1.48.0 auto-clear-on-version-change feature
+  conservatively refuses to fire when stored `peer_version` is empty,
+  so v2 kept rejecting v1's reconnects every 30 minutes for the
+  remainder of the 24h ban window. The exact recovery scenario the
+  feature was designed for is the one it couldn't handle, because the
+  bans that triggered the upgrade were written by the pre-fix binary.
+  Operator had to hand-edit ban_scores.json to recover.
+- **47.5M phantom supply (1.49.0 conservation invariant flagged):**
+  mainnet was launched with `GENESIS_SUPPLY = 1_000_000_000` while the
+  actual on-chain allocation table only distributed ~88.5M tokens
+  (founder ~47.5M staked + treasury 40M + scattered ~1M). The 1.26.0
+  phantom-supply migration assumed `GENESIS_SUPPLY` had been corrected
+  to 140M and rebased `total_supply` from 1B to 140M — but the actual
+  allocation was never 140M, leaving a permanent ~47.5M phantom that
+  the 33M treasury rebase reduced to ~52.5M and the in-flight
+  rebalance bookkeeping nudged to the observed 47,494,983. The
+  phantom does not affect any user balance (it is purely a counter
+  bug in `total_supply`), but it inflates every "% of supply"
+  denominator in the fee model, governance thresholds, and analytics
+  — exactly the distortion the 1.26.0 migration was trying to fix.
+- **1.49.0 conservation check false-positive sources:** the initial
+  invariant summed only `balances + treasury + staked +
+  pending_unstakes` and missed two scalar pools that genuinely hold
+  tokens counted in `total_supply` — `Blockchain.archive_reward_pool`
+  and `Supply.lottery_prize_pool`. Plus `archive_reward_pool` was
+  persisted ONLY in state snapshots (not chaindb), so any node that
+  had been running since genesis lost the in-memory pool on every
+  restart while `total_supply` was correctly persisted. Both gaps
+  would have caused the invariant to false-positive against legitimate
+  fee-burn redirects and lottery accumulation as soon as either bucket
+  had non-zero value.
+
+### Fixed
+
+- **Ban auto-clear handles legacy (pre-1.48) entries** in
+  `clear_ban_on_version_change`. Empty stored `peer_version` is now
+  treated as an unforgeable marker for "this entry was written by
+  code that didn't have the field," and reconnection on any
+  non-empty version clears the ban (logged at WARNING with a
+  "Legacy clear" annotation that distinguishes it from the normal
+  version-change clear). The major instant-ban offenses
+  (`OFFENSE_INVALID_BLOCK` / `OFFENSE_INVALID_TX`) all fire after
+  HANDSHAKE, so all FRESH bans will have `peer_version` stamped via
+  the resolver and the standard version-comparison gate runs for
+  them. Ban-laundering risk is bounded: a peer whose offense was
+  recorded pre-HANDSHAKE gets at most ONE legacy-clear per cycle;
+  their next post-HANDSHAKE offense stamps a real version and the
+  gate from then on only fires on actual version changes. Pinned by
+  `tests/test_ban_decay.py::test_empty_stored_version_legacy_clear`,
+  `::test_legacy_disk_row_without_peer_version_clears`, and
+  `::test_post_legacy_clear_reban_stamps_peer_version`.
+
+- **Conservation check sums the missing pools.**
+  `Blockchain.check_supply_conservation()` now includes
+  `archive_reward_pool` and `lottery_prize_pool` in `actual_total`
+  and the breakdown dict. The cross-reference test
+  `tests/test_supply_conservation_pool_coverage.py` scans the
+  codebase for every `*_pool` int attribute on `Blockchain` /
+  `Supply` and asserts each is either in the breakdown or in a
+  documented per-block-zeroed-accumulator allowlist; a future pool
+  added without updating the check fails this test before any
+  invariant false-positive can fire.
+
+- **`archive_reward_pool` persisted to chaindb supply_meta.** New
+  `ChainDB.set_archive_reward_pool` / `get_archive_reward_pool`
+  methods plus a `Blockchain._set_archive_reward_pool` chokepoint
+  helper that mirrors every mutation into the DB row. All five
+  in-tree mutation sites (snapshot install, snapshot rollback,
+  archive-duty withhold, fee-burn redirect, archive payout) routed
+  through the helper. Symmetric with `lottery_prize_pool`'s
+  persistence (1.41.0). Cold restart now rehydrates the pool from
+  the DB row instead of resetting to zero. Pinned by
+  `tests/test_archive_reward_pool_persistence.py`.
+
+### Added
+
+- **`SUPPLY_RECONCILIATION_HEIGHT` activation-height hard fork** that
+  rebases `total_supply` to the actual on-chain bucket sum, clearing
+  the 47.5M residual phantom from the 1.26.0 migration's incomplete
+  repair. New `Blockchain._apply_supply_reconciliation` runs in
+  `_append_block` AFTER the state-root verify and BEFORE the
+  conservation check. Idempotency via
+  `SupplyTracker.supply_reconciliation_applied`, snapshotted with the
+  rest of the supply state for reorg safety. The rebase mutates only
+  the `total_supply` scalar (a supply_meta row, persisted to chaindb;
+  NOT in any per-entity SMT leaf), so it does not change `state_root`
+  — sim and apply agree on the activation block by construction.
+  Activation height is set to **5000** for ~25 days of rollout
+  runway from the current ~1351 mainnet tip; coordinate validator
+  rolls accordingly. Pinned by
+  `tests/test_supply_reconciliation_hard_fork.py` (rebase fires only
+  at activation, idempotent on re-apply, reorg-safe round-trip
+  through the supply snapshot, leaves state_root unchanged).
+
+### Notes for operators
+
+- **Legacy phantom-supply migration retained.** The 1.26.0
+  `chaindb.migrate_phantom_supply_if_needed` (the "subtract 860M if
+  the gap is exactly 860M" check) is left in place as an idempotent
+  no-op for any pre-1.26.0 state file that still hasn't run it. The
+  new `_apply_supply_reconciliation` supersedes it as the proper
+  general repair — the docstring on the legacy method points readers
+  at the new mechanism.
+
 ## [1.49.0] — 2026-05-03
 
 Minor release. Closes the two highest-priority Tier-A risks identified

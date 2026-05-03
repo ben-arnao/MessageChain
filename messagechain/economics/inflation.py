@@ -363,6 +363,14 @@ class SupplyTracker:
         # this back to False so the replay re-fires cleanly.
         self.treasury_rebase_applied: bool = False
 
+        # Idempotency flag for the SUPPLY_RECONCILIATION_HEIGHT hard
+        # fork (1.50.0).  Snapshotted with the supply state for reorg
+        # safety -- a reorg that undoes the reconciliation block also
+        # un-flips this flag so the canonical replay re-fires cleanly.
+        # See ``Blockchain._apply_supply_reconciliation`` for the
+        # mechanism and CHANGELOG 1.50.0 for the root-cause history.
+        self.supply_reconciliation_applied: bool = False
+
         # Treasury spend-rate cap bookkeeping (hard fork): per-epoch
         # rolling window of debited amounts.  A spend at current_block
         # is charged against the epoch whose start is

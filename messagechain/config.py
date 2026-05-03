@@ -2727,6 +2727,50 @@ TREASURY_REBASE_BURN_AMOUNT = 33_000_000  # 40M - 33M = 7M ≈ 5% of 140M
 TREASURY_MAX_SPEND_BPS_PER_EPOCH = 100    # LEGACY — see get_treasury_max_spend_bps_per_epoch
 TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 
+# ── Supply Reconciliation Hard Fork (1.50.0) ────────────────────────────
+#
+# Mainnet was launched with the original GENESIS_SUPPLY = 1_000_000_000
+# and an allocation table that distributed only ~88.5M tokens (founder
+# 47.5M staked + treasury 40M + scattered ~1M).  When the 1.26.0 fork
+# rebased GENESIS_SUPPLY from 1B to 140M (chaindb.migrate_phantom_supply_
+# if_needed), the migration assumed the 140M figure was correct because
+# that's what the canonical mainnet config said -- but the ACTUAL
+# allocation only ever summed to ~88.5M.  After the 33M treasury rebase
+# burn, total_supply = 107M while actual buckets only ever held ~55.5M:
+# a permanent ~47.5M phantom that the 1.49.0 supply-conservation
+# invariant correctly began flagging.  See ROOT-CAUSE in CHANGELOG 1.50.0.
+#
+# The phantom does not affect any user balance (it is purely a counter
+# bug in total_supply), but it inflates every "% of supply" denominator
+# in the fee model, governance thresholds, and analytics -- the exact
+# class of distortion the 1.26.0 phantom-migration was trying to fix.
+#
+# At block_height == SUPPLY_RECONCILIATION_HEIGHT, every node:
+#   * computes actual via the SAME sum that
+#     ``Blockchain.check_supply_conservation()`` uses
+#     (non_treasury_balances + treasury + staked + pending_unstakes
+#     + archive_reward_pool + lottery_prize_pool).
+#   * sets self.supply.total_supply = actual.
+#   * persists the new total_supply via supply_meta.set_supply_meta
+#     so a subsequent restart rehydrates the corrected value.
+#   * logs delta = post - pre at WARNING with the breakdown.
+#
+# Sum-equals-conservation-sum is intentional: post-reconciliation the
+# conservation invariant passes by construction, and the cross-reference
+# test (test_supply_conservation_pool_coverage) guarantees every
+# total_supply mutation site has a corresponding bucket counted in the
+# conservation sum.  The two together give a closed system.
+#
+# Idempotent: guarded by SupplyTracker.supply_reconciliation_applied,
+# which is reorg-safe (snapshotted with the supply state).  An adjacent
+# re-apply at the same height is a no-op.
+#
+# Operators MUST set this above the current chain tip with enough
+# runway for both validators to upgrade (per CLAUDE.md release
+# procedure) before activation.  Current mainnet tip ~1351 (2026-05-03);
+# 5000 gives ~25 days of runway at 600s/block.
+SUPPLY_RECONCILIATION_HEIGHT = 5000
+
 # Treasury spend-rate cap tightening (hard fork).
 #
 # The original per-epoch cap of 100 bps (1%) was introduced in the

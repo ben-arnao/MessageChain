@@ -81,13 +81,27 @@ class TestBanClearsOnVersionChange(unittest.TestCase):
             "post-fix reconnect must succeed without operator intervention",
         )
 
-    # ── Test 3: unknown stored version → conservative no-clear ──────
-    def test_unknown_stored_version_no_clear(self):
+    # ── Test 3: empty stored version → legacy-clear on first reconnect ──
+    def test_empty_stored_version_legacy_clear(self):
         """A ban entry without a recorded version (legacy on-disk row,
-        or an offense recorded before the version was known) must NOT
-        be cleared just because the reconnecting peer reports any
-        version — we'd lose every existing ban on the first upgrade
-        otherwise.  Conservative default: empty stored version → no clear.
+        or an offense recorded before HANDSHAKE supplied a version)
+        MUST auto-clear on first reconnect with a non-empty version.
+
+        Pre-1.50.0 this was conservatively refused, on the reasoning
+        "we don't know what binary earned the ban, so don't trust the
+        peer."  But that broke the auto-clear feature's PRIMARY use
+        case: the bans that triggered an upgrade were written by the
+        pre-fix binary (which didn't have the peer_version field) and
+        had empty peer_version after the upgrade loaded them, leaving
+        recovery requiring the very ``ban_scores.json`` hand-edit the
+        feature was built to eliminate.
+
+        Empty stored peer_version is now treated as an unforgeable
+        marker for "this entry was written by code that didn't have
+        the field" -- i.e. pre-1.48.  The major instant-ban offenses
+        (OFFENSE_INVALID_BLOCK / OFFENSE_INVALID_TX) all fire after
+        HANDSHAKE, so all FRESH bans will have peer_version stamped
+        and the auto-clear gate runs in its normal mode for them.
         """
         mgr = PeerBanManager(persistence_path=self.path)
         addr = "203.0.113.7:9333"
@@ -96,11 +110,12 @@ class TestBanClearsOnVersionChange(unittest.TestCase):
         self.assertTrue(mgr.is_banned(addr))
 
         cleared = mgr.clear_ban_on_version_change(addr, "1.47.1")
-        self.assertFalse(
+        self.assertTrue(
             cleared,
-            "unknown stored version must NOT auto-clear — too risky",
+            "empty stored version must auto-clear -- this is the "
+            "pre-1.48 ban legacy-recovery path",
         )
-        self.assertTrue(mgr.is_banned(addr))
+        self.assertFalse(mgr.is_banned(addr))
 
     # ── Test 4: empty / unknown peer-reported version → no clear ────
     def test_empty_or_unknown_reported_version_no_clear(self):
@@ -181,11 +196,21 @@ class TestBanClearsOnVersionChange(unittest.TestCase):
         self.assertIn("203.0.113.7", payload)
         self.assertEqual(payload["203.0.113.7"].get("peer_version"), "1.46.0")
 
-    # ── Test 8: legacy on-disk row (no peer_version) loads cleanly ──
-    def test_legacy_disk_row_without_peer_version(self):
-        """Pre-fix on-disk rows have no peer_version key.  Loading
-        must not crash; the entry should round-trip with an empty
-        peer_version (which means "do not auto-clear" per Test 3).
+    # ── Test 8: legacy on-disk row (no peer_version) loads + clears ──
+    def test_legacy_disk_row_without_peer_version_clears(self):
+        """Pre-1.48 on-disk rows have no peer_version key.  Loading
+        must not crash, AND the entry must auto-clear on first
+        reconnect with a non-empty version (the pre-1.48 legacy
+        recovery path -- see Test 3).
+
+        Reproduces the exact 2026-05-03 mainnet incident: v2's
+        ban_scores.json had an entry written by 1.47.x code with no
+        peer_version.  v2 was upgraded to 1.49.0 and reloaded the
+        entry with empty peer_version, which under pre-1.50.0 logic
+        permanently locked v1 out (the auto-clear gate refused to
+        fire on empty stored version).  Operator had to hand-edit
+        the file to recover.  With the 1.50.0 legacy-clear path,
+        this test asserts the same scenario now self-resolves.
         """
         legacy = {
             "203.0.113.7": {
@@ -193,7 +218,7 @@ class TestBanClearsOnVersionChange(unittest.TestCase):
                 "lifetime_score": BAN_THRESHOLD,
                 "first_seen": time.time(),
                 "banned_until": time.time() + 3600,
-                # NO peer_version key
+                # NO peer_version key -- this is the pre-1.48 schema.
             }
         }
         with open(self.path, "w") as f:
@@ -201,11 +226,65 @@ class TestBanClearsOnVersionChange(unittest.TestCase):
 
         mgr = PeerBanManager(persistence_path=self.path)
         self.assertTrue(mgr.is_banned("203.0.113.7:9333"))
-        # New-version reconnect does NOT clear (conservative default).
-        self.assertFalse(
-            mgr.clear_ban_on_version_change("203.0.113.7:9333", "1.47.1")
+        # First reconnect on any non-empty version legacy-clears the ban.
+        self.assertTrue(
+            mgr.clear_ban_on_version_change("203.0.113.7:9333", "1.49.0"),
+            "1.50.0+ must auto-clear pre-1.48 ban entries on first "
+            "reconnect -- this is the 2026-05-03 incident's structural fix",
         )
-        self.assertTrue(mgr.is_banned("203.0.113.7:9333"))
+        self.assertFalse(mgr.is_banned("203.0.113.7:9333"))
+
+    # ── Test 8b: post-legacy-clear, re-ban records peer_version ─────
+    def test_post_legacy_clear_reban_stamps_peer_version(self):
+        """The legacy-clear path stamps the reported version onto the
+        cleared entry, so a SUBSEQUENT ban+reconnect cycle uses the
+        normal version-comparison path -- not another legacy-clear.
+
+        This bounds the "ban laundering" concern: a bad actor whose
+        offense was recorded pre-handshake gets at most ONE legacy-
+        clear per ban cycle.  Their next post-handshake offense
+        records a real version and the auto-clear gate from then on
+        only fires when the version actually changes.
+        """
+        # Legacy entry that triggers a legacy-clear.
+        legacy = {
+            "203.0.113.7": {
+                "score": BAN_THRESHOLD,
+                "lifetime_score": BAN_THRESHOLD,
+                "first_seen": time.time(),
+                "banned_until": time.time() + 3600,
+            }
+        }
+        with open(self.path, "w") as f:
+            json.dump(legacy, f)
+        mgr = PeerBanManager(persistence_path=self.path)
+        addr = "203.0.113.7:9333"
+        # Legacy-clear fires.
+        self.assertTrue(mgr.clear_ban_on_version_change(addr, "1.49.0"))
+        self.assertFalse(mgr.is_banned(addr))
+
+        # Peer re-offends (post-handshake → version stamped).
+        mgr.record_offense(
+            addr, OFFENSE_INVALID_BLOCK, "bad_block",
+            peer_version="1.49.0",
+        )
+        self.assertTrue(mgr.is_banned(addr))
+
+        # Same-version reconnect now does NOT clear -- the legacy-
+        # clear was a one-shot pre-1.48 recovery, not a perpetual pass.
+        self.assertFalse(
+            mgr.clear_ban_on_version_change(addr, "1.49.0"),
+            "post-legacy-clear bans use the normal version-comparison "
+            "gate -- same version cannot launder a fresh ban",
+        )
+        self.assertTrue(mgr.is_banned(addr))
+
+        # Real version change DOES clear, as in the normal path.
+        self.assertTrue(
+            mgr.clear_ban_on_version_change(addr, "1.50.0"),
+            "after legacy-clear, normal version-bump auto-clear works",
+        )
+        self.assertFalse(mgr.is_banned(addr))
 
     # ── Test 9: seed-node / operator IPs also benefit ───────────────
     def test_seed_node_ip_also_benefits_from_version_clearance(self):
