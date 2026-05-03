@@ -76,7 +76,19 @@ class TestRoundCapRecovery(unittest.TestCase):
         simulated_now = _time.time()
         latest.header.timestamp = simulated_now - BLOCK_TIME_TARGET * 100_000
 
-        proposer = pick_selected_proposer(chain, entities)
+        # Pick the proposer for the ACTUAL recovery slot's round_number,
+        # not round 0. After a 100_000-slot stall the VRF-selected
+        # proposer for round 99_999 differs from the round-0 proposer;
+        # using `pick_selected_proposer` (which queries round 0) would
+        # hand the block to the wrong validator and trip the 1.46.0
+        # "Wrong proposer for slot" check before we reach the cap test.
+        recovery_round = 100_000 - 1
+        target_proposer_id = chain._selected_proposer_for_slot(
+            latest, round_number=recovery_round,
+        )
+        proposer = next(
+            e for e in entities if e.entity_id == target_proposer_id
+        )
 
         # The recovery block's timestamp is "now" — exactly what an honest
         # validator coming back online after a stall would pick. The
