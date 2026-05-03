@@ -310,16 +310,32 @@ class PeerBanManager:
         A version change is the cheapest reliable signal that "the
         binary that earned the ban no longer exists."
 
-        Conservative gates (each closes a way this could go wrong):
+        Gates:
           - peer must currently be banned (no-op otherwise),
-          - stored ``peer_version`` must be non-empty (legacy on-disk
-            rows or pre-handshake offenses don't have one — refusing
-            to clear them avoids wiping every existing ban on first
-            upgrade),
           - reported ``current_version`` must be non-empty and not the
             literal "unknown" sentinel (a peer that omits the field
             cannot launder out of a ban),
-          - the two must actually differ.
+          - either (a) the stored ``peer_version`` is non-empty and
+            differs from the reported version (the standard "they
+            shipped a new binary" path), or (b) the stored
+            ``peer_version`` is empty (the legacy / pre-1.48 path:
+            this ban predates the auto-clear feature itself, so we
+            have no version to compare against; clearing is the only
+            way the feature can recover such a ban without operator
+            surgery — exactly the scenario the feature was designed
+            to fix).
+
+        Empty-stored-version safety: the major instant-ban offenses
+        (OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX) fire in block /
+        tx validation, deep AFTER the HANDSHAKE that records
+        ``peer_version`` via the resolver.  So all FRESH instant-bans
+        will have a real peer_version stamped — empty is an
+        unforgeable marker for "this entry was written by code that
+        didn't have the field" (i.e. pre-1.48).  An attacker who
+        only ever offends pre-HANDSHAKE gets at most one legacy-clear
+        per restart of THIS node; their next post-HANDSHAKE offense
+        stamps a real version and the auto-clear gate works normally
+        from then on.
 
         Clearance is a clean slate (lifetime_score reset, offenses
         cleared) — same semantics as ``manual_unban`` — because we've
@@ -333,23 +349,32 @@ class PeerBanManager:
             return False
         if not ps.is_banned:
             return False
-        if not ps.peer_version:
-            # Conservative: no recorded version → can't safely conclude
-            # this is a different binary.  Operator can still
-            # manual_unban if needed.
+        # Two clear paths:
+        #   - legacy: stored peer_version is empty (pre-1.48 ban entry,
+        #     written before the auto-clear feature existed; the
+        #     feature was added expressly to recover this scenario).
+        #   - normal: stored version is non-empty AND differs from
+        #     the freshly-reported version.
+        if ps.peer_version and ps.peer_version == current_version:
             return False
-        if ps.peer_version == current_version:
-            return False
-        old_version = ps.peer_version
+        legacy_clear = not ps.peer_version
+        old_version = ps.peer_version or "<unrecorded — pre-1.48>"
         ps.score = 0
         ps.lifetime_score = 0
         ps.banned_until = 0.0
         ps.offenses.clear()
         ps.peer_version = current_version
-        logger.info(
+        log = logger.warning if legacy_clear else logger.info
+        log(
             f"Peer {ip} ban auto-cleared on version change "
             f"({old_version} → {current_version}) — prior misbehavior "
             f"presumed stale-binary artifact."
+            + (
+                "  Legacy clear: ban entry had no recorded version "
+                "(written by pre-1.48 code) — clearing per the design "
+                "intent of the auto-clear feature itself."
+                if legacy_clear else ""
+            )
         )
         # Transition event = force-save so a crash between "decided to
         # unban" and the next debounce tick doesn't leave the peer

@@ -921,6 +921,25 @@ class Blockchain:
                 self.db.get_lottery_prize_pool()
             )
 
+        # Rehydrate the archive reward pool (1.50.0+).  Same
+        # cold-restart-divergence reasoning as lottery: tokens
+        # accumulate in the pool via fee-burn redirects + duty-miss
+        # withholds; total_supply tracks them in supply_meta but the
+        # pool itself was previously persisted ONLY in state
+        # snapshots.  A node that had been running since genesis
+        # therefore loaded an empty pool on restart while
+        # ``total_supply`` remained correct, producing both the
+        # 1.49.0 conservation false-positive AND a divergence at the
+        # next archive payout (paid against in-memory pool=0 while
+        # peers paid against the accumulated value).  ``hasattr``
+        # gate keeps legacy chain.db files loadable -- they hold a
+        # missing or zero row and the cold-load path becomes a no-op
+        # for them, matching the previous behaviour.
+        if hasattr(self.db, "get_archive_reward_pool"):
+            self.archive_reward_pool = (
+                self.db.get_archive_reward_pool()
+            )
+
         # One-shot phantom-supply migration: legacy mainnet state has
         # total_supply=1B persisted (the pre-fix GENESIS_SUPPLY).  Detect
         # and rebase to the corrected 140M value before populating the
@@ -1336,6 +1355,8 @@ class Blockchain:
                           + sum(staked)
                           + sum(amt for entries in pending_unstakes
                                     for amt, _ in entries)
+                          + archive_reward_pool
+                          + lottery_prize_pool
 
         Returns ``(expected_total, actual_total, breakdown)`` where
         ``breakdown`` is::
@@ -1345,12 +1366,33 @@ class Blockchain:
                 "staked_sum": int,
                 "pending_unstakes_sum": int,
                 "treasury": int,
+                "archive_reward_pool": int,
+                "lottery_prize_pool": int,
             }
 
         ``balances_sum`` excludes the treasury entry (the treasury IS
         one of the entries in ``self.supply.balances``) so an operator
         scanning the log can see WHICH bucket is misbehaving without
         treasury double-counting confusing the picture.
+
+        Pool buckets: ``archive_reward_pool`` (proof-of-custody fee
+        redirects + duty-miss withholds — see ``_apply_archive_rewards``
+        and the per-block withhold loop in ``_apply_block_state``) and
+        ``lottery_prize_pool`` (seed-divestment lottery redistribution
+        scalar) BOTH hold tokens that are tracked in ``total_supply``
+        but live outside ``balances`` / ``staked`` / ``pending_unstakes``.
+        Omitting them would falsely accuse the chain of losing tokens
+        every time fee burn redirects into the archive pool.
+
+        IMPORTANT for future maintainers: any new scalar pool that holds
+        tokens AND moves with ``total_supply`` MUST be added to the
+        ``actual_total`` sum here AND to the breakdown dict.  Pinned by
+        ``test_supply_conservation_pool_coverage`` (which scans the
+        codebase for ``self\\.supply\\.total_supply\\s*\\+=`` mutations
+        and asserts every "redirect into a pool" pattern is reflected
+        in the conservation sum).  If you skip that, you'll either see
+        a 1.50.0-style false-positive supply violation OR (worse) miss
+        a real one because the bucket the bug touches isn't summed.
 
         Read-only: this method NEVER mutates ``self`` or the DB.  Cheap
         — O(N_entities) per call; called once per block apply alongside
@@ -1369,16 +1411,29 @@ class Blockchain:
             for entries in self.supply.pending_unstakes.values()
             for amt, _release in entries
         )
+        # Scalar pools — held outside balances but counted in total_supply.
+        # ``getattr`` defaults: a freshly-initialised Blockchain or a
+        # state-synced node before snapshot apply may not have these
+        # attributes set yet; treat missing as zero rather than crashing
+        # the conservation check itself.
+        archive_reward_pool = int(getattr(self, "archive_reward_pool", 0))
+        lottery_prize_pool = int(
+            getattr(self.supply, "lottery_prize_pool", 0)
+        )
 
         expected_total = self.supply.total_supply
         actual_total = (
-            balances_sum + treasury_balance + staked_sum + pending_unstakes_sum
+            balances_sum + treasury_balance + staked_sum
+            + pending_unstakes_sum
+            + archive_reward_pool + lottery_prize_pool
         )
         breakdown = {
             "balances_sum": balances_sum,
             "staked_sum": staked_sum,
             "pending_unstakes_sum": pending_unstakes_sum,
             "treasury": treasury_balance,
+            "archive_reward_pool": archive_reward_pool,
+            "lottery_prize_pool": lottery_prize_pool,
         }
         return expected_total, actual_total, breakdown
 
@@ -2032,8 +2087,13 @@ class Blockchain:
         # into the snapshot root under _TAG_GLOBAL /
         # _GLOBAL_ARCHIVE_REWARD_POOL (see storage.state_snapshot), so
         # drift here is immediately detectable as a snapshot-root
-        # mismatch.
-        self.archive_reward_pool = int(snap.get("archive_reward_pool", 0))
+        # mismatch.  Routed through `_set_archive_reward_pool` so the
+        # chaindb mirror is populated at checkpoint-sync install time
+        # -- subsequent cold restarts on this node then rehydrate from
+        # the DB row the install wrote (closes the 1.49.0
+        # supply-conservation false-positive that fired because the
+        # pool was previously persisted ONLY in state snapshots).
+        self._set_archive_reward_pool(int(snap.get("archive_reward_pool", 0)))
         # Lottery prize pool (seed-divestment lottery-redistribution
         # hard fork) — consensus-visible scalar.  Same reasoning as
         # archive_reward_pool above: a state-synced node that inherits
@@ -3555,6 +3615,34 @@ class Blockchain:
             self.db, "set_lottery_prize_pool",
         ):
             self.db.set_lottery_prize_pool(int(value))
+
+    def _set_archive_reward_pool(self, value: int) -> None:
+        """Set `self.archive_reward_pool`, DB-mirrored.
+
+        Symmetric chokepoint to ``_set_lottery_prize_pool``.  The
+        archive_reward_pool was previously persisted ONLY in state
+        snapshots (storage.state_snapshot), which meant a node that
+        had been running since genesis (never state-synced) loaded
+        an empty pool on every restart while ``total_supply``
+        remained correct in supply_meta.  After 1.49.0's per-block
+        supply-conservation invariant landed, that gap surfaced as
+        a perpetual false-positive supply violation equal to the
+        restart-time pool value -- and worse, post-restart the
+        node would compute archive payouts against a pool that had
+        silently dropped its accumulated tokens, diverging from
+        uprestarted peers.
+
+        Like the lottery setter, ALL mutations of the pool go
+        through this helper so the in-memory scalar and the chaindb
+        ``supply_meta`` row stay in lockstep.  Direct ``+=`` /
+        ``-=`` writes on ``self.archive_reward_pool`` would bypass
+        the DB mirror and reopen the cold-restart divergence.
+        """
+        self.archive_reward_pool = int(value)
+        if self.db is not None and hasattr(
+            self.db, "set_archive_reward_pool",
+        ):
+            self.db.set_archive_reward_pool(int(value))
 
     def _public_key_at_height(
         self, entity_id: bytes, height: int,
@@ -10445,6 +10533,78 @@ class Blockchain:
             return
         self.supply.treasury_rebase_applied = True
 
+    def _apply_supply_reconciliation(self, block_height: int) -> None:
+        """Rebase total_supply to match actual on-chain buckets at the
+        SUPPLY_RECONCILIATION_HEIGHT activation.
+
+        Fires exactly once, at ``block_height ==
+        SUPPLY_RECONCILIATION_HEIGHT``.  All other heights are no-ops.
+
+        Idempotent: an adjacent re-apply at the same height is guarded
+        by ``self.supply.supply_reconciliation_applied``.  The flag is
+        snapshotted for reorg safety -- a reorged-out reconciliation
+        block correctly un-rebases on rollback via the supply-level
+        snapshot of total_supply plus the flag reset.
+
+        Motivation (1.50.0): mainnet was launched with the original
+        GENESIS_SUPPLY = 1_000_000_000 and an allocation table that
+        only distributed ~88.5M tokens.  The 1.26.0 phantom-supply
+        migration assumed the canonical 140M figure was correct and
+        rebased total_supply from 1B to 140M -- but actual allocations
+        were never 140M, leaving a permanent ~47.5M phantom that
+        the 1.49.0 supply-conservation invariant correctly began
+        flagging.  This activation-height rebase clears the residual.
+
+        Mechanism: total_supply is set to the SAME sum that
+        ``check_supply_conservation`` audits against.  Post-rebase,
+        the conservation invariant passes by construction.  Future
+        bugs that mint/burn outside the conservation buckets are
+        caught immediately by the invariant (since it now agrees
+        with total_supply at this height) instead of accumulating
+        silently for years before being noticed.
+
+        See ``messagechain.config.SUPPLY_RECONCILIATION_HEIGHT`` and
+        the CHANGELOG 1.50.0 root-cause entry.
+        """
+        from messagechain.config import SUPPLY_RECONCILIATION_HEIGHT
+        if block_height != SUPPLY_RECONCILIATION_HEIGHT:
+            return
+        if self.supply.supply_reconciliation_applied:
+            return
+        # Reuse the conservation-check sum so post-rebase the
+        # invariant passes by construction.  Any divergence between
+        # the rebase and the invariant would defeat the whole point.
+        expected_pre, actual, breakdown = self.check_supply_conservation()
+        if expected_pre == actual:
+            # No phantom to reconcile.  Still mark the flag so a
+            # future reorg + replay is a no-op rather than re-running
+            # the (now meaningless) rebase loop.
+            self.supply.supply_reconciliation_applied = True
+            logger.info(
+                "Supply reconciliation at height %d: no rebase needed "
+                "(total_supply already matches actual buckets).",
+                block_height,
+            )
+            return
+        delta = actual - expected_pre
+        self.supply.total_supply = actual
+        if self.db is not None:
+            self.db.set_supply_meta("total_supply", actual)
+        self.supply.supply_reconciliation_applied = True
+        logger.warning(
+            "SUPPLY RECONCILIATION at height %d: rebased "
+            "total_supply %d -> %d (delta=%+d).  Pre-rebase actual "
+            "buckets: %s.  This clears the phantom-supply residual "
+            "left by the 1.26.0 migration's assumption that the "
+            "canonical allocation total matched the actual mainnet "
+            "allocation -- it never did.  See CHANGELOG 1.50.0.",
+            block_height,
+            expected_pre,
+            actual,
+            delta,
+            breakdown,
+        )
+
     def _apply_validator_registration_burn(
         self, stx, block_height: int,
     ) -> bool:
@@ -11498,7 +11658,9 @@ class Blockchain:
             self.supply.balances[_recipient] = (
                 self.supply.balances.get(_recipient, 0) - _withheld
             )
-            self.archive_reward_pool += _withheld
+            self._set_archive_reward_pool(
+                self.archive_reward_pool + _withheld,
+            )
             # Accumulate per-recipient adjustment so we can patch
             # `result` with net amounts below.
             _withhold_adjustments[_recipient] = (
@@ -12015,10 +12177,15 @@ class Blockchain:
                 # pool).  total_supply rises by pool_add because those
                 # tokens are once again held somewhere, but they aren't
                 # in any per-entity balance yet — they sit in the
-                # consensus-visible archive_reward_pool scalar.
+                # consensus-visible archive_reward_pool scalar.  The
+                # pool itself is counted by check_supply_conservation
+                # (1.50.0+) so the +pool_add to total_supply has a
+                # matching bucket for the conservation invariant.
                 self.supply.total_burned -= pool_add
                 self.supply.total_supply += pool_add
-                self.archive_reward_pool += pool_add
+                self._set_archive_reward_pool(
+                    self.archive_reward_pool + pool_add,
+                )
         # Reset regardless — next block's burn accumulates from zero.
         self.supply.fee_burn_this_block = 0
 
@@ -12070,7 +12237,7 @@ class Blockchain:
                     self.supply.balances.get(payout.prover_id, 0)
                     + payout.amount
                 )
-            self.archive_reward_pool = wrapper.balance
+            self._set_archive_reward_pool(wrapper.balance)
             # Bump the watermark for every included proof whose prover
             # has an on-chain pubkey -- mirrors the consume-leaf rule
             # for every other hot-key signed path so the validator
@@ -12771,6 +12938,31 @@ class Blockchain:
                     self.db.rollback_transaction()
                 return False, "Invalid state_root — state commitment mismatch"
 
+            # Supply reconciliation (1.50.0 hard fork) — must run
+            # AFTER ``_apply_block_state`` returns and BEFORE the
+            # conservation check.  Placement rationale: the rebase
+            # mutates ``self.supply.total_supply`` (a supply-level
+            # scalar outside the per-entity SMT, so it does not
+            # change ``state_root``), but the value IS read by
+            # ``calculate_block_reward`` to gate the deflation boost.
+            # Running the rebase INSIDE ``_apply_block_state`` (before
+            # ``mint_block_reward``) would make the activation block's
+            # apply path see a different ``total_supply`` than the
+            # sim path's pre-check, producing an "Invalid state_root"
+            # rejection on every node.  Running here -- after the
+            # state_root verify, before the conservation check --
+            # leaves THIS block's reward computed against the pre-
+            # rebase value (matching the sim) while the NEXT block
+            # already sees the rebased value (sim and apply agree
+            # because both read from the same ``self.supply``).  The
+            # conservation check fires immediately after and must
+            # pass by construction (the rebase sums the same buckets
+            # the check audits).  No-op at every height except
+            # SUPPLY_RECONCILIATION_HEIGHT.
+            self._apply_supply_reconciliation(
+                block.header.block_number,
+            )
+
             # Per-block supply-conservation invariant (1.49.0+).  Runs
             # AFTER state_root verifies, so we know the apply path
             # produced the same state root the proposer committed to.
@@ -13417,6 +13609,15 @@ class Blockchain:
             # re-fires the burn.  The accompanying balance/total_supply
             # rewind is already captured above.
             "treasury_rebase_applied": self.supply.treasury_rebase_applied,
+            # Supply reconciliation (1.50.0 hard fork) — same reorg-
+            # safety reasoning as treasury_rebase_applied.  A reorg
+            # that undoes the SUPPLY_RECONCILIATION_HEIGHT block MUST
+            # un-flip this flag so the canonical replay re-fires the
+            # rebase; the accompanying total_supply rewind is captured
+            # by the standard supply snapshot above.
+            "supply_reconciliation_applied": (
+                self.supply.supply_reconciliation_applied
+            ),
             # Validator-registration burn (hard fork): per-entity set of
             # entity_ids that have paid the one-time burn, plus the
             # one-shot grandfather-applied flag.  Reorg-safe rewind —
@@ -13791,6 +13992,13 @@ class Blockchain:
         self.supply.treasury_rebase_applied = snapshot.get(
             "treasury_rebase_applied", False,
         )
+        # Supply-reconciliation flag (1.50.0) — default False so
+        # older snapshots restore cleanly with the rebase not yet
+        # applied.  Same reorg-safety contract as treasury_rebase_
+        # applied above.
+        self.supply.supply_reconciliation_applied = snapshot.get(
+            "supply_reconciliation_applied", False,
+        )
         # Validator-registration burn tracking.  Defaults match the
         # __init__ state so pre-fork snapshots restore to a pristine
         # set (no entity has paid yet, grandfather has not fired).
@@ -14100,10 +14308,13 @@ class Blockchain:
         # reverted, otherwise the in-memory pool diverges from
         # honest peers' replayed state.  Default 0 so pre-field
         # snapshots restore cleanly (matches a freshly-initialised
-        # Blockchain).  Scalar int is immutable -- direct value
-        # assignment is safe.
-        self.archive_reward_pool = int(
-            snapshot.get("archive_reward_pool", 0),
+        # Blockchain).  Routed through ``_set_archive_reward_pool``
+        # so the chaindb mirror is also rolled back -- otherwise a
+        # restart after a rollback would rehydrate from the stale
+        # post-apply DB row and silently re-introduce the very
+        # mutation the rollback removed.
+        self._set_archive_reward_pool(
+            int(snapshot.get("archive_reward_pool", 0)),
         )
 
     def get_wots_tree_height(self, entity_id: bytes) -> int | None:

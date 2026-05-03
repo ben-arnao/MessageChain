@@ -1864,6 +1864,32 @@ class ChainDB:
         self.set_supply_meta("lottery_prize_pool", int(value))
         self._maybe_commit()
 
+    # ── Archive Reward Pool Persistence (1.50.0) ────────────────────────
+    #
+    # archive_reward_pool was previously persisted ONLY in state snapshots
+    # (storage.state_snapshot) — not in chaindb.  A node that hasn't been
+    # state-synced (i.e. has been running since genesis) loaded an empty
+    # pool on every restart while ``total_supply`` was correctly persisted
+    # in supply_meta.  The conservation invariant added in 1.49.0
+    # therefore reported a false-positive supply violation equal to the
+    # restart-time archive_reward_pool — and worse, a "% of supply"
+    # consumer post-restart computed against an in-memory pool that had
+    # silently lost its accumulated tokens, which would diverge from
+    # uprestarted peers at the next archive payout.
+    #
+    # Symmetric with lottery_prize_pool above.  Mutated via Blockchain.
+    # _set_archive_reward_pool (which mirrors to chaindb on every change)
+    # so the on-disk value is always current.
+
+    def get_archive_reward_pool(self) -> int:
+        """Return the persisted archive reward pool (0 if unset)."""
+        return int(self.get_supply_meta("archive_reward_pool"))
+
+    def set_archive_reward_pool(self, value: int) -> None:
+        """Persist the archive reward pool.  Idempotent upsert."""
+        self.set_supply_meta("archive_reward_pool", int(value))
+        self._maybe_commit()
+
     # ── Phantom-Supply Migration (one-shot correctness repair) ──────────
     #
     # Earlier mainnet builds set GENESIS_SUPPLY = 1_000_000_000 while the
@@ -1884,6 +1910,19 @@ class ChainDB:
     # GENESIS_SUPPLY by EXACTLY 860_000_000 is the phantom-supply
     # signature — rebase by subtracting 860M.  Idempotent: after the
     # first run, stored == GENESIS_SUPPLY and the check is false.
+    #
+    # HISTORICAL NOTE (1.50.0): this migration assumed that
+    # ``GENESIS_SUPPLY`` (140M) equals the actual on-chain allocation
+    # total.  Mainnet allocations only ever summed to ~88.5M (founder
+    # ~47.5M staked + treasury 40M + scattered ~1M), so the migration
+    # left a permanent ~47.5M residual phantom that the 1.49.0 supply-
+    # conservation invariant correctly began flagging.  The proper
+    # repair is the activation-height ``_apply_supply_reconciliation``
+    # hard fork in 1.50.0, which sets ``total_supply`` to the actual
+    # bucket sum at SUPPLY_RECONCILIATION_HEIGHT instead of trusting a
+    # constant.  This method is left in place as an idempotent no-op
+    # for any pre-1.26.0 state files that still need the 1B->140M
+    # initial rebase.
     _PHANTOM_SUPPLY_GAP: int = 860_000_000
 
     def migrate_phantom_supply_if_needed(self) -> bool:
@@ -1897,6 +1936,11 @@ class ChainDB:
         Called automatically from Blockchain._load_from_db on startup,
         so existing mainnet state gets repaired in place.  No-op on a
         fresh chain (total_supply already matches GENESIS_SUPPLY).
+
+        SUPERSEDED by ``_apply_supply_reconciliation`` (1.50.0).  See
+        the historical note in the section comment above.  Kept here as
+        a safe no-op for legacy state files; the new mechanism is what
+        repairs the residual phantom this migration assumed away.
         """
         from messagechain.config import GENESIS_SUPPLY
         stored = self.get_supply_meta("total_supply")
