@@ -238,6 +238,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
              "when --fee is set.",
     )
+    transfer.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- balance ---
     balance = sub.add_parser(
@@ -3028,10 +3032,18 @@ def cmd_transfer(args):
             f"  Note:      Recipient is brand-new on chain - "
             f"+{NEW_ACCOUNT_FEE} NEW_ACCOUNT_FEE surcharge (burned)."
         )
-    confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
-    if confirm != "yes":
-        print("Transfer cancelled.")
-        sys.exit(0)
+    # ``--yes`` / ``-y`` is the script-friendly path: when running over
+    # ``gcloud compute ssh`` (or any SSH+sudo wrapper) piped stdin does
+    # not always reach ``input()``, so the interactive confirm hangs the
+    # session.  Operators driving the CLI from automation pass ``--yes``
+    # to acknowledge they have already verified the recipient.
+    if not getattr(args, "yes", False):
+        confirm = input("\nConfirm send (type 'yes' to proceed): ").strip().lower()
+        if confirm != "yes":
+            print("Transfer cancelled.")
+            sys.exit(0)
+    else:
+        print("\nSkipping confirmation prompt (--yes).")
 
     private_key = _resolve_private_key(args)
     data_dir = getattr(args, "data_dir", None)
