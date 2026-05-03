@@ -4,6 +4,43 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.49.0] — 2026-05-03
+
+Minor release. Closes the two highest-priority Tier-A risks identified
+post-1.48.0: the slashing sim/apply gap (the next predictable chain
+stall) and the absence of a token-conservation invariant.
+
+### Fixed
+
+- **Slashing now mirrors in `compute_post_state_root`.** The pre-check
+  short-circuit at `_append_block` (`if not block.slash_transactions:`)
+  is removed; slash blocks now go through the same state-root
+  pre-check as every other block. The sim mirrors every per-leaf
+  state mutation slashing performs: `staked` decrement,
+  `slashed_validators` insertion (on 100% slash), submitter finder-
+  reward credit, escrow burn debit, fee-burn / proposer-tip flow,
+  honesty-curve gating via `_compute_slash_pct`, and the submitter's
+  WOTS+ leaf watermark bump. Closes the same defect class as the
+  1.47.0 unstake-release fix; without this, the next time slashing
+  fires on mainnet the chain wedges at that block exactly. Pinned by
+  flipping `tests/test_sim_apply_parity.py::test_slash_block` from
+  `@expectedFailure` to a regular pass-required test.
+
+### Added
+
+- **Per-block supply-conservation invariant.** New
+  `Blockchain.check_supply_conservation()` returns
+  `(expected, actual, breakdown)` where the breakdown splits the
+  conservation sum into `balances_sum`, `treasury`, `staked_sum`,
+  `pending_unstakes_sum`. Wired into `_append_block` after the
+  state-root verify. Default-on-violation is `log` (ERROR record +
+  block kept — rejecting a block all peers accepted would fork us
+  off the network); operators can opt into stricter behavior via
+  `supply_invariant_on_violation = "crash" | "reject"`. Catches a
+  defect class the in-memory drift check in 1.48.0 misses: a bug
+  that mints/burns symmetrically into both memory and disk would
+  pass drift but fail conservation.
+
 ## [1.48.0] — 2026-05-03
 
 Minor release. Six fixes in a single roll, addressing the structural
