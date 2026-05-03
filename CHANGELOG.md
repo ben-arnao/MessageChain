@@ -4,6 +4,47 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.3] — 2026-05-03
+
+Hotfix.  The 1.51.2 fork-resolution path correctly walked back, found
+the ancestor, downloaded the competing chain, and recomputed the fork
+tip's cumulative weight via the new from-genesis function.  But the
+recomputed fork weight still failed the reorg comparison against the
+canonical tip's STORED weight, because the two values were computed
+under different historical-stake assumptions:
+
+  * Canonical's stored weight was accumulated incrementally as each
+    block was applied, capturing the founder's pre-rebalance 47.5M
+    stake on early blocks.
+  * Fork's recomputed weight walked back to genesis, but on a node
+    whose chaindb stake_snapshots have been pruned (we keep only the
+    trailing FINALITY_VOTE_MAX_AGE_BLOCKS = 1000 snapshots), the
+    walk fell back to LIVE ``self.supply.staked`` for every block
+    older than block_number - 1000.  After the rebalance the live
+    stake differs from the historical 47.5M.
+
+Witnessed in prod 2026-05-03 immediately after 1.51.2 deploy on
+validator-1: fork-resolution found ancestor at 1333, collected v2's
+30 competing headers up to 1364, recomputed fork weight to 30.67B
+... but canonical was at stored 46.5B (incremental, captures
+historical 47.5M v1 stake).  The reorg refused -- 30.67B < 46.5B --
+even though both chains share the same 1-1333 history.
+
+### Fixed
+
+- **``recompute_fork_tip_and_maybe_reorg`` now recomputes BOTH the
+  candidate fork tip AND the canonical tip via the same
+  ``_compute_full_cumulative_weight`` function**, so the comparison
+  is like-to-like.  Both undercount the pre-snapshot-pruning era by
+  the same amount; the comparison reflects the actual divergent-tail
+  difference.  Both stored weights are updated to the recomputed
+  values so subsequent reorg checks stay consistent.
+
+  For the prod scenario: both tips now compute as ~1361 * 22.5M ≈
+  30.6B for v2's fork (1361 blocks) vs ~1354 * 22.5M ≈ 30.5B for
+  v1's canonical (1354 blocks).  v2's fork wins by the 7-block
+  divergent-tail margin (~160M).  Reorg fires.
+
 ## [1.51.2] — 2026-05-03
 
 Hotfix.  The 1.51.1 fork-resolution path correctly walked back to find

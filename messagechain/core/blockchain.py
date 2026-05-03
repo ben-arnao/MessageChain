@@ -13389,80 +13389,112 @@ class Blockchain:
     def recompute_fork_tip_and_maybe_reorg(
         self, candidate_tip_hash: bytes,
     ) -> tuple[bool, str]:
-        """Force a fresh cumulative-weight recompute for the given
-        fork-tip block (which must already be stored locally) and
-        trigger ``_reorganize`` if it now outweighs the current
-        canonical tip.
+        """Force a fresh cumulative-weight recompute for BOTH the
+        candidate fork tip AND the current canonical tip, then
+        trigger ``_reorganize`` if the candidate now outweighs.
 
-        Used by the fork-resolution sync path (1.51.1) to handle the
+        Used by the fork-resolution sync path (1.51.1+) to handle the
         case where competing blocks were already in chaindb -- e.g.
         accumulated via gossip during a brief reconnection -- but with
-        a STALE cumulative weight from before 1.51.1's fix to
-        ``_compute_cumulative_weight``.  The ``add_block`` path
-        short-circuits with "Block already known" for those, never
-        re-evaluating the fork tip's weight.  This method gives the
-        sync layer an explicit "recompute and maybe switch" hook.
+        stale cumulative weights from prior gossip-time storage.
 
-        Returns ``(reorged, reason)`` -- ``reorged=True`` when the
-        candidate was heavier and ``_reorganize`` succeeded.
+        Why recompute the canonical tip too (1.51.2+):
+
+          The canonical tip's stored weight was accumulated
+          INCREMENTALLY as each block was applied, capturing the
+          historical proposer stake at apply time -- including the
+          founder's pre-rebalance 47.5M stake on early blocks.  The
+          fork tip's stored weight was computed by the bounded
+          walk-back ``_compute_cumulative_weight`` (capped at 110
+          ancestors, undercounts long chains).
+
+          The natural fix is to recompute the candidate from genesis
+          via ``_compute_full_cumulative_weight``.  But on a node
+          whose chaindb stake_snapshots have been pruned (we keep
+          only the trailing FINALITY_VOTE_MAX_AGE_BLOCKS=1000
+          snapshots), the walk falls back to LIVE
+          ``self.supply.staked`` for every old block -- which after
+          a stake rebalance differs from the historical value.  The
+          fork's recomputed weight then disagrees with the
+          canonical's stored value not because the chains differ but
+          because the two values were computed under different
+          historical-stake assumptions.
+
+          So we recompute BOTH with the same function and the same
+          historical-stake fallback rules.  Both undercount the
+          pre-snapshot-pruning era by the same amount; the
+          comparison is then valid (like-to-like) and reflects the
+          actual difference between the two chains' divergent tails.
+          Both stored weights are updated to the recomputed values
+          so subsequent reorg checks stay consistent.
+
+        Returns ``(reorged, reason)``.
         """
         block = self.get_block_by_hash(candidate_tip_hash)
         if block is None:
             return False, "candidate tip not stored locally"
 
-        # Bust the per-block weight cache for the candidate so the
-        # walk-back recomputes from scratch -- the cached value (if
-        # any) may have been written by an earlier call when the chain
-        # state differed.
+        canonical_tip = self.get_latest_block()
+        if canonical_tip is None:
+            return False, "no canonical tip"
+
+        # Bust both tips' caches so the walk-back recomputes from
+        # scratch.  ``_compute_full_cumulative_weight`` initializes
+        # the cache lazily; ``hasattr`` guards against a fresh call
+        # before any cache exists.
         if hasattr(self, "_block_full_cumulative_weight"):
             self._block_full_cumulative_weight.pop(
                 candidate_tip_hash, None,
             )
+            self._block_full_cumulative_weight.pop(
+                canonical_tip.block_hash, None,
+            )
 
-        # Use the from-genesis function so the resulting value is
-        # comparable to the canonical tip's stored weight (which is
-        # accumulated from genesis via the additive add_block path).
-        # The legacy ``_compute_cumulative_weight`` is bounded at
-        # MAX_REORG_DEPTH+10 ancestors and would always understate
-        # for any chain longer than the cap.
-        new_weight = self._compute_full_cumulative_weight(block)
-        # Update fork_choice.tips and chaindb's chain_tips so the
-        # corrected value persists across restarts and is visible to
-        # subsequent best-tip selections.
+        candidate_weight = self._compute_full_cumulative_weight(block)
+        canonical_weight = self._compute_full_cumulative_weight(canonical_tip)
+
+        # Update both tips' stored weights so future best-tip
+        # selections (and the reorg check we're about to do) see the
+        # like-to-like values.
         self.fork_choice.add_tip(
-            candidate_tip_hash, block.header.block_number, new_weight,
+            candidate_tip_hash, block.header.block_number, candidate_weight,
+        )
+        self.fork_choice.add_tip(
+            canonical_tip.block_hash,
+            canonical_tip.header.block_number,
+            canonical_weight,
         )
         if self.db is not None:
             self.db.add_chain_tip(
                 candidate_tip_hash,
                 block.header.block_number,
-                new_weight,
+                candidate_weight,
+            )
+            self.db.add_chain_tip(
+                canonical_tip.block_hash,
+                canonical_tip.header.block_number,
+                canonical_weight,
             )
 
         best_tip = self.fork_choice.get_best_tip()
-        current_tip = self.get_latest_block()
-        if (
-            best_tip
-            and current_tip
-            and best_tip[0] != current_tip.block_hash
-        ):
+        if best_tip and best_tip[0] != canonical_tip.block_hash:
             logger.info(
                 "Fork-tip recompute: candidate %s at #%d weight=%d "
-                "outweighs current tip %s weight=%d — reorganizing",
+                "outweighs canonical tip %s at #%d weight=%d — "
+                "reorganizing",
                 candidate_tip_hash.hex()[:16],
                 block.header.block_number,
-                new_weight,
-                current_tip.block_hash.hex()[:16],
-                self.fork_choice.tips.get(
-                    current_tip.block_hash, (0, 0),
-                )[1],
+                candidate_weight,
+                canonical_tip.block_hash.hex()[:16],
+                canonical_tip.header.block_number,
+                canonical_weight,
             )
             return self._reorganize(
-                current_tip.block_hash, best_tip[0],
+                canonical_tip.block_hash, best_tip[0],
             )
         return False, (
-            f"candidate weight {new_weight} did not outweigh "
-            f"current tip; no reorg"
+            f"candidate weight {candidate_weight} did not outweigh "
+            f"canonical {canonical_weight}; no reorg"
         )
 
     def _reorganize(self, old_tip_hash: bytes, new_tip_hash: bytes) -> tuple[bool, str]:
