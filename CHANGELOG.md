@@ -4,6 +4,26 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.47.1] — 2026-05-03
+
+Hotfix. The 1.47.0 state_root fix was correct, but by the time it
+shipped the mainnet round counter was already at ~157 (the
+post-1.46.0 stall had wedged the chain for 24h+ and the round
+counter ticks up 1 per slot). The pre-existing
+`MAX_PROPOSER_FALLBACK_ROUNDS = 100` cap kept the producer
+self-skipping every slot — fix landed but never ran. Raise the cap
+so the chain can recover.
+
+### Fixed
+
+- **`MAX_PROPOSER_FALLBACK_ROUNDS` raised from 100 → 10_000.** Same
+  defense, looser bound: ≈70 days of stall recovery headroom
+  (10_000 rounds × 600s block-time). Slot-rotation grinding is
+  still bounded; the timestamp-skew defense is still enforced
+  separately via `MAX_BLOCK_FUTURE_DRIFT`. The previous 100 → 5
+  raise (in 1.26.2) was triggered by a similar 12-round operational
+  stall — same shape of fix, just at a larger cap.
+
 ## [1.47.0] — 2026-05-03
 
 Minor release. **Fixes a deterministic chain stall at every
