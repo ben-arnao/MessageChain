@@ -359,6 +359,24 @@ class Blockchain:
         # `self.slash_offense_counts[eid]` would skip the mirror;
         # always go through the chokepoint.
         self.slash_offense_counts: dict[bytes, int] = {}
+        # Per-block supply-conservation invariant (1.49.0+).  Companion
+        # to the 1.48.0 in-memory ↔ on-disk drift check (`check_state_drift`):
+        # the drift check catches the case where one path silently
+        # diverges from the other, but a corrupting bug that mutates
+        # BOTH paths the same way (e.g. a credit that never bumps
+        # `total_supply`) passes the drift check unscathed.  This
+        # invariant catches that defect class by summing every owned
+        # bucket — non-treasury balances + treasury + staked + pending
+        # unstakes — and comparing to `self.supply.total_supply` after
+        # each block apply.  Modes: "log" (default; surface violation
+        # at ERROR with breakdown, do NOT reject the block — chain-
+        # history changes are scary, the goal is to learn about the bug
+        # not to amplify it), "crash" (raise AssertionError so the
+        # process dies and an operator notices), "reject" (return False
+        # from `_append_block` so the block is unwound).  Operators
+        # opt into the stricter modes via the wallet/CLI; nothing in
+        # the protocol layer reaches in here.
+        self.supply_invariant_on_violation: str = "log"
         self.fork_choice = ForkChoice()
         self.finality = FinalityTracker()
         # Long-range-attack defense — persistent finality checkpoints.
@@ -1296,6 +1314,120 @@ class Blockchain:
                 records.append(("slashed_validators", eid, in_mem, on_disk))
 
         return records
+
+    def check_supply_conservation(
+        self,
+    ) -> tuple[int, int, dict[str, int]]:
+        """Verify token conservation against ``self.supply.total_supply``.
+
+        Companion to ``check_state_drift``.  The drift check catches
+        in-memory ↔ on-disk divergence; this check catches a different
+        defect class — any apply-path mutation that mints, burns, or
+        otherwise creates / destroys tokens in a way that doesn't
+        balance against the supply ledger.  A bug that corrupts BOTH
+        the memory path and the disk path the same way (credit a
+        balance without bumping ``total_supply``) is invisible to the
+        drift check but visible here.
+
+        Conservation identity (must hold after every apply):
+
+            total_supply == sum(non_treasury_balances)
+                          + treasury_balance
+                          + sum(staked)
+                          + sum(amt for entries in pending_unstakes
+                                    for amt, _ in entries)
+
+        Returns ``(expected_total, actual_total, breakdown)`` where
+        ``breakdown`` is::
+
+            {
+                "balances_sum": int,        # excludes treasury
+                "staked_sum": int,
+                "pending_unstakes_sum": int,
+                "treasury": int,
+            }
+
+        ``balances_sum`` excludes the treasury entry (the treasury IS
+        one of the entries in ``self.supply.balances``) so an operator
+        scanning the log can see WHICH bucket is misbehaving without
+        treasury double-counting confusing the picture.
+
+        Read-only: this method NEVER mutates ``self`` or the DB.  Cheap
+        — O(N_entities) per call; called once per block apply alongside
+        the existing state_root verify.
+        """
+        from messagechain.config import TREASURY_ENTITY_ID
+
+        treasury_balance = self.supply.balances.get(TREASURY_ENTITY_ID, 0)
+        balances_sum = sum(
+            v for k, v in self.supply.balances.items()
+            if k != TREASURY_ENTITY_ID
+        )
+        staked_sum = sum(self.supply.staked.values())
+        pending_unstakes_sum = sum(
+            amt
+            for entries in self.supply.pending_unstakes.values()
+            for amt, _release in entries
+        )
+
+        expected_total = self.supply.total_supply
+        actual_total = (
+            balances_sum + treasury_balance + staked_sum + pending_unstakes_sum
+        )
+        breakdown = {
+            "balances_sum": balances_sum,
+            "staked_sum": staked_sum,
+            "pending_unstakes_sum": pending_unstakes_sum,
+            "treasury": treasury_balance,
+        }
+        return expected_total, actual_total, breakdown
+
+    def _enforce_supply_conservation(self, block_height: int) -> bool:
+        """Enforce the conservation invariant for the given block.
+
+        Returns True when the invariant holds.  On violation, dispatches
+        based on ``self.supply_invariant_on_violation``:
+
+        * ``"log"``    — log at ERROR with the breakdown and delta and
+                         return False.  Caller decides what to do
+                         (default in ``_append_block``: keep the block;
+                         the goal is to surface the bug, not amplify
+                         it by rejecting blocks all peers accepted).
+        * ``"crash"``  — log at ERROR and raise ``AssertionError``.
+                         For operators who want a noisy halt-on-bug
+                         posture.
+        * ``"reject"`` — log at ERROR and return False.  Caller is
+                         expected to roll back the block.
+
+        Always logs a single ERROR-level record on violation so an
+        operator scanning the journal can spot it and capture the
+        breakdown without ever needing to instrument the node.
+        """
+        expected, actual, breakdown = self.check_supply_conservation()
+        if expected == actual:
+            return True
+
+        delta = actual - expected
+        mode = getattr(self, "supply_invariant_on_violation", "log")
+        logger.error(
+            "supply conservation violation at height=%d: "
+            "expected_total_supply=%d actual_total_supply=%d "
+            "delta=%+d (actual - expected) breakdown=%s "
+            "on_violation_mode=%s",
+            block_height,
+            expected,
+            actual,
+            delta,
+            breakdown,
+            mode,
+        )
+        if mode == "crash":
+            raise AssertionError(
+                f"supply conservation violation: delta={delta:+d} "
+                f"breakdown={breakdown}",
+            )
+        # "log" and "reject" both return False; the caller distinguishes.
+        return False
 
     def _persist_state(self):
         """Write current in-memory state to database atomically.
@@ -12638,6 +12770,38 @@ class Blockchain:
                 if self.db is not None:
                     self.db.rollback_transaction()
                 return False, "Invalid state_root — state commitment mismatch"
+
+            # Per-block supply-conservation invariant (1.49.0+).  Runs
+            # AFTER state_root verifies, so we know the apply path
+            # produced the same state root the proposer committed to.
+            # An invariant violation here means the block's apply
+            # mutated the supply ledger inconsistently — the kind of
+            # bug that survives the drift check (because both memory
+            # and disk are corrupted the same way) but breaks
+            # conservation against `total_supply`.
+            #
+            # Default mode is "log": surface at ERROR, do NOT reject.
+            # Chain-history changes are scary; we want to find out
+            # about the bug, not amplify it by rejecting blocks all
+            # peers accepted.  Operators opt into "crash" or "reject"
+            # if they want stricter behaviour.
+            if not self._enforce_supply_conservation(
+                block_height=block.header.block_number,
+            ):
+                if self.supply_invariant_on_violation == "reject":
+                    self._restore_memory_snapshot(snapshot)
+                    self._rebuild_state_tree()
+                    if self.db is not None:
+                        self.db.rollback_transaction()
+                    return False, (
+                        "supply conservation violation — "
+                        "see ERROR log for breakdown"
+                    )
+                # "log" (default) and "crash" (raised above) both fall
+                # through here.  In "log" mode we KEEP the block: the
+                # consensus chain has already accepted it on every
+                # other validator, and rejecting it here would fork us
+                # off.  The ERROR log is the actionable signal.
 
             self.chain.append(block)
             self._block_by_hash[block.block_hash] = block
