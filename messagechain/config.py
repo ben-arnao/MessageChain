@@ -627,33 +627,34 @@ MAX_BLOCK_FUTURE_DRIFT = 120
 # can opt in via MESSAGECHAIN_PROFILE=prototype (30s) or override
 # individually via MESSAGECHAIN_BLOCK_TIME_TARGET.
 BLOCK_TIME_TARGET = _profile_int("MESSAGECHAIN_BLOCK_TIME_TARGET", "BLOCK_TIME_TARGET", 600)
-# Cap on how many fallback rounds a block's claimed timestamp can imply
-# past the parent.  Block round is computed as
-# int((block.ts - parent.ts - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET).
-# Even after tightening MAX_BLOCK_FUTURE_DRIFT to 120 s, a malicious
-# proposer can still inflate the implied round count by picking a
-# parent.ts well below current wall clock; the explicit round cap keeps
-# slot-rotation grinding bounded regardless of future-drift tolerance.
-# Original cap of 5 covered legitimate missed-slot scenarios.  In
-# 1.26.2 the cap was raised to 100 after an operational chain-stall
-# during the 1.25.x → 1.26.x rollout sequence (the chain went ~2h
-# without a block while a series of regressions in mempool sort key
-# and a corrupted height-guard ratchet were being patched).  Round
-# count (= ts_gap / BLOCK_TIME_TARGET ≈ 1 per 10 min) had run up to
-# ~12, so every recovery proposal was rejected by the round cap and
-# the chain couldn't self-heal until the cap was lifted.
+# Historical: a per-block ``MAX_PROPOSER_FALLBACK_ROUNDS`` cap once
+# bounded how many fallback rounds a block's claimed timestamp could
+# imply past the parent.  It existed to defend against timestamp-skew
+# slot-hijacking grinding — a proposer pushing ``block.timestamp``
+# forward to claim a round where THEY are selected, skipping the honest
+# round-0 proposer.
 #
-# 1.47.1 raises the cap to 10_000 after the 1309 stall: by the time
-# 1.47.0 shipped the state_root fix, the round counter was already
-# at ~157 (post-1.46.0 producer/validator divergence had wedged the
-# chain for 24h+) and the 100-cap kept the producer self-skipping
-# every slot — fix landed but couldn't be exercised. 10_000 covers
-# ~70 days of stall recovery, comfortably absorbing any plausible
-# investigation+patch window. Slot-rotation grinding is still bounded
-# (10_000 rounds × BLOCK_TIME_TARGET = the only meaningful abuse
-# surface), and the future-drift defense still tightens the timestamp
-# itself via MAX_BLOCK_FUTURE_DRIFT.
-MAX_PROPOSER_FALLBACK_ROUNDS = 10_000
+# Removed in the round-cap-decoupling change after we recognized the
+# defense is fully redundant with ``MAX_BLOCK_FUTURE_DRIFT``: a
+# malicious proposer cannot fabricate ``parent.timestamp`` (it's
+# already committed to the chain), and ``block.timestamp`` is bounded
+# by ``now + MAX_BLOCK_FUTURE_DRIFT``.  The maximum extra round an
+# attacker can claim above what an honest proposer would claim is
+# ``MAX_BLOCK_FUTURE_DRIFT / BLOCK_TIME_TARGET = 120 / 600 = 0`` —
+# i.e. the round-cap added zero defense beyond future-drift.
+#
+# Meanwhile the cap was load-bearing for the recovery path: every chain
+# stall longer than ``cap × BLOCK_TIME_TARGET`` became self-perpetuating,
+# because the producer's natural recovery block computed a
+# ``round_number`` proportional to the wall-clock gap from the stale
+# parent and got rejected as "timestamp-skew slot hijacking" before any
+# fix could be exercised.  The cap drifted reactively three times
+# (5 → 100 → 10_000) chasing this ratchet.  Removing it decouples
+# grinding-resistance (still enforced by ``MAX_BLOCK_FUTURE_DRIFT`` and
+# the ``ts_gap >= BLOCK_TIME_TARGET`` rule) from recovery-time
+# (now unbounded — a chain can self-heal from any stall length).
+#
+# See tests/test_round_cap_recovery.py for the recovery property pin.
 # Cap on concurrently-active governance proposals.  Without this, an
 # attacker willing to pay PROPOSAL_FEE per proposal can spin up enough
 # proposals to balloon governance state (each snapshot copies the

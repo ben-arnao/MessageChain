@@ -42,11 +42,11 @@ class ProposerSkipSlotError(RuntimeError):
 
     The bug this prevents: pre-fix, ``record_block_sign`` ran before
     these checks, so a candidate that would be rejected downstream
-    (e.g. round_number > MAX_PROPOSER_FALLBACK_ROUNDS on a long-stalled
-    chain) still permanently advanced the height-guard floor.  After
-    that, every legitimate retry at the same height was refused as
-    "already signed at height N" — the chain wedged with no recovery
-    path short of manual floor surgery.
+    (e.g. timestamp-too-early or future-drift) still permanently
+    advanced the height-guard floor.  After that, every legitimate
+    retry at the same height was refused as "already signed at
+    height N" — the chain wedged with no recovery path short of
+    manual floor surgery.
 
     See ``_local_pre_sign_validation`` for the rule list, and
     ``tests/test_proposer_floor_not_poisoned_on_local_rejection.py``
@@ -91,9 +91,14 @@ def _local_pre_sign_validation(
 
     Coverage as of this fix:
       * timestamp-too-early (``ts_gap < BLOCK_TIME_TARGET``)
-      * round-cap (``round_number > MAX_PROPOSER_FALLBACK_ROUNDS``)
       * future-drift (``timestamp > now + MAX_BLOCK_FUTURE_DRIFT``)
       * MTP, when ``median_time_past`` is supplied by the caller
+
+    Note: a per-block round cap was previously enforced here too;
+    removed in the round-cap-decoupling change.  See
+    ``config.MAX_BLOCK_FUTURE_DRIFT`` (where the grinding rationale
+    now lives) and ``tests/test_round_cap_recovery.py`` for the
+    recovery property the cap removal restores.
 
     Other validate_block rules — state-root match, signature
     verification, fee/byte-budget, etc. — are NOT mirrored here
@@ -121,7 +126,6 @@ def _local_pre_sign_validation(
 
     from messagechain.config import (
         BLOCK_TIME_TARGET,
-        MAX_PROPOSER_FALLBACK_ROUNDS,
         MAX_BLOCK_FUTURE_DRIFT,
     )
 
@@ -133,13 +137,6 @@ def _local_pre_sign_validation(
         return (
             f"timestamp too early: gap {ts_gap:.0f}s < "
             f"BLOCK_TIME_TARGET {BLOCK_TIME_TARGET}s"
-        )
-    round_number = int((ts_gap - BLOCK_TIME_TARGET) // BLOCK_TIME_TARGET)
-    if round_number > MAX_PROPOSER_FALLBACK_ROUNDS:
-        return (
-            f"proposer round {round_number} exceeds cap "
-            f"{MAX_PROPOSER_FALLBACK_ROUNDS} — would be rejected by "
-            f"validate_block as timestamp-skew slot hijacking"
         )
     if header.timestamp > now + MAX_BLOCK_FUTURE_DRIFT:
         return (
