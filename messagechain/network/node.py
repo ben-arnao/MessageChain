@@ -143,6 +143,17 @@ class Node(SharedRuntimeMixin):
             os.path.join(data_dir, "ban_scores.json") if data_dir else None
         )
         self.ban_manager = PeerBanManager(persistence_path=_ban_path)
+        # Resolver lets record_offense() stamp ban entries with the
+        # peer's self-reported software version without every call site
+        # having to plumb a peer object through.  Returns "" when the
+        # peer hasn't completed HANDSHAKE yet (and the offense thus
+        # carries no version tag — see clear_ban_on_version_change).
+        def _peer_version_for(address: str) -> str:
+            p = self.peers.get(address)
+            if p is None:
+                return ""
+            return getattr(p, "peer_version", "") or ""
+        self.ban_manager.set_version_resolver(_peer_version_for)
         self.rate_limiter = PeerRateLimiter()
         self.eviction_protector = PeerEvictionProtector()
 
@@ -612,11 +623,25 @@ class Node(SharedRuntimeMixin):
         address = f"{addr[0]}:{addr[1]}"
         logger.info(f"Incoming connection from {address}")
 
-        # Check ban before accepting
+        # Check ban before accepting.  We do NOT close immediately on
+        # ban — instead we let the read loop run, which will read the
+        # peer's first message (typically HANDSHAKE).  If that HANDSHAKE
+        # advertises a different software version than the one recorded
+        # at ban time, _handle_message clears the ban (see
+        # clear_ban_on_version_change) and the connection proceeds
+        # normally.  This is what unblocks the "we shipped a consensus
+        # fix and the chain stayed split" recovery path.
+        #
+        # If the first message is NOT a version-bumped HANDSHAKE, the
+        # per-message ban check inside _handle_message rejects it and
+        # the connection is dropped — same end state as before, just
+        # one read deeper.  The cost is one read of an inbound socket
+        # we'd otherwise close immediately; not a meaningful DoS lever.
         if self.ban_manager.is_banned(address):
-            logger.info(f"Rejected banned peer {address}")
-            writer.close()
-            return
+            logger.info(
+                f"Banned peer {address} accepted for HANDSHAKE peek "
+                f"(will be dropped unless version has changed)"
+            )
 
         # Enforce MAX_PEERS with eviction. If full, try to evict the worst
         # existing peer; if no eviction candidate, reject the newcomer.
@@ -880,6 +905,25 @@ class Node(SharedRuntimeMixin):
         """Dispatch incoming network messages with ban/rate-limit checks."""
         peer.touch()
         address = peer.address
+
+        # ── Stale-ban clearance on version change ──
+        # If this is a HANDSHAKE and the peer reports a software version
+        # different from the one recorded at ban time, presume the prior
+        # offense was a stale-binary artifact (e.g. consensus bug fixed
+        # by a hard fork) and auto-clear the ban BEFORE the per-message
+        # ban check runs.  See messagechain/network/ban.py for the
+        # full incident-driven rationale.
+        if msg.msg_type == MessageType.HANDSHAKE:
+            try:
+                peer_reported_version = str(
+                    msg.payload.get("version", "") or ""
+                )
+            except AttributeError:
+                peer_reported_version = ""
+            if peer_reported_version:
+                self.ban_manager.clear_ban_on_version_change(
+                    address, peer_reported_version,
+                )
 
         # ── Ban check ──
         if self.ban_manager.is_banned(address):
