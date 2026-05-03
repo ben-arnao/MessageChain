@@ -102,6 +102,23 @@ def build_parser() -> argparse.ArgumentParser:
              "default doesn't match.  Same flag that the systemd unit "
              "example uses (see examples/messagechain-validator.service.example).",
     )
+    start.add_argument(
+        "--state-drift-check-interval", type=int, default=100,
+        help="Run the in-memory vs on-disk state-drift tripwire every "
+             "N successfully-added blocks (default 100, 0 disables).  "
+             "Catches the validator-2-style silent divergence that "
+             "previously surfaced only as a struct.error overflow in "
+             "compute_post_state_root.",
+    )
+    start.add_argument(
+        "--state-drift-on-detect", choices=("log", "crash"), default="log",
+        help="Response when the periodic drift tripwire finds divergent "
+             "records.  'log' (default) records an ERROR-level entry "
+             "with the full record list and bumps a counter; the next "
+             "clean restart will repull state from disk and converge.  "
+             "'crash' raises so systemd restarts the node immediately "
+             "for a clean reload -- faster fix, more disruptive.",
+    )
 
     # --- account ---
     account = sub.add_parser(
@@ -2298,6 +2315,16 @@ def cmd_start(args):
         data_dir=args.data_dir,
         rpc_bind=args.rpc_bind,
     )
+    # Apply state-drift tripwire flags before the async loop starts so
+    # the first periodic fire honours the operator's choice.  The flags
+    # default to (100, "log") inside Server.__init__ so an old CLI that
+    # doesn't pass them keeps the conservative behaviour.
+    if hasattr(args, "state_drift_check_interval"):
+        server.state_drift_check_interval = int(
+            args.state_drift_check_interval,
+        )
+    if hasattr(args, "state_drift_on_detect"):
+        server.state_drift_on_detect = str(args.state_drift_on_detect)
     if getattr(args, "wallet", None):
         # Let server.py resolve the WOTS+ tree_height from chain state
         # rather than config default.  Avoids multi-hour keygen after a

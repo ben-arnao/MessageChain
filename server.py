@@ -1119,6 +1119,34 @@ class Server(SharedRuntimeMixin):
         self._receipt_budget_warn_last: dict[str, float] = {}
         self._running = False
 
+        # Periodic in-memory ↔ on-disk state-drift tripwire.
+        # Background: validator-2 silently diverged its in-memory chain
+        # state from its on-disk ChainDB until ``compute_post_state_root``
+        # crashed deep inside ``_leaf_value`` with
+        # ``struct.error: int too large to convert`` — only the resulting
+        # overflow surfaced; the drift itself ran undetected for an
+        # unknown number of blocks.  ``state_drift_check_interval`` is
+        # the cadence (in successfully-added blocks) at which the
+        # producer fires ``Blockchain.check_state_drift()`` — default
+        # 100 keeps the periodic SQLite re-read cheap relative to a
+        # ~10s block time.  ``state_drift_on_detect`` chooses the
+        # response on a non-empty drift report:
+        #   * ``"log"`` (default) — emit one ERROR-level log line with
+        #     the full record list and bump
+        #     ``state_drift_detection_count`` so an operator scraping
+        #     the ``status`` RPC can alert.  Block production
+        #     continues; the next clean restart will repull state
+        #     from disk and converge.
+        #   * ``"crash"`` — raise ``RuntimeError`` so systemd restarts
+        #     the node and forces a clean reload from disk.  Faster
+        #     fix but more disruptive; opt-in.
+        # ``_blocks_since_drift_check`` is the modulus counter; reset
+        # on every actual check fire.
+        self.state_drift_check_interval: int = 100
+        self.state_drift_on_detect: str = "log"
+        self.state_drift_detection_count: int = 0
+        self._blocks_since_drift_check: int = 0
+
         # Network protection — must exist before syncer for the offense callback.
         # Ban state persists under data_dir so bans survive restarts; a peer
         # banned just before an OOM kill or maintenance reboot used to
@@ -4032,6 +4060,47 @@ class Server(SharedRuntimeMixin):
             # only; never affects consensus).  Reads onboard.toml each
             # call so flags can be flipped without restart.
             self._maybe_notify_governance_proposals()
+            # Periodic in-memory ↔ on-disk state-drift tripwire.  Fires
+            # every ``state_drift_check_interval`` successfully-added
+            # blocks; see __init__ comment for the threat-model
+            # rationale and the response-mode contract.  Wrapped in a
+            # broad except so the tripwire itself can never abort a
+            # block-production iteration — a busted check is far less
+            # bad than a busted block producer.
+            self._blocks_since_drift_check += 1
+            if (
+                self.state_drift_check_interval > 0
+                and self._blocks_since_drift_check
+                >= self.state_drift_check_interval
+            ):
+                self._blocks_since_drift_check = 0
+                try:
+                    drift = self.blockchain.check_state_drift()
+                except Exception:
+                    logger.exception(
+                        "state-drift check raised; treating as no-op for "
+                        "this iteration so block production keeps moving",
+                    )
+                    drift = []
+                if drift:
+                    self.state_drift_detection_count += 1
+                    logger.error(
+                        "STATE DRIFT DETECTED at block #%d: %d divergent "
+                        "record(s) between in-memory state and on-disk "
+                        "chain.db.  Records: %s",
+                        block.header.block_number,
+                        len(drift),
+                        drift,
+                    )
+                    if self.state_drift_on_detect == "crash":
+                        raise RuntimeError(
+                            f"State drift detected at block "
+                            f"#{block.header.block_number}: "
+                            f"{len(drift)} divergent record(s).  "
+                            f"Crashing per --state-drift-on-detect=crash "
+                            f"so systemd restarts the node and forces a "
+                            f"clean reload from disk.",
+                        )
         else:
             # add_block rejected our own candidate.  Roll back the
             # height-guard floor reservation so a future legitimate
@@ -5199,6 +5268,16 @@ async def run(args):
         data_dir=args.data_dir,
         rpc_bind=args.rpc_bind,
     )
+    # State-drift tripwire flags — see Blockchain.check_state_drift and
+    # the periodic-call wiring in _try_produce_block_sync.  Defaults
+    # match the Server.__init__ defaults so this is a no-op when the
+    # operator omits the flags.
+    if hasattr(args, "state_drift_check_interval"):
+        server.state_drift_check_interval = int(
+            args.state_drift_check_interval,
+        )
+    if hasattr(args, "state_drift_on_detect"):
+        server.state_drift_on_detect = str(args.state_drift_on_detect)
 
     # Authenticate with private key to unlock block signing.  Two paths:
     #   * --keyfile: read the hex-encoded key from a 0600 file.  Required
@@ -5645,6 +5724,23 @@ def main():
         "--no-keypair-cache", action="store_true", default=False,
         help="Disable on-disk keypair caching. Forces full WOTS+ tree "
              "regeneration on every restart.",
+    )
+    parser.add_argument(
+        "--state-drift-check-interval", type=int, default=100,
+        help="Run the in-memory ↔ on-disk state-drift tripwire every "
+             "N successfully-added blocks (default 100, 0 disables).  "
+             "Catches the validator-2-style silent divergence that "
+             "previously surfaced only as a struct.error overflow in "
+             "compute_post_state_root.",
+    )
+    parser.add_argument(
+        "--state-drift-on-detect", choices=("log", "crash"), default="log",
+        help="Response when the periodic drift tripwire finds divergent "
+             "records.  'log' (default) records an ERROR-level entry "
+             "with the full record list and bumps a counter; the next "
+             "clean restart will repull state from disk and converge.  "
+             "'crash' raises so systemd restarts the node immediately "
+             "for a clean reload.",
     )
     # --- Censorship-resistance HTTPS submission endpoint (opt-in) ---
     # Off by default.  Set --submission-port (typ. 8443) AND supply
