@@ -95,6 +95,14 @@ class PeerScore:
     # and avoids a schema-migration story if we need it later.
     first_seen: float = field(default_factory=time.time)
     offenses: list = field(default_factory=list)  # [(timestamp, reason, points)]
+    # Last-known peer software version at the time of the most recent
+    # offense.  Used by clear_ban_on_version_change to auto-expire
+    # stale bans when the peer reconnects on a different binary —
+    # the typical "we shipped a consensus fix and the chain stayed
+    # split because v2 still ban-rejects v1's reconnects" scenario.
+    # Empty string = unknown (legacy on-disk row, or offense recorded
+    # before the handshake disclosed a version) → never auto-clears.
+    peer_version: str = ""
 
     @property
     def is_banned(self) -> bool:
@@ -130,8 +138,25 @@ class PeerBanManager:
         # reconnected fresh — now they stay banned.
         self._persistence_path: str | None = persistence_path
         self._last_save_time: float = 0.0
+        # Optional resolver: address-string → peer's last-known software
+        # version.  Set by Node so record_offense() can stamp ban entries
+        # with the binary version that earned them, without forcing every
+        # one of the ~40 record_offense call sites to know about peer
+        # objects.  When the resolver returns "" the offense leaves
+        # peer_version untouched (conservative: see clear_ban_on_version_change).
+        self._version_resolver = None
         if persistence_path is not None:
             self._load()
+
+    def set_version_resolver(self, resolver) -> None:
+        """Install a callable that maps a peer address ("ip:port" or "ip")
+        to the peer's last-known self-reported software version string.
+
+        Used by record_offense() so ban entries auto-pick-up the
+        version-at-time-of-offense without every call site having to
+        thread a peer object through.  Pass ``None`` to clear.
+        """
+        self._version_resolver = resolver
 
     def _get_ip(self, address: str) -> str:
         """Extract a bucket key from 'host:port' for ban accounting.
@@ -183,8 +208,21 @@ class PeerBanManager:
             return False
         return ps.is_banned
 
-    def record_offense(self, address: str, points: int, reason: str) -> bool:
-        """Record a misbehavior offense. Returns True if peer is now banned."""
+    def record_offense(self, address: str, points: int, reason: str,
+                       peer_version: str | None = None) -> bool:
+        """Record a misbehavior offense. Returns True if peer is now banned.
+
+        ``peer_version`` is the peer's self-reported software version at
+        the moment of the offense (from the HANDSHAKE payload).  When
+        provided, it is stored on the score entry so a later reconnect
+        on a different version can auto-clear a stale ban via
+        ``clear_ban_on_version_change``.  Pass ``None`` (the default)
+        when the version is not yet known — e.g. when the offense fires
+        from the connection-accept path before HANDSHAKE has been read.
+        ``None`` and ``""`` are treated identically: the field is left
+        empty, which makes the resulting ban opt-OUT of auto-clearance
+        (the conservative default — see Test 3 in test_ban_decay.py).
+        """
         ip = self._get_ip(address)
         ps = self._get_score(ip)
 
@@ -202,6 +240,20 @@ class PeerBanManager:
         ps.score += points
         ps.lifetime_score += points
         ps.offenses.append((now, reason, points))
+        # Record the version this offense came from when known.  Prefer
+        # an explicit caller-supplied value; fall back to the resolver
+        # so non-HANDSHAKE-path call sites don't have to thread a peer
+        # object.  An empty / "unknown" value is treated as "no info"
+        # so we don't overwrite a previously-recorded real version.
+        version_to_record = peer_version
+        if not version_to_record and self._version_resolver is not None:
+            try:
+                version_to_record = self._version_resolver(address)
+            except Exception:
+                # A flaky resolver must never affect ban accounting.
+                version_to_record = None
+        if version_to_record and version_to_record != "unknown":
+            ps.peer_version = version_to_record
 
         # Trim offense history to last 50
         if len(ps.offenses) > 50:
@@ -241,6 +293,69 @@ class PeerBanManager:
         # Operator-issued bans bypass debounce — they're rare and
         # high-intent, and an operator expects durability.
         self._maybe_save(force=True)
+
+    def clear_ban_on_version_change(
+        self, address: str, current_version: str,
+    ) -> bool:
+        """Auto-expire a ban when the peer reconnects on a different
+        software version than the one recorded at ban time.
+
+        Returns True iff a ban was cleared.
+
+        Rationale (2026-04-25 incident): a 24h+ chain stall caused by
+        a consensus bug led validator-2 to ban validator-1 with a
+        ~3-hour ``banned_until``.  After 1.46.0/1.47.0/1.47.1 shipped
+        the fix, the chain stayed split because v2 still ban-rejected
+        v1's reconnects — the operator had to hand-edit ban_scores.json.
+        A version change is the cheapest reliable signal that "the
+        binary that earned the ban no longer exists."
+
+        Conservative gates (each closes a way this could go wrong):
+          - peer must currently be banned (no-op otherwise),
+          - stored ``peer_version`` must be non-empty (legacy on-disk
+            rows or pre-handshake offenses don't have one — refusing
+            to clear them avoids wiping every existing ban on first
+            upgrade),
+          - reported ``current_version`` must be non-empty and not the
+            literal "unknown" sentinel (a peer that omits the field
+            cannot launder out of a ban),
+          - the two must actually differ.
+
+        Clearance is a clean slate (lifetime_score reset, offenses
+        cleared) — same semantics as ``manual_unban`` — because we've
+        decided the prior misbehavior was a stale-binary artifact.
+        """
+        if not current_version or current_version == "unknown":
+            return False
+        ip = self._get_ip(address)
+        ps = self._scores.get(ip)
+        if ps is None:
+            return False
+        if not ps.is_banned:
+            return False
+        if not ps.peer_version:
+            # Conservative: no recorded version → can't safely conclude
+            # this is a different binary.  Operator can still
+            # manual_unban if needed.
+            return False
+        if ps.peer_version == current_version:
+            return False
+        old_version = ps.peer_version
+        ps.score = 0
+        ps.lifetime_score = 0
+        ps.banned_until = 0.0
+        ps.offenses.clear()
+        ps.peer_version = current_version
+        logger.info(
+            f"Peer {ip} ban auto-cleared on version change "
+            f"({old_version} → {current_version}) — prior misbehavior "
+            f"presumed stale-binary artifact."
+        )
+        # Transition event = force-save so a crash between "decided to
+        # unban" and the next debounce tick doesn't leave the peer
+        # banned again on restart.
+        self._maybe_save(force=True)
+        return True
 
     def manual_unban(self, address: str):
         """Manually unban a peer.
@@ -337,6 +452,11 @@ class PeerBanManager:
                 "banned_until": (
                     float(ps.banned_until) if ps.banned_until else None
                 ),
+                # Recorded peer version at last offense — drives
+                # clear_ban_on_version_change.  Persisted as a string;
+                # legacy rows without this key load as "" (which means
+                # "do not auto-clear" per the conservative default).
+                "peer_version": str(ps.peer_version or ""),
             }
         return out
 
@@ -433,6 +553,13 @@ class PeerBanManager:
                 first_seen = float(entry.get("first_seen", now))
                 bu_raw = entry.get("banned_until")
                 banned_until = float(bu_raw) if bu_raw else 0.0
+                # peer_version is a post-1.47.x addition — legacy rows
+                # have no key, in which case empty-string is the right
+                # default ("do not auto-clear" — see clear_ban_on_version_change).
+                peer_version_raw = entry.get("peer_version", "")
+                peer_version = (
+                    str(peer_version_raw) if peer_version_raw else ""
+                )
             except (TypeError, ValueError):
                 # A single bad row is not a reason to discard the
                 # whole file — silently skip it and keep going.
@@ -453,4 +580,5 @@ class PeerBanManager:
                 last_decay=now,
                 first_seen=first_seen,
                 offenses=[],
+                peer_version=peer_version,
             )

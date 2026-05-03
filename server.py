@@ -1130,6 +1130,16 @@ class Server(SharedRuntimeMixin):
             else None
         )
         self.ban_manager = PeerBanManager(persistence_path=_ban_path)
+        # Resolver: stamp ban entries with the peer's last-known
+        # software version so a later reconnect on a different binary
+        # can auto-clear a stale ban (see clear_ban_on_version_change
+        # and the 2026-04-25 incident notes in messagechain/network/ban.py).
+        def _peer_version_for(address: str) -> str:
+            p = self.peers.get(address)
+            if p is None:
+                return ""
+            return getattr(p, "peer_version", "") or ""
+        self.ban_manager.set_version_resolver(_peer_version_for)
         self.rate_limiter = PeerRateLimiter()
 
         # Sybil-resistant address manager (was previously dead code)
@@ -4122,11 +4132,19 @@ class Server(SharedRuntimeMixin):
         addr = writer.get_extra_info("peername")
         address = f"{addr[0]}:{addr[1]}"
 
-        # Reject banned peers
+        # Banned peer: do NOT close immediately — defer the rejection
+        # to the per-message check so a HANDSHAKE advertising a new
+        # software version can clear a stale ban (see
+        # PeerBanManager.clear_ban_on_version_change).  This is what
+        # unblocks the post-consensus-fix recovery path: prior to this
+        # change, a 24h ban earned during a buggy-binary stall stayed
+        # in force after the fix shipped, requiring manual ban_scores.json
+        # surgery to reconnect.
         if self.ban_manager.is_banned(address):
-            logger.info(f"Rejected banned peer {address}")
-            writer.close()
-            return
+            logger.info(
+                f"Banned peer {address} accepted for HANDSHAKE peek "
+                f"(will be dropped unless version has changed)"
+            )
 
         # H4: MAX_PEERS enforcement — reject if at capacity
         connected_count = sum(1 for p in self.peers.values() if p.is_connected)
@@ -4370,6 +4388,22 @@ class Server(SharedRuntimeMixin):
     async def _handle_p2p_message(self, msg: NetworkMessage, peer: Peer):
         peer.touch()
         address = peer.address
+
+        # Stale-ban clearance on version change — peek the HANDSHAKE
+        # version BEFORE the per-message ban check so a peer that
+        # shipped a fix can recover without operator intervention.
+        # See PeerBanManager.clear_ban_on_version_change.
+        if msg.msg_type == MessageType.HANDSHAKE:
+            try:
+                peer_reported_version = str(
+                    msg.payload.get("version", "") or ""
+                )
+            except AttributeError:
+                peer_reported_version = ""
+            if peer_reported_version:
+                self.ban_manager.clear_ban_on_version_change(
+                    address, peer_reported_version,
+                )
 
         # Ban check
         if self.ban_manager.is_banned(address):
