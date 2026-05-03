@@ -410,6 +410,69 @@ class TestStrictProposerValidation(unittest.TestCase):
             ok, reason = chain.add_block(block)
             self.assertTrue(ok, f"bootstrap must allow {proposer.entity_id.hex()[:8]}: {reason}")
 
+    def test_compute_post_state_root_mirrors_unstake_release(self):
+        """Regression for the mainnet height-1309 stall.
+
+        `_apply_block_state` calls `process_pending_unstakes(block_height)`,
+        which credits matured pending-unstake entries back to the
+        unstaker's spendable balance. `compute_post_state_root` (the
+        sim path that producer + validator pre-check both use to
+        derive the block's `state_root`) MUST mirror that — otherwise
+        the sim's state_root omits the +amount credit, the producer
+        commits the wrong root into the header, and `_append_block`'s
+        post-apply check (`compute_current_state_root` vs claimed
+        root) fails with "Invalid state_root — state commitment
+        mismatch" — wedging the chain forever at the release height.
+
+        Observed on mainnet at the 1309 release block (25M unstake
+        from validator-1 at block 301, release 1008 blocks later).
+        """
+        chain, consensus, entities = _make_chain_with_validators(2)
+
+        # Produce one block so the genesis is past us — propose_block
+        # at genesis takes a special bootstrap path we don't want here.
+        proposer = pick_selected_proposer(chain, entities)
+        block = chain.propose_block(consensus, proposer, [])
+        ok, reason = chain.add_block(block)
+        self.assertTrue(ok, reason)
+
+        parent = chain.get_latest_block()
+        target_height = parent.header.block_number + 1
+
+        # Inject a pending-unstake entry whose release_block is the
+        # next block's height. Skips the unstake-tx flow (which has
+        # min-stake / unbonding-period gates we'd have to traverse) —
+        # the bug is purely in the apply-vs-sim parity at the release
+        # block, not in how the entry got queued.
+        target_entity = entities[1].entity_id
+        chain.supply.balances.setdefault(target_entity, 0)
+        pre_balance = chain.supply.balances[target_entity]
+        release_amount = 25_000_000
+        chain.supply.pending_unstakes.setdefault(target_entity, []).append(
+            (release_amount, target_height),
+        )
+
+        proposer = pick_selected_proposer(chain, entities)
+        candidate = chain.propose_block(consensus, proposer, [])
+        ok, reason = chain.add_block(candidate)
+        self.assertTrue(
+            ok,
+            "compute_post_state_root must mirror process_pending_unstakes "
+            "at the release block; without this the chain wedges at the "
+            f"release height. add_block reason: {reason!r}",
+        )
+
+        # Confirm the release credit landed. Use >= rather than ==
+        # because attester rewards / other independent flows may
+        # incidentally add a small amount to the same entity in this
+        # block; the regression we care about is the +release_amount.
+        self.assertGreaterEqual(
+            chain.supply.balances[target_entity],
+            pre_balance + release_amount,
+            "pending unstake should have been credited to balance "
+            "at the release block",
+        )
+
     def test_early_timestamp_rejected_with_enforcement_on(self):
         """When ENFORCE_SLOT_TIMING is True, a block with a timestamp less
         than BLOCK_TIME_TARGET after the parent must be rejected.
