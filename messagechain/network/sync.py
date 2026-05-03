@@ -1347,13 +1347,54 @@ class ChainSyncer:
             self.state = SyncState.COMPLETE
             self.pending_headers = []
             self._inflight_by_peer.clear()
-            # Fork-resolution wrap-up: every competing block was applied
-            # via add_block, which routes through the fork-storage path
-            # and triggers _reorganize when the fork outweighs the
-            # canonical chain.  By the time we reach here all those
-            # decisions have been made, so just clear the resolution
-            # state.  The chain tip now reflects whichever fork won.
+            # Fork-resolution wrap-up.  Every competing block went
+            # through ``add_block`` which stores it (or reports
+            # "Block already known" if it was previously gossiped in
+            # during a brief reconnect) and triggers ``_reorganize``
+            # when the fork outweighs canonical via the stored
+            # cumulative weight.  Two reasons that auto-trigger can
+            # miss in practice:
+            #   1. Already-known blocks short-circuit in add_block
+            #      before recomputing fork weight, so a stale weight
+            #      from a prior buggy walk-back stays in chaindb and
+            #      the tip never wins the comparison.
+            #   2. Even fresh fork blocks compute weight via the
+            #      pre-1.51.1 bounded walk-back; on a long chain the
+            #      resulting value was always less than canonical's
+            #      genesis-accumulated value regardless of fork
+            #      length, so the reorg never fired.
+            # Force a recompute of the competing tip's weight using
+            # the corrected ``_compute_cumulative_weight`` and trigger
+            # ``_reorganize`` if it now outweighs canonical.  Catches
+            # both cases.
             if self._fork_resolution_active:
+                competing_tip_hash_hex = None
+                if self._fork_resolution_competing_headers:
+                    competing_tip_hash_hex = (
+                        self._fork_resolution_competing_headers[-1].get(
+                            "block_hash", "",
+                        )
+                    )
+                if competing_tip_hash_hex:
+                    competing_tip_hash = parse_hex(competing_tip_hash_hex)
+                    if competing_tip_hash is not None:
+                        reorged, reason = (
+                            self.blockchain
+                            .recompute_fork_tip_and_maybe_reorg(
+                                competing_tip_hash,
+                            )
+                        )
+                        if reorged:
+                            logger.info(
+                                f"Fork resolution: REORGED to competing "
+                                f"chain (peer={self._fork_resolution_peer}, "
+                                f"reason={reason})"
+                            )
+                        else:
+                            logger.info(
+                                f"Fork resolution: no reorg "
+                                f"(reason={reason})"
+                            )
                 logger.info(
                     f"Fork resolution complete: chain tip is now "
                     f"#{self.blockchain.height} "

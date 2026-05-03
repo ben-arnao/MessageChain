@@ -13278,6 +13278,16 @@ class Blockchain:
         makes the walk-back value disagree with the additive cumulative
         stored in fork_choice.tips — which under the lex-smaller-hash
         tiebreak can force a spurious reorg.
+
+        Bounded walk (depth cap MAX_REORG_DEPTH + 10) -- this is the
+        legacy behaviour kept for compatibility with the in-memory
+        snapshot tests and for the cheap "store this fork tip's weight
+        as we receive it" path used by ``add_block``.  Note this path
+        DOES NOT produce a value comparable to canonical's
+        accumulate-from-genesis cumulative once the chain is longer
+        than the cap; for actual reorg decisions (where the values
+        MUST be comparable), use ``_compute_full_cumulative_weight``
+        below.
         """
         weight = 0
         current = block
@@ -13303,6 +13313,157 @@ class Blockchain:
             current = self.get_block_by_hash(current.header.prev_hash)
             depth += 1
         return weight
+
+    def _compute_full_cumulative_weight(self, block: Block) -> int:
+        """Compute the from-genesis cumulative weight for ``block``,
+        comparable to the additive value canonical tips store in
+        ``fork_choice.tips``.
+
+        Differs from ``_compute_cumulative_weight`` (above) which is
+        bounded at MAX_REORG_DEPTH+10 ancestors.  That cap was a
+        latent bug in fork-vs-canonical weight comparisons: on any
+        chain longer than the cap, the canonical value was a sum of
+        N≈chain_length blocks while a fork's value was a sum of only
+        110 -- the canonical was effectively unbeatable regardless of
+        fork length.  Witnessed on validator-1 2026-05-03: v2's
+        competing chain at length 28 vs v1's canonical at length 1353
+        had stored fork weight 2.47B vs canonical 46.5B; the fork
+        should have won by ≈180M but lost by ≈44B because the fork
+        weight only summed the last 110 blocks.
+
+        This function walks back along ``prev_hash`` to genesis
+        without a depth cap, short-circuiting at any ancestor whose
+        cumulative weight is known via ``fork_choice.tips`` or a
+        prior memoization.  Walk is bounded by ``block_number+2`` so
+        it cannot run unbounded even on a corrupt chain.
+
+        Used by ``recompute_fork_tip_and_maybe_reorg`` -- the only
+        caller that needs the value to be canonical-comparable.
+        Other callers (notably ``add_block``'s fork-storage path)
+        keep using the legacy bounded function so existing
+        snapshot-consistency contracts hold.
+        """
+        if not hasattr(self, "_block_full_cumulative_weight"):
+            self._block_full_cumulative_weight: dict[bytes, int] = {}
+        cached = self._block_full_cumulative_weight.get(block.block_hash)
+        if cached is not None:
+            return cached
+
+        walk: list[Block] = []
+        current: Block | None = block
+        base_weight = 0
+        max_steps = block.header.block_number + 2
+        steps = 0
+        while current is not None and steps <= max_steps:
+            steps += 1
+            if current.header.prev_hash == b"\x00" * 32:
+                # Genesis -- cumulative weight is 0 by definition.
+                # Do NOT add genesis to the walk; the additive
+                # canonical path also doesn't credit genesis weight
+                # (initialize_genesis's add_tip uses 0).
+                base_weight = 0
+                break
+            parent_tip = self.fork_choice.tips.get(current.header.prev_hash)
+            if parent_tip is not None:
+                base_weight = parent_tip[1]
+                walk.append(current)
+                break
+            parent_cached = self._block_full_cumulative_weight.get(
+                current.header.prev_hash,
+            )
+            if parent_cached is not None:
+                base_weight = parent_cached
+                walk.append(current)
+                break
+            walk.append(current)
+            current = self.get_block_by_hash(current.header.prev_hash)
+
+        weight = base_weight
+        for blk in reversed(walk):
+            pinned = self._stake_snapshots.get(blk.header.block_number)
+            stakes = pinned if pinned is not None else self.supply.staked
+            weight += compute_block_stake_weight(blk, stakes)
+            self._block_full_cumulative_weight[blk.block_hash] = weight
+        return weight
+
+    def recompute_fork_tip_and_maybe_reorg(
+        self, candidate_tip_hash: bytes,
+    ) -> tuple[bool, str]:
+        """Force a fresh cumulative-weight recompute for the given
+        fork-tip block (which must already be stored locally) and
+        trigger ``_reorganize`` if it now outweighs the current
+        canonical tip.
+
+        Used by the fork-resolution sync path (1.51.1) to handle the
+        case where competing blocks were already in chaindb -- e.g.
+        accumulated via gossip during a brief reconnection -- but with
+        a STALE cumulative weight from before 1.51.1's fix to
+        ``_compute_cumulative_weight``.  The ``add_block`` path
+        short-circuits with "Block already known" for those, never
+        re-evaluating the fork tip's weight.  This method gives the
+        sync layer an explicit "recompute and maybe switch" hook.
+
+        Returns ``(reorged, reason)`` -- ``reorged=True`` when the
+        candidate was heavier and ``_reorganize`` succeeded.
+        """
+        block = self.get_block_by_hash(candidate_tip_hash)
+        if block is None:
+            return False, "candidate tip not stored locally"
+
+        # Bust the per-block weight cache for the candidate so the
+        # walk-back recomputes from scratch -- the cached value (if
+        # any) may have been written by an earlier call when the chain
+        # state differed.
+        if hasattr(self, "_block_full_cumulative_weight"):
+            self._block_full_cumulative_weight.pop(
+                candidate_tip_hash, None,
+            )
+
+        # Use the from-genesis function so the resulting value is
+        # comparable to the canonical tip's stored weight (which is
+        # accumulated from genesis via the additive add_block path).
+        # The legacy ``_compute_cumulative_weight`` is bounded at
+        # MAX_REORG_DEPTH+10 ancestors and would always understate
+        # for any chain longer than the cap.
+        new_weight = self._compute_full_cumulative_weight(block)
+        # Update fork_choice.tips and chaindb's chain_tips so the
+        # corrected value persists across restarts and is visible to
+        # subsequent best-tip selections.
+        self.fork_choice.add_tip(
+            candidate_tip_hash, block.header.block_number, new_weight,
+        )
+        if self.db is not None:
+            self.db.add_chain_tip(
+                candidate_tip_hash,
+                block.header.block_number,
+                new_weight,
+            )
+
+        best_tip = self.fork_choice.get_best_tip()
+        current_tip = self.get_latest_block()
+        if (
+            best_tip
+            and current_tip
+            and best_tip[0] != current_tip.block_hash
+        ):
+            logger.info(
+                "Fork-tip recompute: candidate %s at #%d weight=%d "
+                "outweighs current tip %s weight=%d — reorganizing",
+                candidate_tip_hash.hex()[:16],
+                block.header.block_number,
+                new_weight,
+                current_tip.block_hash.hex()[:16],
+                self.fork_choice.tips.get(
+                    current_tip.block_hash, (0, 0),
+                )[1],
+            )
+            return self._reorganize(
+                current_tip.block_hash, best_tip[0],
+            )
+        return False, (
+            f"candidate weight {new_weight} did not outweigh "
+            f"current tip; no reorg"
+        )
 
     def _reorganize(self, old_tip_hash: bytes, new_tip_hash: bytes) -> tuple[bool, str]:
         """
