@@ -4,6 +4,82 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.2] — 2026-05-03
+
+Hotfix.  The 1.51.1 fork-resolution path correctly walked back to find
+the common ancestor and downloaded the competing chain's blocks, but
+the eventual reorg never fired because ``add_block`` for already-known
+fork blocks short-circuits at "Block already known" without
+recomputing the fork tip's cumulative weight -- AND the legacy
+``_compute_cumulative_weight`` is bounded at MAX_REORG_DEPTH+10 (=110)
+ancestors, so on any chain longer than 110 blocks the canonical-tip's
+accumulated-from-genesis weight is mathematically unbeatable
+regardless of how heavy the competing fork actually is.  Witnessed
+on validator-1 immediately after the 1.51.1 deploy: fork-resolution
+located the correct ancestor at height 1333, collected v2's competing
+chain (28 blocks, 1334..1361), but every block came back as "Block
+already known" (they were gossiped in earlier) and the stored fork
+weight stayed at 2.47B (windowed-110-block sum) while v1's canonical
+tip stayed at 46.5B (genesis-accumulated).  The reorg never fired
+because 2.47B < 46.5B even though the correct comparison
+(genesis-accumulated for both) gives v2's fork ~46.7B vs v1's ~46.5B.
+
+### Root cause
+
+Two separate gaps that compose to break reorg:
+
+  1. ``add_block`` short-circuits at "Block already known" without
+     recomputing fork weights.  Blocks accumulated via gossip during
+     a brief reconnect carry stale stored weights.
+
+  2. ``_compute_cumulative_weight`` walks back at most
+     MAX_REORG_DEPTH+10 ancestors -- a security cap from the
+     fork-choice module that bounds reorg-check work on adversarial
+     inputs.  But the canonical-tip path stores cumulative weight via
+     additive ``new_weight = old_weight + block_weight`` accumulated
+     from genesis without bound.  These two values are not
+     comparable once the chain exceeds the cap.  Pre-1.51.2 every
+     fork-vs-canonical comparison on a long chain compared a
+     ``sum-of-110`` against a ``sum-of-N``.
+
+### Fixed
+
+- **New ``Blockchain._compute_full_cumulative_weight``** that walks
+  back from a block to genesis without a depth cap, short-circuiting
+  at any ancestor whose weight is already known via
+  ``fork_choice.tips`` or per-call memoization.  Bounded by
+  ``block_number+2`` so a corrupt chain can't cause unbounded
+  computation.  Returns a value comparable to the canonical-tip
+  additive cumulative.
+
+- **New ``Blockchain.recompute_fork_tip_and_maybe_reorg``** as the
+  hook the sync layer (and any other reorg-decision call site) uses
+  to:
+    a. force a fresh weight computation for a stored fork tip,
+    b. update both ``fork_choice.tips`` and the chaindb
+       ``chain_tips`` row with the corrected value,
+    c. trigger ``_reorganize`` if the candidate now outweighs the
+       canonical tip.
+
+  Bypasses the "Block already known" short-circuit in ``add_block``
+  and uses the unbounded weight function so the comparison is valid.
+
+- **``ChainSyncer`` calls ``recompute_fork_tip_and_maybe_reorg``** at
+  the end of fork-resolution block download (whether blocks were
+  freshly applied or already-known).  This is what makes the
+  downstream reorg actually fire.
+
+### Why ``_compute_cumulative_weight`` was left unchanged
+
+The legacy bounded function is still consulted by the ``add_block``
+fork-storage path that records fork tips as they arrive.  The
+existing ``test_fork_weight_snapshot_consistency.py`` tests pin its
+behaviour against pinned per-block stake snapshots; changing it
+broke the snapshot-consistency invariant those tests guard.  The
+new path is additive: a separate, unbounded function called only at
+reorg-decision time, leaving the cheap-store-on-receive path
+untouched.
+
 ## [1.51.1] — 2026-05-03
 
 Hotfix.  The 1.51.0 fork-resolution path correctly located the
