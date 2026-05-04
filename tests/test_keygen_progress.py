@@ -94,8 +94,10 @@ class TestCliProgressReporter(unittest.TestCase):
             for i in range(200):  # drive past the first tick + 1%
                 report(i)
         output = buf.getvalue()
-        # Rate as '<N>/s', ETA as '<...>' from _format_eta_seconds.
-        self.assertRegex(output, r"\[\d+/s, ETA ")
+        # Rate as '<N>/s' once warmup completes, or '?/s' while still
+        # calibrating; ETA as '<...>' from _format_eta_seconds.  Both
+        # rate forms must always appear bracketed alongside the ETA.
+        self.assertRegex(output, r"\[(\d+|\?)/s, ETA ")
 
     def test_final_tick_includes_newline(self):
         """After the last leaf the reporter must emit a newline so
@@ -114,6 +116,48 @@ class TestCliProgressReporter(unittest.TestCase):
         # The trailing newline is printed after the final carriage-
         # return frame -- the last character of output must be \n.
         self.assertTrue(output.endswith("\n"))
+
+    def test_first_tick_rate_is_question_mark_not_zero(self):
+        """Regression: while rate is unknown, render it as '?/s', not
+        '0/s'.  '0/s' reads like 'we're stuck'; '?' reads like 'still
+        calibrating' which is the truth.  This co-varies with the
+        ETA-? case below: when the rate window has no measurement
+        yet, both fields are unknown.
+        """
+        from messagechain.cli import _make_progress_reporter
+        report = _make_progress_reporter(100_000, label="Keygen")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            report(0)  # first tick only
+        first_frame = buf.getvalue()
+        self.assertIn("?/s", first_frame)
+        self.assertNotIn("0/s", first_frame)
+
+    def test_first_tick_does_not_print_inflated_eta(self):
+        """Regression: at the first reported tick the rate window has
+        no samples yet, so the ETA must render as '?', NOT as a
+        finite-but-huge number like '391h05m'.
+
+        The bug this guards against: averaging rate as
+        ``done/elapsed_since_start`` folds Python startup + first-leaf
+        overhead (~tens of seconds) into the very first sample,
+        producing an ETA on the order of hundreds of hours for a job
+        that actually finishes in ~25s.  A new user running
+        ``messagechain generate-key`` for the first time sees that
+        number and Ctrl-Cs.  The fix is to capture the rate-window
+        baseline AT the first reported tick, not at process start --
+        so the first frame prints '?' (honest: we don't know yet)
+        and subsequent frames reflect real throughput.
+        """
+        from messagechain.cli import _make_progress_reporter
+        report = _make_progress_reporter(100_000, label="Keygen")
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            report(0)  # first tick only
+        first_frame = buf.getvalue()
+        # The first frame must say 'ETA ?' -- not 'ETA 391h05m' or
+        # any other finite figure derived from a one-sample rate.
+        self.assertIn("ETA ?", first_frame)
 
     def test_early_cadence_is_denser_than_steady(self):
         """First 5% uses 1% increments; afterwards 5% increments.
