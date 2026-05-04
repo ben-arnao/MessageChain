@@ -299,6 +299,71 @@
   }
   details.faucet ol { padding-left: 1.2rem; }
   details.faucet ol li { margin: 0.25rem 0; }
+  /* Quickpost share most of the .faucet styling — same expanding
+     "primary CTA → input panel" shape — so the existing rules carry
+     over for the summary, body, button, and result text.  The few
+     bits that differ (multiline textarea, prominent disclaimer block)
+     get their own selectors below.  Keeping the same visual language
+     reinforces "this is one of the actions on this page", not "this
+     is a different surface". */
+  details.quickpost textarea {
+    width: 100%;
+    font: inherit;
+    font-size: 0.95rem;
+    padding: 0.45rem 0.55rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    color: var(--fg);
+    margin-top: 0.4rem;
+    resize: vertical;
+    min-height: 4.5rem;
+    line-height: 1.4;
+  }
+  details.quickpost .disclaimer {
+    margin-top: 0.6rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid color-mix(in srgb, #c33 60%, var(--border));
+    border-radius: 4px;
+    background: color-mix(in srgb, #c33 6%, var(--card));
+    color: color-mix(in srgb, #c33 70%, var(--fg));
+    font-size: 0.82rem;
+    line-height: 1.45;
+  }
+  @media (prefers-color-scheme: dark) {
+    details.quickpost .disclaimer {
+      color: color-mix(in srgb, #e88 80%, var(--fg));
+    }
+  }
+  details.quickpost .charcount {
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin-top: 0.25rem;
+    text-align: right;
+  }
+  details.quickpost .charcount.over { color: #c33; }
+  details.quickpost .keydl {
+    display: inline-block;
+    margin-top: 0.25rem;
+    padding: 0.4rem 0.7rem;
+    background: var(--accent);
+    color: var(--bg);
+    border-radius: 4px;
+    font-weight: 600;
+    text-decoration: none;
+    font-size: 0.85rem;
+  }
+  details.quickpost code.entity {
+    display: block;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    word-break: break-all;
+    font-size: 0.78rem;
+    background: var(--bg);
+    padding: 0.3rem 0.45rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    margin-top: 0.2rem;
+  }
   /* Chain-identity footer rendered on every page.  A paranoid
      visitor on a hostile network can compare the rendered
      genesis_hash here against their pinned copy (README ships
@@ -446,6 +511,57 @@
       <a class="cta" href="/gh/start">Send a message →</a>
       <span class="or">or</span>
       <a class="cta" href="/gh/node">Run a node, earn tokens →</a>
+    </li>
+    <li id="quickpostStep" class="choice" hidden>
+      <span class="or">or</span>
+      <details class="faucet quickpost" id="quickpostBox">
+        <summary>Just try it — we'll handle everything (less secure)</summary>
+        <div class="body">
+          <p>
+            One-click try-it path.  We generate a wallet on our server,
+            fund it from the faucet, post your message, and stream the
+            keyfile back to your browser.  Your message lands on-chain
+            in a few minutes, once the funding drip confirms.
+          </p>
+          <textarea id="quickpostMsg" rows="3"
+                    placeholder="What do you want to put on-chain forever?"
+                    aria-label="Message to post"></textarea>
+          <div class="charcount" id="quickpostCount">0 / 1024 bytes</div>
+          <div class="disclaimer">
+            <strong>Heads up:</strong> the private key is generated on
+            <em>our</em> server and held briefly in server memory before
+            we send it to your browser.  This is fine for trying it
+            out, but if you want a wallet you'll actually keep, generate
+            it offline via the
+            <a href="/gh/start">CLI walkthrough</a> instead.  Once you
+            download the keyfile it's a real account — treat it as
+            seriously as you want to.
+          </div>
+          <button id="quickpostBtn" type="button">Send message &amp; download keyfile</button>
+          <div id="quickpostProgress" class="progress" hidden></div>
+          <div id="quickpostResult" class="result"></div>
+          <div id="quickpostSuccess" class="success-block" hidden>
+            <div class="row">
+              <div class="label">Your new address (entity_id)</div>
+              <code class="entity" id="quickpostEntity"></code>
+            </div>
+            <div class="row">
+              <div class="label">Your private key — save this NOW</div>
+              <a id="quickpostDownload" class="keydl" download="messagechain-quickpost.key" href="#">
+                Download keyfile
+              </a>
+            </div>
+            <div class="row">
+              <div class="label">What happens next</div>
+              <ol>
+                <li>Funding drip is on its way (tx <code id="quickpostDripTx"></code>).</li>
+                <li>Once it lands (~10 min), our server posts your message automatically.</li>
+                <li>Refresh this page in a few minutes — you'll see your message in the feed below.</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </details>
     </li>
   </ol>
   <p class="status" id="status">Loading…</p>
@@ -704,6 +820,20 @@
   const faucetSuccess = document.getElementById("faucetSuccess");
   const faucetSuccessTx = document.getElementById("faucetSuccessTx");
 
+  // --- Quickpost (server-assisted "try it") UI elements ----------------
+  // Same hidden-by-default pattern as the faucet box: only render when
+  // the validator advertises quickpost_enabled=true on /v1/info.
+  const quickpostStep = document.getElementById("quickpostStep");
+  const quickpostBtn = document.getElementById("quickpostBtn");
+  const quickpostMsg = document.getElementById("quickpostMsg");
+  const quickpostCount = document.getElementById("quickpostCount");
+  const quickpostResult = document.getElementById("quickpostResult");
+  const quickpostProgress = document.getElementById("quickpostProgress");
+  const quickpostSuccess = document.getElementById("quickpostSuccess");
+  const quickpostEntity = document.getElementById("quickpostEntity");
+  const quickpostDripTx = document.getElementById("quickpostDripTx");
+  const quickpostDownload = document.getElementById("quickpostDownload");
+
   async function refreshFaucetInfo() {
     try {
       const r = await fetch("/v1/info", { cache: "no-store" });
@@ -715,8 +845,17 @@
       } else {
         faucetStep.hidden = true;
       }
+      // Quickpost toggles independently — operators can enable the
+      // faucet without quickpost (read-only "give me tokens" path)
+      // or both together.  Keep both checks distinct.
+      if (data.ok && data.quickpost_enabled) {
+        quickpostStep.hidden = false;
+      } else {
+        quickpostStep.hidden = true;
+      }
     } catch (e) {
       faucetStep.hidden = true;
+      quickpostStep.hidden = true;
     }
   }
 
@@ -961,6 +1100,150 @@ self.onmessage = function (e) {
     }
   }
   faucetBtn.addEventListener("click", requestDrip);
+
+  // --- Quickpost flow ---------------------------------------------------
+  // GET /quickpost/challenge -> solve PoW bound to sha256(message)
+  // -> POST /quickpost -> server returns {entity_id, private_key,
+  // drip_tx_hash}.  Browser displays the entity, builds a download
+  // blob for the keyfile, and tells the user the message will land in
+  // a few minutes once the drip confirms.
+  const QUICKPOST_MAX_BYTES = 1024;
+
+  function updateCharCount() {
+    const text = quickpostMsg.value || "";
+    const bytes = new TextEncoder().encode(text).length;
+    quickpostCount.textContent = bytes + " / " + QUICKPOST_MAX_BYTES + " bytes";
+    if (bytes > QUICKPOST_MAX_BYTES) {
+      quickpostCount.classList.add("over");
+    } else {
+      quickpostCount.classList.remove("over");
+    }
+  }
+  quickpostMsg.addEventListener("input", updateCharCount);
+
+  async function sha256Hex(bytes) {
+    const buf = await crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(buf))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+  }
+
+  async function requestQuickpost() {
+    const text = quickpostMsg.value || "";
+    const trimmed = text.trim();
+    if (!trimmed) {
+      quickpostResult.className = "result error";
+      quickpostResult.textContent = "Please type a message first.";
+      return;
+    }
+    const msgBytes = new TextEncoder().encode(text);
+    if (msgBytes.length > QUICKPOST_MAX_BYTES) {
+      quickpostResult.className = "result error";
+      quickpostResult.textContent =
+        "Message is " + msgBytes.length + " bytes UTF-8 (max " +
+        QUICKPOST_MAX_BYTES + ").";
+      return;
+    }
+    quickpostBtn.disabled = true;
+    quickpostResult.className = "result";
+    quickpostResult.textContent = "Requesting challenge…";
+    quickpostSuccess.hidden = true;
+    quickpostProgress.hidden = true;
+    try {
+      // Step 1: get a challenge.  Quickpost challenges are not bound
+      // to an address (the entity is generated server-side after
+      // PoW); the seed itself is the one-shot anti-replay gate.
+      const cresp = await fetch("/quickpost/challenge", { cache: "no-store" });
+      const cdata = await cresp.json().catch(() => ({}));
+      if (!cresp.ok || !cdata.ok) {
+        quickpostResult.className = "result error";
+        quickpostResult.textContent =
+          "Could not get challenge: " +
+          (cdata.error || ("HTTP " + cresp.status));
+        return;
+      }
+      // Step 2: solve PoW bound to sha256(message_utf8).  Reuse the
+      // existing worker; it takes a generic 32-byte "tail" as
+      // `addressHex`, which is exactly what we need.
+      const messageHashHex = await sha256Hex(msgBytes);
+      quickpostResult.textContent =
+        "Solving proof-of-work (~" +
+        Math.round(Math.pow(2, cdata.difficulty) / 1_000_000) +
+        "M sha256 tries on average)…";
+      quickpostProgress.hidden = false;
+      const sol = await solvePow(
+        cdata.seed, messageHashHex, cdata.difficulty,
+        (p) => {
+          quickpostProgress.textContent =
+            p.tries.toLocaleString() + " hashes (" +
+            Math.round(p.rate / 1000) + "k/s, " +
+            p.elapsedSec.toFixed(1) + "s)";
+        },
+      );
+      quickpostProgress.textContent =
+        "Solved in " + sol.tries.toLocaleString() + " tries.";
+      // Step 3: POST the message + (seed, nonce).
+      quickpostResult.textContent = "Generating wallet on server, dripping, queueing…";
+      const qresp = await fetch("/quickpost", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          challenge_seed: cdata.seed,
+          nonce: parseInt(sol.nonce, 10),
+        }),
+      });
+      const qdata = await qresp.json().catch(() => ({}));
+      if (qresp.ok && qdata.ok) {
+        quickpostResult.className = "result success";
+        quickpostResult.textContent =
+          "Wallet generated and funded — your message will land in ~10 min.";
+        quickpostEntity.textContent = qdata.entity_id;
+        quickpostDripTx.textContent = qdata.drip_tx_hash || "(pending)";
+        // Build the keyfile blob.  Format: raw 64-char hex on one line
+        // — matches the daemon-format the CLI's --wallet flag expects,
+        // so the user can drop this file straight into the CLI later
+        // if they decide to keep using this wallet.  No comments in
+        // the file itself; the on-page UI carries the disclaimer.
+        const blob = new Blob([qdata.private_key + "\n"], {
+          type: "text/plain",
+        });
+        const url = URL.createObjectURL(blob);
+        // Revoke any prior URL on this anchor so retries don't leak.
+        const oldUrl = quickpostDownload.dataset.objectUrl;
+        if (oldUrl) {
+          URL.revokeObjectURL(oldUrl);
+        }
+        quickpostDownload.href = url;
+        quickpostDownload.dataset.objectUrl = url;
+        // Filename includes the first chunk of the entity id so a user
+        // who quickposts twice gets two distinct files.
+        quickpostDownload.download =
+          "messagechain-" + qdata.entity_id.slice(0, 12) + ".key";
+        quickpostSuccess.hidden = false;
+        quickpostProgress.hidden = true;
+        // Soft-lock the textarea so the user doesn't accidentally
+        // re-submit the same message — they can re-open the box for
+        // a second post if they want.
+        quickpostMsg.value = "";
+        updateCharCount();
+      } else {
+        quickpostResult.className = "result error";
+        quickpostResult.textContent =
+          "Quickpost failed: " + (qdata.error || ("HTTP " + qresp.status));
+        quickpostSuccess.hidden = true;
+      }
+      refreshFaucetInfo();
+    } catch (e) {
+      quickpostResult.className = "result error";
+      quickpostResult.textContent = "Network error: " + e.message;
+    } finally {
+      quickpostBtn.disabled = false;
+    }
+  }
+  quickpostBtn.addEventListener("click", requestQuickpost);
+  updateCharCount();
+
   refreshFaucetInfo();
   refreshChainIdentityFooter();
 

@@ -86,12 +86,17 @@ _GITHUB_RUN_VALIDATOR_URL = (
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
 
-    def __init__(self, blockchain, faucet=None):
+    def __init__(self, blockchain, faucet=None, quickpost=None):
         self.blockchain = blockchain
         # Optional FaucetState (messagechain.network.faucet).  When
         # None the /faucet POST endpoint returns 405 and the public
         # feed remains read-only.
         self.faucet = faucet
+        # Optional QuickpostState (messagechain.network.quickpost).
+        # When None the /quickpost POST endpoint returns 405; the
+        # quickpost flow piggybacks on the faucet's wallet, so a
+        # validator without --faucet-keyfile cannot enable it.
+        self.quickpost = quickpost
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -209,9 +214,10 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
-        # The only POST route is the optional cold-start funding
-        # faucet.  Every other path returns 405 so the public feed
-        # surface stays read-only by default.
+        # POST routes: the optional cold-start funding faucet and the
+        # optional server-assisted /quickpost flow.  Every other path
+        # returns 405 so the public feed surface stays read-only by
+        # default.
         ctx = self.server._feed_context
         split = urlsplit(self.path)
         if split.path == "/faucet" and ctx.faucet is not None:
@@ -219,6 +225,12 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
                 self._send_text(429, "Too Many Requests")
                 return
             self._serve_faucet(ctx)
+            return
+        if split.path == "/quickpost" and ctx.quickpost is not None:
+            if not ctx.rate_limit_check(self._client_ip()):
+                self._send_text(429, "Too Many Requests")
+                return
+            self._serve_quickpost(ctx)
             return
         self._send_text(405, "Method Not Allowed")
 
@@ -287,6 +299,80 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         else:
             # 429 for rate-limit-style refusals so well-behaved
             # clients can detect/back-off; 400 for malformed input.
+            status = 400 if "must be" in result.error else 429
+            self._send_json(status, {
+                "ok": False,
+                "error": result.error,
+                "remaining_window": result.remaining_window,
+            })
+
+    def _serve_quickpost(self, ctx):
+        """POST /quickpost  body: {"message", "challenge_seed", "nonce"}.
+
+        Server-assisted "try it" flow: generates a fresh wallet on
+        behalf of the visitor, drips it from the faucet wallet, and
+        queues the message tx for submission once the drip confirms.
+        Returns the private key + entity id + drip tx hash; the visitor
+        downloads the keyfile from the response and gets a real on-chain
+        message a few minutes later (after the drip lands).
+
+        Explicitly a "try it" path — the keypair was generated on the
+        server.  The UI disclaimer + README direct serious users to
+        offline keygen.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            length = 0
+        # Cap body at 8 KB.  The message itself is <= 1024 bytes UTF-8
+        # plus minor JSON framing; anything larger is malformed.
+        if length < 0 or length > 8192:
+            self._send_json(400, {"ok": False, "error": "bad body length"})
+            return
+        try:
+            body = self.rfile.read(length) if length else b""
+            payload = json.loads(body or b"{}")
+        except (json.JSONDecodeError, OSError):
+            self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(400, {"ok": False, "error": "body must be a JSON object"})
+            return
+        message = payload.get("message", "")
+        if not isinstance(message, str):
+            self._send_json(400, {"ok": False, "error": "message must be a string"})
+            return
+        challenge_seed = payload.get("challenge_seed", "")
+        if not isinstance(challenge_seed, str):
+            self._send_json(400, {
+                "ok": False,
+                "error": "challenge_seed must be a hex string",
+            })
+            return
+        nonce_raw = payload.get("nonce")
+        if not isinstance(nonce_raw, int):
+            self._send_json(400, {
+                "ok": False,
+                "error": (
+                    "nonce must be an integer (PoW solution).  GET "
+                    "/quickpost/challenge first to obtain a challenge."
+                ),
+            })
+            return
+
+        result = ctx.quickpost.try_quickpost(
+            self._client_ip(), message,
+            challenge_seed_hex=challenge_seed, nonce=nonce_raw,
+        )
+        if result.ok:
+            self._send_json(200, {
+                "ok": True,
+                "entity_id": result.entity_id_hex,
+                "private_key": result.private_key_hex,
+                "drip_tx_hash": result.drip_tx_hash,
+                "remaining_window": result.remaining_window,
+            })
+        else:
             status = 400 if "must be" in result.error else 429
             self._send_json(status, {
                 "ok": False,
@@ -380,6 +466,9 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/faucet/challenge" and ctx.faucet is not None:
             self._serve_faucet_challenge(ctx, split.query)
             return
+        if path == "/quickpost/challenge" and ctx.quickpost is not None:
+            self._serve_quickpost_challenge(ctx)
+            return
         if path == "/beacon/scroll":
             # One-shot engagement beacon the homepage's JS fires when
             # the visitor scrolls past the initial fold. 204 + empty
@@ -393,6 +482,26 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             return
 
         self._send_text(404, "Not Found")
+
+    def _serve_quickpost_challenge(self, ctx):
+        """GET /quickpost/challenge: mint a fresh PoW challenge for the
+        server-assisted "try it" flow.
+
+        Returns {"ok", "seed", "difficulty", "expires_at", "ttl_sec"}.
+        Unlike /faucet/challenge there is no address binding: the
+        recipient does not exist at challenge time (the keypair is
+        generated by the server AFTER PoW verification).  The PoW is
+        bound at /quickpost time via sha256(seed || nonce_be_8 ||
+        sha256(message_utf8)) so a precomputed nonce cannot be
+        replayed for a different message.
+        """
+        ok, error, payload = ctx.quickpost.issue_challenge()
+        if not ok:
+            self._send_json(400, {"ok": False, "error": error})
+            return
+        body = {"ok": True}
+        body.update(payload)
+        self._send_json(200, body)
 
     def _serve_faucet_challenge(self, ctx, query: str):
         """GET /faucet/challenge?address=<hex>: mint a fresh PoW
@@ -558,6 +667,7 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             "height": height,
             "last_block_timestamp": latest_ts,
             "faucet_enabled": ctx.faucet is not None,
+            "quickpost_enabled": ctx.quickpost is not None,
         }
         if ctx.faucet is not None:
             # Surface the visible knobs so the UI can render an
@@ -626,11 +736,13 @@ class PublicFeedServer:
         port: int,
         bind: str = "127.0.0.1",
         faucet=None,
+        quickpost=None,
     ):
         self.blockchain = blockchain
         self.port = port
         self.bind = bind
         self.faucet = faucet
+        self.quickpost = quickpost
         self._httpd: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -641,7 +753,7 @@ class PublicFeedServer:
             (self.bind, self.port), _FeedHandler,
         )
         self._httpd._feed_context = _FeedHandlerContext(
-            self.blockchain, faucet=self.faucet,
+            self.blockchain, faucet=self.faucet, quickpost=self.quickpost,
         )
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

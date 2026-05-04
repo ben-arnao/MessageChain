@@ -5505,6 +5505,7 @@ async def run(args):
         )
 
     public_feed_server = None
+    quickpost_state = None
     if args.public_feed_port is not None:
         from messagechain.network.public_feed_server import PublicFeedServer
 
@@ -5515,11 +5516,24 @@ async def run(args):
         if getattr(args, "faucet_keyfile", None):
             faucet_state = _build_faucet(server, args.faucet_keyfile)
 
+        # Optional /quickpost server-assisted "try it" flow.  Piggybacks
+        # on the faucet wallet (drip + rate-limit) so it requires both
+        # --faucet-keyfile and --quickpost.  Disabled by default: the
+        # path is convenient but the keypair is generated on the server,
+        # so operators opt in explicitly.
+        if (
+            faucet_state is not None
+            and getattr(args, "quickpost", False)
+        ):
+            quickpost_state = _build_quickpost(server, faucet_state)
+            quickpost_state.start_watcher()
+
         public_feed_server = PublicFeedServer(
             blockchain=server.blockchain,
             port=args.public_feed_port,
             bind=args.public_feed_bind,
             faucet=faucet_state,
+            quickpost=quickpost_state,
         )
         public_feed_server.start()
         logger.info(
@@ -5531,6 +5545,11 @@ async def run(args):
                 "Faucet active: drip=%d window_cap=%d",
                 faucet_state.drip_amount,
                 faucet_state.window_cap,
+            )
+        if quickpost_state is not None:
+            logger.info(
+                "Quickpost active: server-assisted /quickpost (try-it path "
+                "— keys generated on server, drips share faucet window cap)",
             )
 
     # Graceful shutdown: SIGTERM from systemd `systemctl stop` must run
@@ -5568,6 +5587,8 @@ async def run(args):
         submission_server.stop()
     if public_feed_server is not None:
         public_feed_server.stop()
+    if quickpost_state is not None:
+        quickpost_state.stop_watcher()
     await server.stop()
 
 
@@ -5701,6 +5722,124 @@ def _build_faucet(server, keyfile_path: str):
     )
 
 
+def _build_quickpost(server, faucet_state):
+    """Wire the QuickpostState that backs POST /quickpost.
+
+    Operator-facing trade-off: this path generates a fresh keypair on
+    the server, drips it from the faucet wallet, and queues the
+    visitor's message for submission once the drip lands.  The
+    private key is briefly held in server memory before being streamed
+    back to the client; the UI disclaimer makes this clear and
+    directs serious users to offline keygen.
+
+    Drips count against the same per-window cap as the /faucet
+    endpoint, so enabling /quickpost does not double the operator's
+    exposure budget — it shares the existing one.
+    """
+    import os as _os
+    from messagechain.identity.identity import Entity
+    from messagechain.network.quickpost import (
+        QUICKPOST_TREE_HEIGHT,
+        QuickpostState,
+    )
+    from messagechain.core.transaction import (
+        create_transaction,
+        calculate_min_fee,
+        PREV_POINTER_STORED_BYTES,
+        SENDER_PUBKEY_STORED_BYTES,
+    )
+    from messagechain.core.compression import encode_payload
+    from messagechain.config import (
+        FEE_INCLUDES_SIGNATURE_HEIGHT,
+        WOTS_KEY_CHAINS,
+    )
+
+    # Pure-function signature-size estimate (mirrors cli._estimate_signature_size).
+    # Inlined here so this factory does not depend on the CLI module.
+    def _est_sig_size(keypair) -> int:
+        _HASH = 32
+        return (
+            2 + WOTS_KEY_CHAINS * _HASH
+            + 4
+            + 1 + keypair.height * _HASH
+            + _HASH + _HASH
+            + 1
+        )
+
+    chain = server.blockchain
+
+    def keygen():
+        private_key = _os.urandom(32)
+        # No on-disk cache for the ephemeral demo wallet — the keypair
+        # only needs to live long enough to sign one message tx, and
+        # we don't have a stable identity for cache lookup anyway
+        # (the entity_id is freshly randomized).
+        entity = Entity.create(
+            private_key, tree_height=QUICKPOST_TREE_HEIGHT,
+        )
+        return entity, private_key
+
+    def submit_message(entity, message: str) -> str:
+        # Brand-new entity: nonce=0, leaf=0, include_pubkey=True so the
+        # first send installs the pubkey via Tier 11 receive-to-exist.
+        height = chain.height
+        tip_height = max(height - 1, 0)
+        target_height = tip_height + 1
+
+        msg_bytes = message.encode("utf-8")
+        stored, _ = encode_payload(msg_bytes)
+        # v3 with sender_pubkey: charges PREV_POINTER_STORED_BYTES (the
+        # presence-flag-only path is +1B; we charge the full slot since
+        # create_transaction lays out v3 with the prev block always
+        # present) plus SENDER_PUBKEY_STORED_BYTES.
+        prev_overhead = 1 + SENDER_PUBKEY_STORED_BYTES
+        if target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
+            sig_bytes_len = _est_sig_size(entity.keypair)
+            local_min = calculate_min_fee(
+                stored,
+                signature_bytes=sig_bytes_len,
+                current_height=target_height,
+                prev_bytes=prev_overhead,
+            )
+        else:
+            local_min = calculate_min_fee(
+                stored,
+                current_height=target_height,
+                prev_bytes=prev_overhead,
+            )
+        # Pad slightly above the floor so a same-block fee adjustment
+        # does not bounce the tx.  The fresh entity has FAUCET_DRIP
+        # tokens after the drip confirms; spending up to ~150 of those
+        # on the message fee leaves the wallet with enough headroom
+        # for at most one or two more sends if the user wants to play.
+        fee = local_min + 10
+
+        tx = create_transaction(
+            entity, message, fee=fee, nonce=0,
+            current_height=target_height,
+            include_pubkey=True,
+        )
+        resp = server._rpc_submit_transaction({
+            "transaction": tx.serialize(),
+        })
+        if not resp.get("ok"):
+            raise RuntimeError(resp.get("error", "submit failed"))
+        return resp["result"]["tx_hash"]
+
+    def is_drip_confirmed(entity_id: bytes) -> bool:
+        try:
+            return chain.supply.get_balance(entity_id) > 0
+        except Exception:
+            return False
+
+    return QuickpostState(
+        faucet=faucet_state,
+        keygen_callback=keygen,
+        submit_message_callback=submit_message,
+        is_drip_confirmed=is_drip_confirmed,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="MessageChain Server")
     parser.add_argument("--port", type=int, default=9333, help="P2P port (default: 9333)")
@@ -5805,6 +5944,25 @@ def main():
              "operator-funded drips to fresh user wallets.  "
              "Generate with scripts/generate_faucet_key.py.  See "
              "messagechain/network/faucet.py for rate-limit details.",
+    )
+    # --- Server-assisted "try it" flow (opt-in, requires --faucet-keyfile) ---
+    # Off by default.  When set together with --faucet-keyfile, the
+    # public feed exposes GET /quickpost/challenge and POST /quickpost
+    # for a one-click "try MessageChain in the browser" path:
+    # generates an ephemeral keypair on the visitor's behalf, drips it
+    # from the faucet wallet, queues the visitor's message for
+    # submission once the drip lands, and streams the keyfile back as
+    # the response payload.  Drips count against the same per-window
+    # cap as the /faucet endpoint.  The server briefly holds the
+    # private key in memory before responding — the UI disclaimer +
+    # README direct serious users to offline keygen.
+    parser.add_argument(
+        "--quickpost", action="store_true", default=False,
+        help="Enable POST /quickpost (server-assisted 'try it' flow).  "
+             "Requires --faucet-keyfile.  Generates an ephemeral wallet "
+             "on the server, drips it, and queues the visitor's message "
+             "for submission once the drip confirms.  See "
+             "messagechain/network/quickpost.py.",
     )
     args = parser.parse_args()
 

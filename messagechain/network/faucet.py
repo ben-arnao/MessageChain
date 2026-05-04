@@ -463,62 +463,100 @@ class FaucetState:
             # requester needs to do new PoW for the next attempt).
             del self._pending_challenges[challenge_seed]
 
-            last = self._ip_last_drip.get(cidr)
-            if last is not None and now - last < self.ip_cooldown_sec:
-                wait_min = (self.ip_cooldown_sec - (now - last)) / 60.0
-                return FaucetDripResult(
-                    ok=False,
-                    error=(
-                        f"this network ({cidr}) already received a drip "
-                        f"recently; try again in {wait_min:.1f} min"
-                    ),
-                    remaining_window=max(0, self.window_cap - self._drips_window),
-                )
+            return self._drip_locked(cidr, recipient_bytes, recipient_hex)
 
-            if self._drips_window >= self.window_cap:
-                return FaucetDripResult(
-                    ok=False,
-                    error=(
-                        f"faucet window cap ({self.window_cap} drips per "
-                        f"{self.window_sec // 60} min) reached; resets "
-                        f"shortly"
-                    ),
-                    remaining_window=0,
-                )
+    def drip_for_quickpost(
+        self, client_ip: str, recipient_bytes: bytes,
+    ) -> FaucetDripResult:
+        """Drip entry that bypasses the faucet's own PoW gate.
 
-            # Build + submit INSIDE the lock so a concurrent request
-            # cannot race the cap counter between check and commit.
-            try:
-                tx_dict = self.build_tx_callback(recipient_bytes)
-            except Exception as e:
-                logger.exception("faucet build_tx failed")
-                return FaucetDripResult(
-                    ok=False,
-                    error=f"faucet wallet build failed: {e}",
-                    remaining_window=max(0, self.window_cap - self._drips_window),
-                )
-
-            ok, reason = self.submit_callback(tx_dict)
-            if not ok:
-                logger.warning("faucet submit rejected: %s", reason)
-                return FaucetDripResult(
-                    ok=False,
-                    error=f"chain rejected drip tx: {reason}",
-                    remaining_window=max(0, self.window_cap - self._drips_window),
-                )
-
-            # Success path: commit state.
-            self._ip_last_drip[cidr] = now
-            self._drips_window += 1
-            tx_hash = tx_dict.get("tx_hash", "")
-            logger.info(
-                "faucet drip: %s -> %s amount=%d (window=%d/%d)",
-                cidr, recipient_hex[:16], self.drip_amount,
-                self._drips_window, self.window_cap,
-            )
+        Used by the /quickpost server-assisted flow: the QuickpostState
+        has already verified its own PoW (bound to the message hash, not
+        the recipient address — the user's browser cannot know the
+        recipient address, since the keypair is generated server-side
+        AFTER PoW).  The IP cooldown + window cap are still applied so
+        quickpost shares the same per-window operator-exposure budget
+        as the faucet itself.
+        """
+        if not isinstance(recipient_bytes, (bytes, bytearray)) or len(recipient_bytes) != 32:
             return FaucetDripResult(
-                ok=True,
-                tx_hash=tx_hash,
-                amount=self.drip_amount,
+                ok=False, error="recipient_bytes must be 32 bytes",
+            )
+        cidr = _ip_cidr_24(client_ip)
+        with self._lock:
+            now = time.time()
+            self._reset_window_if_rolled_locked(now)
+            return self._drip_locked(cidr, bytes(recipient_bytes), recipient_bytes.hex())
+
+    def _drip_locked(
+        self,
+        cidr: str,
+        recipient_bytes: bytes,
+        recipient_hex: str,
+    ) -> FaucetDripResult:
+        """IP cooldown + window cap + build + submit.  Caller MUST hold _lock.
+
+        Extracted from try_drip so /quickpost (which runs its own PoW
+        gate bound to the message hash) can share the same rate-limit
+        and tx-build/submit path without duplicating logic.
+        """
+        now = time.time()
+        last = self._ip_last_drip.get(cidr)
+        if last is not None and now - last < self.ip_cooldown_sec:
+            wait_min = (self.ip_cooldown_sec - (now - last)) / 60.0
+            return FaucetDripResult(
+                ok=False,
+                error=(
+                    f"this network ({cidr}) already received a drip "
+                    f"recently; try again in {wait_min:.1f} min"
+                ),
                 remaining_window=max(0, self.window_cap - self._drips_window),
             )
+
+        if self._drips_window >= self.window_cap:
+            return FaucetDripResult(
+                ok=False,
+                error=(
+                    f"faucet window cap ({self.window_cap} drips per "
+                    f"{self.window_sec // 60} min) reached; resets "
+                    f"shortly"
+                ),
+                remaining_window=0,
+            )
+
+        # Build + submit INSIDE the lock so a concurrent request
+        # cannot race the cap counter between check and commit.
+        try:
+            tx_dict = self.build_tx_callback(recipient_bytes)
+        except Exception as e:
+            logger.exception("faucet build_tx failed")
+            return FaucetDripResult(
+                ok=False,
+                error=f"faucet wallet build failed: {e}",
+                remaining_window=max(0, self.window_cap - self._drips_window),
+            )
+
+        ok, reason = self.submit_callback(tx_dict)
+        if not ok:
+            logger.warning("faucet submit rejected: %s", reason)
+            return FaucetDripResult(
+                ok=False,
+                error=f"chain rejected drip tx: {reason}",
+                remaining_window=max(0, self.window_cap - self._drips_window),
+            )
+
+        # Success path: commit state.
+        self._ip_last_drip[cidr] = now
+        self._drips_window += 1
+        tx_hash = tx_dict.get("tx_hash", "")
+        logger.info(
+            "faucet drip: %s -> %s amount=%d (window=%d/%d)",
+            cidr, recipient_hex[:16], self.drip_amount,
+            self._drips_window, self.window_cap,
+        )
+        return FaucetDripResult(
+            ok=True,
+            tx_hash=tx_hash,
+            amount=self.drip_amount,
+            remaining_window=max(0, self.window_cap - self._drips_window),
+        )
