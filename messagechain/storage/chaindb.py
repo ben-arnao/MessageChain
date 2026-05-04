@@ -1317,6 +1317,28 @@ class ChainDB:
         )
         return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
 
+    def clear_all_last_active_heights(self) -> None:
+        """Truncate the dormancy mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush
+        (post-reorg / post-reset replay) to wipe orphan rows that the
+        in-memory ``last_active_heights`` no longer carries.  Same
+        shape as ``clear_all_reaction_choices`` (round-13 fix for the
+        successful-reorg twin of the round-12 reaction_choices
+        mirror leak): the per-entity ``set_last_active_height`` upsert
+        loop that follows re-emits every live entry, so wiping the
+        table inside the same SQL transaction reconciles the disk
+        state to the canonical-replay in-memory dict.
+
+        Without this truncate-then-re-insert, a successful reorg
+        leaves losing-fork bumps on disk indefinitely; the next cold
+        restart rehydrates them, mixes them into
+        ``compute_active_supply`` / ``compute_dormancy_issuance``,
+        and the restarted node silently forks at the next mint.
+        """
+        self._conn.execute("DELETE FROM entity_last_active")
+        self._maybe_commit()
+
     # ── State: Pending Unstakes ──────────────────────────────────
     # Unbonding queue per validator.  Tokens here have been debited
     # from `staked` but are not yet in `balances`; they sit for
@@ -2562,6 +2584,22 @@ class ChainDB:
             # full reaction_choices map AND restore wipes+re-inserts
             # the table inside the same SQL transaction.
             "reaction_choices": self.get_all_reaction_choices(),
+            # Tier-47 dormancy mirror table (entity_last_active).  Same
+            # mirror-leak defect class as the four prior fixes (round-2
+            # entity_id_to_index, round-4 key_rotation_last_height,
+            # round-7 receipt_subtree_roots, round-12 reaction_choices).
+            # Pre-fix `restore_state_snapshot` did NOT wipe this table
+            # at all -- a successful reorg across a block carrying any
+            # SupplyTracker.bump_active call left the losing-fork bump
+            # permanently on disk.  Cold restart of any node that
+            # processed the losing fork rehydrates the orphan row,
+            # mixes it into compute_active_supply / compute_dormancy_
+            # issuance, and produces a divergent state root vs. the
+            # warm cluster -> silent consensus fork on the next mint.
+            # Snapshot now carries the full last_active_heights map AND
+            # restore wipes+re-inserts the table inside the same SQL
+            # transaction.
+            "last_active_heights": self.get_all_last_active_heights(),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -2665,6 +2703,23 @@ class ChainDB:
             # already wiped above.  Re-inserts happen after the
             # canonical replays restore the supply state below.
             conn.execute("DELETE FROM reaction_choices")
+            # Tier-47 dormancy mirror (entity_last_active) joins the
+            # wipe list.  Each SupplyTracker.bump_active() landed on
+            # the losing fork mirrors a row to disk via
+            # set_last_active_height; on successful reorg the in-memory
+            # last_active_heights is rebuilt from the snapshot but the
+            # disk rows for losing-fork bumps survive without this
+            # DELETE.  The next cold restart rehydrates the orphan
+            # heights (`_load_from_db` calls
+            # `get_all_last_active_heights`),
+            # `compute_active_supply` / `compute_dormancy_issuance`
+            # mix them in, and the restarted node silently forks at
+            # the next mint whose controller output the warm cluster
+            # computes WITHOUT those entries.  Same defect class as
+            # the four mirror tables already wiped above.  Re-inserts
+            # happen after the canonical replays restore the supply
+            # state below.
+            conn.execute("DELETE FROM entity_last_active")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -2789,6 +2844,23 @@ class ChainDB:
                 conn.execute(
                     "INSERT OR REPLACE INTO key_rotation_last_height "
                     "(entity_id, block_height) VALUES (?, ?)",
+                    (eid, int(h)),
+                )
+            # Tier-47 dormancy mirror re-insert.  Snapshot key is
+            # entity_id -> last_active_height; the chaindb mirror
+            # round-trip rebuild reads back via
+            # `get_all_last_active_heights` so the on-disk shape and
+            # the in-memory dict (`SupplyTracker.last_active_heights`)
+            # stay in lockstep.  Default-empty `.get(...)` keeps
+            # legacy snapshot dicts (taken before this field joined
+            # save_state_snapshot) restoring cleanly — they leave the
+            # table empty, matching the pre-fork pristine state.
+            for eid, h in snapshot.get(
+                "last_active_heights", {},
+            ).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO entity_last_active "
+                    "(entity_id, last_active_height) VALUES (?, ?)",
                     (eid, int(h)),
                 )
 
