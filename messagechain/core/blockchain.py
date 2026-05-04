@@ -1661,7 +1661,32 @@ class Blockchain:
             # uniform with balances / staked.  ``hasattr`` gate keeps
             # legacy chain.db files (no entity_last_active table)
             # loadable under the new binary.
+            #
+            # Mirror-leak guard (same defect class as round-13's
+            # `clear_all_reaction_choices` for the successful-reorg
+            # twin of the round-12 reaction_choices fix): on a full
+            # flush (post `_reset_state`, post-successful-reorg) the
+            # dirty-only INSERT-OR-REPLACE loop below would skip rows
+            # that exist only on a rolled-back fork — the canonical
+            # in-memory dict doesn't include those entity_ids, so the
+            # upsert never touches them and the orphan rows survive.
+            # Cold restart of any node that processed the losing fork
+            # then rehydrates the orphan via
+            # `get_all_last_active_heights`, mixes it into
+            # `compute_active_supply` / `compute_dormancy_issuance`,
+            # and silently forks off peers at the next mint.
+            # `restore_state_snapshot`'s wipe+re-insert covers the
+            # FAILED-reorg rollback path; this closes the SUCCESSFUL-
+            # reorg twin.  Wipe the table inside the same SQL
+            # transaction (atomic with the re-INSERTs that follow)
+            # and let the upsert loop re-emit every entry from the
+            # canonical-replay in-memory state.
             if hasattr(self.db, "set_last_active_height"):
+                if (
+                    full_flush
+                    and hasattr(self.db, "clear_all_last_active_heights")
+                ):
+                    self.db.clear_all_last_active_heights()
                 for eid, lah in _scoped(self.supply.last_active_heights):
                     self.db.set_last_active_height(eid, lah)
             for eid, nonce in _scoped(self.nonces):
