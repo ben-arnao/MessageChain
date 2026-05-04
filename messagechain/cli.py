@@ -1698,7 +1698,18 @@ def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
     # "next" starts at 1 so the operator sees a ping as soon as
     # the first leaf finishes -- this is the biggest anxiety
     # reducer; first tick arrives within seconds even on a weak VM.
-    state = {"next": 1, "done": 0, "start": _time.monotonic()}
+    # base_t / base_done are the rate-window baseline: captured at the
+    # FIRST reported tick (not at start) so Python startup / module
+    # import / first-leaf overhead don't get folded into the rate
+    # average.  Without this, the very first ETA prints something like
+    # "391h05m" -- a multi-hundred-hour figure for a ~25s job -- because
+    # the elapsed includes ~20s of one-time setup against ~1 leaf done.
+    state = {
+        "next": 1,
+        "done": 0,
+        "base_t": None,
+        "base_done": 0,
+    }
 
     def report(_leaf_index: int):
         state["done"] += 1
@@ -1706,8 +1717,18 @@ def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
         if done < state["next"] and done != total_leaves:
             return
 
-        elapsed = _time.monotonic() - state["start"]
-        rate = done / elapsed if elapsed > 0 else 0.0
+        now = _time.monotonic()
+        if state["base_t"] is None:
+            # First reported tick: capture the post-startup baseline
+            # but don't print an ETA yet -- we have no rate sample.
+            state["base_t"] = now
+            state["base_done"] = done
+            elapsed_window = 0.0
+            rate = 0.0
+        else:
+            elapsed_window = now - state["base_t"]
+            window_done = done - state["base_done"]
+            rate = window_done / elapsed_window if elapsed_window > 0 else 0.0
         remaining = total_leaves - done
         eta_sec = remaining / rate if rate > 0 else float("inf")
         pct = 100.0 * done / total_leaves
@@ -1715,10 +1736,15 @@ def _make_progress_reporter(total_leaves: int, label: str = "Generating key"):
         # Trailing spaces pad over the previous line in case a
         # longer ETA string ("1h02m") was overwritten by a shorter
         # one ("8s"); without this the stale tail lingers on screen.
+        # Rate shows '?' rather than '0' until we have a reliable
+        # sample -- '0/s' reads as 'stuck' to a first-time user, '?'
+        # reads as 'still calibrating'.  The two co-vary: when rate
+        # is unknown the ETA is unknown too.
+        rate_str = f"{rate:.0f}/s" if rate > 0 else "?/s"
         print(
             f"\r{label}: {pct:5.1f}% "
             f"({done:,}/{total_leaves:,} leaves) "
-            f"[{rate:.0f}/s, ETA {_format_eta_seconds(eta_sec)}]     ",
+            f"[{rate_str}, ETA {_format_eta_seconds(eta_sec)}]     ",
             end="",
             file=sys.stderr,
             flush=True,
