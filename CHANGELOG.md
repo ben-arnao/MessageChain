@@ -4,6 +4,75 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.51.4] — 2026-05-03
+
+Hotfix.  The 1.51.3 reorg-fired-correctly fix exposed a pre-existing
+defect in ``Blockchain._reorganize``: the replay path corrupts supply
+state on any chain that uses genesis allocations.
+
+### Root cause
+
+``_reorganize`` does ``_reset_state()`` (which creates a fresh
+``SupplyTracker`` with empty balances/staked) followed by a replay
+loop ``for blk in self.chain: if blk.header.block_number > 0:
+self._apply_block_state(blk)`` that skips block 0.  Genesis
+allocations (founder 100M / treasury 40M / 95M founder stake) are
+applied directly in ``initialize_genesis`` /
+``_apply_mainnet_genesis_state`` -- NOT inside
+``_apply_block_state(genesis)`` -- so the replay produces a chain
+with empty initial balances.  Subsequent blocks then operate on
+nothing: the founder's stake reads as 0, attestation weights
+collapse, the treasury rebase at TREASURY_REBASE_HEIGHT silently
+fails (treasury empty), and the resulting supply state diverges from
+canonical by the genesis-allocation amount.
+
+Witnessed in prod 2026-05-03 immediately after 1.51.3 deploy:
+validator-1's first-ever successful reorg corrupted its supply state.
+``total_supply`` jumped from 107M (correct, post-rebase) to 140M
+(GENESIS_SUPPLY baseline, no rebase applied).  Balances summed to
+**negative 15.5M** because subsequent blocks burned/credited against
+the empty post-reset balance map.  v1 could no longer apply v2's
+blocks (``"int too large to convert"`` deep in attestation
+processing).  Recovery required a filesystem ``chain.db`` copy from
+healthy v2.
+
+Why this didn't bite earlier: ``_reorganize`` had never fired on a
+production chain before -- the IBD lacked the fork-resolution
+walk-back path (fixed in 1.51.0-1.51.3), so no reorg ever completed.
+The 1.51.3 fix was the first time ``_reorganize`` actually ran on a
+long chain in prod.
+
+### Fixed
+
+- **Extracted ``Blockchain._apply_mainnet_genesis_supply_state``**
+  from ``_apply_mainnet_genesis_state`` -- the same identity /
+  balance / stake / snapshot mutations, but WITHOUT
+  ``self.chain.append(block)``, ``fork_choice.add_tip``,
+  ``db.store_block``, or orphan-drain.  These are the wrapper's job;
+  the helper is a pure state mutator that reorg can call after
+  ``_reset_state`` to restore genesis allocations before the
+  block-1+ replay loop.  ``_apply_mainnet_genesis_state`` now
+  delegates to the helper for the supply-state portion.
+
+- **``_reorganize`` calls the helper after ``_reset_state``** for
+  mainnet chains (PINNED_GENESIS_HASH == _MAINNET_GENESIS_HASH).
+  Devnet / test chains use ``initialize_genesis(allocation_table=...)``
+  whose allocation_table isn't persisted to chaindb -- a known
+  limitation of devnet reorgs, logged at WARNING when the path is
+  hit.  Production reorgs now restore genesis state correctly.
+
+### Tests
+
+  - ``test_reorg_replay_genesis_restore.py``:
+    * helper restores founder 5M liquid + treasury 40M + founder 95M
+      stake on a fresh SupplyTracker without touching chain/fork_choice.
+    * full-replay simulation: ``_reset_state`` then helper restores
+      pre-reorg founder/treasury balances + stake.
+    * post-restore conservation: balances + staked == genesis
+      allocation total (no negative balances, no orphan supply).
+
+  All 4948 tests pass on the worktree.
+
 ## [1.51.3] — 2026-05-03
 
 Hotfix.  The 1.51.2 fork-resolution path correctly walked back, found
