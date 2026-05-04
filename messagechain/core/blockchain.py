@@ -1159,6 +1159,120 @@ class Blockchain:
         # right commitment without a full rebuild on every block.
         self._rebuild_state_tree()
 
+        # Snapshot-on-load (1.52.0).  The field-by-field rehydration
+        # above covers the canonical chaindb tables (balances, staked,
+        # nonces, public_keys, etc.), but several consensus-critical
+        # in-memory accumulators -- _bootstrap_ratchet,
+        # validator_archive_misses, validator_first_active_block,
+        # validator_archive_success_streak, attester_coverage_misses,
+        # archive_active_snapshot, _immature_rewards, _escrow,
+        # seed_initial_stakes -- are NOT in their own chaindb tables
+        # and would otherwise come back as empty defaults.  Apply paths
+        # read those values, so a freshly-loaded node and a long-
+        # running node compute different state_roots on the next
+        # received block.  The 1.50.0-1.51.4 release sequence was
+        # entirely caused by this defect class -- each fix was for one
+        # specific accumulator; this is the structural fix.
+        #
+        # The snapshot blob persisted by ``_persist_state_snapshot``
+        # at the end of every block apply contains all of those
+        # fields (via the canonical ``serialize_state`` /
+        # ``encode_snapshot`` path used by state-sync).  Decoding +
+        # installing it here gives cold-restart the exact in-memory
+        # state a long-running node would have.
+        if (
+            self.chain
+            and self.db is not None
+            and hasattr(self.db, "get_state_snapshot")
+        ):
+            latest_height = self.chain[-1].header.block_number
+            blob = self.db.get_state_snapshot(latest_height)
+            if blob is not None:
+                try:
+                    import pickle
+                    snap = pickle.loads(blob)
+                    # ``_restore_memory_snapshot`` is the symmetric
+                    # loader for ``_snapshot_memory_state`` (the
+                    # serializer used by ``_persist_state_snapshot``).
+                    # It rewrites per-entity dicts AND every in-memory
+                    # accumulator (bootstrap_ratchet,
+                    # validator_archive_misses, _immature_rewards,
+                    # _escrow, archive_active_snapshot, ...) -- the
+                    # exact set 1.50-1.51.4 incrementally tried to
+                    # patch one at a time.
+                    self._restore_memory_snapshot(snap)
+                    self._rebuild_state_tree()
+                    logger.info(
+                        "snapshot-on-load: restored full in-memory "
+                        "state from snapshot at block #%d (covers "
+                        "validator_archive_misses, _bootstrap_ratchet, "
+                        "_immature_rewards, _escrow, etc. that aren't "
+                        "in their own chaindb tables)",
+                        latest_height,
+                    )
+                except Exception:
+                    logger.exception(
+                        "snapshot-on-load failed at block #%d; "
+                        "continuing with field-by-field rehydration "
+                        "only -- in-memory accumulators will start "
+                        "at empty defaults and the chain may produce "
+                        "divergent state_roots on next received "
+                        "block.  Investigate the snapshot bytes.",
+                        latest_height,
+                    )
+            else:
+                # Legacy chain.db without snapshot rows (any release
+                # before 1.52.0 wouldn't have populated them).  Log
+                # at WARNING so operators know the cold-restart is
+                # using the legacy path.  After one block apply
+                # post-upgrade a snapshot row is written and
+                # subsequent restarts use the snapshot path.
+                logger.warning(
+                    "no state-snapshot row at block #%d -- using "
+                    "legacy field-by-field load.  After the next "
+                    "block apply a snapshot row will be written and "
+                    "subsequent restarts will use snapshot-on-load.",
+                    latest_height,
+                )
+
+        # Load-time invariant (1.52.0).  After all rehydration paths,
+        # the per-entity state_root computed from the loaded dicts MUST
+        # equal the latest block's stored header.state_root.  If it
+        # doesn't, the load was incomplete -- some consensus-critical
+        # field is missing from chaindb AND from the snapshot.  Fail
+        # LOUDLY here at startup rather than silently producing
+        # divergent state_roots on the next received block (which is
+        # how every bug from 1.50-1.51.4 manifested).
+        #
+        # Skipped on the bootstrap-from-checkpoint path (chain has a
+        # checkpoint block as its tip whose header.state_root is the
+        # snapshot's commitment, not the prior chain's progression --
+        # bootstrap_from_checkpoint asserts this separately).
+        if self.chain:
+            latest_block = self.chain[-1]
+            latest_header_root = latest_block.header.state_root
+            if latest_header_root and latest_header_root != b"\x00" * 32:
+                actual_root = self.compute_current_state_root()
+                if actual_root != latest_header_root:
+                    raise ChainIntegrityError(
+                        f"Chain load invariant failed at block "
+                        f"#{latest_block.header.block_number}: "
+                        f"computed state_root "
+                        f"{actual_root.hex()[:16]}... does not match "
+                        f"stored header state_root "
+                        f"{latest_header_root.hex()[:16]}...  This "
+                        f"means cold-load left some consensus-"
+                        f"critical in-memory accumulator at an empty "
+                        f"default while a long-running node has it "
+                        f"populated.  The next received block would "
+                        f"silently fail to apply with 'Invalid "
+                        f"state_root' -- this assertion catches the "
+                        f"defect at startup instead.  Fix: ensure "
+                        f"snapshot-on-apply is writing the missing "
+                        f"field, OR add the field's persistence path "
+                        f"to ``_load_from_db``."
+                    )
+
         logger.info(f"Loaded chain: height={self.height}, tips={len(self.fork_choice.tips)}")
 
     def check_state_drift(self) -> list[tuple[str, bytes, object, object]]:
@@ -2038,12 +2152,76 @@ class Blockchain:
 
         return True, "Bootstrap complete"
 
+    # Periodicity for snapshot-on-apply persistence (1.52.0).  Every
+    # block apply persists a snapshot row; pruning trims rows below
+    # ``current - SNAPSHOT_RETENTION_BLOCKS`` so disk stays bounded.
+    # 1000 blocks ≈ 7 days at 600s/block, ~10× MAX_REORG_DEPTH (100)
+    # so any reorg up to the depth limit can find an ancestor snapshot.
+    _SNAPSHOT_RETENTION_BLOCKS: int = 1000
+
+    def _persist_state_snapshot(self, block_number: int) -> None:
+        """Snapshot-on-apply: serialize the full consensus-critical
+        in-memory state and persist to chaindb at ``block_number``.
+
+        Called at the END of every block apply (inside the same
+        transaction as the chain table writes -- see ``_append_block``)
+        so the snapshot reflects the post-apply state.  Prunes
+        snapshots older than ``_SNAPSHOT_RETENTION_BLOCKS`` to bound
+        on-disk growth opportunistically (every 100 blocks).
+
+        Uses ``_snapshot_memory_state()`` -- the same comprehensive
+        in-memory snapshot the reorg-rollback path uses, which
+        captures EVERY in-memory accumulator (bootstrap_ratchet,
+        validator_archive_misses, _immature_rewards, _escrow,
+        archive_active_snapshot, etc.).  Serialized via pickle
+        rather than the wire-format ``encode_snapshot`` because
+        ``_snapshot_memory_state`` includes Python-native types
+        (sets, tuples, custom dataclasses) that the binary wire
+        format doesn't model -- and the blob is local-trusted (we
+        only ever read back our own writes), so pickle's untrusted-
+        input concerns don't apply here.
+
+        See ``_load_from_db`` for the reverse path -- on cold
+        restart, the latest snapshot row is unpickled and installed
+        via ``_restore_memory_snapshot``, which is the symmetric
+        loader for this serializer.
+        """
+        if self.db is None or not hasattr(self.db, "set_state_snapshot"):
+            return
+        try:
+            import pickle
+            snap = self._snapshot_memory_state()
+            blob = pickle.dumps(snap, protocol=pickle.HIGHEST_PROTOCOL)
+            self.db.set_state_snapshot(block_number, blob)
+        except Exception:
+            logger.exception(
+                "snapshot-on-apply failed at block #%d; cold restart "
+                "may need to fall back to legacy field-by-field load",
+                block_number,
+            )
+            return
+        # Opportunistic prune every 100 blocks -- amortises the DELETE
+        # over ~1 per minute at 600s/block instead of every block.
+        if block_number % 100 == 0:
+            cutoff = block_number - self._SNAPSHOT_RETENTION_BLOCKS
+            if cutoff > 0:
+                try:
+                    self.db.prune_state_snapshots_before(cutoff)
+                except Exception:
+                    logger.exception(
+                        "state-snapshot prune at cutoff %d failed; "
+                        "continuing (rows accumulate but consensus "
+                        "remains safe)",
+                        cutoff,
+                    )
+
     def _install_state_snapshot(self, snap: dict) -> None:
         """Load a decoded state-snapshot dict into this blockchain.
 
-        Only called by bootstrap_from_checkpoint on a fresh (no-genesis)
-        chain, after the checkpoint signatures have been verified and
-        the root has been confirmed to match the snapshot bytes.
+        Called by bootstrap_from_checkpoint on a fresh (no-genesis)
+        chain after checkpoint signatures verify, AND by
+        ``_load_from_db`` on cold restart when a snapshot row exists
+        for the latest block (1.52.0 snapshot-on-load path).
         """
         # Per-entity fields
         self.supply.balances = dict(snap["balances"])
@@ -13077,6 +13255,24 @@ class Blockchain:
                     block.block_hash, block.header.block_number, new_weight,
                 )
                 self._persist_state()
+                # Snapshot-on-apply (1.52.0).  Serialize the full
+                # consensus-critical in-memory state so cold-restart /
+                # reorg-restore can rehydrate every accumulator
+                # (validator_archive_misses, _bootstrap_ratchet,
+                # _immature_rewards, _escrow, archive_active_snapshot,
+                # etc.) instead of starting from empty defaults.  Empty-
+                # default rehydration is the bug class that drove the
+                # entire 1.50-1.51.4 release sequence -- a long-running
+                # node and a freshly-loaded node compute different
+                # state_roots on the next received block because their
+                # in-memory accumulators differ.  Snapshot capture is
+                # the canonical fix: one mechanism, captures every
+                # consensus-critical field via the existing
+                # ``serialize_state`` serializer.  Pruning is opportun-
+                # istic (every 100 blocks) so steady-state disk cost
+                # stays bounded; the latest snapshot plus a wide reorg
+                # window is always retained.
+                self._persist_state_snapshot(block.header.block_number)
                 self.db.commit_transaction()
         except BaseException:
             if self.db is not None:
@@ -13604,61 +13800,98 @@ class Blockchain:
         rolled_back = self.chain[ancestor_height + 1:]
         self.chain = self.chain[:ancestor_height + 1]
 
-        # Reset state to ancestor point — replay from genesis.
-        # ``_reset_state`` recreates ``self.supply`` from scratch, so
-        # the genesis allocations (founder 100M / treasury 40M / 95M
-        # founder stake) MUST be re-applied before the block-1+ replay
-        # loop -- otherwise the chain replays forward with empty
-        # initial balances, the treasury rebase at
-        # TREASURY_REBASE_HEIGHT silently fails (treasury is empty),
-        # and the resulting supply state diverges from canonical by
-        # the genesis-allocation amount.  Witnessed in prod 2026-05-03:
+        # Reset state to the ancestor point.  In 1.52.0+ this is a
+        # snapshot-restore from the row at ``ancestor_height`` (always
+        # present for any reorg within MAX_REORG_DEPTH=100, since the
+        # snapshot retention window is 1000 blocks).  The snapshot
+        # captures every consensus-critical accumulator -- supply,
+        # _bootstrap_ratchet, validator_archive_misses, _immature_
+        # rewards, _escrow, archive_active_snapshot, etc. -- so the
+        # forward apply loop sees the EXACT in-memory state the
+        # ancestor block produced.
+        #
+        # Pre-1.52.0 this path called ``_reset_state`` (blanks the
+        # supply tracker) and replayed from block 1 -- the
+        # ``if blk.header.block_number > 0`` skip of block 0 silently
+        # dropped the genesis allocations, and the empty in-memory
+        # accumulators silently produced divergent state for the
+        # rest of the replay.  Witnessed in prod 2026-05-03:
         # validator-1's first-ever successful reorg corrupted its
-        # supply state (total_supply jumped from 107M to 140M, balances
-        # sum went negative) and v1 could no longer apply v2's blocks
-        # ("int too large to convert" deep in attestation processing).
-        # Recovery required a filesystem chain.db copy from healthy v2.
-        # The replay loop's ``if blk.header.block_number > 0`` skip of
-        # block 0 is correct -- ``_apply_block_state`` does NOT model
-        # genesis allocations -- but ``_reset_state`` was missing the
-        # symmetric "re-apply genesis allocations" step.
-        self._reset_state()
-        if self.chain:
-            genesis_block = self.chain[0]
-            import messagechain.config as _cfg
-            pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
-            is_mainnet_genesis = (
-                pinned is not None
-                and pinned == getattr(
-                    _cfg, "_MAINNET_GENESIS_HASH", None,
-                )
-                and genesis_block.block_hash == pinned
+        # supply (total_supply 107M → 140M; balances summed to
+        # negative 15.5M) and v1 lost the ability to apply v2's
+        # subsequent blocks.  Recovery required a filesystem chain.db
+        # copy.  The 1.51.4 fix patched the genesis-allocations
+        # subset of this defect; 1.52.0 fixes it structurally by
+        # routing reorg through the same snapshot loader cold-restart
+        # uses, so any field captured in the snapshot is preserved
+        # for free.
+        ancestor_block = self.chain[ancestor_height]
+        snapshot_loaded = False
+        if (
+            self.db is not None
+            and hasattr(self.db, "get_state_snapshot")
+        ):
+            blob = self.db.get_state_snapshot(
+                ancestor_block.header.block_number,
             )
-            if is_mainnet_genesis:
-                ok, reason = self._apply_mainnet_genesis_supply_state(
-                    genesis_block,
-                )
-                if not ok:
-                    return False, (
-                        f"Reorg failed during genesis supply restore: "
-                        f"{reason}"
+            if blob is not None:
+                try:
+                    import pickle
+                    snap = pickle.loads(blob)
+                    self._restore_memory_snapshot(snap)
+                    self._rebuild_state_tree()
+                    snapshot_loaded = True
+                    logger.info(
+                        "Reorg: restored state from snapshot at "
+                        "ancestor block #%d (avoids replay-from-1)",
+                        ancestor_block.header.block_number,
                     )
-            else:
-                # Devnet / test chain.  Genesis was created via
-                # ``initialize_genesis(allocation_table=...)`` -- the
-                # allocation table isn't persisted to chaindb, so we
-                # have no canonical way to restore it here.  This is
-                # a known limitation of devnet reorgs; production
-                # uses ``_apply_mainnet_genesis_supply_state``.
-                logger.warning(
-                    "Reorg replay on non-mainnet chain: genesis "
-                    "allocations cannot be auto-restored "
-                    "(allocation_table not persisted).  Subsequent "
-                    "block replay may produce divergent state."
+                except Exception:
+                    logger.exception(
+                        "Reorg: snapshot-restore at ancestor #%d "
+                        "failed; falling back to legacy "
+                        "reset+replay path",
+                        ancestor_block.header.block_number,
+                    )
+        if not snapshot_loaded:
+            # Legacy path -- only fires when no snapshot is available
+            # at the ancestor height (e.g. snapshots pruned, or chain
+            # predates 1.52.0).  Carries the 1.51.4 genesis-allocation
+            # fix as the same workaround it always was.
+            self._reset_state()
+            if self.chain:
+                genesis_block = self.chain[0]
+                import messagechain.config as _cfg
+                pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+                is_mainnet_genesis = (
+                    pinned is not None
+                    and pinned == getattr(
+                        _cfg, "_MAINNET_GENESIS_HASH", None,
+                    )
+                    and genesis_block.block_hash == pinned
                 )
-        for blk in self.chain:
-            if blk.header.block_number > 0:
-                self._apply_block_state(blk)
+                if is_mainnet_genesis:
+                    ok, reason = (
+                        self._apply_mainnet_genesis_supply_state(
+                            genesis_block,
+                        )
+                    )
+                    if not ok:
+                        return False, (
+                            f"Reorg failed during genesis supply "
+                            f"restore: {reason}"
+                        )
+                else:
+                    logger.warning(
+                        "Reorg replay on non-mainnet chain: genesis "
+                        "allocations cannot be auto-restored "
+                        "(allocation_table not persisted).  "
+                        "Subsequent block replay may produce "
+                        "divergent state."
+                    )
+            for blk in self.chain:
+                if blk.header.block_number > 0:
+                    self._apply_block_state(blk)
 
         # Apply new fork blocks
         for blk in apply_blocks:
