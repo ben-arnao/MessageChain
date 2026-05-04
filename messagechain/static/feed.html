@@ -76,6 +76,16 @@
     font-size: 1rem;
     line-height: 1;
   }
+  /* A continuation row hangs under the previous numbered step — same
+     left-margin slot, but no counter bump and no number rendered, so
+     it reads as another OR-branch of the step above rather than its
+     own numbered action. */
+  ol.quickstart > li.continuation {
+    counter-increment: none;
+  }
+  ol.quickstart > li.continuation::before {
+    content: "";
+  }
   ol.quickstart .cta {
     flex: 1 1 auto;
     display: block;
@@ -93,6 +103,31 @@
     font-size: 0.85rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+  }
+  /* Divider before the "just try it" continuation — visually says
+     "the option below is an alternative to all three steps above,
+     not just the step it hangs off of". */
+  ol.quickstart > li.continuation {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px dashed var(--border);
+  }
+  ol.quickstart > li.continuation::after {
+    content: "or skip the whole flow —";
+    position: absolute;
+    top: -0.55rem;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg);
+    color: var(--muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 0 0.5rem;
+    white-space: nowrap;
+  }
+  ol.quickstart > li.continuation {
+    position: relative;
   }
   main {
     max-width: 720px;
@@ -512,8 +547,7 @@
       <span class="or">or</span>
       <a class="cta" href="/gh/node">Run a node, earn tokens →</a>
     </li>
-    <li id="quickpostStep" class="choice" hidden>
-      <span class="or">or</span>
+    <li id="quickpostStep" class="choice continuation" hidden>
       <details class="faucet quickpost" id="quickpostBox">
         <summary>Just try it — we'll handle everything (less secure)</summary>
         <div class="body">

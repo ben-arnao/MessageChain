@@ -4,6 +4,22 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.53.1] — 2026-05-04
+
+### Changed
+
+  * **Public feed quickstart — "Just try it" is no longer a numbered
+    step.**  The server-assisted try-it path on `/feed` short-circuits
+    steps 1 + 2 + 3 (server generates a wallet, faucet-funds it, and
+    posts the message), so it doesn't belong on the same numbered
+    ladder as the real-wallet flow.  The `<li>` keeps the
+    primary-button styling but renders without a step number, sits
+    under a dashed divider with an "or skip the whole flow —" centered
+    label, and drops the now-redundant inline "or" span.  Visual cue
+    matches the semantics: it is an alternative to all three steps,
+    not a third option of step 3.  Static-only change to
+    `messagechain/static/feed.html`; no protocol behavior touched.
+
 ## [1.53.0] — 2026-05-04
 
 Coordinated hard fork — Tier 47 (DORMANCY_CONTROLLER_HEIGHT = 5934).
