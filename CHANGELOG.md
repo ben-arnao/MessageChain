@@ -4,6 +4,73 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.54.0] — 2026-05-04
+
+Minor release.  Bundles two consensus / correctness fixes and two UX
+improvements surfaced by audit round 14.
+
+### Fixed
+
+  * **Tier-47 `entity_last_active` mirror leak (consensus-critical
+    pre-activation fix).**  `restore_state_snapshot` was wiping every
+    other reorg-sensitive disk-mirror table (`reputation`,
+    `slash_offense_counts`, `stake_snapshots`, `key_rotation_last_height`,
+    `receipt_subtree_roots`, `key_history`, …) but left
+    `entity_last_active` untouched, and `_persist_state` only upserted
+    rows from `last_active_heights` without DELETEing entries removed
+    in-memory.  Same defect class as the four mirror leaks the
+    1.50–1.52.0 hotfix sequence closed.  Window opens at activation
+    height 5934: an entity that signs on a fork-tip that loses the
+    reorg leaves an orphan row on disk → cold restart rehydrates the
+    orphan → `compute_active_supply` differs from peers →
+    `compute_dormancy_issuance` mints a different amount → state-root
+    mismatch → honest node permanently forks from the network.
+    `restore_state_snapshot` now wipes + re-inserts the table inside
+    the same SQL transaction; `_persist_state` truncates + re-emits on
+    every full flush.  New tests in
+    `tests/test_entity_last_active_reorg_roundtrip.py` exercise both
+    paths and fail on pre-fix `origin/main`.  Fix lands ~14 weeks
+    before activation. (8bbf7ca, 4dfebbb)
+
+  * **`messagechain send --community-id` no longer ImportErrors.**
+    `cmd_send` was importing two symbols that don't exist
+    (`COMMUNITY_ID_BYTES` from config, `COMMUNITY_ID_STORED_BYTES`
+    from transaction) and sha256-hashing the user-typed handle to
+    bytes before passing it to `create_transaction(community_id=…)`,
+    whose contract is `str | None` validated against
+    `_validate_community_id`'s `[a-z0-9_-]` regex.  Every README-driven
+    user trying the Tier-25 communities flow hit a stack trace.  CLI
+    now strips + lowercases the handle and forwards it as a `str`,
+    using `_community_id_stored_bytes(handle, version)` for fee
+    overhead.  New `tests/test_cli_community.py` pins the README
+    example end-to-end. (249131d, 3151620)
+
+### Added
+
+  * **Governance confirm prompt + fee preview on
+    `propose` / `vote` / `react`.**  Anchored in CLAUDE.md:
+    "Governance proposals are deliberately expensive and infrequent."
+    The protocol charges `GOVERNANCE_PROPOSAL_FEE = 10_000` tokens
+    (≈33 faucet drips, the largest single fee in the protocol), but
+    the CLI was auto-feeing, signing, and submitting in one shot —
+    a typo on the title or description silently burned tokens with
+    no recovery path.  `cmd_propose` now prints a fee-preview banner
+    (title / description bytes / fee / entity) and requires typed
+    `yes` (or `--yes`/`-y` for scripts) before signing; `cmd_vote`
+    and `cmd_react` print a one-line fee preview before submitting
+    (no prompt at those fee levels — over-friction).  Mirrors the
+    existing `cmd_transfer` / `cmd_stake` / `cmd_unstake` confirm
+    pattern.  New `tests/test_cli_propose_confirm.py` covers EOF
+    abort, "no" abort, `--yes` submits, fee-preview visibility, and
+    fee-preview-before-submit ordering. (6a3c8ff, 1196404)
+
+  * **Per-card permalinks on the public feed are now shortened tx
+    hashes.**  Replaces the prior generic "Permanent ↗" anchor.
+    Every feed card now exposes its own canonical short-hash link
+    (e.g. `deadbeef…`) so users can copy/share a specific message's
+    permanence proof.  Static-only change to
+    `messagechain/static/feed.html`. (cc3404f, cca77bc)
+
 ## [1.53.1] — 2026-05-04
 
 ### Changed
