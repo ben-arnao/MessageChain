@@ -181,7 +181,7 @@
       <div class="grid" id="fundsGrid"></div>
     </div>
     <div class="section">
-      <h2>Posts</h2>
+      <h2>Activity</h2>
       <div class="grid" id="postsGrid"></div>
     </div>
     <div class="section">
@@ -232,6 +232,44 @@
   function fmtPct(p) {
     if (typeof p !== "number") return "—";
     return p.toFixed(1) + "%";
+  }
+
+  function fmtSmallPct(p) {
+    // For "% of total supply spent" — values are typically far below
+    // 1%.  Render with enough precision to be readable across 4–5
+    // orders of magnitude without dropping to scientific notation
+    // on a profile page.
+    if (typeof p !== "number") return "—";
+    if (p === 0) return "0%";
+    if (p >= 1) return p.toFixed(2) + "%";
+    if (p >= 0.01) return p.toFixed(4) + "%";
+    if (p >= 0.0001) return p.toFixed(6) + "%";
+    return p.toExponential(2) + "%";
+  }
+
+  function fmtRelativeSince(sec) {
+    if (typeof sec !== "number") return "—";
+    const now = Date.now() / 1000;
+    const delta = Math.max(0, now - sec);
+    const day = 86400;
+    if (delta < 3600) {
+      const m = Math.max(1, Math.round(delta / 60));
+      return m + (m === 1 ? " minute ago" : " minutes ago");
+    }
+    if (delta < day) {
+      const h = Math.round(delta / 3600);
+      return h + (h === 1 ? " hour ago" : " hours ago");
+    }
+    if (delta < 30 * day) {
+      const d = Math.round(delta / day);
+      return d + (d === 1 ? " day ago" : " days ago");
+    }
+    if (delta < 365 * day) {
+      const mo = Math.round(delta / (30 * day));
+      return mo + (mo === 1 ? " month ago" : " months ago");
+    }
+    const yrs = delta / (365 * day);
+    return yrs.toFixed(1) + " years ago";
   }
 
   function clearGrids() {
@@ -309,9 +347,17 @@
       fmtInt(profile.rewards.estimated_block_rewards),
       profile.rewards.blocks_proposed + " block(s) proposed");
     addStat("fundsGrid", "Total fees paid", fmtInt(profile.fees_paid));
+    addStat("fundsGrid",
+      "Supply spent on network",
+      fmtSmallPct(profile.supply_spent_pct_cumulative),
+      "cumulative — % of total supply at time of each spend");
 
     // Posts
     const m = profile.messages;
+    addStat("postsGrid",
+      "First seen",
+      us ? fmtRelativeSince(us.timestamp) : "—",
+      us ? fmtTs(us.timestamp) + " · block " + us.block_number : null);
     addStat("postsGrid", "Total messages", fmtInt(m.total));
     addStat("postsGrid",
       "First post",
@@ -325,27 +371,22 @@
     // Reputation
     const rep = profile.reputation;
     addStat("reputationGrid",
-      "Reputation score",
-      fmtInt(rep.score),
-      "+" + rep.ups_received + " / -" + rep.downs_received,
+      "Profile upvotes",
+      fmtInt(rep.ups_received),
+      typeof rep.rate_pct === "number"
+        ? fmtPct(rep.rate_pct) + " up · -" + rep.downs_received + " down"
+        : "no votes yet",
       signClass(rep.score));
     const ps = profile.post_score;
     addStat("reputationGrid",
-      "Post score",
-      fmtInt(ps.total),
-      "+" + ps.ups_received + " / -" + ps.downs_received,
+      "Distinct post upvoters",
+      fmtInt(ps.distinct_upvoters),
+      typeof ps.rate_pct === "number"
+        ? fmtPct(ps.rate_pct) + " up · " + ps.ups_received + "/+ "
+          + ps.downs_received + "/- across all posts"
+        : "no post votes yet",
       signClass(ps.total));
     addStat("reputationGrid", "Reactions cast", fmtInt(profile.reactions_cast));
-    const ul = profile.react_majority_alignment.user_level;
-    addStat("reputationGrid",
-      "Majority match (users)",
-      fmtPct(ul.pct),
-      ul.with_majority + " / " + ul.votes + " agreed with current sign");
-    const pl = profile.react_majority_alignment.post_level;
-    addStat("reputationGrid",
-      "Majority match (posts)",
-      fmtPct(pl.pct),
-      pl.with_majority + " / " + pl.votes + " agreed with current sign");
 
     // Governance
     addStat("governanceGrid", "Proposals made", fmtInt(profile.governance.proposals_made));
