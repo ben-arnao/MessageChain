@@ -12515,27 +12515,38 @@ class Blockchain:
         # Phase 3: prune
         tracker.prune_closed_proposals(current_block)
 
-    def _apply_mainnet_genesis_state(self, block: Block) -> tuple[bool, str]:
-        """Reconstruct mainnet post-bootstrap state from block 0 alone.
+    def _apply_mainnet_genesis_supply_state(
+        self, block: Block,
+    ) -> tuple[bool, str]:
+        """Apply ONLY the genesis supply/identity mutations -- without
+        chain.append, fork_choice, db.store_block, or orphan-drain.
 
-        The founder's launch flow did `initialize_genesis +
-        bootstrap_seed_local` — block 0 was minted, then off-block
-        direct-state mutations applied (register pubkey, self-authority-
-        key, stake 95M).  A joining validator's IBD must
-        reproduce those mutations exactly, else its pre-block-1 state
-        diverges from the founder's and block 1's state_root rejects.
+        Extracted from ``_apply_mainnet_genesis_state`` so the reorg
+        replay path (``_reorganize``) can re-apply genesis allocations
+        after ``_reset_state`` blanks the supply tracker.  The full
+        ``_apply_mainnet_genesis_state`` wraps this with chain-append /
+        fork_choice / db / orphan-drain for the IBD-of-block-0 path.
 
-        The founder's public key is extracted from block 0's proposer
-        signature via Merkle-auth-path reconstruction.  Applying the
-        canonical _MAINNET_FOUNDER_LIQUID / _MAINNET_FOUNDER_STAKE
-        constants then reproduces the exact post-bootstrap state.  Any
-        drift from the founder's actual parameters surfaces as a
-        state_root mismatch at block 1 — constants are self-verifying.
+        Mutations performed (idempotent across replay):
+          * public_keys[founder] (overwrite -- already in old_pks
+            after _reset_state but adding the explicit set is safe).
+          * key_history (re-record -- _record_key_history is no-op if
+            current key already matches, see implementation).
+          * nonces[founder] = 0
+          * tree_height pin
+          * entity_index assign
+          * proposer_sig_counts[founder] = 1
+          * leaf_watermark bump for founder's block-0 sig leaf
+          * balances[founder] += _MAINNET_FOUNDER_TOTAL (100M)
+          * balances[TREASURY_ENTITY_ID] += TREASURY_ALLOCATION (40M)
+          * seed_entity_ids = {founder}
+          * stake snapshot pin at height 0
+          * stake(founder, _MAINNET_FOUNDER_STAKE = 95M) -- moves 95M
+            from balances to staked, leaving founder with 5M liquid.
 
-        Called from add_block's synced-genesis branch after the
-        PINNED_GENESIS_HASH check passes.  Only runs when the pinned
-        hash is the mainnet hash (testnet/devnet keep the existing
-        snapshot/tarball workflow).
+        Returns (ok, reason).  Caller must NOT also try to append the
+        block to chain or update fork_choice -- those are the
+        wrapper's job.
         """
         import messagechain.config as _cfg
         sig = block.header.proposer_signature
@@ -12582,9 +12593,6 @@ class Blockchain:
         tree_height = len(sig.auth_path)
 
         # ── initialize_genesis-equivalent mutations ───────────────────
-        self.chain.append(block)
-        self._block_by_hash[block.block_hash] = block
-
         self.public_keys[founder_eid] = founder_pubkey
         self._record_key_history(founder_eid, founder_pubkey)
         self.nonces[founder_eid] = 0
@@ -12607,8 +12615,6 @@ class Blockchain:
 
         # Seed set: founder is the only seed (treasury is excluded).
         self.seed_entity_ids = frozenset({founder_eid})
-
-        self.fork_choice.add_tip(block.block_hash, 0, 0)
 
         # Pin empty stake snapshot at block 0 — matches the founder's
         # node, where _record_stake_snapshot(0) runs inside
@@ -12642,10 +12648,50 @@ class Blockchain:
         # silently corrupting.
         if not self.supply.stake(founder_eid, _cfg._MAINNET_FOUNDER_STAKE):
             raise RuntimeError(
-                "BUG: _apply_mainnet_genesis_state stake step failed "
-                "despite canonical TOTAL >= STAKE invariant — refusing "
-                "to continue with half-built genesis state"
+                "BUG: _apply_mainnet_genesis_supply_state stake step "
+                "failed despite canonical TOTAL >= STAKE invariant — "
+                "refusing to continue with half-built genesis state"
             )
+
+        return True, "Genesis supply state applied"
+
+    def _apply_mainnet_genesis_state(self, block: Block) -> tuple[bool, str]:
+        """Reconstruct mainnet post-bootstrap state from block 0 alone.
+
+        The founder's launch flow did `initialize_genesis +
+        bootstrap_seed_local` — block 0 was minted, then off-block
+        direct-state mutations applied (register pubkey, self-authority-
+        key, stake 95M).  A joining validator's IBD must
+        reproduce those mutations exactly, else its pre-block-1 state
+        diverges from the founder's and block 1's state_root rejects.
+
+        The founder's public key is extracted from block 0's proposer
+        signature via Merkle-auth-path reconstruction.  Applying the
+        canonical _MAINNET_FOUNDER_LIQUID / _MAINNET_FOUNDER_STAKE
+        constants then reproduces the exact post-bootstrap state.  Any
+        drift from the founder's actual parameters surfaces as a
+        state_root mismatch at block 1 — constants are self-verifying.
+
+        Called from add_block's synced-genesis branch after the
+        PINNED_GENESIS_HASH check passes.  Only runs when the pinned
+        hash is the mainnet hash (testnet/devnet keep the existing
+        snapshot/tarball workflow).
+        """
+        # ── chain registration (separate from supply/state) ──────────
+        self.chain.append(block)
+        self._block_by_hash[block.block_hash] = block
+
+        # ── supply / identity / stake mutations ──────────────────────
+        ok, reason = self._apply_mainnet_genesis_supply_state(block)
+        if not ok:
+            # Roll back the chain append since supply state didn't
+            # apply -- otherwise the block sits in chain with no
+            # corresponding state and every subsequent block fails.
+            self.chain.pop()
+            self._block_by_hash.pop(block.block_hash, None)
+            return False, reason
+
+        self.fork_choice.add_tip(block.block_hash, 0, 0)
 
         # Rebuild the state tree so compute_current_state_root reflects
         # the fully-populated post-bootstrap state.
@@ -13558,8 +13604,58 @@ class Blockchain:
         rolled_back = self.chain[ancestor_height + 1:]
         self.chain = self.chain[:ancestor_height + 1]
 
-        # Reset state to ancestor point — replay from genesis
+        # Reset state to ancestor point — replay from genesis.
+        # ``_reset_state`` recreates ``self.supply`` from scratch, so
+        # the genesis allocations (founder 100M / treasury 40M / 95M
+        # founder stake) MUST be re-applied before the block-1+ replay
+        # loop -- otherwise the chain replays forward with empty
+        # initial balances, the treasury rebase at
+        # TREASURY_REBASE_HEIGHT silently fails (treasury is empty),
+        # and the resulting supply state diverges from canonical by
+        # the genesis-allocation amount.  Witnessed in prod 2026-05-03:
+        # validator-1's first-ever successful reorg corrupted its
+        # supply state (total_supply jumped from 107M to 140M, balances
+        # sum went negative) and v1 could no longer apply v2's blocks
+        # ("int too large to convert" deep in attestation processing).
+        # Recovery required a filesystem chain.db copy from healthy v2.
+        # The replay loop's ``if blk.header.block_number > 0`` skip of
+        # block 0 is correct -- ``_apply_block_state`` does NOT model
+        # genesis allocations -- but ``_reset_state`` was missing the
+        # symmetric "re-apply genesis allocations" step.
         self._reset_state()
+        if self.chain:
+            genesis_block = self.chain[0]
+            import messagechain.config as _cfg
+            pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+            is_mainnet_genesis = (
+                pinned is not None
+                and pinned == getattr(
+                    _cfg, "_MAINNET_GENESIS_HASH", None,
+                )
+                and genesis_block.block_hash == pinned
+            )
+            if is_mainnet_genesis:
+                ok, reason = self._apply_mainnet_genesis_supply_state(
+                    genesis_block,
+                )
+                if not ok:
+                    return False, (
+                        f"Reorg failed during genesis supply restore: "
+                        f"{reason}"
+                    )
+            else:
+                # Devnet / test chain.  Genesis was created via
+                # ``initialize_genesis(allocation_table=...)`` -- the
+                # allocation table isn't persisted to chaindb, so we
+                # have no canonical way to restore it here.  This is
+                # a known limitation of devnet reorgs; production
+                # uses ``_apply_mainnet_genesis_supply_state``.
+                logger.warning(
+                    "Reorg replay on non-mainnet chain: genesis "
+                    "allocations cannot be auto-restored "
+                    "(allocation_table not persisted).  Subsequent "
+                    "block replay may produce divergent state."
+                )
         for blk in self.chain:
             if blk.header.block_number > 0:
                 self._apply_block_state(blk)
