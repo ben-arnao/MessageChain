@@ -27,6 +27,12 @@ from messagechain.network.entity_profile import compute_entity_profile
 from messagechain.network.public_feed_server import PublicFeedServer
 
 
+# Override genesis supply per stub-chain so tests exercise the
+# spend-pct math against an easy-to-eyeball base.  Real config
+# value (140M) is irrelevant to the aggregator's correctness.
+STUB_GENESIS_SUPPLY = 100_000
+
+
 def _eid(seed: int) -> bytes:
     return seed.to_bytes(32, "big")
 
@@ -106,6 +112,8 @@ def _block(
 class _StubSupply:
     """Reproduces the pieces of SupplyTracker the aggregator touches."""
 
+    GENESIS_SUPPLY = STUB_GENESIS_SUPPLY
+
     def __init__(self):
         self.balances: dict[bytes, int] = {}
         self.staked: dict[bytes, int] = {}
@@ -149,6 +157,12 @@ class TestComputeEntityProfile(unittest.TestCase):
         self.assertEqual(profile["messages"]["total"], 0)
         self.assertIsNone(profile["user_since"])
         self.assertIsNone(profile["stake_pct_of_funds"])
+        self.assertEqual(profile["supply_spent_pct_cumulative"], 0.0)
+        self.assertIsNone(profile["reputation"]["rate_pct"])
+        self.assertIsNone(profile["post_score"]["rate_pct"])
+        self.assertEqual(profile["post_score"]["distinct_upvoters"], 0)
+        # react_majority_alignment is gone — not in the new contract.
+        self.assertNotIn("react_majority_alignment", profile)
 
     def test_funds_and_stake_pct(self):
         chain = _StubChain()
@@ -242,78 +256,94 @@ class TestComputeEntityProfile(unittest.TestCase):
         # Only the SENT transfer's fee counts toward fees_paid.
         self.assertEqual(profile["fees_paid"], 5)
 
-    def test_reputation_and_post_score_from_reaction_state(self):
+    def test_reputation_rate_and_post_distinct_upvoters(self):
         author = _eid(20)
-        liker = _eid(21)
-        hater = _eid(22)
-        msg_h = _txh(50)
+        liker_a = _eid(21)
+        liker_b = _eid(22)
+        liker_c = _eid(23)
+        hater = _eid(24)
+        msg_h1 = _txh(50)
+        msg_h2 = _txh(51)
         b = _block(
             block_number=1, timestamp=100.0, proposer=_eid(99),
-            txs=[_msg(author, 50.0, 10, msg_h)],
+            txs=[
+                _msg(author, 50.0, 10, msg_h1),
+                _msg(author, 60.0, 10, msg_h2),
+            ],
         )
         chain = _StubChain([b])
         rs = chain.reaction_state
-        # 2 ups, 1 down on author's user-trust → reputation = +1.
-        rs.choices[(liker, author, True)] = REACT_CHOICE_UP
-        rs.choices[(_eid(23), author, True)] = REACT_CHOICE_UP
+        # Profile-level: 3 ups, 1 down → score +2, rate 75%.
+        rs.choices[(liker_a, author, True)] = REACT_CHOICE_UP
+        rs.choices[(liker_b, author, True)] = REACT_CHOICE_UP
+        rs.choices[(liker_c, author, True)] = REACT_CHOICE_UP
         rs.choices[(hater, author, True)] = REACT_CHOICE_DOWN
-        rs._user_trust_score[author] = 1
-        # On the message: 1 up, 0 down → post score = +1.
-        rs.choices[(liker, msg_h, False)] = REACT_CHOICE_UP
-        rs._message_score[msg_h] = 1
+        rs._user_trust_score[author] = 2
+        # Posts: liker_a upvotes both posts (counts once toward
+        # distinct upvoters), liker_b upvotes msg_h1, hater downvotes
+        # msg_h1.  Distinct post-upvoters = {liker_a, liker_b} = 2.
+        # post_ups=3, post_downs=1 → rate 75%.
+        rs.choices[(liker_a, msg_h1, False)] = REACT_CHOICE_UP
+        rs.choices[(liker_a, msg_h2, False)] = REACT_CHOICE_UP
+        rs.choices[(liker_b, msg_h1, False)] = REACT_CHOICE_UP
+        rs.choices[(hater, msg_h1, False)] = REACT_CHOICE_DOWN
+        rs._message_score[msg_h1] = 1
+        rs._message_score[msg_h2] = 1
 
         profile = compute_entity_profile(chain, author)
-        self.assertEqual(profile["reputation"]["score"], 1)
-        self.assertEqual(profile["reputation"]["ups_received"], 2)
-        self.assertEqual(profile["reputation"]["downs_received"], 1)
-        self.assertEqual(profile["post_score"]["total"], 1)
-        self.assertEqual(profile["post_score"]["ups_received"], 1)
-        self.assertEqual(profile["post_score"]["downs_received"], 0)
 
-    def test_react_majority_alignment_user_and_post_levels(self):
-        voter = _eid(30)
-        # Two user-trust targets:
-        #   target_a aggregate +5  (voter went UP → matches)
-        #   target_b aggregate -3  (voter went UP → MIS-matches)
-        # One post target:
-        #   msg aggregate +1 (voter went UP → matches)
-        # Tie target excluded from denominator:
-        #   target_c aggregate 0 (voter went UP → not counted)
-        chain = _StubChain()
-        rs = chain.reaction_state
-        target_a = _eid(31)
-        target_b = _eid(32)
-        target_c = _eid(33)
-        msg = _txh(40)
-        rs.choices[(voter, target_a, True)] = REACT_CHOICE_UP
-        rs.choices[(voter, target_b, True)] = REACT_CHOICE_UP
-        rs.choices[(voter, target_c, True)] = REACT_CHOICE_UP
-        rs.choices[(voter, msg, False)] = REACT_CHOICE_UP
-        rs._user_trust_score[target_a] = 5
-        rs._user_trust_score[target_b] = -3
-        # target_c omitted from aggregate map → score 0 (tie).
-        rs._message_score[msg] = 1
+        rep = profile["reputation"]
+        self.assertEqual(rep["score"], 2)
+        self.assertEqual(rep["ups_received"], 3)
+        self.assertEqual(rep["downs_received"], 1)
+        self.assertAlmostEqual(rep["rate_pct"], 75.0)
 
-        profile = compute_entity_profile(chain, voter)
-        ul = profile["react_majority_alignment"]["user_level"]
-        pl = profile["react_majority_alignment"]["post_level"]
-        # 2 user votes counted (target_c excluded), 1 matched.
-        self.assertEqual(ul["votes"], 2)
-        self.assertEqual(ul["with_majority"], 1)
-        self.assertAlmostEqual(ul["pct"], 50.0)
-        self.assertEqual(pl["votes"], 1)
-        self.assertEqual(pl["with_majority"], 1)
-        self.assertAlmostEqual(pl["pct"], 100.0)
+        ps = profile["post_score"]
+        self.assertEqual(ps["total"], 2)
+        self.assertEqual(ps["ups_received"], 3)
+        self.assertEqual(ps["downs_received"], 1)
+        self.assertEqual(ps["distinct_upvoters"], 2)
+        self.assertAlmostEqual(ps["rate_pct"], 75.0)
 
-    def test_react_majority_pct_is_none_with_no_votes(self):
-        chain = _StubChain()
-        profile = compute_entity_profile(chain, _eid(99))
-        self.assertIsNone(
-            profile["react_majority_alignment"]["user_level"]["pct"]
+    def test_supply_spent_pct_cumulative_fees_and_transfers(self):
+        # Genesis supply 100_000, block reward 1_000/block.
+        # Block 1 supply (after mint) = 101_000.
+        #   message fee 100 → 100/101_000 * 100 ≈ 0.0990099%
+        # Block 2 supply (after mint) = 102_000.
+        #   transfer amount 500 + fee 50 = 550 → 550/102_000 * 100
+        #     ≈ 0.5392157%
+        # Total ≈ 0.6382256%.
+        eid = _eid(40)
+        peer = _eid(41)
+        b1 = _block(
+            block_number=1, timestamp=10.0, proposer=_eid(99),
+            txs=[_msg(eid, 9.0, 100, _txh(1))],
         )
-        self.assertIsNone(
-            profile["react_majority_alignment"]["post_level"]["pct"]
+        b2 = _block(
+            block_number=2, timestamp=20.0, proposer=_eid(99),
+            transfers=[_transfer(eid, peer, 500, 50)],
         )
+        chain = _StubChain([b1, b2])
+        profile = compute_entity_profile(chain, eid)
+        expected = (
+            100.0 * 100 / (STUB_GENESIS_SUPPLY + 1_000)
+            + 100.0 * (500 + 50) / (STUB_GENESIS_SUPPLY + 2_000)
+        )
+        self.assertAlmostEqual(
+            profile["supply_spent_pct_cumulative"],
+            expected,
+            places=9,
+        )
+
+    def test_supply_spent_pct_zero_for_inactive_entity(self):
+        eid = _eid(42)
+        b1 = _block(
+            block_number=1, timestamp=10.0, proposer=_eid(99),
+            txs=[_msg(_eid(99), 9.0, 100, _txh(1))],
+        )
+        chain = _StubChain([b1])
+        profile = compute_entity_profile(chain, eid)
+        self.assertEqual(profile["supply_spent_pct_cumulative"], 0.0)
 
     def test_invalid_entity_id_raises(self):
         with self.assertRaises(ValueError):
@@ -381,6 +411,13 @@ class TestEntityEndpoint(unittest.TestCase):
         self.assertEqual(prof["balance"], 555)
         self.assertEqual(prof["messages"]["total"], 1)
         self.assertEqual(prof["rewards"]["blocks_proposed"], 1)
+        # New contract: no react_majority_alignment, but supply spent
+        # and rate fields are present.
+        self.assertNotIn("react_majority_alignment", prof)
+        self.assertIn("supply_spent_pct_cumulative", prof)
+        self.assertIn("rate_pct", prof["reputation"])
+        self.assertIn("rate_pct", prof["post_score"])
+        self.assertIn("distinct_upvoters", prof["post_score"])
 
     def test_v1_entity_rejects_bad_hex(self):
         status, _h, body = self._get("/v1/entity?id=nothex")
