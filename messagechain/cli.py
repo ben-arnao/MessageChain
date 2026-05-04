@@ -594,6 +594,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
              "when --fee is set.",
     )
+    # Governance proposals charge the largest single fee in the
+    # protocol (GOVERNANCE_PROPOSAL_FEE = 10,000 tokens) and a typo on
+    # title/description is an irreversible burn.  --yes / -y is the
+    # script-friendly path that skips the interactive confirm; mirrors
+    # cmd_transfer's --yes (1.48.0).
+    propose.add_argument(
+        "--yes", "-y", action="store_true",
+        help="Skip the confirmation prompt (for scripts / CI).",
+    )
 
     # --- vote ---
     vote = sub.add_parser(
@@ -4507,6 +4516,37 @@ def cmd_propose(args):
         )
         # Defensive: never undercut the chain's own floor function.
         fee = max(fee, proposal_fee_floor(payload_bytes, target_height))
+
+    # Fee preview + confirmation banner.  Governance proposals charge
+    # the largest single fee in the protocol (GOVERNANCE_PROPOSAL_FEE
+    # baseline = 10,000 tokens) and a typo on title/description is an
+    # irreversible burn with no recovery path.  Show the number with
+    # thousands separators so the magnitude is unmistakable, then ask
+    # for explicit "yes" before signing/submitting.  Mirrors the
+    # cmd_transfer pattern shipped in 1.48.0; --yes / -y bypasses the
+    # prompt for scripts / CI (gcloud compute ssh + sudo doesn't always
+    # deliver piped stdin to input()).
+    description_bytes = len(args.description.encode("utf-8"))
+    print()
+    print("About to propose:")
+    print(f"  Title:       {args.title}")
+    print(f"  Description: {description_bytes} bytes")
+    print(f"  Fee:         {fee:,} tokens  (governance proposal fee)")
+    print(f"  Entity:      {entity.entity_id_hex[:16]}...")
+    if not getattr(args, "yes", False):
+        try:
+            confirm = input(
+                "\nConfirm propose (type 'yes' to proceed): "
+            ).strip().lower()
+        except EOFError:
+            print("\nProposal cancelled (no stdin).")
+            sys.exit(1)
+        if confirm != "yes":
+            print("Proposal cancelled.")
+            sys.exit(0)
+    else:
+        print("\nSkipping confirmation prompt (--yes).")
+
     tx = create_proposal(
         entity, args.title, args.description, fee=fee,
         current_height=target_height,
@@ -4591,6 +4631,13 @@ def cmd_vote(args):
             mempool_estimate=mempool_estimate,
         )
         fee = max(fee, GOVERNANCE_VOTE_FEE)
+
+    # Fee preview (no confirm prompt -- vote fees are small enough
+    # that an extra interactive step is over-friction for the user).
+    # Surfacing the cost is still load-bearing: prior to this the user
+    # had no signal at all about how much the vote was about to burn.
+    print(f"  Fee:     {fee:,} tokens  (governance vote fee)")
+
     tx = create_vote(entity, proposal_id, approve, fee=fee)
 
     response = rpc_call(host, port, "submit_vote", {
@@ -4694,6 +4741,11 @@ def cmd_react(args):
             current_height=target_height,
             mempool_estimate=mempool_estimate,
         )
+
+    # Fee preview (no confirm prompt -- reaction fees are small).
+    # Without this print the user had zero signal about cost between
+    # "Reacting as ..." and the eventual success/failure line.
+    print(f"  Fee:     {fee:,} tokens  (reaction fee)")
 
     tx = create_react_transaction(
         entity,
