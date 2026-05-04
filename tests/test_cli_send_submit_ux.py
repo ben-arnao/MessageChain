@@ -35,6 +35,8 @@ def _send_args(message: str, **overrides):
         prev=None,
         keyfile="/dev/null",
         data_dir=None,
+        urgency="normal",
+        community_id=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -190,6 +192,95 @@ class TestCmdSendUnknownEntityFriendlyError(unittest.TestCase):
         self.assertIn(entity.entity_id_hex, out,
             "must echo the user's address so they can ask someone "
             "to send tokens to it")
+
+
+class TestCmdSendCommunityIdHandlePassthrough(unittest.TestCase):
+    """`--community-id NAME` must reach the chain as the normalized
+    ASCII handle string (NFC + lowercase), NOT as a sha256 hash.
+
+    Pre-fix (1.32.0–1.53.0): cmd_send imported a non-existent
+    `COMMUNITY_ID_BYTES` and called `sha256(name).digest()[:N]`,
+    handing `create_transaction` 16 binary bytes that the chain's
+    `_validate_community_id` (ASCII a-z0-9 / DNS-label edges) was
+    guaranteed to reject.  --community-id was unusable end-to-end.
+    """
+
+    def _run(self, raw_handle: str) -> dict:
+        from messagechain import cli as cli_mod
+
+        entity = MagicMock()
+        entity.entity_id = b"\x01" * 32
+        entity.entity_id_hex = "01" * 32
+        entity.keypair = MagicMock()
+        entity.keypair.advance_to_leaf = MagicMock()
+
+        fake_tx = MagicMock()
+        fake_tx.serialize.return_value = {"fake": "tx"}
+
+        captured = {}
+
+        def fake_create_transaction(*args, **kwargs):
+            captured.update(kwargs)
+            return fake_tx
+
+        def rpc_side(host, port, method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 432}}
+            if method == "get_fee_estimate":
+                return {"ok": True, "result": {"fee_estimate": 100}}
+            if method == "estimate_fee":
+                return {"ok": True, "result": {"mempool_fee": 0}}
+            if method == "submit_transaction":
+                return {"ok": True, "result": {"tx_hash": "deadbeef", "fee": 250}}
+            return {"ok": True, "result": {}}
+
+        with patch.object(cli_mod, "_resolve_private_key",
+                          return_value=b"\x02" * 32), \
+             patch("messagechain.identity.identity.Entity.create",
+                   return_value=entity), \
+             patch("messagechain.core.transaction.create_transaction",
+                   side_effect=fake_create_transaction), \
+             patch("client.rpc_call", side_effect=rpc_side), \
+             patch.object(cli_mod, "_parse_server",
+                          return_value=("127.0.0.1", 9334)), \
+             patch.object(cli_mod, "_reserve_leaf_via_rpc",
+                          return_value=0):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                cli_mod.cmd_send(_send_args(
+                    "hello", community_id=raw_handle,
+                ))
+        return captured
+
+    def test_handle_reaches_create_transaction_as_string(self):
+        captured = self._run("test")
+        self.assertIn("community_id", captured)
+        self.assertIsInstance(
+            captured["community_id"], str,
+            "community_id MUST be the ASCII handle string, not bytes",
+        )
+        self.assertEqual(captured["community_id"], "test")
+
+    def test_handle_is_lowercased_and_stripped(self):
+        captured = self._run("  MyCommunity  ")
+        self.assertEqual(captured["community_id"], "mycommunity")
+
+    def test_chain_validator_accepts_passed_handle(self):
+        """Closing the loop: whatever cmd_send passes through must
+        also satisfy the chain's _validate_community_id.  Catches
+        any future regression that re-introduces hashing or another
+        encoding that the chain would reject."""
+        from messagechain.core.transaction import _validate_community_id
+        for raw in ("test", "MessageChain", "art-news", "a1_b2"):
+            captured = self._run(raw)
+            ok, reason = _validate_community_id(captured["community_id"])
+            self.assertTrue(
+                ok,
+                f"normalized handle for {raw!r} rejected by chain "
+                f"validator: {reason}",
+            )
 
 
 if __name__ == "__main__":
