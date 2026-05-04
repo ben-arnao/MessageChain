@@ -3031,6 +3031,149 @@ assert (
 AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234  # Tier 46 — +700 spacing above Tier 45 (4534)
 
 # ─────────────────────────────────────────────────────────────────────
+# Dormancy-filtered active-supply controller (hard fork — Tier 47)
+# ─────────────────────────────────────────────────────────────────────
+# Rationale: see CLAUDE.md anchor "Issuance targets a stable active
+# supply, not a fixed schedule."  Pre-fork issuance is a fixed schedule
+# (BLOCK_REWARD with halving + a one-sided deflation-floor lever); both
+# were partial mechanisms aimed at the supply-stability problem.  Post-
+# fork the chain replaces them with a single controller that targets a
+# fixed nominal point for `active_supply` (= sum of balances filtered by
+# how recently their owner was active).  Burns and lost-key dormancy
+# pull active supply down; the controller mints to refill toward the
+# target.  The user-visible promise is "X tokens always means roughly X
+# tokens" — fixed-token fees, stake thresholds, and proposal costs keep
+# their economic weight forever because the denominator is held
+# constant.
+#
+# Activity definition (signed action by the entity required — receiving
+# tokens does NOT count, since that would let an attacker keep dormant
+# wallets "active" by sending dust):
+#   * outgoing tx signed by the entity (transfer, message, react,
+#     stake, unstake, key-rotation, set-authority, revoke,
+#     governance proposal/vote)
+#   * attestation by the entity (validators)
+#   * block proposal by the entity (validators)
+#
+# Smooth taper, integer-deterministic:
+#   age = current_height - last_active_height
+#   if age <  WINDOW - TAPER:        weight_bps = 10_000  (full active)
+#   if WINDOW - TAPER <= age < WINDOW: weight_bps = 10_000 * (WINDOW - age) // TAPER
+#   if age >= WINDOW:                weight_bps = 0       (fully dormant)
+#   active_supply = Σ balance × weight_bps // 10_000
+#
+# Dormancy is observability of the supply metric only — dormant
+# balances are NEVER confiscated.  They continue to exist with their
+# full balance and rejoin active_supply the moment the owner transacts.
+# Bitcoin's "lost coins" treatment, made explicit at the protocol
+# level.
+#
+# Controller (proportional, integer-deterministic):
+#   gap = max(0, TARGET_ACTIVE_SUPPLY - active_supply)
+#   issuance = min(MAX_ISSUANCE_PER_BLOCK, gap * K_NUM // K_DEN)
+# At target, gap=0, issuance=0 — validators run on fees alone (the
+# fee market is the long-term security budget; issuance's purpose is
+# supply integrity, not validator pay).  No floor — issuance is
+# allowed to drop to zero indefinitely if active_supply is at target.
+#
+# Activation backfill: at block_height == DORMANCY_CONTROLLER_HEIGHT,
+# every entity with a balance > 0 has its last_active_height stamped to
+# the activation height (one-shot, idempotent flag).  Active_supply at
+# activation therefore equals the sum of post-fork balances; the
+# controller starts from gap≈0 and refills only as burns / dormancy
+# accumulate over time.  Same pattern as treasury_rebase / registration-
+# burn grandfather hard forks — flag snapshotted with the supply state
+# for reorg safety.
+#
+# State-tree fold: post-activation, _leaf_value() folds
+# last_active_height into the per-entity leaf hash so state-synced
+# nodes inherit the same dormancy state as replaying nodes.  Pre-
+# activation the leaf format is byte-identical to the legacy hash
+# (the new field is defaulted to 0 and excluded from the hash by a
+# height gate inside _leaf_value).
+#
+# Halving + deflation-floor retirement: post-activation, both legacy
+# levers are bypassed.  calculate_block_reward() routes through the
+# controller and returns its output directly; the BLOCK_REWARD /
+# HALVING_INTERVAL / BLOCK_REWARD_FLOOR / DEFLATION_FLOOR_V2 paths are
+# never read post-fork.  Constants retained as imports because the
+# legacy code path remains live for replay of pre-fork heights.
+#
+# Activation: DORMANCY_CONTROLLER_HEIGHT = 5934 — +700 spacing above
+# Tier 46 (5234), matching the cohort spacing used throughout the
+# recent fork ladder.  Current mainnet tip is ~860, so live operators
+# have many weeks of runway to upgrade.
+
+# Activation height for the controller and all dormancy bookkeeping.
+DORMANCY_CONTROLLER_HEIGHT = 5934  # Tier 47 — +700 spacing above Tier 46 (5234)
+
+# Dormancy window: how long a balance can sit idle before its weight
+# tapers out of active_supply.  Set on the centuries horizon per
+# CLAUDE.md anchor — decades, not years.  At 600s/block this is
+# 1_314_000 blocks ≈ 25 years.  Loosening later (raising the window)
+# only un-reclassifies dormant balances; tightening it reclassifies
+# live holders, which is the operationally harder direction — so
+# pick conservatively at fork time.
+DORMANCY_WINDOW_BLOCKS = 1_314_000
+
+# Smooth taper width.  A balance whose age is within the last
+# TAPER_BLOCKS of the WINDOW gets a linearly-decreasing weight from
+# 10_000 bps down to 0 bps.  Avoids a cliff at exactly WINDOW where a
+# balance flips from 100% active to 0% active in one block, which
+# would create a controller jitter and a perverse incentive to time
+# transactions exactly at the boundary.  10% of the window
+# (~2.5 years at 600s blocks) is generous.
+DORMANCY_TAPER_BLOCKS = 131_400
+
+# Target nominal active supply — the value the controller targets
+# forever.  Set to GENESIS_SUPPLY (140M) so the chain's active-supply
+# economic constant aligns with its founding parameter.  Governance
+# may retune via a future fork; the fixed-target shape is anchored.
+DORMANCY_TARGET_ACTIVE_SUPPLY = 140_000_000
+
+# Controller gain.  Per-block issuance = gap * K_NUM // K_DEN, where
+# gap = TARGET - active_supply.  K = 1/100_000 chosen so the
+# controller halves the gap every ~16 months at 600s/block — fast
+# enough to track meaningful drift, slow enough that a transient burn
+# spike doesn't crash issuance up to the per-block ceiling.
+# Governance can retune via a future fork.
+DORMANCY_CONTROLLER_K_NUM = 1
+DORMANCY_CONTROLLER_K_DEN = 100_000
+
+# Per-block issuance ceiling.  Hard cap so a pathological state
+# (active_supply briefly far below target due to a bug or large slash)
+# can't trigger a runaway mint.  64 tokens/block is 4× the legacy
+# pre-halving BLOCK_REWARD (16) and 16× the legacy floor (4) — gives
+# the controller plenty of headroom to refill while still bounding
+# worst-case issuance to a known number.
+DORMANCY_MAX_ISSUANCE_PER_BLOCK = 64
+
+assert DORMANCY_CONTROLLER_HEIGHT > AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, (
+    "DORMANCY_CONTROLLER_HEIGHT must follow Tier 46 — operators upgrade "
+    "through prior forks before the controller binds, and the +700 "
+    "cohort spacing is preserved"
+)
+assert 0 < DORMANCY_TAPER_BLOCKS < DORMANCY_WINDOW_BLOCKS, (
+    "DORMANCY_TAPER_BLOCKS must be a non-empty proper subset of the "
+    "window — taper width must leave a non-empty 'fully active' interval"
+)
+assert DORMANCY_CONTROLLER_K_NUM > 0 and DORMANCY_CONTROLLER_K_DEN > 0, (
+    "controller gain must be positive — a zero or negative gain breaks "
+    "the supply-replenishment invariant"
+)
+assert DORMANCY_TARGET_ACTIVE_SUPPLY > 0, (
+    "DORMANCY_TARGET_ACTIVE_SUPPLY must be positive — a zero or "
+    "negative target makes 'gap' negative for any positive supply, "
+    "and the controller would never mint"
+)
+assert DORMANCY_MAX_ISSUANCE_PER_BLOCK > 0, (
+    "DORMANCY_MAX_ISSUANCE_PER_BLOCK must be positive — a zero ceiling "
+    "would prevent the controller from ever minting, defeating the "
+    "purpose of the entire fork"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Finality-vote reward from issuance (hard fork)
 # ─────────────────────────────────────────────────────────────────────
 # Latent economic failure in the shipped code: the

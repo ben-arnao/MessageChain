@@ -259,15 +259,18 @@ class TestHalvingStillWorks(unittest.TestCase):
     """Halving schedule should still produce meaningful halvings."""
 
     def test_halvings_with_floor(self):
+        """Pre-Tier-47 invariant — pinned to legacy helper because
+        post-Tier-47 the halving schedule is retired in favor of the
+        dormancy controller."""
         from messagechain.economics.inflation import SupplyTracker
         from messagechain.config import BLOCK_REWARD_FLOOR
         tracker = SupplyTracker()
-        self.assertEqual(tracker.calculate_block_reward(0), 16)
-        self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL), 8)
-        self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL * 2), BLOCK_REWARD_FLOOR)
+        self.assertEqual(tracker._calculate_legacy_block_reward(0), 16)
+        self.assertEqual(tracker._calculate_legacy_block_reward(HALVING_INTERVAL), 8)
+        self.assertEqual(tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 2), BLOCK_REWARD_FLOOR)
         # After hitting floor, reward stays at floor
-        self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL * 3), BLOCK_REWARD_FLOOR)
-        self.assertEqual(tracker.calculate_block_reward(HALVING_INTERVAL * 100), BLOCK_REWARD_FLOOR)
+        self.assertEqual(tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 3), BLOCK_REWARD_FLOOR)
+        self.assertEqual(tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 100), BLOCK_REWARD_FLOOR)
 
 
 class TestChainGrowthAnalysis(unittest.TestCase):

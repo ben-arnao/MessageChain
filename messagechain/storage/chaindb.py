@@ -592,6 +592,21 @@ class ChainDB:
                 amount INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Tier-47 dormancy controller: per-entity last-activity
+            -- height for compute_active_supply().  Mirrors
+            -- SupplyTracker.last_active_heights so cold restart
+            -- rehydrates the same dict — without this a restart would
+            -- zero every entry and active_supply would silently
+            -- collapse on the restarted node, forking consensus at
+            -- the next mint.  Pre-fork the table stays empty (the
+            -- bump helper short-circuits below DORMANCY_CONTROLLER_
+            -- HEIGHT).  Additive — no migration of legacy balance
+            -- rows is required.
+            CREATE TABLE IF NOT EXISTS entity_last_active (
+                entity_id BLOB PRIMARY KEY,
+                last_active_height INTEGER NOT NULL DEFAULT 0
+            );
+
             -- Pending unbonding tickets for every validator that has
             -- called unstake() but whose UNBONDING_PERIOD hasn't elapsed.
             -- Tokens have been debited from `staked` but not yet
@@ -1243,6 +1258,64 @@ class ChainDB:
     def get_all_staked(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, amount FROM staked WHERE amount > 0")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Tier-47 dormancy (entity_last_active) ────────────────
+
+    def set_last_active_height(
+        self, entity_id: bytes, height: int,
+    ) -> None:
+        """Persist one entity's last-activity height.
+
+        INSERT OR REPLACE matches the in-memory monotonic-bump
+        semantics: if a re-apply (reorg replay) writes a height >=
+        the previously-persisted value, the row is updated; if the
+        replay writes a smaller height, the row is rewritten with
+        the smaller value (which the canonical replay then bumps
+        back up via subsequent block applies).  Caller is responsible
+        for monotonicity at the in-memory layer; persistence simply
+        mirrors whatever the dict says.
+
+        ``_maybe_commit`` mirrors the pending_unstakes / set_balance
+        pattern: a stand-alone call commits immediately, but a call
+        inside an outer ``begin_transaction`` scope is held until
+        ``commit_transaction`` so atomicity is preserved.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO entity_last_active "
+            "(entity_id, last_active_height) VALUES (?, ?)",
+            (entity_id, int(height)),
+        )
+        self._maybe_commit()
+
+    def clear_last_active_height(self, entity_id: bytes) -> None:
+        """Remove one entity from the dormancy table.
+
+        Used by reorg rollback paths when a reorg past the activation
+        block un-flips the backfill flag and returns the dict to its
+        pre-fork empty state.  Called per-entity rather than truncating
+        the whole table so an in-flight rollback that only crosses
+        SOME of the post-fork blocks (the common case) leaves
+        unrelated entities untouched.
+        """
+        self._conn.execute(
+            "DELETE FROM entity_last_active WHERE entity_id = ?",
+            (entity_id,),
+        )
+        self._maybe_commit()
+
+    def get_all_last_active_heights(self) -> dict[bytes, int]:
+        """Rehydrate the dormancy map on cold start.
+
+        Returns the same shape as SupplyTracker.last_active_heights
+        — entity_id → last_active_height.  Pre-fork the table is
+        empty and the call returns {}.  Post-fork, every entity that
+        was either backfilled at activation or bumped by a signed
+        action is included.
+        """
+        cur = self._conn.execute(
+            "SELECT entity_id, last_active_height FROM entity_last_active"
+        )
+        return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
 
     # ── State: Pending Unstakes ──────────────────────────────────
     # Unbonding queue per validator.  Tokens here have been debited

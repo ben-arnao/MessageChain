@@ -4,6 +4,107 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.53.0] — 2026-05-04
+
+Coordinated hard fork — Tier 47 (DORMANCY_CONTROLLER_HEIGHT = 5934).
+Replaces the legacy halving + deflation-floor schedule with a
+dormancy-filtered active-supply controller.  Anchored in CLAUDE.md
+"Issuance targets a stable active supply, not a fixed schedule": the
+chain's nominal token unit must hold its real economic weight across
+centuries, so `X tokens` means roughly `X tokens` to a current user a
+hundred years from now.
+
+### Mechanism
+
+  * **`active_supply` is dormancy-filtered.**  Every entity carries a
+    `last_active_height` stamp; balances whose owner has not signed an
+    outgoing tx, attested, or proposed within `DORMANCY_WINDOW_BLOCKS`
+    (~25yr at 600s blocks) taper out of `active_supply`, with a
+    `DORMANCY_TAPER_BLOCKS` linear taper to avoid a cliff.  Receiving
+    tokens does NOT count as activity by design — that would let an
+    attacker keep dormant wallets active by sending dust.  Dormant
+    balances are never confiscated; they continue to exist with their
+    full balance and rejoin `active_supply` the moment the owner
+    transacts (Bitcoin's "lost coins" treatment, made explicit at the
+    protocol level).
+
+  * **Issuance is a proportional refill controller.**  Per-block
+    issuance = `min(MAX_ISSUANCE_PER_BLOCK, gap × K_NUM // K_DEN)`
+    where `gap = max(0, TARGET_ACTIVE_SUPPLY - active_supply)`.  At
+    target the controller mints zero — validators run on fees alone,
+    which is the long-term design intent (the fee market is the
+    security budget; issuance's purpose is supply integrity, not
+    validator pay).  Halving + deflation-floor (`BLOCK_REWARD`,
+    `HALVING_INTERVAL`, `BLOCK_REWARD_FLOOR`,
+    `TARGET_CIRCULATING_SUPPLY_FLOOR`, `DEFLATION_FLOOR_V2_HEIGHT`)
+    are bypassed at and above `DORMANCY_CONTROLLER_HEIGHT`.  The
+    legacy schedule is preserved byte-for-byte below the activation
+    height for re-validation of historical blocks via the
+    extracted `_calculate_legacy_block_reward` helper.
+
+  * **Activation backfill.**  At exactly
+    `DORMANCY_CONTROLLER_HEIGHT`, every entity with a non-zero balance
+    or stake is stamped with `last_active_height = activation_height`
+    in one shot (idempotent via the new `dormancy_backfill_applied`
+    flag, same reorg-safe pattern as `treasury_rebase_applied` /
+    `grandfather_applied`).  At activation `gap ≈ 0`, so the
+    controller starts from a defined baseline rather than minting
+    its full ceiling.
+
+### Implementation
+
+  * `messagechain/config.py` adds `DORMANCY_CONTROLLER_HEIGHT`,
+    `DORMANCY_WINDOW_BLOCKS`, `DORMANCY_TAPER_BLOCKS`,
+    `DORMANCY_TARGET_ACTIVE_SUPPLY`, `DORMANCY_CONTROLLER_K_NUM`,
+    `DORMANCY_CONTROLLER_K_DEN`, `DORMANCY_MAX_ISSUANCE_PER_BLOCK`
+    with full anchor rationale and ordering / sanity assertions.
+  * `messagechain/economics/inflation.py` extends `SupplyTracker`
+    with `last_active_heights`, `dormancy_backfill_applied`,
+    `bump_active`, `_dormancy_weight_bps`, `compute_active_supply`,
+    `compute_dormancy_issuance`, and routes `calculate_block_reward`
+    through the controller post-fork.
+  * `messagechain/core/state_tree.py` folds `last_active_height`
+    into `_leaf_value()` via the "0 contributes nothing" data-driven
+    convention so pre-Tier-47 leaves hash byte-identically to the
+    legacy format and the state-shape transition rides on the data
+    flipping from default to non-default at activation.
+  * `messagechain/core/blockchain.py` adds `_iter_block_signers`
+    and `_apply_dormancy_for_block`, with the apply-path call wired
+    into `_apply_block_state` and the sim-path mirror wired into
+    `compute_post_state_root` (sim/apply lockstep).  Snapshot /
+    restore and `_persist_state` flush both `last_active_heights`
+    and `dormancy_backfill_applied` for reorg + cold-restart safety.
+  * `messagechain/storage/chaindb.py` adds the additive
+    `entity_last_active` table plus `set_last_active_height`,
+    `clear_last_active_height`, `get_all_last_active_heights`.
+    `bump_active` mirrors writes through to disk; cold start loads
+    via `_load_from_db`.
+  * `get_supply_stats` exposes `active_supply`,
+    `dormancy_target_active_supply`, `dormancy_gap`,
+    `dormancy_window_blocks`, `dormancy_taper_blocks`,
+    `dormancy_controller_height`, and `dormancy_backfill_applied`.
+
+### Tests
+
+  * `tests/test_dormancy_controller_tier47.py` — 47 new tests
+    covering taper boundaries, controller output, pre-fork legacy
+    schedule, leaf hash backwards-compat, bump monotonicity,
+    activation backfill (one-shot + idempotent + pre-fork no-op),
+    reorg snapshot/restore round-trip, ChainDB persistence
+    round-trip, and the signer dispatcher.
+  * Full suite: 5004 passed, 24 skipped.
+
+### Operator notes
+
+Activation height 5934 is `+700` above Tier 46 (5234) and gives every
+live operator multiple weeks of runway at the current ~860-block
+tip.  Pre-activation behavior is byte-identical to 1.52.0; running a
+1.53.0 binary on a chain that hasn't crossed 5934 yet produces the
+same blocks as 1.52.0 would.  The controller's tuning constants are
+in code (not CLAUDE.md) and may be retuned by future governance
+forks; the SHAPE — dormancy-filtered active supply + supply-
+replenishing controller — is anchored.
+
 ## [1.52.0] — 2026-05-04
 
 Minor release.  Closes the entire defect class that drove the

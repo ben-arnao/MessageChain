@@ -969,6 +969,17 @@ class Blockchain:
         # the new binary.
         if hasattr(self.db, "get_all_pending_unstakes"):
             self.supply.pending_unstakes = self.db.get_all_pending_unstakes()
+        # Tier-47 dormancy load — without this, a cold-booted node
+        # starts with an empty ``last_active_heights`` dict while the
+        # state-tree leaf format expects the per-entity stamps, so
+        # active_supply collapses on the restarted node and the next
+        # mint produces a different controller output than peer nodes.
+        # ``hasattr`` gate keeps pre-fork chain.db files (no
+        # entity_last_active table) loadable under the new binary.
+        if hasattr(self.db, "get_all_last_active_heights"):
+            self.supply.last_active_heights = (
+                self.db.get_all_last_active_heights()
+            )
         self.supply.total_supply = self.db.get_supply_meta("total_supply")
         self.supply.total_minted = self.db.get_supply_meta("total_minted")
         self.supply.total_fees_collected = self.db.get_supply_meta("total_fees_collected")
@@ -1640,6 +1651,19 @@ class Blockchain:
                 self.db.set_balance(eid, bal)
             for eid, stk in _scoped(self.supply.staked):
                 self.db.set_staked(eid, stk)
+            # Tier-47 dormancy persistence.  bump_active mirrors per-
+            # bump into the table directly (so the bump is visible to a
+            # crash-restart even before the next persist), but a flush
+            # via _persist_state is also issued here to cover paths
+            # that mutate ``last_active_heights`` without going through
+            # bump_active — notably the activation backfill loop and
+            # reorg-restore — and to keep the scoped-flush contract
+            # uniform with balances / staked.  ``hasattr`` gate keeps
+            # legacy chain.db files (no entity_last_active table)
+            # loadable under the new binary.
+            if hasattr(self.db, "set_last_active_height"):
+                for eid, lah in _scoped(self.supply.last_active_heights):
+                    self.db.set_last_active_height(eid, lah)
             for eid, nonce in _scoped(self.nonces):
                 self.db.set_nonce(eid, nonce)
             for eid, pk in _scoped(self.public_keys):
@@ -4891,6 +4915,7 @@ class Blockchain:
                 rotation_count=self.key_rotation_counts.get(eid, 0),
                 is_revoked=(eid in self.revoked_entities),
                 is_slashed=(eid in self.slashed_validators),
+                last_active_height=self.supply.last_active_heights.get(eid, 0),
             )
 
     def _rebuild_state_tree(self):
@@ -4923,6 +4948,7 @@ class Blockchain:
             | set(self.public_keys) | set(self.leaf_watermarks)
             | set(self.key_rotation_counts) | set(self.revoked_entities)
             | set(self.slashed_validators)
+            | set(self.supply.last_active_heights)
         )
         # Drop entries the tree holds that have been deleted from live.
         tree_keys = set(self.state_tree._accounts.keys())
@@ -4941,6 +4967,7 @@ class Blockchain:
                 rotation_count=self.key_rotation_counts.get(eid, 0),
                 is_revoked=(eid in self.revoked_entities),
                 is_slashed=(eid in self.slashed_validators),
+                last_active_height=self.supply.last_active_heights.get(eid, 0),
             )
 
     def compute_current_state_root(self) -> bytes:
@@ -5097,6 +5124,47 @@ class Blockchain:
         sim_rotation_counts = dict(self.key_rotation_counts)
         sim_revoked = set(self.revoked_entities)
         sim_slashed = set(self.slashed_validators)
+        # Tier-47 dormancy mirror: the apply path bumps every signed
+        # actor's last_active_height in this block via
+        # _apply_dormancy_for_block; sim must mirror those bumps so
+        # the leaf hash agrees with the apply-path leaf hash post-
+        # fork.  Pre-DORMANCY_CONTROLLER_HEIGHT _apply_dormancy_for_
+        # block short-circuits — sim mirrors the same gate below.
+        from messagechain.config import (
+            DORMANCY_CONTROLLER_HEIGHT as _DORMANCY_HEIGHT,
+        )
+        sim_last_active_heights = dict(self.supply.last_active_heights)
+        sim_dormancy_backfill_applied = self.supply.dormancy_backfill_applied
+        if block_height >= _DORMANCY_HEIGHT:
+            # Backfill mirror — same shape as the apply-path one-shot.
+            if not sim_dormancy_backfill_applied:
+                stamp_height = _DORMANCY_HEIGHT
+                for _eid in set(sim_balances) | set(sim_staked):
+                    if _eid not in sim_last_active_heights:
+                        sim_last_active_heights[_eid] = stamp_height
+                sim_dormancy_backfill_applied = True
+            # Per-block signer bumps — must match the apply-path
+            # _iter_block_signers for the same block byte-for-byte.
+            for _sid in self._iter_block_signers(
+                proposer_id=proposer_id,
+                transactions=transactions,
+                transfer_transactions=transfer_transactions or [],
+                attestations=attestations or [],
+                authority_txs=authority_txs or [],
+                stake_transactions=stake_transactions or [],
+                unstake_transactions=unstake_transactions or [],
+                react_transactions=react_transactions or [],
+                governance_txs=governance_txs or [],
+                finality_votes=finality_votes or [],
+                custody_proofs=custody_proofs or [],
+                slash_transactions=slash_transactions or [],
+                censorship_evidence_txs=censorship_evidence_txs or [],
+                bogus_rejection_evidence_txs=bogus_rejection_evidence_txs or [],
+                non_response_evidence_txs=non_response_evidence_txs or [],
+                inclusion_list_violation_evidence_txs=inclusion_list_violation_evidence_txs or [],
+            ):
+                if _sid and sim_last_active_heights.get(_sid, 0) < block_height:
+                    sim_last_active_heights[_sid] = block_height
         current_base_fee = self.supply.base_fee
 
         # ATTESTER_FEE_FUNDING_HEIGHT hard-fork mirror: the apply path's
@@ -7255,12 +7323,15 @@ class Blockchain:
             | set(sim_rotation_counts)
             | set(sim_revoked)
             | set(sim_slashed)
+            | set(sim_last_active_heights)
         )
         self.state_tree.begin()
         try:
             for eid in touched_keys:
                 # Build the full committed-tuple shape the SMT leaf uses
                 # (see SparseMerkleTree._DEFAULT_AUTH for field order).
+                # Index 9 (Tier 47) is last_active_height — see
+                # SparseMerkleTree._DEFAULT_AUTH.
                 new_tuple = (
                     sim_balances.get(eid, 0),
                     sim_nonces.get(eid, 0),
@@ -7271,6 +7342,7 @@ class Blockchain:
                     sim_rotation_counts.get(eid, 0),
                     eid in sim_revoked,
                     eid in sim_slashed,
+                    sim_last_active_heights.get(eid, 0),
                 )
                 # Fast path: if the committed leaf already matches the
                 # sim value, the set() would be a no-op anyway — skip
@@ -7287,6 +7359,7 @@ class Blockchain:
                     rotation_count=new_tuple[6],
                     is_revoked=new_tuple[7],
                     is_slashed=new_tuple[8],
+                    last_active_height=new_tuple[9],
                 )
             entity_root = self.state_tree.root()
         finally:
@@ -10612,6 +10685,180 @@ class Blockchain:
         "inclusion_list_violation_evidence_txs",
     )
 
+    # Tier-47 dormancy registry: per tx-kind, the attribute that names
+    # the SIGNER (the entity whose action proves they are alive).
+    # Receivers / targets are intentionally NOT here — receiving tokens
+    # or being the target of a react does not prove the holder of that
+    # entity's keys is alive, and including them would let an attacker
+    # keep dormant wallets out of the dormancy filter by sending them
+    # dust.  See CLAUDE.md "Issuance targets a stable active supply"
+    # anchor.
+    #
+    # When a new tx kind is appended to ``_BLOCK_TX_LIST_ATTRS``, also
+    # register its signer field here — the structural-guard test in
+    # ``tests/test_dormancy_signer_registry.py`` (added with Tier 47)
+    # fails at CI when a new kind ships without an entry.  A tx kind
+    # that legitimately has no signer (a system / synthetic event)
+    # registers as ``None`` and contributes nothing to dormancy.
+    _DORMANCY_SIGNER_ATTRS: dict[str, str | None] = {
+        "transactions": "entity_id",
+        "transfer_transactions": "entity_id",
+        "slash_transactions": "submitter_id",
+        "attestations": "validator_id",
+        "authority_txs": "entity_id",
+        "stake_transactions": "entity_id",
+        "unstake_transactions": "entity_id",
+        "react_transactions": "voter_id",
+        "governance_txs": None,  # mixed shape (proposer_id / voter_id) — handled by special-case below
+        "finality_votes": "signer_entity_id",
+        "custody_proofs": "prover_id",
+        "censorship_evidence_txs": "submitter_id",
+        "bogus_rejection_evidence_txs": "submitter_id",
+        "non_response_evidence_txs": "submitter_id",
+        "inclusion_list_violation_evidence_txs": "submitter_id",
+    }
+
+    @staticmethod
+    def _signer_of(tx) -> bytes | None:
+        """Return the entity_id whose action this tx represents, or None.
+
+        Used by the dormancy bump dispatcher.  A tx kind whose signer
+        attribute is not in the registry contributes nothing to
+        dormancy (defensive fallback).  Governance txs are a polymorphic
+        sub-tree (ProposalTransaction.proposer_id, VoteTransaction.
+        voter_id, TreasurySpendTransaction.proposer_id) — covered here
+        by attribute probing rather than registry-table since one
+        entry can't capture all three.
+        """
+        for attr in ("voter_id", "proposer_id", "entity_id", "validator_id",
+                     "submitter_id", "signer_entity_id", "prover_id"):
+            v = getattr(tx, attr, None)
+            if isinstance(v, (bytes, bytearray)):
+                return bytes(v)
+        return None
+
+    def _iter_block_signers(
+        self,
+        *,
+        proposer_id: bytes,
+        transactions=(),
+        transfer_transactions=(),
+        attestations=(),
+        authority_txs=(),
+        stake_transactions=(),
+        unstake_transactions=(),
+        react_transactions=(),
+        governance_txs=(),
+        finality_votes=(),
+        custody_proofs=(),
+        slash_transactions=(),
+        censorship_evidence_txs=(),
+        bogus_rejection_evidence_txs=(),
+        non_response_evidence_txs=(),
+        inclusion_list_violation_evidence_txs=(),
+    ):
+        """Yield every entity that signed something in this block.
+
+        Used by both the apply path (via _apply_dormancy_bumps reading
+        the live Block) and the sim path (via compute_post_state_root
+        reading the explicit lists).  Two callers, one source of truth
+        for the "signer per tx kind" mapping — sim/apply cannot drift
+        on which signers are counted as active.
+
+        Order is deterministic — proposer first, then per-kind in the
+        canonical ``_BLOCK_TX_LIST_ATTRS`` order, then per-tx in list
+        order.  Bump_active is monotonic so order does not affect the
+        final dict, but a deterministic order matters if a future
+        consumer wants to attribute "first-active-of-block" semantics
+        without re-sorting.
+        """
+        yield proposer_id
+        kind_iter = (
+            ("transactions", transactions),
+            ("transfer_transactions", transfer_transactions),
+            ("slash_transactions", slash_transactions),
+            ("attestations", attestations),
+            ("authority_txs", authority_txs),
+            ("stake_transactions", stake_transactions),
+            ("unstake_transactions", unstake_transactions),
+            ("react_transactions", react_transactions),
+            ("governance_txs", governance_txs),
+            ("finality_votes", finality_votes),
+            ("custody_proofs", custody_proofs),
+            ("censorship_evidence_txs", censorship_evidence_txs),
+            ("bogus_rejection_evidence_txs", bogus_rejection_evidence_txs),
+            ("non_response_evidence_txs", non_response_evidence_txs),
+            ("inclusion_list_violation_evidence_txs",
+             inclusion_list_violation_evidence_txs),
+        )
+        for _attr, lst in kind_iter:
+            if not lst:
+                continue
+            for tx in lst:
+                sid = self._signer_of(tx)
+                if sid:
+                    yield sid
+
+    def _apply_dormancy_for_block(
+        self, block_height: int, signers,
+    ) -> None:
+        """Apply Tier-47 dormancy mutations for a single block.
+
+        Two responsibilities:
+          1. One-shot activation backfill at the fork height — every
+             entity holding a balance or stake at activation gets its
+             ``last_active_heights`` stamped to the activation height
+             (idempotent flag dormancy_backfill_applied; same pattern
+             as treasury_rebase_applied / grandfather_applied).  After
+             this, gap = TARGET - active_supply ≈ TARGET - total_supply
+             at the activation block, so the controller starts from a
+             defined baseline rather than a zeroed-out dict.
+          2. Bump every signer in this block.  bump_active is monotonic
+             so multiple bumps in one block converge on the same value
+             (block_height).
+
+        Pre-DORMANCY_CONTROLLER_HEIGHT this is a no-op.  At and after
+        the activation height the bumps and backfill are required for
+        the controller to see real ``active_supply`` data — without
+        them every entity stays at last_active=0 and (eventually,
+        after WINDOW blocks) silently dormant-outs together.
+
+        Caller (apply path or sim path) is responsible for the height
+        gate; the helper short-circuits cheaply but must not be called
+        with a height below DORMANCY_CONTROLLER_HEIGHT in the apply
+        path because the sim mirror skips it on the same condition,
+        and the two must stay in lockstep.
+        """
+        from messagechain.config import DORMANCY_CONTROLLER_HEIGHT
+        if block_height < DORMANCY_CONTROLLER_HEIGHT:
+            return
+        # One-shot backfill at exactly the activation block.  Every
+        # entity with a non-zero balance OR stake gets stamped at the
+        # activation height; pure-receiver entities with no balance
+        # are skipped (nothing to weight) and acquire a stamp later
+        # only if they sign something themselves.
+        if not self.supply.dormancy_backfill_applied:
+            stamp_height = DORMANCY_CONTROLLER_HEIGHT
+            db_has_last_active = self.supply.db is not None and hasattr(
+                self.supply.db, "set_last_active_height",
+            )
+            for eid in set(self.supply.balances) | set(self.supply.staked):
+                if eid not in self.supply.last_active_heights:
+                    self.supply.last_active_heights[eid] = stamp_height
+                    # Mark dirty so _persist_state flushes the row, AND
+                    # mirror the write directly (same belt-and-suspenders
+                    # pattern as bump_active above) so a crash-restart
+                    # before the end-of-block persist still sees the
+                    # backfilled state.
+                    if self._dirty_entities is not None:
+                        self._dirty_entities.add(eid)
+                    if db_has_last_active:
+                        self.supply.db.set_last_active_height(eid, stamp_height)
+            self.supply.dormancy_backfill_applied = True
+        # Per-block bumps.  bump_active is monotonic.
+        for sid in signers:
+            self.supply.bump_active(sid, block_height)
+
     def _block_affected_entities(self, block: Block) -> set[bytes]:
         """Collect every entity_id whose state_tree leaf this block
         might touch on apply.
@@ -11176,6 +11423,32 @@ class Blockchain:
         # block from a grandfathered entity skips the burn cleanly.
         # Idempotent via ``grandfather_applied``.
         self._apply_registration_grandfather(block.header.block_number)
+
+        # Tier-47 dormancy controller (DORMANCY_CONTROLLER_HEIGHT):
+        # one-shot backfill at the activation block + per-block
+        # signer bumps.  Runs BEFORE the per-tx state mutation loops
+        # so the leaf-hash refresh at end-of-block sees the post-bump
+        # last_active_heights.  Sim path mirrors this in
+        # compute_post_state_root with sim_last_active_heights.
+        block_signers = self._iter_block_signers(
+            proposer_id=proposer_id,
+            transactions=block.transactions,
+            transfer_transactions=block.transfer_transactions,
+            attestations=block.attestations,
+            authority_txs=getattr(block, "authority_txs", ()) or (),
+            stake_transactions=getattr(block, "stake_transactions", ()) or (),
+            unstake_transactions=getattr(block, "unstake_transactions", ()) or (),
+            react_transactions=getattr(block, "react_transactions", ()) or (),
+            governance_txs=getattr(block, "governance_txs", ()) or (),
+            finality_votes=getattr(block, "finality_votes", ()) or (),
+            custody_proofs=getattr(block, "custody_proofs", ()) or (),
+            slash_transactions=getattr(block, "slash_transactions", ()) or (),
+            censorship_evidence_txs=getattr(block, "censorship_evidence_txs", ()) or (),
+            bogus_rejection_evidence_txs=getattr(block, "bogus_rejection_evidence_txs", ()) or (),
+            non_response_evidence_txs=getattr(block, "non_response_evidence_txs", ()) or (),
+            inclusion_list_violation_evidence_txs=getattr(block, "inclusion_list_violation_evidence_txs", ()) or (),
+        )
+        self._apply_dormancy_for_block(block.header.block_number, block_signers)
 
         # Deflation-floor-v2 activation-seed (hard fork, one-shot at
         # DEFLATION_FLOOR_V2_HEIGHT).  Runs BEFORE any fee processing
@@ -14202,6 +14475,22 @@ class Blockchain:
             # for the first ~1K blocks post-activation.  Same reorg-
             # rollback pattern as treasury_rebase_applied.
             "rolling_fee_burn_seeded": self.supply.rolling_fee_burn_seeded,
+            # Tier-47 dormancy controller (DORMANCY_CONTROLLER_HEIGHT):
+            # per-entity last-activity height tracker plus the one-shot
+            # backfill-applied flag.  Reorg that undoes the activation
+            # block MUST un-flip the flag AND restore the pre-backfill
+            # dict, or the canonical replay would skip the backfill
+            # and active_supply would silently diverge between nodes.
+            # Reorg that undoes any post-fork block with bumps MUST
+            # revert those bumps to the pre-block highest height for
+            # each affected entity, or the leaf hash diverges between
+            # the rolled-back replay and a peer that never saw the
+            # orphaned block.  Same reorg-rollback pattern as
+            # treasury_rebase_applied / rolling_fee_burn_seeded.
+            # Shallow dict copy is sufficient (int values are
+            # immutable).
+            "last_active_heights": dict(self.supply.last_active_heights),
+            "dormancy_backfill_applied": self.supply.dormancy_backfill_applied,
             # Seed-divestment lottery redistribution (hard fork):
             # pool of lottery-share tokens accumulated from divested
             # founder stake, awaiting reputation-weighted-lottery
@@ -14577,6 +14866,20 @@ class Blockchain:
         # entry in lockstep.
         self.supply.rolling_fee_burn_seeded = snapshot.get(
             "rolling_fee_burn_seeded", False,
+        )
+        # Tier-47 dormancy state.  Default to empty / False so pre-fork
+        # snapshots restore to the pristine pre-activation state (no
+        # backfill, no bumps).  Both fields move together: a reorg
+        # past the activation block restores the un-backfilled dict
+        # AND un-flips the flag, so the canonical replay re-fires the
+        # backfill cleanly.  Materialize the dict as int values so
+        # equality comparisons with freshly-built dicts work uniformly.
+        self.supply.last_active_heights = {
+            bytes(eid): int(h)
+            for eid, h in snapshot.get("last_active_heights", {}).items()
+        }
+        self.supply.dormancy_backfill_applied = snapshot.get(
+            "dormancy_backfill_applied", False,
         )
         # Lottery prize pool — reorg rollback restores the pre-reorg
         # accumulation / drain state so the canonical replay produces

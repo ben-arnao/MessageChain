@@ -63,6 +63,13 @@ from messagechain.config import (
     REWARD_CURVE_SMOOTH_V2_PEAK_NUM,
     REWARD_CURVE_SMOOTH_V2_FLOOR_NUM,
     REWARD_CURVE_SMOOTH_V2_SCALE_BPS,
+    DORMANCY_CONTROLLER_HEIGHT,
+    DORMANCY_WINDOW_BLOCKS,
+    DORMANCY_TAPER_BLOCKS,
+    DORMANCY_TARGET_ACTIVE_SUPPLY,
+    DORMANCY_CONTROLLER_K_NUM,
+    DORMANCY_CONTROLLER_K_DEN,
+    DORMANCY_MAX_ISSUANCE_PER_BLOCK,
 )
 
 
@@ -582,12 +589,210 @@ class SupplyTracker:
         # win; the tunnel is a fallback only.
         self._current_block_height: int | None = None
 
+        # Dormancy-controller hard fork (DORMANCY_CONTROLLER_HEIGHT,
+        # Tier 47): per-entity last-activity height for the dormancy
+        # filter that drives compute_active_supply().  Bumped by
+        # bump_active() on every signed action by the entity (outgoing
+        # tx, attestation, block proposal — incoming transfers do NOT
+        # count, by design, so an attacker can't keep dormant wallets
+        # "active" by sending dust).
+        #
+        # Consensus-visible state: folded into _leaf_value() at and
+        # above DORMANCY_CONTROLLER_HEIGHT (height-gated so pre-fork
+        # leaf hashes are byte-identical to the legacy format), and
+        # snapshotted alongside balances for reorg safety.  Persisted
+        # to chaindb so cold restart rehydrates the same dormancy
+        # state — without persistence a restart would zero every
+        # entry and active_supply would silently collapse to 0 on
+        # the restarted node, forking consensus at the next mint.
+        #
+        # Lifecycle: empty pre-activation.  At
+        # DORMANCY_CONTROLLER_HEIGHT, ``_apply_dormancy_backfill``
+        # stamps every existing balance-holder with the activation
+        # height in one shot (idempotent flag below).  From then on,
+        # bump_active() updates entries in lockstep with apply-path
+        # activity; entries are never deleted (dormant balances stay
+        # in the dict at their last-active-height value forever, so
+        # the dormancy filter can recompute their weight on demand).
+        self.last_active_heights: dict[bytes, int] = {}
+
+        # One-shot guard for the activation backfill at
+        # DORMANCY_CONTROLLER_HEIGHT.  Same pattern as
+        # ``treasury_rebase_applied`` and ``grandfather_applied``:
+        # snapshotted with the supply state for reorg safety so a
+        # reorg past the activation block un-flips this flag and
+        # the canonical replay re-fires the backfill cleanly.
+        self.dormancy_backfill_applied: bool = False
+
     def get_balance(self, entity_id: bytes) -> int:
         """Get spendable (non-staked) balance."""
         return self.balances.get(entity_id, 0)
 
     def get_staked(self, entity_id: bytes) -> int:
         return self.staked.get(entity_id, 0)
+
+    # ─── Dormancy controller (Tier 47, DORMANCY_CONTROLLER_HEIGHT) ──
+    #
+    # Three primitives drive the post-fork supply-replenishing
+    # controller:
+    #
+    #   1. bump_active(eid, height) — record an entity's signed action
+    #   2. compute_active_supply(current_height) — dormancy-filtered Σ
+    #   3. compute_dormancy_issuance(current_height) — controller mint
+    #
+    # All three are pure functions of (in-memory state, current_height)
+    # and contain no I/O, so they are safe to call from both the sim
+    # path (compute_post_state_root) and the apply path
+    # (_apply_block_state) — sim/apply stay in lockstep automatically,
+    # mirroring the calculate_block_reward pattern above.
+
+    def bump_active(self, entity_id: bytes, height: int) -> None:
+        """Record that ``entity_id`` was active at ``height``.
+
+        Monotonic: a later height always wins.  An equal-height bump
+        is a no-op (an entity active at h is still active at h, no
+        meaningful state change).  An earlier-height bump is silently
+        ignored — this guards against an out-of-order reorg replay
+        accidentally rolling activity backwards; the canonical replay
+        always sees the highest height for any given (entity, action)
+        pair last.
+
+        Pre-activation callers can invoke this freely — the dict
+        accumulates state, but nothing reads it until
+        compute_active_supply() is called from a post-activation gate
+        in calculate_block_reward().  Cheap to call unconditionally.
+
+        Mirrors the bump into the chaindb ``entity_last_active`` table
+        when ``self.db`` is set (production path).  Without persistence
+        a cold restart would zero every entry and active_supply would
+        silently collapse on the restarted node, forking consensus at
+        the next mint.  Test contexts that don't set ``self.db``
+        skip the mirror — the in-memory dict is sufficient there.
+        """
+        prev = self.last_active_heights.get(entity_id, 0)
+        if height > prev:
+            self.last_active_heights[entity_id] = height
+            if self.db is not None:
+                self.db.set_last_active_height(entity_id, height)
+
+    def _dormancy_weight_bps(self, age: int) -> int:
+        """Integer-deterministic dormancy weight in basis points.
+
+        Helper for compute_active_supply().  Pulled out so the taper
+        math is independently unit-testable without constructing a
+        full balance state.  See CLAUDE.md anchor for the smooth-
+        taper rationale (avoid a cliff at exactly WINDOW that would
+        flip a balance from 100% active to 0% in one block).
+
+            age <  WINDOW - TAPER     → 10_000 (full active)
+            WINDOW - TAPER ≤ age < WINDOW → linear interp 10_000 → 0
+            age ≥ WINDOW              → 0 (fully dormant)
+
+        Negative ``age`` (last_active is in the future, normally
+        impossible) clamps to 0 — defensive only, the apply path
+        never produces this state because bump_active is monotonic
+        and is called BEFORE the height advances.
+        """
+        if age < 0:
+            return 10_000
+        cliff = DORMANCY_WINDOW_BLOCKS - DORMANCY_TAPER_BLOCKS
+        if age < cliff:
+            return 10_000
+        if age >= DORMANCY_WINDOW_BLOCKS:
+            return 0
+        # Linear taper: at age == cliff weight is 10_000, at age ==
+        # WINDOW weight is 0.  Integer math is exact at endpoints
+        # because (WINDOW - age) at age==cliff is TAPER, and
+        # 10_000 * TAPER // TAPER == 10_000.
+        return (10_000 * (DORMANCY_WINDOW_BLOCKS - age)) // DORMANCY_TAPER_BLOCKS
+
+    def compute_active_supply(self, current_height: int) -> int:
+        """Sum of balances weighted by recency-of-activity.
+
+        Iterates ``self.balances`` once.  An entity's contribution to
+        active_supply is ``balance * weight_bps // 10_000`` where the
+        weight is computed from ``current_height - last_active``.  An
+        entity whose ``last_active_heights`` entry is missing
+        (genesis-era balance never bumped, or the missing default
+        case) is treated as last-active=0, i.e. potentially fully
+        dormant — but the activation backfill at
+        DORMANCY_CONTROLLER_HEIGHT seeds every existing balance-
+        holder so this default only affects pre-activation callers
+        and post-activation entities that received tokens but never
+        signed an outgoing action (which is exactly the lost-keys
+        case the dormancy filter is meant to detect).
+
+        Staked balances are also weighted: staking IS activity at the
+        time it happens (the entity signed a stake tx, bumping
+        last_active), but a staker who hasn't signed anything since
+        — no attestations, no proposals, no rotations — eventually
+        falls out of active_supply just like a regular hodler.  In
+        practice no live validator goes that long without attesting.
+
+        Pre-activation callers (block_height < DORMANCY_CONTROLLER_HEIGHT)
+        can still call this — it returns a meaningful value based on
+        whatever bump_active calls have happened — but the returned
+        value is NOT consensus-critical pre-fork because
+        calculate_block_reward gates the controller on the activation
+        height.
+        """
+        total: int = 0
+        # Sum spendable + staked: staked balances are real tokens
+        # that should count toward active_supply when their owner is
+        # active.  See _treat_stake_as_active rationale in CLAUDE.md.
+        for eid, balance in self.balances.items():
+            if balance <= 0:
+                continue
+            last_active = self.last_active_heights.get(eid, 0)
+            age = current_height - last_active
+            weight_bps = self._dormancy_weight_bps(age)
+            if weight_bps == 0:
+                continue
+            if weight_bps == 10_000:
+                total += balance
+            else:
+                total += (balance * weight_bps) // 10_000
+        for eid, staked in self.staked.items():
+            if staked <= 0:
+                continue
+            last_active = self.last_active_heights.get(eid, 0)
+            age = current_height - last_active
+            weight_bps = self._dormancy_weight_bps(age)
+            if weight_bps == 0:
+                continue
+            if weight_bps == 10_000:
+                total += staked
+            else:
+                total += (staked * weight_bps) // 10_000
+        return total
+
+    def compute_dormancy_issuance(self, current_height: int) -> int:
+        """Per-block issuance under the Tier 47 controller.
+
+        Replaces calculate_block_reward at and above
+        DORMANCY_CONTROLLER_HEIGHT.  Computed as
+
+            gap = max(0, TARGET - active_supply(current_height))
+            issuance = min(MAX_ISSUANCE_PER_BLOCK,
+                           gap * K_NUM // K_DEN)
+
+        At target (active_supply ≥ TARGET) the gap is zero and the
+        controller mints zero — validators run on fees alone, which is
+        the long-term design intent (the fee market is the security
+        budget; issuance's purpose is supply integrity, not pay).
+
+        Caller (calculate_block_reward) is responsible for the
+        height-gate: pre-DORMANCY_CONTROLLER_HEIGHT this function is
+        not invoked, so legacy halving + deflation-floor behavior is
+        preserved byte-for-byte for re-validation of historical
+        blocks.
+        """
+        active = self.compute_active_supply(current_height)
+        gap = DORMANCY_TARGET_ACTIVE_SUPPLY - active
+        if gap <= 0:
+            return 0
+        raw_issuance = (gap * DORMANCY_CONTROLLER_K_NUM) // DORMANCY_CONTROLLER_K_DEN
+        return min(DORMANCY_MAX_ISSUANCE_PER_BLOCK, raw_issuance)
 
     def calculate_block_reward(self, block_height: int) -> int:
         """
@@ -627,6 +832,28 @@ class SupplyTracker:
         truth called by both the sim path (compute_post_state_root)
         and the apply path (_apply_block_state / mint_block_reward),
         so sim/apply stay in lockstep automatically.
+
+        Tier 47 (DORMANCY_CONTROLLER_HEIGHT): at and above the
+        activation height the controller short-circuits halving +
+        deflation-floor entirely.  Issuance is governed solely by
+        the gap between TARGET_ACTIVE_SUPPLY and the dormancy-
+        filtered active_supply.  Pre-activation behavior is
+        unchanged byte-for-byte (the legacy schedule below is the
+        sole code path).
+        """
+        if block_height >= DORMANCY_CONTROLLER_HEIGHT:
+            return self.compute_dormancy_issuance(block_height)
+        return self._calculate_legacy_block_reward(block_height)
+
+    def _calculate_legacy_block_reward(self, block_height: int) -> int:
+        """Pre-Tier-47 halving + deflation-floor schedule.
+
+        Extracted from calculate_block_reward so re-validation paths
+        for pre-fork blocks (and legacy regression tests) can invoke
+        the legacy formula directly without depending on the post-
+        fork dispatch gate.  Behavior is byte-for-byte identical to
+        the original calculate_block_reward body — the function name
+        was renamed to make the legacy/post-fork split explicit.
         """
         halvings = block_height // HALVING_INTERVAL
         reward = BLOCK_REWARD >> halvings  # integer division by 2^halvings
@@ -1762,6 +1989,8 @@ class SupplyTracker:
         return slashed_amount
 
     def get_supply_stats(self, current_block_height: int = 0) -> dict:
+        active_supply = self.compute_active_supply(current_block_height)
+        dormancy_gap = max(0, DORMANCY_TARGET_ACTIVE_SUPPLY - active_supply)
         return {
             "total_supply": self.total_supply,
             "genesis_supply": GENESIS_SUPPLY,
@@ -1773,4 +2002,17 @@ class SupplyTracker:
             "current_block_reward": self.calculate_block_reward(current_block_height),
             "current_base_fee": self.base_fee,
             "next_halving_block": ((current_block_height // HALVING_INTERVAL) + 1) * HALVING_INTERVAL,
+            # Tier 47 dormancy controller observability.  Pre-activation
+            # `active_supply` is computed against whatever bump_active
+            # calls have happened (typically near-zero since the
+            # backfill hasn't fired); not consensus-critical pre-fork
+            # because calculate_block_reward gates the controller on
+            # the activation height.
+            "active_supply": active_supply,
+            "dormancy_target_active_supply": DORMANCY_TARGET_ACTIVE_SUPPLY,
+            "dormancy_gap": dormancy_gap,
+            "dormancy_window_blocks": DORMANCY_WINDOW_BLOCKS,
+            "dormancy_taper_blocks": DORMANCY_TAPER_BLOCKS,
+            "dormancy_controller_height": DORMANCY_CONTROLLER_HEIGHT,
+            "dormancy_backfill_applied": self.dormancy_backfill_applied,
         }

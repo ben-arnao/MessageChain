@@ -92,6 +92,7 @@ def _leaf_value(
     rotation_count: int = 0,
     is_revoked: bool = False,
     is_slashed: bool = False,
+    last_active_height: int = 0,
 ) -> bytes:
     """Commitment hash for a single account's full state.
 
@@ -112,10 +113,21 @@ def _leaf_value(
 
     All variable-length byte fields (authority_key, public_key) are
     prefixed with a 2-byte length so b"" vs b"\\x00\\x00" cannot collide.
+
+    Tier-47 dormancy fold (DORMANCY_CONTROLLER_HEIGHT): the new
+    ``last_active_height`` field is included in the hash ONLY when it
+    is non-zero.  Convention: 0 means "not-yet-tracked" and contributes
+    nothing to the hash, so pre-Tier-47 entities (whose dormancy state
+    has never been touched) hash byte-identically to the legacy format.
+    Post-Tier-47 entities (stamped by the activation backfill or by an
+    activity bump) get the field length-prefixed and folded into the
+    digest.  This avoids needing a height-gate inside the hash function
+    itself — the state-tree state-shape transition rides on the data
+    itself flipping from default to non-default at activation.
     """
     ak = authority_key or b""
     pk = public_key or b""
-    return _h(
+    base = (
         entity_id
         + struct.pack(">Q", balance)
         + struct.pack(">Q", nonce)
@@ -127,6 +139,15 @@ def _leaf_value(
         + (b"\x01" if is_revoked else b"\x00")
         + (b"\x01" if is_slashed else b"\x00")
     )
+    if last_active_height:
+        # Length-prefixed disambiguation: a future addition of another
+        # optional trailer must follow the same pattern (1-byte tag + Q)
+        # so they cannot ambiguously share the same trailing-byte
+        # signature.  0x01 marks "dormancy trailer present"; absence of
+        # any trailer is byte-identical to the legacy (Tier-46 and
+        # earlier) hash.
+        base += b"\x01" + struct.pack(">Q", last_active_height)
+    return _h(base)
 
 
 def _key_for(entity_id: bytes) -> bytes:
@@ -149,8 +170,12 @@ class SparseMerkleTree:
     # the pre-authority-coverage layout for accounts that never set a
     # cold key, rotated, or got revoked.  Fields:
     #   (authority_key, public_key, leaf_watermark, rotation_count,
-    #    revoked, slashed)
-    _DEFAULT_AUTH = (b"", b"", 0, 0, False, False)
+    #    revoked, slashed, last_active_height)
+    # Tier-47 added last_active_height as the trailing field; default 0
+    # means "not-yet-tracked" and is byte-identical to the legacy
+    # (Tier-46 and earlier) record via _leaf_value's "0 contributes
+    # nothing" convention.
+    _DEFAULT_AUTH = (b"", b"", 0, 0, False, False, 0)
 
     def __init__(self):
         # (level, path_int) -> non-default node hash at that position.
@@ -158,12 +183,16 @@ class SparseMerkleTree:
         self._nodes: dict[tuple[int, int], bytes] = {}
         # entity_id -> full committed tuple:
         #   (balance, nonce, stake, authority_key, public_key,
-        #    leaf_watermark, rotation_count, is_revoked, is_slashed)
+        #    leaf_watermark, rotation_count, is_revoked, is_slashed,
+        #    last_active_height)
         # The tree itself doesn't store accounts, only their committed
         # hashes, so we keep this side-index for reads and for rebuild
-        # from persistence.
+        # from persistence.  Tier-47 added last_active_height as the
+        # trailing field — see _DEFAULT_AUTH for the legacy-compatible
+        # default-zero convention.
         self._accounts: dict[
-            bytes, tuple[int, int, int, bytes, bytes, int, int, bool, bool]
+            bytes,
+            tuple[int, int, int, bytes, bytes, int, int, bool, bool, int],
         ] = {}
         # Cached current root — invalidated on any write.
         self._root_cache: bytes | None = EMPTY_ROOT
@@ -221,7 +250,8 @@ class SparseMerkleTree:
 
         Tuple layout:
             (balance, nonce, stake, authority_key, public_key,
-             leaf_watermark, rotation_count, is_revoked, is_slashed)
+             leaf_watermark, rotation_count, is_revoked, is_slashed,
+             last_active_height)
         """
         return self._accounts.get(entity_id)
 
@@ -251,6 +281,7 @@ class SparseMerkleTree:
         rotation_count: int = 0,
         is_revoked: bool = False,
         is_slashed: bool = False,
+        last_active_height: int = 0,
     ):
         """Upsert an account's committed state.
 
@@ -265,12 +296,18 @@ class SparseMerkleTree:
         authority record" — i.e., no cold key, default public key, no
         revoke, no slash, no rotations.  Blockchain._touch_state is the
         canonical caller and passes every field explicitly.
+
+        Tier-47 added last_active_height as a trailing keyword arg with
+        default 0 (= not-yet-tracked, byte-identical to legacy hash via
+        _leaf_value's data-driven gate).  Existing callers that omit it
+        produce byte-identical leaves to the pre-Tier-47 format.
         """
         ak = authority_key or b""
         pk = public_key or b""
         new_tuple = (
             balance, nonce, stake, ak, pk,
             leaf_watermark, rotation_count, is_revoked, is_slashed,
+            last_active_height,
         )
         old_tuple = self._accounts.get(entity_id)
         if new_tuple == old_tuple:
@@ -280,6 +317,7 @@ class SparseMerkleTree:
             and ak == b"" and pk == b""
             and leaf_watermark == 0 and rotation_count == 0
             and not is_revoked and not is_slashed
+            and last_active_height == 0
         )
         if is_default:
             self.remove(entity_id)
@@ -294,6 +332,7 @@ class SparseMerkleTree:
             rotation_count=rotation_count,
             is_revoked=is_revoked,
             is_slashed=is_slashed,
+            last_active_height=last_active_height,
         )
         changes = self._set_leaf(key, leaf)
 
@@ -375,25 +414,40 @@ class SparseMerkleTree:
         Storing only accounts (and not the full _nodes map) keeps
         persistence small and makes loading trivially reconstructable:
         replay the accounts into a fresh tree and the root will match.
+
+        Tier-47: ``last_active_height`` (trailing tuple field) is
+        included in the serialization with default-omit so a
+        deserialized v3 record (no ``last_active_height`` key) round-
+        trips byte-identically to a v3 record with last_active=0 —
+        same convention as _leaf_value / set's "0 contributes nothing"
+        gate.  Bumped to v4 when the field is present so future readers
+        can tell the difference and we don't have to silently change
+        v3 semantics.
         """
+        accounts = []
+        for eid, tup in self._accounts.items():
+            bal, nonce, stake, ak, pk, wm, rc, rev, sl, lah = tup
+            entry = {
+                "entity_id": eid.hex(),
+                "balance": bal,
+                "nonce": nonce,
+                "stake": stake,
+                "authority_key": ak.hex(),
+                "public_key": pk.hex(),
+                "leaf_watermark": wm,
+                "rotation_count": rc,
+                "is_revoked": rev,
+                "is_slashed": sl,
+            }
+            if lah:
+                entry["last_active_height"] = lah
+            accounts.append(entry)
+        # Schema version bumps when we actually write last_active_height
+        # entries; otherwise stay at v3 so older readers can consume.
+        any_dormancy = any("last_active_height" in e for e in accounts)
         return {
-            "version": 3,
-            "accounts": [
-                {
-                    "entity_id": eid.hex(),
-                    "balance": bal,
-                    "nonce": nonce,
-                    "stake": stake,
-                    "authority_key": ak.hex(),
-                    "public_key": pk.hex(),
-                    "leaf_watermark": wm,
-                    "rotation_count": rc,
-                    "is_revoked": rev,
-                    "is_slashed": sl,
-                }
-                for eid, (bal, nonce, stake, ak, pk, wm, rc, rev, sl)
-                in self._accounts.items()
-            ],
+            "version": 4 if any_dormancy else 3,
+            "accounts": accounts,
         }
 
     @classmethod
@@ -411,6 +465,7 @@ class SparseMerkleTree:
                 rotation_count=entry.get("rotation_count", 0),
                 is_revoked=entry.get("is_revoked", False),
                 is_slashed=entry.get("is_slashed", False),
+                last_active_height=entry.get("last_active_height", 0),
             )
         return tree
 

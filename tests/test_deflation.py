@@ -39,23 +39,32 @@ class TestInflation(unittest.TestCase):
         self.assertGreater(self.tracker.total_supply, GENESIS_SUPPLY)
 
     def test_halving_reduces_reward(self):
-        reward_early = self.tracker.calculate_block_reward(0)
-        reward_after_halving = self.tracker.calculate_block_reward(HALVING_INTERVAL)
+        """Pre-Tier-47 invariant — pinned to legacy helper because
+        post-Tier-47 issuance is governed by the dormancy controller,
+        not the halving schedule."""
+        reward_early = self.tracker._calculate_legacy_block_reward(0)
+        reward_after_halving = self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL)
         self.assertEqual(reward_early, 16)
         self.assertEqual(reward_after_halving, 8)
 
     def test_four_meaningful_halvings(self):
-        """BLOCK_REWARD=16 gives 2 meaningful halvings: 16 -> 8 -> 4 (floor)."""
-        self.assertEqual(self.tracker.calculate_block_reward(0), 16)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL), 8)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 2), 4)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 3), 4)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 4), 4)
-        self.assertEqual(self.tracker.calculate_block_reward(HALVING_INTERVAL * 5), 4)
+        """BLOCK_REWARD=16 gives 2 meaningful halvings: 16 -> 8 -> 4 (floor).
+
+        Pre-Tier-47 invariant — see test_halving_reduces_reward.
+        """
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(0), 16)
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL), 8)
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 2), 4)
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 3), 4)
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 4), 4)
+        self.assertEqual(self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 5), 4)
 
     def test_reward_never_reaches_zero(self):
-        """Even after many halvings, reward stays at least BLOCK_REWARD_FLOOR."""
-        reward = self.tracker.calculate_block_reward(HALVING_INTERVAL * 100)
+        """Under the legacy schedule, reward stays ≥ floor after all halvings.
+
+        Pre-Tier-47 invariant — see test_halving_reduces_reward.
+        """
+        reward = self.tracker._calculate_legacy_block_reward(HALVING_INTERVAL * 100)
         self.assertGreaterEqual(reward, BLOCK_REWARD_FLOOR)
 
     def test_fee_payment(self):
