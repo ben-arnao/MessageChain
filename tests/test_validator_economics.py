@@ -29,21 +29,33 @@ class TestBlockRewardFloor(unittest.TestCase):
         self.assertGreaterEqual(BLOCK_REWARD_FLOOR, 2)
 
     def test_reward_never_below_floor(self):
-        """After all halvings, reward stays at BLOCK_REWARD_FLOOR."""
+        """Under the legacy halving schedule, reward stays at
+        BLOCK_REWARD_FLOOR after all halvings.
+
+        Pre-Tier-47 invariant — pinned to the legacy helper because
+        post-Tier-47 issuance is governed by the dormancy controller
+        and the halving floor is no longer the binding constraint.
+        """
         tracker = SupplyTracker()
-        # After enough halvings, BLOCK_REWARD >> halvings < BLOCK_REWARD_FLOOR
-        # At that point the floor should kick in.
         very_late_block = HALVING_INTERVAL * 100  # way past all halvings
-        reward = tracker.calculate_block_reward(very_late_block)
+        reward = tracker._calculate_legacy_block_reward(very_late_block)
         self.assertEqual(reward, BLOCK_REWARD_FLOOR)
 
     def test_halving_schedule_reaches_floor(self):
-        """Walk the halving schedule and verify floor engagement."""
+        """Walk the legacy (pre-Tier-47) halving schedule and verify
+        floor engagement.
+
+        Tier 47 (DORMANCY_CONTROLLER_HEIGHT) replaces halving + floor
+        with the dormancy-controller; this test pins the legacy
+        path via _calculate_legacy_block_reward so it continues to
+        document the historical schedule used for re-validation of
+        pre-fork blocks.
+        """
         tracker = SupplyTracker()
         rewards = []
         for i in range(10):
             height = i * HALVING_INTERVAL
-            reward = tracker.calculate_block_reward(height)
+            reward = tracker._calculate_legacy_block_reward(height)
             rewards.append(reward)
 
         # First reward is BLOCK_REWARD
@@ -56,7 +68,12 @@ class TestBlockRewardFloor(unittest.TestCase):
             self.assertGreaterEqual(r, BLOCK_REWARD_FLOOR)
 
     def test_floor_applies_at_exact_boundary(self):
-        """When halving would drop below floor, floor is used instead."""
+        """When legacy halving would drop below floor, floor is used.
+
+        Pre-Tier-47 invariant — see test_halving_schedule_reaches_floor
+        for the rationale on why the legacy helper is called
+        directly.
+        """
         tracker = SupplyTracker()
         # Find the halving epoch where naive reward < floor
         epoch = 0
@@ -64,7 +81,10 @@ class TestBlockRewardFloor(unittest.TestCase):
             epoch += 1
         # At this epoch, naive reward < floor but actual reward = floor
         height = epoch * HALVING_INTERVAL
-        self.assertEqual(tracker.calculate_block_reward(height), BLOCK_REWARD_FLOOR)
+        self.assertEqual(
+            tracker._calculate_legacy_block_reward(height),
+            BLOCK_REWARD_FLOOR,
+        )
 
 
 class TestAttestationRewards(unittest.TestCase):
@@ -478,11 +498,16 @@ class TestLongTermEconomics(unittest.TestCase):
     """Verify the economic model sustains validator incentives over time."""
 
     def test_reward_floor_provides_meaningful_income(self):
-        """At the reward floor, annual minting is still non-trivial."""
+        """At the legacy reward floor, annual minting is non-trivial.
+
+        Pre-Tier-47 invariant — pinned to the legacy helper because
+        post-Tier-47 issuance is governed by the dormancy controller,
+        not the legacy halving floor.
+        """
         tracker = SupplyTracker()
-        # Simulate far-future block
+        # Simulate far-future block under the legacy schedule
         far_future = HALVING_INTERVAL * 50
-        reward = tracker.calculate_block_reward(far_future)
+        reward = tracker._calculate_legacy_block_reward(far_future)
         self.assertEqual(reward, BLOCK_REWARD_FLOOR)
 
         # ~263K blocks/year at 120s blocks

@@ -219,6 +219,9 @@ class TestFloorEraRebateDominates(unittest.TestCase):
     so rebate dominates even more."""
 
     def test_floor_era_high_burn_rebate(self):
+        """Pre-Tier-47 invariant — pinned to legacy helper because
+        post-Tier-47 the deflation-floor rebate is retired in favor
+        of the dormancy controller."""
         from messagechain.config import HALVING_INTERVAL
         floor_era_height = HALVING_INTERVAL * 3 + 1
         # Make sure floor_era_height >= DEFLATION_FLOOR_V2_HEIGHT (it is
@@ -231,7 +234,7 @@ class TestFloorEraRebateDominates(unittest.TestCase):
             (floor_era_height - 1 - i, 1000)
             for i in range(DEFLATION_REBATE_WINDOW_BLOCKS)
         ]
-        reward = supply.calculate_block_reward(floor_era_height)
+        reward = supply._calculate_legacy_block_reward(floor_era_height)
         self.assertEqual(reward, 700)
         self.assertGreater(reward, BLOCK_REWARD_FLOOR)
 

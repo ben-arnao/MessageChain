@@ -153,11 +153,19 @@ class TestBoostAfterFloorClamp(unittest.TestCase):
         )
 
     def test_floor_era_no_boost_hits_just_the_floor(self):
+        """At supply == floor (boundary), the legacy v1 boost does NOT
+        fire — strictly-less-than is required.
+
+        Pre-Tier-47 invariant — pinned to the legacy helper because
+        post-Tier-47 issuance is governed by the dormancy controller
+        and neither the halving schedule nor the deflation-floor
+        levers are read.
+        """
         floor_era_height = HALVING_INTERVAL * 3 + 1
 
         supply = SupplyTracker()
         supply.total_supply = TARGET_CIRCULATING_SUPPLY_FLOOR
-        reward = supply.calculate_block_reward(floor_era_height)
+        reward = supply._calculate_legacy_block_reward(floor_era_height)
         self.assertEqual(reward, BLOCK_REWARD_FLOOR)
 
     def test_halving_era_boost_works_on_non_floor_reward(self):
