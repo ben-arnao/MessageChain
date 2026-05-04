@@ -888,6 +888,35 @@ class ChainDB:
                 signatures_blob BLOB NOT NULL
             );
 
+            -- Per-block state snapshots (1.52.0 -- snapshot-on-apply).
+            --
+            -- A full serialization of the consensus-critical in-memory
+            -- state at the end of every block apply.  Cold restart
+            -- restores from the latest row here so accumulators that
+            -- aren't otherwise persisted (validator_archive_misses,
+            -- _bootstrap_ratchet, _immature_rewards, _escrow,
+            -- archive_active_snapshot, etc.) come back at their
+            -- correct values rather than empty defaults.  Without
+            -- this, a restart silently produces a different state_root
+            -- on the next received block -- the prod-2026-05-03 bug
+            -- class that drove this entire 1.50-1.52 release sequence.
+            --
+            -- Reorg also restores from the row at the common ancestor's
+            -- height, then applies the divergent fork blocks forward
+            -- -- replacing the prior ``_reset_state`` + replay-from-1
+            -- path which had the genesis-allocation bug 1.51.4 fixed.
+            -- Both paths now use the same loader: anything that loads
+            -- correctly for cold-restart loads correctly for reorg.
+            --
+            -- ``state_blob`` is ``encode_snapshot(serialize_state(self))``
+            -- -- the same canonical wire format the state-sync path
+            -- already uses.  Kept opaque so future
+            -- ``STATE_SNAPSHOT_VERSION`` bumps don't migrate the table.
+            CREATE TABLE IF NOT EXISTS state_snapshots (
+                block_number INTEGER PRIMARY KEY,
+                state_blob BLOB NOT NULL
+            );
+
             -- Witness separation — stores witness data (WOTS signatures +
             -- Merkle auth paths) separately from block bodies for finalized
             -- blocks.  Full nodes strip witnesses from finalized blocks to
@@ -2278,6 +2307,67 @@ class ChainDB:
             "ORDER BY block_number"
         )
         return [row[0] for row in cur.fetchall()]
+
+    # ── Per-Block State Snapshots (1.52.0 snapshot-on-apply) ──────
+
+    def set_state_snapshot(
+        self, block_number: int, state_blob: bytes,
+    ) -> None:
+        """Persist the full state-snapshot blob produced at the end of
+        block ``block_number``'s apply.  Idempotent upsert -- a re-apply
+        at the same height (e.g. via reorg) overwrites the prior row.
+
+        The blob is ``encode_snapshot(serialize_state(blockchain))``;
+        callers don't need to know the on-the-wire format.  Stored
+        opaque so future ``STATE_SNAPSHOT_VERSION`` bumps don't
+        require schema changes.
+        """
+        self._conn.execute(
+            "INSERT OR REPLACE INTO state_snapshots "
+            "(block_number, state_blob) VALUES (?, ?)",
+            (int(block_number), bytes(state_blob)),
+        )
+        self._maybe_commit()
+
+    def get_state_snapshot(self, block_number: int) -> bytes | None:
+        """Return the persisted state-snapshot blob for the given height,
+        or None if no row exists.  Caller decodes via
+        ``decode_snapshot``."""
+        cur = self._conn.execute(
+            "SELECT state_blob FROM state_snapshots "
+            "WHERE block_number = ?",
+            (int(block_number),),
+        )
+        row = cur.fetchone()
+        return bytes(row[0]) if row is not None else None
+
+    def get_latest_state_snapshot_height(self) -> int | None:
+        """Return the highest block_number with a persisted state
+        snapshot, or None if the table is empty."""
+        cur = self._conn.execute(
+            "SELECT MAX(block_number) FROM state_snapshots"
+        )
+        row = cur.fetchone()
+        return row[0] if row is not None and row[0] is not None else None
+
+    def prune_state_snapshots_before(self, cutoff_height: int) -> None:
+        """Drop snapshots strictly below ``cutoff_height``.  Bounds
+        on-disk growth -- the loader only ever needs the LATEST
+        snapshot for cold-restart and snapshots within the last
+        MAX_REORG_DEPTH for reorg-restore.  Conservative caller passes
+        ``current_height - MAX_REORG_DEPTH * 2`` to keep the latest
+        plus a wide reorg-window buffer.
+
+        Never deletes the row at ``cutoff_height`` itself nor anything
+        above it.  Idempotent: pruning into an empty range is a no-op.
+        """
+        if cutoff_height <= 0:
+            return
+        self._conn.execute(
+            "DELETE FROM state_snapshots WHERE block_number < ?",
+            (int(cutoff_height),),
+        )
+        self._maybe_commit()
 
     # ── Batch Operations (for state snapshots / reorgs) ──────────
 

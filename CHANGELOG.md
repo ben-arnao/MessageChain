@@ -4,6 +4,127 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.52.0] — 2026-05-04
+
+Minor release.  Closes the entire defect class that drove the
+1.50.0-1.51.4 release sequence: consensus-critical in-memory
+accumulators that aren't persisted to chaindb, where cold-load
+creates them at empty defaults while a long-running node has them
+populated, causing the two to compute different state_roots on the
+next received block (``Invalid state_root -- state commitment
+mismatch``).  Each prior fix patched ONE field's persistence
+(lottery_prize_pool in 1.41.0, archive_reward_pool in 1.50.0,
+genesis allocations in 1.51.4) and missed the next one in the
+queue.  This is the structural fix.
+
+### Root cause
+
+Several fields used by the apply path are held in memory only and
+never written to chaindb:
+
+  * ``_bootstrap_ratchet.max_progress`` -- gates deflation boost,
+    escrow length, attester committee weighting
+  * ``validator_archive_misses`` / ``_success_streak`` /
+    ``_first_active_block`` -- gates archive reward withhold
+  * ``attester_coverage_misses`` -- gates inclusion-list coverage
+    leak burns
+  * ``archive_active_snapshot`` -- per-epoch active validator set
+  * ``_immature_rewards`` -- spendable balance check
+  * ``_escrow._entries`` -- attester reward locks
+
+These are accumulated incrementally during block apply.  After
+``_load_from_db`` (cold restart, copied chain.db, etc.) they come
+back as empty defaults because no chaindb table holds them.  A
+long-running node has them populated.  The next time both nodes
+apply the same block, the apply paths read these values and produce
+DIFFERENT post-state, breaking ``state_root`` consensus.
+
+Witnessed in prod 2026-05-03 (validator-1's chain.db copy from v2,
+post 1.51.4 deploy): cold-loaded v1 had ``bootstrap_progress=0.0``,
+``validator_archive_misses={}``, etc.; long-running v2 had populated
+values.  v1 successfully applied blocks 1366 and 1367 (apply path
+happened not to exercise divergence-sensitive code) but failed on
+1368 with ``Invalid state_root``.  No quick recovery -- v1 was stuck.
+
+### Added
+
+- **``state_snapshots`` chaindb table** (block_number → blob).  At
+  the end of every block apply, the full in-memory state captured
+  by ``_snapshot_memory_state()`` (the comprehensive serializer
+  already used for reorg-rollback) is pickled and persisted at
+  the block's height.  The blob captures EVERY consensus-critical
+  field including the in-memory accumulators above.
+
+- **``Blockchain._persist_state_snapshot(block_number)``** -- called
+  at end of ``_append_block`` inside the apply transaction so the
+  snapshot is atomic with the chain table writes.  Opportunistic
+  pruning (every 100 blocks) trims rows below
+  ``current - SNAPSHOT_RETENTION_BLOCKS = 1000`` so disk growth
+  stays bounded (~50MB steady-state at current scale).
+
+- **Snapshot-on-load in ``_load_from_db``**.  After the existing
+  field-by-field rehydration completes, the latest ``state_snapshots``
+  row is unpickled and installed via ``_restore_memory_snapshot``
+  (the symmetric loader for the serializer above).  Cold-restart
+  now produces an in-memory state byte-identical to what a long-
+  running node had at the same height -- adding a new in-memory
+  accumulator no longer requires a separate persistence path.
+
+- **Snapshot-on-reorg in ``_reorganize``**.  Replaces the prior
+  ``_reset_state`` + replay-from-block-1 path (which had the
+  1.51.4 genesis-allocation bug as a workaround for one slice of
+  this defect class) with: load the snapshot at the common
+  ancestor's height, install via ``_restore_memory_snapshot``,
+  apply the divergent fork blocks forward.  Same loader as
+  cold-restart -- bug in one is bug in the other; they get tested
+  together.  Falls back to the legacy reset+replay path if no
+  snapshot row exists at the ancestor (e.g. snapshots pruned
+  beyond retention; legacy chain.db pre-1.52.0).
+
+- **Load-time invariant assertion**.  After ``_load_from_db``
+  completes, asserts ``compute_current_state_root() ==
+  latest_block.header.state_root``.  If false, raises
+  ``ChainIntegrityError`` with a descriptive message naming the
+  cold-load divergence as the cause.  Catches the defect within
+  seconds of startup instead of silently producing divergent
+  state_roots on the next received block.
+
+### Tests
+
+  * ``test_snapshot_on_apply.py``:
+    - chaindb table accessor round-trip
+    - genesis does not require a snapshot row (only post-genesis
+      blocks produce them)
+    - block apply via ``add_block`` writes a snapshot row
+    - cold-restart restores ``bootstrap_progress`` and
+      ``_immature_rewards`` to long-running values (the defining
+      1.52.0 invariant)
+    - load with snapshot row deleted falls back cleanly to
+      field-by-field rehydration (1.51.x → 1.52.0 upgrade path)
+
+### Operator notes
+
+  * **Upgrade is single-step.**  No coordinated activation height.
+    A node upgrading from 1.51.x loads its existing chain.db with
+    no snapshot rows, falls through to the legacy field-by-field
+    load, applies the next block, and writes its first snapshot
+    row.  Subsequent restarts use the snapshot path.
+
+  * **Cold-restart prod recovery for the 2026-05-03 incident:** v1
+    upgrades to 1.52.0, restarts, and on next block apply persists
+    a snapshot.  All future cold-restarts and reorgs work
+    correctly.  But the ALREADY-DIVERGED v1 state from before
+    1.52.0 still needs the manual chain.db recovery (already done
+    in prod -- v1 is currently running on a copy of v2's healthy
+    chain.db).  After 1.52.0 deploys, v1's in-memory accumulators
+    will be EMPTY (chain.db has no snapshot row).  v2's accumulators
+    are populated.  They will diverge on the next block apply and
+    v1 will hit ``ChainIntegrityError`` on next restart -- expected.
+    To fully recover: have v1 do a fresh chain.db copy from v2
+    AFTER both are on 1.52.0 and v2 has applied at least one block
+    post-upgrade (to write a snapshot row); v1 then loads the
+    snapshot row and is in lockstep going forward.
+
 ## [1.51.4] — 2026-05-03
 
 Hotfix.  The 1.51.3 reorg-fired-correctly fix exposed a pre-existing
