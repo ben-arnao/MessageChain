@@ -671,9 +671,9 @@
       const verify = document.createElement("a");
       verify.className = "permalink";
       verify.href = "/r/" + m.tx_hash;
-      verify.title = "Permanent · verify on chain";
-      verify.textContent = "Permanent ↗";
-      right.appendChild(document.createTextNode(" "));
+      verify.title = "tx " + m.tx_hash + " · verify permanence on chain";
+      verify.textContent = shortHex(m.tx_hash, 8, 6);
+      right.appendChild(document.createTextNode(" · "));
       right.appendChild(verify);
     }
     meta.appendChild(entity);
