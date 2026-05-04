@@ -661,10 +661,19 @@ class SupplyTracker:
         accumulates state, but nothing reads it until
         compute_active_supply() is called from a post-activation gate
         in calculate_block_reward().  Cheap to call unconditionally.
+
+        Mirrors the bump into the chaindb ``entity_last_active`` table
+        when ``self.db`` is set (production path).  Without persistence
+        a cold restart would zero every entry and active_supply would
+        silently collapse on the restarted node, forking consensus at
+        the next mint.  Test contexts that don't set ``self.db``
+        skip the mirror — the in-memory dict is sufficient there.
         """
         prev = self.last_active_heights.get(entity_id, 0)
         if height > prev:
             self.last_active_heights[entity_id] = height
+            if self.db is not None:
+                self.db.set_last_active_height(entity_id, height)
 
     def _dormancy_weight_bps(self, age: int) -> int:
         """Integer-deterministic dormancy weight in basis points.
