@@ -3132,21 +3132,35 @@ DORMANCY_TAPER_BLOCKS = 131_400
 DORMANCY_TARGET_ACTIVE_SUPPLY = 140_000_000
 
 # Controller gain.  Per-block issuance = gap * K_NUM // K_DEN, where
-# gap = TARGET - active_supply.  K = 1/100_000 chosen so the
-# controller halves the gap every ~16 months at 600s/block — fast
-# enough to track meaningful drift, slow enough that a transient burn
-# spike doesn't crash issuance up to the per-block ceiling.
-# Governance can retune via a future fork.
+# gap = TARGET - active_supply.  K = 1/20_000 chosen so the controller
+# halves the gap roughly quarterly at 600s/block.  Tuning retune
+# (not a shape change — proportional refill is anchored): the prior
+# 1/100_000 gain combined with the 64-token ceiling left the
+# controller saturated for years under the documented 10–15M
+# tokens/yr burn estimate (see TARGET_CIRCULATING_SUPPLY_FLOOR
+# commentary below), so the gap-tracking property the controller
+# was sized for never bound.  Tightening the gain restores
+# responsive tracking under realistic founder-dormancy and long-
+# burn scenarios.  Governance can retune again via a future fork.
 DORMANCY_CONTROLLER_K_NUM = 1
-DORMANCY_CONTROLLER_K_DEN = 100_000
+DORMANCY_CONTROLLER_K_DEN = 20_000
 
 # Per-block issuance ceiling.  Hard cap so a pathological state
 # (active_supply briefly far below target due to a bug or large slash)
-# can't trigger a runaway mint.  64 tokens/block is 4× the legacy
-# pre-halving BLOCK_REWARD (16) and 16× the legacy floor (4) — gives
-# the controller plenty of headroom to refill while still bounding
-# worst-case issuance to a known number.
-DORMANCY_MAX_ISSUANCE_PER_BLOCK = 64
+# can't trigger a runaway mint.  500 tokens/block ≈ 26.3M tokens/yr
+# at 52,560 blocks/yr — roughly 2× the documented 10–15M tokens/yr
+# burn estimate, so the controller can actually close the gap rather
+# than peg at MAX while supply continues falling.  Prior value (64
+# tokens/block ≈ 3.37M/yr) was 3–5× too low: the controller
+# saturated whenever gap ≥ 6.4M (~4.6% of target), which under
+# realistic burn meant net active supply continued dropping ~7–12M/yr
+# indefinitely, breaking the anchored "stable active supply" promise
+# within a decade post-activation.  Tuning retune (not a shape
+# change) per the CLAUDE.md anchor that controller curve, ceiling,
+# and window are tuning knobs in code.  Safe to change in place —
+# Tier 47 has not yet activated on mainnet at edit time, so no
+# historical block-replay output changes.
+DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500
 
 assert DORMANCY_CONTROLLER_HEIGHT > AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, (
     "DORMANCY_CONTROLLER_HEIGHT must follow Tier 46 — operators upgrade "
