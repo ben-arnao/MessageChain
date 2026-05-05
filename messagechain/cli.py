@@ -7598,10 +7598,27 @@ def cmd_rotate_key_if_needed(args):
         # namespace so cmd_rotate_key can reuse the same interactive
         # flags (--yes, --server). Prefer the keyfile listed in
         # onboard.toml so the timer unit can run unattended.
+        #
+        # data_dir MUST be carried through from onboard.toml.  Without
+        # it, cmd_rotate_key reads getattr(args, "data_dir", None) ->
+        # None and the leaf-cursor resolver routes this signing
+        # invocation to the per-user fallback at
+        # ~/.messagechain/leaves/<entity>.idx, while the validator
+        # daemon is persisting its cursor to <data_dir>/leaf_index.json.
+        # Two cursors with no fsync handshake re-opens the cross-process
+        # WOTS+ leaf-reuse window -- equivocation evidence on chain and
+        # 100% slash on detection.  _reserve_leaf_via_rpc is a
+        # best-effort fallback only and silently returns None on
+        # transient RPC errors and on older daemons.
         import argparse as _ap
         kf = getattr(args, "keyfile", None) or cfg.get("keyfile") or None
+        ddir = getattr(args, "data_dir", None) or cfg.get("data_dir") or None
         ns = _ap.Namespace(
-            server=args.server, yes=True, fee=None, keyfile=kf,
+            server=args.server,
+            yes=True,
+            fee=None,
+            keyfile=kf,
+            data_dir=ddir,
         )
         cmd_rotate_key(ns)
 
