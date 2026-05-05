@@ -268,13 +268,23 @@ def verify_transfer_transaction(
     the message-only flat floor, preserving historical-block validity.
     """
     from messagechain.core.transaction import enforce_signature_aware_min_fee
+    from messagechain.config import (
+        UNIFIED_FEE_FLOOR_HEIGHT, MARKET_FEE_FLOOR,
+    )
     if tx.amount <= 0:
         return False
+    # Tier 49: unified fee floor across non-message tx types.  Pre-fork
+    # MIN_FEE=100 binds; post-fork MARKET_FEE_FLOOR=1 binds, matching
+    # the message tx kind and restoring the unified fee-model anchor.
+    if current_height is not None and current_height >= UNIFIED_FEE_FLOOR_HEIGHT:
+        active_flat_floor = MARKET_FEE_FLOOR
+    else:
+        active_flat_floor = MIN_FEE
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=MIN_FEE,
+        flat_floor=active_flat_floor,
     ):
         return False
     if tx.timestamp <= 0:

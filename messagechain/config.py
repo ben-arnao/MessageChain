@@ -5764,6 +5764,56 @@ assert WITNESS_ROOT_ACTIVATION_HEIGHT > DORMANCY_CONTROLLER_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 49: unified fee floor across non-message tx types (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Pre-Tier-49 admission for TransferTransaction / StakeTransaction /
+# UnstakeTransaction enforced ``tx.fee >= max(MIN_FEE, MARKET_FEE_FLOOR)``
+# = ``max(100, 1)`` = 100, while MessageTransaction admission used the
+# Tier-16 ``MARKET_FEE_FLOOR=1`` directly.  Same fee model, 100×
+# different floors — a transfer at 96 stored bytes paying 100 tokens
+# is fee-per-byte 1.04, while a message at ~280 stored bytes paying 1
+# token is fee-per-byte 0.0036, so transfers structurally crowd
+# messages out of the mempool at the floor.  Violates the fee-model
+# anchor "Every tx type the chain accepts ... follows this same fee
+# model.  Don't carve out per-type fee logic" and the auto-fee
+# anchor "any wallet/CLI helper ... computes a target fee-per-byte
+# from current mempool conditions and multiplies by the tx's stored
+# byte count".
+#
+# At and after this height, transfer / stake / unstake admission uses
+# ``flat_floor = MARKET_FEE_FLOOR`` instead of ``MIN_FEE``, restoring
+# the unified fee model: every tx type binds at the same protocol
+# baseline, with selection-by-fee-per-byte and the EIP-1559 base fee
+# above the floor doing the market work.  Reaction txs already moved
+# to MARKET_FEE_FLOOR at Tier 18 (TIER_18_HEIGHT); this fork brings
+# transfer / stake / unstake into the same regime.
+#
+# Type-specific surcharges that legitimately bind above
+# MARKET_FEE_FLOOR (NEW_ACCOUNT_FEE on transfer, GOVERNANCE_PROPOSAL_FEE
+# on propose, KEY_ROTATION_FEE, AUTHORITY_KEY_FEE, REVOKE_TX_FEE,
+# RECEIPT_SUBTREE_ROOT_FEE) are unaffected — they are layered on top
+# of the protocol floor at their respective callsites.
+#
+# Activation: above the existing 1700–1712 fork band with ~38 blocks
+# (~6.3h at 600s) of additional spacing.  Two-validator network, both
+# operator-controlled, so the cutover is coordinated and the runway
+# bound is operational (binary deploy + restart) rather than the
+# multi-week external-validator notice the band was originally sized
+# for.  Pre-fork blocks replay byte-identically because every
+# historical transfer / stake / unstake on chain paid >= MIN_FEE=100
+# anyway — the verifier admits everything it admitted before; only
+# new low-fee txs become acceptable post-fork.
+UNIFIED_FEE_FLOOR_HEIGHT = 1750  # Tier 49
+
+assert UNIFIED_FEE_FLOOR_HEIGHT > WITNESS_ROOT_ACTIVATION_HEIGHT, (
+    "UNIFIED_FEE_FLOOR_HEIGHT must follow Tier 48 — operators upgrade "
+    "through prior forks before this admission-rule change binds, and "
+    "the cohort spacing keeps consensus-rule changes from collapsing "
+    "into a single activation window"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

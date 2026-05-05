@@ -220,15 +220,33 @@ def _message_floor(stored_size: int, current_height: int | None) -> int:
     return MIN_FEE
 
 
+def _non_message_flat_floor(current_height: int | None) -> int:
+    """Active flat floor for transfer / stake / unstake admission.
+
+    Mirrors the height gate in ``verify_transfer_transaction`` /
+    ``verify_stake_transaction`` / ``verify_unstake_transaction``:
+    pre-Tier-49 the legacy ``MIN_FEE=100`` binds, post-fork the
+    protocol baseline collapses to ``MARKET_FEE_FLOOR=1`` so every
+    tx type rides the same unified fee model and the fee market
+    (selection-by-fee-per-byte + EIP-1559 base fee) does the
+    market-pricing work above the floor.
+    """
+    h = current_height
+    unified_h = getattr(config, "UNIFIED_FEE_FLOOR_HEIGHT", None)
+    if h is not None and unified_h is not None and h >= unified_h:
+        return MARKET_FEE_FLOOR
+    return MIN_FEE
+
+
 def _transfer_floor(current_height: int | None, recipient_is_new: bool) -> int:
     """Live admission floor for a TransferTransaction.
 
-    See `verify_transfer_transaction` — flat_floor is MIN_FEE; Tier 16+
-    layers MARKET_FEE_FLOOR=1 underneath but MIN_FEE=100 still binds.
-    NEW_ACCOUNT_FEE surcharge applies when the recipient is brand-new
-    (priced upfront so the user isn't surprised by a chain reject).
+    Tier 49 collapses the flat floor to ``MARKET_FEE_FLOOR``; pre-fork
+    ``MIN_FEE=100`` still binds.  ``NEW_ACCOUNT_FEE`` surcharge applies
+    when the recipient is brand-new (priced upfront so the user isn't
+    surprised by a chain reject).
     """
-    floor = max(MIN_FEE, MARKET_FEE_FLOOR)
+    floor = _non_message_flat_floor(current_height)
     if recipient_is_new:
         floor += NEW_ACCOUNT_FEE
     return floor
@@ -236,12 +254,12 @@ def _transfer_floor(current_height: int | None, recipient_is_new: bool) -> int:
 
 def _stake_floor(current_height: int | None) -> int:
     """Live admission floor for StakeTransaction (same shape as transfer)."""
-    return max(MIN_FEE, MARKET_FEE_FLOOR)
+    return _non_message_flat_floor(current_height)
 
 
 def _unstake_floor(current_height: int | None) -> int:
     """Live admission floor for UnstakeTransaction (same shape as stake)."""
-    return max(MIN_FEE, MARKET_FEE_FLOOR)
+    return _non_message_flat_floor(current_height)
 
 
 def _react_floor(current_height: int | None) -> int:

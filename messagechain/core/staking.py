@@ -484,11 +484,19 @@ def verify_stake_transaction(
         gate_height = current_height if current_height is not None else block_height
         if tx.amount < get_validator_min_stake(gate_height):
             return False
+    # Tier 49: unified fee floor — see verify_transfer_transaction.
+    from messagechain.config import (
+        UNIFIED_FEE_FLOOR_HEIGHT, MARKET_FEE_FLOOR,
+    )
+    if current_height is not None and current_height >= UNIFIED_FEE_FLOOR_HEIGHT:
+        active_flat_floor = MARKET_FEE_FLOOR
+    else:
+        active_flat_floor = MIN_FEE
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=MIN_FEE,
+        flat_floor=active_flat_floor,
     ):
         return False
     if tx.timestamp <= 0:
@@ -509,13 +517,21 @@ def verify_unstake_transaction(
     `current_height` selects the fee rule (see verify_stake_transaction).
     """
     from messagechain.core.transaction import enforce_signature_aware_min_fee
+    from messagechain.config import (
+        UNIFIED_FEE_FLOOR_HEIGHT, MARKET_FEE_FLOOR,
+    )
     if tx.amount <= 0:
         return False
+    # Tier 49: unified fee floor — see verify_transfer_transaction.
+    if current_height is not None and current_height >= UNIFIED_FEE_FLOOR_HEIGHT:
+        active_flat_floor = MARKET_FEE_FLOOR
+    else:
+        active_flat_floor = MIN_FEE
     if not enforce_signature_aware_min_fee(
         tx.fee,
         signature_bytes=len(tx.signature.to_bytes()),
         current_height=current_height,
-        flat_floor=MIN_FEE,
+        flat_floor=active_flat_floor,
     ):
         return False
     if tx.timestamp <= 0:
