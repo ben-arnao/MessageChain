@@ -418,23 +418,45 @@
     font-size: 0.78rem;
   }
   footer#chainFooter a { color: var(--accent); }
-  /* Per-card affordances: community chip + permanent verify link.
-     Sit alongside the meta row so they're visible without dragging
-     the eye away from the message body. */
-  .msg .community {
-    display: inline-block;
-    font-size: 0.72rem;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 12%, var(--card));
-    border: 1px solid var(--accent);
-    border-radius: 12px;
-    padding: 0.05rem 0.45rem;
-    margin-right: 0.4rem;
+  /* Per-card affordances: community link + permanent verify link.
+     Both render inline in the meta row so they read as metadata
+     ("from X · block N · in handle · tx-hash") rather than as a
+     chip stacked above the message body — chip styling drew the
+     eye away from the message itself and double-used the accent
+     color already taken by the tx-hash. */
+  .msg .meta .community {
+    color: var(--muted);
     text-decoration: none;
-    vertical-align: 1px;
+    font-size: 0.78rem;
+    margin-left: 0.4rem;
   }
-  .msg .community:hover { text-decoration: underline; }
+  .msg .meta .community:hover { text-decoration: underline; }
+  .msg .meta .community .handle {
+    color: var(--fg);
+  }
+  /* Filter banner: visible only when the user is filtering the
+     feed by a community handle (#community=<handle> in the URL).
+     Click the · clear · link to drop the filter. */
+  #communityFilter {
+    margin: 0 0 0.6rem;
+    padding: 0.5rem 0.7rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--card);
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  #communityFilter .handle {
+    color: var(--fg);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  #communityFilter a {
+    color: var(--accent);
+    text-decoration: none;
+    margin-left: 0.6rem;
+  }
+  #communityFilter a:hover { text-decoration: underline; }
+  .msg.filtered-out { display: none; }
   .msg .meta .permalink {
     color: var(--accent);
     text-decoration: none;
@@ -599,6 +621,11 @@
     </li>
   </ol>
   <p class="status" id="status">Loading…</p>
+  <div id="communityFilter" hidden>
+    Filtering by community
+    <span class="handle" id="communityFilterHandle"></span>
+    <a href="#" id="communityFilterClear">· clear</a>
+  </div>
   <div id="feed"></div>
 </main>
 <footer id="chainFooter">
@@ -615,7 +642,55 @@
   const LIMIT = 30;
   const statusEl = document.getElementById("status");
   const feedEl = document.getElementById("feed");
+  const filterBannerEl = document.getElementById("communityFilter");
+  const filterHandleEl = document.getElementById("communityFilterHandle");
+  const filterClearEl = document.getElementById("communityFilterClear");
   let seenHashes = new Set();
+
+  // Tier 25 community filter — driven by `#community=<handle>` in
+  // the URL.  Implemented client-side: hide cards whose
+  // data-community-id != handle, show a banner with a clear link.
+  // No server round-trip — the user can drop the filter and reload
+  // by clicking · clear, which strips the fragment.  Validates
+  // against the same charset the chain enforces (a-z0-9_-) so a
+  // hostile fragment cannot inject markup via the banner.
+  const COMMUNITY_HANDLE_RE = /^[a-z0-9](?:[a-z0-9_-]{0,30}[a-z0-9])?$/;
+  function currentCommunityFilter() {
+    const m = /^#community=([^&]+)$/.exec(location.hash || "");
+    if (!m) return null;
+    let h;
+    try {
+      h = decodeURIComponent(m[1]).toLowerCase();
+    } catch (_) {
+      return null;
+    }
+    return COMMUNITY_HANDLE_RE.test(h) ? h : null;
+  }
+  function applyCommunityFilter() {
+    const handle = currentCommunityFilter();
+    const cards = feedEl.querySelectorAll(".msg");
+    if (!handle) {
+      filterBannerEl.hidden = true;
+      cards.forEach(c => c.classList.remove("filtered-out"));
+      return;
+    }
+    filterHandleEl.textContent = handle;
+    filterBannerEl.hidden = false;
+    cards.forEach(c => {
+      if (c.dataset.communityId === handle) {
+        c.classList.remove("filtered-out");
+      } else {
+        c.classList.add("filtered-out");
+      }
+    });
+  }
+  filterClearEl.addEventListener("click", function (e) {
+    e.preventDefault();
+    // Strip the fragment without leaving a `#` in the URL bar.
+    history.replaceState(null, "", location.pathname + location.search);
+    applyCommunityFilter();
+  });
+  window.addEventListener("hashchange", applyCommunityFilter);
 
   function shortHex(hex, head, tail) {
     if (!hex || hex.length <= head + tail + 1) return hex || "";
@@ -663,6 +738,26 @@
     entity.appendChild(entityLink);
     const right = document.createElement("span");
     right.textContent = "block " + m.block_number + " · " + formatTs(m.timestamp);
+    // Tier 25 community grouping — render as `· in <handle>` inline
+    // with the rest of the metadata so the eye reads "from X · block
+    // N · in handle · tx-hash" as a single info row.  L2 / app layer
+    // maps the handle to a display name; protocol surface stays
+    // handle-only.  Clicking filters the local feed via a URL hash
+    // fragment that the page picks up on hashchange.
+    if (m.community_id) {
+      card.dataset.communityId = m.community_id;
+      const community = document.createElement("a");
+      community.className = "community";
+      community.href = "#community=" + encodeURIComponent(m.community_id);
+      community.title = "filter by community " + m.community_id;
+      community.appendChild(document.createTextNode("· in "));
+      const handle = document.createElement("span");
+      handle.className = "handle";
+      handle.textContent = m.community_id;
+      community.appendChild(handle);
+      right.appendChild(document.createTextNode(" "));
+      right.appendChild(community);
+    }
     // Per-card permanent-verify affordance.  Links to /r/<tx_hash>
     // which renders inclusion proof + permanence framing — the
     // first-time visitor's path from "is this a real social feed"
@@ -679,22 +774,6 @@
     meta.appendChild(entity);
     meta.appendChild(right);
     card.appendChild(meta);
-    // Tier 25 community chip — `[handle]` next to the message body
-    // when the tx opted into a community grouping.  Renders the
-    // handle exactly as committed (lowercase ASCII), so a reader
-    // can paste it into search.  L2 / app layer maps the handle to
-    // a display name; protocol surface stays handle-only.
-    if (m.community_id) {
-      const chip = document.createElement("a");
-      chip.className = "community";
-      chip.textContent = "[" + m.community_id + "]";
-      chip.title = "community " + m.community_id;
-      // No on-chain registry; clicking the chip filters the local
-      // feed via a URL fragment so the page can pick it up on
-      // refresh.  Server-side filter would require a new RPC param.
-      chip.href = "#community=" + encodeURIComponent(m.community_id);
-      card.appendChild(chip);
-    }
     // Optional `prev` ref: the Tier 10 pointer to a prior message.
     // Absence means "no predecessor" — render nothing, keep layout
     // identical to pre-fork cards.
@@ -788,12 +867,20 @@
       feedEl.appendChild(renderMessage(m, knownHashes, hashToAuthor));
     }
     statusEl.textContent = "Chain height " + height + " · showing " + messages.length + " newest";
+    // Re-apply the community filter after each repaint so a poll()
+    // doesn't silently un-hide cards that should still be filtered
+    // out.  Cheap: a single querySelectorAll + classList toggle.
+    applyCommunityFilter();
     // If the URL already has a fragment (user landed here via an
     // inbound link or an earlier click), re-scroll to it now that the
     // target card has been re-rendered.  Without this, a poll()
     // repaint silently breaks the :target selector and the user
-    // loses their place.
-    if (location.hash && document.getElementById(location.hash.slice(1))) {
+    // loses their place.  Skip the scroll when the fragment is the
+    // community-filter form (#community=...) — that's a filter, not
+    // a card anchor.
+    if (location.hash &&
+        !location.hash.startsWith("#community=") &&
+        document.getElementById(location.hash.slice(1))) {
       const target = document.getElementById(location.hash.slice(1));
       target.scrollIntoView({ block: "center", behavior: "instant" });
     }
