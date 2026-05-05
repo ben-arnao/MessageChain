@@ -4,6 +4,91 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.57.1] — 2026-05-05
+
+Patch release.  Audit round 19 top-2 ships, both correctness fixes
+to existing slashing infrastructure -- no new tier, no new wire
+format, no new CLI surface.
+
+### Fixed
+
+  * **Wire the slashing + fork-emergency enforcement layer onto the
+    production ``Server`` runtime (validator-collusion defense, mainnet
+    impact).**  CLI launches the validator via ``from server import
+    Server`` (``messagechain/cli.py:2345``), so the production mainnet
+    runtime is ``server.py:Server`` -- and ``messagechain.network.node.
+    Node`` is never instantiated by any production code path.  But the
+    entire slashing-evidence + fork-emergency enforcement layer was
+    wired only on ``Node``: ``EquivocationWatcher`` (block-header +
+    attestation auto-slash) was instantiated only at
+    ``messagechain/network/node.py:353``; the 1.57.0 FinalityVote-layer
+    slasher emission edge fix (``_emit_pending_finality_slashes``)
+    was wired only at ``node.py:562`` via ``_after_block_added``;
+    ``_maybe_auto_recover_from_fork_emergency`` (1.57.0 standing-focus
+    item "accidental-fork auto-recovery for full nodes") was defined
+    only at ``node.py:1733``; and the fork-emergency halt gates were
+    only at ``node.py:1613`` (attest) / ``:2315`` (propose), so
+    ``server.py``'s ``should_propose`` chain never read
+    ``is_in_emergency()``.  Net effect: production mainnet validators
+    have been running WITHOUT the chain's primary anchored deterrent
+    against validator collusion (the auto-slash backbone) since 1.55.0
+    wired ``EquivocationWatcher``.  The 1.55.0 / 1.57.0 release notes
+    described fixes that were no-ops on the live path.  CLAUDE.md
+    anchors "collective censorship resistance via slashable-evidence
+    trail" as the deterrent for validator collusion -- without
+    auto-slash actually running, that anchor was unenforced in
+    production.  Fix ports the four pieces from ``Node`` to
+    ``Server``: (1) ``Server.__init__`` constructs an
+    ``EquivocationWatcher`` when a chaindb is present; submitter
+    starts as ``None`` (detect-only) and is upgraded in
+    ``set_wallet_entity`` once a signing key is attached; (2) new
+    ``Server._after_block_added(block)`` post-add hook runs the
+    watcher's ``observe_block_header`` + ``prune``, drains
+    ``blockchain._pending_finality_slashes`` into mempool slash txs,
+    and attempts auto-recovery (full nodes only) -- each step
+    try/excepted so one failure never aborts the others; (3) the hook
+    is invoked at BOTH add_block-success sites
+    (``_try_produce_block_sync`` and the ``ANNOUNCE_BLOCK`` gossip
+    handler); (4) fork-emergency halt gates added to
+    ``_try_produce_block_sync`` (after ``should_propose`` returns
+    ok) and ``_maybe_attest_accepted_block`` (top of body); (5)
+    ``_handle_announce_attestation`` feeds verified attestations into
+    ``equivocation_watcher.observe_attestation`` after sig verification.
+    New ``tests/test_server_slashing_recovery_wiring.py`` (10 tests).
+    Surfaced by audit r19 top-3 #1.  (50d1453)
+
+  * **Equivocation-watcher prune horizon must match slash-tx admission
+    window (validator-collusion defense gap).**
+    ``EquivocationWatcher.prune`` deleted ``seen_signatures`` rows at
+    ``current_height - UNBONDING_PERIOD`` (~2176 blocks) but
+    ``validate_slash_transaction`` accepts evidence up to
+    ``max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)`` blocks old
+    (~12960 blocks).  A second conflicting signature gossiped in the
+    [UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS] window therefore found
+    the watcher's seen-signatures cache empty and was indexed as a
+    fresh observation, not a slash trigger -- no auto-slash fired
+    despite the chain still admitting evidence for the same offense.
+    Adversary: validator collusion (the chain's primary anchored
+    adversary).  A colluding subset can equivocate at height H,
+    suppress one half from gossip until H+~2200, then release -- every
+    honest watcher across the network is silenced identically by
+    design.  The fix aligns the prune cutoff with the validation
+    gate's ``evidence_ttl = max(UNBONDING_PERIOD,
+    ATTESTER_ESCROW_BLOCKS)``.  Cache size grows from
+    ~UNBONDING_PERIOD * gossip-rate to ~ATTESTER_ESCROW_BLOCKS *
+    gossip-rate -- ~6x larger but still bounded and small (the
+    ``seen_signatures`` table stores one row per signed slot, not
+    per gossip echo).  Pairs with the wiring fix above -- without #1
+    the watcher was dead code; without #2 the watcher would still
+    be silenced for any delayed-disclosure equivocation in the
+    [UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS] window.  Three new
+    regression tests in
+    ``tests/test_equivocation_watcher.py::TestRollingPrune``: an
+    observation must survive past ``UNBONDING_PERIOD``; rows older
+    than ``max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)`` are pruned;
+    end-to-end delayed-disclosure equivocation still produces a slash
+    transaction.  Surfaced by audit r19 top-3 #2.  (c6f8175)
+
 ## [1.57.0] — 2026-05-05
 
 Minor release.  Audit round 18 top-3 ships: a critical operator-side
