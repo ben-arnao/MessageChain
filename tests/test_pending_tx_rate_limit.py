@@ -95,13 +95,11 @@ class TestGossipReceiverEnforcesRateLimit(_Base):
         """After the burst is exhausted, subsequent gossip is rejected
         and the peer accumulates ban score.
 
-        The bucket refills at RATE_PENDING_TX[0] tokens/sec, and WOTS+
-        signing each tx takes real wall-clock time — if the test fires
-        `burst + K` messages it can accidentally get enough refill
-        tokens to avoid a drop.  We side-step that by draining the
-        bucket directly with cheap malformed-payload messages (which
-        consume a token before any validation) and firing a single
-        valid tx afterwards to confirm the drop path is hit.
+        The bucket refills at RATE_PENDING_TX[0] tokens/sec.  Under
+        xdist contention each handler call takes longer than the
+        refill interval, so a "drain by burst+K" loop can accidentally
+        let the bucket refill faster than we drain.  Patch the refill
+        rate to 0 for this test so draining is monotonic.
         """
         srv = _build_server()
         alice = _entity(b"alice")
@@ -109,12 +107,21 @@ class TestGossipReceiverEnforcesRateLimit(_Base):
         srv.blockchain.supply.balances[alice.entity_id] = 10_000_000
         peer = _FakePeer()
 
-        # Drain the bucket with malformed payloads.  These are rejected
-        # BEFORE the slow signature-verify path so bucket refill between
-        # calls is negligible.  Use float("inf") iteration-bounded by
-        # bucket exhaustion.
-        burst = RATE_PENDING_TX[1]
-        for _ in range(burst + 50):
+        # Force the pending_tx bucket's refill rate to 0 for this peer.
+        # Once drained, it cannot refill — eliminates the wall-clock
+        # race entirely without changing what's tested (over-burst
+        # rejection + ban scoring).  Reach into the limiter and
+        # pre-create / overwrite the per-peer bucket directly; the
+        # limiter caches the rate at bucket-creation time, not per-call.
+        from messagechain.network.ratelimit import TokenBucket
+        rate, burst = RATE_PENDING_TX
+        ip = srv.rate_limiter._get_ip(peer.address)
+        srv.rate_limiter._ensure_buckets(ip)
+        srv.rate_limiter._buckets[ip]["pending_tx"] = TokenBucket(
+            rate=0.0, max_tokens=burst,
+        )
+
+        for _ in range(burst + 5):
             srv._handle_announce_pending_tx({"kind": "bogus"}, peer)
 
         # Now a valid gossip — should be dropped because the bucket is
