@@ -45,11 +45,16 @@ class TestActivationConstant(unittest.TestCase):
         ):
             self.assertGreater(WITNESS_ROOT_ACTIVATION_HEIGHT, prior_height)
 
-    def test_activation_height_well_above_current_tip(self):
-        # Tip is around block 1500-2000 in early bootstrap.  Activation
-        # at 15_000 leaves at least a year of runway at 600s blocks.
-        # Loose lower bound — this catches an accidental compression.
-        self.assertGreaterEqual(WITNESS_ROOT_ACTIVATION_HEIGHT, 10_000)
+    def test_activation_height_above_dormancy_controller(self):
+        # Tier 48 must follow Tier 47 (DORMANCY_CONTROLLER_HEIGHT).
+        # The originally-comfortable 15_000 runway was compressed in
+        # the 1.55.1 sweep; the only invariant that still matters is
+        # the strict ordering vs Tier 47, which is what consensus uses.
+        from messagechain.config import DORMANCY_CONTROLLER_HEIGHT
+        self.assertGreater(
+            WITNESS_ROOT_ACTIVATION_HEIGHT,
+            DORMANCY_CONTROLLER_HEIGHT,
+        )
 
 
 class TestBuilderPopulatesWitnessRoot(unittest.TestCase):

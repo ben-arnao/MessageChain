@@ -78,8 +78,9 @@ class TestConstantsVisible(unittest.TestCase):
             5000,
         )
 
-    def test_tier45_height_constant_is_4534(self):
-        self.assertEqual(PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT, 4534)
+    def test_tier45_height_constant_compressed(self):
+        # Re-runwayed to 1707 in 1.55.1 sweep (was 4534).
+        self.assertEqual(PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT, 1707)
 
     def test_legacy_bps_unchanged(self):
         # Legacy bps must remain at 100 — the fix is a NEW height-gated

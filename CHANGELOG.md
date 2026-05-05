@@ -4,6 +4,58 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.1] — 2026-05-05
+
+Patch release.  Compresses every remaining future activation height
+into a single tight band just past the live mainnet tip.
+
+### Changed
+
+  * **Compressed schedule for all 13 future activations.**  With the
+    network in early bootstrap (only two validators, both operator-
+    controlled), the multi-thousand-block runways inherited from the
+    1.26.0 / 1.32.0 / 1.38.x fork sweeps no longer serve a purpose —
+    they were sized for an external-validator world to give operators
+    advance notice.  All 13 forks now activate at consecutive heights
+    1700 → 1712, in the same partial order the prior schedule
+    enforced (every monotonicity assert in `messagechain/config.py`
+    still holds without modification).  Tip at the time of the cut
+    was 1567, giving ~133 blocks (~30 hours at observed cadence) of
+    runway between this release going live on validators and the
+    first fork firing.
+
+    **Schedule (was → is):**
+
+    | Tier | Constant                                           | Was    | Is   |
+    | ---- | -------------------------------------------------- | ------ | ---- |
+    |  3   | `SEED_DIVESTMENT_REDIST_HEIGHT`                    |  1600  | 1700 |
+    | 40   | `REWARD_CURVE_SMOOTH_HEIGHT`                       |  1634  | 1701 |
+    | 41   | `ACK_DEADLINE_GRACE_DEFENSE_HEIGHT`                |  1640  | 1702 |
+    | 42   | `REWARD_CURVE_SMOOTH_V2_HEIGHT`                    |  2400  | 1703 |
+    | (—)  | `WITNESS_AUTO_SEPARATION_HEIGHT`                   |  3000  | 1704 |
+    | 43   | `FORCED_INCLUSION_ALL_POOLS_HEIGHT`                |  3134  | 1705 |
+    | 44   | `CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT`     |  3834  | 1706 |
+    | 45   | `PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT`         |  4534  | 1707 |
+    | (—)  | `SUPPLY_RECONCILIATION_HEIGHT`                     |  5000  | 1708 |
+    | 46   | `AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT`            |  5234  | 1709 |
+    | 47   | `DORMANCY_CONTROLLER_HEIGHT`                       |  5934  | 1710 |
+    | 3-S  | `SEED_DIVESTMENT_START_HEIGHT`                     |  7500  | 1711 |
+    | 48   | `WITNESS_ROOT_ACTIVATION_HEIGHT`                   | 15000  | 1712 |
+
+    **Operational notes:**
+
+    * Tier 48's witness-root activation lands without B-3 / Milestone C
+      / Milestone D having shipped.  Those are local-pruning and
+      witness-fetch features — neither is consensus-critical.  Pre-D
+      archive nodes still hold full block bodies, so peer-served
+      witness data is unaffected.
+    * Tier 47's dormancy controller activates two blocks before
+      witness-root.  Dormancy backfill runs as designed at activation;
+      the dormancy window remains unchanged (centuries-scale).
+    * `SUPPLY_RECONCILIATION_HEIGHT` lands inside the band — no
+      change to its consensus effect, which is still gated by the
+      same height check.
+
 ## [1.55.0] — 2026-05-05
 
 Minor release.  Tier 48 — witness-root activation (B-1 + B-2 of the
