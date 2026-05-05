@@ -368,29 +368,34 @@ def strip_block_witnesses(block) -> "Block":
     the original witnesses before stripping.  The block_hash changes
     because the block is reconstructed, but the header data (including
     witness_root) remains identical, so the block_hash still matches.
+
+    Every signed-body slot the block carries MUST round-trip through
+    this function — the witness_root commitment folds in leaves from
+    every slot ``enumerate_block_signatures`` walks (reactions, custody
+    proofs, inclusion list, the four evidence kinds, ...), so any slot
+    silently dropped here means the stripped block recomputes a
+    different witness_root post-activation and ``attach_block_witnesses``
+    raises ``WitnessRootMismatchError`` on every read.  We use
+    ``dataclasses.replace`` rather than an explicit field list so future
+    block-shape additions inherit the correct strip semantics
+    automatically — listing slots one-by-one was the defect form.
     """
-    from messagechain.core.block import Block, BlockHeader
     import copy
+    import dataclasses
 
     stripped_txs = [strip_tx_witness(tx) for tx in block.transactions]
 
-    # Deep copy header to avoid mutating original
-    header = copy.deepcopy(block.header)
-
-    stripped_block = Block(
-        header=header,
+    # Deep-copy header so callers that hold the original block see no
+    # mutation; replace() carries every other Block field through
+    # unchanged so reactions / custody / inclusion list / evidence
+    # slots are preserved alongside the slots we explicitly override.
+    stripped_block = dataclasses.replace(
+        block,
+        header=copy.deepcopy(block.header),
         transactions=stripped_txs,
-        validator_signatures=block.validator_signatures,
-        slash_transactions=block.slash_transactions,
-        attestations=block.attestations,
-        transfer_transactions=block.transfer_transactions,
-        governance_txs=block.governance_txs,
-        authority_txs=block.authority_txs,
-        stake_transactions=block.stake_transactions,
-        unstake_transactions=block.unstake_transactions,
-        finality_votes=block.finality_votes,
+        block_hash=b"",
     )
-    # block_hash is header-derived, so it should match the original
+    # block_hash is header-derived, so it should match the original.
     stripped_block.block_hash = stripped_block._compute_hash()
     return stripped_block
 
@@ -459,9 +464,9 @@ def attach_block_witnesses(stripped_block, witness_data: bytes):
     (which only checks it post-activation); all three must agree or a
     block accepted at validate-time could fail reattach later.
     """
-    from messagechain.core.block import Block
     from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
     import copy
+    import dataclasses
 
     offset = 0
     tx_count = struct.unpack_from(">I", witness_data, offset)[0]
@@ -481,21 +486,19 @@ def attach_block_witnesses(stripped_block, witness_data: bytes):
         offset += w_len
         restored_txs.append(attach_tx_witness(tx, w_bytes))
 
-    header = copy.deepcopy(stripped_block.header)
-
-    restored = Block(
-        header=header,
+    # Replace carries every Block field through unchanged — reactions,
+    # custody proofs, inclusion list, and the four evidence kinds all
+    # contribute leaves to ``compute_block_witness_root``, so dropping
+    # any of them here would make the post-activation witness_root
+    # check below fire on legitimate reattach.  Same defect class as
+    # the strip path's previous explicit-field-list form.
+    restored = dataclasses.replace(
+        stripped_block,
+        header=copy.deepcopy(stripped_block.header),
         transactions=restored_txs,
-        validator_signatures=stripped_block.validator_signatures,
-        slash_transactions=stripped_block.slash_transactions,
-        attestations=stripped_block.attestations,
-        transfer_transactions=stripped_block.transfer_transactions,
-        governance_txs=stripped_block.governance_txs,
-        authority_txs=stripped_block.authority_txs,
-        stake_transactions=stripped_block.stake_transactions,
-        unstake_transactions=stripped_block.unstake_transactions,
-        finality_votes=stripped_block.finality_votes,
+        block_hash=b"",
     )
+    header = restored.header
     restored.block_hash = restored._compute_hash()
 
     # Self-verify post-activation.  The header is unmodified by

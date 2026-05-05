@@ -259,6 +259,136 @@ class TestChainDBReattachVerification(unittest.TestCase):
 # ── Activation-gate sanity ───────────────────────────────────────────
 
 
+class TestStripAttachPreservesAllSignedSlots(unittest.TestCase):
+    """strip + attach must preserve every slot ``enumerate_block_signatures``
+    walks, not just transactions / transfers / stakes / governance /
+    authority / finality / slash / attestation.
+
+    Pre-fix, ``strip_block_witnesses`` and ``attach_block_witnesses``
+    constructed the new ``Block`` from only 10 of the 17 signed-body
+    slots; these 7 were silently dropped:
+
+      * ``react_transactions``                       (SLOT_TX_REACTION)
+      * ``custody_proofs``                           (SLOT_CUSTODY_PROOF)
+      * ``inclusion_list``                           (SLOT_INCLUSION_LIST)
+      * ``censorship_evidence_txs``                  (SLOT_CENSORSHIP_EVIDENCE)
+      * ``bogus_rejection_evidence_txs``             (SLOT_BOGUS_REJECT_EVIDENCE)
+      * ``inclusion_list_violation_evidence_txs``    (SLOT_INCLUSION_VIOLATION_EVIDENCE)
+      * ``non_response_evidence_txs``                (SLOT_NON_RESPONSE_EVIDENCE)
+
+    With any of those slots populated by an item carrying a real
+    ``Signature``, the post-activation ``witness_root`` commitment FAILS
+    at reattach: the original commits to leaves contributed by the
+    dropped slot, but the stripped/attached block sees an empty list
+    and recomputes a different root.  Pre-1712 the same defect silently
+    deletes the slot data on disk; post-1712 it raises
+    ``WitnessRootMismatchError`` on every read of any block that
+    carried any of those slots.
+    """
+
+    def test_post_activation_roundtrip_preserves_all_seven_slots(self):
+        from dataclasses import dataclass as _dc, field as _field
+        from messagechain.crypto.keys import Signature as _Sig
+
+        @_dc
+        class _SignedStub:
+            """Minimal duck-typed item carrying a real ``Signature`` so
+            ``_safe_signature`` admits it as a witness leaf contributor.
+            We deliberately avoid the real consensus types here — the
+            bug is at the ``Block`` constructor (slots passed through),
+            not at the per-item serialiser level."""
+            signature: _Sig
+            tx_hash: bytes = _field(default=b"\x00" * 32)
+
+        entity = _make_entity()
+        # One real Signature is enough — every leaf is keyed by
+        # (slot_id, item_index, signature.canonical_bytes()), so reusing
+        # the same sig across stubs still produces 7 distinct leaves.
+        sig = entity.keypair.sign(b"witness-stub-signable-bytes")
+        stub = _SignedStub(signature=sig, tx_hash=b"\xaa" * 32)
+
+        msg_tx = create_transaction(entity, "msg 0", 10_000, 0)
+
+        merkle_root = compute_merkle_root([msg_tx.tx_hash])
+        header = BlockHeader(
+            version=1,
+            block_number=WITNESS_ROOT_ACTIVATION_HEIGHT + 5,
+            prev_hash=b"\x00" * 32,
+            merkle_root=merkle_root,
+            timestamp=1_000_001.0,
+            proposer_id=entity.entity_id,
+        )
+        # archive_proof_bundle pre-set so __post_init__ does NOT try to
+        # auto-derive a real ``ArchiveProofBundle`` from the stubbed
+        # custody_proofs (which would fail real-type validation).
+        block = Block(
+            header=header,
+            transactions=[msg_tx],
+            react_transactions=[stub],
+            custody_proofs=[stub],
+            archive_proof_bundle=stub,
+            inclusion_list=stub,
+            censorship_evidence_txs=[stub],
+            bogus_rejection_evidence_txs=[stub],
+            inclusion_list_violation_evidence_txs=[stub],
+            non_response_evidence_txs=[stub],
+        )
+        # Witness_root must be computed AFTER the slots are populated so
+        # the leaves they contribute are baked into the commitment the
+        # proposer signs.
+        header.witness_root = compute_block_witness_root(block)
+        header.proposer_signature = entity.keypair.sign(
+            _hash(header.signable_data())
+        )
+        block.block_hash = block._compute_hash()
+
+        blob = get_block_witness_data(block)
+        stripped = strip_block_witnesses(block)
+
+        # Every populated slot must survive ``strip``.  The pre-fix code
+        # constructed ``stripped`` from only 10 of 17 slots; this is the
+        # assertion that fails on pre-fix ``origin/main``.
+        for slot_name in (
+            "react_transactions",
+            "custody_proofs",
+            "censorship_evidence_txs",
+            "bogus_rejection_evidence_txs",
+            "inclusion_list_violation_evidence_txs",
+            "non_response_evidence_txs",
+        ):
+            self.assertEqual(
+                list(getattr(stripped, slot_name)),
+                list(getattr(block, slot_name)),
+                f"{slot_name} lost on strip — witness_root commitment broken",
+            )
+        self.assertIs(stripped.inclusion_list, block.inclusion_list)
+        self.assertIs(stripped.archive_proof_bundle, block.archive_proof_bundle)
+
+        # Reattach must succeed without raising — every slot's leaves
+        # are present, so the recomputed witness_root equals the
+        # committed header.witness_root.  Pre-fix this raises
+        # WitnessRootMismatchError because the seven slots are empty
+        # on the restored block and their leaves are missing from the
+        # recomputed root.
+        restored = attach_block_witnesses(stripped, blob)
+        for slot_name in (
+            "react_transactions",
+            "custody_proofs",
+            "censorship_evidence_txs",
+            "bogus_rejection_evidence_txs",
+            "inclusion_list_violation_evidence_txs",
+            "non_response_evidence_txs",
+        ):
+            self.assertEqual(
+                list(getattr(restored, slot_name)),
+                list(getattr(block, slot_name)),
+            )
+        self.assertIs(restored.inclusion_list, block.inclusion_list)
+        self.assertEqual(
+            compute_block_witness_root(restored), header.witness_root,
+        )
+
+
 class TestActivationGateMatchesValidator(unittest.TestCase):
     """The reattach gate must use the same WITNESS_ROOT_ACTIVATION_HEIGHT
     constant as `pos.create_block` and `Blockchain.validate_block`.  If
