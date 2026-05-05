@@ -67,6 +67,7 @@ from messagechain.consensus.slashing import (
     SlashTransaction as SlashTx, verify_slashing_evidence, verify_attestation_slashing_evidence,
     SlashingEvidence, AttestationSlashingEvidence,
 )
+from messagechain.consensus.equivocation_watcher import EquivocationWatcher
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX, OFFENSE_MINOR,
     OFFENSE_PROTOCOL_VIOLATION, OFFENSE_RATE_LIMIT,
@@ -1080,6 +1081,26 @@ class Server(SharedRuntimeMixin):
             self._iter_server_pools_with_arrivals,
         )
         self.consensus = ProofOfStake()
+
+        # Equivocation watcher — files slash evidence automatically when
+        # any peer double-signs a block header or attestation on the
+        # wire.  Persistent observations live in chaindb.seen_signatures
+        # so a node restart does not reopen a hole an attacker could
+        # time their double-sign through.  Production validators run
+        # Server (not Node), so this wiring MUST live here too — pre-fix
+        # the watcher only existed on Node and the auto-slash backbone
+        # for the chain's primary anchored adversary (validator
+        # collusion) ran in dead code on mainnet.  Submitter starts as
+        # None and is upgraded in set_wallet_entity once a signing key
+        # is attached; detect-only mode still records observations.
+        self.equivocation_watcher: EquivocationWatcher | None = None
+        if self.db is not None:
+            self.equivocation_watcher = EquivocationWatcher(
+                chaindb=self.db,
+                blockchain=self.blockchain,
+                mempool=self.mempool,
+                submitter_entity=None,
+            )
         self.peers: dict[str, Peer] = {}
         # In-flight outbound dials, keyed by "host:port".  A Peer only
         # lands in self.peers after asyncio.open_connection returns;
@@ -1316,6 +1337,11 @@ class Server(SharedRuntimeMixin):
         """Set the full wallet entity (with keypair) for block signing."""
         self.wallet_entity = entity
         self.wallet_id = entity.entity_id
+        # Upgrade the equivocation watcher from detect-only to
+        # auto-emit mode — pre-this-call it can record observations
+        # but has no signer to wrap evidence into a SlashTransaction.
+        if self.equivocation_watcher is not None:
+            self.equivocation_watcher.submitter_entity = entity
 
     def _sync_validators_from_chain(self):
         """Load validator stakes from chain state into the consensus module."""
@@ -2474,6 +2500,168 @@ class Server(SharedRuntimeMixin):
             if getattr(tx, "entity_id", None) == entity_id:
                 return True
         return False
+
+    def _maybe_auto_recover_from_fork_emergency(self) -> None:
+        """Opt-in full-node auto-rewind when a fork emergency surfaces.
+
+        Mirrors ``messagechain/network/node.py:Node._maybe_auto_recover_
+        from_fork_emergency`` — production validators run Server, not
+        Node, so the wiring landed in 1.57.0 (which only touched
+        node.py) had no effect on the live mainnet path.  This is the
+        Server-side twin.
+
+        Gated by ``config.FORK_EMERGENCY_AUTO_RECOVERY`` (default
+        False) AND by the node holding zero stake — autoflipping a
+        registered validator on a quorum-signal bug would weaponize
+        the bug into network-wide chain abandonment, which is exactly
+        the failure mode the validator-halt branch in
+        ``_try_produce_block_sync`` is meant to prevent.  Full nodes
+        have no slashable role, so an incorrect rewind costs only
+        resync time; that's why opt-in is safe for them.
+
+        Exception-safe: a failure inside the recovery path must not
+        break the surrounding post-block hook.
+        """
+        try:
+            from messagechain import config as _cfg
+            if not getattr(_cfg, "FORK_EMERGENCY_AUTO_RECOVERY", False):
+                return
+            det = getattr(
+                self.blockchain, "fork_emergency_detector", None,
+            )
+            if det is None or not det.is_in_emergency():
+                return
+            # Validator-role gate: any non-zero stake means this node
+            # is slashable and MUST stay halted instead of auto-
+            # flipping.  consensus.stakes is the active-validator-set
+            # source of truth.
+            my_id = self.wallet_id
+            if (
+                my_id is not None
+                and my_id in self.consensus.stakes
+                and self.consensus.stakes[my_id] > 0
+            ):
+                return
+            ok, reason = self.blockchain.attempt_fork_emergency_recovery()
+            if ok:
+                logger.warning(
+                    "fork-emergency auto-recovery applied: %s; "
+                    "syncer will refetch the canonical chain",
+                    reason,
+                )
+            else:
+                logger.info(
+                    "fork-emergency auto-recovery skipped: %s",
+                    reason,
+                )
+        except Exception:
+            logger.exception(
+                "fork-emergency auto-recovery raised; ignoring",
+            )
+
+    def _after_block_added(self, block) -> None:
+        """Post-add_block hook for the production Server runtime.
+
+        Runs the slashing-evidence + fork-emergency machinery that
+        previously lived only on ``messagechain.network.node.Node`` —
+        production mainnet validators run Server, so without this hook
+        the auto-slash backbone (CLAUDE.md anchored deterrent for
+        validator collusion) and the 1.57.0 fork-emergency auto-
+        recovery were dead code on the live path.
+
+        Steps (each wrapped in its own try/except so one misbehaving
+        sub-step never aborts the others):
+          1. Feed the just-applied block header into the
+             ``EquivocationWatcher`` so a prior conflicting header
+             from the same proposer at the same height auto-emits a
+             ``SlashTransaction`` into our mempool.  Then prune
+             expired observations.
+          2. Drain ``blockchain._pending_finality_slashes`` (the
+             FinalityVote-layer equivocation accumulator written by
+             ``FinalityCheckpoints.add_vote``) into mempool slash
+             transactions.  This is the 1.57.0 emission edge that
+             was wired only on Node.
+          3. If the FinalityVote feed surfaced a fork emergency,
+             full nodes (zero-stake) may opt into auto-recovery via
+             ``FORK_EMERGENCY_AUTO_RECOVERY``; validators MUST stay
+             halted (the gate inside the helper enforces this).
+
+        Exceptions are logged and swallowed: the post-block hook is
+        on the consensus hot path and MUST never raise into add_block's
+        caller.  Mirrors the same fail-soft contract Node uses.
+        """
+        # Step 1 — equivocation watcher.
+        if self.equivocation_watcher is not None:
+            try:
+                self.equivocation_watcher.observe_block_header(block.header)
+                self.equivocation_watcher.prune()
+            except Exception:
+                logger.exception(
+                    "equivocation_watcher crashed on block #%d",
+                    block.header.block_number,
+                )
+
+        # Step 2 — drain FinalityDoubleVoteEvidence into mempool slash txs.
+        # Mirrors messagechain/network/node.py:_emit_pending_finality_slashes.
+        try:
+            self._drain_pending_finality_slashes()
+        except Exception:
+            logger.exception("finality-slash drain hook failed")
+
+        # Step 3 — full-node auto-recovery (no-op for staked validators).
+        try:
+            self._maybe_auto_recover_from_fork_emergency()
+        except Exception:
+            logger.exception("fork-emergency auto-recovery raised")
+
+    def _drain_pending_finality_slashes(self) -> None:
+        """Drain ``blockchain._pending_finality_slashes`` into mempool
+        slash transactions.
+
+        Detection of double-finality-vote equivocation lives in
+        ``FinalityCheckpoints.add_vote`` (called from
+        ``Blockchain._apply_block_state``); this method is the
+        production-path counterpart to
+        ``messagechain.network.node._emit_pending_finality_slashes``.
+
+        Detect-only Server (no ``wallet_entity``) re-stashes the
+        drained evidence so a future call with a real submitter can
+        emit it.  Caller is ``_after_block_added`` so detection and
+        emission happen in the same tick.
+        """
+        pending = self.blockchain.drain_pending_finality_slashes()
+        if not pending:
+            return
+        if self.wallet_entity is None:
+            existing = getattr(
+                self.blockchain, "_pending_finality_slashes", [],
+            ) or []
+            self.blockchain._pending_finality_slashes = existing + pending
+            return
+        from messagechain.consensus.slashing import create_slash_transaction
+        base_fee = getattr(
+            getattr(self.blockchain, "supply", None), "base_fee", 100,
+        )
+        for evidence in pending:
+            try:
+                slash_tx = create_slash_transaction(
+                    self.wallet_entity, evidence, fee=base_fee,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to build FinalityDoubleVoteEvidence slash tx "
+                    "for offender %s",
+                    getattr(evidence, "offender_id", b"").hex()[:16],
+                )
+                continue
+            try:
+                self.mempool.add_slash_transaction(slash_tx)
+            except Exception:
+                logger.exception(
+                    "Failed to add FinalityDoubleVoteEvidence slash tx "
+                    "to mempool for offender %s",
+                    getattr(evidence, "offender_id", b"").hex()[:16],
+                )
 
     def _maybe_auto_restake(self):
         """Node-local opt-in policy: convert surplus liquid into stake.
@@ -3901,6 +4089,24 @@ class Server(SharedRuntimeMixin):
         if not ok:
             return None
 
+        # Fork-emergency halt gate: a registered validator on a
+        # supermajority-disagreement tip must refuse to produce.
+        # Continuing would burn a WOTS+ leaf on a chain we'll need to
+        # abandon AND accumulate slashable evidence the recovering
+        # tip's history will use against us.  Anchored in CLAUDE.md:
+        # "registered validators NEVER auto-flip — they HALT instead,
+        # preserving 'no slashable evidence from minority tip'."
+        # Twin of the gate at messagechain/network/node.py:2315.
+        det = getattr(self.blockchain, "fork_emergency_detector", None)
+        if det is not None and det.is_in_emergency():
+            lowest = det.lowest_emergency()
+            if lowest is not None:
+                logger.warning(
+                    "Halting block proposal — fork emergency active: %s",
+                    lowest.short(),
+                )
+            return None
+
         # Build the block. Empty mempool is fine — empty blocks carry
         # attestations and advance block-denominated timers.
         all_pending = self.mempool.get_transactions_with_entity_cap(MAX_TXS_PER_BLOCK)
@@ -4063,6 +4269,14 @@ class Server(SharedRuntimeMixin):
                 f"reward: {self.blockchain.supply.calculate_block_reward(block.header.block_number)} | "
                 f"wallet balance: {balance}"
             )
+            # Slashing + fork-emergency post-block hook.  Runs FIRST
+            # so the equivocation watcher records the just-applied
+            # block header, the FinalityVote-layer slasher emission
+            # drain fires, and any newly-surfaced fork emergency gets
+            # the auto-recovery shot before downstream operator-runtime
+            # hooks (auto-restake / notify) act on the rewound state.
+            # Twin of network/node.py:Node._after_block_added.
+            self._after_block_added(block)
             # Opt-in auto-restake — sweep liquid rewards back into stake
             # if the operator has enabled it.  Runs AFTER add_block so the
             # reward the proposer just earned is already credited to
@@ -4681,6 +4895,13 @@ class Server(SharedRuntimeMixin):
             self._drain_orphan_flood_offenses()
             if success:
                 self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
+                # Slashing + fork-emergency post-block hook.  Runs
+                # before the attester-duty broadcast so a fresh
+                # emergency that surfaces during apply gets the
+                # auto-recovery shot before this node attests on what
+                # may turn out to be the wrong tip.  Twin of
+                # network/node.py:Node._after_block_added.
+                self._after_block_added(block)
                 # Attester duty: vote on the accepted block, but only if
                 # it honors our forced-inclusion list (censorship
                 # resistance).  Silent omission of a top-N long-waited
@@ -4779,6 +5000,22 @@ class Server(SharedRuntimeMixin):
         if self.wallet_id not in self.consensus.stakes:
             return
 
+        # Fork-emergency halt gate: a registered validator must not
+        # attest while the chain is in a supermajority-disagreement
+        # state.  Attesting on a divergent branch reinforces the
+        # wrong tip and burns leaves on a chain we'll need to abandon.
+        # Twin of the gate at messagechain/network/node.py:1613.
+        det = getattr(self.blockchain, "fork_emergency_detector", None)
+        if det is not None and det.is_in_emergency():
+            lowest = det.lowest_emergency()
+            if lowest is not None:
+                logger.warning(
+                    "Refusing attestation for block #%d — fork emergency "
+                    "active: %s",
+                    block.header.block_number, lowest.short(),
+                )
+            return
+
         def _is_includable(tx) -> bool:
             ok, _reason = self.blockchain.validate_transaction(tx)
             return ok
@@ -4847,6 +5084,22 @@ class Server(SharedRuntimeMixin):
                 peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
             )
             return
+
+        # Equivocation watcher: feed the verified attestation in so a
+        # prior conflicting attestation from the same validator at the
+        # same height auto-emits a SlashTransaction into our mempool.
+        # Mirrors network/node.py:_handle_announce_attestation —
+        # production validators run Server, so this wiring is what
+        # makes attestation-layer auto-slashing actually fire on the
+        # live path.
+        if self.equivocation_watcher is not None:
+            try:
+                self.equivocation_watcher.observe_attestation(att)
+            except Exception:
+                logger.exception(
+                    "equivocation_watcher crashed on attestation from %s",
+                    att.validator_id.hex()[:16],
+                )
 
         validator_stake = self.blockchain.supply.get_staked(att.validator_id)
         total_stake = sum(self.blockchain.supply.staked.values())
