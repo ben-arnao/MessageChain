@@ -94,6 +94,55 @@ logger = logging.getLogger(__name__)
 from messagechain.runtime.shared import SharedRuntimeMixin
 
 
+def _emit_pending_finality_slashes(*, blockchain, entity, mempool):
+    """Drain ``blockchain._pending_finality_slashes`` into mempool slash txs.
+
+    Mirrors ``EquivocationWatcher._emit_slash`` for the FinalityVote
+    layer.  Detection of double-finality-vote equivocation lives in
+    ``FinalityCheckpoints.add_vote`` (called from
+    ``Blockchain._apply_block_state``); pre-this-fix the accumulated
+    evidence had no reader and equivocators at the finality layer
+    escaped slashing.
+
+    Detect-only nodes (no submitter ``entity``) re-stash the drained
+    evidence so a future call with a real submitter can emit it.
+    Callers SHOULD invoke this from a post-block hook so detection
+    and emission happen in the same tick.
+    """
+    pending = blockchain.drain_pending_finality_slashes()
+    if not pending:
+        return
+    if entity is None:
+        # No submitter to sign — preserve evidence for a later call.
+        existing = getattr(blockchain, "_pending_finality_slashes", []) or []
+        blockchain._pending_finality_slashes = existing + pending
+        return
+    from messagechain.consensus.slashing import create_slash_transaction
+    base_fee = getattr(
+        getattr(blockchain, "supply", None), "base_fee", 100,
+    )
+    for evidence in pending:
+        try:
+            slash_tx = create_slash_transaction(
+                entity, evidence, fee=base_fee,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to build FinalityDoubleVoteEvidence slash tx "
+                "for offender %s",
+                getattr(evidence, "offender_id", b"").hex()[:16],
+            )
+            continue
+        try:
+            mempool.add_slash_transaction(slash_tx)
+        except Exception:
+            logger.exception(
+                "Failed to add FinalityDoubleVoteEvidence slash tx "
+                "to mempool for offender %s",
+                getattr(evidence, "offender_id", b"").hex()[:16],
+            )
+
+
 class Node(SharedRuntimeMixin):
     """A full MessageChain network node."""
 
@@ -488,20 +537,35 @@ class Node(SharedRuntimeMixin):
             # internal short-circuit would handle this too, but bailing
             # here saves the governance read on every block.
             if not cfg.get(notify.NOTIFY_EMAIL_ENABLED, False):
-                return
-            notify.process_block_for_notifications(
-                current_height=self.blockchain.height,
-                list_proposals=lambda: self.blockchain.governance.list_proposals(
-                    current_block=self.blockchain.height,
-                ),
-                config=cfg,
-                state_path=notify.default_state_path(self.data_dir),
-            )
+                pass
+            else:
+                notify.process_block_for_notifications(
+                    current_height=self.blockchain.height,
+                    list_proposals=lambda: self.blockchain.governance.list_proposals(
+                        current_block=self.blockchain.height,
+                    ),
+                    config=cfg,
+                    state_path=notify.default_state_path(self.data_dir),
+                )
         except Exception as e:
             # Catch-all defends against ANY downstream failure leaking
             # into the consensus path.  Log at debug so a misconfigured
             # SMTP / missing onboard.toml doesn't spam the journal.
             logger.debug(f"post-block notify hook failed: {e}")
+
+        # Drain FinalityDoubleVoteEvidence auto-detected during apply
+        # into mempool slash txs.  Detection is wired at
+        # FinalityCheckpoints.add_vote; emission lives here so the
+        # accumulator on Blockchain stays free of network/mempool
+        # concerns.  Same fail-soft contract as the notify hook above.
+        try:
+            _emit_pending_finality_slashes(
+                blockchain=self.blockchain,
+                entity=self.entity,
+                mempool=self.mempool,
+            )
+        except Exception as e:
+            logger.debug(f"finality-slash drain hook failed: {e}")
 
     # _next_connection_type, _track_seen_tx, _get_peer_writer now live
     # on SharedRuntimeMixin.

@@ -8292,6 +8292,46 @@ class Blockchain:
                 self._pending_finality_slashes = []
             self._pending_finality_slashes.extend(pending)
 
+    def drain_pending_finality_slashes(self) -> list:
+        """Return and clear FinalityDoubleVoteEvidence auto-detected
+        during ``_apply_block_state``.
+
+        Detection lives at ``finality.add_vote`` (a second vote from
+        the same signer at the same height for a different target hash
+        auto-builds ``FinalityDoubleVoteEvidence`` and surfaces it via
+        ``get_pending_slashing_evidence``).  Pre-this-fix the apply
+        path appended into ``self._pending_finality_slashes`` but no
+        caller drained it, so equivocators at the FinalityVote layer
+        escaped slashing despite the detection being fully wired.
+
+        Filter out evidence whose hash is already in
+        ``_processed_evidence`` so a reorg replay (or a peer's slash
+        tx that already mined) does not re-emit a duplicate slash tx
+        for the same offence.
+
+        Returns the surviving evidence list and clears the in-memory
+        queue regardless of filtering -- detect-only callers may pass
+        ``None`` as the submitter and want the queue rebuilt on the
+        next conflicting vote, but a stuck-queue would compound the
+        defect this fix was meant to close, so a single drain always
+        empties the buffer.  Callers that cannot emit (no submitter
+        entity) MUST re-stash the survivors themselves; the
+        node-side helper does this so detect-only nodes preserve the
+        evidence for a future call with a real submitter.
+        """
+        pending = getattr(self, "_pending_finality_slashes", None)
+        self._pending_finality_slashes = []
+        if not pending:
+            return []
+        out = []
+        processed = self._processed_evidence
+        for ev in pending:
+            ev_hash = getattr(ev, "evidence_hash", None)
+            if ev_hash is not None and ev_hash in processed:
+                continue
+            out.append(ev)
+        return out
+
     def _observe_vote_for_emergency(
         self,
         vote,
