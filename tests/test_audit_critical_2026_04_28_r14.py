@@ -100,7 +100,10 @@ class TestReceiptBudgetCheckGlobalCap(unittest.TestCase):
     """
 
     def test_global_cap_bounds_total_receipts_across_ips(self):
-        tracker = ReceiptBudgetTracker(max_tracked_ips=8192)
+        # max_tracked_ips ≥ n_ips so we don't trip the per-IP bucket
+        # LRU eviction path (quadratic scan); we're testing the global
+        # cap, not eviction.
+        tracker = ReceiptBudgetTracker(max_tracked_ips=4096 + 256)
         # Rotate through enough IPs that, without a global cap, a
         # per-IP-only defense would let the attacker drain far more
         # than RECEIPT_GLOBAL_BURST leaves total.  Each fresh IP
@@ -138,11 +141,14 @@ class TestReceiptBudgetCheckSharesGlobalBucketWithRejection(unittest.TestCase):
     """
 
     def test_receipt_bucket_consumes_same_global_as_rejection(self):
-        tracker = ReceiptBudgetTracker()
+        # max_tracked_ips comfortably exceeds RECEIPT_GLOBAL_BURST so the
+        # drain loop never triggers per-IP-bucket LRU eviction (an O(N)
+        # scan that turns this test quadratic at the default 4096 cap).
+        tracker = ReceiptBudgetTracker(max_tracked_ips=RECEIPT_GLOBAL_BURST + 256)
         # Drain the global bucket via the rejection path (using fresh
         # IPs so per-IP cap never fires before global).
         drained = 0
-        n_ips = 8192  # max_tracked_ips default
+        n_ips = RECEIPT_GLOBAL_BURST + 256
         for ip_n in range(n_ips):
             ip = f"172.16.{(ip_n >> 8) & 0xff}.{ip_n & 0xff}"
             if tracker.rejection_budget_check(ip):

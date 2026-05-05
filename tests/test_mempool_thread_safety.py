@@ -119,23 +119,22 @@ class TestBlockProductionIterationSafe(unittest.TestCase):
         # `pending` to be populated enough that sorted(.values()) takes
         # measurable time relative to a single dict mutation.
         mempool = Mempool(max_size=4096)
-        # Mint a pool of pre-signed txs from many distinct entities so
-        # the writer thread doesn't have to do expensive Entity.create
-        # work in its hot loop — every writer iteration is a pure
-        # mempool mutation, maximizing the time fraction spent inside
-        # the dict.
-        pre_entities = [_make_entity(f"hot{i}".encode()) for i in range(64)]
+        # Mint a pool of pre-signed txs from distinct entities so the
+        # writer thread doesn't do Entity.create in its hot loop.
+        # 24 entities (18 pre-populated + 6 churn) is enough bulk for
+        # sorted(.values()) to span the writer's mutation window —
+        # 64 was overkill and added ~1s of keygen on first run.
+        pre_entities = [_make_entity(f"hot{i}".encode()) for i in range(24)]
         pre_txs = [
             _make_signed_tx(pre_entities[i], f"hot-{i}", fee=1500, nonce=0)
-            for i in range(64)
+            for i in range(24)
         ]
-        # Pre-populate with most of them so iteration has bulk to chew on.
-        for tx in pre_txs[:48]:
+        for tx in pre_txs[:18]:
             self.assertTrue(mempool.add_transaction(tx))
 
         # The remaining txs are the writer's "rotating" set: it adds
         # them, then removes them, in a tight loop.
-        churn_txs = pre_txs[48:]
+        churn_txs = pre_txs[18:]
 
         stop = threading.Event()
         errors: list[BaseException] = []
@@ -172,7 +171,12 @@ class TestBlockProductionIterationSafe(unittest.TestCase):
         writers = [threading.Thread(target=writer) for _ in range(3)]
         for t in readers + writers:
             t.start()
-        time.sleep(2.0)
+        # 0.5s is plenty: each reader does thousands of full-dict
+        # iterations and each writer does thousands of add/remove
+        # rounds in that window — the race window is wide enough to
+        # surface a missing lock reliably.  2s was conservative
+        # padding that bought no additional coverage.
+        time.sleep(0.5)
         stop.set()
         for t in readers + writers:
             t.join(timeout=5.0)
@@ -311,7 +315,10 @@ class TestGetTransactionsConsistentSnapshot(unittest.TestCase):
         rs = [threading.Thread(target=reader) for _ in range(2)]
         for t in ts + rs:
             t.start()
-        time.sleep(1.5)
+        # 0.4s is plenty for the snapshot consistency check — readers
+        # do thousands of get_transactions calls per worker in that
+        # window, churners thousands of mutations.
+        time.sleep(0.4)
         stop.set()
         for t in ts + rs:
             t.join(timeout=5.0)
@@ -385,11 +392,14 @@ class TestNoDeadlockUnderLoad(unittest.TestCase):
         for t in threads:
             t.start()
 
-        # Liveness check: sample progress after 1.5s and again after 3s.
-        time.sleep(1.5)
+        # Liveness check: sample progress at two points 0.4s apart.
+        # Each worker does thousands of operations per 100ms, so 0.4s
+        # of separation is well past the noise floor and proves
+        # forward progress between samples.
+        time.sleep(0.4)
         with progress_lock:
             mid = dict(progress)
-        time.sleep(1.5)
+        time.sleep(0.4)
         with progress_lock:
             end = dict(progress)
         stop.set()

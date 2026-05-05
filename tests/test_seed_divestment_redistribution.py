@@ -67,8 +67,25 @@ END = config.SEED_DIVESTMENT_END_HEIGHT
 WINDOW = END - START
 
 
+_ENTITY_POOL: dict[bytes, Entity] = {}
+
+
 def _entity(tag: bytes) -> Entity:
-    return Entity.create(tag.ljust(32, b"\x00"))
+    """Module-scoped entity cache.  Tests in this file build dozens of
+    entities from a small set of fixed tags via _bootstrapped_chain;
+    regenerating the WOTS+ tree per call burns memory on the same
+    xdist worker (this file uses loadscope, so all 32 tests share one
+    process), which is the most plausible root cause of the
+    sporadic Windows-xdist worker terminations.  Reuse + reset of
+    _next_leaf delivers identical semantics at a fraction of the
+    keygen / memory cost."""
+    seed = tag.ljust(32, b"\x00")
+    cached = _ENTITY_POOL.get(seed)
+    if cached is None:
+        cached = Entity.create(seed)
+        _ENTITY_POOL[seed] = cached
+    cached.keypair._next_leaf = 0
+    return cached
 
 
 def _bootstrapped_chain(

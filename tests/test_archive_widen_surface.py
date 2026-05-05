@@ -228,24 +228,27 @@ class TestLotteryFairness(unittest.TestCase):
         block = _mini_block(
             [f"tx-{i}".encode() * 10 for i in range(2)], 7,
         )
-        # 20 valid provers; pick 5 per round; many rounds.
-        proofs = [_make_proof(i + 1, block) for i in range(20)]
+        # 12 valid provers; pick 4 per round; 70 rounds.
+        # P(any prover never wins) = (8/12)^70 ≈ 4.3e-13;
+        # P(suite false-fail) ≤ 12 × 4.3e-13 ≈ 5e-12 — well under 1e-9.
+        # Smaller field × fewer rounds halves verifier cost vs the
+        # earlier 20-prover/80-round formulation while keeping the
+        # false-fail margin at the CLAUDE.md target.
+        proofs = [_make_proof(i + 1, block) for i in range(12)]
         ever_won: set[bytes] = set()
-        for i in range(80):
+        for i in range(70):
             pool = ArchiveRewardPool(); pool.fund(1_000_000)
             result = apply_archive_rewards(
                 proofs=proofs, pool=pool,
                 expected_block_hash=block["block_hash"],
                 selection_seed=_h(f"round-{i}".encode()),
-                max_payouts=5,
+                max_payouts=4,
             )
             for p in result.payouts:
                 ever_won.add(p.prover_id)
-        # 80 × 5 = 400 slot-draws over 20 provers at uniform probability.
-        # P(any one prover never wins) = (15/20)^80 ≈ 4e-10 × 20 ≈ 8e-9.
         self.assertEqual(
-            len(ever_won), 20,
-            f"only {len(ever_won)}/20 provers ever won across 200 "
+            len(ever_won), 12,
+            f"only {len(ever_won)}/12 provers ever won across 70 "
             f"rounds — lottery is not uniformly covering the field",
         )
 
