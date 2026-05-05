@@ -14300,6 +14300,176 @@ class Blockchain:
         )
         return True, f"Chain reorganized (rollback={len(rolled_back)}, applied={len(apply_blocks)})"
 
+    def attempt_fork_emergency_recovery(self) -> tuple[bool, str]:
+        """Rewind to a height before the lowest active fork emergency.
+
+        Closes the half-built ``FORK_EMERGENCY_AUTO_RECOVERY`` path
+        promised by the detector docstrings. Caller MUST gate by
+        ``FORK_EMERGENCY_AUTO_RECOVERY`` (default False) AND MUST NOT
+        invoke on a registered validator — autoflip on a quorum-
+        signal bug would weaponize the bug into network-wide chain
+        abandonment.
+
+        Refuses if the rewind would cross finality. On success, drops
+        every block above the target height, restores state at the
+        target via the same snapshot/replay machinery ``_reorganize``
+        uses, clears the detector's emergency flags, and returns
+        (True, …); the syncer then re-fetches the canonical chain
+        forward via normal peer sync.
+        """
+        det = self.fork_emergency_detector
+        if not det.is_in_emergency():
+            return False, "no active fork emergency"
+
+        lowest = det.lowest_emergency()
+        if lowest is None:
+            # Belt-and-suspenders: is_in_emergency() returning True
+            # implies lowest_emergency() is non-None, but the detector
+            # is intentionally exception-safe and could in principle
+            # be cleared between calls on a future concurrent path.
+            return False, "no active fork emergency"
+        target_height = lowest.height - 1
+        if target_height < 0:
+            return False, (
+                f"emergency at height {lowest.height} is at or below "
+                f"genesis; cannot rewind"
+            )
+        if target_height >= len(self.chain) - 1:
+            return False, (
+                f"emergency at height {lowest.height} is not below "
+                f"local tip {len(self.chain) - 1}; resync will resolve"
+            )
+
+        # Refuse to cross finality — same rule as ``_reorganize``.
+        # A fork emergency that spans finalized blocks is a deeper
+        # consensus problem operator surgery (and slashing-evidence)
+        # must handle, not an automatic rewind.
+        blocks_above = list(self.chain[target_height + 1:])
+        for blk in blocks_above:
+            if (
+                self.finality.is_finalized(blk.block_hash)
+                or self.finalized_checkpoints.is_finalized(blk.block_hash)
+            ):
+                return False, (
+                    f"rewind rejected — block #{blk.header.block_number} "
+                    f"({blk.block_hash.hex()[:16]}) is finalized; "
+                    f"emergency requires manual investigation"
+                )
+
+        logger.warning(
+            "fork-emergency auto-recovery: rewinding from height %d "
+            "to %d (lowest emergency at %d, supermajority hash %s)",
+            len(self.chain) - 1,
+            target_height,
+            lowest.height,
+            lowest.supermajority_hash.hex()[:16],
+        )
+
+        # Save a rollback snapshot in case the rewind itself fails
+        # (e.g. genesis-supply restore on a non-mainnet test chain).
+        if self.db is not None:
+            rollback_snapshot = self.db.save_state_snapshot()
+        else:
+            rollback_snapshot = self._snapshot_memory_state()
+
+        target_block = self.chain[target_height]
+        rolled_back_count = len(blocks_above)
+
+        self.sig_cache.invalidate()
+        self.chain = self.chain[:target_height + 1]
+        for blk in blocks_above:
+            self._block_by_hash.pop(blk.block_hash, None)
+
+        # Restore state at target via the same snapshot/replay logic
+        # ``_reorganize`` uses.  Prod (db mode) loads the chaindb
+        # snapshot; in-memory tests fall through to reset+replay.
+        snapshot_loaded = False
+        if self.db is not None and hasattr(self.db, "get_state_snapshot"):
+            blob = self.db.get_state_snapshot(
+                target_block.header.block_number,
+            )
+            if blob is not None:
+                try:
+                    import pickle
+                    snap = pickle.loads(blob)
+                    self._restore_memory_snapshot(snap)
+                    self._rebuild_state_tree()
+                    snapshot_loaded = True
+                except Exception:
+                    logger.exception(
+                        "fork-emergency rewind: snapshot-restore "
+                        "at #%d failed; falling back to replay",
+                        target_block.header.block_number,
+                    )
+        if not snapshot_loaded:
+            # Reset + replay from genesis to target_height.  Mirrors
+            # ``_reorganize``'s legacy fallback for the "no snapshot
+            # at this height" case (test chains, or pruned snapshots
+            # below the retention window).
+            self._reset_state()
+            if self.chain:
+                genesis_block = self.chain[0]
+                import messagechain.config as _cfg
+                pinned = getattr(_cfg, "PINNED_GENESIS_HASH", None)
+                is_mainnet_genesis = (
+                    pinned is not None
+                    and pinned == getattr(
+                        _cfg, "_MAINNET_GENESIS_HASH", None,
+                    )
+                    and genesis_block.block_hash == pinned
+                )
+                if is_mainnet_genesis:
+                    ok, reason = (
+                        self._apply_mainnet_genesis_supply_state(
+                            genesis_block,
+                        )
+                    )
+                    if not ok:
+                        # Restore pre-rewind state and bail.
+                        if self.db is not None:
+                            self.db.restore_state_snapshot(
+                                rollback_snapshot,
+                            )
+                        else:
+                            self._restore_memory_snapshot(
+                                rollback_snapshot,
+                            )
+                        self.chain = (
+                            self.chain[:target_height + 1] + blocks_above
+                        )
+                        for blk in blocks_above:
+                            self._block_by_hash[blk.block_hash] = blk
+                        return False, (
+                            f"genesis supply restore failed: {reason}"
+                        )
+            for blk in self.chain:
+                if blk.header.block_number > 0:
+                    self._apply_block_state(blk)
+
+        # Persist the rewound state.
+        if self.db is not None:
+            self._dirty_entities = None
+            self._persist_state()
+
+        # Clear all detector emergencies.  The syncer's normal peer-
+        # follow loop re-fetches forward from peers; if we somehow
+        # land back on a divergent branch the detector will re-flag
+        # via ``observe_finality_vote`` from incoming gossip.
+        cleared = det.clear_all()
+
+        logger.warning(
+            "fork-emergency auto-recovery complete: rewound %d "
+            "blocks to height %d; cleared %d emergency flag(s); "
+            "resync will follow",
+            rolled_back_count,
+            target_height,
+            cleared,
+        )
+        return True, (
+            f"rewound {rolled_back_count} blocks to height "
+            f"{target_height}"
+        )
+
     def _reset_state(self):
         """Reset in-memory state to genesis defaults for replay.
 

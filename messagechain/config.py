@@ -1987,6 +1987,30 @@ FINALITY_INTERVAL = 100               # blocks between finality checkpoints (~16
 FINALITY_VOTE_INCLUSION_REWARD = 1    # tokens paid to proposer per vote included (from treasury)
 FINALITY_INACTIVITY_PENALTY = 0       # placeholder — reward-loss, not slashing; tune later
 
+# Fork-emergency auto-recovery — full-node-only, opt-in, default False.
+#
+# CLAUDE.md anchor: "a node that ends up on a minority/unintentional
+# fork must auto-resync to the canonical chain with no manual state
+# surgery on the operator side, and must not accumulate slashable
+# evidence solely from being briefly on the wrong tip."
+#
+# When True AND the node is NOT a registered validator (no slashable
+# role), Blockchain.attempt_fork_emergency_recovery() will rewind the
+# local chain to the height before the lowest active emergency and
+# clear the detector flags so the syncer re-fetches the canonical
+# chain forward via normal peer sync.
+#
+# Default is False because validators MUST stay halted on a fork
+# emergency rather than auto-flip — autoflipping on a quorum-signal
+# bug would weaponize the bug into network-wide chain abandonment
+# (the supermajority signal is what consensus already trusts to
+# finalize, so a bug in it is a bug consensus already can't catch).
+# Full nodes have no slashable role, so an incorrect rewind costs
+# only resync time; that's why opt-in is safe for them. Operators
+# running a non-validating node can flip this on via env override
+# or a future CLI flag once they understand the trade-off.
+FORK_EMERGENCY_AUTO_RECOVERY = False
+
 # Inactivity leak — Casper-style defense against liveness attacks.
 # If finalization stalls, non-participating validators' stakes are slowly
 # drained (quadratically) until honest participants hold 2/3 supermajority.

@@ -1666,6 +1666,53 @@ class Node(SharedRuntimeMixin):
         )
         await self._broadcast(relay_msg, exclude=peer.address)
 
+    def _maybe_auto_recover_from_fork_emergency(self) -> None:
+        """Opt-in full-node auto-rewind when a fork emergency surfaces.
+
+        Gated by ``config.FORK_EMERGENCY_AUTO_RECOVERY`` (default
+        False) AND by the node holding zero stake — autoflipping a
+        registered validator on a quorum-signal bug would weaponize
+        the bug into network-wide chain abandonment, which is exactly
+        the failure mode the validator-halt branches in
+        ``_try_produce_block`` / ``_attest_block`` exist to prevent.
+        Full nodes have no slashable role, so an incorrect rewind
+        costs only resync time; that's why opt-in is safe for them.
+
+        Exception-safe: a failure inside the recovery path must not
+        break the surrounding gossip relay.
+        """
+        try:
+            from messagechain import config as _cfg
+            if not getattr(_cfg, "FORK_EMERGENCY_AUTO_RECOVERY", False):
+                return
+            det = getattr(
+                self.blockchain, "fork_emergency_detector", None,
+            )
+            if det is None or not det.is_in_emergency():
+                return
+            # Validator-role gate: any non-zero stake (consensus.stakes
+            # tracks active validator stake) means this node is
+            # slashable and MUST stay halted instead of auto-flipping.
+            my_id = self.entity.entity_id
+            if my_id in self.consensus.stakes and self.consensus.stakes[my_id] > 0:
+                return
+            ok, reason = self.blockchain.attempt_fork_emergency_recovery()
+            if ok:
+                logger.warning(
+                    "fork-emergency auto-recovery applied: %s; "
+                    "syncer will refetch the canonical chain",
+                    reason,
+                )
+            else:
+                logger.info(
+                    "fork-emergency auto-recovery skipped: %s",
+                    reason,
+                )
+        except Exception:
+            logger.exception(
+                "fork-emergency auto-recovery raised; ignoring",
+            )
+
     async def _handle_announce_finality_vote(self, payload: dict, peer: Peer):
         """Handle incoming FinalityVote gossip.
 
@@ -1710,6 +1757,13 @@ class Node(SharedRuntimeMixin):
             self.blockchain.observe_finality_vote(vote)
         except Exception:
             logger.exception("fork-emergency observe_finality_vote failed")
+
+        # If a fresh emergency just surfaced, full nodes (no slashable
+        # role) may opt into auto-rewind via FORK_EMERGENCY_AUTO_RECOVERY.
+        # Validators MUST stay halted instead — autoflipping on a
+        # quorum-signal bug would weaponize the bug into network-wide
+        # chain abandonment.
+        self._maybe_auto_recover_from_fork_emergency()
 
         added = self.mempool.add_finality_vote(vote)
 
