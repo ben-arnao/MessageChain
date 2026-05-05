@@ -17,6 +17,17 @@ import time
 import unittest
 
 from messagechain.network.peer import Peer, ConnectionType
+from messagechain.network.sync import PeerSyncInfo
+
+
+class _StubSyncer:
+    """Minimal stand-in for ChainSyncer — only the attributes _rpc_get_peers
+    reads.  Lets the RPC test exercise its height-source logic without
+    standing up a real syncer (which would pull in a Blockchain, mempool,
+    etc., none of which the operator-facing RPC actually depends on)."""
+
+    def __init__(self):
+        self.peer_heights: dict[str, PeerSyncInfo] = {}
 
 
 class TestGetPeersRPC(unittest.TestCase):
@@ -26,6 +37,7 @@ class TestGetPeersRPC(unittest.TestCase):
         from server import Server
         self.server = Server.__new__(Server)
         self.server.peers = {}
+        self.server.syncer = _StubSyncer()
 
     def _add_peer(
         self, host: str, port: int, *, direction: str = "outbound",
@@ -116,6 +128,50 @@ class TestGetPeersRPC(unittest.TestCase):
         self._add_peer("10.0.0.5", 9333)
         result = Server._rpc_get_peers(self.server)
         self.assertEqual(result["result"]["peers"][0]["transport"], "plain")
+
+    def test_height_uses_live_syncer_value_over_stale_handshake(self):
+        """The RPC must surface the syncer's live peer height — what every
+        consensus path already uses — not the frozen handshake-time value
+        on the Peer object.
+
+        Repro of the bug this test guards against: validators connect at
+        height 1508, run for 10 hours, both advance to 1568, but the peers
+        table on each shows the other still at 1508 because peer.peer_height
+        is set once at handshake and never updated.  The 10s _sync_loop
+        keeps syncer.peer_heights current; the RPC now reads from there.
+        """
+        from server import Server
+        self._add_peer("10.0.0.5", 9333, height=1508)
+        self.server.syncer.peer_heights["10.0.0.5:9333"] = PeerSyncInfo(
+            peer_address="10.0.0.5:9333",
+            chain_height=1568,
+        )
+        result = Server._rpc_get_peers(self.server)
+        self.assertEqual(result["result"]["peers"][0]["height"], 1568)
+
+    def test_height_falls_back_to_handshake_when_syncer_has_no_entry(self):
+        """A peer that just handshook hasn't yet had a chain-height
+        round-trip recorded by the syncer (the _sync_loop runs every 10s).
+        In that gap the RPC should still surface the handshake value
+        rather than reporting 0."""
+        from server import Server
+        self._add_peer("10.0.0.5", 9333, height=1508)
+        result = Server._rpc_get_peers(self.server)
+        self.assertEqual(result["result"]["peers"][0]["height"], 1508)
+
+    def test_height_zero_in_syncer_falls_back_to_handshake(self):
+        """A PeerSyncInfo can exist with chain_height==0 if the syncer was
+        populated before the peer responded.  Treat that as 'no live
+        evidence yet' and fall back to the handshake value, so the table
+        never reports a peer that was at 1508 ten seconds ago as 0."""
+        from server import Server
+        self._add_peer("10.0.0.5", 9333, height=1508)
+        self.server.syncer.peer_heights["10.0.0.5:9333"] = PeerSyncInfo(
+            peer_address="10.0.0.5:9333",
+            chain_height=0,
+        )
+        result = Server._rpc_get_peers(self.server)
+        self.assertEqual(result["result"]["peers"][0]["height"], 1508)
 
     def test_transport_tls_surfaces(self):
         """When a peer is created over TLS the RPC surfaces it.

@@ -3623,11 +3623,20 @@ class Server(SharedRuntimeMixin):
         """List every Peer object currently tracked by this node.
 
         Observability-only.  Returns per-peer: address, direction,
-        connection type, height last reported in handshake, seconds
-        connected, entity_id (if the handshake completed), and a
-        boolean `connected` flag (a peer object can linger after its
+        connection type, the peer's most recent reported chain height,
+        seconds connected, entity_id (if the handshake completed), and
+        a boolean `connected` flag (a peer object can linger after its
         socket dies — surfacing that lets an operator see churn).
         Sorted by address for stable CLI output.
+
+        Height source: the syncer's ``peer_heights`` map is refreshed
+        every ~10s by the REQUEST/RESPONSE_CHAIN_HEIGHT exchange and is
+        what every consensus-relevant code path already reads (sync
+        decisions, minority-fork detection, weight validation).  We
+        surface the same value here so the operator-facing peers table
+        cannot disagree with the chain's actual view of its peers.
+        Falls back to the handshake-time ``peer.peer_height`` only if
+        the syncer hasn't recorded a response yet.
 
         Design note: entity_id lives in peer memory only if the peer
         sent it in their handshake.  Empty string is rendered as-is
@@ -3645,6 +3654,11 @@ class Server(SharedRuntimeMixin):
                 conn_type = peer.connection_type.value
             except AttributeError:
                 conn_type = str(peer.connection_type)
+            sync_info = self.syncer.peer_heights.get(peer.address)
+            if sync_info is not None and sync_info.chain_height > 0:
+                height = int(sync_info.chain_height)
+            else:
+                height = int(getattr(peer, "peer_height", 0) or 0)
             rows.append({
                 "address": peer.address,
                 "direction": getattr(peer, "direction", "inbound"),
@@ -3652,7 +3666,7 @@ class Server(SharedRuntimeMixin):
                 "connected": bool(peer.is_connected),
                 "connected_at": int(connected_at),
                 "seconds_connected": seconds_connected,
-                "height": int(getattr(peer, "peer_height", 0) or 0),
+                "height": height,
                 "version": str(getattr(peer, "peer_version", "") or ""),
                 "entity_id": getattr(peer, "entity_id", "") or "",
                 # "plain" | "tls".  getattr fallback guards against a
