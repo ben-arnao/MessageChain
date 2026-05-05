@@ -62,6 +62,7 @@ import time
 from typing import TYPE_CHECKING
 
 from messagechain.config import (
+    ATTESTER_ESCROW_BLOCKS,
     CHAIN_ID,
     SIG_VERSION_CURRENT,
     UNBONDING_PERIOD,
@@ -201,14 +202,31 @@ class EquivocationWatcher:
     # ── maintenance ──────────────────────────────────────────────
 
     def prune(self, current_height: int | None = None) -> int:
-        """Delete observations older than UNBONDING_PERIOD blocks.
+        """Delete observations older than the slash-tx admission window.
+
+        The cutoff MUST match ``validate_slash_transaction``'s
+        ``evidence_ttl = max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)``
+        (~12960 blocks).  Pre-r19-fix this used ``UNBONDING_PERIOD``
+        (~2176 blocks) — narrower than the admission window — so a
+        delayed-disclosure equivocation in the
+        [UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS] window found the
+        watcher's seen-signatures cache empty when the second
+        conflicting payload arrived, and no auto-slash fired.  Honest
+        watchers across the network were silenced identically by
+        design, giving colluding validators a clean amnesty for any
+        equivocation they could keep secret for ~UNBONDING_PERIOD
+        blocks.
 
         Should be called once per applied block — a single bounded
         DELETE is cheaper than a periodic scan.  Safe to no-op early
-        in chain life (current_height < UNBONDING_PERIOD).
+        in chain life (current_height < cutoff).  Cache size grows
+        from ~UNBONDING_PERIOD * gossip-rate to
+        ~ATTESTER_ESCROW_BLOCKS * gossip-rate -- ~6x larger but still
+        bounded and small (the seen-signatures table stores one row
+        per signed slot, not per gossip echo).
         """
         h = self._current_height(current_height)
-        cutoff = h - UNBONDING_PERIOD
+        cutoff = h - max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)
         if cutoff <= 0:
             return 0
         return self.chaindb.prune_seen_signatures_before(cutoff)

@@ -28,6 +28,7 @@ import time
 import unittest
 
 from messagechain.config import (
+    ATTESTER_ESCROW_BLOCKS,
     TREASURY_ENTITY_ID,
     UNBONDING_PERIOD,
     VALIDATOR_MIN_STAKE,
@@ -275,42 +276,121 @@ class TestConcurrentObservers(_WatcherFixture):
 
 
 class TestRollingPrune(_WatcherFixture):
-    """Observations older than UNBONDING_PERIOD must be pruned."""
+    """Observations are kept for the FULL slash-tx admission window.
 
-    def test_old_observations_are_pruned(self):
-        """Record an observation at block height X.  After the chain
-        advances to X + UNBONDING_PERIOD + 1 (with prune hooks firing),
-        the stored observation must be gone.
+    Audit r19 finding #2: pre-fix the watcher pruned at
+    ``UNBONDING_PERIOD`` (~2176 blocks) but
+    ``validate_slash_transaction`` accepts evidence up to
+    ``max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)`` blocks old
+    (~12960 blocks).  Delayed-disclosure equivocation in the
+    [UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS] window therefore
+    escaped auto-slash because the watcher's seen-signatures cache
+    was empty by the time the conflicting payload arrived.  Post-fix
+    the cache survives for the full admission window so a second
+    conflicting signature gossiped late still produces evidence.
+    """
 
-        We don't need to build 1008 blocks — prune() takes the current
-        chain height as an argument.  We record at a synthetic height
-        and then call the prune hook with a later height.
+    def test_observation_survives_unbonding_window(self):
+        """An observation at H=X must STILL be present at
+        H=X + UNBONDING_PERIOD + 1 -- the slash-tx admission window
+        is wider than UNBONDING_PERIOD so the watcher must hold the
+        original record long enough to detect a delayed-disclosure
+        conflicting payload.  Pre-fix this assertion fails (the
+        pre-fix prune cutoff is UNBONDING_PERIOD, so the row is
+        gone exactly when an attacker would release the second
+        payload).
         """
         prev = self.chain.get_latest_block()
         header = _make_signed_header(self.offender, prev, b"A")
 
-        recorded_at = 5  # pretend we saw this header when chain was at H=5
+        recorded_at = 5
         self.watcher.observe_block_header(header, current_height=recorded_at)
+
+        # Advance just past UNBONDING_PERIOD.  Within the admission
+        # window, so the row must NOT be pruned.
+        self.watcher.prune(current_height=recorded_at + UNBONDING_PERIOD + 1)
         self.assertTrue(
             self.watcher.has_observation_for(
                 self.offender.entity_id,
                 header.block_number,
                 message_type="block",
             ),
-            "Observation must be present immediately after observe()",
+            "Observation must survive past UNBONDING_PERIOD because "
+            "validate_slash_transaction's evidence_ttl is "
+            "max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS); pruning "
+            "earlier reopens the delayed-disclosure equivocation "
+            "amnesty the watcher exists to close.",
         )
 
-        # Now simulate the chain advancing well past the window.
-        self.watcher.prune(current_height=recorded_at + UNBONDING_PERIOD + 1)
+    def test_old_observations_are_pruned_at_admission_window_edge(self):
+        """An observation MUST eventually be pruned -- once it is
+        older than the slash-tx admission window, no honest slash
+        tx can ever cite it again, so the row is dead weight.  The
+        post-fix cutoff is ``max(UNBONDING_PERIOD,
+        ATTESTER_ESCROW_BLOCKS)``.
+        """
+        prev = self.chain.get_latest_block()
+        header = _make_signed_header(self.offender, prev, b"A")
 
+        recorded_at = 5
+        self.watcher.observe_block_header(header, current_height=recorded_at)
+
+        cutoff = max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS)
+        self.watcher.prune(current_height=recorded_at + cutoff + 1)
         self.assertFalse(
             self.watcher.has_observation_for(
                 self.offender.entity_id,
                 header.block_number,
                 message_type="block",
             ),
-            "Observation must be pruned once it is older than "
-            "UNBONDING_PERIOD — it is worthless for slashing anyway.",
+            "Observation must be pruned once it is older than the "
+            "slash-tx admission window -- by definition no honest "
+            "slash tx can ever land citing it.",
+        )
+
+    def test_delayed_disclosure_equivocation_still_slashes(self):
+        """End-to-end: validator equivocates at H=K, watcher sees
+        header_a immediately, header_b is gossiped LATE -- after
+        UNBONDING_PERIOD blocks but before ATTESTER_ESCROW_BLOCKS.
+        Watcher must STILL emit a SlashTransaction.  Pre-fix the
+        first observation was pruned and the late-arriving header
+        was indexed as fresh, no slash.
+        """
+        prev = self.chain.get_latest_block()
+        header_a = _make_signed_header(self.offender, prev, b"A")
+        header_b = _make_signed_header(self.offender, prev, b"B", t_offset=1.0)
+        self.assertEqual(header_a.block_number, header_b.block_number)
+
+        recorded_at = 5
+        self.watcher.observe_block_header(
+            header_a, current_height=recorded_at,
+        )
+        self.assertEqual(len(self.mempool.slash_pool), 0)
+
+        # Simulate chain advancing into the delayed-disclosure
+        # window.  Pre-fix prune wipes header_a here; post-fix it
+        # survives.
+        late_height = recorded_at + UNBONDING_PERIOD + 100
+        self.assertLess(
+            late_height - recorded_at,
+            max(UNBONDING_PERIOD, ATTESTER_ESCROW_BLOCKS),
+            "Test setup: late-disclosure height must lie inside the "
+            "post-fix admission window for the assertion to be "
+            "meaningful.",
+        )
+        self.watcher.prune(current_height=late_height)
+
+        # The late conflicting payload arrives.
+        self.watcher.observe_block_header(
+            header_b, current_height=late_height,
+        )
+
+        self.assertEqual(
+            len(self.mempool.slash_pool), 1,
+            "Delayed-disclosure equivocation in the [UNBONDING_PERIOD, "
+            "ATTESTER_ESCROW_BLOCKS] window MUST still produce a slash "
+            "transaction; pre-fix it escaped because the watcher's "
+            "row was pruned before the second payload arrived.",
         )
 
 
