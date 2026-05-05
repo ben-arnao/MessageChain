@@ -4,6 +4,90 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.56.0] — 2026-05-05
+
+Minor release.  Audit round 17 ships two fixes: a critical witness
+strip/attach slot-preservation hotfix that becomes load-bearing as
+soon as Tier 48 binds at height 1712 (~hours away from the live tip
+~1593), and Tier 49 — the unified fee floor across non-message tx
+types — which collapses the 100× asymmetry between message and
+transfer/stake/unstake admission floors.
+
+### Fixed
+
+  * **Witness `strip`/`attach` must preserve every signed body slot
+    (consensus integrity, immediate impact).**  Pre-fix
+    `strip_block_witnesses` and `attach_block_witnesses` constructed
+    the new `Block` from only 10 of the 17 slots
+    `enumerate_block_signatures` walks; these 7 were silently
+    dropped: `react_transactions`, `custody_proofs`, `inclusion_list`,
+    `censorship_evidence_txs`, `bogus_rejection_evidence_txs`,
+    `inclusion_list_violation_evidence_txs`, and
+    `non_response_evidence_txs`.  Pre-Tier-48
+    (`block_number < WITNESS_ROOT_ACTIVATION_HEIGHT = 1712`) the
+    verification gate is skipped, so the data was silently being
+    deleted from the on-disk side-table for every stripped block
+    carrying a reaction or evidence — the slashing-evidence audit
+    trail vaporised on disk while the warm in-memory cache still
+    looked correct.  Post-Tier-48 the gate fires and
+    `WitnessRootMismatchError` would crash every read of any such
+    block, including via `get_block_by_hash(include_witnesses=True)`
+    and the imminent auto-separation pass at
+    `WITNESS_AUTO_SEPARATION_HEIGHT = 1704`.  Both functions now use
+    `dataclasses.replace` to carry every Block field through
+    unchanged — the explicit field list was the defect shape, and any
+    future block-shape addition (a new evidence kind, a new committee
+    tx slot, ...) inherits the correct strip/attach semantics for
+    free.  New regression test in
+    `tests/test_witness_reattach_verification.py` populates each of
+    the 7 slots with an item carrying a real `Signature`, computes
+    `header.witness_root` over the full block, then asserts both the
+    slot-list pass-through and the post-activation reattach
+    round-trip succeed without raising — fails on pre-fix
+    `origin/main` for every slot.  (269197a)
+
+### Changed
+
+  * **Tier 49 — unified fee floor across non-message tx types
+    (consensus, hard fork, activation height 1750).**  Pre-Tier-49,
+    transfer / stake / unstake admission enforced
+    `tx.fee >= max(MIN_FEE, MARKET_FEE_FLOOR) = max(100, 1) = 100`,
+    while message-tx admission used the Tier-16 `MARKET_FEE_FLOOR=1`
+    directly — same fee model, 100× different floors across tx kinds.
+    Density-wise, transfer (96 stored bytes / 100 fee = 1.04 fee/byte)
+    vs message (~280 bytes / 1 fee = 0.0036 fee/byte) — selection-by-
+    fee-per-byte therefore always crowds messages out of the mempool
+    by transfers at the floor, exactly the failure the unified
+    fee-model anchor is meant to prevent ("Every tx type the chain
+    accepts ... follows this same fee model.  Don't carve out
+    per-type fee logic").  Reaction txs already moved to
+    `MARKET_FEE_FLOOR` at Tier 18; Tier 49 brings transfer / stake /
+    unstake into the same regime.  Type-specific surcharges that
+    legitimately bind above the protocol floor (`NEW_ACCOUNT_FEE` on
+    transfer, `GOVERNANCE_PROPOSAL_FEE`, `KEY_ROTATION_FEE`,
+    `AUTHORITY_KEY_FEE`, `REVOKE_TX_FEE`,
+    `RECEIPT_SUBTREE_ROOT_FEE`) are unaffected — they layer on top of
+    the unified floor at their respective callsites.  Activation
+    height 1750 sits above the existing 1700–1712 fork band with
+    additional cohort spacing (~38 blocks ≈ 6.3 h at 600s); two-
+    validator network, both operator-controlled, so the cutover is
+    coordinated and the runway bound is operational rather than the
+    multi-week external-validator notice the band was originally
+    sized for.  Pre-fork blocks replay byte-identically because every
+    historical transfer / stake / unstake on chain paid >=
+    `MIN_FEE = 100`, so the verifier admits everything it admitted
+    before; only new low-fee txs become acceptable post-fork.
+    `economics/auto_fee.py` mirrors the height gate via a new
+    `_non_message_flat_floor` helper consumed by `_transfer_floor`,
+    `_stake_floor`, `_unstake_floor` — wallet/CLI quotes shift with
+    the verifier rule, no over-quote drift.  New
+    `tests/test_unified_fee_floor_tier49.py` covers activation
+    ordering, pre-fork rejection at sub-`MIN_FEE`, post-fork
+    acceptance at `MARKET_FEE_FLOOR`, post-fork zero-fee path stays
+    closed, pre-fork history replays byte-identically,
+    `auto_fee` quote correctness across the gate, and surcharge
+    layering.  (c9b6623)
+
 ## [1.55.2] — 2026-05-05
 
 Patch release.  Three audit-round-16 fixes plus the test-suite perf
