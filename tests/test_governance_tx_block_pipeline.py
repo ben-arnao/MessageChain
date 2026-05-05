@@ -36,8 +36,21 @@ def _window():
 from tests import pick_selected_proposer
 
 
+_ENTITY_POOL: dict[bytes, Entity] = {}
+
+
 def _entity(seed: bytes) -> Entity:
-    return Entity.create(seed.ljust(32, b"\x00"))
+    """Module-cached entity factory.  Several test classes spin up
+    3 staked validators per setUp; without caching, each setUp pays
+    fresh WOTS+ keygen at MERKLE_TREE_HEIGHT=6 (~250ms each).  Reuse
+    + reset _next_leaf is semantically equivalent for these tests."""
+    padded = seed.ljust(32, b"\x00")
+    cached = _ENTITY_POOL.get(padded)
+    if cached is None:
+        cached = Entity.create(padded)
+        _ENTITY_POOL[padded] = cached
+    cached.keypair._next_leaf = 0
+    return cached
 
 
 class _Base(unittest.TestCase):

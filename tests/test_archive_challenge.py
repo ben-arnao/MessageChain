@@ -370,7 +370,37 @@ class TestArchiveRewardPool(unittest.TestCase):
 
 
 class TestFCFSCap(unittest.TestCase):
+    # Class-level cache: building 100+ signed custody proofs costs
+    # ~1.7s of WOTS+ keygen+sign and is paid by both bulk tests
+    # under unittest's per-test setUp semantics.  Build once per class.
+    # Selection / payout rules don't mutate the proofs (except where
+    # a test explicitly forges; that test deep-copies its target).
+    _BLOCK = None
+    _PROOFS: list = []
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _mini_block(
+            [f"t{i}".encode() * 10 for i in range(3)], 5,
+        )
+        for i in range(ARCHIVE_PROOFS_PER_CHALLENGE + 10):
+            cls._PROOFS.append(
+                build_custody_proof(
+                    entity=_test_entity(i + 1),
+                    target_height=cls._BLOCK["block_number"],
+                    target_block_hash=cls._BLOCK["block_hash"],
+                    header_bytes=cls._BLOCK["header_bytes"],
+                    merkle_root=cls._BLOCK["merkle_root"],
+                    tx_index=0,
+                    tx_bytes=cls._BLOCK["tx_bytes_list"][0],
+                    all_tx_hashes=cls._BLOCK["tx_hashes"],
+                )
+            )
+
     def _proof(self, prover_byte: int, block):
+        # Single-use proofs (e.g. the duplicate-prover test) build
+        # fresh — they need a specific prover_byte and the block the
+        # test constructed locally.
         return build_custody_proof(
             entity=_test_entity(prover_byte),
             target_height=block["block_number"],
@@ -390,17 +420,12 @@ class TestFCFSCap(unittest.TestCase):
         """
         pool = ArchiveRewardPool()
         pool.fund(ARCHIVE_REWARD * (ARCHIVE_PROOFS_PER_CHALLENGE + 20))
-        block = _mini_block([f"t{i}".encode() * 10 for i in range(3)], 5)
-        proofs = [
-            self._proof(i + 1, block)
-            for i in range(ARCHIVE_PROOFS_PER_CHALLENGE + 10)
-        ]
+        proofs = list(self._PROOFS)
         result = apply_archive_rewards(
             proofs=proofs,
             pool=pool,
-            expected_block_hash=block["block_hash"],
+            expected_block_hash=self._BLOCK["block_hash"],
         )
-        # Exactly ARCHIVE_PROOFS_PER_CHALLENGE paid.
         self.assertEqual(len(result.payouts), ARCHIVE_PROOFS_PER_CHALLENGE)
         self.assertEqual(
             result.total_paid,
@@ -411,23 +436,24 @@ class TestFCFSCap(unittest.TestCase):
         """Invalid proofs don't consume a slot — a forged proof in
         position 2 is silently dropped and proof #11 gets paid instead of
         being excluded by the cap."""
+        import copy
         pool = ArchiveRewardPool()
         pool.fund(ARCHIVE_REWARD * 100)
-        block = _mini_block([f"t{i}".encode() * 10 for i in range(3)], 5)
-        proofs = []
-        for i in range(ARCHIVE_PROOFS_PER_CHALLENGE + 2):
-            p = self._proof(i + 1, block)
-            if i == 2:
-                # Forge this one
-                p.tx_bytes = b"FORGED"
-            proofs.append(p)
+        # Take cap+2 proofs from the cached pool; deep-copy index 2 so
+        # forging tx_bytes doesn't poison subsequent tests.
+        proofs = list(self._PROOFS[:ARCHIVE_PROOFS_PER_CHALLENGE + 2])
+        proofs[2] = copy.deepcopy(proofs[2])
+        proofs[2].tx_bytes = b"FORGED"
+        forged_prover_id = proofs[2].prover_id
         result = apply_archive_rewards(
             proofs=proofs,
             pool=pool,
-            expected_block_hash=block["block_hash"],
+            expected_block_hash=self._BLOCK["block_hash"],
         )
         self.assertEqual(len(result.payouts), ARCHIVE_PROOFS_PER_CHALLENGE)
-        self.assertNotIn(bytes([3]) * 32, {p.prover_id for p in result.payouts})
+        self.assertNotIn(
+            forged_prover_id, {p.prover_id for p in result.payouts},
+        )
 
     def test_duplicate_prover_only_paid_once(self):
         """Same prover submitting twice claims only one slot — Sybil bound."""
