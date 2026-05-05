@@ -11,6 +11,30 @@ persists somewhere forever.
 Key design property: tx_hash is computed from _signable_data() which
 EXCLUDES the signature, so stripping witnesses preserves tx_hash exactly.
 No SegWit-style txid/wtxid split is needed.
+
+Two witness-root forms live in this module — DO NOT confuse them in new
+code:
+
+  * `compute_witness_root(transactions)` — LEGACY single-slot form.  Only
+    folds the `transactions` (SLOT_TX_MESSAGE) signatures, with a flat
+    leaf rule (`HASH(sig.canonical_bytes())`) and no domain separation.
+    Retained ONLY for back-compat with existing tests and historical
+    fixtures; it is NOT the consensus-binding root.  Never wire this
+    into a new code path; never compare its output to `header.witness_root`
+    on a post-activation block.
+
+  * `compute_block_witness_root(block)` — CANONICAL multi-slot form.
+    Walks every signed body slot via `enumerate_block_signatures` with
+    domain-separated leaves (slot_id + item_index baked into each leaf
+    hash) and tagged Merkle internals.  This is what
+    `header.witness_root` commits to from
+    `WITNESS_ROOT_ACTIVATION_HEIGHT` onward, and what every new
+    strip/attach, peer-fetch, or audit path MUST verify against.
+
+The two functions are NOT byte-equivalent on the same input.  Mixing
+them silently produces a chain-halting bug; the module-level constant
+domain tags below (`_WITNESS_*_TAG`) exist precisely so the two trees
+are computationally distinguishable.
 """
 
 import hashlib
@@ -384,69 +408,59 @@ def get_block_witness_data(block) -> bytes:
     return b"".join(parts)
 
 
-def verify_witness_data(witness_data: bytes, expected_root: bytes) -> bool:
-    """Verify a serialized witness blob matches a committed witness_root.
+class WitnessRootMismatchError(Exception):
+    """Raised when a reattached block's recomputed witness_root does not
+    match the committed `header.witness_root`.
 
-    This is the integrity anchor for any flow that fetches witnesses
-    from a peer (or reads them from a side-table after separation):
-    the blob is only trusted if re-hashing it reproduces the
-    witness_root already committed in the header (which is itself
-    covered by the block_hash and the proposer signature).
+    This is the integrity anchor for the strip/attach surface — without
+    it, disk corruption, an attacker with archive-node write access, or
+    a future B-3 peer-fetch path could substitute fabricated WOTS+ blobs
+    that deserialize cleanly while the unmodified header (and therefore
+    the block_hash) still verifies.
 
-    Recomputes the Merkle tree using the same leaf rule as
-    compute_witness_root — leaf = HASH(signature.canonical_bytes()).
-    The blob format is the one produced by get_block_witness_data.
-
-    Returns True iff the recomputed root equals expected_root.  Any
-    structural error in the blob returns False (not raises) — this
-    function is called on untrusted input from peers and must not
-    crash on malformed data.
+    Carries enough context for a chaindb caller to log actionably:
+    `block_number` to find the bad row, `expected_root` (the value the
+    proposer signed in the header), and `actual_root` (what was
+    recomputed from the blob actually returned).
     """
-    try:
-        offset = 0
-        tx_count = struct.unpack_from(">I", witness_data, offset)[0]
-        offset += 4
 
-        if tx_count == 0:
-            return expected_root == default_hash(b"")
-
-        leaves = []
-        for _ in range(tx_count):
-            w_len = struct.unpack_from(">I", witness_data, offset)[0]
-            offset += 4
-            w_bytes = witness_data[offset:offset + w_len]
-            if len(w_bytes) != w_len:
-                return False
-            offset += w_len
-
-            # Decode and re-canonicalize.  The blob uses Signature.to_bytes
-            # (compact storage form); witness_root uses canonical_bytes
-            # (deterministic serialization with length prefixes).  They
-            # are not the same byte string, so we must round-trip through
-            # the Signature object to re-derive the canonical form.
-            sig = Signature.from_bytes(w_bytes)
-            leaves.append(_hash(sig.canonical_bytes()))
-
-        if offset != len(witness_data):
-            return False
-
-        layer = list(leaves)
-        while len(layer) > 1:
-            if len(layer) % 2 == 1:
-                layer.append(_hash(b"\x02witness_sentinel"))
-            next_layer = []
-            for i in range(0, len(layer), 2):
-                next_layer.append(_hash(layer[i] + layer[i + 1]))
-            layer = next_layer
-
-        return layer[0] == expected_root
-    except (struct.error, ValueError, IndexError):
-        return False
+    def __init__(
+        self,
+        block_number: int,
+        expected_root: bytes,
+        actual_root: bytes,
+    ):
+        self.block_number = block_number
+        self.expected_root = expected_root
+        self.actual_root = actual_root
+        super().__init__(
+            f"witness_root mismatch on reattach at block {block_number}: "
+            f"expected {expected_root.hex()}, got {actual_root.hex()}"
+        )
 
 
 def attach_block_witnesses(stripped_block, witness_data: bytes):
-    """Reattach witness data to a stripped block."""
+    """Reattach witness data to a stripped block, verifying integrity.
+
+    Post-activation (block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT):
+        Re-derives `compute_block_witness_root(restored)` and asserts
+        equality with `restored.header.witness_root`.  Mismatch raises
+        `WitnessRootMismatchError` — never silently returns a tampered
+        block.
+
+    Pre-activation (block_number < WITNESS_ROOT_ACTIVATION_HEIGHT):
+        The header field is the all-zero default by design (the
+        commitment was not yet enforced when the block was produced),
+        so verification is skipped — enforcing would reject every
+        historical block on chain today.
+
+    The activation gate matches `pos.create_block` (which only
+    populates the field post-activation) and `Blockchain.validate_block`
+    (which only checks it post-activation); all three must agree or a
+    block accepted at validate-time could fail reattach later.
+    """
     from messagechain.core.block import Block
+    from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
     import copy
 
     offset = 0
@@ -483,4 +497,18 @@ def attach_block_witnesses(stripped_block, witness_data: bytes):
         finality_votes=stripped_block.finality_votes,
     )
     restored.block_hash = restored._compute_hash()
+
+    # Self-verify post-activation.  The header is unmodified by
+    # stripping, so `restored.header.witness_root` is the value the
+    # proposer signed; any divergence means the witness blob was
+    # tampered (or corrupted) between strip and attach.
+    if header.block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT:
+        actual_root = compute_block_witness_root(restored)
+        if actual_root != header.witness_root:
+            raise WitnessRootMismatchError(
+                block_number=header.block_number,
+                expected_root=header.witness_root,
+                actual_root=actual_root,
+            )
+
     return restored

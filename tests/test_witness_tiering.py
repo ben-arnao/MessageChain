@@ -1,26 +1,28 @@
-"""Witness tiering — verifier + opt-in auto-separation driver.
+"""Witness tiering — opt-in auto-separation driver.
 
 Phase A on-disk slice.  Witness-stripping helpers and the separate
 block_witnesses table already exist (see test_witness_separation.py);
-this adds:
-
-  * verify_witness_data(blob, expected_root) — so any node that re-
-    fetches witnesses from a peer can confirm the blob matches the
-    committed witness_root.
-  * ChainDB.auto_separate_finalized_witnesses(finalized_height, ...)
-    — opt-in driver that moves witnesses of finalized blocks older
-    than WITNESS_RETENTION_BLOCKS from inline storage to the side
-    table.  Gated on WITNESS_AUTO_SEPARATION_ENABLED so the current
-    default behavior (witnesses inline, no callers silently broken)
-    is unchanged.
+this exercises `ChainDB.auto_separate_finalized_witnesses(finalized_height, ...)`
+— opt-in driver that moves witnesses of finalized blocks older than
+WITNESS_RETENTION_BLOCKS from inline storage to the side table.  Gated
+on WITNESS_AUTO_SEPARATION_ENABLED so the current default behavior
+(witnesses inline, no callers silently broken) is unchanged.
 
 Permanence: separation NEVER deletes witnesses — it moves them from
 the `blocks.data` BLOB into the `block_witnesses.witness_data` BLOB
 in the same database.  Full reassembly via
 get_block_by_hash(..., include_witnesses=True) is always possible on
-this node.  A node that later opts into a deeper prune (phase B)
-relies on peers to re-serve witnesses; the verifier here is the
-trust anchor for that flow.
+this node.
+
+Reattach integrity (the trust anchor for any phase-B/C/D flow that
+re-fetches witnesses from peers) lives in
+`tests/test_witness_reattach_verification.py` —
+`attach_block_witnesses` self-verifies against the committed
+`header.witness_root` post-activation.  The legacy single-slot
+`verify_witness_data` helper used to live here; it was retired with
+the Tier 48 audit because its leaf rule is incompatible with the
+canonical `compute_block_witness_root` and shipping it as a public
+helper invited a chain-halting bug.
 """
 import os
 import tempfile
@@ -33,7 +35,6 @@ from messagechain.core.witness import (
     compute_witness_root,
     get_block_witness_data,
     tx_has_witness,
-    verify_witness_data,
 )
 from messagechain.crypto.keys import Signature
 from messagechain.identity.identity import Entity
@@ -64,64 +65,6 @@ def _make_block_with_txs(n_txs=3, block_number=1):
     block = Block(header=header, transactions=txs)
     block.block_hash = block._compute_hash()
     return block
-
-
-class TestVerifyWitnessData(unittest.TestCase):
-    """The witness-data verifier is the integrity anchor for any flow
-    that re-fetches witnesses from a peer.  A node must be able to
-    confirm the blob matches the committed witness_root WITHOUT
-    trusting the peer.
-    """
-
-    def test_valid_blob_verifies(self):
-        block = _make_block_with_txs(5)
-        blob = get_block_witness_data(block)
-        self.assertTrue(
-            verify_witness_data(blob, block.header.witness_root)
-        )
-
-    def test_empty_block_verifies(self):
-        block = _make_block_with_txs(0)
-        blob = get_block_witness_data(block)
-        self.assertTrue(
-            verify_witness_data(blob, block.header.witness_root)
-        )
-
-    def test_tampered_signature_rejected(self):
-        """Flipping a bit inside any signature must be detected."""
-        block = _make_block_with_txs(3)
-        blob = bytearray(get_block_witness_data(block))
-        # Flip a byte past the 4-byte tx_count + 4-byte first-sig-len
-        # prefixes — lands inside the first signature.
-        blob[12] ^= 0xFF
-        self.assertFalse(
-            verify_witness_data(bytes(blob), block.header.witness_root)
-        )
-
-    def test_wrong_root_rejected(self):
-        block = _make_block_with_txs(3)
-        blob = get_block_witness_data(block)
-        self.assertFalse(verify_witness_data(blob, b"\xaa" * 32))
-
-    def test_truncated_blob_rejected(self):
-        """Malformed blob must fail cleanly, not crash."""
-        block = _make_block_with_txs(3)
-        blob = get_block_witness_data(block)
-        self.assertFalse(
-            verify_witness_data(blob[:8], block.header.witness_root)
-        )
-
-    def test_wrong_tx_count_rejected(self):
-        """A blob claiming a different tx count than the committed
-        root's tree must not verify.
-        """
-        block_a = _make_block_with_txs(3)
-        block_b = _make_block_with_txs(5)
-        blob_b = get_block_witness_data(block_b)
-        # Root from the 3-tx block, blob from the 5-tx block
-        self.assertFalse(
-            verify_witness_data(blob_b, block_a.header.witness_root)
-        )
 
 
 class TestAutoSeparationFlag(unittest.TestCase):
@@ -258,10 +201,11 @@ class TestSeparatedBlockRoundTrip(unittest.TestCase):
             self.assertTrue(tx_has_witness(tx))
             self.assertEqual(tx.signature.to_bytes(), orig)
 
-    def test_separated_blob_verifies_against_witness_root(self):
-        """The side-table blob must pass verify_witness_data against
-        the committed witness_root.  Without this, phase B would have
-        no integrity anchor for witnesses fetched from peers.
+    def test_separated_blob_present_in_side_table(self):
+        """The side-table row must be populated by auto-separation —
+        the integrity check that the blob matches the committed
+        witness_root happens at reattach time (see
+        `tests/test_witness_reattach_verification.py`).
         """
         block = _make_block_with_txs(4, block_number=1)
         self.db.store_block(block)
@@ -269,9 +213,7 @@ class TestSeparatedBlockRoundTrip(unittest.TestCase):
 
         blob = self.db.get_witness_data(block.block_hash)
         self.assertIsNotNone(blob)
-        self.assertTrue(
-            verify_witness_data(blob, block.header.witness_root)
-        )
+        self.assertGreater(len(blob), 4)  # At least the tx_count prefix.
 
     def test_default_read_still_returns_core(self):
         """A caller that doesn't opt into witnesses gets the stripped

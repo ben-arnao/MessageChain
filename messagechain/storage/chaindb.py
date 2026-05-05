@@ -1120,6 +1120,16 @@ class ChainDB:
         stripped (witness data stored separately in block_witnesses),
         the witness data is reattached before returning.  Default is
         False — callers that need witness data must opt in.
+
+        Reattach is self-verifying: post-activation
+        (block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT) the rebuilt
+        block's recomputed `compute_block_witness_root` must equal the
+        committed `header.witness_root`.  Mismatch raises
+        `messagechain.core.witness.WitnessRootMismatchError` rather
+        than silently returning attacker-substituted signatures —
+        callers (RPC handlers, audit tools) must catch and surface.
+        Pre-activation blocks pass through with no enforcement
+        (the header field is the all-zero default by design).
         """
         cur = self._conn.execute("SELECT data FROM blocks WHERE block_hash = ?", (block_hash,))
         row = cur.fetchone()
@@ -1130,6 +1140,10 @@ class ChainDB:
             from messagechain.core.witness import attach_block_witnesses
             witness_data = self.get_witness_data(block_hash)
             if witness_data is not None:
+                # attach_block_witnesses self-verifies post-activation
+                # and raises WitnessRootMismatchError on tampered blobs.
+                # Propagate — silent fallback to a stripped block would
+                # mask disk corruption / archive-write attacks.
                 block = attach_block_witnesses(block, witness_data)
         return block
 
