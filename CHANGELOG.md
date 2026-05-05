@@ -4,6 +4,81 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.0] — 2026-05-05
+
+Minor release.  Tier 48 — witness-root activation (B-1 + B-2 of the
+witness-tier fork).  Block headers commit to a Merkle root over every
+signature byte across all signed body slots.  Pre-activation behavior
+unchanged; activation gated at `WITNESS_ROOT_ACTIVATION_HEIGHT = 15_000`
+(~95 days runway from current ~1_500 mainnet tip).
+
+### Why this matters
+
+Witness separation already runs in production (`strip_block_witnesses`
++ `attach_block_witnesses` in `chaindb.py`) but the existing single-slot
+`compute_witness_root` is never called from production code, so today's
+separated witnesses have no header commitment to verify against.  A peer
+or a corrupted side-table could serve substituted witness data for any
+post-finality block, and the current code has no cryptographic way to
+detect it without re-verifying every signature individually (which
+defeats the storage point of separation).  Tier 48 closes that gap by
+binding every signed body slot's signatures into a single Merkle root
+that the proposer signs and validators check on receipt.
+
+### Added
+
+  * **`messagechain/core/witness.py`** — canonical multi-slot Merkle
+    commitment over block signatures.
+      * `enumerate_block_signatures(block)`: slot-id-ordered iterator
+        over every `Signature` in every signed body slot, item-index
+        tagged.
+      * `compute_block_witness_root(block)`: domain-separated Merkle
+        root over the iterator's leaves.  Empty-block sentinel
+        deliberately distinct from the all-zero default of
+        `header.witness_root` to surface "forgot to populate" bugs.
+      * 17 stable slot IDs (`SLOT_TX_MESSAGE` 0x01 through
+        `SLOT_NON_RESPONSE_EVIDENCE` 0x11).  `SLOT_VALIDATOR_SIG`
+        (0x0B) reserved-but-skipped — validator_signatures land
+        post-proposer-sign and have their own per-sig integrity via
+        `block_hash`.
+  * **`messagechain/consensus/pos.py`** — `create_block` populates
+    `header.witness_root` before the proposer signs, gated on
+    `block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT`.  Pre-activation
+    blocks pass the field through at its all-zero default.
+  * **`messagechain/core/blockchain.py`** — `validate_block` and
+    `validate_block_standalone` recompute the witness root and reject
+    "Invalid witness_root" for post-activation blocks whose header
+    field disagrees with the body.
+  * **`messagechain/config.py`** — `WITNESS_ROOT_ACTIVATION_HEIGHT =
+    15_000` (Tier 48).  Asserts ride above
+    `NON_RESPONSE_EVIDENCE_BLOCK_SLOT_HEIGHT` (Tier 35, latest body
+    slot) and `DORMANCY_CONTROLLER_HEIGHT` (Tier 47).
+  * **22 new tests** (`tests/test_witness_root_activation.py` +
+    `tests/test_witness_root_v2.py`) covering enumeration order, slot
+    coverage, activation gate, post-activation enforcement, and
+    pre-activation no-op.
+
+### Compat
+
+Pre-activation: completely no-op.  `compute_witness_root(transactions)`
+and other existing single-slot witness helpers are preserved unchanged
+for back-compat with the test suite and any external integrations.
+Post-activation (height ≥ 15_000): every block header MUST carry
+`witness_root == compute_block_witness_root(block)` — proposers that
+omit the field or compute it incorrectly are rejected at validate time.
+
+### Follow-on milestones
+
+This release ships only the consensus-binding piece (B-1 + B-2 of
+Milestone B) of the witness-tier fork.  Remaining work — extending
+`strip_block_witnesses` / `get_block_witness_data` to walk all 17 slots
+(B-3), strippability rule + warm window (Milestone C),
+`WitnessProof` type + p2p witness fetch + carrot wiring (Milestone D)
+— remains pending and will land in subsequent releases.  Shipping the
+commitment piece on its own makes the existing single-slot strip/attach
+flow cryptographically safe and gives B-3/C/D a stable consensus base
+to build on.
+
 ## [1.54.2] — 2026-05-04
 
 Patch release.  Fixes a latent integer-truncation bug in the EIP-1559

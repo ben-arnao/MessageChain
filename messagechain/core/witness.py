@@ -68,6 +68,13 @@ def compute_witness_root(transactions: list) -> bytes:
 
     The witness_root is included in BlockHeader.signable_data() so the
     block_hash commits to witnesses even when they are stored separately.
+
+    Legacy form: only commits to MessageTransaction signatures.  Retained
+    for backward compatibility with existing tests and external callers.
+    The CONSENSUS-BINDING form is `compute_block_witness_root(block)` —
+    that one walks every signed body slot, not just `transactions`.  The
+    two functions are NOT byte-equivalent on the same input; never compare
+    a legacy root to a block root.
     """
     if not transactions:
         return default_hash(b"")
@@ -89,6 +96,194 @@ def compute_witness_root(transactions: list) -> bytes:
         layer = next_layer
 
     return layer[0]
+
+
+# ── Block-level witness root (v1, all signed body slots) ─────────────
+#
+# The consensus-binding witness commitment.  Walks every signed body slot
+# in canonical order and folds each Signature into a Merkle root, with
+# each leaf domain-separated by (slot_id, item_index, sig.canonical_bytes).
+#
+# Why per-leaf slot+index domain separation:
+#   * slot_id prevents a relayer from moving a signature between slots
+#     (e.g., grafting a transfer-tx sig into a message-tx slot) — even
+#     though the canonical_bytes would be identical, the leaf hash differs.
+#   * item_index prevents within-slot reordering — again even though
+#     canonical_bytes is identical, the position changes the leaf.
+#   * Both fields are committed independently of the underlying body
+#     merkle_root, so witness_root is a defense-in-depth commitment that
+#     a malformed block fails BOTH roots.
+#
+# Slot IDs are stable consensus constants — never reorder, never repurpose.
+# A new signed body slot gets a NEW unused id; deleted slots leave their
+# id permanently retired.
+
+# Domain tags for leaf and internal nodes — distinct from any other
+# tagged-hash use in this codebase to prevent cross-tree collision.
+_WITNESS_LEAF_TAG = b"\x03witness-leaf-v1"
+_WITNESS_INTERNAL_TAG = b"\x04witness-int-v1"
+_WITNESS_PAD_TAG = b"\x05witness-pad-v1"
+_WITNESS_EMPTY_TAG = b"\x06witness-empty-v1"
+
+# Stable per-slot domain bytes.  See enumerate_block_signatures for the
+# slot-to-attribute mapping.  Bytes 0x01..0x10 are reserved for the
+# initial signed-body surface; future slots take 0x11+.
+SLOT_TX_MESSAGE = 0x01
+SLOT_TX_TRANSFER = 0x02
+SLOT_TX_STAKE = 0x03
+SLOT_TX_UNSTAKE = 0x04
+SLOT_TX_GOVERNANCE = 0x05
+SLOT_TX_AUTHORITY = 0x06
+SLOT_TX_REACTION = 0x07
+SLOT_FINALITY_VOTE = 0x08
+SLOT_SLASH_TX = 0x09
+SLOT_ATTESTATION = 0x0A
+SLOT_VALIDATOR_SIG = 0x0B
+SLOT_CUSTODY_PROOF = 0x0C
+SLOT_INCLUSION_LIST = 0x0D
+SLOT_CENSORSHIP_EVIDENCE = 0x0E
+SLOT_BOGUS_REJECT_EVIDENCE = 0x0F
+SLOT_INCLUSION_VIOLATION_EVIDENCE = 0x10
+SLOT_NON_RESPONSE_EVIDENCE = 0x11
+
+
+def _safe_signature(obj) -> Signature | None:
+    """Extract `.signature` from `obj` if present and structurally a Signature.
+
+    Tolerant of test fixtures where signature may be None or absent;
+    returns None in those cases so they simply contribute no leaf.
+    """
+    sig = getattr(obj, "signature", None)
+    if isinstance(sig, Signature):
+        return sig
+    return None
+
+
+def enumerate_block_signatures(block) -> list[tuple[int, int, Signature]]:
+    """Walk a block in canonical order, yielding (slot_id, index, signature).
+
+    Iteration order is fixed and consensus-binding:
+        1. Slots are visited in SLOT_* numeric order defined above.
+        2. Within a slot, items appear in their stored list order.
+        3. Items whose `.signature` is None or absent contribute nothing.
+
+    This is the order `compute_block_witness_root` commits to.  Reordering
+    items within a list, swapping items between slots, or omitting an
+    item all change the resulting root.
+
+    Excluded by design — `validator_signatures` (slot 0x0B):
+        These are appended by validators AFTER the proposer signs the
+        header, so they are not present at witness_root computation time.
+        Each validator_signature is itself a signature over `block_hash`,
+        which already commits to witness_root + everything else — so
+        per-sig integrity is preserved without folding them in.  The
+        SLOT_VALIDATOR_SIG constant stays defined and reserved so a
+        future iteration can adopt it for a separate post-sign
+        commitment if needed.
+    """
+    out: list[tuple[int, int, Signature]] = []
+
+    def _emit(slot_id: int, attr_name: str, sig_extractor):
+        # getattr with [] default — tolerant of duck-typed block-likes
+        # (e.g. the SimpleNamespace pos.create_block builds before the
+        # real Block exists) that may not carry every slot attribute.
+        # Treats a missing attribute as an empty list, NOT as a fatal
+        # error: the proposer simply has no items in that slot.
+        items = getattr(block, attr_name, None) or []
+        for i, item in enumerate(items):
+            sig = sig_extractor(item)
+            if sig is not None:
+                out.append((slot_id, i, sig))
+
+    _emit(SLOT_TX_MESSAGE, "transactions", _safe_signature)
+    _emit(SLOT_TX_TRANSFER, "transfer_transactions", _safe_signature)
+    _emit(SLOT_TX_STAKE, "stake_transactions", _safe_signature)
+    _emit(SLOT_TX_UNSTAKE, "unstake_transactions", _safe_signature)
+    _emit(SLOT_TX_GOVERNANCE, "governance_txs", _safe_signature)
+    _emit(SLOT_TX_AUTHORITY, "authority_txs", _safe_signature)
+    _emit(SLOT_TX_REACTION, "react_transactions", _safe_signature)
+    _emit(SLOT_FINALITY_VOTE, "finality_votes", _safe_signature)
+    _emit(SLOT_SLASH_TX, "slash_transactions", _safe_signature)
+    _emit(SLOT_ATTESTATION, "attestations", _safe_signature)
+
+    # SLOT_VALIDATOR_SIG (0x0B) deliberately skipped — see docstring.
+
+    _emit(SLOT_CUSTODY_PROOF, "custody_proofs", _safe_signature)
+
+    inclusion_list = getattr(block, "inclusion_list", None)
+    if inclusion_list is not None:
+        sig = _safe_signature(inclusion_list)
+        if sig is not None:
+            out.append((SLOT_INCLUSION_LIST, 0, sig))
+
+    _emit(SLOT_CENSORSHIP_EVIDENCE, "censorship_evidence_txs", _safe_signature)
+    _emit(SLOT_BOGUS_REJECT_EVIDENCE, "bogus_rejection_evidence_txs", _safe_signature)
+    _emit(
+        SLOT_INCLUSION_VIOLATION_EVIDENCE,
+        "inclusion_list_violation_evidence_txs",
+        _safe_signature,
+    )
+    _emit(
+        SLOT_NON_RESPONSE_EVIDENCE,
+        "non_response_evidence_txs",
+        _safe_signature,
+    )
+
+    return out
+
+
+def _witness_leaf_hash(slot_id: int, item_index: int, sig: Signature) -> bytes:
+    return _hash(
+        _WITNESS_LEAF_TAG
+        + struct.pack(">B", slot_id)
+        + struct.pack(">I", item_index)
+        + sig.canonical_bytes()
+    )
+
+
+def _build_witness_merkle(leaves: list[bytes]) -> bytes:
+    """Fold pre-hashed leaves into a Merkle root.
+
+    Empty leaf set returns a distinguishable sentinel — never collides
+    with the legacy-form empty root (`default_hash(b"")`) nor with the
+    all-zero default of `header.witness_root`.
+    """
+    if not leaves:
+        return _hash(_WITNESS_EMPTY_TAG)
+    layer = list(leaves)
+    while len(layer) > 1:
+        if len(layer) % 2 == 1:
+            layer.append(_hash(_WITNESS_PAD_TAG))
+        next_layer = []
+        for i in range(0, len(layer), 2):
+            next_layer.append(
+                _hash(_WITNESS_INTERNAL_TAG + layer[i] + layer[i + 1])
+            )
+        layer = next_layer
+    return layer[0]
+
+
+def compute_block_witness_root(block) -> bytes:
+    """Consensus-binding witness Merkle root for a block.
+
+    Walks every signed body slot via `enumerate_block_signatures`, builds
+    a domain-separated leaf per signature, folds into one Merkle root.
+
+    Once activation lands (B-2), block builders set
+    `header.witness_root = compute_block_witness_root(block)` before
+    signing and validators reject blocks where the recomputed root
+    disagrees with the carried header field.
+
+    Returns the empty-block sentinel when no slot contains a signature.
+    The sentinel is distinct from `b"\\x00" * 32` (the field default) so
+    a builder that forgets to populate witness_root never accidentally
+    produces a valid empty-body witness commitment.
+    """
+    leaves = [
+        _witness_leaf_hash(slot, idx, sig)
+        for (slot, idx, sig) in enumerate_block_signatures(block)
+    ]
+    return _build_witness_merkle(leaves)
 
 
 def tx_has_witness(tx: MessageTransaction) -> bool:
