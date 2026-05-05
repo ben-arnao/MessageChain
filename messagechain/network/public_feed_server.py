@@ -31,13 +31,14 @@ Stdlib-only: `http.server.ThreadingHTTPServer`.  No new pip deps.
 from __future__ import annotations
 
 import http.server
+import ipaddress
 import json
 import logging
 import os
 import socketserver
 import threading
 import time
-from typing import Optional
+from typing import Iterable, Mapping, Optional, Sequence, Union
 from urllib.parse import parse_qs, urlsplit
 
 from messagechain.config import (
@@ -52,7 +53,167 @@ from messagechain.network.ratelimit import TokenBucket
 logger = logging.getLogger("messagechain.public_feed")
 
 
-__all__ = ["PublicFeedServer"]
+__all__ = [
+    "PublicFeedServer",
+    "_parse_trusted_proxies",
+    "_resolve_client_ip",
+]
+
+
+# Sentinel bucket key for syntactically invalid forwarded-for tokens
+# from trusted proxies.  Routing all malformed traffic to one shared
+# bucket prevents an attacker from rejoining the legitimate-traffic
+# bucket by sending garbage in the header.  Value is intentionally
+# not a valid IP literal so it can never collide with a real client.
+_UNATTRIBUTABLE_BUCKET = "__unattributable__"
+
+
+def _parse_trusted_proxies(
+    spec: Optional[str],
+) -> list[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """Parse a comma-separated list of trusted-proxy CIDRs.
+
+    Empty / None yields an empty list, which means "trust no proxy" —
+    headers are ignored unconditionally.  Bare IPs (no /prefix) are
+    treated as host networks (/32 v4, /128 v6).  Garbage raises
+    ValueError so a config typo fails loudly at startup rather than
+    silently degrading to no header trust at all.
+    """
+    if not spec:
+        return []
+    out: list[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        # `strict=False` lets "10.0.0.5/24" parse without complaining
+        # that host bits are set — the operator is naming the CIDR.
+        out.append(ipaddress.ip_network(token, strict=False))
+    return out
+
+
+def _validate_ip_token(token: str) -> Optional[str]:
+    """Return a normalized IP literal if `token` parses, else None.
+
+    Strips an optional port suffix (Forwarded: for= can carry one,
+    e.g. ``"203.0.113.7:1234"`` or ``"[2001:db8::1]:1234"``), then
+    validates against ``ipaddress.ip_address``.  Returns the textual
+    form so the caller can use it as a dict key directly.
+    """
+    s = token.strip()
+    if not s:
+        return None
+    # Strip surrounding quotes (Forwarded: for="203.0.113.7").
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    # Bracketed IPv6 with optional port: "[2001:db8::1]:1234".
+    if s.startswith("["):
+        end = s.find("]")
+        if end < 0:
+            return None
+        s = s[1:end]
+    else:
+        # Bare token may have a :port suffix only if it's IPv4.
+        # IPv6 without brackets must NOT be split on ':' since the
+        # address itself contains colons.
+        if s.count(":") == 1 and "." in s:
+            s = s.split(":", 1)[0]
+    try:
+        return str(ipaddress.ip_address(s))
+    except ValueError:
+        return None
+
+
+def _extract_forwarded_for(
+    headers: Mapping[str, str],
+) -> Optional[str]:
+    """Return the rightmost forwarded-for token, or None.
+
+    Prefers ``X-Forwarded-For`` (the de facto standard).  Falls back
+    to RFC 7239 ``Forwarded: for=<ip>``.  Returns the raw token so
+    the caller can validate it; an empty/missing header yields None.
+    """
+    # Case-insensitive lookup -- http.server's headers object is
+    # case-insensitive but generic Mapping (e.g. our test dicts)
+    # is not.
+    def _lookup(name: str) -> Optional[str]:
+        if hasattr(headers, "get") and not isinstance(headers, dict):
+            v = headers.get(name)
+            if v is not None:
+                return v
+        # Fallback: linear scan, case-insensitive.
+        for k, v in (headers.items() if hasattr(headers, "items") else []):
+            if k.lower() == name.lower():
+                return v
+        return None
+
+    xff = _lookup("X-Forwarded-For")
+    if xff is not None:
+        # Header explicitly present.  Even if empty, treat it as a
+        # forwarding claim that needs validation downstream — an
+        # empty/whitespace value from a trusted proxy is malformed
+        # input, not "no header at all".
+        # Rightmost is the only token the trusted proxy directly saw;
+        # earlier entries are attacker-controlled appends.
+        parts = [p.strip() for p in xff.split(",") if p.strip()]
+        if parts:
+            return parts[-1]
+        return ""  # header present but empty -> unattributable
+
+    fwd = _lookup("Forwarded")
+    if fwd is not None:
+        # Multiple forwarded-elements separated by ',' — rightmost
+        # again.  Each element is a ';'-separated set of pairs;
+        # extract for=<value>.
+        elements = [e.strip() for e in fwd.split(",") if e.strip()]
+        if not elements:
+            return ""
+        last = elements[-1]
+        for pair in last.split(";"):
+            pair = pair.strip()
+            if pair.lower().startswith("for="):
+                return pair[4:].strip()
+        return ""
+    return None
+
+
+def _resolve_client_ip(
+    socket_peer: str,
+    headers: Mapping[str, str],
+    trusted_proxies: Sequence[
+        Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+    ],
+) -> str:
+    """Derive the bucket-key IP for per-IP rate limiting.
+
+    Returns the socket peer unconditionally when ``trusted_proxies``
+    is empty (default operator posture).  When non-empty, requests
+    whose socket peer falls inside any allowlist CIDR have their
+    rightmost forwarded-for token honored — provided it parses as
+    a valid IP.  Malformed tokens from a trusted proxy go to the
+    sentinel bucket so attackers can't collapse onto the legitimate
+    bucket by sending garbage.
+    """
+    if not trusted_proxies:
+        return socket_peer
+    try:
+        peer_addr = ipaddress.ip_address(socket_peer)
+    except ValueError:
+        # Socket peer itself is malformed -- shouldn't happen in
+        # practice, but be defensive.  Treat as untrusted.
+        return socket_peer
+    is_trusted = any(peer_addr in net for net in trusted_proxies)
+    if not is_trusted:
+        return socket_peer
+    raw = _extract_forwarded_for(headers)
+    if raw is None:
+        # No forwarded header at all -- honest direct hit on the
+        # proxy (e.g. health probe).  Fall back to the socket peer.
+        return socket_peer
+    parsed = _validate_ip_token(raw)
+    if parsed is None:
+        return _UNATTRIBUTABLE_BUCKET
+    return parsed
 
 
 # Path to the bundled static HTML page served at "/".
@@ -86,7 +247,13 @@ _GITHUB_RUN_VALIDATOR_URL = (
 class _FeedHandlerContext:
     """Shared state for all handler instances on one server."""
 
-    def __init__(self, blockchain, faucet=None, quickpost=None):
+    def __init__(
+        self,
+        blockchain,
+        faucet=None,
+        quickpost=None,
+        trusted_proxies: Optional[Iterable] = None,
+    ):
         self.blockchain = blockchain
         # Optional FaucetState (messagechain.network.faucet).  When
         # None the /faucet POST endpoint returns 405 and the public
@@ -97,6 +264,11 @@ class _FeedHandlerContext:
         # quickpost flow piggybacks on the faucet's wallet, so a
         # validator without --faucet-keyfile cannot enable it.
         self.quickpost = quickpost
+        # Allowlist of reverse-proxy CIDRs whose X-Forwarded-For we
+        # honor.  Empty => trust no proxy (default), header always
+        # ignored.  See _resolve_client_ip + the operator-facing
+        # --trusted-proxies CLI flag in server.py.
+        self.trusted_proxies: list = list(trusted_proxies or [])
         self._buckets: dict[str, TokenBucket] = {}
         self._last_active: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -159,7 +331,18 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         return
 
     def _client_ip(self) -> str:
-        return self.client_address[0]
+        # Per-IP rate-limit bucket key.  When the operator has
+        # configured --trusted-proxies and this connection's socket
+        # peer falls inside one of those CIDRs, we honor the
+        # rightmost X-Forwarded-For (or RFC 7239 Forwarded: for=)
+        # token as the real client IP.  Otherwise the header is
+        # ignored entirely — never trust client-supplied identity
+        # headers from arbitrary inbound.
+        ctx = getattr(self.server, "_feed_context", None)
+        trusted = getattr(ctx, "trusted_proxies", []) if ctx else []
+        return _resolve_client_ip(
+            self.client_address[0], self.headers, trusted,
+        )
 
     def _cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -737,12 +920,20 @@ class PublicFeedServer:
         bind: str = "127.0.0.1",
         faucet=None,
         quickpost=None,
+        trusted_proxies: Optional[Iterable] = None,
     ):
         self.blockchain = blockchain
         self.port = port
         self.bind = bind
         self.faucet = faucet
         self.quickpost = quickpost
+        # Sequence of ipaddress.ip_network objects.  Empty list (the
+        # default) means "trust no proxy" — the X-Forwarded-For header
+        # is ignored unconditionally and per-IP rate limits attribute
+        # to the socket peer.  Operators fronting the feed with a
+        # reverse proxy should pass --trusted-proxies <cidr> so real
+        # client IPs flow through to the per-IP buckets.
+        self.trusted_proxies: list = list(trusted_proxies or [])
         self._httpd: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -753,7 +944,10 @@ class PublicFeedServer:
             (self.bind, self.port), _FeedHandler,
         )
         self._httpd._feed_context = _FeedHandlerContext(
-            self.blockchain, faucet=self.faucet, quickpost=self.quickpost,
+            self.blockchain,
+            faucet=self.faucet,
+            quickpost=self.quickpost,
+            trusted_proxies=self.trusted_proxies,
         )
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

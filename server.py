@@ -5507,7 +5507,10 @@ async def run(args):
     public_feed_server = None
     quickpost_state = None
     if args.public_feed_port is not None:
-        from messagechain.network.public_feed_server import PublicFeedServer
+        from messagechain.network.public_feed_server import (
+            PublicFeedServer,
+            _parse_trusted_proxies,
+        )
 
         # Optional cold-start faucet.  Requires --public-feed-port
         # to expose the /faucet POST handler.  When --faucet-keyfile
@@ -5528,18 +5531,30 @@ async def run(args):
             quickpost_state = _build_quickpost(server, faucet_state)
             quickpost_state.start_watcher()
 
+        # Parse the trusted-proxy allowlist up front so a config typo
+        # (`--trusted-proxies not-a-cidr`) crashes startup instead of
+        # silently degrading to no header trust.
+        trusted_proxies = _parse_trusted_proxies(
+            getattr(args, "trusted_proxies", "") or "",
+        )
         public_feed_server = PublicFeedServer(
             blockchain=server.blockchain,
             port=args.public_feed_port,
             bind=args.public_feed_bind,
             faucet=faucet_state,
             quickpost=quickpost_state,
+            trusted_proxies=trusted_proxies,
         )
         public_feed_server.start()
         logger.info(
             "Public feed active on http://%s:%d/  (front with Caddy/Cloudflare for TLS)",
             args.public_feed_bind, args.public_feed_port,
         )
+        if trusted_proxies:
+            logger.info(
+                "Public feed honoring X-Forwarded-For from trusted proxies: %s",
+                ", ".join(str(n) for n in trusted_proxies),
+            )
         if faucet_state is not None:
             logger.info(
                 "Faucet active: drip=%d window_cap=%d",
@@ -5924,6 +5939,21 @@ def main():
         help="Bind address for the public feed (default: 127.0.0.1). "
              "Typically bound to localhost and fronted by a reverse proxy; "
              "use 0.0.0.0 only if exposing directly to the public internet.",
+    )
+    parser.add_argument(
+        "--trusted-proxies", type=str, default="",
+        help="Comma-separated list of reverse-proxy CIDRs whose "
+             "X-Forwarded-For (or RFC 7239 Forwarded: for=) header is "
+             "honored to derive the real client IP for per-IP rate "
+             "limiting. Empty (default) means trust no proxy and ignore "
+             "the header unconditionally — pre-fix behavior. When the "
+             "feed is fronted by Caddy/Cloudflare/etc., set this to the "
+             "proxy's source CIDR (e.g. '127.0.0.1/32') so faucet, "
+             "quickpost, and feed rate limits attribute to real visitor "
+             "IPs instead of collapsing onto the proxy's loopback. "
+             "Headers from sources OUTSIDE the allowlist are always "
+             "ignored — never trust client-supplied identity headers "
+             "from arbitrary inbound.",
     )
     # --- Cold-start funding faucet (opt-in, requires --public-feed-port) ---
     # Off by default.  When set, the validator loads a separate WOTS+
