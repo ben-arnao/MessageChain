@@ -54,32 +54,33 @@
     margin: 0.8rem 0 1.4rem;
   }
   ol.quickstart > li { margin: 0.55rem 0; }
-  /* Each step is a flex row so the button (or details) fills the
-     column width and lines up flush with the message cards below.
-     The step number is rendered via ::before with a negative
-     margin-left so it hangs to the LEFT of the column rather than
-     indenting the button. */
+  /* Each step is a positioned block, NOT a flex row.  The step
+     number rides as an absolute-positioned ::before in the gutter
+     to the left of the column, so the row's natural height equals
+     the height of its content (the button OR the expanded
+     <details>) and there is no flex cross-axis alignment that
+     could mis-center the button when the panel below it grows.
+     We hit this twice with flex: align-items:center pushed the
+     summary into the vertical middle of a tall row when the
+     details opened, and align-items:flex-start still left a
+     residual gap because the flex baseline on the row shifted as
+     the panel grew.  Block flow + absolute gutter has no such
+     quirks — the button stays anchored at top:0 of its row, and
+     the expanded body simply extends the row downward. */
   ol.quickstart > li:not([hidden]) {
     counter-increment: step;
-    display: flex;
-    flex-wrap: wrap;
-    /* align-items: flex-start (with a small top padding on the
-       step number to vertically match the button label) — anchors
-       the button to the top of the row so an expanded faucet
-       <details> grows DOWNWARD into the next step's slot rather
-       than widening this row symmetrically and pulling the button
-       into a vertically-centered position with empty space above
-       and below. */
-    align-items: flex-start;
-    gap: 0.6rem;
+    position: relative;
+    display: block;
   }
   ol.quickstart > li:not([hidden])::before {
     content: counter(step) ".";
-    flex: 0 0 1.6rem;
-    margin-left: -2.2rem;
-    /* Nudge the number down so its baseline matches the button's
-       label baseline now that the row is top-aligned. */
-    padding-top: 0.55rem;
+    position: absolute;
+    left: -2.2rem;
+    /* Aligns the digit's optical center with the button label's
+       baseline; bottom of the digit sits just above the row's
+       midline at default font sizes. */
+    top: 0.55rem;
+    width: 1.6rem;
     text-align: center;
     color: var(--accent);
     font-weight: 700;
@@ -97,8 +98,8 @@
     content: "";
   }
   ol.quickstart .cta {
-    flex: 1 1 auto;
     display: block;
+    width: 100%;
     text-align: center;
     padding: 0.55rem 0.9rem;
     background: var(--accent);
@@ -107,17 +108,34 @@
     font-weight: 600;
     text-decoration: none;
     font-size: 0.95rem;
+    box-sizing: border-box;
+  }
+  /* Step 3 is two CTAs side-by-side with an "or" label between
+     them — the only quickstart row that needs a horizontal
+     layout beyond the single full-width primary action. */
+  ol.quickstart > li.choice {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  ol.quickstart > li.choice .cta {
+    flex: 1 1 0;
+    width: auto;
   }
   ol.quickstart > li.choice .or {
     color: var(--muted);
     font-size: 0.85rem;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    flex: 0 0 auto;
   }
   /* Divider before the "just try it" continuation — visually says
      "the option below is an alternative to all three steps above,
-     not just the step it hangs off of". */
+     not just the step it hangs off of".  Override the .choice flex
+     display since the continuation has a single full-width button
+     (or expanded <details>), not a side-by-side pair. */
   ol.quickstart > li.continuation {
+    display: block;
     margin-top: 1rem;
     padding-top: 1rem;
     border-top: 1px dashed var(--border);
@@ -135,9 +153,6 @@
     letter-spacing: 0.06em;
     padding: 0 0.5rem;
     white-space: nowrap;
-  }
-  ol.quickstart > li.continuation {
-    position: relative;
   }
   main {
     max-width: 720px;
@@ -259,8 +274,10 @@
   }
   details.faucet {
     margin: 0;
-    flex: 1 1 auto;
+    display: block;
+    width: 100%;
     min-width: 0;
+    box-sizing: border-box;
   }
   details.faucet summary {
     display: block;
