@@ -2156,6 +2156,31 @@ class ChainDB:
             (evidence_hash,),
         )
 
+    def clear_all_pending_censorship_evidence(self) -> None:
+        """Truncate the pending_censorship_evidence mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush
+        (post-reorg / post-reset replay) to wipe orphan rows that
+        the in-memory ``censorship_processor.pending`` no longer
+        carries.  Same shape as ``clear_all_last_active_heights``
+        (round-14 fix for the Tier-47 dormancy mirror leak): the
+        per-row ``set_pending_censorship_evidence`` upsert loop that
+        follows re-emits every live entry, so wiping the table inside
+        the same SQL transaction reconciles the disk state to the
+        canonical-replay in-memory dict.
+
+        Without this truncate-then-re-insert, a successful reorg
+        across a CensorshipEvidenceTx-admitting block leaves the
+        losing-fork evidence on disk indefinitely; the next cold
+        restart rehydrates the orphan via
+        ``get_all_pending_censorship_evidence``, the next maturity
+        tick at ``EVIDENCE_MATURITY_BLOCKS`` slashes a validator the
+        warm cluster never accuses, and the restarted node forks off
+        peers via the unjustified ``CENSORSHIP_SLASH_BPS`` burn.
+        """
+        self._conn.execute("DELETE FROM pending_censorship_evidence")
+        self._maybe_commit()
+
     def get_all_pending_censorship_evidence(self) -> dict:
         """Return {evidence_hash -> (offender_id, tx_hash, admitted_height,
         evidence_tx_hash, staked_at_admission)}."""
@@ -2600,6 +2625,29 @@ class ChainDB:
             # restore wipes+re-inserts the table inside the same SQL
             # transaction.
             "last_active_heights": self.get_all_last_active_heights(),
+            # pending_censorship_evidence mirror table.  Same
+            # mirror-leak defect class as the six prior fixes
+            # (round-2 entity_id_to_index, round-4
+            # key_rotation_last_height, round-7 receipt_subtree_roots,
+            # round-12 reaction_choices, round-13 successful-reorg
+            # twin, round-14 entity_last_active for Tier-47).
+            # Pre-fix `restore_state_snapshot` did NOT wipe this
+            # table at all -- a successful reorg across a block
+            # carrying a CensorshipEvidenceTx left the losing-fork
+            # evidence permanently on disk.  Cold restart of any
+            # node that processed the losing fork rehydrates the
+            # orphan row into censorship_processor.pending, the
+            # next maturity tick at EVIDENCE_MATURITY_BLOCKS slashes
+            # a validator the warm cluster never accuses (an
+            # unjustified CENSORSHIP_SLASH_BPS burn against an
+            # honest operator -> consensus split), violating the
+            # "honest operators are insured against accidents"
+            # anchor.  Snapshot now carries the full pending map
+            # AND restore wipes+re-inserts the table inside the
+            # same SQL transaction.
+            "pending_censorship_evidence": (
+                self.get_all_pending_censorship_evidence()
+            ),
             "total_supply": self.get_supply_meta("total_supply"),
             "total_minted": self.get_supply_meta("total_minted"),
             "total_fees_collected": self.get_supply_meta("total_fees_collected"),
@@ -2720,6 +2768,25 @@ class ChainDB:
             # happen after the canonical replays restore the supply
             # state below.
             conn.execute("DELETE FROM entity_last_active")
+            # pending_censorship_evidence mirror joins the wipe list.
+            # Each CensorshipEvidenceTx admitted on the losing fork
+            # mirrors a row to disk via
+            # set_pending_censorship_evidence (issued from
+            # _persist_state); on successful reorg the in-memory
+            # censorship_processor.pending is rebuilt from the
+            # canonical replay but the disk rows for losing-fork
+            # admissions survive without this DELETE.  The next cold
+            # restart rehydrates the orphan evidence
+            # (`_load_from_db` calls
+            # `get_all_pending_censorship_evidence`), the next
+            # maturity tick at EVIDENCE_MATURITY_BLOCKS slashes a
+            # validator the warm cluster never accuses -> unjustified
+            # CENSORSHIP_SLASH_BPS burn against an honest operator,
+            # silent consensus split.  Same defect class as the
+            # mirror tables already wiped above.  Re-inserts happen
+            # after the canonical replays restore the supply state
+            # below.
+            conn.execute("DELETE FROM pending_censorship_evidence")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -2862,6 +2929,32 @@ class ChainDB:
                     "INSERT OR REPLACE INTO entity_last_active "
                     "(entity_id, last_active_height) VALUES (?, ?)",
                     (eid, int(h)),
+                )
+            # pending_censorship_evidence re-insert.  Snapshot key is
+            # evidence_hash -> (offender_id, tx_hash, admitted_height,
+            # evidence_tx_hash, staked_at_admission); the chaindb
+            # mirror round-trip rebuild reads back via
+            # `get_all_pending_censorship_evidence` so the on-disk
+            # shape and the in-memory dict
+            # (`censorship_processor.pending`) stay in lockstep.
+            # Default-empty `.get(...)` keeps legacy snapshot dicts
+            # (taken before this field joined save_state_snapshot)
+            # restoring cleanly — they leave the table empty,
+            # matching the pre-fork pristine state.
+            for ev_hash, payload in snapshot.get(
+                "pending_censorship_evidence", {},
+            ).items():
+                offender_id, tx_hash, admitted_height, evidence_tx_hash, staked_at_admission = payload
+                conn.execute(
+                    "INSERT OR REPLACE INTO pending_censorship_evidence "
+                    "(evidence_hash, offender_id, tx_hash, "
+                    "admitted_height, evidence_tx_hash, "
+                    "staked_at_admission) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        ev_hash, offender_id, tx_hash,
+                        int(admitted_height), evidence_tx_hash,
+                        int(staked_at_admission),
+                    ),
                 )
 
             conn.execute("UPDATE supply_meta SET value = ? WHERE key = 'total_supply'", (snapshot["total_supply"],))

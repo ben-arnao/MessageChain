@@ -1764,6 +1764,37 @@ class Blockchain:
                 # stake -- the slash is silently nullified.  This was
                 # the exact failure mode the snapshot-stake-at-admission
                 # hardening was designed to prevent.
+                #
+                # Mirror-leak guard (same defect class as round-13's
+                # `clear_all_reaction_choices` for the successful-reorg
+                # twin of the round-12 reaction_choices fix and
+                # round-14's `clear_all_last_active_heights` for
+                # Tier-47 dormancy): on a full flush (post
+                # `_reset_state`, post-successful-reorg) the
+                # INSERT-OR-REPLACE loop below would skip rows that
+                # exist only on a rolled-back fork — the canonical
+                # in-memory dict doesn't include those evidence_hashes,
+                # so the upsert never touches them and the orphan rows
+                # survive.  Cold restart of any node that processed the
+                # losing fork then rehydrates the orphan via
+                # `get_all_pending_censorship_evidence`, the next
+                # maturity tick slashes a validator the canonical
+                # chain never accuses (unjustified
+                # CENSORSHIP_SLASH_BPS burn against an honest
+                # operator -> silent consensus split, violates the
+                # "honest operators are insured against accidents"
+                # anchor).  `restore_state_snapshot`'s wipe+re-insert
+                # covers the FAILED-reorg rollback path; this closes
+                # the SUCCESSFUL-reorg twin.  Wipe the table inside
+                # the same SQL transaction (atomic with the
+                # re-INSERTs that follow) and let the upsert loop
+                # re-emit every entry from the canonical-replay
+                # in-memory state.
+                if (
+                    full_flush
+                    and hasattr(self.db, "clear_all_pending_censorship_evidence")
+                ):
+                    self.db.clear_all_pending_censorship_evidence()
                 for ev_hash, entry in self.censorship_processor.pending.items():
                     self.db.set_pending_censorship_evidence(
                         ev_hash,
