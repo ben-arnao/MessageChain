@@ -4,6 +4,32 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.54.2] — 2026-05-04
+
+Patch release.  Fixes a latent integer-truncation bug in the EIP-1559
+`base_fee` decay that pinned the controller above the protocol floor.
+
+### Fixed
+
+  * **EIP-1559 `base_fee` decay floored at 7 instead of reaching
+    `MARKET_FEE_FLOOR`=1.**  The decrease branch of `update_base_fee`
+    computed `delta = base_fee * deficit // (target * denom)` with no
+    minimum step.  At post-Tier-9 `target=22` and `denom=8`, integer
+    truncation pushed `delta` to 0 once `base_fee * 22 < 22 * 8`, i.e.
+    once `base_fee < 8`.  Result: under sustained empty blocks the
+    controller decayed `100 → 99 → … → 8 → 7` and then got stuck at 7
+    permanently — the docstring's stated intent ("decay to 1 during
+    quiet periods") was unreachable, leaving the EIP-1559 controller
+    pinned ~7× above the protocol floor instead of converging on it.
+    The decrease branch now mirrors the increase branch's
+    `max(1, delta)` floor so quiet periods can drive `base_fee` all the
+    way to `MARKET_FEE_FLOOR=1`.  Consensus-visible (changes the value
+    persisted in `supply_meta.base_fee`), but unconditional — applied
+    at all heights.  Two-validator network, coordinated upgrade, no
+    scheduled activation height needed.  Test in
+    `tests/test_market_fee_floor.py`
+    (`test_decay_reaches_floor_under_empty_blocks`).
+
 ## [1.54.1] — 2026-05-04
 
 Patch release.  Two security fixes surfaced by audit round 15.
