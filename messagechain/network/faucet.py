@@ -116,6 +116,25 @@ FAUCET_CHALLENGE_TTL_SEC = 600
 # pending challenges at ~96 bytes each = ~400 KB worst case.
 FAUCET_MAX_PENDING_CHALLENGES = 4096
 
+# Cap on the per-cidr "last drip" timestamp dict to bound memory.
+# Without this, every successful drip writes (cidr -> timestamp) and
+# never deletes — for IPv6 (where _ip_cidr_24 returns the FULL address
+# because the /24 collapse is IPv4-only), an attacker on a /48 alloc
+# (~2**80 addresses, trivial to enumerate) can drive unbounded growth
+# at ~50 bytes/entry, eventually OOM'ing the validator or stalling GC
+# long enough to miss attestation slots and have the inactivity penalty
+# bill the honest operator for an external resource attack.
+#
+# Defense: every drip first sweeps entries older than ip_cooldown_sec
+# (those are already behavioral no-ops — the cooldown has elapsed and
+# they wouldn't block a fresh drip anyway), then if the dict is still
+# above this hard ceiling, drops the oldest-by-timestamp entries until
+# under it.  The cap is sized large enough to absorb realistic
+# legitimate traffic (orders of magnitude above the ~few-drips/window
+# operator-exposure budget) but small enough that the worst-case memory
+# footprint stays bounded at ~3-4 MB.
+FAUCET_IP_LAST_DRIP_MAX = 65_536
+
 
 # Per-drip token amount.  Sized for ~1 short message at the live
 # LINEAR fee floor (BASE_TX_FEE=10 + FEE_PER_STORED_BYTE=1 * stored).
@@ -349,6 +368,61 @@ class FaucetState:
             del self._pending_challenges[seed]
         return len(stale)
 
+    def _evict_ip_last_drip_locked(self, now: float) -> int:
+        """Bound `_ip_last_drip` so an attacker cannot OOM the validator.
+
+        Caller MUST hold `_lock`.  Two-pass eviction:
+          1. Drop every entry whose timestamp is older than
+             `ip_cooldown_sec` — those entries are already behavioral
+             no-ops (a fresh drip from the same cidr would be allowed),
+             they are just consuming memory.
+          2. If the dict is still above `FAUCET_IP_LAST_DRIP_MAX`,
+             drop the oldest-timestamp entries until back under the
+             ceiling.  This is the defense against an attacker spinning
+             new IPv6 addresses faster than entries can expire — the
+             IPv6 cidr key is the full address (the /24 collapse only
+             applies to IPv4), so a /48 allocation (~2**80 addresses)
+             can otherwise drive unbounded growth.
+
+        O(N) at worst per call.  Drips happen at PoW + cooldown rates
+        (not 1000/s), so a full scan per drip is acceptable; we
+        deliberately do NOT spawn a background eviction thread or
+        async timer (extra moving parts for a problem that fits
+        comfortably inline).
+
+        Returns total number of entries dropped.
+        """
+        dropped = 0
+
+        # Pass 1: expired entries.  An entry whose age exceeds
+        # ip_cooldown_sec would not block a fresh drip from the same
+        # cidr anyway — keeping it around is pure memory cost.
+        cooldown = self.ip_cooldown_sec
+        if cooldown > 0:
+            stale = [
+                cidr for cidr, ts in self._ip_last_drip.items()
+                if now - ts > cooldown
+            ]
+            for cidr in stale:
+                del self._ip_last_drip[cidr]
+            dropped += len(stale)
+
+        # Pass 2: hard ceiling.  If the dict is still over-budget,
+        # drop the oldest-by-timestamp entries until under the cap.
+        # Sorting once is O(N log N) — fine at N ≤ ~65k and only
+        # triggered when the cap is exceeded, which is rare in normal
+        # operation and capped-cost under attack.
+        if len(self._ip_last_drip) > FAUCET_IP_LAST_DRIP_MAX:
+            excess = len(self._ip_last_drip) - FAUCET_IP_LAST_DRIP_MAX
+            # Sort by ascending timestamp (oldest first) and drop the
+            # leading `excess` entries.
+            ordered = sorted(self._ip_last_drip.items(), key=lambda kv: kv[1])
+            for cidr, _ts in ordered[:excess]:
+                del self._ip_last_drip[cidr]
+            dropped += excess
+
+        return dropped
+
     def _reset_window_if_rolled_locked(self, now: float) -> None:
         """Roll the window counter when the bucket index advances.
 
@@ -547,6 +621,11 @@ class FaucetState:
 
         # Success path: commit state.
         self._ip_last_drip[cidr] = now
+        # Bound the per-cidr cooldown dict so an attacker enumerating
+        # IPv6 addresses (where the cidr key is the full address)
+        # cannot OOM the validator.  Sweep expired entries and, if
+        # still over the hard ceiling, drop the oldest-by-timestamp.
+        self._evict_ip_last_drip_locked(now)
         self._drips_window += 1
         tx_hash = tx_dict.get("tx_hash", "")
         logger.info(
