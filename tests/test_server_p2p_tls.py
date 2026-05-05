@@ -33,6 +33,18 @@ def _run(coro):
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Cancel background tasks Server.start spawned (block-production
+        # loop, sync loops, etc.) — without this they leak as
+        # "Task was destroyed but it is pending!" warnings and
+        # accumulate state on the xdist worker process, contributing
+        # to intermittent worker terminations.
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
         loop.close()
 
 
