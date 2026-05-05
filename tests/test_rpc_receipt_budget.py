@@ -473,6 +473,7 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
             create_react_transaction,
             REACT_CHOICE_UP,
         )
+        from messagechain.network.submission_server import TokenBucket
         # Force the react activation height to 0 so the test doesn't
         # need to advance the chain past REACT_TX_HEIGHT.
         import messagechain.core.reaction as _reaction_mod
@@ -483,6 +484,15 @@ class TestRpcSubmitTransferAndReactShareGate(_BudgetTestBase):
             bob = Entity.create(b"r-budget-mix-rx-bob".ljust(32, b"\x00"))
             register_entity_for_test(srv.blockchain, bob)
             ip = "10.0.0.8"
+
+            # Pre-create the per-IP receipt bucket with refill rate 0
+            # so the drain loop below is monotonic — under xdist
+            # contention the 5 rpc submits can take 10s+ wall, and
+            # 0.1 token/s refill would leave a token in the bucket
+            # by the time the react fires, defeating the gate.
+            srv.receipt_budget_tracker._receipt_buckets[ip] = TokenBucket(
+                rate=0.0, max_tokens=SUBMISSION_RECEIPT_BURST,
+            )
 
             # Exhaust budget via MESSAGE.
             for nonce in range(SUBMISSION_RECEIPT_BURST):

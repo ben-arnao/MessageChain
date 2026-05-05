@@ -157,8 +157,22 @@ class TestM1VerifyPeerCertificateWithEntity(unittest.TestCase):
 # ─── M4: Revoke precedes SetAuthorityKey in same block ────────────────
 
 
-def _entity(seed: bytes, height: int = 6) -> Entity:
-    return Entity.create(seed + b"\x00" * (32 - len(seed)), tree_height=height)
+_ENTITY_POOL: dict[tuple[bytes, int], Entity] = {}
+
+
+def _entity(seed: bytes, height: int = 4) -> Entity:
+    """Module-cached entity factory.  Tests in this file sign each
+    entity at most 3 times — h=4 (16 leaves) is plenty.  Caching
+    avoids the per-test WOTS+ keygen cost (the dominant per-test
+    runtime here)."""
+    padded = seed + b"\x00" * (32 - len(seed))
+    key = (padded, height)
+    cached = _ENTITY_POOL.get(key)
+    if cached is None:
+        cached = Entity.create(padded, tree_height=height)
+        _ENTITY_POOL[key] = cached
+    cached.keypair._next_leaf = 0
+    return cached
 
 
 class TestM4RevokeBeforeSetAuthorityOrdering(unittest.TestCase):
@@ -168,8 +182,12 @@ class TestM4RevokeBeforeSetAuthorityOrdering(unittest.TestCase):
     key is supposed to defeat."""
 
     def setUp(self):
+        # Each test signs ≤3 times per entity (register + 2 block
+        # proposals or 2 authority txs).  h=4 (conftest default,
+        # 16 leaves) is comfortably enough; the prior h=6 (64 leaves)
+        # was 4× the WOTS+ keygen cost for no extra coverage.
         self._orig_height = config.MERKLE_TREE_HEIGHT
-        config.MERKLE_TREE_HEIGHT = 6
+        config.MERKLE_TREE_HEIGHT = 4
 
     def tearDown(self):
         config.MERKLE_TREE_HEIGHT = self._orig_height

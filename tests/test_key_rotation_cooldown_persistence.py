@@ -38,14 +38,25 @@ from messagechain.crypto.hash_sig import _hash
 from messagechain.identity.identity import Entity
 
 
-def _entity(seed: bytes, height: int = 6) -> Entity:
-    return Entity.create(seed + b"\x00" * (32 - len(seed)), tree_height=height)
+_ENTITY_POOL: dict[tuple[bytes, int], Entity] = {}
+
+
+def _entity(seed: bytes, height: int = 4) -> Entity:
+    """Module-cached entity factory."""
+    padded = seed + b"\x00" * (32 - len(seed))
+    key = (padded, height)
+    cached = _ENTITY_POOL.get(key)
+    if cached is None:
+        cached = Entity.create(padded, tree_height=height)
+        _ENTITY_POOL[key] = cached
+    cached.keypair._next_leaf = 0
+    return cached
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
         self._orig_height = config.MERKLE_TREE_HEIGHT
-        config.MERKLE_TREE_HEIGHT = 6
+        config.MERKLE_TREE_HEIGHT = 4
 
     def tearDown(self):
         config.MERKLE_TREE_HEIGHT = self._orig_height

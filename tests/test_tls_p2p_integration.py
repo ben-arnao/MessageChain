@@ -33,11 +33,31 @@ def _make_entity(seed: bytes) -> Entity:
 
 
 def _run(coro):
-    """Run an async coroutine under a fresh event loop (unittest sync entry)."""
+    """Run an async coroutine under a fresh event loop, then cancel any
+    background tasks Node.start() spawned before closing the loop.
+
+    Without this, Node.start() leaves the block_production_loop,
+    sync_loop, outbound_maintenance_loop, and mempool_sync_loop tasks
+    pending — every one of which begins with `await asyncio.sleep(N)`
+    BEFORE checking `_running`, so setting `_running=False` doesn't
+    short-circuit them.  The leaked tasks generate
+    "Task was destroyed but it is pending!" warnings AND accumulate
+    state on the xdist worker process, contributing to intermittent
+    `[gw_X] node down` worker terminations under contention.
+    """
     loop = asyncio.new_event_loop()
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Cancel any tasks the test left running (block-production
+        # loops, mempool sync, etc.) and let them unwind cleanly.
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(
+                asyncio.gather(*pending, return_exceptions=True)
+            )
         loop.close()
 
 

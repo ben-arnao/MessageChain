@@ -266,15 +266,32 @@ class TestDomainTagSeparation(unittest.TestCase):
 # 9. Configuration matrix — multiple (t, n)
 # ---------------------------------------------------------------------------
 class TestConfigMatrix(unittest.TestCase):
-    def test_matrix(self):
-        for (t, n) in [(1, 1), (1, 3), (2, 3), (3, 5), (5, 7)]:
-            with self.subTest(t=t, n=n):
-                pk, shares = _key(t, n)
-                msg = f"matrix t={t} n={n}".encode()
-                ct = encrypt(pk, msg)
-                ds = [decrypt_share(shares[i], ct, pk) for i in range(t)]
-                recovered = combine_shares(ct, ds, pk)
-                self.assertEqual(recovered, msg)
+    """One method per (t, n) combo so xdist can distribute the cold-
+    cache RSA-keygen cost across workers and no single test risks
+    exceeding the 30s timeout on a cold cache + xdist contention."""
+
+    def _exercise(self, t: int, n: int):
+        pk, shares = _key(t, n)
+        msg = f"matrix t={t} n={n}".encode()
+        ct = encrypt(pk, msg)
+        ds = [decrypt_share(shares[i], ct, pk) for i in range(t)]
+        recovered = combine_shares(ct, ds, pk)
+        self.assertEqual(recovered, msg)
+
+    def test_matrix_1_1(self):
+        self._exercise(1, 1)
+
+    def test_matrix_1_3(self):
+        self._exercise(1, 3)
+
+    def test_matrix_2_3(self):
+        self._exercise(2, 3)
+
+    def test_matrix_3_5(self):
+        self._exercise(3, 5)
+
+    def test_matrix_5_7(self):
+        self._exercise(5, 7)
 
 
 # ---------------------------------------------------------------------------

@@ -36,14 +36,29 @@ from messagechain.crypto.keys import Signature
 from messagechain.identity.identity import Entity
 
 
-def _entity(seed: bytes, height: int = 6) -> Entity:
-    return Entity.create(seed + b"\x00" * (32 - len(seed)), tree_height=height)
+_ENTITY_POOL: dict[tuple[bytes, int], Entity] = {}
+
+
+def _entity(seed: bytes, height: int = 4) -> Entity:
+    """Module-cached entity factory.  Tests in this file sign each
+    entity ≤4 times — h=4 (16 leaves) is plenty.  The original h=6
+    quadrupled keygen cost for no extra coverage."""
+    padded = seed + b"\x00" * (32 - len(seed))
+    key = (padded, height)
+    cached = _ENTITY_POOL.get(key)
+    if cached is None:
+        cached = Entity.create(padded, tree_height=height)
+        _ENTITY_POOL[key] = cached
+    cached.keypair._next_leaf = 0
+    return cached
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
+        # h=4 (conftest default) is enough for 4-sign worst case in
+        # any test in this file; the prior h=6 quadrupled keygen cost.
         self._orig_height = config.MERKLE_TREE_HEIGHT
-        config.MERKLE_TREE_HEIGHT = 6
+        config.MERKLE_TREE_HEIGHT = 4
 
     def tearDown(self):
         config.MERKLE_TREE_HEIGHT = self._orig_height

@@ -86,22 +86,36 @@ def _make_proof(entity_idx: int, challenge_block: int, block: dict):
 
 
 class TestFairSelection(unittest.TestCase):
+    # Class-level proof cache: signing 30 custody proofs costs ~0.5s
+    # and is re-paid by every per-test setUp under unittest semantics.
+    # Building once in setUpClass and re-loading into a fresh
+    # ArchiveProofMempool per test cuts the class wall-clock by ~3s.
+    # Selection methods don't mutate the proofs, so reuse is safe.
+    _CHALLENGE_BLOCK = 100
+    _CAP = 10
+    _N_PROVERS = 30
+    _CACHED_PROOFS: list = []
+    _CACHED_PROVER_IDS: list = []
+    _CACHED_TARGET: dict | None = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls._CACHED_TARGET = _mini_block([], block_number=5)
+        for i in range(cls._N_PROVERS):
+            proof = _make_proof(i, cls._CHALLENGE_BLOCK, cls._CACHED_TARGET)
+            cls._CACHED_PROOFS.append(proof)
+            cls._CACHED_PROVER_IDS.append(proof.prover_id)
+
     def setUp(self):
         self.pool = ArchiveProofMempool()
-        self.target = _mini_block([], block_number=5)
-        # Submit 30 proofs from 30 different entities into the mempool
-        # for the same challenge.  Cap in tests is 10 (sufficient to
-        # exercise selection; smaller than default cap so we exercise
-        # the "more in mempool than cap" branch).
-        self.challenge_block = 100
-        self.cap = 10
-        self.submitted_provers: list[bytes] = []
-        for i in range(30):
-            proof = _make_proof(i, self.challenge_block, self.target)
+        self.target = self._CACHED_TARGET
+        self.challenge_block = self._CHALLENGE_BLOCK
+        self.cap = self._CAP
+        self.submitted_provers: list[bytes] = list(self._CACHED_PROVER_IDS)
+        for proof in self._CACHED_PROOFS:
             self.pool.add_proof(
                 proof, challenge_block_number=self.challenge_block,
             )
-            self.submitted_provers.append(proof.prover_id)
 
     def test_select_returns_cap_or_fewer(self):
         """Selection never returns more than `cap` proofs."""
@@ -189,9 +203,12 @@ class TestFairSelection(unittest.TestCase):
         """When mempool has fewer proofs than cap, selection returns
         all of them (no drops).  Shuffle order may vary but the set
         is unchanged."""
+        # Reuse 5 of the cached 30-prover proofs — building 5 fresh
+        # entities + signed proofs cost ~1.5s of WOTS+ keygen on top
+        # of the setUpClass already-paid cost.  Selection is read-
+        # only so reusing is safe.
         small_pool = ArchiveProofMempool()
-        for i in range(5):
-            proof = _make_proof(i + 100, self.challenge_block, self.target)
+        for proof in self._CACHED_PROOFS[:5]:
             small_pool.add_proof(
                 proof, challenge_block_number=self.challenge_block,
             )

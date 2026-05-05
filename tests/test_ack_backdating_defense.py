@@ -95,18 +95,24 @@ class _AckDefenseHarness(unittest.TestCase):
 
     def setUp(self):
         from messagechain.config import VALIDATOR_MIN_STAKE
-        # Bump MERKLE_TREE_HEIGHT for this harness — several tests need
-        # to mine ~25 blocks past genesis (DEADLINE + GRACE + slack) to
-        # exercise the bound around the backdating cutoff.  Tree height
-        # 6 = 64 leaves comfortably covers the worst-case proposer
-        # sign count.  Restored in tearDown so the conftest-pinned 4
-        # is back for the next test.
-        import messagechain.config as _cfg_mh
-        self._orig_merkle_height = _cfg_mh.MERKLE_TREE_HEIGHT
-        _cfg_mh.MERKLE_TREE_HEIGHT = 6
+        # Shrink production-sized window/grace so we mine ~5 blocks
+        # instead of ~25 to exercise the same bound — this turns
+        # 16s/test into ~3s without changing the rule under test.
+        # MERKLE_TREE_HEIGHT then only needs 4 leaves (conftest default).
+        import messagechain.config as _cfg
+        self._orig_window = _cfg.WITNESS_RESPONSE_DEADLINE_BLOCKS
+        self._orig_grace = _cfg.ACK_INCLUSION_GRACE
+        _cfg.WITNESS_RESPONSE_DEADLINE_BLOCKS = 2
+        _cfg.ACK_INCLUSION_GRACE = 1
+        # Patch the local-module re-import too (this file imported
+        # WITNESS_RESPONSE_DEADLINE_BLOCKS at top-level).
+        import tests.test_ack_backdating_defense as _self_mod
+        self._orig_local_window = _self_mod.WITNESS_RESPONSE_DEADLINE_BLOCKS
+        _self_mod.WITNESS_RESPONSE_DEADLINE_BLOCKS = 2
+        # Conftest-pinned MERKLE_TREE_HEIGHT (4 → 16 leaves) is enough
+        # for the proposer's worst-case sign count under the shrunk window.
         self._patches: list = []
         if self.activation_height is not None:
-            import messagechain.config as _cfg
             self._orig_height = _cfg.ACK_BACKDATING_DEFENSE_HEIGHT
             _cfg.ACK_BACKDATING_DEFENSE_HEIGHT = self.activation_height
 
@@ -129,12 +135,12 @@ class _AckDefenseHarness(unittest.TestCase):
         )
 
     def tearDown(self):
-        # Restore MERKLE_TREE_HEIGHT FIRST so a leak under setUp's
-        # config bump can't poison the next test's keygen budget.
-        import messagechain.config as _cfg_mh
-        _cfg_mh.MERKLE_TREE_HEIGHT = self._orig_merkle_height
+        import messagechain.config as _cfg
+        _cfg.WITNESS_RESPONSE_DEADLINE_BLOCKS = self._orig_window
+        _cfg.ACK_INCLUSION_GRACE = self._orig_grace
+        import tests.test_ack_backdating_defense as _self_mod
+        _self_mod.WITNESS_RESPONSE_DEADLINE_BLOCKS = self._orig_local_window
         if self.activation_height is not None:
-            import messagechain.config as _cfg
             _cfg.ACK_BACKDATING_DEFENSE_HEIGHT = self._orig_height
 
     def _propose_and_inject(self, acks: list, block_height: int | None = None):

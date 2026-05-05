@@ -130,36 +130,40 @@ class TestPersonalWalletCacheRoundTrip(unittest.TestCase):
     def test_warm_call_is_orders_of_magnitude_faster_than_cold(self):
         """Warm-path wall-clock must be small relative to a fresh Entity.create.
 
-        At test tree_height=4 the cold path is already cheap (microseconds
-        of leaf derivation), so this asserts the warm path is at least 5x
-        faster than a fresh Entity.create — enough margin to detect a
-        regression where the cache is silently bypassed without being so
-        tight that scheduling jitter flakes the test.
+        Take the best-of-N timing on each path (xdist + Windows scheduling
+        jitter inflates a single sample by 3-5x and used to flake this
+        test).  Best-of-N collapses transient stalls; if the cache is
+        bypassed, the warm path's *minimum* will still grow with tree
+        height.  Margin held at 5x — generous enough for jitter, tight
+        enough to catch a regression at this test's small tree size.
         """
         # Cold-populate the cache once so subsequent calls hit the warm path.
         load_or_create_personal_wallet_entity(
             self.private_key, tree_height=self.tree_height,
         )
 
-        # Time a fresh keygen.
-        t0 = time.perf_counter()
-        Entity.create(self.private_key, tree_height=self.tree_height)
-        cold_elapsed = time.perf_counter() - t0
+        N = 5
 
-        # Time the warm path.
-        t0 = time.perf_counter()
-        load_or_create_personal_wallet_entity(
-            self.private_key, tree_height=self.tree_height,
-        )
-        warm_elapsed = time.perf_counter() - t0
+        cold_samples = []
+        for _ in range(N):
+            t0 = time.perf_counter()
+            Entity.create(self.private_key, tree_height=self.tree_height)
+            cold_samples.append(time.perf_counter() - t0)
 
-        # Floor the cold-elapsed measurement to dodge timer-resolution flake
-        # at sub-millisecond cold paths (test height is tiny).
-        cold_elapsed = max(cold_elapsed, 1e-3)
+        warm_samples = []
+        for _ in range(N):
+            t0 = time.perf_counter()
+            load_or_create_personal_wallet_entity(
+                self.private_key, tree_height=self.tree_height,
+            )
+            warm_samples.append(time.perf_counter() - t0)
+
+        cold_elapsed = max(min(cold_samples), 1e-3)
+        warm_elapsed = min(warm_samples)
         self.assertLess(
             warm_elapsed, cold_elapsed / 5,
             f"warm={warm_elapsed*1000:.2f}ms cold={cold_elapsed*1000:.2f}ms "
-            f"— cache appears to be regenerating",
+            f"(best of {N}) — cache appears to be regenerating",
         )
 
     def test_bad_mac_is_rejected(self):

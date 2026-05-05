@@ -298,25 +298,36 @@ class TestValidExcuses(unittest.TestCase):
 
     def test_tx_count_cap_reached_is_valid_excuse(self):
         """MAX_TXS_PER_BLOCK txs included → no room for more."""
+        # Shrink the cap to 8 for this test so we only pay 8 Entity.create
+        # WOTS+-keygens instead of 45.  At 45 entities × ~150ms keygen,
+        # this test was the slowest single test in the suite (~27s alone,
+        # past the 30s timeout under xdist contention) and a chronic
+        # flake.  The check under test (block at cap → extra forced tx
+        # excused) holds for any cap value.
+        from unittest.mock import patch
+        small_cap = 8
         entities = [
             Entity.create(f"entity-count-{i}-priv".encode().ljust(32, b"\x00"))
-            for i in range(MAX_TXS_PER_BLOCK)
+            for i in range(small_cap)
         ]
         block_txs = []
-        # Put high-fee txs in the pool and the block
         for i, e in enumerate(entities):
             tx = _make_tx(e, fee=_BASE_FEE + 10_000 + i, nonce=0)
             self.pool.add_transaction(tx, arrival_block_height=0)
             block_txs.append(tx)
 
-        # An extra low-fee forced tx wouldn't fit anyway
         late = _make_tx(self.alice, fee=_BASE_FEE + 100, nonce=0)
         self.pool.add_transaction(late, arrival_block_height=0)
 
         block = _FakeBlock(txs=block_txs)
-        ok, reason = check_forced_inclusion(
-            block, self.pool, current_block_height=FORCED_INCLUSION_WAIT_BLOCKS,
-        )
+        with patch(
+            "messagechain.consensus.forced_inclusion.MAX_TXS_PER_BLOCK",
+            small_cap,
+        ):
+            ok, reason = check_forced_inclusion(
+                block, self.pool,
+                current_block_height=FORCED_INCLUSION_WAIT_BLOCKS,
+            )
         self.assertTrue(ok, reason)
 
 
