@@ -394,6 +394,50 @@ curl-pipe.
 
 </details>
 
+## Learn more
+
+Deeper dives on specific features and the design thinking behind
+them — written for users, not implementers. Full index in
+[guides/](./guides/README.md).
+
+- [Identity, keys, and rotation](./guides/identity.md) — one live
+  key per entity, rotation preserves identity, plus cold authority
+  key and emergency revoke.
+- [Quantum resistance and WOTS+](./guides/quantum-resistance.md)
+  — why MessageChain signs with hash-based signatures from day
+  one, and how versioned schemes handle future migrations.
+- [Stable money over centuries](./guides/stable-money.md) —
+  dormancy-filtered active supply and why "X tokens" should mean
+  the same thing in 2126 as it does today.
+- [Fees: how pricing actually works](./guides/fees.md) — flat
+  floor, per-byte component, EIP-1559-style burn, auto-fee picker.
+- [Keeping rewards fair](./guides/fair-rewards.md) — the
+  diminishing-returns curve, founder divestment, and the lottery
+  that redistributes seed stake to the broader validator set.
+- [Validator economics](./guides/validator-economics.md) — what
+  running a validator costs, what you earn, what's at risk, and
+  rough break-even math.
+- [Governance: expensive proposals, permanent record](./guides/governance.md)
+  — how proposals work, who gets paid for voting, why most
+  results are advisory but recorded forever.
+- [Anti-bloat: keeping the chain small enough to run forever](./guides/anti-bloat.md)
+  — slow blocks, the 1024-byte message cap, and worst-case storage
+  projections out to 50+ years.
+- [Permanence guarantees](./guides/permanence.md) — the
+  protocol-level mechanics behind "your message can never be
+  deleted": archive duty, forced inclusion, slashable censorship
+  evidence.
+- [Forum primitives](./guides/forum-primitives.md) — replies,
+  up/down votes, communities, long-form threading — the on-chain
+  building blocks any front-end can reassemble.
+- [Reputation primitive](./guides/reputation.md) — trust and flag
+  votes between users, what the protocol stores, and where richer
+  reputation systems can be built on top.
+- [Combating AI spam](./guides/ai-spam.md) — the thesis: real fee
+  floor + permanent reputation graph = bulk-AI-spam economics
+  that don't pencil out. No detection, no blocklists, no
+  proof-of-human.
+
 ## How MessageChain compares
 
 How MessageChain stacks up against Nostr, Arweave, and DeSo: see
