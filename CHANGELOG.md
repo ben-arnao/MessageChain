@@ -4,6 +4,67 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.54.1] — 2026-05-04
+
+Patch release.  Two security fixes surfaced by audit round 15.
+
+### Fixed
+
+  * **`pending_censorship_evidence` chaindb mirror leak
+    (consensus-critical, slashing surface).**  Same defect class as
+    the five mirror tables fixed across the 1.50–1.54 hotfix
+    sequence (`entity_id_to_index`, `key_rotation_last_height`,
+    `receipt_subtree_roots`, `reaction_choices`,
+    `entity_last_active`) — and this one drives slashing directly.
+    `restore_state_snapshot` did not wipe `pending_censorship_evidence`
+    on reorg, and `_persist_state` was upsert-only with no DELETE
+    pass for orphans removed in-memory.  A `CensorshipEvidenceTx`
+    admitted on a fork-tip that lost the reorg left an orphan row
+    on disk → cold restart rehydrated it into
+    `censorship_processor.pending` → next maturity tick at
+    `EVIDENCE_MATURITY_BLOCKS` slashed a validator the warm cluster
+    never accused → consensus split + an unjustified
+    `CENSORSHIP_SLASH_BPS` burn against an honest operator.
+    `restore_state_snapshot` now wipes + re-inserts the table inside
+    the same SQL transaction; `_persist_state` truncates orphans
+    via the new `clear_all_pending_censorship_evidence()` helper
+    before the upsert loop on every full flush.  New
+    `tests/test_pending_censorship_evidence_reorg_roundtrip.py`
+    exercises both paths and fails on pre-fix `origin/main`.
+    (eb0e6b9, 003e026)
+
+### Security
+
+  * **Public-feed server honors `X-Forwarded-For` only from a
+    `--trusted-proxies` allowlist.**  The public-feed server's
+    `_client_ip()` returned `self.client_address[0]` unconditionally,
+    so when fronted by Caddy on the live `messagechain.org`
+    deployment every visitor's socket peer was the proxy's loopback
+    IP.  Per-/24 IP cooldown, per-IP faucet rate-limit, per-IP
+    quickpost rate-limit, and `PeerRateLimiter` per-IP buckets all
+    collapsed onto a single shared bucket — a single attacker
+    could drain the operator-funded faucet wallet at the
+    `(PoW × window-cap)` rate and crowd legitimate visitors out
+    of the bucket.  PoW (`FAUCET_POW_BITS`) was the only remaining
+    defense and is bounded for a "try it" flow.  New
+    `--trusted-proxies <cidr>[,<cidr>...]` flag gates header-trust;
+    when the socket peer falls inside an allowlisted CIDR the
+    rightmost `X-Forwarded-For` (or RFC 7239 `Forwarded: for=`)
+    token is honored as the real client IP, otherwise the header
+    is ignored unconditionally (textbook OWASP "never trust
+    client-supplied identity headers from arbitrary inbound").
+    Empty allowlist (the default) preserves pre-fix behavior.
+    Malformed forwarded-for tokens from a trusted proxy go to a
+    sentinel "unattributable" bucket so attackers can't rejoin the
+    legitimate-traffic bucket by sending garbage.  New
+    `tests/test_public_feed_trusted_proxies.py` covers the four
+    mandatory cases (trusted/untrusted/absent/malformed) plus
+    rightmost-token, IPv6, RFC 7239, and parser unit tests.
+    Operators fronting the feed via reverse proxy should pass
+    `--trusted-proxies 127.0.0.1/32` (or the appropriate
+    proxy-side CIDR) so per-IP rate limits attribute correctly.
+    (4657cbd, 461acbf)
+
 ## [1.54.0] — 2026-05-04
 
 Minor release.  Bundles two consensus / correctness fixes and two UX
