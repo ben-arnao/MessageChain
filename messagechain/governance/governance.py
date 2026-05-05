@@ -1077,7 +1077,10 @@ class GovernanceTracker:
         Returns a dict ``{"passed": bool, "payouts": dict[bytes, int],
         "burned": int}`` for inspection; chain code does not need it.
         """
-        from messagechain.config import VOTER_REWARD_MAX_SHARE_BPS
+        from messagechain.config import (
+            VOTER_REWARD_INCLUSIVE_HEIGHT,
+            VOTER_REWARD_MAX_SHARE_BPS,
+        )
 
         state = self.proposals.get(proposal_id)
         if state is None:
@@ -1103,31 +1106,50 @@ class GovernanceTracker:
             > total_eligible * GOVERNANCE_APPROVAL_THRESHOLD_NUMERATOR
         )
 
-        if not passed:
-            # Burn the entire pool.  Decrement state's pool to 0 so a
-            # replay/idempotent call is a no-op.
+        # Tier 50 (VOTER_REWARD_INCLUSIVE_HEIGHT): the per-proposal
+        # voter-reward escrow distributes pro-rata across ALL voters
+        # (yes OR no) by live stake at close, regardless of pass/fail.
+        # Pre-Tier-50 (legacy Tier 22): yes-only on pass, full burn on
+        # reject -- preserved here for byte-identical historical replay
+        # of proposals closing below the activation height.
+        inclusive_active = current_block >= VOTER_REWARD_INCLUSIVE_HEIGHT
+
+        if not passed and not inclusive_active:
+            # Pre-Tier-50 reject: burn the entire pool.  Decrement
+            # state's pool to 0 so a replay/idempotent call is a no-op.
             state.voter_reward_pool = 0
             supply_tracker.total_supply -= pool
             supply_tracker.total_burned += pool
             return {"passed": False, "payouts": {}, "burned": pool}
 
-        # Build the winners set: yes-voters with live stake > 0.
+        # Build the winners set.  Pre-Tier-50: yes-voters with live
+        # stake > 0.  Post-Tier-50: ALL voters (yes OR no) with live
+        # stake > 0 -- the proposer paid for honest deliberation, not
+        # specifically for approval, and excluding NO voters
+        # corrupts the vote signal with a "vote yes to get paid"
+        # incentive.  Live-stake gate stays in both paths so a
+        # voter slashed or fully-unstaked between cast and close
+        # cannot collect.
         winners = {}  # voter_id -> live_stake
         for voter_id, approve in state.votes.items():
-            if not approve:
+            if not inclusive_active and not approve:
                 continue
             live = supply_tracker.get_staked(voter_id)
             if live > 0:
                 winners[voter_id] = live
 
         if not winners:
-            # Edge case: proposal "passed" via silent supermajority
-            # math somehow (e.g., zero eligible after slashing — but
-            # passed is False then).  Defensive: burn pool.
+            # Edge case: nothing to distribute (no live voters in the
+            # eligible set).  Pre-Tier-50: this only fired on the
+            # passed branch (rejected branch already returned above).
+            # Post-Tier-50: same defensive burn applies on either
+            # outcome -- if the entire participating set is dust,
+            # the pool burns rather than minting an unattributable
+            # remainder.
             state.voter_reward_pool = 0
             supply_tracker.total_supply -= pool
             supply_tracker.total_burned += pool
-            return {"passed": True, "payouts": {}, "burned": pool}
+            return {"passed": passed, "payouts": {}, "burned": pool}
 
         cap = pool * VOTER_REWARD_MAX_SHARE_BPS // 10_000
         winners_total = sum(winners.values())
@@ -1162,7 +1184,12 @@ class GovernanceTracker:
             supply_tracker.total_burned += burned
 
         state.voter_reward_pool = 0
-        return {"passed": True, "payouts": payouts, "burned": burned}
+        # Pre-Tier-50 only the passed branch reached this return, so
+        # passed=True was hard-coded.  Post-Tier-50 the rejected branch
+        # ALSO reaches here (still distributes the pool), so the
+        # outcome flag must reflect the real tally rather than the
+        # presence of payouts.
+        return {"passed": passed, "payouts": payouts, "burned": burned}
 
     def execute_treasury_spend(
         self,

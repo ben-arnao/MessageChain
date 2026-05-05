@@ -5837,6 +5837,57 @@ assert UNIFIED_FEE_FLOOR_HEIGHT > WITNESS_ROOT_ACTIVATION_HEIGHT, (
     "into a single activation window"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 50 — Inclusive voter rewards (hard fork)
+# ─────────────────────────────────────────────────────────────────────
+# Pre-Tier-50 (i.e. Tier 22, VOTER_REWARD_HEIGHT) violated the
+# governance anchor in CLAUDE.md:
+#
+#     "voters who cast a vote during the window receive a reward
+#      funded out of the proposal fee."
+#
+# in two compounding ways:
+#
+#   1. NO-voters never earned anything, even on a passing proposal —
+#      the winners filter excluded `if not approve: continue`.
+#   2. Rejected proposals burned the entire pool, so every voter's
+#      deliberation was unrewarded.
+#
+# Net: a stake-weighted voter has a measurable pay incentive to vote
+# YES regardless of merit (50_000-token surcharge × yes-only payouts ×
+# full-burn-on-reject), corrupting the very signal governance is
+# supposed to produce — and biasing the founder→community handoff in
+# the wrong direction during the bootstrap window where this hurts
+# most.
+#
+# Tier 50 closes both gaps: at and above VOTER_REWARD_INCLUSIVE_HEIGHT,
+# the per-proposal voter-reward escrow distributes pro-rata across
+# ALL voters (yes OR no) by live stake at close, regardless of
+# pass/fail.  Pre-fork proposals (closed at current_block <
+# VOTER_REWARD_INCLUSIVE_HEIGHT) preserve the byte-identical legacy
+# Tier-22 behavior so historical replay is unchanged.
+#
+# Activation height 1800 sits above Tier 49 (UNIFIED_FEE_FLOOR_HEIGHT
+# = 1750) with ~50 blocks ≈ 8.3h cohort spacing at 600s blocks; current
+# tip ~1593 gives ~207 blocks ≈ 35 hours of runway for the binary
+# rollout.  Two-validator network, both operator-controlled, so the
+# cutover is coordinated and the runway bound is operational rather
+# than the multi-week external-validator notice the band was
+# originally sized for.
+VOTER_REWARD_INCLUSIVE_HEIGHT = 1800  # Tier 50
+
+assert VOTER_REWARD_INCLUSIVE_HEIGHT > UNIFIED_FEE_FLOOR_HEIGHT, (
+    "VOTER_REWARD_INCLUSIVE_HEIGHT must follow Tier 49 — operators "
+    "upgrade through Tier 49 before this consensus-rule change binds, "
+    "and the cohort spacing keeps two consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
+)
+assert VOTER_REWARD_INCLUSIVE_HEIGHT > VOTER_REWARD_HEIGHT, (
+    "VOTER_REWARD_INCLUSIVE_HEIGHT must follow Tier 22 — the legacy "
+    "yes-only path must remain reachable for historical proposals "
+    "closing pre-Tier-50"
+)
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
