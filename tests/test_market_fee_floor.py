@@ -265,6 +265,28 @@ class TestBaseFeeFloorAtTier16(unittest.TestCase):
         self.assertEqual(ledger.base_fee, MARKET_FEE_FLOOR)
         self.assertLess(ledger.base_fee, MIN_FEE)
 
+    def test_decay_reaches_floor_under_empty_blocks(self):
+        # Under sustained empty blocks the EIP-1559 controller must be
+        # able to decay all the way to MARKET_FEE_FLOOR=1.  Pre-fix,
+        # integer truncation in (base_fee * deficit) // (target * denom)
+        # floored to 0 once base_fee got small enough — e.g. at
+        # base_fee=7, target=22, denom=8 the delta was 154//176 = 0,
+        # pinning base_fee at 7 forever.  The decrease branch now uses
+        # max(1, delta) to mirror the increase branch and guarantee
+        # progress toward the floor.
+        from messagechain.config import BASE_FEE_INITIAL
+        ledger = self._fresh_ledger()
+        ledger.base_fee = BASE_FEE_INITIAL  # 100, the post-genesis value
+        # 100 → 1 takes O(log_{8/7}(100)) ~ 33 steps with the fixed
+        # 12.5%-of-current decay; floor at 7 was the old pin, so 200
+        # empty-block iterations is plenty of headroom.
+        for _ in range(200):
+            ledger.update_base_fee(
+                parent_tx_count=0,
+                current_height=MARKET_FEE_FLOOR_HEIGHT,
+            )
+        self.assertEqual(ledger.base_fee, MARKET_FEE_FLOOR)
+
 
 if __name__ == "__main__":
     unittest.main()

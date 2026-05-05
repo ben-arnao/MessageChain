@@ -1461,9 +1461,17 @@ class SupplyTracker:
             # realistic organic fee but finite.
             self.base_fee = min(self.base_fee + max(1, delta), max_base_fee)
         else:
-            # Block was under target — decrease base fee
+            # Block was under target — decrease base fee.  Mirror the
+            # increase branch's max(1, delta): integer truncation of
+            # (base_fee * deficit) // (target * denom) floors to 0
+            # once base_fee gets small enough (e.g. base_fee=7,
+            # target=22, denom=8 → 154 // 176 = 0), pinning base_fee
+            # above the intended MARKET_FEE_FLOOR=1.  Force a minimum
+            # 1-token step whenever the parent block was under target,
+            # so quiet periods can decay base_fee all the way down to
+            # the floor.
             deficit = target - parent_tx_count
-            delta = self.base_fee * deficit // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR)
+            delta = max(1, self.base_fee * deficit // (target * BASE_FEE_MAX_CHANGE_DENOMINATOR))
             self.base_fee = max(base_floor, self.base_fee - delta)
 
         return self.base_fee
