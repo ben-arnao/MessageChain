@@ -4,6 +4,127 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.57.0] — 2026-05-05
+
+Minor release.  Audit round 18 top-3 ships: a critical operator-side
+slashing footgun fix on the daily rotate-key timer (cli leaf-cursor
+mismatch with the daemon -- 100% slash on detection on the shipped
+systemd unit), the missing emission edge of the FinalityVote-layer
+equivocation slasher (detection was wired but the accumulator had
+no reader, so equivocators escaped), and Tier 50 (inclusive voter
+rewards, hard fork at height 1800) -- closes the "vote yes to get
+paid" perverse-incentive that pre-Tier-22 governance carried.  Plus
+the standalone fork-emergency auto-recovery wiring committed
+post-1.56.0.
+
+### Fixed
+
+  * **`rotate-key-if-needed` timer must propagate `data_dir` to
+    `cmd_rotate_key` (operator-honest-fairness, immediate impact).**
+    The daily systemd timer (`messagechain-rotate-key.timer`) called
+    `cmd_rotate_key_if_needed`, which synthesised an
+    `argparse.Namespace(server, yes, fee, keyfile)` and handed it
+    to `cmd_rotate_key`.  The synthesised namespace lacked
+    `data_dir`, so `cmd_rotate_key`'s
+    `getattr(args, "data_dir", None)` returned None and the
+    leaf-cursor resolver routed the timer's WOTS+ cursor to the
+    per-user fallback `~/.messagechain/leaves/<entity>.idx` while
+    the validator daemon kept persisting to
+    `<data_dir>/leaf_index.json`.  Two cursors with no fsync
+    handshake re-opens the cross-process WOTS+ leaf-reuse window:
+    `_reserve_leaf_via_rpc` was the only thing keeping the timer's
+    signed rotate-tx from re-using a leaf the daemon already
+    burned, and it silently returns None on transient RPC errors
+    and on older daemons.  Leaf reuse is detected as equivocation
+    under the same rule and slashes 100% of stake pre-Tier-20 /
+    decays geometrically post -- exactly the disaster slot the
+    README spends ~70 lines warning operators about, occurring on
+    the shipped, recommended timer config.  Fix: pull `data_dir`
+    (and existing `keyfile`) out of `read_onboard_config()` and
+    include both in the synthesised `Namespace`.  Honest operators
+    running the daily timer now sign through the same cursor file
+    as the daemon.  Regression test in
+    `tests/test_rotate_if_needed_data_dir_propagation.py` asserts
+    the timer-side `Namespace` carries the cfg-derived `data_dir`
+    and that the resolved leaf-cursor path equals the daemon's.
+    (c724327)
+
+  * **Drain `_pending_finality_slashes` into mempool slash
+    transactions (validator-collusion defense gap).**
+    `FinalityCheckpoints.add_vote` auto-detects double-finality-vote
+    equivocation and surfaces it via
+    `get_pending_slashing_evidence`; `_apply_block_state` appended
+    that evidence into `self._pending_finality_slashes`.  But that
+    write site was the **only** reference to the accumulator
+    anywhere in the codebase (verified by grep: 3 hits, all the
+    write site at blockchain.py:8291-8293).  Detection was wired
+    -- emission was not.  Equivocators at the FinalityVote layer
+    therefore escaped slashing despite the chain being fully able
+    to verify and apply `FinalityDoubleVoteEvidence`-bearing
+    `SlashTransaction`s.  `EquivocationWatcher` already handled
+    the same shape for the block-header and attestation layers;
+    this change closes the symmetric gap for the FinalityVote
+    layer: new `Blockchain.drain_pending_finality_slashes()`
+    returns and clears the accumulator (filtering already-
+    on-chain evidence via `_processed_evidence`), new
+    `messagechain.network.node._emit_pending_finality_slashes()`
+    wraps each drained evidence in a `SlashTransaction` signed by
+    the local entity at `base_fee` and pushes into the mempool slash
+    pool, and `Node._after_block_added` wires the helper into the
+    same post-block hook the notify-on-proposal flow uses.  Detect-
+    only nodes (no submitter `entity`) re-stash the survivors so a
+    future call with a real submitter can emit them.  5 new
+    regression tests in
+    `tests/test_pending_finality_slashes_drain.py`.  (dc6aadf)
+
+### Added
+
+  * **Tier 50 -- inclusive voter rewards (hard fork, activation
+    height 1800).**  Pre-Tier-50 (Tier 22, `VOTER_REWARD_HEIGHT`)
+    violated the governance anchor in CLAUDE.md ("voters who cast
+    a vote during the window receive a reward funded out of the
+    proposal fee") in two compounding ways: (1) NO-voters never
+    earned anything, even on a passing proposal -- the winners
+    filter excluded `if not approve: continue`; (2) rejected
+    proposals burned the entire pool wholesale.  Net effect: a
+    stake-weighted voter has a measurable pay incentive to vote
+    YES regardless of merit (50_000-token surcharge × yes-only
+    distribution × full-burn-on-reject), corrupting the very
+    signal governance is supposed to produce -- and biasing the
+    founder-to-community handoff in the wrong direction during
+    the bootstrap window where this hurts most.  Tier 50 closes
+    both gaps: at and above `VOTER_REWARD_INCLUSIVE_HEIGHT`,
+    `finalize_voter_rewards` distributes the per-proposal voter-
+    reward escrow pro-rata across ALL voters (yes OR no) by live
+    stake at close, regardless of pass/fail.  The proposer paid
+    for honest deliberation, not specifically for approval.
+    Pre-fork proposals (closed at `current_block <
+    VOTER_REWARD_INCLUSIVE_HEIGHT`) preserve byte-identical
+    legacy Tier-22 behavior so historical replay is unchanged.
+    Activation height 1800 sits above Tier 49
+    (`UNIFIED_FEE_FLOOR_HEIGHT = 1750`) with ~50 blocks ≈ 8.3h
+    cohort spacing at 600s blocks; current tip ~1593 gives ~207
+    blocks ≈ 35 hours of runway.  Two-validator network, both
+    operator-controlled, so the cutover is coordinated and the
+    runway bound is operational rather than the multi-week
+    external-validator notice the band was originally sized for.
+    8 new regression tests in
+    `tests/test_voter_rewards_inclusive_tier50.py` (pre-fork
+    legacy preserved; post-fork passed pays all; post-fork
+    rejected still pays all; mixed yes+no all paid; activation-
+    height ordering).  (80e2086)
+
+  * **Fork-emergency auto-recovery wired for full nodes.**
+    Standing-focus item from prior audits: a node ending up on a
+    minority/unintentional fork must auto-resync to the canonical
+    chain without operator state surgery.  Wiring landed
+    post-1.56.0 was tagged: detector + rewind-via-snapshot path,
+    gated on zero-stake (registered validators NEVER auto-flip --
+    they HALT instead, preserving "no slashable evidence from
+    minority tip"), gated on never crossing finality, with
+    snapshot-then-replay rewind and a fall-back to reset+replay
+    if the snapshot was already pruned.  (8c94653)
+
 ## [1.56.0] — 2026-05-05
 
 Minor release.  Audit round 17 ships two fixes: a critical witness
