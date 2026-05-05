@@ -1693,7 +1693,7 @@ from messagechain.consensus.bootstrap_gradient import BOOTSTRAP_END_HEIGHT as _B
 # 210_384 blocks ≈ 4 years) is preserved so the per-block divestment
 # rate stays sane; only the start is pulled forward.  See CHANGELOG
 # 1.21.0 rationale.
-SEED_DIVESTMENT_START_HEIGHT = 7_500                                   # was 50_000
+SEED_DIVESTMENT_START_HEIGHT = 1711  # Compressed 2026-05-05 — was 7_500; collapsed to mainnet-tip+runway under the 1.55.1 sweep (only 2 validators on chain, both ours)
 SEED_DIVESTMENT_END_HEIGHT = SEED_DIVESTMENT_START_HEIGHT + 210_384    # 217_884
 SEED_DIVESTMENT_BURN_BPS = 7500       # 75% of each block's divested amount is burned
 SEED_DIVESTMENT_TREASURY_BPS = 2500   # 25% routed to treasury
@@ -1781,7 +1781,7 @@ assert (
     == 10_000
 )
 
-SEED_DIVESTMENT_REDIST_HEIGHT = 1600              # Tier 3 (compressed: was 74_000)
+SEED_DIVESTMENT_REDIST_HEIGHT = 1700              # Tier 3 (compressed 2026-05-05 in 1.55.1 sweep — was 1600; collapsed to mainnet-tip+runway since both validators are ours)
 
 # Operators MUST coordinate REDIST at or after RETUNE — REDIST is a
 # LATER fork that extends the retune policy.  Activating REDIST before
@@ -2183,7 +2183,7 @@ WITNESS_AUTO_SEPARATION_ENABLED = True
 # upgrade.  The fork is one-way: once activated, pre-fork blocks
 # remain un-stripped forever; only blocks at or above this height are
 # eligible for separation.
-WITNESS_AUTO_SEPARATION_HEIGHT = 3000
+WITNESS_AUTO_SEPARATION_HEIGHT = 1704  # Compressed 2026-05-05 in 1.55.1 sweep — was 3000
 
 
 # Governance — on-chain voting for protocol/codebase changes
@@ -2769,7 +2769,7 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 # runway for both validators to upgrade (per CLAUDE.md release
 # procedure) before activation.  Current mainnet tip ~1351 (2026-05-03);
 # 5000 gives ~25 days of runway at 600s/block.
-SUPPLY_RECONCILIATION_HEIGHT = 5000
+SUPPLY_RECONCILIATION_HEIGHT = 1708  # Compressed 2026-05-05 in 1.55.1 sweep — was 5000
 
 # Treasury spend-rate cap tightening (hard fork).
 #
@@ -2973,7 +2973,7 @@ assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH <= 10_000, (
 #
 # Pre-activation byte-identical to the legacy 100 bps path.
 PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45 = 5000  # 50% of epoch pool
-PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT = 4534  # Tier 45 — +700 spacing above Tier 44 (3834)
+PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT = 1707  # Tier 45 — compressed 2026-05-05 in 1.55.1 sweep (was 4534)
 
 assert 0 < PER_VALIDATOR_ATTESTER_REWARD_CAP_BPS_PER_EPOCH_TIER45 <= 10_000, (
     "Tier 45 cap must be a positive basis-point fraction <= 100%"
@@ -3028,7 +3028,7 @@ assert (
 # every live operator has multiple weeks of runway to upgrade their
 # cmd_set_authority_key invocation to attach a cold-key counter-sig
 # before the gate binds.
-AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234  # Tier 46 — +700 spacing above Tier 45 (4534)
+AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 1709  # Tier 46 — compressed 2026-05-05 in 1.55.1 sweep (was 5234)
 
 # ─────────────────────────────────────────────────────────────────────
 # Dormancy-filtered active-supply controller (hard fork — Tier 47)
@@ -3105,7 +3105,7 @@ AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT = 5234  # Tier 46 — +700 spacing above T
 # have many weeks of runway to upgrade.
 
 # Activation height for the controller and all dormancy bookkeeping.
-DORMANCY_CONTROLLER_HEIGHT = 5934  # Tier 47 — +700 spacing above Tier 46 (5234)
+DORMANCY_CONTROLLER_HEIGHT = 1710  # Tier 47 — compressed 2026-05-05 in 1.55.1 sweep (was 5934)
 
 # Dormancy window: how long a balance can sit idle before its weight
 # tapers out of active_supply.  Set on the centuries horizon per
@@ -5249,7 +5249,7 @@ assert ACK_INCLUSION_GRACE < WITNESS_RESPONSE_DEADLINE_BLOCKS, (
 # Activation height comfortably above Tier 39 (height 802) and current
 # tip (~835 at 1.37.0) with several hours of runway for operator
 # rollout before the new shape bites.
-REWARD_CURVE_SMOOTH_HEIGHT = 1634  # Tier 40 — re-runwayed in 1.38.1 (was 900; preserves +734 spacing across the entire 33-40 cohort)
+REWARD_CURVE_SMOOTH_HEIGHT = 1701  # Tier 40 — compressed 2026-05-05 in 1.55.1 sweep (was 1634)
 
 # Multiplier shape parameters.  All in the same MULT_DEN basis so the
 # helper composes them with a single common denominator.
@@ -5324,7 +5324,7 @@ assert REWARD_CURVE_SMOOTH_SCALE_BPS > 0, (
 # Activation rides above Tier 40 with a comfortable runway buffer
 # above the current ~840 mainnet tip so operators upgrade through
 # prior forks before the new comparator bites.
-ACK_DEADLINE_GRACE_DEFENSE_HEIGHT = 1640  # Tier 41 — runway above Tier 40 (1634) and current ~840 mainnet tip
+ACK_DEADLINE_GRACE_DEFENSE_HEIGHT = 1702  # Tier 41 — compressed 2026-05-05 in 1.55.1 sweep (was 1640)
 
 assert ACK_DEADLINE_GRACE_DEFENSE_HEIGHT > REWARD_CURVE_SMOOTH_HEIGHT, (
     "ACK_DEADLINE_GRACE_DEFENSE_HEIGHT must follow Tier 40 — Tier 41 "
@@ -5382,7 +5382,7 @@ assert ACK_DEADLINE_GRACE_DEFENSE_HEIGHT > ACK_BACKDATING_DEFENSE_HEIGHT, (
 # Activation height comfortably above Tier 41 (1640) with multi-day
 # runway above the current ~840 mainnet tip so operators upgrade
 # through the prior fork ladder before the new shape bites.
-REWARD_CURVE_SMOOTH_V2_HEIGHT = 2400  # Tier 42 — comfortable runway above Tier 41 (1640) and current ~840 mainnet tip
+REWARD_CURVE_SMOOTH_V2_HEIGHT = 1703  # Tier 42 — compressed 2026-05-05 in 1.55.1 sweep (was 2400)
 
 # Multiplier shape parameters for the V2 retune.  Same MULT_DEN basis
 # (REWARD_CURVE_SMOOTH_MULT_DEN, shared with V1) so the v4 helper
@@ -5466,7 +5466,7 @@ assert REWARD_CURVE_SMOOTH_V2_SCALE_BPS > 0, (
 # = 2400) with multi-day runway so operators upgrade through the
 # prior fork ladder before the new source-side rule bites.  +734
 # spacing matches the cohort the 1.38.1 re-runway used.
-FORCED_INCLUSION_ALL_POOLS_HEIGHT = 3134  # Tier 43 — comfortable runway above Tier 42 (2400) with the standard +734 cohort spacing
+FORCED_INCLUSION_ALL_POOLS_HEIGHT = 1705  # Tier 43 — compressed 2026-05-05 in 1.55.1 sweep (was 3134)
 
 assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > REWARD_CURVE_SMOOTH_V2_HEIGHT, (
     "FORCED_INCLUSION_ALL_POOLS_HEIGHT must follow Tier 42 — the "
@@ -5527,7 +5527,7 @@ assert FORCED_INCLUSION_ALL_POOLS_HEIGHT > FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGH
 # Activation height comfortably above Tier 43 (FORCED_INCLUSION_ALL_
 # POOLS = 3134) with the standard +700-block runway so operators
 # upgrade through the prior fork before the new wire format binds.
-CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT = 3834  # Tier 44 — +700 spacing above Tier 43 (3134); current tip ≈ 850
+CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT = 1706  # Tier 44 — compressed 2026-05-05 in 1.55.1 sweep (was 3834)
 
 assert CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT > FORCED_INCLUSION_ALL_POOLS_HEIGHT, (
     "CENSORSHIP_EVIDENCE_POLY_RECEIPTED_TX_HEIGHT must follow Tier 43 — "
@@ -5726,7 +5726,7 @@ assert HONESTY_CURVE_HEIGHT > SOFT_SLASH_HEIGHT, (
 # only way to test the activation gate without a network split is to
 # have every operator on a binary that knows about the new rule
 # before the cutover.
-WITNESS_ROOT_ACTIVATION_HEIGHT = 15_000  # Tier 48
+WITNESS_ROOT_ACTIVATION_HEIGHT = 1712  # Tier 48 — compressed 2026-05-05 in 1.55.1 sweep (was 15_000)
 
 # Witness-root must activate after the most recent body-slot addition
 # (Tier 35 added non_response_evidence_txs).  Activating before that

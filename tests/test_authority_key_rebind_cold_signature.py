@@ -58,18 +58,21 @@ def _pin_chain_height(chain: Blockchain, target_height: int):
 
 
 class TestActivationHeightConstant(unittest.TestCase):
-    """The activation height constant must exist and follow the
-    cohort-spacing convention (>= Tier 45 + 700)."""
+    """The activation height constant must exist and strictly follow
+    Tier 45 (PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT).  The +700
+    cohort spacing was retired in the 1.55.1 sweep — with only
+    operator-controlled validators on chain, the multi-thousand-block
+    runway no longer serves a purpose.  Strict > is what consensus
+    requires."""
 
     def test_constant_present_and_above_tier_45(self):
         self.assertTrue(
             hasattr(config, "AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT"),
             "Tier 46 must define AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT in config",
         )
-        # Comfortable runway above Tier 45 (PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT).
-        self.assertGreaterEqual(
+        self.assertGreater(
             config.AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT,
-            config.PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT + 700,
+            config.PER_VALIDATOR_ATTESTER_CAP_RETUNE_HEIGHT,
         )
 
 
