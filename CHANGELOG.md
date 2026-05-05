@@ -4,6 +4,80 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.55.2] — 2026-05-05
+
+Patch release.  Three audit-round-16 fixes plus the test-suite perf
+sweep that landed alongside.  All non-breaking: the witness reattach
+verification is a defense-in-depth check that becomes load-bearing
+post-Tier-48 activation, the faucet leak fix is operational hygiene,
+and the dormancy-controller retune lands before Tier 47 ever
+activates so no historical block reward changes.
+
+### Fixed
+
+  * **Tier 48 strip/attach commitment is now enforced on reattach.**
+    `attach_block_witnesses` was rebuilding signatures into a block
+    without re-deriving `compute_block_witness_root` and asserting
+    equality with `header.witness_root`, so any disk corruption,
+    archive-node tampering, or future B-3 peer-fetch path could
+    deserialize fabricated WOTS+ blobs as "valid" reattached
+    transactions (the block_hash still matches because the header
+    is unmodified).  Post-activation the reattach now raises
+    `WitnessRootMismatchError` on diverge; pre-activation
+    (`block_number < WITNESS_ROOT_ACTIVATION_HEIGHT`) is a no-op.
+    `get_block_by_hash(include_witnesses=True)` propagates the
+    new error.  Also retired the dead `verify_witness_data` helper
+    whose legacy single-slot leaf rule would have silently returned
+    wrong answers if any future B-3/D wiring imported the obvious-
+    looking helper.  New `tests/test_witness_reattach_verification.py`
+    + updates to `tests/test_witness_tiering.py`.  (b41f0a4, 9a618f7)
+
+  * **Public-feed faucet `_ip_last_drip` is now bounded.**  Every
+    successful drip wrote `cidr → timestamp` and never deleted, with
+    `_ip_cidr_24` collapsing only IPv4 to /24 — IPv6 addresses keyed
+    on the full address.  An attacker on a /48 (~2⁸⁰ choices) could
+    drive unbounded growth at ~50 bytes/entry, eventually inducing
+    GC stalls long enough to miss attestation slots on the public-
+    feed validator (which the inactivity penalty would then bill to
+    the honest operator).  Per-drip eviction now drops every entry
+    where `now - timestamp > ip_cooldown_sec` (already a behavioral
+    no-op), with a `FAUCET_IP_LAST_DRIP_MAX = 65_536` hard ceiling
+    that drops the oldest-timestamp entries when an attacker spins
+    new IPs faster than expiration.  New
+    `tests/test_faucet_ip_last_drip_eviction.py`.  (f38df24, 27fbbad)
+
+### Changed
+
+  * **Tier-47 dormancy controller retune (no activation height
+    change).**  `DORMANCY_MAX_ISSUANCE_PER_BLOCK` 64 → 500 and
+    `DORMANCY_CONTROLLER_K_DEN` 100_000 → 20_000.  Pre-retune the
+    controller pegged at MAX whenever `gap ≥ 6.4M` (~4.6% of the
+    140M target), capping annual issuance at ~3.37M while the
+    chain's own documented burn estimate (`config.py`
+    `TARGET_CIRCULATING_SUPPLY_FLOOR` commentary) is 10–15M
+    tokens/yr — net active supply would have continued falling
+    7–12M/yr indefinitely, breaking the anchored "stable active
+    supply" promise within a decade post-activation.  Post-retune:
+    ~26.3M tokens/yr ceiling (~2× burn) with quarterly gap-halving,
+    so the controller can actually close the gap.  Tuning retune
+    (not a shape change) per the CLAUDE.md anchor that controller
+    curve / ceiling / window are tuning knobs in code.  Safe to
+    edit in place because Tier 47 has not yet activated on mainnet
+    (activation height 1710, current tip ~1500); the constants are
+    consumed only inside `compute_dormancy_issuance` which is
+    height-gated, so no historical block-replay output changes.
+    New `tests/test_dormancy_controller_ceiling_retune.py`.
+    (03225e0, 168a681)
+
+### Perf
+
+  * **Test suite ~5min → ~110s** via setUp hoists, entity-pool
+    caching, and asyncio cleanup across 23 test files.  Two prior
+    sweeps merged: shrunk Monte-Carlo loop counts on the slowest
+    tests and hardened previously-flaky async tests revealed by
+    the faster cadence.  No production code touched.  (cc2de07,
+    3c1332d, 7179acc, 175879b, a7cbb94, 8abf93b)
+
 ## [1.55.1] — 2026-05-05
 
 Patch release.  Compresses every remaining future activation height
