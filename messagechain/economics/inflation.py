@@ -378,6 +378,21 @@ class SupplyTracker:
         # mechanism and CHANGELOG 1.50.0 for the root-cause history.
         self.supply_reconciliation_applied: bool = False
 
+        # Idempotency flag for the SUPPLY_RECONCILIATION_FIX_HEIGHT
+        # hard fork (1.58.4).  The 1.50.0 reconciliation rebased
+        # ``total_supply`` to match the bucket-sum invariant but
+        # forgot to bump ``total_burned`` by the same delta, leaving
+        # the scalar invariant ``total_supply == GENESIS_SUPPLY +
+        # total_minted - total_burned`` broken.  The next block's
+        # end-of-apply scalar check tripped and the chain wedged.
+        # This flag guards the corrective bump so an adjacent reorg
+        # replay is a no-op.  Same reorg-safety contract as
+        # ``treasury_rebase_applied`` / ``supply_reconciliation_applied``:
+        # snapshotted with the supply state, un-flipped on rollback.
+        # See ``Blockchain._apply_supply_reconciliation_fix`` and
+        # CHANGELOG 1.58.4 for the root-cause history.
+        self.supply_reconciliation_fix_applied: bool = False
+
         # Treasury spend-rate cap bookkeeping (hard fork): per-epoch
         # rolling window of debited amounts.  A spend at current_block
         # is charged against the epoch whose start is

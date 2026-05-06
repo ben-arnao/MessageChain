@@ -2795,6 +2795,57 @@ TREASURY_SPEND_CAP_EPOCH_BLOCKS = FINALITY_INTERVAL  # 100-block cadence
 # 5000 gives ~25 days of runway at 600s/block.
 SUPPLY_RECONCILIATION_HEIGHT = 1708  # Compressed 2026-05-05 in 1.55.1 sweep — was 5000
 
+# Supply-reconciliation FIX (1.58.4 hard fork).
+#
+# The 1.50.0 SUPPLY_RECONCILIATION_HEIGHT rebase set ``total_supply``
+# to match the bucket-sum invariant (``check_supply_conservation``)
+# but did NOT bump ``total_burned`` by the same delta — so the
+# SCALAR invariant ``total_supply == GENESIS_SUPPLY + total_minted -
+# total_burned`` was left broken by exactly the rebase delta.  The
+# scalar invariant fires at the END of every ``_apply_block_state``;
+# at the activation block itself (``SUPPLY_RECONCILIATION_HEIGHT``)
+# the check runs BEFORE the reconciliation (the rebase is called from
+# ``_append_block`` after ``_apply_block_state`` returns) so it
+# passes.  The very NEXT block trips the check with a
+# ``ChainIntegrityError`` and the chain wedges.
+#
+# Mainnet realized this incident on 2026-05-06: the rebase at block
+# 1708 set ``total_supply`` from ~107M to ~59.5M (delta -47,494,983)
+# without bumping ``total_burned``; block 1709's apply tripped the
+# scalar check and both validators wedged at height 1709 indefinitely.
+#
+# This fix: at ``SUPPLY_RECONCILIATION_FIX_HEIGHT`` a one-shot bumps
+# ``total_burned`` by the gap (or ``total_minted`` if the gap is
+# negative — defensive, not expected on the realized mainnet
+# trajectory) to restore the scalar invariant.  Runs at the START
+# of ``_apply_block_state`` (alongside other one-shot activation
+# hooks) so the rest of the apply path — including the end-of-apply
+# scalar check — sees the corrected state.
+#
+# Activation = 1709: the next block to be applied on mainnet (block
+# 1708 is the wedged-on tip; block 1709 is what validators are
+# repeatedly failing to apply).  Mainnet recovery: validators
+# upgrade to the fix release, the same-height-sign-guard at 1709 is
+# manually reset operator-side, and the next slot timer fires a
+# fresh proposal at height 1709 whose apply succeeds because the
+# fix establishes the scalar invariant before the per-block
+# mutations run.
+#
+# Idempotent via ``self.supply.supply_reconciliation_fix_applied``;
+# snapshotted for reorg safety alongside ``treasury_rebase_applied``
+# and ``supply_reconciliation_applied`` so a rolled-back fix block
+# correctly un-flips the flag for the canonical replay.
+SUPPLY_RECONCILIATION_FIX_HEIGHT = 1709  # Tier 52 — 1.58.4 hotfix.
+
+assert SUPPLY_RECONCILIATION_FIX_HEIGHT >= SUPPLY_RECONCILIATION_HEIGHT, (
+    f"SUPPLY_RECONCILIATION_FIX_HEIGHT "
+    f"({SUPPLY_RECONCILIATION_FIX_HEIGHT}) must be >= "
+    f"SUPPLY_RECONCILIATION_HEIGHT ({SUPPLY_RECONCILIATION_HEIGHT}) — "
+    f"the fix only makes sense at or after the original reconciliation "
+    f"has fired (the broken scalar state IS a consequence of the "
+    f"original reconciliation)"
+)
+
 # Treasury spend-rate cap tightening (hard fork).
 #
 # The original per-epoch cap of 100 bps (1%) was introduced in the

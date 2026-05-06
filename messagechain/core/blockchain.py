@@ -11440,6 +11440,116 @@ class Blockchain:
             breakdown,
         )
 
+    def _apply_supply_reconciliation_fix(self, block_height: int) -> None:
+        """Restore the scalar supply invariant after the 1.50.0
+        reconciliation forgot to bump ``total_burned``.
+
+        Fires exactly once, at ``block_height ==
+        SUPPLY_RECONCILIATION_FIX_HEIGHT``.  All other heights are
+        no-ops.
+
+        Idempotent: an adjacent re-apply at the same height is guarded
+        by ``self.supply.supply_reconciliation_fix_applied``.  The
+        flag is snapshotted alongside ``treasury_rebase_applied`` and
+        ``supply_reconciliation_applied`` for reorg safety -- a
+        reorged-out fix block correctly un-flips the flag on rollback
+        via the supply-level snapshot.
+
+        Background: the 1.50.0 ``SUPPLY_RECONCILIATION_HEIGHT`` rebase
+        set ``total_supply`` to match the bucket-sum invariant
+        (``check_supply_conservation``) but did NOT bump
+        ``total_burned`` by the same delta -- so the SCALAR invariant
+        ``total_supply == GENESIS_SUPPLY + total_minted - total_burned``
+        was left broken by exactly the rebase delta.  The scalar
+        invariant fires at the END of every ``_apply_block_state``;
+        at the activation block itself the check runs BEFORE the
+        reconciliation (the rebase is called from ``_append_block``
+        after ``_apply_block_state`` returns), so it passes.  The
+        very NEXT block trips the check with a
+        ``ChainIntegrityError`` and the chain wedges.
+
+        On mainnet 2026-05-06 the rebase at block 1708 set
+        ``total_supply`` from ~107M to ~59.5M (delta -47,494,983)
+        without bumping ``total_burned``; block 1709's apply tripped
+        the scalar check and both validators wedged at height 1709.
+
+        Mechanism: bump ``total_burned`` by the gap (or
+        ``total_minted`` if the gap is negative -- defensive, not
+        expected on the realized mainnet trajectory) so the scalar
+        invariant ``total_supply == GENESIS_SUPPLY + total_minted -
+        total_burned`` holds again.  Runs at the START of
+        ``_apply_block_state`` (alongside other one-shot activation
+        hooks) so the rest of the apply path -- including the end-
+        of-apply scalar check -- sees the corrected state.
+
+        Note on bucket invariant: the fix only mutates ``total_burned``
+        (or ``total_minted``), neither of which is in the
+        ``check_supply_conservation`` bucket sum.  Bucket-vs-scalar
+        delta is therefore unchanged by the fix -- the bucket
+        invariant continues to hold post-fix iff it held pre-fix.
+
+        See ``messagechain.config.SUPPLY_RECONCILIATION_FIX_HEIGHT``
+        and the CHANGELOG 1.58.4 root-cause entry.
+        """
+        from messagechain.config import (
+            SUPPLY_RECONCILIATION_FIX_HEIGHT,
+            GENESIS_SUPPLY,
+        )
+        if block_height != SUPPLY_RECONCILIATION_FIX_HEIGHT:
+            return
+        if self.supply.supply_reconciliation_fix_applied:
+            return
+        expected = (
+            GENESIS_SUPPLY
+            + self.supply.total_minted
+            - self.supply.total_burned
+        )
+        actual = self.supply.total_supply
+        delta = expected - actual    # positive iff total_burned needs to go UP
+        if delta > 0:
+            # The rebase moved tokens out of circulation but didn't
+            # account them as burned.  Catch up total_burned.
+            self.supply.total_burned += delta
+            if self.db is not None:
+                self.db.set_supply_meta(
+                    "total_burned", self.supply.total_burned,
+                )
+            logger.warning(
+                "SUPPLY RECONCILIATION FIX at height %d: bumped "
+                "total_burned by %d to restore the scalar invariant "
+                "total_supply == GENESIS + total_minted - total_burned.  "
+                "Pre-fix: total_supply=%d, GENESIS+minted-burned=%d.",
+                block_height, delta, actual, expected,
+            )
+        elif delta < 0:
+            # Defensive: the rebase moved tokens INTO circulation
+            # (extremely unlikely given the realized mainnet
+            # trajectory, but the fork constants admit either sign).
+            # Catch up total_minted so the scalar invariant balances.
+            self.supply.total_minted += -delta
+            if self.db is not None:
+                self.db.set_supply_meta(
+                    "total_minted", self.supply.total_minted,
+                )
+            logger.warning(
+                "SUPPLY RECONCILIATION FIX at height %d: bumped "
+                "total_minted by %d to restore the scalar invariant "
+                "total_supply == GENESIS + total_minted - total_burned.  "
+                "Pre-fix: total_supply=%d, GENESIS+minted-burned=%d.",
+                block_height, -delta, actual, expected,
+            )
+        else:
+            # Already balanced -- e.g. devnet that never crossed the
+            # reconciliation height, or the rebase produced a zero-
+            # delta no-op.  Still flip the flag so a future re-apply
+            # at the same height is also a no-op.
+            logger.info(
+                "Supply reconciliation fix at height %d: scalar "
+                "invariant already balanced; no-op.",
+                block_height,
+            )
+        self.supply.supply_reconciliation_fix_applied = True
+
     def _apply_validator_registration_burn(
         self, stx, block_height: int,
     ) -> bool:
@@ -11833,6 +11943,21 @@ class Blockchain:
         # block from a grandfathered entity skips the burn cleanly.
         # Idempotent via ``grandfather_applied``.
         self._apply_registration_grandfather(block.header.block_number)
+
+        # Supply-reconciliation FIX (1.58.4 hard fork, one-shot at
+        # SUPPLY_RECONCILIATION_FIX_HEIGHT).  The 1.50.0 reconciliation
+        # rebased ``total_supply`` to match the bucket-sum invariant
+        # but forgot to bump ``total_burned`` by the same delta,
+        # leaving the SCALAR invariant ``total_supply == GENESIS_SUPPLY
+        # + total_minted - total_burned`` broken.  The end-of-apply
+        # scalar check at the bottom of this function tripped on the
+        # very next block and wedged the chain.  This fix establishes
+        # the scalar invariant BEFORE any block-N mutations run, so
+        # the rest of the apply path -- including the end-of-apply
+        # scalar check -- sees the corrected state.  No-op at every
+        # height except SUPPLY_RECONCILIATION_FIX_HEIGHT.  Idempotent
+        # via ``supply_reconciliation_fix_applied``.
+        self._apply_supply_reconciliation_fix(block.header.block_number)
 
         # Tier-47 dormancy controller (DORMANCY_CONTROLLER_HEIGHT):
         # one-shot backfill at the activation block + per-block
@@ -14993,6 +15118,17 @@ class Blockchain:
             "supply_reconciliation_applied": (
                 self.supply.supply_reconciliation_applied
             ),
+            # Supply reconciliation FIX (1.58.4 hard fork) — companion
+            # flag to ``supply_reconciliation_applied``.  Tracks the
+            # one-shot scalar-invariant repair at
+            # SUPPLY_RECONCILIATION_FIX_HEIGHT.  Reorg-safe rewind:
+            # a rolled-back fix block un-flips this flag so the
+            # canonical replay re-fires; the accompanying
+            # total_burned (or total_minted) rewind is captured by
+            # the standard supply snapshot above.
+            "supply_reconciliation_fix_applied": (
+                self.supply.supply_reconciliation_fix_applied
+            ),
             # Validator-registration burn (hard fork): per-entity set of
             # entity_ids that have paid the one-time burn, plus the
             # one-shot grandfather-applied flag.  Reorg-safe rewind —
@@ -15389,6 +15525,13 @@ class Blockchain:
         # applied above.
         self.supply.supply_reconciliation_applied = snapshot.get(
             "supply_reconciliation_applied", False,
+        )
+        # Supply-reconciliation FIX flag (1.58.4) — default False so
+        # older snapshots restore cleanly with the corrective bump
+        # not yet applied.  Same reorg-safety contract as
+        # supply_reconciliation_applied above.
+        self.supply.supply_reconciliation_fix_applied = snapshot.get(
+            "supply_reconciliation_fix_applied", False,
         )
         # Validator-registration burn tracking.  Defaults match the
         # __init__ state so pre-fork snapshots restore to a pristine
