@@ -4,6 +4,145 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.1] — 2026-05-06
+
+Patch release.  Audit round 23 top-3 ships, all bugfixes -- one
+mainnet-imminent issuance-cliff fix gated to land before Tier 47
+activates (height 1710), one censorship-resistance unit-mismatch
+that was silently disabling the Tier-34 forced-inclusion gate's
+slash-evidence trail on every block, and one CLI smart-default that
+closes the README's exact "Run a validator" walkthrough getting
+stuck on a 24-word getpass under sudo.  No new tier, no new wire
+format, no new CLI surface.
+
+### Fixed
+
+  * **Tier 47 dormancy controller would mint exactly 0 tokens/block
+    at activation -- mainnet validators about to drop to fees-only
+    income at floor era.**  ``compute_dormancy_issuance`` calls
+    ``compute_active_supply`` and computes ``gap = TARGET - active``;
+    pre-fix every active balance summed in, including the treasury's
+    40M.  Mainnet allocates exactly 100M to the founder + 40M to
+    ``TREASURY_ENTITY_ID`` = ``GENESIS_SUPPLY=140M`` =
+    ``DORMANCY_TARGET_ACTIVE_SUPPLY``.  At Tier 47 activation
+    (height 1710) the one-shot backfill in
+    ``_apply_dormancy_active_bumps`` stamps every entity (founder
+    AND treasury) active, ``compute_active_supply`` returned
+    ``140M = TARGET``, ``gap = 0``, controller minted 0/block --
+    and stayed at 0 for ~25 years (until the dormancy window
+    expired) because the treasury's perpetual existence guarantees
+    it never goes ``DORMANCY_WINDOW_BLOCKS`` without the existence
+    of an entity.  At mainnet's pre-revenue scale (base_fee at
+    ``MARKET_FEE_FLOOR=1`` on a quiet chain), this dropped
+    validators from the legacy ``BLOCK_REWARD_FLOOR=4`` (~210K
+    tokens/yr from issuance) to zero from issuance + zero from
+    fees -- net negative operator P&L against any non-trivial
+    hosting cost, and a shrinking validator set where the
+    censorship-resistance anchor explicitly relies on having more.
+    Tier 47 had not yet activated on mainnet (tip ~1640 vs height
+    1710), so the constant-shape change was safe in place per the
+    in-source comment at ``config.py:3185`` -- no historical
+    block-replay output changes.
+
+    Fix: skip ``TREASURY_ENTITY_ID`` in both the balances and
+    staked loops of ``compute_active_supply``.  CLAUDE.md anchors
+    active supply on holders whose
+    "stake/attestation/proposal activity counts as active without
+    a transfer" -- the treasury produces none of those signals;
+    treating it as max-active forever was a definitional miss.
+    After the fix, mainnet's 100M founder + 40M treasury becomes
+    100M active, gap = 40M, controller mints proportionally
+    (capped at ``DORMANCY_MAX_ISSUANCE_PER_BLOCK=500`` per block).
+    The activation backfill at ``blockchain.py:11151-11168`` is
+    left alone (it stamps every entity including treasury, but
+    treasury's stamp is now ignored by ``compute_active_supply``;
+    mirroring the unused stamp is harmless).  4 new tests in
+    ``tests/test_dormancy_controller_tier47.py``.  Surfaced by
+    audit r23 top-3 #1.  (12a217f)
+
+  * **Forced-inclusion byte cap mismatched the byte axis it gates
+    -- a single colluding proposer could suppress any high-fpb tx
+    today.**  The Tier 34 multi-list path summed
+    ``_stored_bytes_of(tx) = len(tx.to_bytes())`` (stored bytes,
+    matching the mempool's fee-per-byte ranking axis) into
+    ``used_bytes`` but compared the running total against
+    ``MAX_BLOCK_MESSAGE_BYTES = 45_000`` -- the *payload* cap, the
+    cap the block-level validator at
+    ``blockchain.validate_block`` enforces against
+    ``sum(len(tx.message))``.  A WOTS+ ``MessageTransaction``
+    with a 9-byte payload serializes to ~2_300 stored bytes
+    (~256x amplification, dominated by the WOTS+ signature +
+    auth path).  ~20 such txs sum to ~46 KB stored -- over the 45
+    KB cap reference -- while their payload sum is ~180 B, miles
+    inside both the payload cap and the Tier 18 unified
+    stored-byte cap (``MAX_BLOCK_TOTAL_BYTES = 200_000``).  A
+    colluding proposer who fills the block with their own
+    witness-heavy small-payload messages drives ``used_bytes``
+    past 45 KB while the block remains fully valid at the
+    validator level -- and the gate excused ANY forced tx as
+    "byte budget exhausted".  CLAUDE.md anchors collective
+    censorship resistance on the property that a tx paying at
+    least the per-byte floor "cannot be suppressed by anything
+    weaker than a full validator-set majority actively colluding"
+    -- pre-fix the suppression took exactly one proposer, with
+    no risk surface.  Tier 34 activated at height 1498; the bug
+    has been live on mainnet since.
+
+    Fix: when the multi-list (post-Tier-34) path is taken,
+    compare the stored-byte running total against
+    ``MAX_BLOCK_TOTAL_BYTES`` -- the unified Tier 18 cap that
+    actually bounds stored bytes at the validator level.  The
+    legacy pre-Tier-34 path is byte-identical (it sums
+    ``len(tx.message)`` and is correctly bounded by
+    ``MAX_BLOCK_MESSAGE_BYTES``).  A second regression test pins
+    that excuse #1 still fires when stored bytes genuinely
+    exhaust ``MAX_BLOCK_TOTAL_BYTES`` -- the fix tightens the
+    rule, it does not delete it.  Soft-fix: attester-side check
+    only, no consensus rule change at the block validator;
+    two-validator coordinated upgrade.  2 new tests in
+    ``tests/test_forced_inclusion_all_tx_kinds.py``.  Surfaced
+    by audit r23 top-3 #2.  (a7f582f)
+
+  * **``_resolve_private_key`` now auto-picks up a keyfile from
+    ``onboard.toml`` (or ``default_keyfile()``) rather than
+    re-prompting the 24-word phrase on every signing command.**
+    Pre-fix every signing command (``send`` / ``transfer`` /
+    ``stake`` / ``unstake`` / ``react`` / ``propose`` / ``vote``
+    / ``rotate-key`` / ...) honoured ``args.keyfile`` and
+    otherwise fell straight through to ``_collect_private_key``
+    -- an interactive ``getpass`` for the 24-word recovery
+    phrase.  README's literal "Run a validator" walkthrough
+    (``sudo -u messagechain messagechain stake --amount 200``)
+    therefore prompted for a phrase under ``sudo`` (env stripped)
+    over piped stdin (gcloud compute ssh + sudo) -- a fragile
+    path that operators routinely abandoned, or worse, that
+    leaked the phrase into shell history when typed at a
+    non-TTY-isolated prompt.  Twin in shape with the 1.57.3
+    signing-cmd ``data_dir`` auto-fallback (commit 27853bf):
+    same defect class (smart-default-coverage gap on the same
+    set of signing commands), opposite axis.  Anchored in
+    CLAUDE.md "Smart-defaults coverage" (Principle #3,
+    Simplicity) and "Honest operators are insured against
+    accidents."
+
+    Fix in ``_resolve_private_key``.  Resolution order: (1)
+    ``args.keyfile`` (explicit ``--keyfile``, always wins), (2)
+    ``onboard.toml.keyfile`` if the file exists, (3)
+    ``default_keyfile()`` (``/etc/messagechain/keyfile`` for
+    root, ``~/.messagechain/keyfile`` for user) if THAT file
+    exists, (4) interactive prompt -- unchanged for personal-
+    wallet users who haven't opted into a keyfile.  When
+    auto-pickup fires, prints one line naming the source so the
+    operator sees where the secret came from.  Auto-picked path
+    that fails to load (stale onboard.toml entry pointing at a
+    moved file) degrades silently to the prompt; explicit
+    ``--keyfile`` that fails to load still hard-errors as
+    before.  raw-hex format detection from ``data_dir``-set is
+    preserved (validator keyfiles are written in raw 64-hex by
+    the daemon).  6 new tests in
+    ``tests/test_signing_cmd_keyfile_fallback.py``.  Surfaced
+    by audit r23 top-3 #3.  (06ebde4)
+
 ## [1.58.0] — 2026-05-06
 
 Minor release.  Audit round 22 top-3 ships: Tier 51 (AMBIGUOUS slash
