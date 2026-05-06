@@ -5057,7 +5057,16 @@ class Server(SharedRuntimeMixin):
             return
 
         def _is_includable(tx) -> bool:
-            ok, _reason = self.blockchain.validate_transaction(tx)
+            # Twin of the per-kind dispatcher wiring at
+            # messagechain/network/node.py:1642-1644 (audit r25 #1).
+            # Bare validate_transaction is hard-coded to
+            # MessageTransaction semantics and returns False for every
+            # non-message forced tx kind — Tier 34/43 brought
+            # Transfer / Vote / Proposal / KeyRotation /
+            # SetAuthorityKey / CensorshipEvidence /
+            # NonResponseEvidence / Slash under this gate, and a
+            # message-only oracle silently excuses their omission.
+            ok, _reason = self.blockchain.validate_forced_includable_tx(tx)
             return ok
 
         att = attest_block_if_allowed(
