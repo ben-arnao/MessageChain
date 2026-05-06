@@ -4,6 +4,111 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.0] — 2026-05-06
+
+Minor release.  Audit round 22 top-3 ships: Tier 51 (AMBIGUOUS slash
+severity cap, hard fork at height 1850) + the 9th of the recurring
+chaindb mirror-leak class (four sibling tables in one batch) + a
+guides correction on the headline anti-spam pitch.
+
+### Added
+
+  * **Tier 51 -- AMBIGUOUS slash severity cap (hard fork, activation
+    height 1850).**  Pre-Tier-51 the AMBIGUOUS path produced
+    escalation-driven severity ``sev = base × (1 + REPEAT_MULTIPLIER
+    × prior) × relief`` with ``BASE=5``, ``REPEAT_MULTIPLIER=2``, and
+    a relief floor of 1/5.  On a long-tenured operator at
+    ``track=200``, ``prior=5`` lands at ``5 × 11 × 0.5 = 27%``; at
+    ``prior=10`` -> ``52%``; at very high tenure the relief floor
+    pins at 0.2 so a ``prior=20`` veteran still gets ``5 × 41 ×
+    0.2 = 41%``.  21--52% on AMBIGUOUS (restart-shape) evidence does
+    NOT pass the CLAUDE.md "Honest operators are insured against
+    accidents" anchor's "small fraction of stake, not a wipe" bar --
+    the math turns the anchor inside out for exactly the long-
+    tenured / high-volume class it's named to protect.  Tier 51
+    clamps the AMBIGUOUS-path output to
+    ``HONESTY_CURVE_AMBIGUOUS_MAX_PCT = 10`` (2× SOFT_SLASH_PCT,
+    firmly in "small fraction" territory while still producing a
+    real deterrent against repeat hiccups -- 5 events compound to
+    ~40% lost over time).  Cap binds AFTER escalation + relief but
+    BEFORE the global [MIN_PCT, 100] clamp.  UNAMBIGUOUS path is
+    unchanged -- the deliberate-Byzantine bar (50%+ first / 100%
+    repeat) still applies, because the anchor explicitly carves out
+    "Catastrophic slashes are reserved for unambiguous, intentional
+    protocol violations."  Pre-fork heights replay byte-identically
+    because every historical AMBIGUOUS slash was applied uncapped --
+    only post-fork high-prior + relief-erosion cases see the cap
+    bind.  Activation height 1850 sits above Tier 50 (height 1800)
+    with ~50 blocks ≈ 8.3h cohort spacing at 600s blocks; current
+    tip ~1593+ gives ~257 blocks ≈ 43h of runway.  8 new regression
+    tests in ``tests/test_honesty_curve_ambiguous_cap_tier51.py``.
+    Surfaced by audit r22 top-3 #2.  (faaf9e8)
+
+### Fixed
+
+  * **Four more chaindb mirror tables leak orphan rows on the
+    successful-reorg path (9th of recurring class).**
+    ``proposer_sig_counts``, ``slash_offense_counts``,
+    ``reputation``, and ``key_rotation_last_height`` all eagerly
+    mirror to chaindb on write but the
+    ``_persist_state(full_flush=True)`` post-replay path only does
+    dirty-only INSERT-OR-REPLACE upserts -- losing-fork rows for
+    entity_ids absent from canonical replay survive on disk.  Cold
+    restart of any node that processed the losing fork rehydrates
+    the orphans into consensus-deterministic state and silently
+    forks vs. the warm cluster: ``proposer_sig_counts`` (attester-
+    weight + slashing_severity good-history) -> divergent attester
+    selection or slash severity; ``slash_offense_counts`` (repeat-
+    offense escalation) -> divergent slash_pct -> state_root
+    mismatch at the next slash; ``reputation`` (lottery winner +
+    good-history) -> different lottery winner OR slash_pct;
+    ``key_rotation_last_height`` (rotation cooldown gate) -> cold-
+    restarted node rejects a valid KeyRotation tx warm peers
+    accept (note: ``restore_state_snapshot`` already wipes this
+    table on the FAILED-reorg rollback path; the SUCCESSFUL-reorg
+    twin was open).  Same defect class as the eight prior mirror-
+    leak fixes (round-2 ``entity_id_to_index``, round-4
+    ``key_rotation_last_height`` save/restore, round-7
+    ``receipt_subtree_roots``, round-12 ``reaction_choices``,
+    round-13 successful-reorg twin, round-14 ``entity_last_active``
+    for Tier-47, round-15 ``pending_censorship_evidence``,
+    round-21 ``key_rotation_counts``).  Fix mirrors the established
+    pattern exactly: four new ``clear_all_*`` chaindb helpers,
+    each gated behind ``hasattr`` in ``_persist_state`` for legacy
+    chain.db compat; full-flush calls ``clear_all_*`` BEFORE the
+    upsert pass and re-emits the entire in-memory dict (not just
+    dirty entries).  ``restore_state_snapshot`` (FAILED-reorg
+    rollback) is unchanged -- all four tables already wired there
+    in earlier rounds.  New
+    ``tests/test_mirror_leaks_reorg_roundtrip_r22.py`` (8 tests).
+    Surfaced by audit r22 top-3 #1.  (c720b36)
+
+### Changed
+
+  * **Guides corrected: the chain's flat per-tx admission floor is
+    1 token, not 1,000.**  ``guides/fees.md``, ``guides/ai-spam.md``,
+    ``guides/anti-bloat.md``, and ``guides/stable-money.md``
+    asserted a "1,000-token flat per-tx admission floor" as the
+    anchored anti-spam mechanism.  Live floor is
+    ``MARKET_FEE_FLOOR = 1`` (Tier-16 for messages since height 623;
+    Tier-49 unifying transfer/stake/unstake/react at the same value
+    post-1750).  The 1,000 number is the LEGACY ``MIN_FEE_POST_FLAT``
+    constant retired in favor of MARKET_FEE_FLOOR=1 -- it survives
+    only as a config historical reference.  AI-spam-refugees are a
+    named target persona (CLAUDE.md "Mission"); these guides build
+    their mental model of the chain's spam economics, and a 1000×
+    discrepancy on first verification collapses trust on the
+    headline pitch.  The pitch itself is real: 1-token floor +
+    EIP-1559 base fee + fee-per-byte ranking + per-block byte
+    budget DOES deliver spam discipline at any meaningful token
+    price.  Updated copy explains that composition rather than
+    asserting a fictional flat number.  Surcharges that ARE 1,000
+    tokens (NEW_ACCOUNT_FEE, KEY_ROTATION_FEE) remain correctly
+    documented; added a missing "Key-rotation surcharge" row to the
+    fees-summary table for completeness.  Docs-only -- no code,
+    no consensus rule, no hard fork, no test changes.  Surfaced by
+    audit r22 top-3 #3.  (03407eb)
+
 ## [1.57.3] — 2026-05-05
 
 Patch release.  Audit round 21 top-2 ships -- one chaindb mirror
