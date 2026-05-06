@@ -4,6 +4,115 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.4] — 2026-05-06
+
+Patch release / **mainnet recovery**.  Fixes a wedged-chain
+incident: both validators stalled at height 1709 with
+``ChainIntegrityError: Supply invariant broken at height 1709`` for
+~3 hours.  Tier 52 = ``SUPPLY_RECONCILIATION_FIX_HEIGHT = 1709``,
+activates inside the next block both validators apply post-upgrade.
+
+### Fixed
+
+  * **Mainnet wedged at block 1709 with broken scalar supply
+    invariant -- both validators stalled, no progress for hours.**
+    Diagnostic from the live chain.db: ``total_supply=59,512,707``
+    matches ``sum(balances)+sum(staked)``, ``total_burned=33,039,471``,
+    ``total_minted=47,161`` -> ``GENESIS+minted-burned=107,007,690``
+    -> deficit exactly **47,494,983**.
+
+    Root cause: ``Blockchain._apply_supply_reconciliation`` at the
+    1.50.0 ``SUPPLY_RECONCILIATION_HEIGHT`` (= 1708) rebased
+    ``total_supply`` to match the bucket-sum invariant
+    (``check_supply_conservation``: balances + staked +
+    pending_unstakes + treasury + scalar pools) but did NOT bump
+    ``total_burned`` by the same delta -- so the SCALAR invariant
+    ``total_supply == GENESIS_SUPPLY + total_minted - total_burned``
+    was left broken by exactly the rebase delta (-47,494,983 on
+    mainnet).
+
+    The scalar invariant fires at the END of every
+    ``_apply_block_state``.  At the activation block itself (1708)
+    the check ran BEFORE the reconciliation -- the rebase is called
+    from ``_append_block`` AFTER ``_apply_block_state`` returns --
+    so it passed.  The very NEXT block (1709) tripped the check
+    with ``ChainIntegrityError``, the apply rolled back, and the
+    chain wedged.  Existing 1.50.0 reconciliation tests covered
+    the BUCKET conservation invariant (which the rebase fixed) but
+    did NOT cover the SCALAR invariant (which the rebase broke),
+    so the bug shipped.
+
+    Fix: a new one-shot at
+    ``SUPPLY_RECONCILIATION_FIX_HEIGHT = 1709`` (Tier 52) that bumps
+    ``total_burned`` by the gap (or ``total_minted`` if the gap is
+    negative -- defensive, not expected on the realized mainnet
+    trajectory) to restore the scalar invariant.  Runs at the START
+    of ``_apply_block_state`` (alongside
+    ``_apply_registration_grandfather``) so the rest of the apply
+    path -- including the end-of-apply scalar check -- sees the
+    corrected state.  Idempotent via
+    ``supply_reconciliation_fix_applied``, snapshotted with the
+    supply state for reorg safety (same contract as
+    ``treasury_rebase_applied`` and
+    ``supply_reconciliation_applied``).
+
+    Why activate at 1709 specifically: that's the next block the
+    live mainnet validators are repeatedly failing to apply.  Any
+    LATER fix height would leave the chain wedged forever (it can't
+    advance to a future fix height when 1709 keeps tripping).  Any
+    EARLIER height would change past-block behavior for fresh-genesis
+    replay -- a consensus divergence we cannot accept.  1709 is
+    the unique correct activation height.
+
+    Why bump ``total_burned`` and not rebase ``total_supply``: the
+    bucket sums are the source of truth (every entity's balance is
+    in chain.db, every mint/burn between the 1.50.0 reconciliation
+    and this fix has updated balances correctly).  ``total_supply``
+    matches the bucket sums.  The discrepancy is purely in
+    ``total_burned`` not having been bumped at the rebase -- so
+    bumping ``total_burned`` to the right value is the minimal
+    correct repair, preserving both the scalar AND bucket invariants
+    going forward.
+
+    The buggy ``_apply_supply_reconciliation`` is left EXACTLY
+    as-is so fresh-genesis replay through block 1708 produces the
+    same on-chain state mainnet validators currently have at block
+    1708.  Block 1709's fix at apply-start is what makes both code
+    paths converge cleanly thereafter.
+
+    Mainnet recovery (operational, see ops runbook):
+
+      1. Both validators upgrade in place to 1.58.4.
+      2. Operator-side reset of the same-height-sign-guard at 1709
+         on each validator.  The persistent guard correctly refuses
+         to re-sign at 1709 because each validator already broadcast
+         a pre-fix block 1709 that no peer accepted; the guard
+         doesn't know that the prior signing was a no-op from the
+         chain's perspective.  The reset is the operator's
+         affirmative statement "I am about to sign at this height
+         again -- the prior block at this height never made it into
+         any peer's chain."
+      3. Slot timer fires for height 1709, the selected proposer
+         signs a fresh block 1709 with the fix applied at
+         apply-start; other validator applies it cleanly; chain
+         advances.
+      4. Subsequent blocks see the fix as a no-op via the
+         idempotent flag.  Tier 47 dormancy controller activates
+         at height 1710 as designed.
+
+    The "double-sign at 1709" risk during recovery is theoretical:
+    the pre-fix block 1709 signed by a validator before the wedge
+    was broadcast but no peer ever applied it (every peer also
+    tripped the scalar check); it does not exist in any peer's
+    chain.  On a 2-validator chain with both nodes operated by the
+    same person, no slashing actor exists.
+
+    5 new test classes in ``tests/test_supply_reconciliation_fix.py``
+    pin the fix: activation-height behavior, idempotency, bucket-
+    invariant preservation, snapshot round-trip of the new flag,
+    and validation of the activation-height constant itself.
+    (cacc45d)
+
 ## [1.58.3] — 2026-05-06
 
 Patch release.  Audit round 25 top-3 partial ships -- two bugfixes,
