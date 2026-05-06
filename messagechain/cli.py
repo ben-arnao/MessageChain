@@ -2267,27 +2267,83 @@ def _reserve_leaf_via_rpc(host, port, entity_id_hex):
 def _resolve_private_key(args=None):
     """Resolve the private key for a signing command.
 
-    If the user passed --keyfile on the command line (global flag),
-    read the key from that file.  Otherwise fall back to the
-    interactive prompt in `_collect_private_key`.
+    Resolution order:
+      1. ``args.keyfile`` (operator passed ``--keyfile`` explicitly).
+      2. ``onboard.toml.keyfile`` if the file exists.
+      3. ``default_keyfile()`` (``/etc/messagechain/keyfile`` for root,
+         ``~/.messagechain/keyfile`` for user) if THAT file exists.
+      4. Interactive prompt via ``_collect_private_key``.
 
     This is the single entry point for spending commands - putting the
-    branch here means every signing subcommand supports --keyfile for
-    free, enabling unattended/scripted operation.
+    branch here means every signing subcommand supports the auto-pickup
+    chain for free, enabling unattended/scripted operation without
+    requiring the operator to remember ``--keyfile`` on every invocation.
+
+    Anchored in CLAUDE.md "Smart-defaults coverage": when ``init`` has
+    written a keyfile and recorded its path in ``onboard.toml``, every
+    subsequent signing command should silently use that keyfile rather
+    than prompting for the 24-word recovery phrase under sudo (which is
+    fragile under piped stdin and routinely captured into shell
+    history when typed at a non-TTY-isolated prompt).  Explicit
+    ``--keyfile`` always wins; absence-of-onboard-file leaves the
+    interactive prompt path unchanged for personal-wallet users who
+    haven't opted into a keyfile.
     """
-    if args is not None and getattr(args, "keyfile", None):
-        # When --data-dir is set, the caller is co-resident with a
-        # daemon and the keyfile is almost certainly in daemon raw-hex
-        # format.  Opt into the 64-char parser so the CLI can sign
-        # with the SAME keyfile the validator unit is using, without
-        # needing a parallel checksummed copy of the operator key.
-        accept_raw = bool(getattr(args, "data_dir", None))
+    explicit_path = (
+        args.keyfile if args is not None and getattr(args, "keyfile", None)
+        else None
+    )
+    keyfile_path = explicit_path
+    auto_picked_from = ""
+
+    if keyfile_path is None:
+        # Best-effort auto-pickup.  Any failure here (corrupt
+        # onboard.toml, IO error, etc.) silently falls through to the
+        # interactive prompt - never crash the CLI on a malformed
+        # config that's adjacent to a signing command.
         try:
-            return _load_key_from_file(args.keyfile, accept_raw_hex=accept_raw)
-        except KeyFileError as e:
+            from messagechain.runtime import onboarding as _ob
+            try:
+                cfg = _ob.read_onboard_config()
+            except Exception:
+                cfg = {}
+            cfg_kf = cfg.get("keyfile") or ""
+            if cfg_kf and os.path.exists(cfg_kf):
+                keyfile_path = cfg_kf
+                auto_picked_from = "onboard.toml"
+            else:
+                default = _ob.default_keyfile()
+                if os.path.exists(default):
+                    keyfile_path = default
+                    auto_picked_from = "default keyfile"
+        except Exception:
+            pass
+
+    if keyfile_path is None:
+        return _collect_private_key()
+
+    # When --data-dir is set, the caller is co-resident with a
+    # daemon and the keyfile is almost certainly in daemon raw-hex
+    # format.  Opt into the 64-char parser so the CLI can sign
+    # with the SAME keyfile the validator unit is using, without
+    # needing a parallel checksummed copy of the operator key.
+    accept_raw = bool(getattr(args, "data_dir", None) if args is not None else False)
+    try:
+        key = _load_key_from_file(keyfile_path, accept_raw_hex=accept_raw)
+    except KeyFileError as e:
+        if explicit_path is not None:
+            # Explicit --keyfile that fails to load is a hard error -
+            # the operator asked for THIS file, not a fallback.
             print(f"Error: {e}")
             sys.exit(1)
-    return _collect_private_key()
+        # Auto-picked path that failed - degrade silently to prompt.
+        # The operator may have a stale onboard.toml entry pointing at
+        # a moved/deleted keyfile, and the right behavior is to fall
+        # through to the interactive prompt rather than refuse to sign.
+        return _collect_private_key()
+    if auto_picked_from and explicit_path is None:
+        print(f"Using keyfile from {auto_picked_from}: {keyfile_path}")
+    return key
 
 
 def _collect_private_key():

@@ -327,11 +327,12 @@ class TestByteBudgetExcuseStoredBytesAxis(unittest.TestCase):
     bind — i.e. against MAX_BLOCK_TOTAL_BYTES."""
 
     def setUp(self):
-        # Alice (the proposer in this test) signs ~20 txs in one
-        # subtest and ~90 in the other.  log2(90) ≈ 7 → 128 leaves.
-        # Bob signs once → tree_height=2 (4 leaves) is plenty.
+        # Alice signs ~20 txs (log2(21)=5 -> 32 leaves).  Bob signs
+        # once -> tree_height=2 is plenty.  The "really exhausts the
+        # cap" subtest uses mock fillers (no signing) so neither
+        # entity has to scale to 90+ sigs at production tree height.
         self.alice = Entity.create(
-            b"t34-bb-alice".ljust(32, b"\x00"), tree_height=7,
+            b"t34-bb-alice".ljust(32, b"\x00"), tree_height=5,
         )
         self.bob = Entity.create(
             b"t34-bb-bob".ljust(32, b"\x00"), tree_height=2,
@@ -399,39 +400,53 @@ class TestByteBudgetExcuseStoredBytesAxis(unittest.TestCase):
     def test_post_tier_34_byte_budget_excuse_still_fires_at_real_cap(self):
         # Inverse direction: when stored bytes really do overrun the
         # correct cap (MAX_BLOCK_TOTAL_BYTES), excuse #1 must still
-        # fire — the fix tightens the rule, it does not delete it.
-        # Construct a forced tx whose stored size exceeds whatever
-        # remaining stored bytes the block has after the proposer's
-        # own selection.
+        # fire - the fix tightens the rule, it does not delete it.
+        #
+        # Block fillers are mock objects (not real signed txs) so we
+        # don't have to scale Alice's WOTS+ tree to ~90 leaves.  The
+        # gate only reads tx.tx_hash, tx.to_bytes(), and the
+        # entity-id-style fields off block-side txs - it never
+        # verifies their signatures (that's the validate-block layer).
+        # Per the test-perf rule "Don't sign just to drain a counter":
+        # if the handler doesn't need a real signature, give it a stub.
         bob_forced = create_transaction(
             self.bob, "f", fee=10_000, nonce=0,
         )
         self.pool.add_transaction(bob_forced, arrival_block_height=0)
-        # Build a block whose stored-byte total is ~= MAX_BLOCK_TOTAL_BYTES
-        # by stuffing many message txs.  ~2300 B/tx × 90 ≈ 207 KB,
-        # comfortably over 200 KB.
-        alice_block_txs = [
-            create_transaction(
-                self.alice, f"x{n:03d}",
-                fee=200, nonce=n,
-            )
-            for n in range(90)
-        ]
         from messagechain.config import MAX_BLOCK_TOTAL_BYTES
-        stored_total = sum(len(t.to_bytes()) for t in alice_block_txs)
+
+        class _BulkMockTx:
+            __slots__ = ("tx_hash", "_blob", "entity_id", "fee", "message")
+            def __init__(self, idx, target_bytes, entity_id):
+                self.tx_hash = (b"M" + idx.to_bytes(8, "big")).ljust(32, b"\x00")
+                self._blob = b"\x00" * target_bytes
+                self.entity_id = entity_id
+                self.fee = 100
+                self.message = b""
+            def to_bytes(self):
+                return self._blob
+
+        # Six 35 KB stubs sum to 210 KB, over MAX_BLOCK_TOTAL_BYTES = 200 KB.
+        per_tx_bytes = 35_000
+        n_txs = (MAX_BLOCK_TOTAL_BYTES // per_tx_bytes) + 1
+        bulk_txs = [
+            _BulkMockTx(i, per_tx_bytes, self.alice.entity_id)
+            for i in range(n_txs)
+        ]
+        stored_total = sum(len(t.to_bytes()) for t in bulk_txs)
         self.assertGreater(
             stored_total, MAX_BLOCK_TOTAL_BYTES,
-            "test setup expects Alice's stored-byte total to actually "
-            "exhaust the unified Tier-18 budget so excuse #1 has a real "
-            "constraint to invoke.",
+            "test setup expects bulk fillers' stored-byte total to "
+            "actually exhaust the unified Tier-18 budget so excuse #1 "
+            "has a real constraint to invoke.",
         )
-        block = _FakeBlock(message_txs=alice_block_txs)
+        block = _FakeBlock(message_txs=bulk_txs)
         h = POST_T34 + 5
         ok, _reason = check_forced_inclusion(block, self.pool, h)
         self.assertTrue(
             ok,
             "When stored bytes really do exhaust MAX_BLOCK_TOTAL_BYTES, "
-            "excuse #1 must fire — otherwise the proposer is being "
+            "excuse #1 must fire - otherwise the proposer is being "
             "punished for a real space constraint.",
         )
 
