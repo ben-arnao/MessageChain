@@ -154,6 +154,74 @@ class TestComputeActiveSupply(unittest.TestCase):
         self.assertEqual(s.compute_active_supply(h), 10_000)
 
 
+# ───────── 2b. Treasury is excluded from active_supply ─────────────
+
+class TestTreasuryExcludedFromActiveSupply(unittest.TestCase):
+    """Treasury balance is governance state, not a live economic user.
+
+    Without the exclusion, founder (100M) + treasury (40M) = exactly
+    GENESIS_SUPPLY = DORMANCY_TARGET_ACTIVE_SUPPLY (140M), so at Tier-47
+    activation the controller computes gap=0 and mints zero — for ~25
+    years (until the dormancy window expires).  Excluding treasury
+    pulls active_supply to 100M (founder only), gap=40M, and the
+    controller mints at the configured per-block rate.
+
+    Anchor: CLAUDE.md "stake/attestation/proposal activity counts as
+    active without a transfer" — treasury never produces any of those
+    signals, so absent this skip it would forever be max-weighted and
+    the gap would never close.
+    """
+
+    def setUp(self):
+        from messagechain.config import TREASURY_ENTITY_ID
+        self.TREASURY = TREASURY_ENTITY_ID
+        self.s = SupplyTracker()
+        self.h = DORMANCY_CONTROLLER_HEIGHT + 100
+
+    def test_treasury_balance_excluded_from_active_supply(self):
+        # Treasury alone, just-bumped → would be 40M without exclusion.
+        self.s.balances = {self.TREASURY: 40_000_000}
+        self.s.bump_active(self.TREASURY, self.h)
+        self.assertEqual(self.s.compute_active_supply(self.h), 0)
+
+    def test_treasury_staked_excluded_from_active_supply(self):
+        # Defensive: treasury never stakes today, but if a future
+        # governance lever moved tokens into staked under the same
+        # entity_id, the exclusion must hold there too.
+        self.s.balances = {}
+        self.s.staked = {self.TREASURY: 40_000_000}
+        self.s.bump_active(self.TREASURY, self.h)
+        self.assertEqual(self.s.compute_active_supply(self.h), 0)
+
+    def test_founder_plus_treasury_at_target_still_yields_gap(self):
+        # The exact mainnet shape at Tier-47 activation: founder=100M,
+        # treasury=40M, sum=GENESIS_SUPPLY=TARGET.  Without the fix,
+        # gap=0 and controller mints 0.  With the fix, treasury drops
+        # out, active_supply=100M, gap=40M, controller mints non-zero.
+        founder = b"F" * 32
+        self.s.balances = {founder: 100_000_000, self.TREASURY: 40_000_000}
+        self.s.bump_active(founder, self.h)
+        self.s.bump_active(self.TREASURY, self.h)
+        active = self.s.compute_active_supply(self.h)
+        self.assertEqual(active, 100_000_000)
+        gap = DORMANCY_TARGET_ACTIVE_SUPPLY - active
+        self.assertEqual(gap, 40_000_000)
+        # Controller must mint a positive amount, not zero.
+        issuance = self.s.compute_dormancy_issuance(self.h)
+        self.assertGreater(issuance, 0)
+        # And it should be capped at the per-block ceiling.
+        self.assertLessEqual(issuance, DORMANCY_MAX_ISSUANCE_PER_BLOCK)
+
+    def test_treasury_excluded_alongside_other_holders(self):
+        # Mixed: a regular holder + treasury, both active.  Active supply
+        # must equal the regular holder's balance only.
+        a = b"A" * 32
+        self.s.balances = {a: 5_000_000, self.TREASURY: 40_000_000}
+        self.s.bump_active(a, self.h)
+        self.s.bump_active(self.TREASURY, self.h)
+        self.assertEqual(self.s.compute_active_supply(self.h), 5_000_000)
+
+
 # ───────── 3. Controller output ────────────────────────────────────
 
 class TestDormancyController(unittest.TestCase):

@@ -740,8 +740,25 @@ class SupplyTracker:
         # Sum spendable + staked: staked balances are real tokens
         # that should count toward active_supply when their owner is
         # active.  See _treat_stake_as_active rationale in CLAUDE.md.
+        #
+        # TREASURY_ENTITY_ID is excluded: the treasury is governance
+        # state, not a live economic user.  CLAUDE.md anchors active
+        # supply on holders whose "stake/attestation/proposal activity
+        # counts as active without a transfer" — the treasury produces
+        # none of those signals, so absent this skip its 40M balance
+        # would forever be max-weighted (the activation backfill stamps
+        # it active at fork height, and the only thing that demotes a
+        # stamped entity is going DORMANCY_WINDOW_BLOCKS without any
+        # activity, which the treasury's perpetual existence guarantees
+        # never happens).  At mainnet's exact founder=100M + treasury=40M
+        # = GENESIS_SUPPLY = DORMANCY_TARGET_ACTIVE_SUPPLY shape, that
+        # would peg gap=0 and force the controller to mint 0/block for
+        # ~25 years post-Tier-47 activation, breaking the validator-
+        # profitability and stable-active-supply anchors simultaneously.
         for eid, balance in self.balances.items():
             if balance <= 0:
+                continue
+            if eid == TREASURY_ENTITY_ID:
                 continue
             last_active = self.last_active_heights.get(eid, 0)
             age = current_height - last_active
@@ -754,6 +771,8 @@ class SupplyTracker:
                 total += (balance * weight_bps) // 10_000
         for eid, staked in self.staked.items():
             if staked <= 0:
+                continue
+            if eid == TREASURY_ENTITY_ID:
                 continue
             last_active = self.last_active_heights.get(eid, 0)
             age = current_height - last_active
