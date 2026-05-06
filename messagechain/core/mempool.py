@@ -605,16 +605,33 @@ class Mempool:
             _stored_bytes(new_tx, cache=self._stored_bytes)
             return True
 
-    def get_fee_estimate(self, message_bytes: int = 0) -> int:
+    def get_fee_estimate(
+        self, message_bytes: int = 0, *, target_blocks: int = 3,
+    ) -> int:
         """Estimate the absolute fee to bid for inclusion of a tx of given size.
 
-        Computed as `median(fee/len(message))` across pending txs (the
-        same density axis selection ranks on), multiplied by
-        ``message_bytes``, floored at ``MARKET_FEE_FLOOR``.  The shape
-        matches the original estimator (median across pending) but is
-        expressed in fee-per-byte so a wallet bidding this fee on a
-        1024-byte message pays proportionally more than on a 100-byte
-        message — matching the proposer's selection priority.
+        Walks the pending pool's fee-per-byte densities (the same axis
+        the proposer ranks on for selection) and returns
+        ``percentile_density × message_bytes``, floored at
+        ``MARKET_FEE_FLOOR``.  ``target_blocks`` selects the percentile
+        rung — the same ladder the FeeEstimator's recent-blocks path
+        uses, so the wallet's auto-fee `urgency` knob produces the same
+        shape regardless of which estimator backs the quote:
+
+            target_blocks=1   → 90th percentile (high urgency)
+            target_blocks=2-3 → 75th percentile (normal, default)
+            target_blocks=4-5 → 60th percentile
+            target_blocks=6-10→ 25th percentile
+            target_blocks≥11  → 10th percentile (low urgency)
+
+        Audit r25 #3 — pre-fix this method's signature was
+        ``(self, message_bytes=0)`` (no ``target_blocks``).  The server-
+        side auto-fee call wrapped its invocation in ``try/except
+        TypeError`` and silently fell back to the median (50th
+        percentile) on every quote, so the urgency knob was echoed in
+        the result for display but never bound on the bid.  Adding the
+        kwarg here closes the silent regression — every urgency level
+        now produces a distinct bid, as the wallet UX promises.
 
         Empty mempool → returns ``MARKET_FEE_FLOOR`` (no demand signal,
         the cheapest valid fee).  ``message_bytes <= 0`` (legacy callers
@@ -629,8 +646,25 @@ class Mempool:
                 _fee_per_byte(tx, cache=self._stored_bytes)
                 for tx in self.pending.values()
             )
-            median_density = densities[len(densities) // 2]
-            estimate = int(median_density * message_bytes)
+            # Percentile ladder mirrors FeeEstimator (recent-blocks
+            # path) so the same target_blocks rung returns the same
+            # shape from either estimator.  The unified ladder is what
+            # makes the auto-fee urgency knob coherent across mempool-
+            # demand-driven (this path) and historical-block-driven
+            # (FeeEstimator) modes.
+            if target_blocks <= 1:
+                percentile = 0.90
+            elif target_blocks <= 3:
+                percentile = 0.75
+            elif target_blocks <= 5:
+                percentile = 0.60
+            elif target_blocks <= 10:
+                percentile = 0.25
+            else:
+                percentile = 0.10
+            idx = min(int(len(densities) * percentile), len(densities) - 1)
+            density = densities[idx]
+            estimate = int(density * message_bytes)
             return max(MARKET_FEE_FLOOR, estimate)
 
     # save_to_file / load_from_file exist so operator tooling (and our

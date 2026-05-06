@@ -3384,15 +3384,17 @@ class Server(SharedRuntimeMixin):
         # quoted."  When the mempool is empty the helper returns the
         # floor and the type-specific min_fee binds.
         quoting_bytes = stored_bytes if stored_bytes > 0 else message_bytes
-        try:
-            mempool_fee = self.mempool.get_fee_estimate(
-                message_bytes=quoting_bytes, target_blocks=target_blocks,
-            )
-        except TypeError:
-            # Older mempool implementations without target_blocks.
-            mempool_fee = self.mempool.get_fee_estimate(
-                message_bytes=quoting_bytes,
-            )
+        # Audit r25 #3: ``Mempool.get_fee_estimate`` now declares
+        # ``target_blocks`` as a kw-only arg, so the legacy
+        # ``try/except TypeError`` fallback that silently pinned the
+        # quote to the median (50th percentile) on every call is no
+        # longer needed.  Removing the fallback closes the silent
+        # regression and ensures any future signature drift surfaces
+        # as a real test/lint failure rather than re-disabling the
+        # urgency knob.
+        mempool_fee = self.mempool.get_fee_estimate(
+            message_bytes=quoting_bytes, target_blocks=target_blocks,
+        )
 
         recommended = max(int(min_fee), int(mempool_fee))
         fee_per_byte = (
