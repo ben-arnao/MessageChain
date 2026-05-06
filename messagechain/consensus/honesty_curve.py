@@ -281,6 +281,8 @@ def slashing_severity(
     """
     from messagechain.config import (
         HONESTY_CURVE_AMBIGUOUS_BASE_PCT,
+        HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT,
+        HONESTY_CURVE_AMBIGUOUS_MAX_PCT,
         HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER,
         HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD,
         HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN,
@@ -374,6 +376,18 @@ def slashing_severity(
     # replayer agrees on the same integer regardless of float
     # implementation, intermediate rounding, or platform.
     sev_int = (base * escalation * relief_num) // relief_den
+
+    # Tier 51 — AMBIGUOUS-path cap.  Even after escalation + relief, an
+    # AMBIGUOUS slash MUST stay "small fractional" per the CLAUDE.md
+    # honest-operator-insurance anchor.  Pre-Tier-51 the formula could
+    # produce 21–52% on long-tenured operators with a few priors; the
+    # cap binds at HONESTY_CURVE_AMBIGUOUS_MAX_PCT (= 10) so a
+    # restart-shape evidence pattern can never compound to a wipeout.
+    # UNAMBIGUOUS path is untouched (the deliberate-Byzantine bar
+    # stands).  Pre-fork: byte-identical legacy behavior.
+    if current_height >= HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT:
+        sev_int = min(sev_int, HONESTY_CURVE_AMBIGUOUS_MAX_PCT)
+
     return _clamp_pct(sev_int, HONESTY_CURVE_MIN_PCT, 100)
 
 

@@ -4308,6 +4308,48 @@ HONESTY_CURVE_ATTEST_WEIGHT = 1
 # half-stake.
 HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT = 50
 
+# Tier 51 — AMBIGUOUS slash severity ceiling.
+#
+# The CLAUDE.md "Honest operators are insured against accidents" anchor
+# requires that "when an honest node IS slashed (transient evidence
+# collision, recoverable misconfig), the burn is a small fraction of
+# stake, not a wipe."  Pre-Tier-51 the AMBIGUOUS path produces
+# escalation-driven severity:
+#
+#   sev = base × (1 + REPEAT_MULTIPLIER × prior) × relief
+#
+# At ``BASE=5``, ``REPEAT_MULTIPLIER=2``, ``HONEST_TRACK_FLOOR=1/5``,
+# a long-tenured operator at ``track=200`` and ``prior=5`` lands at
+# ``5 × 11 × 0.5 = 27%``; at ``prior=10`` -> ``52%``; at very high
+# tenure the relief floor pins at 0.2 so a ``prior=20`` veteran still
+# gets ``5 × 41 × 0.2 = 41%``.  21--52% on AMBIGUOUS (restart-shape)
+# evidence does NOT pass the "small fractional" bar, exactly inverting
+# the anchor for the long-tenured / high-volume class it names.
+#
+# Tier 51 bounds the AMBIGUOUS-path output at
+# ``HONESTY_CURVE_AMBIGUOUS_MAX_PCT`` (= 10, 2× SOFT_SLASH_PCT) at and
+# above ``HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT``.  10% is firmly in
+# "small fraction" territory while still producing a real deterrent
+# against repeat hiccups (5 events compound to ~40% lost over time).
+# Pre-fork heights replay byte-identically.  UNAMBIGUOUS path is
+# unchanged -- the deliberate-Byzantine bar (UNAMBIGUOUS_FIRST_PCT on
+# first offense, 100% on any repeat) still applies, because the anchor
+# explicitly carves out "Catastrophic slashes are reserved for
+# unambiguous, intentional protocol violations."
+HONESTY_CURVE_AMBIGUOUS_MAX_PCT = 10
+
+assert HONESTY_CURVE_AMBIGUOUS_MAX_PCT >= HONESTY_CURVE_AMBIGUOUS_BASE_PCT, (
+    "HONESTY_CURVE_AMBIGUOUS_MAX_PCT must be at least BASE_PCT — a cap "
+    "below the baseline would force first-offense AMBIGUOUS slashes "
+    "BELOW the soft-slash floor, breaking the ratchet from the legacy "
+    "Tier 20 semantics"
+)
+assert HONESTY_CURVE_AMBIGUOUS_MAX_PCT <= HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT, (
+    "HONESTY_CURVE_AMBIGUOUS_MAX_PCT must be at most UNAMBIGUOUS_FIRST_PCT "
+    "— deliberate Byzantine evidence cannot be slashed less than an "
+    "accidental one for the same offender"
+)
+
 # Restart-drift tolerance: two block headers whose timestamps differ
 # by ≤ this many seconds and whose only signable_data difference is
 # merkle_root (and timestamp) are classified AMBIGUOUS.  Beyond this,
@@ -5886,6 +5928,32 @@ assert VOTER_REWARD_INCLUSIVE_HEIGHT > VOTER_REWARD_HEIGHT, (
     "VOTER_REWARD_INCLUSIVE_HEIGHT must follow Tier 22 — the legacy "
     "yes-only path must remain reachable for historical proposals "
     "closing pre-Tier-50"
+)
+
+# Tier 51 — AMBIGUOUS slash severity cap (hard fork)
+#
+# Bounds AMBIGUOUS-path output at HONESTY_CURVE_AMBIGUOUS_MAX_PCT.
+# See the constants block above for the math, motivation, and
+# CLAUDE.md anchor (honest-operator insurance).  UNAMBIGUOUS path is
+# unchanged.
+#
+# Activation height 1850 sits above Tier 50 (VOTER_REWARD_INCLUSIVE_
+# HEIGHT = 1800) with ~50 blocks ≈ 8.3h cohort spacing at 600s blocks.
+# Two-validator network, both operator-controlled, so the cutover is
+# coordinated and the runway bound is operational rather than the
+# multi-week external-validator notice the band was originally sized
+# for.  Pre-fork blocks replay byte-identically because the cap only
+# REDUCES severity, and every historical AMBIGUOUS slash on chain was
+# applied uncapped — the verifier admits the same slash_pct it
+# admitted before.  Only post-fork high-prior + relief-erosion cases
+# see the cap bind.
+HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT = 1850  # Tier 51
+
+assert HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT > VOTER_REWARD_INCLUSIVE_HEIGHT, (
+    "HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT must follow Tier 50 — operators "
+    "upgrade through Tier 50 before this consensus-rule change binds, "
+    "and the cohort spacing keeps two consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
 )
 
 
