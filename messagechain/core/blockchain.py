@@ -1734,6 +1734,35 @@ class Blockchain:
                 for eid in revoked_iter:
                     self.db.set_revoked(eid)
             if hasattr(self.db, 'set_key_rotation_count'):
+                # Mirror-leak guard (same defect class as round-13's
+                # ``clear_all_reaction_choices`` for the successful-reorg
+                # twin of the round-12 reaction_choices fix, round-14's
+                # ``clear_all_last_active_heights`` for Tier-47
+                # entity_last_active, and round-15's
+                # ``clear_all_pending_censorship_evidence``): on a full
+                # flush (post ``_reset_state``, post-successful-reorg)
+                # the dirty-only INSERT-OR-REPLACE loop below would
+                # skip rows that exist only on a rolled-back fork --
+                # the canonical in-memory dict doesn't include those
+                # entity_ids, so the upsert never touches them and the
+                # orphan rows survive.  Cold restart of any node that
+                # processed the losing fork then rehydrates the orphan
+                # via ``get_all_key_rotation_counts``, state_tree
+                # commits the phantom rotation_count into the per-leaf
+                # state-root, and the restarted node silently forks
+                # vs. the warm cluster at the next state-root
+                # commitment.  ``restore_state_snapshot``'s
+                # wipe+re-insert covers the FAILED-reorg rollback path;
+                # this closes the SUCCESSFUL-reorg twin.  Wipe the
+                # table inside the same SQL transaction (atomic with
+                # the re-INSERTs that follow) and let the upsert loop
+                # re-emit every entry from the canonical-replay
+                # in-memory state.
+                if (
+                    full_flush
+                    and hasattr(self.db, "clear_all_key_rotation_counts")
+                ):
+                    self.db.clear_all_key_rotation_counts()
                 for eid, rn in _scoped(self.key_rotation_counts):
                     self.db.set_key_rotation_count(eid, rn)
             if hasattr(self.db, 'set_key_rotation_last_height'):

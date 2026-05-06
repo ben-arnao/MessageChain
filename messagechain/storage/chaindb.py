@@ -1908,6 +1908,32 @@ class ChainDB:
             (entity_id, rotation_number),
         )
 
+    def clear_all_key_rotation_counts(self) -> None:
+        """Truncate the key_rotation_counts mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush (post
+        ``_reset_state`` / post-successful-reorg) to drop orphan rows
+        whose entity_id is no longer in the in-memory
+        ``key_rotation_counts`` dict.  Same shape as
+        ``clear_all_pending_censorship_evidence`` (round-15 fix for
+        the successful-reorg twin of the round-15
+        pending_censorship_evidence mirror leak),
+        ``clear_all_last_active_heights`` (round-14 for Tier-47
+        entity_last_active), and ``clear_all_reaction_choices``
+        (round-13 for the Tier-17 reaction_choices mirror).
+
+        rotation_count is committed into the per-leaf state-root
+        (state_tree.py via ``rotation_count=...``), so an orphan
+        on-disk row that survives a successful reorg silently forks
+        the cold-restarted node from the canonical cluster at the
+        next state-root commitment.
+
+        ``restore_state_snapshot`` covers the FAILED-reorg rollback
+        path; this helper is what closes the SUCCESSFUL-reorg twin
+        when called from ``_persist_state``.
+        """
+        self._conn.execute("DELETE FROM key_rotation_counts")
+
     def get_all_key_rotation_counts(self) -> dict[bytes, int]:
         cur = self._conn.execute(
             "SELECT entity_id, rotation_number FROM key_rotation_counts"
@@ -2608,6 +2634,26 @@ class ChainDB:
             "key_rotation_last_height": (
                 self.get_all_key_rotation_last_height()
             ),
+            # key_rotation_counts mirror table.  Same mirror-leak
+            # defect class as the seven prior fixes (round-2
+            # entity_id_to_index, round-4 key_rotation_last_height,
+            # round-7 receipt_subtree_roots, round-12 reaction_choices,
+            # round-13 successful-reorg twin, round-14 entity_last_active
+            # for Tier-47, round-15 pending_censorship_evidence).
+            # Pre-fix ``restore_state_snapshot`` did NOT wipe this
+            # table at all -- a successful reorg across a key-rotation
+            # block left the losing-fork rotation count permanently on
+            # disk.  Cold restart of any node that processed the losing
+            # fork rehydrates the orphan via
+            # ``get_all_key_rotation_counts``, state_tree commits the
+            # phantom rotation_count into the per-leaf state-root
+            # (``rotation_count=...``), and the restarted node silently
+            # forks at the next state-root commitment vs. warm-cluster
+            # peers that never observed the losing fork.  Snapshot now
+            # carries the full key_rotation_counts map AND restore
+            # wipes+re-inserts the table inside the same SQL
+            # transaction.
+            "key_rotation_counts": self.get_all_key_rotation_counts(),
             # Round-12 fix: reaction_choices mirror table (Tier 17).
             # Pre-fix `restore_state_snapshot` did NOT wipe this table
             # at all -- a successful reorg across a block carrying
@@ -2801,6 +2847,21 @@ class ChainDB:
             # after the canonical replays restore the supply state
             # below.
             conn.execute("DELETE FROM pending_censorship_evidence")
+            # key_rotation_counts mirror joins the wipe list.  Each
+            # KeyRotation tx applied on the losing fork mirrors a row
+            # to disk via ``set_key_rotation_count`` (issued from
+            # ``_persist_state``); on successful reorg the in-memory
+            # ``key_rotation_counts`` is rebuilt from canonical replay
+            # but the disk rows for losing-fork rotations survive
+            # without this DELETE.  The next cold restart rehydrates
+            # the orphan counts (``_load_from_db`` calls
+            # ``get_all_key_rotation_counts``), state_tree commits the
+            # phantom rotation_count into the per-leaf state-root, and
+            # the restarted node silently forks vs. the warm cluster.
+            # Same defect class as the mirror tables already wiped
+            # above.  Re-inserts happen after the canonical replays
+            # restore the supply state below.
+            conn.execute("DELETE FROM key_rotation_counts")
             # NOTE: leaf_watermarks and revoked_entities are intentionally
             # NOT wiped — they are security ratchets that never decrease.
 
@@ -2926,6 +2987,23 @@ class ChainDB:
                     "INSERT OR REPLACE INTO key_rotation_last_height "
                     "(entity_id, block_height) VALUES (?, ?)",
                     (eid, int(h)),
+                )
+            # key_rotation_counts re-insert.  Snapshot key is
+            # entity_id -> rotation_number; the chaindb mirror
+            # round-trip rebuild reads back via
+            # ``get_all_key_rotation_counts`` so the on-disk shape
+            # and the in-memory dict (``Blockchain.key_rotation_counts``)
+            # stay in lockstep.  Default-empty ``.get(...)`` keeps
+            # legacy snapshot dicts (taken before this field joined
+            # save_state_snapshot) restoring cleanly -- they leave the
+            # table empty, matching the pristine state.
+            for eid, rn in snapshot.get(
+                "key_rotation_counts", {},
+            ).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO key_rotation_counts "
+                    "(entity_id, rotation_number) VALUES (?, ?)",
+                    (eid, int(rn)),
                 )
             # Tier-47 dormancy mirror re-insert.  Snapshot key is
             # entity_id -> last_active_height; the chaindb mirror
