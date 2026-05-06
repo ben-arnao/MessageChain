@@ -198,6 +198,7 @@ def load_or_create_personal_wallet_entity(
     private_key: bytes,
     *,
     tree_height: Optional[int] = None,
+    progress=None,
 ) -> Entity:
     """Return an Entity, using ``~/.messagechain/wallet_cache/`` when possible.
 
@@ -224,9 +225,19 @@ def load_or_create_personal_wallet_entity(
     before the default was lowered).  This prevents a default change
     from silently regenerating a different public key for the same
     seed and orphaning the user's on-chain identity.
+
+    ``progress`` is an optional per-leaf callback forwarded to
+    ``Entity.create`` ONLY on the cache-miss keygen path.  Cache hits
+    return without invoking the callback (the slow path is what
+    needs feedback, not the fast path).  The CLI installs
+    ``_make_progress_reporter`` here so cold-wallet first signing
+    commands show a bar identical to ``generate-key`` instead of
+    looking frozen for minutes.
     """
     if tree_height is not None:
-        return _load_or_create_at_height(private_key, tree_height)
+        return _load_or_create_at_height(
+            private_key, tree_height, progress=progress,
+        )
 
     # No explicit height: probe the cache at both the new wallet default
     # AND the historical validator default.  This keeps existing wallets
@@ -272,12 +283,12 @@ def load_or_create_personal_wallet_entity(
     # historical default and then drives a CLI command through this
     # resolver).
     return _load_or_create_at_height(
-        private_key, MERKLE_TREE_HEIGHT,
+        private_key, MERKLE_TREE_HEIGHT, progress=progress,
     )
 
 
 def _load_or_create_at_height(
-    private_key: bytes, tree_height: int,
+    private_key: bytes, tree_height: int, *, progress=None,
 ) -> Entity:
     """Cache-or-generate at a single specific tree height."""
     cache_path = personal_wallet_cache_path(private_key, tree_height)
@@ -304,8 +315,13 @@ def _load_or_create_at_height(
         except OSError:
             pass
 
-    # Fresh keygen -- slow path.
-    entity = Entity.create(private_key, tree_height=tree_height)
+    # Fresh keygen -- slow path.  ``progress`` (when present) is the
+    # per-leaf callback the CLI uses to drive the cold-wallet
+    # progress bar.  ``Entity.create`` already accepts the kwarg and
+    # forwards it to ``KeyPair.generate``.
+    entity = Entity.create(
+        private_key, tree_height=tree_height, progress=progress,
+    )
 
     # Write the cache for next time.  Best-effort: a permission error,
     # full disk, or unserializable entity (test mocks, malformed

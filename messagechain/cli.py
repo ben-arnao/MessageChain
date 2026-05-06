@@ -2120,17 +2120,46 @@ def _resolve_signing_entity(private_key, args=None, *, tree_height=None):
     personal-wallet flow regenerates the tree on every command -- a
     ~20-30 minute wedge per signing call at the production tree
     height that makes the README's first-message walkthrough unusable.
+
+    Audit r26 #3: the personal-wallet path also installs a per-leaf
+    progress reporter so cold-wallet first signing commands (``send``
+    / ``transfer`` / ``stake`` / ``unstake`` / ``react`` / ``propose``
+    / ``vote`` / ``submit-evidence`` / ``emergency-revoke`` /
+    ``bootstrap-seed``) show the same bar ``generate-key`` shows
+    rather than looking frozen for minutes during the one-time
+    keygen.  The reporter is forwarded only on the personal-wallet
+    branch -- on cache hit it is never invoked, so warm signing
+    commands stay silent.  ``_make_progress_reporter`` returns
+    ``None`` for small trees (tests, prototype profile) so the test
+    suite's reduced ``MERKLE_TREE_HEIGHT`` is unaffected.
     """
     from messagechain.identity.keypair_cache import (
         load_or_create_personal_wallet_entity,
+    )
+    from messagechain.config import (
+        MERKLE_TREE_HEIGHT as _PROD_HEIGHT,
     )
     data_dir = getattr(args, "data_dir", None) if args is not None else None
     if data_dir:
         entity = _load_cached_entity(private_key, data_dir)
         if entity is not None:
             return entity
+    # Cap reporter sizing at the height the cache-miss fallback would
+    # use.  ``load_or_create_personal_wallet_entity`` probes
+    # ``WALLET_DEFAULT_TREE_HEIGHT`` AND ``MERKLE_TREE_HEIGHT`` and
+    # falls back to ``MERKLE_TREE_HEIGHT`` on full miss -- sizing the
+    # reporter to that upper bound keeps ETA accurate for the worst
+    # case.  If a smaller-height cache hits, no keygen runs and the
+    # reporter is never invoked.
+    effective_height = (
+        tree_height if tree_height is not None else _PROD_HEIGHT
+    )
+    progress = _make_progress_reporter(
+        1 << effective_height,
+        label="Building wallet keys (one-time)",
+    )
     return load_or_create_personal_wallet_entity(
-        private_key, tree_height=tree_height,
+        private_key, tree_height=tree_height, progress=progress,
     )
 
 
