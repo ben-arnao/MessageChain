@@ -4,6 +4,118 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.5] — 2026-05-06
+
+Patch release.  Audit round 26 top-3 ships: one censorship-resistance
+fix on the attester-side forced-inclusion gate (validator-axis
+alignment closes a single-proposer suppression path), one public-doc
+correction (UTF-8 has been live since Tier 12 but four guides claimed
+ASCII-only), and one cold-wallet UX fix (every first signing command
+now shows a progress bar during one-time WOTS+ keygen instead of
+looking frozen for minutes).  No new tier, no new wire format, no new
+CLI surface.
+
+### Fixed
+
+  * **Forced-inclusion gate's `used_bytes` / `used_count` / per-entity
+    tally walked all 9 kinds in `_BLOCK_TX_LIST_ATTRS`; the block
+    validator's Tier-18 unified-budget cap only sums message + transfer
+    + react bytes and per-entity-caps message-only.**  The Tier 34
+    multi-list path summed every kind (stake / unstake / governance /
+    authority / non-response-evidence / censorship-evidence) into the
+    excuse tallies the gate uses to forgive a proposer's omission of a
+    forced tx.  A colluding proposer could legitimately stuff their own
+    governance / authority / evidence bytes into the block until the
+    gate's `used_bytes` tripped excuse #1 (byte cap exhausted) or until
+    `entity_counts[E]` tripped excuse #3 (per-entity cap reached) for
+    target entity E — and the block remained fully valid because the
+    validator's narrower axis stayed comfortably under cap.  CLAUDE.md
+    anchor: "a tx that is well-formed, pays at least the per-byte
+    floor, and fits the byte budget cannot be suppressed by anything
+    weaker than a full validator-set majority actively colluding."
+    Pre-fix the suppression took ONE proposer with no slashable trail.
+
+    Fix introduces `_VALIDATOR_BUDGET_ATTRS` as the single source-of-
+    truth for the validator-counted byte/count kinds (message +
+    transfer + react).  The gate's `used_bytes` / `used_count` re-key
+    onto this narrower walk; per-entity tally re-keys onto
+    `block.transactions` (matching the validator's message-only cap);
+    excuse #3 only fires when the forced tx is itself a message (the
+    validator never per-entity-caps non-message kinds, so there is no
+    validator-level cap an excuse could legitimately reflect).
+    Inclusion-recognition continues to walk `_BLOCK_TX_LIST_ATTRS` so
+    a forced tx in any kind-slot is still recognized as included.
+
+    Soft-fix: attester-side check only, no consensus rule change at
+    the block validator.  `check_forced_inclusion` is called only by
+    attester vote paths (`should_attest_block` -> attestation), never
+    by `validate_block` or `validate_censorship_evidence_tx`; past
+    attester votes are already cast and the change does not perturb
+    chain state determinism.  Two-validator coordinated upgrade.  Same
+    soft-fix shape as the 1.58.1 byte-cap-axis fix and the 1.58.3
+    includable-per-kind fix.  9 new tests in
+    `tests/test_forced_inclusion_validator_axis_alignment.py` plus
+    re-anchored Tier-34 per-entity-cap regression test.  Surfaced by
+    audit r26 top-3 #1.  (ac8f7c5)
+
+  * **Personal-wallet first signing commands had no progress UX —
+    `messagechain send "hello"` after `generate-key` looked frozen
+    for minutes during the one-time WOTS+ keygen.**  At the production
+    tree height (20 leaves -> ~1M leaves), Entity.create takes
+    multiple minutes; without feedback operators kill the process
+    thinking it hung.  `cmd_generate_key` / `cmd_init` /
+    `cmd_rotate_key` already installed `_make_progress_reporter` and
+    showed a progress bar; ten other signing commands (`send` /
+    `transfer` / `stake` / `unstake` / `react` / `propose` / `vote` /
+    `submit-evidence` / `emergency-revoke` / `bootstrap-seed`) all
+    routed through `_resolve_signing_entity` without it.  CLAUDE.md
+    anchors: "newcomer E2E flow" + "smart-defaults coverage" +
+    Principle #3 (Simplicity).
+
+    Fix plumbs an optional `progress` callback through
+    `load_or_create_personal_wallet_entity` ->
+    `_load_or_create_at_height` -> `Entity.create`
+    (`KeyPair.generate` already accepted `progress=` end-to-end).
+    `_resolve_signing_entity` constructs the reporter eagerly and
+    forwards it; on cache hit the callback is never invoked (keygen
+    doesn't run) so warm signing commands stay silent.  Reporter is
+    sized at `MERKLE_TREE_HEIGHT` to match the cache-miss fallback's
+    upper bound, keeping ETA accurate for the worst case.  No fork,
+    no consensus rule change, no wire-format change, no new CLI
+    surface.  4 new tests in
+    `tests/test_personal_wallet_progress_wiring.py` including a
+    source-level pin that the reporter wiring stays in
+    `_resolve_signing_entity`.  Surfaced by audit r26 top-3 #3.
+    (e788547)
+
+### Changed
+
+  * **Four public guides corrected: messages have been UTF-8 since
+    Tier 12 (height 705), not "1024 ASCII characters."**
+    `guides/forum-primitives.md` (3 sites) and `guides/anti-bloat.md`
+    (1 site) asserted "1024 ASCII characters" / "ASCII text only" as
+    the message-cap rule.  Live rule is `MAX_MESSAGE_CHARS = 1024`
+    UTF-8 bytes after the Tier 12 fork; plaintext is NFC-normalized
+    UTF-8 in the Unicode L\*/M\*/N\*/P\*/Zs categories — every modern
+    written language is admissible.  CLAUDE.md "Mission" names
+    dissidents and AI-spam refugees as target users; both populations
+    are heavily non-English-speaking, and a public guide claiming the
+    chain is ASCII-only erases the target persona on first read.
+    Same defect class as the 1.58.0 1k-floor fiction cleanup.
+
+    `guides/stable-money.md` "When does this activate?" paragraph
+    said the dormancy controller "activates at a future block height
+    (Tier 47)" with the chain "running the legacy halving-based
+    issuance schedule" until then.  Mainnet tip is 1709 with the
+    controller activating at 1710 — the future-tense framing was
+    about to become incorrect inside the next block.  Rewritten to
+    evergreen present-tense: the controller is the anchored issuance
+    model, pre-fork heights replay under the legacy schedule for
+    determinism, post-fork the controller is the only minting path.
+
+    Docs-only — no code, no consensus rule, no hard fork, no test
+    changes.  Surfaced by audit r26 top-3 #2.  (8fcbf5b)
+
 ## [1.58.4] — 2026-05-06
 
 Patch release / **mainnet recovery**.  Fixes a wedged-chain
