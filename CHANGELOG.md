@@ -4,6 +4,87 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.57.2] — 2026-05-05
+
+Patch release.  Audit round 20 top-2 ships, both consensus
+wiring fixes that close real gaps in already-shipped slashing
+infrastructure on the production runtime.  No new tier, no new
+wire format, no new CLI surface.
+
+### Fixed
+
+  * **Production `Server` had no `ANNOUNCE_FINALITY_VOTE` gossip
+    handler — the 1.57.0 + 1.57.1 finality-vote slasher / fork-
+    emergency wiring was deaf on mainnet.**  `server.py:Server`
+    dispatched every `MessageType.*` except `ANNOUNCE_FINALITY_VOTE`;
+    the full handler shape (deserialize, verify, observe via
+    `blockchain.observe_finality_vote`, pool via
+    `mempool.add_finality_vote`, relay) lived only on
+    `messagechain/network/node.py:Node`, which production code never
+    instantiates.  `_try_produce_block_sync` also omitted the
+    `finality_votes=` kwarg on its `propose_block` call, so even if
+    pool-arrived votes existed they would never land in a proposed
+    block.  Net consequence: `FinalityCheckpoints.add_vote` only
+    fired on votes folded into already-applied blocks (never on free
+    gossip), so a divergent supermajority could not be detected
+    before honest validators had already extended the wrong tip; the
+    `_pending_finality_slashes` accumulator that
+    `_after_block_added` drains was empty by construction; and the
+    fork-emergency detector's earliest signal arrived only after the
+    block-apply tick.  Fix: port the dispatch case + handler + the
+    `finality_votes=` propose-block kwarg + the post-add
+    `mempool.remove_finality_votes` cleanup from Node into Server.
+    Handler ordering mirrors Node — observe BEFORE pool insert so a
+    duplicate-pool dedup return doesn't suppress emergency
+    surfacing on never-observed signers.  Regression test in
+    `tests/test_server_finality_vote_gossip_wiring.py` pins
+    handler-exists, observe + pool, unknown-signer-rejection,
+    message-router dispatch, and the propose-block drain wiring.
+    (35bd64a)
+
+  * **Equivocation watcher fed only on `add_block` success — block
+    whose proposer signature verified but whose body failed any
+    later validate-block check silently bypassed the watcher.**
+    `EquivocationWatcher.observe_block_header` was called
+    exclusively from `_after_block_added`, the post-success hook on
+    `Blockchain.add_block`.  A block whose proposer signature
+    verified but whose body failed any later check (state_root
+    mismatch, randao mismatch, contained-tx signature failure, etc.)
+    silently bypassed the watcher: `add_block` returned
+    `(False, reason)` early, `_after_block_added` was not called,
+    and the watcher's `seen_signatures` cache never recorded the
+    header — even though the protocol had all the crypto needed to
+    slash for the equivocation (the second header carried a valid
+    proposer signature over different `signable_data` than the
+    first).  Documented attack window: a colluding double-proposer
+    signs two headers (A, B) at the same height, broadcasts A
+    cleanly and B with a body crafted to fail a late validate-block
+    check, and walks away unslashed because honest validators
+    rejected B but never observed its header.  Fix: add a
+    Blockchain-level observer hook
+    (`register_block_header_observer` /
+    `_notify_block_header_observer`) invoked from `validate_block`
+    and `validate_block_standalone` immediately AFTER the proposer
+    signature is verified and BEFORE downstream checks decide
+    accept/reject.  Forged-signature blocks never reach the
+    observer (the `verify_signature` gate above the hook returns
+    False first), so the watcher's `seen_signatures` cache cannot
+    be polluted.  `Server.__init__` and `Node.__init__` now register
+    `self.equivocation_watcher.observe_block_header` as the
+    observer, so the production runtime gets the pre-validation
+    feed automatically.  The success-only feed in
+    `_after_block_added` is left in place (idempotent on duplicate
+    observation) — belt-and-braces against any path that bypasses
+    the new hook.  Regression test in
+    `tests/test_block_header_observer_pre_validation.py` pins the
+    method exists + stores the callback + swallows observer
+    exceptions, plus source-level pins on `validate_block`,
+    `validate_block_standalone`, `Server.__init__`, and
+    `Node.__init__` that catch future regressions in either
+    direction (observer call deleted → success-only feed returns;
+    observer call moved before sig-verify → watcher pollution
+    attack returns).  (05977dd)
+
 ## [1.57.1] — 2026-05-05
 
 Patch release.  Audit round 19 top-2 ships, both correctness fixes
