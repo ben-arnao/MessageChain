@@ -256,17 +256,35 @@ class TestAutoFeeMirrorsUnifiedFloor(unittest.TestCase):
             MARKET_FEE_FLOOR,
         )
 
-    def test_transfer_new_account_surcharge_layers_on_top(self):
-        # NEW_ACCOUNT_FEE is a type-specific surcharge that binds above
-        # the protocol floor — Tier 49 collapses the floor but the
-        # surcharge is unaffected.
+    def test_transfer_new_account_surcharge_layers_on_legacy_min_fee(self):
+        # NEW_ACCOUNT_FEE is a state-creation tariff that the chain
+        # validator hard-codes at ``MIN_FEE + NEW_ACCOUNT_FEE`` with
+        # no Tier 49 height gate — see
+        # ``Blockchain.verify_transfer_transaction`` and
+        # ``_validate_transfer_in_block``.  Tier 49 unified the *flat
+        # protocol baseline* across non-message tx kinds for the
+        # regular-recipient path, but the new-account branch was
+        # never migrated.  The wallet quote must mirror the
+        # consensus literal or every new-recipient transfer
+        # post-Tier-49 silently underbids the chain by 99 tokens
+        # (= MIN_FEE - MARKET_FEE_FLOOR) and is rejected.  Pinned
+        # again with stronger framing in
+        # ``tests/test_auto_fee_transfer_new_account_floor.py``.
         from messagechain.config import NEW_ACCOUNT_FEE
         from messagechain.economics.auto_fee import _transfer_floor
         post_fork = _transfer_floor(
             current_height=UNIFIED_FEE_FLOOR_HEIGHT,
             recipient_is_new=True,
         )
-        self.assertEqual(post_fork, MARKET_FEE_FLOOR + NEW_ACCOUNT_FEE)
+        self.assertEqual(post_fork, MIN_FEE + NEW_ACCOUNT_FEE)
+        # And the same literal binds pre-fork — the new-account
+        # branch is height-invariant, so the quote does not change
+        # across the Tier 49 boundary.
+        pre_fork = _transfer_floor(
+            current_height=UNIFIED_FEE_FLOOR_HEIGHT - 1,
+            recipient_is_new=True,
+        )
+        self.assertEqual(pre_fork, MIN_FEE + NEW_ACCOUNT_FEE)
 
 
 if __name__ == "__main__":

@@ -241,15 +241,30 @@ def _non_message_flat_floor(current_height: int | None) -> int:
 def _transfer_floor(current_height: int | None, recipient_is_new: bool) -> int:
     """Live admission floor for a TransferTransaction.
 
-    Tier 49 collapses the flat floor to ``MARKET_FEE_FLOOR``; pre-fork
-    ``MIN_FEE=100`` still binds.  ``NEW_ACCOUNT_FEE`` surcharge applies
-    when the recipient is brand-new (priced upfront so the user isn't
-    surprised by a chain reject).
+    Two branches with different consensus shapes:
+
+      * Regular recipient: Tier 49 collapses the flat floor to
+        ``MARKET_FEE_FLOOR``; pre-fork ``MIN_FEE=100`` still binds.
+
+      * New (brand-new on-chain entity) recipient: the chain validator
+        at ``Blockchain.verify_transfer_transaction`` and
+        ``_validate_transfer_in_block`` hard-code
+        ``required = MIN_FEE + NEW_ACCOUNT_FEE`` with no Tier 49
+        height gate.  The wallet quote must mirror that literal — if
+        the wallet drops to the unified Tier-49 floor on this branch
+        (i.e. ``MARKET_FEE_FLOOR + NEW_ACCOUNT_FEE = 1001`` post-fork)
+        every new-recipient transfer underbids the chain's 1100-token
+        floor and is silently rejected.
+
+    The branches diverge on Tier 49 by design — Tier 49 unified the
+    *flat protocol baseline* across non-message tx kinds, but the
+    ``NEW_ACCOUNT_FEE`` surcharge is a separate state-creation tariff
+    layered on top of the legacy ``MIN_FEE`` and was never migrated.
+    Pinned by ``tests/test_auto_fee_transfer_new_account_floor.py``.
     """
-    floor = _non_message_flat_floor(current_height)
     if recipient_is_new:
-        floor += NEW_ACCOUNT_FEE
-    return floor
+        return MIN_FEE + NEW_ACCOUNT_FEE
+    return _non_message_flat_floor(current_height)
 
 
 def _stake_floor(current_height: int | None) -> int:
