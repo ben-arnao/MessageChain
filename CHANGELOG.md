@@ -4,6 +4,94 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.57.3] — 2026-05-05
+
+Patch release.  Audit round 21 top-2 ships -- one chaindb mirror
+leak (8th of the recurring class) and one CLI smart-default that
+closes a slashable WOTS+ leaf-reuse footgun on the README's exact
+validator-bootstrap path.  No new tier, no new wire format, no
+new CLI surface.
+
+### Fixed
+
+  * **`key_rotation_counts` chaindb mirror leak (silent consensus
+    fork on cold restart).**  ``key_rotation_counts`` is the
+    in-memory rotation-counter dict mirrored to disk for cold-boot
+    rehydration and committed into the per-leaf state-root via
+    ``state_tree.py`` (``rotation_count=...``).  Pre-fix three
+    half-built parts (vs the seven prior mirror-leak fixes which
+    all wired the full set):
+
+      * ``save_state_snapshot`` did NOT carry
+        ``key_rotation_counts``.
+      * ``restore_state_snapshot`` did NOT wipe the table on
+        rollback.
+      * ``_persist_state`` was upsert-only with no orphan-cleanup
+        pass on the successful-reorg path.
+
+    Result: an entity X registering + rotating only on a fork that
+    loses the reorg leaves an orphan row on disk after
+    ``_reset_state`` clears the in-memory dict and canonical replay
+    rebuilds it without X.  Cold restart of any node that processed
+    the losing fork rehydrates the orphan via
+    ``get_all_key_rotation_counts``, state_tree commits the phantom
+    rotation_count into the per-leaf state-root, and the restarted
+    node silently forks from the warm cluster at the next state-root
+    commitment.
+
+    Same defect class as the seven prior mirror-leak fixes (round-2
+    ``entity_id_to_index``, round-4 ``key_rotation_last_height``,
+    round-7 ``receipt_subtree_roots``, round-12
+    ``reaction_choices``, round-13 successful-reorg twin, round-14
+    ``entity_last_active`` for Tier-47, round-15
+    ``pending_censorship_evidence``).
+
+    Fix mirrors the established pattern exactly: new
+    ``clear_all_key_rotation_counts`` chaindb helper;
+    ``save_state_snapshot`` adds the field;
+    ``restore_state_snapshot`` adds DELETE + re-INSERT inside the
+    same SQL transaction; ``_persist_state`` calls
+    ``clear_all_*`` on full flush before the upsert loop, gated on
+    ``hasattr`` so legacy chain.db files (no helper) load cleanly.
+    New ``tests/test_key_rotation_counts_reorg_roundtrip.py`` (4
+    tests).  Surfaced by audit r21 top-3 #1.  (3264fe4)
+
+  * **Manual signing-cmd ``data_dir`` falls back to ``onboard.toml``
+    -- closes the slashable WOTS+ leaf-reuse footgun on the README's
+    validator-bootstrap path.**  Same disaster slot the 1.57.0
+    rotate-key-if-needed timer fix (commit c724327) closed for the
+    daily timer, but for the manual signing path.  ``cmd_stake``,
+    ``cmd_unstake``, ``cmd_rotate_key`` (and every other signing
+    command listed in ``_bind_persistent_leaf_index``'s docstring)
+    all read ``getattr(args, "data_dir", None)`` and pass it
+    directly to the leaf-cursor binder.  An operator running the
+    README's step 3 of "Run a validator"
+    (``messagechain stake --amount 200`` with no ``--data-dir``)
+    routed the leaf cursor to the per-user fallback
+    ``~/.messagechain/leaves/<eid>.idx`` while the running validator
+    daemon persisted to
+    ``<onboard.data_dir>/leaf_index.json``.  Two cursors with no
+    fsync handshake re-opens the cross-process WOTS+ leaf-reuse
+    window: equivocation evidence on chain, 100% slash on detection
+    pre-Tier-20 (geometric soft-slash post).  ``_reserve_leaf_via_rpc``
+    is a best-effort fallback only and silently returns None on
+    transient RPC errors and on older daemons.
+
+    Fix in ``resolve_defaults``: for the explicitly-enumerated set
+    of signing commands (the same set whose handlers route through
+    ``_bind_persistent_leaf_index``), if ``args.data_dir`` is None
+    and ``onboard.toml`` carries a ``data_dir``, fill it in.
+    Explicit ``--data-dir`` still wins.  Personal-wallet path with
+    no ``onboard.toml`` is unchanged (``read_onboard_config``
+    returns empty dict, fallback is a no-op).  Set is enumerated
+    rather than blanket-applied because the leaf-cursor risk is
+    specific to commands that route through
+    ``_bind_persistent_leaf_index``; non-signing commands that
+    happen to expose ``--data-dir`` should not silently inherit the
+    daemon's data_dir.  New
+    ``tests/test_signing_cmd_data_dir_fallback.py`` (11 tests).
+    Surfaced by audit r21 top-3 #3.  (27853bf)
+
 ## [1.57.2] — 2026-05-05
 
 Patch release.  Audit round 20 top-2 ships, both consensus
