@@ -17,15 +17,25 @@ The primitives — all of them — fit on one page.
 
 ## 1. The message
 
-The base unit. Up to **1024 ASCII characters** of human-readable
-text, signed by the sender's key, included in a block by validators,
+The base unit. Up to **1024 UTF-8 bytes** of human-readable text,
+signed by the sender's key, included in a block by validators,
 permanent forever.
 
 ```bash
 messagechain send "hello world"
+messagechain send "привет, мир"
+messagechain send "你好，世界"
 ```
 
-Anything longer than 1024 characters has to be split into multiple
+Plaintext is NFC-normalized UTF-8 in the Unicode Letter / Mark /
+Number / Punctuation / Space-separator categories — every modern
+written language is a first-class citizen. ASCII English fits 1024
+characters; CJK or Devanagari content fits about a third of that
+character count for the same byte budget. The chain prices stored
+bytes uniformly, so each user pays per byte for the permanence they
+actually pin.
+
+Anything longer than the byte cap has to be split into multiple
 messages and chained (see *long-form threads* below).
 
 That's it. There's no separate "post" type, "comment" type, or
@@ -59,14 +69,14 @@ with it:
 
 `prev` bytes do count against the per-stored-byte fee — you pay for
 the pointer like you pay for any other byte. But they do **not**
-count against the 1024-character message-content cap. Pointer is
+count against the 1024-byte message-content cap. Pointer is
 structural metadata; message text is content.
 
 ## 3. Long-form threads
 
-Since each message tops out at 1024 characters, "write a 5,000-word
-essay" is implemented by splitting the essay into chunks of ≤1024
-chars and chaining them with `prev`:
+Since each message tops out at 1024 bytes of body text, "write a
+5,000-word essay" is implemented by splitting the essay into chunks
+that fit the cap and chaining them with `prev`:
 
 ```
 [essay part 1]                      ←  block N
@@ -82,7 +92,7 @@ different workflow than short-form posting, and the chain doesn't
 pretend otherwise.
 
 For most cases, a multi-block thread is overkill — a single 1024-
-character message says plenty. Long-form is there when it's needed.
+byte message says plenty. Long-form is there when it's needed.
 
 ## 4. Up/down votes on messages
 
@@ -211,8 +221,8 @@ What a forum has to build itself, on top of these primitives:
   list of `entity_id`s you care about and filter the public
   message stream against it. The chain doesn't need to know who
   you read.
-- **No images, no attachments.** ASCII text only, capped at 1024
-  characters. Anything richer goes to L2 / off-chain hosting,
+- **No images, no attachments.** Plain text only, capped at 1024
+  UTF-8 bytes. Anything richer goes to L2 / off-chain hosting,
   referenced by URL inside the message body if you want it
   alongside.
 
@@ -220,8 +230,8 @@ What a forum has to build itself, on top of these primitives:
 
 The full set of forum primitives:
 
-- **One tx type for content** (message), with 1024-char body, an
-  optional `prev` pointer, and an optional `community-id`.
+- **One tx type for content** (message), with a 1024-byte UTF-8
+  body, an optional `prev` pointer, and an optional `community-id`.
 - **One tx type for reactions** (React), with two target flavors
   (message, user) and three choices (up, down, clear).
 - **Permanent, on-chain, fee-paid, signed** — every one of them.

@@ -33,14 +33,21 @@ puts a hard ceiling on how fast the chain can grow.
 A messaging chain that fired off blocks every 2 seconds would have
 to fight bloat with much harsher per-message limits or aggressive
 storage tricks. Slow blocks let MessageChain keep per-message limits
-generous (full 1024-character messages) while keeping daily growth
-modest.
+generous (a full 1024-byte body — tweet-scale text in any modern
+script) while keeping daily growth modest.
 
 ## 2. The 1024-byte message cap
 
-**Every message body is capped at 1024 ASCII characters / 1024
-bytes.** Period. No long-form posts, no embedded images, no inline
-attachments.
+**Every message body is capped at 1024 UTF-8 bytes.** Period. No
+long-form posts, no embedded images, no inline attachments.
+
+Plaintext is NFC-normalized UTF-8 in the Unicode Letter / Mark /
+Number / Punctuation / Space-separator categories — every modern
+written language is admissible. ASCII English fits 1024 characters
+in 1024 bytes; scripts like CJK or Devanagari fit fewer characters
+for the same byte budget, because each codepoint encodes to more
+bytes. Per-byte storage pricing means every user pays for the
+permanence they actually pin, regardless of script.
 
 This isn't a UX bug, it's a feature: it forces "tweet-scale" speech
 to live on chain and pushes everything longer to either be chained

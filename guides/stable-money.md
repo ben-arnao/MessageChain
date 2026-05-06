@@ -131,13 +131,16 @@ weight on the next block.
   full balance and their full active-supply weight, with the next
   block they sign.
 
-## When does this activate?
+## How activation works
 
-The dormancy controller activates at a future block height (Tier 47
-in the upgrade schedule). Until activation, the chain runs the
-legacy halving-based issuance schedule. Both behaviors are
-byte-for-byte identical pre-activation, and the controller takes
-over cleanly at the activation block — no migration tx required.
+The dormancy controller is the chain's anchored issuance model. It
+landed as a hard fork (Tier 47 in the upgrade schedule); pre-fork
+blocks ran a legacy halving-based schedule, post-fork blocks run
+the controller. Pre-fork heights replay byte-identically under the
+old schedule so historical state is unchanged. From the activation
+block onward, the controller is the only minting path — no migration
+tx, no operator action. The legacy halving was retired by the same
+fork.
 
 ## Further reading
 
