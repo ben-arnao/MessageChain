@@ -1378,6 +1378,60 @@ def resolve_defaults(args: argparse.Namespace) -> argparse.Namespace:
 
     # Server address: explicit override wins.  Otherwise leave None so
     # _parse_server can run the seed-pick + sqrt(stake) routing.
+
+    # Signing-command ``data_dir`` fallback to onboard.toml.  Same
+    # WOTS+ leaf-reuse footgun the 1.57.0 rotate-key-if-needed timer
+    # fix (commit c724327) closed, but for the manual signing path:
+    # ``messagechain stake`` / ``unstake`` / ``rotate-key`` (and the
+    # other signing commands listed in
+    # ``_bind_persistent_leaf_index``'s docstring) all read
+    # ``getattr(args, "data_dir", None)`` and pass it directly to the
+    # leaf-cursor binder.  Without an onboard.toml fallback, an
+    # operator running the README's exact validator-bootstrap step
+    # (`messagechain stake --amount 200` with no ``--data-dir``)
+    # routes the leaf cursor to the per-user fallback at
+    # ``~/.messagechain/leaves/<entity>.idx`` while the running
+    # validator daemon persists to
+    # ``<onboard.data_dir>/leaf_index.json``.  Two cursors with no
+    # fsync handshake -- cross-process WOTS+ leaf reuse,
+    # equivocation evidence on chain, 100% slash on detection (or
+    # geometric soft-slash post-Tier-20).
+    #
+    # Explicit ``--data-dir`` still wins; this only fires when the
+    # operator did not pass one and onboard.toml carries a data_dir
+    # value (i.e. the operator ran ``messagechain init`` so the host
+    # IS a validator host).  Personal-wallet path with no onboard.toml
+    # is unchanged (read_onboard_config returns empty dict, the
+    # fallback is a no-op).
+    #
+    # Set explicitly enumerated rather than "any cmd with the attribute"
+    # because the leaf-cursor risk is specific to commands that route
+    # through ``_bind_persistent_leaf_index``; non-signing commands
+    # that happen to expose ``--data-dir`` (e.g. an inspection tool)
+    # should not silently inherit the daemon's data_dir.
+    _DATA_DIR_FALLBACK_SIGNING_CMDS = {
+        "send", "transfer", "react", "stake", "unstake",
+        "rotate-key", "propose", "vote", "set-authority-key",
+        "emergency-revoke", "set-receipt-subtree-root",
+        "bootstrap-seed", "submit-evidence", "send-multi",
+    }
+    if (
+        cmd in _DATA_DIR_FALLBACK_SIGNING_CMDS
+        and getattr(args, "data_dir", None) is None
+    ):
+        try:
+            from messagechain.runtime import onboarding as _ob
+            _cfg = _ob.read_onboard_config()
+            _ddir = _cfg.get("data_dir")
+            if _ddir:
+                args.data_dir = _ddir
+        except Exception:
+            # Best-effort: a corrupt or unreadable onboard.toml is the
+            # operator's problem to surface elsewhere; resolve_defaults
+            # MUST NOT crash a personal-wallet user who happens to have
+            # a malformed config in a parent directory.
+            pass
+
     # Data dir defaults for node
     if cmd == "start" and args.data_dir is None:
         args.data_dir = os.path.join(os.path.expanduser("~"), ".messagechain", "chaindata")
