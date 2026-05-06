@@ -1701,6 +1701,32 @@ class ChainDB:
         )
         return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
 
+    def clear_all_reputation(self) -> None:
+        """Truncate the reputation mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush (post
+        ``_reset_state`` / post-successful-reorg) to drop orphan rows
+        whose entity_id is no longer in the in-memory ``reputation``
+        dict.  Same shape as ``clear_all_key_rotation_counts`` (round-21
+        fix), ``clear_all_pending_censorship_evidence`` (round-15),
+        ``clear_all_last_active_heights`` (round-14 for Tier-47
+        entity_last_active), and ``clear_all_reaction_choices``
+        (round-13).
+
+        ``reputation`` feeds the bootstrap-era reputation-weighted
+        lottery winner selection (whose payouts mutate
+        ``supply.balances``) AND the ``slashing_severity``
+        good-history input.  An orphan on-disk row that survives a
+        successful reorg silently picks a different lottery winner OR
+        produces a different slash_pct on the cold-restarted node ->
+        state_root divergence at the next lottery payout / slash apply.
+
+        ``restore_state_snapshot`` covers the FAILED-reorg rollback
+        path; this helper is what closes the SUCCESSFUL-reorg twin
+        when called from ``_persist_state``.
+        """
+        self._conn.execute("DELETE FROM reputation")
+
     # ── State: Slash Offense Counts (Tier 23/24 honesty curve) ───
     # Per-validator slash-applied counter driving the
     # `slashing_severity` repeat-offense escalation + Tier 24 rate
@@ -1745,6 +1771,29 @@ class ChainDB:
             "SELECT entity_id, count FROM slash_offense_counts",
         )
         return {bytes(row[0]): int(row[1]) for row in cur.fetchall()}
+
+    def clear_all_slash_offense_counts(self) -> None:
+        """Truncate the slash_offense_counts mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush (post
+        ``_reset_state`` / post-successful-reorg) to drop orphan rows
+        whose entity_id is no longer in the in-memory
+        ``slash_offense_counts`` dict.  Same shape as the round-21
+        ``clear_all_key_rotation_counts`` fix and earlier siblings.
+
+        slash_offense_counts feeds the ``slashing_severity``
+        repeat-offense escalation (post-Tier-23/24).  An orphan
+        on-disk row that survives a successful reorg silently grades
+        the next slash differently on the cold-restarted node vs.
+        the warm cluster -> divergent ``slash_pct`` ->
+        ``supply.staked[offender]`` diverges -> state_root mismatch
+        at the next slash tx.
+
+        ``restore_state_snapshot`` covers the FAILED-reorg rollback
+        path; this helper is what closes the SUCCESSFUL-reorg twin
+        when called from ``_persist_state``.
+        """
+        self._conn.execute("DELETE FROM slash_offense_counts")
 
     # ── State: Entity Index Registry (bloat reduction) ──────────
 
@@ -1817,6 +1866,28 @@ class ChainDB:
         cur = self._conn.execute("SELECT entity_id, count FROM proposer_sig_counts")
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
+    def clear_all_proposer_sig_counts(self) -> None:
+        """Truncate the proposer_sig_counts mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush (post
+        ``_reset_state`` / post-successful-reorg) to drop orphan rows
+        whose entity_id is no longer in the in-memory
+        ``proposer_sig_counts`` dict.  Same shape as the round-21
+        ``clear_all_key_rotation_counts`` fix and earlier siblings.
+
+        proposer_sig_counts feeds attester-weight calculations + the
+        ``slashing_severity`` ``_track_record`` good-history factor
+        (volume of good behavior).  An orphan on-disk row that
+        survives a successful reorg silently inflates either input on
+        the cold-restarted node -> divergent attester selection or
+        slash severity -> consensus split.
+
+        ``restore_state_snapshot`` covers the FAILED-reorg rollback
+        path; this helper is what closes the SUCCESSFUL-reorg twin
+        when called from ``_persist_state``.
+        """
+        self._conn.execute("DELETE FROM proposer_sig_counts")
+
     # ── State: Leaf Watermarks (WOTS+ reuse prevention) ─────────
 
     def get_leaf_watermark(self, entity_id: bytes) -> int:
@@ -1853,6 +1924,34 @@ class ChainDB:
             "SELECT entity_id, block_height FROM key_rotation_last_height",
         )
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    def clear_all_key_rotation_last_height(self) -> None:
+        """Truncate the key_rotation_last_height mirror table.
+
+        Used by ``Blockchain._persist_state`` on a full flush (post
+        ``_reset_state`` / post-successful-reorg) to drop orphan rows
+        whose entity_id is no longer in the in-memory
+        ``key_rotation_last_height`` dict.  Same shape as the round-21
+        ``clear_all_key_rotation_counts`` fix and earlier siblings.
+
+        ``restore_state_snapshot`` already DELETEs the table on the
+        FAILED-reorg rollback path (proving it IS reorg-sensitive),
+        but the SUCCESSFUL-reorg twin (the
+        ``_persist_state(full_flush=True)`` post-replay) only does
+        the dirty-only INSERT-OR-REPLACE upsert -- losing-fork
+        rotation rows survive on disk.  Cold restart of any node that
+        processed the losing fork rehydrates the higher last_height
+        via ``get_all_key_rotation_last_height`` -> the cold-restarted
+        node rejects a valid KeyRotation tx ("cooldown N blocks
+        remaining") that warm peers accept -> consensus split on
+        every block carrying that rotation tx + identity-continuity
+        anchor broken (the user can't rotate keys).
+
+        ``restore_state_snapshot`` covers the FAILED-reorg rollback
+        path; this helper is what closes the SUCCESSFUL-reorg twin
+        when called from ``_persist_state``.
+        """
+        self._conn.execute("DELETE FROM key_rotation_last_height")
 
     # ── State: Authority Keys (cold-key withdrawal gating) ──────
 

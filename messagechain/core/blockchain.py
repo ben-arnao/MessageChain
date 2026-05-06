@@ -1713,8 +1713,68 @@ class Blockchain:
                 self.db.set_public_key(eid, pk)
             for eid, cnt in _scoped(self.entity_message_count):
                 self.db.set_message_count(eid, cnt)
-            for eid, cnt in _scoped(self.proposer_sig_counts):
-                self.db.set_proposer_sig_count(eid, cnt)
+            # Mirror-leak guard (round-22 fix; same defect class as the
+            # eight prior mirror-leak fixes).  proposer_sig_counts feeds
+            # attester-weight calculations + the slashing_severity
+            # _track_record good-history factor (volume of good behavior),
+            # both consensus-deterministic.  On a full flush (post
+            # _reset_state, post-successful-reorg) the dirty-only
+            # INSERT-OR-REPLACE loop below would skip rows that exist
+            # only on a rolled-back fork -- the canonical in-memory dict
+            # doesn't include those entity_ids, so the upsert never
+            # touches them and the orphan rows survive.  Cold restart of
+            # any node that processed the losing fork rehydrates the
+            # orphan via get_all_proposer_sig_counts and silently forks
+            # off peers at the next attester-weighted decision.  Wipe
+            # the table inside the same SQL transaction (atomic with
+            # the re-INSERTs that follow) and let the upsert loop
+            # re-emit every entry from canonical-replay state.
+            if (
+                full_flush
+                and hasattr(self.db, "clear_all_proposer_sig_counts")
+            ):
+                self.db.clear_all_proposer_sig_counts()
+            # On a full flush the upsert iterates the entire in-memory
+            # dict, not just dirty entries, so every canonical row is
+            # re-emitted after the wipe above.
+            if full_flush:
+                for eid, cnt in self.proposer_sig_counts.items():
+                    self.db.set_proposer_sig_count(eid, cnt)
+            else:
+                for eid, cnt in _scoped(self.proposer_sig_counts):
+                    self.db.set_proposer_sig_count(eid, cnt)
+            # reputation and slash_offense_counts mirrors are written
+            # eagerly via _bump_reputation / _clear_reputation /
+            # _bump_slash_offense_count / clear_slash_offense_count
+            # chokepoints, so per-block they stay in sync without a
+            # dedicated upsert here.  But on a full flush
+            # (post _reset_state, post-successful-reorg) the eager
+            # writes from canonical replay only touch the entity_ids
+            # the canonical chain re-emits -- losing-fork rows for
+            # entity_ids absent from the canonical replay survive on
+            # disk.  Cold restart rehydrates the orphans into
+            # consensus-deterministic state (slashing_severity,
+            # bootstrap-era reputation lottery) and silently forks.
+            # Round-22 fix: on full_flush wipe the table and re-emit
+            # the entire in-memory dict inside the same SQL
+            # transaction.  Same defect class as the eight prior
+            # mirror-leak fixes.
+            if (
+                full_flush
+                and hasattr(self.db, "clear_all_reputation")
+                and hasattr(self.db, "set_reputation")
+            ):
+                self.db.clear_all_reputation()
+                for eid, count in self.reputation.items():
+                    self.db.set_reputation(eid, count)
+            if (
+                full_flush
+                and hasattr(self.db, "clear_all_slash_offense_counts")
+                and hasattr(self.db, "set_slash_offense_count")
+            ):
+                self.db.clear_all_slash_offense_counts()
+                for eid, count in self.slash_offense_counts.items():
+                    self.db.set_slash_offense_count(eid, count)
             if hasattr(self.db, 'set_leaf_watermark'):
                 for eid, nxt in _scoped(self.leaf_watermarks):
                     self.db.set_leaf_watermark(eid, nxt)
@@ -1766,8 +1826,34 @@ class Blockchain:
                 for eid, rn in _scoped(self.key_rotation_counts):
                     self.db.set_key_rotation_count(eid, rn)
             if hasattr(self.db, 'set_key_rotation_last_height'):
-                for eid, bh in _scoped(self.key_rotation_last_height):
-                    self.db.set_key_rotation_last_height(eid, bh)
+                # Mirror-leak guard (round-22 fix; same defect class as the
+                # eight prior mirror-leak fixes).  key_rotation_last_height
+                # gates the KeyRotation cooldown
+                # (KEY_ROTATION_COOLDOWN_BLOCKS).  restore_state_snapshot
+                # already DELETEs this table on the FAILED-reorg rollback
+                # path (proving it IS reorg-sensitive), but the
+                # SUCCESSFUL-reorg twin only does the dirty-only
+                # INSERT-OR-REPLACE upsert below -- losing-fork rotation
+                # rows survive.  Cold restart rehydrates the higher
+                # last_height -> the cold-restarted node rejects a valid
+                # KeyRotation tx that warm peers accept -> consensus
+                # split + identity-continuity anchor broken.  Wipe the
+                # table inside the same SQL transaction (atomic with the
+                # re-INSERTs that follow) and let the upsert loop
+                # re-emit every entry from canonical-replay state.
+                if (
+                    full_flush
+                    and hasattr(
+                        self.db, "clear_all_key_rotation_last_height",
+                    )
+                ):
+                    self.db.clear_all_key_rotation_last_height()
+                if full_flush:
+                    for eid, bh in self.key_rotation_last_height.items():
+                        self.db.set_key_rotation_last_height(eid, bh)
+                else:
+                    for eid, bh in _scoped(self.key_rotation_last_height):
+                        self.db.set_key_rotation_last_height(eid, bh)
             if hasattr(self.db, 'set_wots_tree_height'):
                 # Set-once at the storage layer (INSERT OR IGNORE), so
                 # re-persisting unchanged entries is a cheap no-op.
