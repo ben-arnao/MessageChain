@@ -76,6 +76,7 @@ from messagechain.config import (
     FORCED_INCLUSION_ALL_TX_KINDS_HEIGHT,
     FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT,
     MAX_BLOCK_MESSAGE_BYTES,
+    MAX_BLOCK_TOTAL_BYTES,
     MAX_TXS_PER_BLOCK,
     MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
@@ -301,7 +302,31 @@ def check_forced_inclusion(
                 entity_counts.get(tx.entity_id, 0) + 1
             )
 
-    remaining_bytes = MAX_BLOCK_MESSAGE_BYTES - used_bytes
+    # Excuse-#1 byte cap: the cap referenced here MUST match the axis
+    # ``used_bytes`` was computed on, and the cap must be the one the
+    # block validator itself enforces against that axis — otherwise a
+    # proposer whose block IS valid (validator's cap unbroken) can be
+    # excused for omitting a forced tx whose inclusion the validator
+    # would have admitted.  Pre-Tier-34 the legacy path summed
+    # ``len(tx.message)`` (payload bytes) and is correctly bounded by
+    # ``MAX_BLOCK_MESSAGE_BYTES`` (the payload cap).  Post-Tier-34 the
+    # multi-list path sums ``len(tx.to_bytes())`` (stored bytes,
+    # matching the mempool's fee-per-byte ranking axis); the cap that
+    # actually bounds stored bytes is Tier 18's unified
+    # ``MAX_BLOCK_TOTAL_BYTES``.  Pre-fix the post-Tier-34 branch
+    # checked stored-byte usage against the payload cap — a unit
+    # mismatch that let a colluding proposer fill the block with their
+    # own witness-heavy txs (small payloads, ~256× WOTS+ amplification
+    # in stored bytes) until ``used_bytes > MAX_BLOCK_MESSAGE_BYTES``,
+    # at which point excuse #1 fired for any forced tx while the
+    # block's actual ``len(tx.message)`` total was nowhere near the
+    # payload cap and the block-level ``MAX_BLOCK_TOTAL_BYTES`` check
+    # was nowhere near binding either.  CLAUDE.md anchor: "a tx that
+    # pays at least the per-byte floor and fits the byte budget cannot
+    # be suppressed by anything weaker than a full validator-set
+    # majority" — the suppression took only one proposer pre-fix.
+    cap_bytes = MAX_BLOCK_TOTAL_BYTES if use_multi_list else MAX_BLOCK_MESSAGE_BYTES
+    remaining_bytes = cap_bytes - used_bytes
     remaining_count = MAX_TXS_PER_BLOCK - used_count
 
     for ftx in forced:

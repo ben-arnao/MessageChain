@@ -299,5 +299,142 @@ class TestMultiListPerEntityCap(unittest.TestCase):
         )
 
 
+# ────────────────────────────────────────────────────────────────────
+# Byte-budget unit-mismatch — Tier 34 multi-list path summed STORED
+# bytes against the PAYLOAD cap, letting a single proposer suppress
+# any forced tx by stuffing the block with their own witness-heavy
+# message txs whose stored bytes overrun MAX_BLOCK_MESSAGE_BYTES while
+# the block validator's payload check (sum of `len(tx.message)` against
+# the same cap) stays well below.  CLAUDE.md anchor: "a tx that pays at
+# least the per-byte floor and fits the byte budget cannot be
+# suppressed by anything weaker than a full validator-set majority".
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestByteBudgetExcuseStoredBytesAxis(unittest.TestCase):
+    """Excuse #1 must compare stored bytes against MAX_BLOCK_TOTAL_BYTES
+    (the cap that actually bounds stored bytes — Tier 18's unified
+    budget), not against MAX_BLOCK_MESSAGE_BYTES (the payload cap).
+
+    A WOTS+ MessageTransaction is ~256× its payload in stored bytes
+    (small payloads mostly amortize to ~2 KB witness).  20 such txs
+    overrun MAX_BLOCK_MESSAGE_BYTES = 45_000 stored bytes while their
+    payload sum is hundreds of bytes — well inside both the payload
+    cap and the unified Tier 18 cap.  Pre-fix: any forced tx is excused
+    as "byte budget exhausted", and a colluding proposer can drop ANY
+    high-fpb tx by filling the block with their own txs.  Post-fix:
+    excuse #1 only fires when the stored-byte axis would actually
+    bind — i.e. against MAX_BLOCK_TOTAL_BYTES."""
+
+    def setUp(self):
+        # Alice (the proposer in this test) signs ~20 txs in one
+        # subtest and ~90 in the other.  log2(90) ≈ 7 → 128 leaves.
+        # Bob signs once → tree_height=2 (4 leaves) is plenty.
+        self.alice = Entity.create(
+            b"t34-bb-alice".ljust(32, b"\x00"), tree_height=7,
+        )
+        self.bob = Entity.create(
+            b"t34-bb-bob".ljust(32, b"\x00"), tree_height=2,
+        )
+        self.pool = Mempool(max_size=200, fee_policy=_STATIC_FEE)
+
+    def test_post_tier_34_witness_heavy_block_does_not_excuse_omission(self):
+        # Bob's forced tx — the one a colluding proposer wants to
+        # suppress.  Tiny payload, small stored size; the question is
+        # whether the gate excuses its omission.
+        bob_forced = create_transaction(
+            self.bob, "forced", fee=10_000, nonce=0,
+        )
+        self.pool.add_transaction(bob_forced, arrival_block_height=0)
+        # Alice (the proposer) fills the block with HER OWN small-payload
+        # message txs.  At ~2300 stored bytes each, 20 txs sum to
+        # ~46 KB — over the 45 KB MAX_BLOCK_MESSAGE_BYTES (the broken
+        # cap reference) but well under the 200 KB MAX_BLOCK_TOTAL_BYTES
+        # (the correct cap).  Their payload sum is ~180 B, so the
+        # block validator's `len(tx.message)` check passes trivially
+        # — the block IS valid; the proposer just declined to include
+        # bob's forced tx.
+        alice_block_txs = [
+            create_transaction(
+                self.alice, f"x{n:02d}",
+                fee=200, nonce=n,
+            )
+            for n in range(20)
+        ]
+        # Sanity-pin the inputs the test relies on so a future encoding
+        # tweak that shrinks WOTS+ doesn't silently turn this test into
+        # a no-op.
+        from messagechain.config import (
+            MAX_BLOCK_MESSAGE_BYTES, MAX_BLOCK_TOTAL_BYTES,
+        )
+        stored_total = sum(len(t.to_bytes()) for t in alice_block_txs)
+        payload_total = sum(len(t.message) for t in alice_block_txs)
+        self.assertGreater(
+            stored_total, MAX_BLOCK_MESSAGE_BYTES,
+            "test setup expects Alice's stored-byte total to exceed the "
+            "(broken) payload-cap reference so the bug is exercised; if "
+            "WOTS+ encoding shrinks, raise the tx count.",
+        )
+        self.assertLess(
+            stored_total, MAX_BLOCK_TOTAL_BYTES,
+            "test setup expects Alice's stored-byte total to fit inside "
+            "MAX_BLOCK_TOTAL_BYTES so the block IS valid — the question "
+            "is whether the censorship-gate's excuse #1 fires.",
+        )
+        self.assertLess(
+            payload_total, MAX_BLOCK_MESSAGE_BYTES,
+            "test setup expects Alice's payload total to fit inside the "
+            "payload cap so the block validator does not reject the block.",
+        )
+        block = _FakeBlock(message_txs=alice_block_txs)
+        h = POST_T34 + 5
+        ok, reason = check_forced_inclusion(block, self.pool, h)
+        self.assertFalse(
+            ok,
+            f"Tier 34 byte-budget excuse must NOT fire when stored bytes "
+            f"are well within MAX_BLOCK_TOTAL_BYTES; the proposer dropped "
+            f"a forced tx with no real space constraint: reason={reason!r}",
+        )
+
+    def test_post_tier_34_byte_budget_excuse_still_fires_at_real_cap(self):
+        # Inverse direction: when stored bytes really do overrun the
+        # correct cap (MAX_BLOCK_TOTAL_BYTES), excuse #1 must still
+        # fire — the fix tightens the rule, it does not delete it.
+        # Construct a forced tx whose stored size exceeds whatever
+        # remaining stored bytes the block has after the proposer's
+        # own selection.
+        bob_forced = create_transaction(
+            self.bob, "f", fee=10_000, nonce=0,
+        )
+        self.pool.add_transaction(bob_forced, arrival_block_height=0)
+        # Build a block whose stored-byte total is ~= MAX_BLOCK_TOTAL_BYTES
+        # by stuffing many message txs.  ~2300 B/tx × 90 ≈ 207 KB,
+        # comfortably over 200 KB.
+        alice_block_txs = [
+            create_transaction(
+                self.alice, f"x{n:03d}",
+                fee=200, nonce=n,
+            )
+            for n in range(90)
+        ]
+        from messagechain.config import MAX_BLOCK_TOTAL_BYTES
+        stored_total = sum(len(t.to_bytes()) for t in alice_block_txs)
+        self.assertGreater(
+            stored_total, MAX_BLOCK_TOTAL_BYTES,
+            "test setup expects Alice's stored-byte total to actually "
+            "exhaust the unified Tier-18 budget so excuse #1 has a real "
+            "constraint to invoke.",
+        )
+        block = _FakeBlock(message_txs=alice_block_txs)
+        h = POST_T34 + 5
+        ok, _reason = check_forced_inclusion(block, self.pool, h)
+        self.assertTrue(
+            ok,
+            "When stored bytes really do exhaust MAX_BLOCK_TOTAL_BYTES, "
+            "excuse #1 must fire — otherwise the proposer is being "
+            "punished for a real space constraint.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
