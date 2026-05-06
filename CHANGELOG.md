@@ -4,6 +4,150 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.3] — 2026-05-06
+
+Patch release.  Audit round 25 top-3 partial ships -- two bugfixes,
+one structural finding (incremental ``compute_active_supply`` for
+year-50/100 full-node-accessibility) deferred to a dedicated cycle
+because the safe shape (running scalar maintained across 38+ balance/
+staked/``bump_active`` mutation sites + bucketed taper-aging) exceeds
+a single audit-cycle's risk budget.  Pre-fix the consensus rule
+``compute_active_supply`` is height-pure -- any future O(1)
+implementation that returns identical values is consensus-safe, so
+the deferral does not foreclose the future fix.  No new tier, no
+new wire format, no new CLI surface.
+
+### Fixed
+
+  * **Forced-inclusion ``_is_includable`` callback was hard-coded to
+    the message-only ``validate_transaction``, silently disabling the
+    Tier 34 / Tier 43 multi-list censorship gate for every non-message
+    forced tx kind.**  Tier 34/43 brought non-message tx kinds
+    (Transfer, Vote, Proposal, SetAuthorityKey, KeyRotation,
+    CensorshipEvidence, NonResponseEvidence, ...) under the attester-
+    enforced forced-inclusion gate.  The gate uses an
+    ``is_includable(tx)`` callback as the proposer-time validity
+    oracle (excuse #4: "tx is no longer includable").  The production
+    wiring on ``messagechain/network/node.py``'s
+    ``_maybe_attest_accepted_block`` was
+
+        def _is_includable(tx) -> bool:
+            ok, _reason = self.blockchain.validate_transaction(tx)
+            return ok
+
+    ``Blockchain.validate_transaction`` is hard-coded to
+    ``MessageTransaction`` semantics -- it reads ``tx.message``, calls
+    the message-only ``verify_transaction``, and references
+    ``self.public_keys[tx.entity_id]`` under message-tx assumptions.
+    Every non-message forced tx therefore returned False (or raised
+    ``AttributeError`` -> False), and the gate excused the omission as
+    "no longer includable" -- silently re-opening the exact attack
+    surface Tier 34/43 claimed to close.
+
+    Concrete failure mode: a colluding proposer drops a forced
+    governance Vote / Transfer / SetAuthorityKey / censorship-evidence
+    tx that has waited >= ``FORCED_INCLUSION_WAIT_BLOCKS`` and is
+    paying high fee-per-byte.  Honest attesters call
+    ``_is_includable(forced_tx)`` -> ``validate_transaction(forced_tx)``
+    -> False, excused.  Block passes the attester gate without slash.
+    Live on mainnet since Tier 34 activation (height 1498); CLAUDE.md
+    anchor explicitly requires "a tx that is well-formed, pays at
+    least the per-byte floor, and fits the byte budget cannot be
+    suppressed by anything weaker than a full validator-set majority
+    actively colluding."  Pre-fix the suppression took exactly one
+    proposer, with no risk surface for any non-message tx kind.
+
+    Fix: add ``Blockchain.validate_forced_includable_tx(tx)`` as the
+    single chokepoint.  Dispatches per-kind via ``isinstance`` to the
+    right validator (``validate_transaction`` for Message,
+    ``validate_transfer_transaction`` for Transfer,
+    ``validate_key_rotation`` /
+    ``validate_set_authority_key`` / ``validate_revoke`` /
+    ``validate_set_receipt_subtree_root`` /
+    ``validate_slash_transaction`` /
+    ``validate_censorship_evidence_tx`` /
+    ``validate_non_response_evidence_tx`` for the others).  Tx kinds
+    without a stateful re-validator on Blockchain (Stake / Unstake /
+    Governance / React) return ``(True, ...)`` -- the gate's purpose
+    is to EXCUSE omissions where chain state moved on, not to
+    authorize them.  Without a stateful check the conservative
+    default is "still valid," which forces the proposer to either
+    include the forced tx or face the censorship vote.  Same default
+    for an unrecognized tx kind.
+
+    Soft-fix: attester-side validity oracle only, no consensus rule
+    change at the block validator.  No new tier, no new wire format.
+    Two-validator coordinated upgrade.  Pre-fork heights replay
+    byte-identically because the gate's input set was already empty
+    for non-message kinds in the pre-Tier-43 single-pool path; post-
+    Tier-43 the gate now consults the right per-kind validator for
+    kinds that were already in scope but silently excused.  6 new
+    regression tests in
+    ``tests/test_forced_inclusion_includable_per_kind.py`` including a
+    source-level pin that
+    ``node.py:_maybe_attest_accepted_block`` wires its
+    ``_is_includable`` through the new dispatcher (so the wrapping
+    doesn't drift back to the bug-shape on the next refactor).
+    Surfaced by audit r25 top-3 #1.  (050db6e)
+
+  * **``Mempool.get_fee_estimate`` was missing the ``target_blocks``
+    kwarg the auto-fee path passes -- urgency knob silently dead on
+    every quote.**  The auto-fee path on the server side calls
+
+        mempool.get_fee_estimate(
+            message_bytes=quoting_bytes, target_blocks=target_blocks,
+        )
+
+    but ``Mempool.get_fee_estimate`` was declared as
+    ``(self, message_bytes: int = 0)`` -- no ``target_blocks`` kwarg.
+    The server wrapped the call in ``try/except TypeError`` and
+    silently fell back to the median (50th percentile) on every quote.
+    The urgency field was echoed in the result dict for display (so
+    the CLI ``messagechain send --urgency high`` LOOKED like it
+    bound) but never reached the bid: every "high" / "normal" / "low"
+    quote returned the same number.
+
+    Today's empty mempool hides the bug -- median \approx
+    ``MARKET_FEE_FLOOR`` on a quiet chain, so all rungs collapse to
+    the floor.  The moment real congestion arrives the regression
+    bites: every "high"-urgency user silently underbids and stalls in
+    the queue, and every "low"-urgency user overpays.  CLAUDE.md
+    anchor: "Auto-fee defaults adjust to fit this model.  When the
+    fee model shifts, every auto-fee path shifts with it -- don't
+    leave a tx kind defaulting to a stale flat fee while others
+    auto-bid by density."
+
+    Fix: add ``target_blocks: int = 3`` (kw-only) to
+    ``Mempool.get_fee_estimate`` and apply the same percentile ladder
+    the ``FeeEstimator`` (recent-blocks path) uses, so a wallet
+    picking the auto-fee urgency rung gets the same shape regardless
+    of which estimator backs the quote:
+
+        target_blocks=1   -> 90th percentile (high urgency)
+        target_blocks=2-3 -> 75th percentile (normal, default)
+        target_blocks=4-5 -> 60th percentile
+        target_blocks=6-10-> 25th percentile
+        target_blocks>=11 -> 10th percentile (low urgency)
+
+    Default of 3 matches ``DEFAULT_URGENCY = "normal"`` in
+    ``messagechain/economics/auto_fee.py``.  The server-side
+    ``try/except TypeError`` fallback is no longer load-bearing -- the
+    kwarg is now part of the signature.  Removing the fallback closes
+    the silent regression and ensures any future signature drift
+    surfaces as a real test/lint failure rather than re-disabling the
+    urgency knob.
+
+    No fork.  Wallet/CLI helper change only; consensus selection still
+    ranks by fee/byte at apply time.  Two upstream tests that mocked
+    ``Mempool.get_fee_estimate`` with bare
+    ``lambda message_bytes=0: 1`` are updated to also accept the
+    kw-only ``target_blocks`` (the lambda shape now matches the
+    production signature).  4 new regression tests in
+    ``tests/test_mempool_fee_estimate_target_blocks.py`` including a
+    source-level pin that ``server.py`` both passes ``target_blocks``
+    and no longer carries the dead ``except TypeError`` block around
+    the estimator call.  Surfaced by audit r25 top-3 #3.  (46943ce)
+
 ## [1.58.2] — 2026-05-06
 
 Patch release.  Audit round 24 top-3 ships, all bugfixes -- one
