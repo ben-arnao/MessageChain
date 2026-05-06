@@ -1604,8 +1604,18 @@ class Node(SharedRuntimeMixin):
         proposer-time validity oracle: a tx whose nonce has moved on
         (or whose sender lacks balance, or whose signature no longer
         verifies) is a valid excuse for omission.  We delegate to the
-        blockchain's own validate_transaction so the attester and the
-        proposer agree on what "includable right now" means.
+        blockchain's own per-kind validity dispatcher so the gate
+        consults the right validator for each forced tx kind.
+
+        Audit r25 #1: routing through `validate_transaction` directly
+        was wrong — that validator is message-only and returned False
+        for every non-message forced tx (Transfer, Vote, Proposal,
+        Authority change, censorship evidence, ...), which the gate
+        excused as "no longer includable" — silently letting a
+        colluding proposer drop high-fpb forced txs of any non-message
+        kind without producing slashable evidence.  Always route
+        through `validate_forced_includable_tx` so the gate sees the
+        right per-kind result.
         """
         # Only registered validators attest.  A node that hasn't
         # staked has no vote to cast.
@@ -1630,7 +1640,7 @@ class Node(SharedRuntimeMixin):
             return
 
         def _is_includable(tx) -> bool:
-            ok, _reason = self.blockchain.validate_transaction(tx)
+            ok, _reason = self.blockchain.validate_forced_includable_tx(tx)
             return ok
 
         att = attest_block_if_allowed(

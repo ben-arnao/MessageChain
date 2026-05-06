@@ -3443,6 +3443,105 @@ class Blockchain:
 
         return True, "Valid"
 
+    def validate_forced_includable_tx(self, tx) -> tuple[bool, str]:
+        """Per-kind validity oracle for forced-inclusion's `is_includable`.
+
+        The attester-enforced forced-inclusion gate (Tier 34/43) walks
+        every block tx-list field and asks "is this forced tx still
+        valid to include given current chain state?" via the
+        `is_includable` callback (excuse #4).  The pre-fix wiring on
+        `node.py` routed the callback through `validate_transaction`,
+        which is hard-coded to MessageTransaction semantics — so every
+        non-message forced tx returned False and the gate excused the
+        omission, silently letting a colluding proposer drop ANY non-
+        message forced tx (governance Vote, Transfer, Authority change,
+        censorship evidence, ...) without producing slashable evidence.
+        That breaks the CLAUDE.md anchor "a tx that pays the per-byte
+        floor cannot be suppressed by anything weaker than a full
+        validator-set majority actively colluding."
+
+        This dispatcher is the single chokepoint that fans out to the
+        right per-kind validator.  Tx kinds without a stateful re-
+        validator (Stake / Unstake / Governance / React) return
+        (True, ...) — the gate's purpose is to EXCUSE omissions where
+        chain state moved on (nonce, balance, signature), not to
+        authorize them.  Without a stateful check the conservative
+        default is "still valid," which forces the proposer to either
+        include the forced tx or face the censorship vote.  Same
+        rationale for an unrecognized tx kind.
+        """
+        # Already-imported kinds at module scope.
+        if isinstance(tx, MessageTransaction):
+            return self.validate_transaction(tx)
+        if isinstance(tx, TransferTransaction):
+            return self.validate_transfer_transaction(tx)
+        if isinstance(tx, KeyRotationTransaction):
+            return self.validate_key_rotation(tx)
+        if isinstance(tx, SetAuthorityKeyTransaction):
+            return self.validate_set_authority_key(tx)
+        if isinstance(tx, RevokeTransaction):
+            return self.validate_revoke(tx)
+        if isinstance(tx, SetReceiptSubtreeRootTransaction):
+            return self.validate_set_receipt_subtree_root(tx)
+        if isinstance(tx, SlashTransaction):
+            return self.validate_slash_transaction(tx)
+
+        # Lazy imports for kinds whose modules aren't already loaded at
+        # blockchain.py module scope.  Each block is self-contained so a
+        # missing optional module degrades to "fall through to default."
+        try:
+            from messagechain.consensus.censorship_evidence import (
+                CensorshipEvidenceTx,
+            )
+            if isinstance(tx, CensorshipEvidenceTx):
+                return self.validate_censorship_evidence_tx(tx)
+        except ImportError:
+            pass
+
+        try:
+            from messagechain.consensus.non_response_evidence import (
+                NonResponseEvidenceTx,
+            )
+            if isinstance(tx, NonResponseEvidenceTx):
+                return self.validate_non_response_evidence_tx(tx)
+        except ImportError:
+            pass
+
+        # Kinds without a stateful re-validator on Blockchain.  They
+        # passed admission-time validation at submit; the gate excuses
+        # only state-moved-on omissions, so default to includable.
+        try:
+            from messagechain.governance.governance import (
+                ProposalTransaction, VoteTransaction, TreasurySpendTransaction,
+            )
+            if isinstance(
+                tx, (ProposalTransaction, VoteTransaction, TreasurySpendTransaction),
+            ):
+                return True, "governance tx — admission-time validation suffices"
+        except ImportError:
+            pass
+
+        try:
+            from messagechain.core.staking import (
+                StakeTransaction, UnstakeTransaction,
+            )
+            if isinstance(tx, (StakeTransaction, UnstakeTransaction)):
+                return True, "stake tx — admission-time validation suffices"
+        except ImportError:
+            pass
+
+        try:
+            from messagechain.core.reaction import ReactTransaction
+            if isinstance(tx, ReactTransaction):
+                return True, "react tx — admission-time validation suffices"
+        except ImportError:
+            pass
+
+        # Unrecognized kind — same reasoning: the gate forbids excusing
+        # an omission without a concrete stateful reason, so default to
+        # includable.
+        return True, "unrecognized tx kind — admission-time validation suffices"
+
     def _recipient_is_new(
         self,
         recipient_id: bytes,
