@@ -118,11 +118,59 @@ _BLOCK_TX_LIST_ATTRS: tuple[str, ...] = (
 )
 
 
+# Tx-list fields whose stored bytes / counts the BLOCK VALIDATOR's caps
+# actually account for.  The Tier-18 unified-budget check at
+# ``blockchain.validate_block`` (and the tx-count cap at the same site)
+# sums message + transfer + react and ignores every other kind in
+# ``_BLOCK_TX_LIST_ATTRS`` — those kinds are bounded by their own
+# admission rules, not by ``MAX_BLOCK_TOTAL_BYTES`` / ``MAX_TXS_PER_BLOCK``.
+#
+# The forced-inclusion gate's ``used_bytes`` / ``used_count`` /
+# per-entity tallies must use this narrower set: a colluding proposer
+# who pads the block with their own stake / governance / authority /
+# evidence bytes does NOT raise the binding constraint at the validator,
+# so the gate must not excuse omission of a forced tx on a constraint
+# the validator never enforces.  Inclusion-recognition still walks
+# ``_BLOCK_TX_LIST_ATTRS`` (a forced tx in any kind-slot is recognized).
+_VALIDATOR_BUDGET_ATTRS: tuple[str, ...] = (
+    "transactions",
+    "transfer_transactions",
+    "react_transactions",
+)
+
+
 def _iter_all_block_txs(block):
     """Yield every tx across known block tx-list fields."""
     for attr in _BLOCK_TX_LIST_ATTRS:
         for tx in getattr(block, attr, None) or ():
             yield tx
+
+
+def _iter_validator_budget_txs(block):
+    """Yield txs from kinds the validator's byte / count caps account for."""
+    for attr in _VALIDATOR_BUDGET_ATTRS:
+        for tx in getattr(block, attr, None) or ():
+            yield tx
+
+
+def _is_message_tx(tx) -> bool:
+    """True iff `tx` is a MessageTransaction.
+
+    The block validator's per-entity cap (``MAX_TXS_PER_ENTITY_PER_BLOCK``)
+    is enforced ONLY against ``block.transactions`` — every other kind
+    is admitted under its own rules without a per-entity-per-block cap.
+    The forced-inclusion gate's per-entity tally and excuse-#3 path
+    must therefore key on message-only too: a forced non-message tx is
+    never excusable on per-entity-cap grounds, and same-entity
+    non-message volume in the block does not legitimize omitting a
+    forced message of the same sender.
+
+    Imported lazily to avoid a circular import — this module is loaded
+    by ``messagechain.consensus`` initialization, which transitively
+    pulls ``messagechain.core``.
+    """
+    from messagechain.core.transaction import MessageTransaction
+    return isinstance(tx, MessageTransaction)
 
 
 def _entity_id_of(tx) -> bytes | None:
@@ -270,20 +318,36 @@ def check_forced_inclusion(
     # touched on the consensus path).
     entity_block_txs: dict[bytes, list] = {}
     if use_multi_list:
-        # Tier 34: walk every known block tx-list field so a forced tx
-        # placed in its correct slot (e.g. a TransferTransaction in
-        # `block.transfer_transactions`) is recognized as included,
-        # not flagged as censored.  Byte budget uses stored bytes
-        # (matching the mempool's fee-per-byte ranking axis).
+        # Tier 34: inclusion-recognition walks every known block
+        # tx-list field so a forced tx placed in its correct slot
+        # (e.g. a TransferTransaction in `block.transfer_transactions`)
+        # is recognized as included, not flagged as censored.
         included_hashes = {
             tx.tx_hash for tx in _iter_all_block_txs(block)
         }
+        # Audit r26 #1: ``used_bytes`` / ``used_count`` / per-entity
+        # tallies key on the kind-set the BLOCK VALIDATOR's caps
+        # actually account for (message + transfer + react for byte
+        # and count caps; message-only for the per-entity cap).
+        # Pre-fix the gate walked all 9 kinds in `_BLOCK_TX_LIST_ATTRS`
+        # — letting a colluding proposer pad the block with stake /
+        # governance / authority / evidence bytes until the gate's
+        # tally tripped excuse #1 or excuse #3 while the validator's
+        # narrower axis stayed comfortably under cap, silently
+        # excusing the omission of any forced tx.  CLAUDE.md anchor:
+        # "a tx that pays at least the per-byte floor and fits the
+        # byte budget cannot be suppressed by anything weaker than a
+        # full validator-set majority" — pre-fix the suppression
+        # took one proposer with no slashable trail.
         used_bytes = sum(
-            _stored_bytes_of(tx) for tx in _iter_all_block_txs(block)
+            _stored_bytes_of(tx) for tx in _iter_validator_budget_txs(block)
         )
-        used_count = sum(1 for _ in _iter_all_block_txs(block))
+        used_count = sum(1 for _ in _iter_validator_budget_txs(block))
+        # Per-entity cap is message-only at the validator —
+        # `block.transactions` is the only list it iterates for the
+        # `entity_msg_counts` check.
         entity_counts: dict[bytes, int] = {}
-        for tx in _iter_all_block_txs(block):
+        for tx in block.transactions:
             eid = _entity_id_of(tx)
             if eid is not None:
                 entity_counts[eid] = entity_counts.get(eid, 0) + 1
@@ -347,8 +411,17 @@ def check_forced_inclusion(
             continue
 
         # Valid excuse #3: per-entity cap reached for this tx's sender.
+        # Audit r26 #1: only applies when the FORCED tx itself is a
+        # message — the block validator's per-entity cap is enforced
+        # only against ``block.transactions`` at validate_block, so a
+        # forced non-message tx (transfer / governance / etc.) has no
+        # validator-level per-entity cap that could legitimize its
+        # omission.  Without this gate a colluding proposer could
+        # excuse omitting any forced non-message tx by stacking
+        # same-entity messages — a constraint the validator never
+        # enforces.
         ftx_eid = _entity_id_of(ftx)
-        if ftx_eid is not None:
+        if ftx_eid is not None and _is_message_tx(ftx):
             if apply_entity_cap_fix:
                 # Tier 37: only same-entity block txs at >= the forced
                 # tx's fpb count toward the cap.  Same-entity block txs

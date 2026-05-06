@@ -261,18 +261,32 @@ class TestTransferInclusionRecognition(unittest.TestCase):
 
 
 class TestMultiListPerEntityCap(unittest.TestCase):
-    """Per-entity inclusion cap counts tx contributions from EVERY
-    tx-list field, not just `block.transactions`."""
+    """Per-entity inclusion cap mirrors the BLOCK VALIDATOR's
+    per-entity cap, which is message-only at validate_block (the
+    `entity_msg_counts` walk iterates only `block.transactions`).
+
+    Audit r26 #1 corrected the original Tier 34 implementation here:
+    pre-fix the gate counted same-entity contributions across every
+    kind in `_BLOCK_TX_LIST_ATTRS`, letting a colluding proposer
+    legitimately stack same-entity transfers / governance txs (kinds
+    the validator never per-entity-caps) and use that volume to
+    excuse omitting a same-entity forced message.  The validator
+    would have admitted the forced message just fine — the suppression
+    took one proposer with no slashable trail.  Fix re-keys the
+    gate's per-entity tally on `block.transactions` only, matching
+    the validator's actual cap.
+    """
 
     def setUp(self):
         self.alice = Entity.create(b"t34c-alice".ljust(32, b"\x00"))
         self.bob = Entity.create(b"t34c-bob".ljust(32, b"\x00"))
         self.pool = Mempool(max_size=100, fee_policy=_STATIC_FEE)
 
-    def test_post_tier_34_per_entity_count_includes_transfers(self):
-        """A forced message tx whose sender already has
-        MAX_TXS_PER_ENTITY_PER_BLOCK transfers in the same block is
-        excused — the per-entity cap binds across both lists."""
+    def test_post_tier_34_per_entity_count_is_message_only(self):
+        """A forced message tx whose sender has many TRANSFERS in the
+        block is NOT excused — the validator's per-entity cap is
+        message-only, so transfer volume cannot legitimize omission
+        of a forced message of the same sender."""
         from messagechain.config import MAX_TXS_PER_ENTITY_PER_BLOCK
         # Stack alice's quota worth of transfers in transfer_transactions.
         xfers = [
@@ -280,22 +294,22 @@ class TestMultiListPerEntityCap(unittest.TestCase):
                        fee=_BASE_FEE, nonce=n)
             for n in range(MAX_TXS_PER_ENTITY_PER_BLOCK)
         ]
-        # Now push a forced message from alice to the mempool — quota-
-        # exceeding so excuse #3 (per-entity cap reached) must fire.
+        # Forced message from alice — pre-fix excuse #3 fired against
+        # the cross-list tally; post-fix the gate keys on alice's
+        # MESSAGE count in the block (= 0), no excuse applies.
         forced_msg = _make_msg(
             self.alice, fee=_BASE_FEE,
             nonce=MAX_TXS_PER_ENTITY_PER_BLOCK,
         )
         self.pool.add_transaction(forced_msg, arrival_block_height=0)
-        # Block contains alice's transfers but NOT the forced message.
         block = _FakeBlock(transfer_txs=xfers)
         h = POST_T34 + 5
         ok, reason = check_forced_inclusion(block, self.pool, h)
-        self.assertTrue(
+        self.assertFalse(
             ok,
-            f"Post-Tier-34: per-entity cap must count transfers in the "
-            f"tally so a forced quota-exceeding message is properly "
-            f"excused: reason={reason!r}",
+            f"Post-Tier-34 (audit r26 #1): per-entity cap is message-only; "
+            f"transfers in the block must NOT excuse omitting a forced "
+            f"message of the same sender.  reason={reason!r}",
         )
 
 
