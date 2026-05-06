@@ -193,11 +193,18 @@ class TestTreasuryExcludedFromActiveSupply(unittest.TestCase):
         self.s.bump_active(self.TREASURY, self.h)
         self.assertEqual(self.s.compute_active_supply(self.h), 0)
 
-    def test_founder_plus_treasury_at_target_still_yields_gap(self):
+    def test_founder_plus_treasury_at_target_yields_zero_gap(self):
         # The exact mainnet shape at Tier-47 activation: founder=100M,
-        # treasury=40M, sum=GENESIS_SUPPLY=TARGET.  Without the fix,
-        # gap=0 and controller mints 0.  With the fix, treasury drops
-        # out, active_supply=100M, gap=40M, controller mints non-zero.
+        # treasury=40M.  ``compute_active_supply`` skips treasury, so
+        # active_supply=100M=TARGET (post-r24-retune), gap=0,
+        # controller mints zero.
+        #
+        # Pre-r24 the TARGET was 140M and this test asserted the
+        # opposite — gap=40M and a non-zero perma-mint.  See
+        # ``test_dormancy_target_active_supply_retune`` for the
+        # rationale: TARGET aligned to the active-supply definition
+        # is the anchored shape; the perma-mint was a definitional
+        # mismatch surfaced by audit r24 top-3 #1.
         founder = b"F" * 32
         self.s.balances = {founder: 100_000_000, self.TREASURY: 40_000_000}
         self.s.bump_active(founder, self.h)
@@ -205,12 +212,11 @@ class TestTreasuryExcludedFromActiveSupply(unittest.TestCase):
         active = self.s.compute_active_supply(self.h)
         self.assertEqual(active, 100_000_000)
         gap = DORMANCY_TARGET_ACTIVE_SUPPLY - active
-        self.assertEqual(gap, 40_000_000)
-        # Controller must mint a positive amount, not zero.
-        issuance = self.s.compute_dormancy_issuance(self.h)
-        self.assertGreater(issuance, 0)
-        # And it should be capped at the per-block ceiling.
-        self.assertLessEqual(issuance, DORMANCY_MAX_ISSUANCE_PER_BLOCK)
+        self.assertEqual(gap, 0)
+        # Controller mints zero — the chain is at-target.  Real
+        # dormancy or burns will open the gap and the controller
+        # will refill, but at activation the gap is closed.
+        self.assertEqual(self.s.compute_dormancy_issuance(self.h), 0)
 
     def test_treasury_excluded_alongside_other_holders(self):
         # Mixed: a regular holder + treasury, both active.  Active supply

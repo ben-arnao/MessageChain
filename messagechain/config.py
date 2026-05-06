@@ -3150,10 +3150,35 @@ DORMANCY_WINDOW_BLOCKS = 1_314_000
 DORMANCY_TAPER_BLOCKS = 131_400
 
 # Target nominal active supply — the value the controller targets
-# forever.  Set to GENESIS_SUPPLY (140M) so the chain's active-supply
-# economic constant aligns with its founding parameter.  Governance
-# may retune via a future fork; the fixed-target shape is anchored.
-DORMANCY_TARGET_ACTIVE_SUPPLY = 140_000_000
+# forever.  Set to ``GENESIS_SUPPLY - TREASURY_ALLOCATION = 100M`` so
+# the TARGET aligns with ``compute_active_supply``'s definition: the
+# active-supply measure skips ``TREASURY_ENTITY_ID`` (treasury is
+# governance state, not a live economic user — see the rationale in
+# ``inflation.compute_active_supply``), so the controller's TARGET
+# must use the same definition or the gap perma-binds at one of the
+# extremes.  At mainnet activation (founder=100M + treasury=40M, both
+# stamped active by the one-shot backfill), active=100M=TARGET, gap=0,
+# controller mints zero — and only mints as real dormancy or burns
+# open the gap, exactly as the "stable active supply" anchor intends.
+#
+# Pre-retune (1.58.1) value was 140M = GENESIS_SUPPLY: at activation
+# active=100M (treasury excluded), gap=40M, raw_issuance=2000/block,
+# clamped to MAX=500/block — the controller pegged at MAX for ~60K
+# blocks (~1.14 yr) until the founder's balance grew to ~130M, at
+# which point convergence began.  ~30M new tokens were minted over
+# the bind window, ~99.99% of which would have accrued to the founder
+# via the sole-proposer share + stake-pro-rata attester pool, ratchet-
+# ing founder concentration 71.4% → 79.2% — the *opposite* direction
+# the stake-concentration soft-cap and founder-handoff anchors want.
+# Surfaced by audit r24 top-3 #1.
+#
+# Pure constant retune; no consensus-shape change.  Rides under the
+# existing Tier 47 height — pre-fork heights replay byte-identically
+# because ``compute_dormancy_issuance`` is height-gated and Tier 47
+# has not yet activated on mainnet at edit time, so no historical
+# block-replay output changes.  Governance may retune via a future
+# fork; the fixed-target shape is anchored.
+DORMANCY_TARGET_ACTIVE_SUPPLY = 100_000_000
 
 # Controller gain.  Per-block issuance = gap * K_NUM // K_DEN, where
 # gap = TARGET - active_supply.  K = 1/20_000 chosen so the controller
