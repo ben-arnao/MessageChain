@@ -67,6 +67,9 @@ from messagechain.consensus.slashing import (
     SlashTransaction as SlashTx, verify_slashing_evidence, verify_attestation_slashing_evidence,
     SlashingEvidence, AttestationSlashingEvidence,
 )
+from messagechain.consensus.finality import (
+    FinalityVote, verify_finality_vote,
+)
 from messagechain.consensus.equivocation_watcher import EquivocationWatcher
 from messagechain.network.ban import (
     PeerBanManager, OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX, OFFENSE_MINOR,
@@ -4185,6 +4188,17 @@ class Server(SharedRuntimeMixin):
             max_count=MAX_TXS_PER_BLOCK,
         )
 
+        # Drain pooled FinalityVotes from gossip.  Without this drain
+        # Server's proposed block carries no votes regardless of mempool
+        # contents, so the finality-vote inclusion reward is never
+        # earned and the 2/3-stake commitment toward block finality
+        # never advances on the production path.  Twin of the same
+        # drain in messagechain/network/node.py:_try_produce_block.
+        from messagechain.config import MAX_FINALITY_VOTES_PER_BLOCK
+        fin_votes = self.mempool.get_finality_votes(
+            MAX_FINALITY_VOTES_PER_BLOCK,
+        )
+
         # Drain in-memory attestations for the parent block so the
         # produced block carries the chain's permanent record of who
         # attested.  Without this drain, attestations live entirely in
@@ -4223,6 +4237,7 @@ class Server(SharedRuntimeMixin):
                 governance_txs=governance_txs,
                 react_transactions=react_txs,
                 censorship_evidence_txs=ce_txs,
+                finality_votes=fin_votes,
                 attestations=parent_attestations,
             )
 
@@ -4237,6 +4252,13 @@ class Server(SharedRuntimeMixin):
             if react_txs:
                 self.mempool.remove_react_transactions(
                     [r.tx_hash for r in react_txs]
+                )
+            if fin_votes:
+                # Drop the included votes from the gossip pool so they
+                # don't keep getting re-proposed every block.  Twin of
+                # the same drain in messagechain/network/node.py.
+                self.mempool.remove_finality_votes(
+                    [v.consensus_hash() for v in fin_votes]
                 )
             # Tier 43: arrival-height tracker is keyed by tx_hash
             # across ALL four server pools, so every drain path must
@@ -4961,6 +4983,9 @@ class Server(SharedRuntimeMixin):
         elif msg.msg_type == MessageType.ANNOUNCE_SLASH:
             await self._handle_announce_slash(msg.payload, peer)
 
+        elif msg.msg_type == MessageType.ANNOUNCE_FINALITY_VOTE:
+            await self._handle_announce_finality_vote(msg.payload, peer)
+
         elif msg.msg_type == MessageType.ANNOUNCE_PENDING_TX:
             self._handle_announce_pending_tx(msg.payload, peer)
 
@@ -5140,6 +5165,83 @@ class Server(SharedRuntimeMixin):
         added = self.mempool.add_slash_transaction(slash_tx)
         if added:
             relay_msg = NetworkMessage(MessageType.ANNOUNCE_SLASH, payload)
+            await self._broadcast(relay_msg)
+
+    async def _handle_announce_finality_vote(self, payload: dict, peer: Peer):
+        """Handle incoming FinalityVote gossip on the production runtime.
+
+        Twin of ``messagechain/network/node.py:_handle_announce_finality_vote``
+        — pre-fix Server had no handler at all, so every gossiped
+        finality vote was treated as ``unhandled_msg_type`` (source
+        peer accruing a protocol-violation strike), and the
+        ``FinalityCheckpoints.add_vote`` path that detects double-
+        finality-vote equivocation only ever saw votes folded into
+        already-applied blocks.  Net consequence on mainnet: the
+        FinalityVote-layer auto-slasher's accumulator stayed empty,
+        and the fork-emergency detector's earliest signal arrived
+        only after the network had already extended the wrong tip
+        with attestations on top.
+
+        Steps mirror Node:
+          1. Deserialize the vote (malformed → ban-score and drop).
+          2. Reject votes from unknown / revoked / slashed signers.
+          3. Verify the WOTS+ signature against the on-chain pubkey.
+          4. Feed the verified vote into the fork-emergency detector
+             via ``blockchain.observe_finality_vote`` BEFORE pooling,
+             so emergencies surface even when a duplicate gossip path
+             dedupes the pool insert.
+          5. Take the auto-recovery shot — full nodes only; the gate
+             inside the helper is what keeps staked validators halted
+             rather than auto-flipping.
+          6. Pool the vote in mempool's ``finality_pool`` so the next
+             block this validator proposes carries it (the inclusion
+             reward earned by the proposer is what incentivises
+             validators to gossip-collect votes in the first place).
+          7. Relay on first sight (deduped by mempool insert).
+        """
+        try:
+            vote = FinalityVote.deserialize(payload)
+        except Exception:
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_PROTOCOL_VIOLATION,
+                "invalid_finality_vote_data",
+            )
+            return
+
+        if vote.signer_entity_id not in self.blockchain.public_keys:
+            return
+        if vote.signer_entity_id in self.blockchain.revoked_entities:
+            return
+        if vote.signer_entity_id in self.blockchain.slashed_validators:
+            return
+
+        pk = self.blockchain.public_keys[vote.signer_entity_id]
+        if not verify_finality_vote(vote, pk):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX, "invalid_finality_vote_sig",
+            )
+            return
+
+        # Detector feed BEFORE pool insert: see _handle_announce_finality_vote
+        # in Node for the rationale (duplicate-pool returns False but the
+        # detector hasn't necessarily seen this signer at this height yet).
+        try:
+            self.blockchain.observe_finality_vote(vote)
+        except Exception:
+            logger.exception("fork-emergency observe_finality_vote failed")
+
+        # Auto-recovery shot for full nodes — staked validators stay
+        # halted (the gate is inside _maybe_auto_recover_from_fork_emergency).
+        try:
+            self._maybe_auto_recover_from_fork_emergency()
+        except Exception:
+            logger.exception("fork-emergency auto-recovery raised")
+
+        added = self.mempool.add_finality_vote(vote)
+        if added:
+            relay_msg = NetworkMessage(
+                MessageType.ANNOUNCE_FINALITY_VOTE, payload,
+            )
             await self._broadcast(relay_msg)
 
     # ── inv/getdata relay ──────────────────────────────────────────
