@@ -4,6 +4,164 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.6] — 2026-05-06
+
+Patch release.  Audit round 27 top-3 ships, all bugfixes: one
+censorship-resistance regression on the production attester runtime
+(server.py wired the forced-inclusion oracle to the message-only
+validator and silently excused every non-message forced-tx omission
+on every mainnet validator -- exact twin of the audit r25 fix in
+node.py, missed in the parallel codepath), one wallet-vs-consensus
+drift on the new-account transfer floor (auto-fee quoted 1001
+post-Tier-49 while the chain hard-codes 1100, breaking every CLI
+new-recipient transfer), and one CLI UX cliff (read / proposals
+truncated tx_hash / proposal_id below the 64-hex form react / vote /
+receipt / submit-evidence all hard-require, blocking the read-and-
+react / read-and-vote loop for any CLI-only user).  No new tier, no
+new wire format, no new CLI surface.
+
+### Fixed
+
+  * **``server.py:_maybe_attest_accepted_block`` wired the forced-
+    inclusion oracle to the message-only ``validate_transaction`` --
+    every non-message forced tx kind silently excused on every
+    mainnet validator.**  Twin of the audit r25 #1 fix in
+    ``messagechain/network/node.py:1642-1644`` (1.58.3); the
+    production validator runtime entered via
+    ``cli.py:cmd_run_validator -> from server import Server`` was
+    missed in that fix.  Pre-fix the ``_is_includable`` callback
+    on the Server class called ``self.blockchain.validate_transaction(tx)``,
+    which is hard-coded to ``MessageTransaction`` semantics (reads
+    ``tx.message``, references ``self.public_keys[tx.entity_id]``
+    under message-tx assumptions).  Every non-message forced tx --
+    Transfer, Vote, Proposal, KeyRotation, SetAuthorityKey,
+    CensorshipEvidence, NonResponseEvidence, Slash -- returned
+    ``(False, ...)`` from the oracle or raised ``AttributeError ->
+    False``, the gate triggered excuse #4 ("no longer includable"),
+    and honest server-running validators silently still attested
+    YES on the suppressing block.
+
+    Concrete failure mode: a colluding proposer drops a forced
+    governance Vote, Transfer, SetAuthorityKey, or
+    CensorshipEvidence tx that has waited >=
+    ``FORCED_INCLUSION_WAIT_BLOCKS`` and pays high fee-per-byte.
+    Honest attesters (every mainnet validator) call
+    ``_is_includable(forced_tx) -> validate_transaction(forced_tx)
+    -> False``, excused.  Block passes the attester gate without
+    slash.  CLAUDE.md anchor explicitly requires "a tx that is
+    well-formed, pays at least the per-byte floor, and fits the
+    byte budget cannot be suppressed by anything weaker than a
+    full validator-set majority actively colluding."  Pre-fix the
+    suppression took exactly one proposer, with no risk surface
+    for any non-message tx kind -- including suppression of the
+    very ``CensorshipEvidence`` tx that would have exposed the
+    cabal.  Live on mainnet from Tier 43 activation through 1.58.5
+    in the Server runtime path.
+
+    Fix mirrors the r25 wiring in ``node.py:1642-1644`` byte-for-
+    byte: swap ``self.blockchain.validate_transaction(tx)`` for
+    ``self.blockchain.validate_forced_includable_tx(tx)``.  The
+    dispatcher already lives on Blockchain (added 1.58.3) and
+    routes per-kind via ``isinstance`` to the right validator
+    (``validate_transaction`` for Message,
+    ``validate_transfer_transaction`` for Transfer, etc.); kinds
+    without a stateful re-validator return ``(True, ...)`` so an
+    honest proposer is forced to either include the forced tx or
+    face the censorship vote.  Soft-fix: attester-side validity
+    oracle only, no consensus rule change at the block validator.
+    No new tier, no new wire format.  Two-validator coordinated
+    upgrade.  New source-level pin in
+    ``tests/test_server_forced_inclusion_oracle_dispatch.py``
+    twins the existing node.py pin -- a future refactor cannot
+    drift back to the bug-shape silently on either codepath.
+    Surfaced by audit r27 top-3 #1.  (a815e85)
+
+  * **``auto_fee._transfer_floor`` underbids the chain by 99
+    tokens on every post-Tier-49 transfer to a brand-new
+    recipient -- silent rejection of the canonical "send tokens
+    to a new address" CLI flow.**  The wallet helper computed
+    ``_non_message_flat_floor(h) + NEW_ACCOUNT_FEE``, which post-
+    Tier-49 (``UNIFIED_FEE_FLOOR_HEIGHT = 1750``) collapses to
+    ``MARKET_FEE_FLOOR + NEW_ACCOUNT_FEE = 1 + 1000 = 1001``.
+    The consensus rule, however, has no Tier 49 height gate on
+    the new-account branch and remains a flat literal
+    ``MIN_FEE + NEW_ACCOUNT_FEE = 100 + 1000 = 1100`` at both
+    ``Blockchain.verify_transfer_transaction`` (admission-time)
+    and ``_validate_transfer_in_block`` (block-validation-time).
+
+    Result: every CLI/wallet ``messagechain transfer --to <new>``
+    that reached the auto-fee path quoted 1001; the validator
+    rejected with "Transfer to brand-new recipient requires
+    fee >= 1100 ...; got 1001."  The first end-to-end "send
+    tokens to a brand-new recipient" path documented in the
+    README + the operator-bootstrap doc was broken on every
+    mainnet node from the Tier 49 activation height (1750)
+    onward.  CLAUDE.md anchors: "auto-fee defaults adjust to fit
+    this model" + "token-as-tradable-asset quality bar -- wallet/
+    transfer/balance code held to mainstream-asset standards."
+    Pre-Tier-49 the wallet quote already happened to equal the
+    consensus literal (because ``_non_message_flat_floor(pre_fork)
+    == MIN_FEE``); the bug only bites post-Tier-49 when the
+    unified floor and the legacy ``MIN_FEE`` diverge.
+
+    Fix realigns the wallet quote with the consensus literal:
+    ``_transfer_floor(recipient_is_new=True)`` now returns
+    ``MIN_FEE + NEW_ACCOUNT_FEE`` directly.  No consensus rule
+    change, no fork: only the wallet/CLI surface shifts.  The
+    Tier 49 unification covers the *flat protocol baseline*
+    across non-message tx kinds for the regular-recipient path;
+    the ``NEW_ACCOUNT_FEE`` surcharge is a separate state-creation
+    tariff layered on the legacy ``MIN_FEE`` and was never
+    migrated.  Source-level pin in
+    ``tests/test_auto_fee_transfer_new_account_floor.py`` asserts
+    the chain source carries the literal ``MIN_FEE +
+    NEW_ACCOUNT_FEE`` so a future migration of the consensus
+    path to a unified Tier-N floor trips the pin and forces the
+    wallet quote to update in lockstep.  The pre-existing
+    ``tests/test_unified_fee_floor_tier49.py::test_transfer_new_account_surcharge_layers_on_top``
+    pinned the buggy shape (``MARKET_FEE_FLOOR + NEW_ACCOUNT_FEE``);
+    renamed to ``..._on_legacy_min_fee`` and updated to assert
+    the corrected literal at both pre- and post-Tier-49 heights.
+    Surfaced by audit r27 top-3 #2.  (aac599e)
+
+  * **``messagechain read`` truncated ``tx_hash`` to 12 chars and
+    ``messagechain proposals`` truncated ``proposal_id`` to 16,
+    while ``react`` / ``vote`` / ``receipt`` / ``submit-evidence``
+    all hard-require the full 64-hex form -- the canonical
+    "browse the feed, react / vote on a message-or-proposal" CLI
+    loop could not complete without round-tripping through the
+    web feed.**  Every command that consumes one of these hashes
+    rejected anything other than the full form: ``react --target
+    <tx>`` rejects with "target must be exactly 64 hex chars" at
+    ``cli.py:4881``; ``vote --proposal <id>`` calls
+    ``parse_hex(..., expected_len=32)`` which raises on anything
+    else; ``receipt <tx>`` and ``submit-evidence censorship
+    --receipt <bundle>`` both expect the full hash to compose the
+    bundle path.  Result: a CLI-only user (no browser, e.g.
+    operating over ``gcloud compute ssh`` or in an offline-air-
+    gapped sign workflow) could read the feed but could NOT
+    compose the next command without leaving the CLI to look up
+    the full hash on the web feed.  CLAUDE.md positioning anchor:
+    "decentralized reddit/twitter core" framing -- a feed where
+    you can read but cannot react / vote without leaving the CLI
+    is not actually social.  Principle #3 (Simplicity).
+
+    Fix preserves the truncated visual chip on the header line so
+    human-scanning the feed still works (12 chars is enough to
+    distinguish messages by eye), and adds a second indented line
+    carrying the full 64-hex hash on its own line so triple-click
+    + paste recovers the full form.  Same shape applied to
+    ``cmd_proposals``.  The ``prev`` pointer line is widened to
+    render the full prev hash inline (it was already on its own
+    line, so no visual disruption).  No CLI flag, no new surface,
+    no smart-defaults knob.  Pure output-format change; existing
+    scripts that grep for the truncated-prefix substring continue
+    to match (the full form is a superset of the prefix).  3 new
+    tests in ``tests/test_cli_read_proposals_full_hash.py``
+    asserting the full hash appears in the output of ``cmd_read``
+    (tx_hash + prev pointer) and ``cmd_proposals`` (proposal_id).
+    Surfaced by audit r27 top-3 #3.  (f3060f4)
+
 ## [1.58.5] — 2026-05-06
 
 Patch release.  Audit round 26 top-3 ships: one censorship-resistance
