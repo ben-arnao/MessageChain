@@ -4,6 +4,132 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.58.2] — 2026-05-06
+
+Patch release.  Audit round 24 top-3 ships, all bugfixes -- one
+mainnet-imminent issuance-curve retune gated to land before Tier 47
+activates (height 1710), one CLI security regression introduced by
+1.58.1's keyfile auto-pickup that silently signed personal-wallet
+commands with the validator hot-key on validator hosts, and one
+PENDING-receipt UX that pointed users at a deprecated submit-evidence
+stub instead of the live censorship-evidence form.  No new tier, no
+new wire format, no new CLI surface.
+
+### Fixed
+
+  * **Tier 47 dormancy controller would peg at MAX-cap and ratchet
+    founder concentration +7.8 pp once the Tier 47 fork activated.**
+    1.58.1 correctly excluded ``TREASURY_ENTITY_ID`` from
+    ``compute_active_supply`` -- but the controller's
+    ``DORMANCY_TARGET_ACTIVE_SUPPLY`` constant was left at ``140M``
+    (= ``GENESIS_SUPPLY`` = founder 100M + treasury 40M).  At
+    activation (height 1710) the active-supply measure (treasury
+    excluded) returns 100M, gap = ``140M - 100M = 40M``,
+    ``raw_issuance = 40M / 20_000 = 2000`` tokens/block, clamped to
+    ``DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500``.  The cap binds for
+    ~60K blocks (~1.14 yr) until the founder's balance grows to
+    ~130M, at which point convergence begins.  Net flow over the
+    bind window: ~30M new tokens, ~99.99% of which accrue to the
+    founder via the sole-proposer share + stake-pro-rata attester
+    pool, ratcheting founder concentration 71.4% -> 79.2% -- the
+    *opposite* direction the stake-concentration soft-cap and
+    founder-handoff anchors want.  Pre-1.58.2 the constant was
+    set to match ``GENESIS_SUPPLY`` so "the chain's active-supply
+    economic constant aligns with its founding parameter"; that
+    framing predates the 1.58.1 treasury-exclusion fix and stopped
+    being correct the moment ``compute_active_supply`` skipped the
+    treasury.
+
+    Fix: retune ``DORMANCY_TARGET_ACTIVE_SUPPLY`` from ``140M`` to
+    ``100M`` (= ``GENESIS_SUPPLY - TREASURY_ALLOCATION``).  The
+    TARGET now equals the *active* portion of genesis supply, the
+    same definition ``compute_active_supply`` uses.  At mainnet
+    activation: active=100M=TARGET, gap=0, controller mints zero --
+    and only mints as real dormancy or burns open the gap, exactly
+    as the "stable active supply" anchor intends.  Pure constant
+    retune, no consensus-shape change, no new tier; rides under
+    the existing Tier 47 height -- pre-fork heights replay byte-
+    identically because the controller is height-gated and Tier 47
+    has not yet activated on mainnet at edit time (tip ~1640+ vs
+    height 1710).  7 new regression tests in
+    ``tests/test_dormancy_target_active_supply_retune.py``; the
+    pre-existing ``test_founder_plus_treasury_at_target_still_yields_gap``
+    asserted the now-broken "perma-mint" outcome and was renamed +
+    updated to assert the new anchor.  Surfaced by audit r24 top-3
+    #1.  (ce6786d)
+
+  * **``_resolve_private_key`` auto-pickup silently signed personal-
+    wallet CLI commands with the validator hot-key on validator hosts
+    (regression introduced by 1.58.1).**  1.58.1 closed the
+    ``sudo messagechain stake/unstake/rotate-key`` getpass cliff by
+    auto-picking a keyfile from ``onboard.toml`` or
+    ``default_keyfile()`` whenever no ``--keyfile`` was passed.  The
+    fix is correct for validator-state ops -- but the auto-pickup
+    chain applied to *every* signing command including ``send``,
+    ``transfer``, ``react``, ``propose``, ``vote``.  Concrete failure
+    modes on a validator host running as root:
+
+      * ``sudo messagechain transfer --to mc1... --amount 50``
+        silently drains validator balance and signs with the
+        validator's identity -- fund-loss footgun on a fat-fingered
+        shell line.
+      * ``sudo messagechain send "hi"`` increments the validator's
+        WOTS+ leaf cursor for personal messages, accelerating
+        mandatory key-rotation.
+      * The on-chain ``entity_id`` of every casual sudo-message is
+        the validator's, not a personal wallet -- identity-attribution
+        pollution.
+
+    The single ``Using keyfile from default keyfile: ...`` print line
+    was the only signal, and operators conditioned to skim daemon
+    logs miss it.  Live on mainnet for the 1.58.1 release window.
+
+    Fix gates auto-pickup on a kw-only ``personal_wallet=True``
+    parameter.  When the auto-picked path matches the validator
+    hot-key default (``/etc/messagechain/keyfile``), personal-wallet
+    commands fall through to the interactive prompt instead of
+    silently using the validator key, with one print line naming
+    what we did.  Five HARD-GATE handlers opt in: ``cmd_send``,
+    ``cmd_transfer``, ``cmd_react``, ``cmd_propose``, ``cmd_vote``.
+    Validator-state ops (stake / unstake / rotate-key /
+    set-authority-key / set-receipt-subtree-root / emergency-revoke
+    / bootstrap-seed / broadcast-revoke) leave the flag at its
+    default of False -- the 1.58.1 cliff-close still applies for
+    them, exactly the persona it was for.  Explicit ``--keyfile``
+    bypasses the gate (operator's stated intent wins).  7 new
+    regression tests in
+    ``tests/test_resolve_private_key_personal_wallet_gate.py``
+    including a source-level pin that all five HARD-GATE handlers
+    carry the ``personal_wallet=True`` call.  Surfaced by audit r24
+    top-3 #2.  (338556c)
+
+  * **``_print_pending_receipt`` named the deprecated
+    ``submit-evidence --tx <hash>`` stub form -- silent failure of
+    the headline censorship-resistance escalation path.**  The
+    PENDING branch of ``messagechain receipt <tx_hash>`` printed
+    ``messagechain submit-evidence --tx {tx_hash}``.  That form was
+    deprecated in audit r7 (cli.py:5996-6008 already migrated the
+    NOT_FOUND branch to the live form) -- running the deprecated
+    form today prints a "use ``submit-evidence censorship --receipt
+    <bundle.json>`` instead" diagnostic and exits 0 without filing
+    anything on chain.  Every user hitting the exact moment
+    censorship anxiety peaks (queued tx, suspected validator
+    collusion) was handed a copy-paste command that pretended to
+    succeed and never actually filed evidence -- silently hollowing
+    out the chain's headline censorship-resistance differentiator
+    for the most likely usage path.
+
+    Fix mirrors the r7 NOT_FOUND fix exactly: same bundle-path
+    construction (``_default_receipts_dir() + tx_hash + .json``)
+    and same live-form invocation, so a user who copy-pastes the
+    suggestion lands at the canonical evidence path ``cmd_send``
+    writes on submit.  3 new regression tests in
+    ``tests/test_pending_receipt_submit_evidence_form.py``:
+    deprecated form must NOT appear, live form MUST appear with
+    the canonical bundle path, status framing + "permanent and can
+    never be deleted" guarantee preserved.  Surfaced by audit r24
+    top-3 #3.  (9e73db8)
+
 ## [1.58.1] — 2026-05-06
 
 Patch release.  Audit round 23 top-3 ships, all bugfixes -- one
