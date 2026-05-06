@@ -5956,13 +5956,26 @@ def _print_pending_receipt(
         "  then drop it produce slashable evidence on chain."
     )
 
-    # Escalation: name the submit-evidence path.
+    # Escalation: name the submit-evidence path.  Mirror the r7
+    # NOT_FOUND fix (cli.py:5996-6008) -- point at the LIVE
+    # submit-evidence form (``censorship --receipt <bundle.json>``),
+    # not the deprecated ``--tx <hash>`` stub which prints a
+    # migration diagnostic and files nothing on chain.  The bundle
+    # path is the canonical location ``cmd_send`` writes to on
+    # submit, so the user can copy-paste verbatim.  Surfaced by
+    # audit r24 top-3 #3.
+    bundle_path = os.path.join(
+        _default_receipts_dir(), f"{tx_hash_hex}.json",
+    )
     print()
     print(
         "  If your message is not included in the next 2 blocks, run:\n"
-        f"    messagechain submit-evidence --tx {tx_hash_hex}\n"
+        f"    messagechain submit-evidence censorship --receipt {bundle_path}\n"
         "  to put validator collusion evidence on chain.  Validators\n"
-        "  found to have receipted-then-censored the tx are slashed."
+        "  found to have receipted-then-censored the tx are slashed.\n"
+        "  (`messagechain send` saves the receipt bundle there\n"
+        "  automatically on submit; pass --receipt to point at a\n"
+        "  different path if you saved it elsewhere.)"
     )
     return 0
 
