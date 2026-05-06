@@ -1104,6 +1104,19 @@ class Server(SharedRuntimeMixin):
                 mempool=self.mempool,
                 submitter_entity=None,
             )
+            # Audit r20 #2: feed the watcher PRE-validation so a
+            # block whose proposer signature verifies but whose body
+            # fails any later validate_block check still leaves an
+            # equivocation observation behind.  Pre-fix the watcher
+            # was fed only via _after_block_added (success-only),
+            # which silently dropped the canonical "valid sig + bad
+            # body" attack shape.  The hook fires only after the
+            # proposer signature has been verified (forged-sig
+            # blocks never reach the observer), so the watcher's
+            # seen_signatures cache cannot be polluted.
+            self.blockchain.register_block_header_observer(
+                self.equivocation_watcher.observe_block_header,
+            )
         self.peers: dict[str, Peer] = {}
         # In-flight outbound dials, keyed by "host:port".  A Peer only
         # lands in self.peers after asyncio.open_connection returns;

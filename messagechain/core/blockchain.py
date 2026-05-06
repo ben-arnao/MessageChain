@@ -425,6 +425,24 @@ class Blockchain:
         # doing, so block proposal / validation is independent of total
         # account count.
         self.state_tree: SparseMerkleTree = SparseMerkleTree()
+        # Audit r20 #2: pre-validation feed for the equivocation
+        # watcher's block-header path.  ``validate_block`` and
+        # ``validate_block_standalone`` invoke this callback with the
+        # block's signed header IMMEDIATELY AFTER the proposer
+        # signature is verified successfully -- regardless of whether
+        # downstream checks (state_root, randao, contained-tx sig,
+        # etc.) ultimately reject the block.  Without it, the watcher
+        # was fed only from ``_after_block_added`` (the success-only
+        # post-add hook), so a colluding double-proposer could craft a
+        # second conflicting block whose header signature is valid but
+        # whose body fails some later check -- and the watcher never
+        # saw the second header even though the protocol had all the
+        # crypto needed to slash for the equivocation.  Set via
+        # ``register_block_header_observer``; left None on a fresh
+        # Blockchain so non-network test fixtures don't have to wire a
+        # watcher.  Exception-safe at the call site: a misbehaving
+        # observer must never fail validate_block.
+        self._block_header_observer = None
         # Per-entity dirty set for scoped ``_persist_state``.
         #   None  — next persist is a FULL flush (cold start, post-reset,
         #           post-reorg, freshly-loaded-from-db).  Every per-entity
@@ -8706,6 +8724,36 @@ class Blockchain:
                 )
         return True, "ok"
 
+    def register_block_header_observer(self, callback) -> None:
+        """Wire a callable that receives every block whose proposer
+        signature has been verified, BEFORE the validation path
+        decides accept/reject.  See ``self._block_header_observer``
+        in ``__init__`` for the rationale.  Pass the
+        ``EquivocationWatcher.observe_block_header`` bound method to
+        get the watcher fed pre-validation; pass ``None`` to clear.
+        """
+        self._block_header_observer = callback
+
+    def _notify_block_header_observer(self, header) -> None:
+        """Fire the registered block-header observer with the (now
+        signature-verified) header.  Exception-safe: a misbehaving
+        observer must never abort validate_block, since validate is
+        the cheap-and-pure consensus gate that every reorg replay
+        path also runs.
+        """
+        observer = self._block_header_observer
+        if observer is None:
+            return
+        try:
+            observer(header)
+        except Exception:
+            logger.exception(
+                "block_header_observer crashed on block #%d "
+                "from %s -- continuing validation",
+                header.block_number,
+                header.proposer_id.hex()[:16],
+            )
+
     def validate_block(self, block: Block) -> tuple[bool, str]:
         """Validate a block before adding it to the chain."""
         latest = self.get_latest_block()
@@ -9206,6 +9254,19 @@ class Blockchain:
         header_hash = _hash(block.header.signable_data())
         if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
             return False, "Invalid proposer signature"
+
+        # Audit r20 #2: feed the equivocation watcher (or any other
+        # observer) IMMEDIATELY AFTER the proposer signature has been
+        # verified, BEFORE downstream checks decide accept/reject.
+        # Without this hook the watcher was fed only via
+        # _after_block_added (success-only), so a colluding
+        # double-proposer who crafts a second block whose header
+        # signature is valid but whose body fails any later check
+        # bypassed the watcher entirely.  Forged-signature blocks
+        # never reach this line because the verify_signature gate
+        # above returned False -- so the watcher's seen_signatures
+        # cache cannot be polluted by an attacker with no valid key.
+        self._notify_block_header_observer(block.header)
 
         # Verify randao_mix is correctly derived from the parent's mix and
         # this block's proposer signature. This binds the mix to the
@@ -10408,6 +10469,15 @@ class Blockchain:
         header_hash = _hash(block.header.signable_data())
         if not verify_signature(header_hash, block.header.proposer_signature, proposer_pk):
             return False, "Invalid proposer signature"
+
+        # Audit r20 #2: feed the equivocation watcher AFTER signature
+        # verification but BEFORE downstream rejects -- twin of the
+        # same hook in validate_block.  Catches the fork-path case
+        # where a colluding proposer's second conflicting block
+        # arrives with a different parent (or fails some other late
+        # check) -- without this, the watcher's only feed was the
+        # success-only _after_block_added path.
+        self._notify_block_header_observer(block.header)
 
         # RANDAO mix
         from messagechain.consensus.randao import derive_randao_mix

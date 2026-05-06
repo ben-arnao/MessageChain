@@ -356,6 +356,14 @@ class Node(SharedRuntimeMixin):
                 mempool=self.mempool,
                 submitter_entity=self.entity,
             )
+            # Audit r20 #2: pre-validation feed for the watcher --
+            # twin of the same wiring on Server.  See server.py for
+            # the rationale (closing the "valid sig + bad body"
+            # equivocation gap that the success-only
+            # _after_block_added feed silently dropped).
+            self.blockchain.register_block_header_observer(
+                self.equivocation_watcher.observe_block_header,
+            )
 
     # _on_sync_offense, _handle_task_exception, _current_cumulative_weight
     # now live on SharedRuntimeMixin.
