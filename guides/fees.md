@@ -34,23 +34,38 @@ flow auto-prices.
 
 ## What the floor is (and isn't)
 
-The flat per-tx floor is **1,000 tokens** today (Tier-16 protocol
-floor; the relay floor at the network edge is lower at 1 token,
-but the in-block floor is what actually matters for inclusion).
+The flat per-tx admission floor is **1 token** today — the Tier-16
+`MARKET_FEE_FLOOR`, applied uniformly to messages, transfers,
+stake/unstake, reactions, key rotations, and every other tx kind
+the chain accepts. Type-specific surcharges (the new-account burn,
+the governance proposal fee, the key-rotation fee) layer on top of
+the floor at their respective callsites; the floor itself is the
+same single number.
 
 A few things to keep straight:
 
-- The floor is a **spam gate**, not the market price. It exists to
-  separate "real user-submitted tx" from "free-rider tx that costs
-  the network permanent storage." Pricing *above* the floor is
-  market-driven, not floor-driven.
+- The floor is a **spam gate**, not the market price. Its job is to
+  separate "user-submitted tx" from "free-rider tx that costs the
+  network permanent storage" — keeping zero-fee posts out, full
+  stop. Pricing *above* the floor is market-driven (fee-per-byte
+  ranking + EIP-1559 base fee), not floor-driven. A 1-token floor
+  combined with the byte budget and the EIP-1559 base fee delivers
+  the actual anti-spam discipline; the floor is just the lower
+  bound.
 - The floor is **flat by design**, not linear-in-bytes. Storage
   pricing for long messages is delivered by fee-per-byte ranking
-  in the mempool, not by the floor. (See [anti-bloat
+  in the mempool — when blocks fill, long txs lose inclusion races
+  at the floor and must bid higher. (See [anti-bloat
   guide](./anti-bloat.md) for why this composition is sufficient.)
-- The floor is a **hard fork knob**, not a market parameter. It
+- The floor is a **hard-fork knob**, not a market parameter. It
   changes only via a coordinated upgrade. Day-to-day fee dynamics
-  happen entirely above it.
+  happen entirely above it via the EIP-1559 base fee.
+
+The intuition: at any meaningful token price, the *real* cost of
+posting is set by congestion (base fee × bytes) rather than the
+1-token floor. The floor is what's left when the chain is quiet —
+it's not what disciplines bulk posting; the byte budget + base fee
+do that as soon as the budget binds.
 
 ## The base fee — burn vs tip
 
@@ -235,12 +250,13 @@ network).
 
 | Component | Current value | Knob type |
 |-----------|--------------|-----------|
-| Per-tx flat floor | 1,000 tokens | Hard-fork |
-| Per-stored-byte component (above floor) | 3 tokens/byte (Tier-9) | Hard-fork |
+| Per-tx flat floor (`MARKET_FEE_FLOOR`) | 1 token | Hard-fork |
+| Per-stored-byte component (above floor) | EIP-1559 base × bytes | Market |
 | Base fee | Adjusts per block | Market |
 | Auto-fee lookback | Last 50 blocks | CLI |
 | Urgency rungs | 25 / 75 / 90 percentile | CLI |
 | New-account surcharge | 1,000 tokens (burned) | Hard-fork |
+| Key-rotation surcharge | 1,000 tokens | Hard-fork |
 | Governance proposal fee | 100,000 + 50/byte | Hard-fork |
 | Governance vote fee | 100 tokens | Hard-fork |
 | Mempool TTL | ~24 hours | Soft (relay) |

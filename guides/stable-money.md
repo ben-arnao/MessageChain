@@ -116,11 +116,11 @@ weight on the next block.
 
 ## What this protects
 
-- **Fixed-token costs keep their meaning.** A 1,000-token minimum
-  fee, a 200-token validator stake floor, a 100,000-token proposal
-  fee — none of these need to be retuned every few years to track
-  changes in supply. The chain holds the denominator constant and
-  the constants stay constant.
+- **Fixed-token costs keep their meaning.** A 1-token minimum fee,
+  a 200-token validator stake floor, a 100,000-token proposal fee,
+  a 1,000-token new-account surcharge — none of these need to be
+  retuned every few years to track changes in supply. The chain
+  holds the denominator constant and the constants stay constant.
 - **Lost-key drift is silent and self-correcting.** If half the
   genesis distribution disappears into lost laptops over the next
   two centuries, the controller refills it from issuance over time

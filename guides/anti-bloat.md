@@ -89,12 +89,18 @@ delivered by the *market*, not by an artificial schedule.
 
 The floor underneath the market is intentionally simple:
 
-- **Flat per-tx admission floor:** 1,000 tokens minimum, no matter
-  the size — this is the spam gate, separating "user-submitted tx"
-  from "free-rider that costs the network permanent storage."
-- **Per-stored-byte component (current Tier-9):** 3 tokens/byte
-  baseline. Above the flat floor, longer messages cost
-  proportionally more.
+- **Flat per-tx admission floor (`MARKET_FEE_FLOOR`):** 1 token
+  minimum, no matter the size — this is the spam gate, keeping
+  zero-fee txs out and separating "user-submitted tx" from
+  "free-rider that costs the network permanent storage." The floor
+  is *not* the market price; it's the lower bound the EIP-1559
+  base fee sits above.
+- **Per-stored-byte cost above the floor:** market-driven, not a
+  fixed schedule. When blocks fill, the EIP-1559 base fee rises
+  and longer txs lose inclusion races at the floor — they have to
+  bid proportionally higher to win the same priority. The
+  fee-per-byte ranking in the mempool is what makes long messages
+  compete with short ones at equal stake.
 
 ## 5. Witness separation and compression
 

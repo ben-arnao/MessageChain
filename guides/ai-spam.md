@@ -36,9 +36,13 @@ machine-generated speech, without ever asking "is this human?"
 
 Every message on chain costs **real tokens**. The fee scales
 linearly with stored bytes (see [Fees: how pricing actually
-works](./fees.md)). There's a flat per-tx admission floor of
-1,000 tokens — explicitly designed as a spam gate, not a market
-price — and a per-byte component above it.
+works](./fees.md)). There's a flat 1-token per-tx admission floor
+(`MARKET_FEE_FLOOR`, Tier-16) — designed as a spam gate to keep
+zero-fee posts out — and above the floor the real per-byte cost
+is set by the EIP-1559 base fee, which **rises every block under
+congestion**. At any meaningful token price the floor itself is
+trivial; the anti-spam work is done by the base-fee + byte-budget
+composition above it.
 
 This is the same fee everyone pays. A human posting "happy
 birthday" pays it. A bot posting "happy birthday" pays it. There
