@@ -2264,7 +2264,36 @@ def _reserve_leaf_via_rpc(host, port, entity_id_hex):
     return leaf
 
 
-def _resolve_private_key(args=None):
+_VALIDATOR_HOT_KEY_DEFAULT_PATH = "/etc/messagechain/keyfile"
+
+
+def _is_validator_hot_keyfile(path: str) -> bool:
+    """Heuristic: does ``path`` name the validator hot-key default?
+
+    The validator daemon writes its hot-signing keyfile to
+    ``/etc/messagechain/keyfile`` (root-owned, mode 0600) -- this is
+    the path ``default_keyfile()`` returns when running as root, and
+    the canonical layout the README's "Run a validator" walkthrough
+    bootstraps.  An auto-pick that lands on this path is almost
+    certainly about to sign with the validator's identity, which is
+    correct for validator-state ops (stake/unstake/rotate-key/etc.)
+    but a footgun for personal-wallet ops (send/transfer/react/etc.)
+    -- see ``_resolve_private_key`` ``personal_wallet`` rationale.
+    """
+    try:
+        # Use os.path.normpath so a forward-slash literal compares
+        # against an OS-normalised auto-pick.  Match exactly (not
+        # ``startswith``) -- alternate keyfiles under
+        # /etc/messagechain/ MAY be personal (e.g. an operator's
+        # personal-wallet keyfile they parked alongside the daemon's).
+        return os.path.normpath(path) == os.path.normpath(
+            _VALIDATOR_HOT_KEY_DEFAULT_PATH,
+        )
+    except Exception:
+        return False
+
+
+def _resolve_private_key(args=None, *, personal_wallet=False):
     """Resolve the private key for a signing command.
 
     Resolution order:
@@ -2288,6 +2317,22 @@ def _resolve_private_key(args=None):
     ``--keyfile`` always wins; absence-of-onboard-file leaves the
     interactive prompt path unchanged for personal-wallet users who
     haven't opted into a keyfile.
+
+    ``personal_wallet`` (kw-only): when True, the resolver REFUSES to
+    auto-pick the validator hot-key default (``/etc/messagechain/
+    keyfile``) and falls through to the interactive prompt instead.
+    Set by the personal-wallet HARD-GATE command handlers (``send``,
+    ``transfer``, ``react``, ``propose``, ``vote``) so that
+    ``sudo messagechain transfer ...`` on a validator host does NOT
+    silently sign with the validator's identity (which would be a
+    fund-loss / identity-attribution footgun).  Validator-state ops
+    (``stake``, ``unstake``, ``rotate-key``, ``set-authority-key``,
+    etc.) leave the flag at its default of False -- the 1.58.1
+    cliff-close (no more 24-word prompt under sudo for the
+    validator's own ops) still applies for them, because that's
+    exactly the persona it was built for.  Explicit ``--keyfile``
+    bypasses the gate (operator's stated intent wins).  Surfaced by
+    audit r24 top-3 #2.
     """
     explicit_path = (
         args.keyfile if args is not None and getattr(args, "keyfile", None)
@@ -2301,6 +2346,8 @@ def _resolve_private_key(args=None):
         # onboard.toml, IO error, etc.) silently falls through to the
         # interactive prompt - never crash the CLI on a malformed
         # config that's adjacent to a signing command.
+        candidate_path = ""
+        candidate_source = ""
         try:
             from messagechain.runtime import onboarding as _ob
             try:
@@ -2309,15 +2356,34 @@ def _resolve_private_key(args=None):
                 cfg = {}
             cfg_kf = cfg.get("keyfile") or ""
             if cfg_kf and os.path.exists(cfg_kf):
-                keyfile_path = cfg_kf
-                auto_picked_from = "onboard.toml"
+                candidate_path = cfg_kf
+                candidate_source = "onboard.toml"
             else:
                 default = _ob.default_keyfile()
                 if os.path.exists(default):
-                    keyfile_path = default
-                    auto_picked_from = "default keyfile"
+                    candidate_path = default
+                    candidate_source = "default keyfile"
         except Exception:
-            pass
+            candidate_path = ""
+
+        if candidate_path:
+            if personal_wallet and _is_validator_hot_keyfile(candidate_path):
+                # Refuse to auto-pick the validator hot-key for a
+                # personal-wallet op.  Don't sign with the validator's
+                # identity by default; fall through to the interactive
+                # prompt instead.  Print one line so the operator sees
+                # why -- silent fall-through would re-create the
+                # exact "no recovery phrase entered" UX cliff the
+                # 1.58.1 fix closed for validator-state ops.
+                print(
+                    "Refusing to auto-pick validator hot-key "
+                    f"({candidate_path}) for a personal-wallet "
+                    "command. Pass --keyfile explicitly to use it, "
+                    "or supply a personal keyfile / recovery phrase."
+                )
+            else:
+                keyfile_path = candidate_path
+                auto_picked_from = candidate_source
 
     if keyfile_path is None:
         return _collect_private_key()
@@ -2724,7 +2790,7 @@ def cmd_send(args):
     print(f"=== Send Message ({char_count} chars, {len(msg_bytes_preview)} bytes) ===\n")
 
     # Authenticate
-    private_key = _resolve_private_key(args)
+    private_key = _resolve_private_key(args, personal_wallet=True)
     data_dir = getattr(args, "data_dir", None)
     entity = _resolve_signing_entity(private_key, args)
     print(f"\nSigning as: {entity.entity_id_hex[:16]}...")
@@ -3259,7 +3325,7 @@ def cmd_transfer(args):
     else:
         print("\nSkipping confirmation prompt (--yes).")
 
-    private_key = _resolve_private_key(args)
+    private_key = _resolve_private_key(args, personal_wallet=True)
     data_dir = getattr(args, "data_dir", None)
     entity = _resolve_signing_entity(private_key, args)
     print(f"\nSending as: {entity.entity_id_hex[:16]}...")
@@ -4562,7 +4628,7 @@ def cmd_propose(args):
     print(f"  Title: {args.title}")
     print(f"  Description: {args.description}")
 
-    private_key = _resolve_private_key(args)
+    private_key = _resolve_private_key(args, personal_wallet=True)
     entity = _resolve_signing_entity(private_key, args)
     print(f"\nProposing as: {entity.entity_id_hex[:16]}...")
 
@@ -4686,7 +4752,7 @@ def cmd_vote(args):
     print(f"=== Cast Vote ({'YES' if approve else 'NO'}) ===\n")
     print(f"  Proposal: {args.proposal[:16]}...")
 
-    private_key = _resolve_private_key(args)
+    private_key = _resolve_private_key(args, personal_wallet=True)
     entity = _resolve_signing_entity(private_key, args)
     print(f"\nVoting as: {entity.entity_id_hex[:16]}...")
 
@@ -4799,7 +4865,7 @@ def cmd_react(args):
     print(f"=== React ({label}, {args.choice.upper()}) ===\n")
     print(f"  Target: {target_hex[:16]}...")
 
-    private_key = _resolve_private_key(args)
+    private_key = _resolve_private_key(args, personal_wallet=True)
     entity = _resolve_signing_entity(private_key, args)
     print(f"\nReacting as: {entity.entity_id_hex[:16]}...")
 
