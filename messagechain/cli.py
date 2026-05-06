@@ -5170,13 +5170,24 @@ def cmd_read(args):
         if tx_hash:
             head += f"  tx {tx_hash[:12]}"
         print(head)
+        # Full hash on its own indented line so a CLI user can
+        # triple-click + paste into `react --target <tx>` /
+        # `receipt <tx>` / `submit-evidence censorship --receipt
+        # <bundle>` without round-tripping through the web feed.
+        # Every command that consumes a tx_hash hard-rejects
+        # anything other than the full 64-hex form.
+        if tx_hash:
+            print(f"  id {tx_hash}")
         # Optional `prev` arrow on its own line so the eye can spot
-        # threaded replies / multi-tx continuations.  ASCII -> arrow
-        # to keep cli.py source ASCII-only (Windows cp1252 console
-        # encoding crashes on Unicode in argparse help output).
+        # threaded replies / multi-tx continuations.  Render the
+        # full 64-hex prev hash (not a truncated prefix) so the
+        # user can compose a follow-up react / receipt against the
+        # parent without leaving the CLI.  ASCII -> arrow to keep
+        # cli.py source ASCII-only (Windows cp1252 console encoding
+        # crashes on Unicode in argparse help output).
         prev = msg.get("prev")
         if prev:
-            print(f"  prev -> {prev[:12]}")
+            print(f"  prev -> {prev}")
         print(f"  {msg.get('message', '')}")
         # Vote totals only when at least one vote has been cast.
         # ASCII "up"/"down" labels (the web feed uses real triangle
@@ -5508,6 +5519,11 @@ def cmd_proposals(args):
     print(f"=== Proposals ({len(proposals)}) ===\n")
     for p in proposals:
         print(f"  {p['proposal_id'][:16]}...  [{p['status'].upper()}]  {p['title']}")
+        # Full proposal_id on its own indented line so a CLI user
+        # can copy it into `messagechain vote --proposal <id>` --
+        # the vote command rejects anything other than the full
+        # 64-hex form.
+        print(f"    id {p['proposal_id']}")
         print(f"    proposer: {p['proposer_id'][:16]}...")
         print(f"    votes: {p['vote_count']} cast  |  yes {p['yes_weight']} / eligible {p['total_eligible']}")
         if p["status"] == "open":
