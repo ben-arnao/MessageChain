@@ -11063,12 +11063,61 @@ class Blockchain:
             if not ok:
                 return False, f"Proposer signature: {reason}"
 
+        # Audit r37 #1: mirror the Tier-18 cross-kind tx-count + unified-
+        # byte gates from validate_block.  Pre-fix the standalone
+        # validator only counted (message + transfer) and capped only
+        # message-payload bytes, so a colluding proposer could mint a
+        # fork tip with bloated react_transactions OR oversized total
+        # serialized bytes that the canonical-chain validate_block
+        # would have rejected -- _handle_fork would store it as a
+        # fork tip and a future _reorganize could swap canonical to
+        # it.  CLAUDE.md anchor: "censorship resistance is a
+        # *collective decision*" + "minimize chain bloat" -- the
+        # Tier-18 budget is the cross-kind market mechanism, and the
+        # fork path must enforce it identically.
+        from messagechain.config import (
+            TIER_18_HEIGHT as _TIER_18_H,
+            MAX_BLOCK_TOTAL_BYTES as _MAX_TOTAL_B,
+        )
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if block.header.block_number >= _TIER_18_H:
+            total_tx_count += len(getattr(block, "react_transactions", []) or [])
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Too many transactions"
         total_message_bytes = sum(len(tx.message) for tx in block.transactions)
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, f"Block message bytes {total_message_bytes} exceed budget {MAX_BLOCK_MESSAGE_BYTES}"
+        if block.header.block_number >= _TIER_18_H:
+            total_block_bytes = 0
+            for _tx in block.transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid message tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            for _tx in block.transfer_transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid transfer tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            for _tx in getattr(block, "react_transactions", []) or []:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, (
+                        f"Invalid react tx {_tx.tx_hash.hex()[:16]}: "
+                        "to_bytes() failed during unified-budget check"
+                    )
+            if total_block_bytes > _MAX_TOTAL_B:
+                return False, (
+                    f"Block total bytes {total_block_bytes} exceed Tier-18 "
+                    f"unified budget {_MAX_TOTAL_B}"
+                )
 
         # Per-entity message tx cap (same rule as validate_block).
         entity_msg_counts: dict[bytes, int] = {}
@@ -14442,12 +14491,46 @@ class Blockchain:
         sig_cost = compute_block_sig_cost(block)
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Orphan rejected — sig cost {sig_cost} exceeds limit"
+        # Audit r37 #1: mirror the Tier-18 cross-kind tx-count + unified-
+        # byte gates from validate_block.  Pre-fix the orphan pre-
+        # validator only counted (message + transfer) and capped only
+        # message-payload bytes, defeating the "pre-validate before
+        # storing to prevent garbage" hardening for blocks bloated via
+        # react_transactions or oversized total serialized bytes.
+        from messagechain.config import (
+            TIER_18_HEIGHT as _TIER_18_H,
+            MAX_BLOCK_TOTAL_BYTES as _MAX_TOTAL_B,
+        )
         total_tx_count = len(block.transactions) + len(block.transfer_transactions)
+        if block.header.block_number >= _TIER_18_H:
+            total_tx_count += len(getattr(block, "react_transactions", []) or [])
         if total_tx_count > MAX_TXS_PER_BLOCK:
             return False, "Orphan rejected — too many transactions"
         total_message_bytes = sum(len(tx.message) for tx in block.transactions)
         if total_message_bytes > MAX_BLOCK_MESSAGE_BYTES:
             return False, "Orphan rejected — message bytes exceed budget"
+        if block.header.block_number >= _TIER_18_H:
+            total_block_bytes = 0
+            for _tx in block.transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, "Orphan rejected — message tx to_bytes() failed"
+            for _tx in block.transfer_transactions:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, "Orphan rejected — transfer tx to_bytes() failed"
+            for _tx in getattr(block, "react_transactions", []) or []:
+                try:
+                    total_block_bytes += len(_tx.to_bytes())
+                except Exception:
+                    return False, "Orphan rejected — react tx to_bytes() failed"
+            if total_block_bytes > _MAX_TOTAL_B:
+                return False, (
+                    f"Orphan rejected — block total bytes {total_block_bytes} "
+                    f"exceed Tier-18 unified budget {_MAX_TOTAL_B}"
+                )
         # Per-entity cap (cheap structural check — no chain state needed).
         _orphan_entity_counts: dict[bytes, int] = {}
         for tx in block.transactions:
