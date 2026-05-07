@@ -36,6 +36,12 @@ from messagechain.core.block import (
     canonical_block_tx_hashes,
 )
 from messagechain.core.state_tree import SparseMerkleTree
+from messagechain.storage.state_snapshot_envelope import (
+    SnapshotEnvelopeError,
+    generate_secret as _generate_snapshot_secret,
+    pack as _pack_snapshot_blob,
+    unpack as _unpack_snapshot_blob,
+)
 from messagechain.core.transaction import MessageTransaction, verify_transaction
 from messagechain.core.key_rotation import (
     KeyRotationTransaction, verify_key_rotation,
@@ -1232,8 +1238,11 @@ class Blockchain:
             blob = self.db.get_state_snapshot(latest_height)
             if blob is not None:
                 try:
-                    import pickle
-                    snap = pickle.loads(blob)
+                    # Audit r29 #1: HMAC-verify before unpickling.
+                    # ``_decode_snapshot_blob`` raises on tampered /
+                    # legacy / cross-node blobs and the except branch
+                    # below falls back to legacy field-by-field load.
+                    snap = self._decode_snapshot_blob(blob)
                     # ``_restore_memory_snapshot`` is the symmetric
                     # loader for ``_snapshot_memory_state`` (the
                     # serializer used by ``_persist_state_snapshot``).
@@ -2386,6 +2395,73 @@ class Blockchain:
     # so any reorg up to the depth limit can find an ancestor snapshot.
     _SNAPSHOT_RETENTION_BLOCKS: int = 1000
 
+    # Per-node HMAC secret authenticating snapshot blobs.  Audit r29
+    # #1: ``pickle.loads`` on a tampered ``state_snapshots`` row is a
+    # local-RCE primitive; the secret + envelope make ``pickle.loads``
+    # unreachable for any blob this node didn't write itself.
+    _SNAPSHOT_HMAC_META_KEY: str = "snapshot_hmac_key"
+
+    def _decode_snapshot_blob(self, blob: bytes) -> dict:
+        """Verify the snapshot envelope (audit r29 #1) and pickle.loads
+        the inner payload.  Raises if the envelope's HMAC tag does not
+        match the per-node secret -- the caller's existing
+        ``try/except Exception`` then falls back to legacy field-by-
+        field load.
+
+        On the cross-upgrade window, legacy unprefixed pickle blobs in
+        chaindb fail the magic check inside ``unpack`` and this method
+        raises before ``pickle.loads`` is ever called -- exactly the
+        security contract.
+        """
+        import pickle
+        secret = self._get_snapshot_hmac_secret()
+        if secret is None:
+            # No secret available (test stub / legacy DB without
+            # ``meta`` accessors).  Refuse to unpickle: with no
+            # secret to verify the blob, treating it as trusted is
+            # exactly the RCE the envelope exists to prevent.  The
+            # caller's ``try/except`` falls back to legacy load.
+            raise SnapshotEnvelopeError(
+                "no per-node HMAC secret available; refusing to "
+                "unpickle untrusted snapshot blob",
+            )
+        payload = _unpack_snapshot_blob(blob, secret)
+        return pickle.loads(payload)
+
+    def _get_snapshot_hmac_secret(self) -> bytes | None:
+        """Return this node's HMAC secret for snapshot envelopes,
+        generating + persisting one on first call.  Returns None when
+        the underlying DB cannot persist meta rows (in-memory test
+        stubs); callers fall back to the legacy unenveloped path in
+        that case.
+
+        The secret is per-node and never sent over the wire.  Rotating
+        it (deleting the meta row and restarting) forces the next
+        block apply to re-emit envelopes, but does not break consensus.
+        """
+        cached = getattr(self, "_snapshot_hmac_secret_cache", None)
+        if cached is not None:
+            return cached
+        if self.db is None or not hasattr(self.db, "get_meta"):
+            return None
+        try:
+            stored = self.db.get_meta(self._SNAPSHOT_HMAC_META_KEY)
+            if stored:
+                secret = bytes.fromhex(stored)
+            else:
+                secret = _generate_snapshot_secret()
+                self.db.set_meta(
+                    self._SNAPSHOT_HMAC_META_KEY, secret.hex(),
+                )
+        except Exception:
+            logger.exception(
+                "snapshot HMAC secret read/write failed; falling "
+                "back to legacy unenveloped snapshot path",
+            )
+            return None
+        self._snapshot_hmac_secret_cache = secret
+        return secret
+
     def _persist_state_snapshot(self, block_number: int) -> None:
         """Snapshot-on-apply: serialize the full consensus-critical
         in-memory state and persist to chaindb at ``block_number``.
@@ -2404,21 +2480,39 @@ class Blockchain:
         rather than the wire-format ``encode_snapshot`` because
         ``_snapshot_memory_state`` includes Python-native types
         (sets, tuples, custom dataclasses) that the binary wire
-        format doesn't model -- and the blob is local-trusted (we
-        only ever read back our own writes), so pickle's untrusted-
-        input concerns don't apply here.
+        format doesn't model.
+
+        Pickle bytes are wrapped in an HMAC-SHA256 envelope keyed by
+        a per-node secret (audit r29 #1).  The blob is local-trusted
+        in normal operation, but a restored backup or tampered DB
+        could substitute a malicious pickle that would RCE on the
+        next ``pickle.loads`` -- the envelope verifies in constant
+        time before unpickling, so an attacker without the per-node
+        secret cannot reach ``pickle.loads`` at all.
 
         See ``_load_from_db`` for the reverse path -- on cold
-        restart, the latest snapshot row is unpickled and installed
-        via ``_restore_memory_snapshot``, which is the symmetric
-        loader for this serializer.
+        restart, the latest snapshot row is verified, unpickled, and
+        installed via ``_restore_memory_snapshot``.
         """
         if self.db is None or not hasattr(self.db, "set_state_snapshot"):
             return
         try:
             import pickle
             snap = self._snapshot_memory_state()
-            blob = pickle.dumps(snap, protocol=pickle.HIGHEST_PROTOCOL)
+            pickle_blob = pickle.dumps(
+                snap, protocol=pickle.HIGHEST_PROTOCOL,
+            )
+            secret = self._get_snapshot_hmac_secret()
+            if secret is None:
+                # Test stub or legacy DB without ``meta`` accessors --
+                # write the raw pickle blob (the load path's HMAC
+                # check will fail and fall back to legacy field-by-
+                # field load, mirroring the cross-version upgrade
+                # path).  Not used on real chaindb: ChainDB has
+                # ``get_meta`` / ``set_meta`` post-1.59.1.
+                blob = pickle_blob
+            else:
+                blob = _pack_snapshot_blob(pickle_blob, secret)
             self.db.set_state_snapshot(block_number, blob)
         except Exception:
             logger.exception(
@@ -14730,8 +14824,8 @@ class Blockchain:
             )
             if blob is not None:
                 try:
-                    import pickle
-                    snap = pickle.loads(blob)
+                    # Audit r29 #1: HMAC-verify before unpickling.
+                    snap = self._decode_snapshot_blob(blob)
                     self._restore_memory_snapshot(snap)
                     self._rebuild_state_tree()
                     snapshot_loaded = True
@@ -14925,8 +15019,8 @@ class Blockchain:
             )
             if blob is not None:
                 try:
-                    import pickle
-                    snap = pickle.loads(blob)
+                    # Audit r29 #1: HMAC-verify before unpickling.
+                    snap = self._decode_snapshot_blob(blob)
                     self._restore_memory_snapshot(snap)
                     self._rebuild_state_tree()
                     snapshot_loaded = True

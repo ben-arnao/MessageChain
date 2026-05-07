@@ -2567,6 +2567,31 @@ class ChainDB:
         )
         return [row[0] for row in cur.fetchall()]
 
+    # ── Meta key/value (per-node config; never sent over the wire) ─
+
+    def get_meta(self, key: str) -> str | None:
+        """Read a row from the ``meta`` key/value table.
+
+        Used for per-node config that must persist across restarts but
+        is not consensus state -- e.g. the per-node HMAC secret that
+        authenticates state-snapshot blobs (audit r29 #1).  Returns
+        None when the key is absent.
+        """
+        cur = self._conn.execute(
+            "SELECT value FROM meta WHERE key = ?", (str(key),),
+        )
+        row = cur.fetchone()
+        return row[0] if row is not None else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Write a row to the ``meta`` key/value table.  Idempotent
+        upsert by key.  See ``get_meta`` for the read side."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+            (str(key), str(value)),
+        )
+        self._maybe_commit()
+
     # ── Per-Block State Snapshots (1.52.0 snapshot-on-apply) ──────
 
     def set_state_snapshot(
