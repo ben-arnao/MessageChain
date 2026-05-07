@@ -6660,6 +6660,63 @@ assert STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT > LOTTERY_DETERMINISTIC_HEIGHT,
 )
 
 
+# ``FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT``: Tier 64 -- post-
+# activation ``Mempool.get_forced_inclusion_set`` walks the sorted
+# qualifying list and applies a per-entity cap of
+# ``MAX_TXS_PER_ENTITY_PER_BLOCK`` to the FORCED SOURCE SET.
+# Pre-fix the source set was sorted by (-fpb, arrival, tx_hash) and
+# sliced to ``FORCED_INCLUSION_SET_SIZE`` with NO per-entity cap.  A
+# colluding cartel could pay a high-stake entity to flood the mempool
+# with N high-fpb txs from a single entity_id; after the wait window
+# those N txs occupied all FORCED_INCLUSION_SET_SIZE slots, evicting a
+# censored victim's lower-fpb tx from the forced set entirely.  The
+# cartel proposer could then exclude the victim without triggering
+# excuse #1 (the victim wasn't in the forced set anymore) or excuse
+# #3 (Tier 37's cap-fix tightens excuse #3 on the proposer-validator
+# axis but not on the attester-side forced source set).  CLAUDE.md
+# anchor at risk: "a tx that is well-formed, pays at least the per-
+# byte floor, and fits the byte budget cannot be suppressed by
+# anything weaker than a full validator-set majority actively colluding
+# AND willing to absorb the slashing risk that exposed collusion
+# produces."
+#
+# Tier 64 closes the gap: forcing more than
+# ``MAX_TXS_PER_ENTITY_PER_BLOCK`` from one entity is meaningless
+# anyway -- the proposer literally cannot fit them in a single block
+# under the existing block-validator cap.  Capping the forced source
+# set at the same constant therefore preserves every honest forced-
+# inclusion outcome while denying the flooder the eviction primitive.
+# The freed slots fill with the next-ranked txs from OTHER entities,
+# which is exactly the censored-victim path the anchor protects.
+#
+# Soft-fork: the forced source set is per-attester local state, not
+# consensus-relevant block content.  Different attesters may see
+# different mempool views and the soft-vote aggregation handles
+# divergence.  Pre-fork (height < FORCED_INCLUSION_PER_ENTITY_CAP_
+# HEIGHT) the legacy uncapped path runs byte-identically so historical
+# attester votes replay byte-identically.  Activation height 2450
+# sits 50 blocks above Tier 63 (2400) -- ~8.3h cohort spacing
+# matching the Tier 49-63 pattern.
+FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT = 2450  # Tier 64
+
+assert (
+    FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT
+    > STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT
+), (
+    "FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT must follow Tier 63 -- "
+    "consecutive consensus-rule activations need cohort spacing to "
+    "keep the validator-upgrade window from collapsing"
+)
+assert (
+    FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT
+    > FORCED_INCLUSION_ALL_POOLS_HEIGHT
+), (
+    "FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT must follow Tier 43 -- "
+    "the cap binds against the multi-pool source set Tier 43 wires "
+    "in, so that gate must already be live"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

@@ -27,9 +27,31 @@ from messagechain.config import (
     MEMPOOL_MAX_ORPHAN_PER_SENDER, MEMPOOL_MAX_ORPHAN_NONCE_GAP,
     MIN_FEE,
     FORCED_INCLUSION_ALL_POOLS_HEIGHT,
+    FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT,
     FORCED_INCLUSION_WAIT_BLOCKS, FORCED_INCLUSION_SET_SIZE,
     MAX_TXS_PER_ENTITY_PER_BLOCK,
 )
+
+
+def _forced_inclusion_entity_id(tx) -> bytes | None:
+    """Resolve the per-entity-cap key for a tx in the forced source set.
+
+    Mirrors ``messagechain.consensus.forced_inclusion._entity_id_of``
+    -- the forced-inclusion source set is the union of every pool kind
+    once Tier 43 lands, so the per-entity tally must read whichever
+    field that kind exposes (``entity_id`` for Message/Transfer/Stake/
+    React, ``voter_id`` for governance votes, ``proposer_id`` for
+    governance proposals, ``submitter_id`` for slash + censorship
+    evidence).  Defined here as a private helper instead of importing
+    from ``consensus/`` to avoid the wrong-direction module dependency
+    -- mempool is below consensus in the layering.
+    """
+    return (
+        getattr(tx, "entity_id", None)
+        or getattr(tx, "voter_id", None)
+        or getattr(tx, "proposer_id", None)
+        or getattr(tx, "submitter_id", None)
+    )
 from messagechain.core.transaction import MessageTransaction
 from messagechain.economics.dynamic_fee import DynamicFeePolicy
 
@@ -472,6 +494,41 @@ class Mempool:
                     t.tx_hash,
                 )
             )
+            # Tier 64 per-entity cap on the FORCED SOURCE SET.  Pre-
+            # fix a single high-stake entity could flood the mempool
+            # with N high-fpb txs and occupy every forced slot,
+            # evicting a censored victim's lower-fpb tx without
+            # triggering any structural excuse.  Forcing more than
+            # MAX_TXS_PER_ENTITY_PER_BLOCK from one entity is
+            # meaningless anyway -- the proposer cannot fit them in
+            # one block under the existing block-validator cap.
+            # Capping at the same constant therefore denies the
+            # eviction primitive while preserving every honest
+            # forced-inclusion outcome.  Pre-fork (height <
+            # FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT) the legacy
+            # uncapped path runs byte-identically so historical
+            # attester votes replay byte-identically.
+            if (
+                int(current_block_height)
+                >= FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT
+            ):
+                capped: list = []
+                per_entity: dict[bytes, int] = {}
+                for tx in qualifying:
+                    eid = _forced_inclusion_entity_id(tx)
+                    if eid is None:
+                        # No identifiable signer -- pass through
+                        # uncapped.  Cannot cap what we can't key.
+                        capped.append(tx)
+                    else:
+                        n = per_entity.get(eid, 0)
+                        if n >= MAX_TXS_PER_ENTITY_PER_BLOCK:
+                            continue
+                        per_entity[eid] = n + 1
+                        capped.append(tx)
+                    if len(capped) >= FORCED_INCLUSION_SET_SIZE:
+                        break
+                return capped[:FORCED_INCLUSION_SET_SIZE]
             return qualifying[:FORCED_INCLUSION_SET_SIZE]
 
     def get_pending_nonce(self, entity_id: bytes, on_chain_nonce: int) -> int:
