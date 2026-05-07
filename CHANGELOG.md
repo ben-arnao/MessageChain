@@ -4,6 +4,44 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.61.1] — 2026-05-07
+
+Patch release.  Hotfix for a 1.61.0 consensus-replay regression in
+``Blockchain._apply_governance_block``: the Tier 56 implementation
+split the apply-time voter-reward surcharge gate per-class so
+``TreasurySpendTransaction`` was gated on Tier 56 separately from
+``ProposalTransaction`` (Tier 22).  That changed pre-Tier-56
+TreasurySpend behavior: a TreasurySpend with ``fee + SURCHARGE``
+balance used to escrow ``VOTER_REWARD_SURCHARGE`` (legacy Tier 22)
+but the split code escrowed 0 (Tier 56 not yet active).  Result:
+state divergence between a 1.61.0 validator and a 1.60.0 validator
+on any historical block carrying a well-funded TreasurySpend, hard-
+wedging the upgraded validator on a divergent proposer schedule
+(the on-disk chain.db was unrecoverable without a full restore from
+peer).  No new tier, no new wire format, no new CLI surface.
+
+### Fixed
+
+  * **Tier 56 apply-path replay determinism** -- reverted the per-
+    class apply gate.  Tier 56's intent is to tighten the ADMISSION
+    rule (``_validate_governance_tx`` rejects fee-only TreasurySpend
+    post-activation) while leaving the apply-time mutation
+    byte-identical to the legacy single-flag behavior.  The new
+    apply path uses one ``proposal_surcharge`` flag for both
+    ProposalTransaction and TreasurySpend, gated solely on Tier 22
+    (``VOTER_REWARD_HEIGHT``); pre-Tier-56 TreasurySpend continues
+    to debit the surcharge if the proposer's balance allows
+    (legacy), and post-Tier-56 the admission gate guarantees
+    balance allows so the debit always succeeds.  Net effect post-
+    Tier-56: voters always get paid -- exactly the audit r30 #3
+    intent -- without breaking pre-fork replay.  New regression pin
+    in ``tests/test_treasury_spend_voter_surcharge_tier56.py::
+    TestPreForkApplyReplayDeterminism`` exercises the apply path at
+    a pre-Tier-56 height with a well-funded TreasurySpend and
+    asserts the surcharge IS debited and escrowed -- if a future
+    change re-introduces a per-class apply gate, this test trips
+    immediately.
+
 ## [1.61.0] — 2026-05-07
 
 Minor release.  Audit round 30 top-3 ships: two new hard forks

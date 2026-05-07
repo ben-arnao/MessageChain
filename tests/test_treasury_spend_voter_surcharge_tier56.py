@@ -272,5 +272,113 @@ class TestApplyPathEscrowSymmetric(_Base):
         )
 
 
+class TestPreForkApplyReplayDeterminism(_Base):
+    """Regression pin (added 2026-05-07 after the 1.61.0 incident):
+    pre-Tier-56 TreasurySpend apply behavior MUST be byte-identical
+    to the legacy (single-flag) behavior.
+
+    The 1.61.0 release split the apply-time surcharge gate per-class
+    so TreasurySpend was gated on Tier 56 separately.  That changed
+    pre-Tier-56 behavior: a TreasurySpend with fee+surcharge balance
+    used to escrow ``VOTER_REWARD_SURCHARGE`` (legacy) but the split
+    code escrowed 0 (Tier 56 not active).  Result: state divergence
+    between the validator running 1.61.0 and the validator running
+    1.60.0, on any historical block carrying a well-funded
+    TreasurySpend.  Validator-1 hard-stuck on a divergent proposer
+    schedule and required a chain.db restore from peer to recover.
+
+    This test exercises the apply path at a pre-Tier-56 height with
+    a TreasurySpend whose proposer carries fee+surcharge, and asserts
+    the surcharge IS debited and the escrow IS the full surcharge --
+    matching the legacy Tier 22 behavior.  If a future change
+    re-introduces a per-class apply gate, this test trips
+    immediately and prevents the regression from shipping.
+    """
+
+    def _set_height(self, chain, target_height):
+        while chain.height < target_height:
+            chain.chain.append(object())
+
+    def test_pre_tier56_treasury_spend_with_balance_escrows_surcharge(self):
+        from messagechain.core.block import Block, BlockHeader
+
+        chain = Blockchain()
+        proposer = _entity(b"prop-pre-tier56-replay")
+        self._register(chain, proposer)
+        chain.supply.staked[proposer.entity_id] = 1_000_000
+
+        # Push the chain to a height that's >= Tier 22
+        # (VOTER_REWARD_HEIGHT) but < Tier 56 (TREASURY_SPEND_
+        # VOTER_SURCHARGE_HEIGHT).  This is the live pre-Tier-56
+        # window during which the regression happened.
+        target = config.TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT - 50
+        self.assertGreaterEqual(
+            target, config.VOTER_REWARD_HEIGHT,
+            "test setup: pre-Tier-56 height must be >= Tier 22 so "
+            "voter_reward_active is True (the bug only manifests in "
+            "this window).",
+        )
+        self._set_height(chain, target)
+
+        tx = create_treasury_spend_proposal(
+            proposer,
+            recipient_id=proposer.entity_id,
+            amount=1,
+            title="r30-replay",
+            description="r30-replay-test",
+            current_height=target,
+        )
+
+        # Proposer carries fee + full surcharge -- the case that
+        # diverged in the 1.61.0 incident (legacy escrowed
+        # SURCHARGE, broken split escrowed 0).
+        starting_balance = tx.fee + config.VOTER_REWARD_SURCHARGE + 10
+        chain.supply.balances[proposer.entity_id] = starting_balance
+
+        header = BlockHeader(
+            version=2,
+            block_number=target + 1,
+            prev_hash=b"\x00" * 32,
+            merkle_root=b"\x00" * 32,
+            timestamp=int(time.time()),
+            proposer_id=proposer.entity_id,
+        )
+        block = Block(header=header, transactions=[])
+        block.governance_txs = [tx]
+
+        chain._apply_governance_block(block)
+
+        # The surcharge MUST have been debited from the proposer's
+        # balance and escrowed on the proposal state -- legacy
+        # behavior.  An apply-path that gates the debit on Tier 56
+        # would leave the balance untouched and escrow=0; this
+        # assertion blocks that regression.
+        state = chain.governance.proposals.get(tx.proposal_id)
+        self.assertIsNotNone(
+            state,
+            "TreasurySpend must land in tracker.proposals.",
+        )
+        self.assertEqual(
+            state.voter_reward_pool,
+            config.VOTER_REWARD_SURCHARGE,
+            "Pre-Tier-56 TreasurySpend with fee+surcharge balance "
+            "MUST escrow the full surcharge -- this is the legacy "
+            "Tier 22 behavior every replayer must reproduce "
+            "byte-identically.  An apply-time gate that excludes "
+            "TreasurySpend pre-Tier-56 breaks state-root replay "
+            "determinism (the 1.61.0 incident).",
+        )
+        # Balance must reflect the surcharge debit + the fee burn
+        # (fee_burn handled by pay_fee_with_burn).  At minimum, the
+        # post-apply balance must be strictly less than starting -
+        # surcharge to confirm the surcharge was debited.
+        post_balance = chain.supply.get_balance(proposer.entity_id)
+        self.assertLessEqual(
+            post_balance, starting_balance - config.VOTER_REWARD_SURCHARGE,
+            "Proposer balance must be debited by at least the "
+            "surcharge amount post-apply.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

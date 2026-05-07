@@ -13637,32 +13637,36 @@ class Blockchain:
             GOVERNANCE_VOTING_WINDOW,
             VOTER_REWARD_HEIGHT,
             VOTER_REWARD_SURCHARGE,
-            TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT,
         )
 
         tracker = self.governance
         current_block = block.header.block_number
         proposer_id = block.header.proposer_id
         current_base_fee = self.supply.base_fee
-        # Tier 22: post-fork ProposalTransaction carries a surcharge
-        # that escrows into a per-proposal voter-reward pool.  Pre-
-        # fork the surcharge is 0 so add_proposal stores
-        # voter_reward_pool=0 exactly as before -- historical replay
-        # is byte-identical.
+        # Tier 22: post-fork proposals carry a surcharge that escrows
+        # into a per-proposal voter-reward pool.  Pre-fork the
+        # surcharge is 0 so add_proposal stores voter_reward_pool=0
+        # exactly as before — historical replay is byte-identical.
         #
-        # Tier 56: TreasurySpend carries the same surcharge post-
-        # activation (TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT).  Pre-
-        # Tier-56 the apply path tried to debit but the validation
-        # gate didn't enforce affordability, so a fee-only proposer
-        # silently escrowed zero.  Post-Tier-56 the validation gate
-        # blocks fee-only admission, the apply-time debit always
-        # succeeds, and treasury-spend voters get paid identically
-        # to advisory-proposal voters.  Pre-Tier-56 TreasurySpend
-        # blocks replay byte-identically: surcharge=0 below the
-        # activation height.
-        proposal_surcharge_active = current_block >= VOTER_REWARD_HEIGHT
-        treasury_surcharge_active = (
-            current_block >= TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT
+        # Tier 56 (TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT) extends the
+        # ADMISSION rule (``_validate_governance_tx``) so a
+        # ``TreasurySpendTransaction`` post-Tier-56 must carry
+        # ``fee + VOTER_REWARD_SURCHARGE`` to validate.  The
+        # APPLY-time path here remains the legacy single-flag shape
+        # for both classes: every replay -- pre-Tier-22, post-
+        # Tier-22, pre-Tier-56, post-Tier-56 -- runs the exact
+        # mutation it did at the time the block was first applied.
+        # An earlier 1.61.0 attempt split the per-class apply gate
+        # (TreasurySpend gated on Tier 56) and broke pre-Tier-56
+        # replay determinism on any historical block carrying a
+        # well-funded TreasurySpend; the validator stuck on a
+        # diverging proposer schedule and required a chain.db
+        # restore from peer to recover.  Do NOT re-introduce a
+        # per-class apply gate here -- the admission gate is the
+        # only place per-class logic belongs.
+        voter_reward_active = current_block >= VOTER_REWARD_HEIGHT
+        proposal_surcharge = (
+            VOTER_REWARD_SURCHARGE if voter_reward_active else 0
         )
 
         # Phase 1: register
@@ -13675,35 +13679,24 @@ class Blockchain:
                         f"Governance proposal fee payment failed — skipping"
                     )
                     continue
-                # Per-class surcharge gate.  ProposalTransaction
-                # follows Tier 22 (VOTER_REWARD_HEIGHT).  TreasurySpend
-                # follows Tier 56 (TREASURY_SPEND_VOTER_SURCHARGE_
-                # HEIGHT).  The two heights are independent so the
-                # legacy pre-Tier-56 TreasurySpend path stays
-                # byte-identical (escrow = 0 because the per-class
-                # gate is False below the activation).
-                if isinstance(gtx, ProposalTransaction):
-                    surcharge_for_this_tx = (
-                        VOTER_REWARD_SURCHARGE if proposal_surcharge_active else 0
-                    )
-                else:  # TreasurySpendTransaction
-                    surcharge_for_this_tx = (
-                        VOTER_REWARD_SURCHARGE if treasury_surcharge_active else 0
-                    )
-                # Tier 22 / Tier 56: debit the voter-reward surcharge
-                # from the proposer's balance and escrow it on the
-                # proposal state.  No mint/burn here -- the tokens
-                # stay in circulation, just sequestered until close.
-                # Skip if the proposer can't afford it (validation
-                # should have rejected the tx in this case, but be
-                # defensive for replay paths that hit a partially-
-                # debited balance -- better to skip the surcharge
-                # than to underflow).
+                # Tier 22: debit the voter-reward surcharge from the
+                # proposer's balance and escrow it on the proposal
+                # state.  No mint/burn here — the tokens stay in
+                # circulation, just sequestered until close.  Skip if
+                # the proposer can't afford it (validation should
+                # have rejected the tx in this case, but be defensive
+                # for replay paths that hit a partially-debited
+                # balance — better to skip the surcharge than to
+                # underflow).  Post-Tier-56 the admission gate
+                # guarantees TreasurySpend has fee+surcharge so the
+                # debit always succeeds; pre-Tier-56 a fee-only
+                # TreasurySpend silently escrows 0 (legacy behavior
+                # preserved for replay determinism).
                 escrow = 0
-                if surcharge_for_this_tx > 0:
-                    if self.supply.get_balance(gtx.proposer_id) >= surcharge_for_this_tx:
-                        self.supply.balances[gtx.proposer_id] -= surcharge_for_this_tx
-                        escrow = surcharge_for_this_tx
+                if proposal_surcharge > 0:
+                    if self.supply.get_balance(gtx.proposer_id) >= proposal_surcharge:
+                        self.supply.balances[gtx.proposer_id] -= proposal_surcharge
+                        escrow = proposal_surcharge
                     else:
                         logger.error(
                             "Voter-reward surcharge debit failed — "
