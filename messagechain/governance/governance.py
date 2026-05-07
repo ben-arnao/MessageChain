@@ -1078,6 +1078,7 @@ class GovernanceTracker:
         "burned": int}`` for inspection; chain code does not need it.
         """
         from messagechain.config import (
+            VOTER_REWARD_ADAPTIVE_CAP_HEIGHT,
             VOTER_REWARD_INCLUSIVE_HEIGHT,
             VOTER_REWARD_MAX_SHARE_BPS,
             VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT,
@@ -1152,7 +1153,32 @@ class GovernanceTracker:
             supply_tracker.total_burned += pool
             return {"passed": passed, "payouts": {}, "burned": pool}
 
-        cap = pool * VOTER_REWARD_MAX_SHARE_BPS // 10_000
+        # Tier 66 -- per-voter cap is adaptive in N_voters post-
+        # activation.  Pre-fix Tier 65 redistributed cap-overflow to
+        # non-cap voters, but couldn't break the per-voter cap itself
+        # -- so at N=1 voter the lone voter caps at 25% and 75% burns;
+        # at N=2 equal-stake voters each caps at 25% and 50% burns.
+        # On today's two-validator bootstrap mainnet this means every
+        # governance proposal still burns 50-75% of the surcharge,
+        # inverting the "voters paid from the proposal fee" anchor in
+        # the small-N regime Tier 65 didn't reach.  Tier 66 fix:
+        # ``effective_cap_bps = max(VOTER_REWARD_MAX_SHARE_BPS,
+        # 10_000 // N_voters)`` -- N=1 → 100%, N=2 → 50%, N=3 → 33.3%,
+        # N >= 4 → legacy 25% floor (anchored "large-N anti-whale"
+        # shape preserved exactly).  Pre-fork the legacy 25% cap runs
+        # byte-identically so historical proposals replay unchanged.
+        n_voters = len(winners)
+        if (
+            current_block >= VOTER_REWARD_ADAPTIVE_CAP_HEIGHT
+            and n_voters > 0
+        ):
+            effective_cap_bps = max(
+                VOTER_REWARD_MAX_SHARE_BPS,
+                10_000 // n_voters,
+            )
+        else:
+            effective_cap_bps = VOTER_REWARD_MAX_SHARE_BPS
+        cap = pool * effective_cap_bps // 10_000
         winners_total = sum(winners.values())
         # Iterate in a deterministic order (sorted by entity_id) so
         # the dust calculation is reproducible across nodes.  The

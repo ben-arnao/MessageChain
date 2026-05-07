@@ -6767,6 +6767,59 @@ assert (
 )
 
 
+# ``VOTER_REWARD_ADAPTIVE_CAP_HEIGHT``: Tier 66 -- post-activation the
+# per-voter share cap becomes adaptive in the number of voters.
+#
+# Pre-fix: Tier 65 made cap-overflow REDISTRIBUTE to non-cap voters
+# before the burn fallback -- correct for skewed-stake distributions.
+# But the redistribute loop can only redistribute *within voters
+# present*; it cannot break the per-voter
+# ``VOTER_REWARD_MAX_SHARE_BPS`` cap.  When every voter is already
+# at the cap, the residual still burns.  At N=1 voter the lone voter
+# caps at 25% and 75% burns; at N=2 voters with equal stake each
+# caps at 25% and 50% burns.  On today's two-validator bootstrap
+# mainnet (founder ≈ 100% of stake; typical participating-voter
+# count is N=1 or N=2) every governance proposal STILL burns 50-75%
+# of the voter surcharge after Tier 65.
+#
+# CLAUDE.md anchor at risk: governance economics anchor -- "voters
+# who cast a vote during the window receive a reward funded *out of
+# the proposal fee* -- the proposer pays the voters they're asking
+# to evaluate the proposal."  When the cap binds for every voter,
+# the surcharge isn't going to voters at all -- it's just supply
+# deflation.  Tier 65 closed the skewed-stake leak; Tier 66 closes
+# the small-N leak.
+#
+# Tier 66 fix: ``effective_cap_bps = max(VOTER_REWARD_MAX_SHARE_BPS,
+# 10_000 // num_voters)``.  N=1 → 10_000 bps (100%, lone voter gets
+# the pool).  N=2 → 5_000 bps (50% each, two voters split equally
+# absent stake skew).  N=3 → 3_333 bps.  N >= 4 → 2_500 bps (the
+# legacy 25% floor binds, so the anchored "large-N anti-whale"
+# shape is preserved unchanged).  The Tier 65 redistribute loop runs
+# unchanged on top of the new cap value -- a skewed N=2 distribution
+# (whale=99 small=1 pool=100) goes whale capped at 50 + small lifted
+# to 50 by redistribute → 100 distributed, 0 burned.
+#
+# Hard fork: balance writes shift between the legacy cap and the
+# adaptive cap, which is consensus-visible.  Pre-fork (close-block
+# height < activation) the legacy code runs byte-for-byte so
+# historical proposals replay identically.  Activation height 2550
+# sits 50 blocks above Tier 65 (2500) -- ~8.3h cohort spacing
+# matching the Tier 49-65 pattern.  No new wire format, no new tx
+# kinds, no state-tree changes.
+VOTER_REWARD_ADAPTIVE_CAP_HEIGHT = 2550  # Tier 66
+
+assert (
+    VOTER_REWARD_ADAPTIVE_CAP_HEIGHT
+    > VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT
+), (
+    "VOTER_REWARD_ADAPTIVE_CAP_HEIGHT must follow Tier 65 -- the "
+    "adaptive cap is layered on top of Tier 65's redistribute loop, "
+    "so the redistribute path must already be the active default "
+    "at adaptive-cap activation"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
