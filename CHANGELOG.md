@@ -4,6 +4,48 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.65.1] — 2026-05-07
+
+Patch release.  Audit round 35 top-1 ships: pure removal of the
+dormant ``messagechain.crypto.threshold_rsa`` module.
+
+The module was a "Phase 1 threshold-RSA primitive for MessageChain's
+encrypted mempool" with phased Phase 2/3/4 deployment language
+(DKG, on-chain wire format, hybrid RSA+AES) -- but the CLAUDE.md
+"Settled Design Decisions" anchor is unambiguous: **"Payloads are
+fully public.  Hard no, ever on protocol-level encrypted message
+types.  Encryption is strictly a user/app-layer concern."** Zero
+production callers (only its own test imported it), but its
+presence in the ``crypto/`` namespace dressed the anchor as soft
+and invited a future contributor to finish the path.  Deletion
+ratifies the anchor at the code level.
+
+No consensus impact, no tier, no fork, no wire-format change, no
+CLI surface, no new config keys.  Pure dead-code removal plus a
+regression pin.
+
+### Removed
+
+  * ``messagechain/crypto/threshold_rsa.py`` (1245 lines) and
+    ``tests/test_threshold_rsa.py`` (503 lines).  Surfaced by
+    audit r35 top-3 #1.  (baf9124)
+
+### Added
+
+  * ``tests/test_no_protocol_encryption_anchor.py`` --
+    regression pin for the CLAUDE.md "no protocol-level encrypted
+    message types" anchor.  Three tests assert (a) no
+    ``messagechain/crypto/threshold_rsa.py`` file in the tree,
+    (b) ``import messagechain.crypto.threshold_rsa`` raises
+    ``ModuleNotFoundError``, and (c) no file under
+    ``messagechain/crypto/`` carries the load-bearing
+    "encrypted mempool" / "threshold decryption" /
+    "threshold-rsa primitive" docstring shape (the forbidden-
+    phrase scan is precise enough to avoid false-positives on
+    legitimate user/app-layer encryption uses like keystore
+    at-rest protection).  Re-introducing any of the above trips
+    the test immediately.  (baf9124)
+
 ## [1.65.0] — 2026-05-07
 
 Minor release.  Audit round 34 top-2 ships: one new hard fork
