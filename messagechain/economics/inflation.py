@@ -69,6 +69,8 @@ from messagechain.config import (
     DORMANCY_TARGET_ACTIVE_SUPPLY,
     DORMANCY_CONTROLLER_K_NUM,
     DORMANCY_CONTROLLER_K_DEN,
+    DORMANCY_CONTROLLER_K_DEN_POST_RETUNE,
+    DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT,
     DORMANCY_MAX_ISSUANCE_PER_BLOCK,
     PROPOSER_CAP_REDISTRIBUTE_HEIGHT,
 )
@@ -816,6 +818,12 @@ class SupplyTracker:
         the long-term design intent (the fee market is the security
         budget; issuance's purpose is supply integrity, not pay).
 
+        Tier 54 (DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT): K_DEN
+        widens 20_000 → 200_000 so the linear band reaches MAX only
+        at gap = 100M (real catastrophic-event scale) rather than at
+        gap = 10M (routine mid-divestment scale).  Pre-Tier-54 blocks
+        replay byte-identically via the height gate below.
+
         Caller (calculate_block_reward) is responsible for the
         height-gate: pre-DORMANCY_CONTROLLER_HEIGHT this function is
         not invoked, so legacy halving + deflation-floor behavior is
@@ -826,7 +834,11 @@ class SupplyTracker:
         gap = DORMANCY_TARGET_ACTIVE_SUPPLY - active
         if gap <= 0:
             return 0
-        raw_issuance = (gap * DORMANCY_CONTROLLER_K_NUM) // DORMANCY_CONTROLLER_K_DEN
+        if current_height >= DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT:
+            k_den = DORMANCY_CONTROLLER_K_DEN_POST_RETUNE
+        else:
+            k_den = DORMANCY_CONTROLLER_K_DEN
+        raw_issuance = (gap * DORMANCY_CONTROLLER_K_NUM) // k_den
         return min(DORMANCY_MAX_ISSUANCE_PER_BLOCK, raw_issuance)
 
     def calculate_block_reward(self, block_height: int) -> int:

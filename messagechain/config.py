@@ -6078,6 +6078,68 @@ assert HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT > VOTER_REWARD_INCLUSIVE_HEIGHT, (
 # bound is operational.
 PROPOSER_CAP_REDISTRIBUTE_HEIGHT = 1900  # Tier 53
 
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 54 — dormancy controller K_DEN retune (linear band → 100M gap)
+# ─────────────────────────────────────────────────────────────────────
+# Pre-Tier-54 the controller's gain is K = 1 / 20_000.  Combined with
+# DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500, the proportional term saturates
+# the ceiling at gap = 10M tokens (10M × 1 / 20_000 = 500 = MAX).  Any
+# gap beyond 10M produces the same per-block mint as a 10M gap — the
+# controller's "respond proportionally to the gap" property collapses
+# to "constant at MAX once the gap exceeds 10M."
+#
+# That tuning is wrong for the realized mainnet trajectory.  Seed-
+# divestment is scheduled to burn ~85M of founder stake over its
+# 4-year window; mid-divestment plausible active supply ≈ 55M, gap ≈
+# 45M, controller pegs at MAX = 500/block = ~26.3M tokens/yr ≈ 26%/yr
+# of TARGET sustained for years until active recovers above 90M.
+# That regime breaks two anchors at once: "the chain's nominal token
+# unit must hold its real economic weight across centuries" (a 26%/yr
+# regime for years inverts the promise) and "issuance's purpose is
+# supply replenishment, not security-funding" (at MAX the controller
+# dwarfs every other economic lever).
+#
+# Tier 54 retunes K_DEN from 20_000 → 200_000 so the linear band
+# reaches MAX only at gap = 100M (the real catastrophic-event scale,
+# not a routine mid-divestment gap).  Post-retune at gap = 10M, raw =
+# 50/block ≈ 2.6M tokens/yr — order of the documented burn rate, no
+# saturation, controller actually closes the gap proportionally as
+# CLAUDE.md anchors.  At gap = 100M (founder fully dormant scenario),
+# raw = 500/block = MAX, ceiling still binds for a real worst case.
+#
+# Pure constant retune; no consensus-shape change.  Pre-fork blocks
+# replay byte-identically via the height gate inside
+# ``compute_dormancy_issuance``.  Activation height 1950 sits above
+# Tier 53 (PROPOSER_CAP_REDISTRIBUTE_HEIGHT = 1900) with ~50 blocks ≈
+# 8.3h cohort spacing at 600s blocks, matching the spacing pattern
+# Tiers 49-53 used.  Surfaced by audit r29 top-3 #2.
+DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT = 1950  # Tier 54
+DORMANCY_CONTROLLER_K_DEN_POST_RETUNE = 200_000
+
+assert DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT > PROPOSER_CAP_REDISTRIBUTE_HEIGHT, (
+    "DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT must follow Tier 53 — "
+    "operators upgrade through Tier 53 before this consensus-rule "
+    "change binds, and the cohort spacing keeps two consecutive "
+    "consensus-rule changes from collapsing into a single activation "
+    "window"
+)
+assert DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT > DORMANCY_CONTROLLER_HEIGHT, (
+    "DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT must follow Tier 47 — "
+    "the controller itself activates at Tier 47; retuning its gain "
+    "before activation is a contradiction"
+)
+assert DORMANCY_CONTROLLER_K_DEN_POST_RETUNE > 0, (
+    "DORMANCY_CONTROLLER_K_DEN_POST_RETUNE must be positive — same "
+    "invariant as the legacy K_DEN"
+)
+assert DORMANCY_CONTROLLER_K_DEN_POST_RETUNE > DORMANCY_CONTROLLER_K_DEN, (
+    "DORMANCY_CONTROLLER_K_DEN_POST_RETUNE must be strictly greater "
+    "than the legacy K_DEN — Tier 54's intent is to tighten the gain "
+    "(larger denominator), not loosen it"
+)
+
+
 assert PROPOSER_CAP_REDISTRIBUTE_HEIGHT > HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT, (
     "PROPOSER_CAP_REDISTRIBUTE_HEIGHT must follow Tier 51 — operators "
     "upgrade through Tier 51 before this consensus-rule change binds, "
