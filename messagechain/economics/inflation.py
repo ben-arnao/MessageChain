@@ -831,7 +831,22 @@ class SupplyTracker:
         blocks.
         """
         active = self.compute_active_supply(current_height)
-        gap = DORMANCY_TARGET_ACTIVE_SUPPLY - active
+        # Tier 60 -- TARGET retune.  Pre-fork (height <
+        # DORMANCY_TARGET_RETUNE_HEIGHT) the legacy 100M target is
+        # preserved byte-identically for replay determinism.  Post-
+        # fork the V2 target (110M) takes over so gap > 0 even when
+        # the founder is fully active, restoring the bootstrap-arc
+        # anchor.  See config.py Tier 60 block for the full
+        # rationale.
+        from messagechain.config import (
+            DORMANCY_TARGET_ACTIVE_SUPPLY_V2,
+            DORMANCY_TARGET_RETUNE_HEIGHT,
+        )
+        if current_height >= DORMANCY_TARGET_RETUNE_HEIGHT:
+            target = DORMANCY_TARGET_ACTIVE_SUPPLY_V2
+        else:
+            target = DORMANCY_TARGET_ACTIVE_SUPPLY
+        gap = target - active
         if gap <= 0:
             return 0
         if current_height >= DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT:

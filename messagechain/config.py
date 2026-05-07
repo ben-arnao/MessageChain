@@ -6470,6 +6470,75 @@ assert INACTIVITY_LEAK_STAKE_SCALED_HEIGHT > INACTIVITY_LEAK_HONESTY_CURVE_HEIGH
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 60 — Dormancy controller TARGET retune (bootstrap-arc anchor)
+# ─────────────────────────────────────────────────────────────────────
+# Pre-fix: ``DORMANCY_TARGET_ACTIVE_SUPPLY = 100_000_000`` exactly
+# matches the founder's genesis balance (100M; treasury 40M is
+# excluded from active-supply per ``compute_active_supply`` lines
+# 779-780).  While the founder signs blocks (validator-1's hot key
+# signs every block), ``last_active`` bumps each block, weight =
+# 10000 bps, contribution = 100M.  ``gap = 100M - 100M = 0`` →
+# ``compute_dormancy_issuance`` returns 0/block, indefinitely.  The
+# legacy halving-floor (BLOCK_REWARD_FLOOR=4) was short-circuited at
+# ``DORMANCY_CONTROLLER_HEIGHT`` (Tier 47).  Validators currently
+# earn ~0/block of issuance during the entire 25-year DORMANCY_
+# WINDOW (or until the founder transfers tokens to other signing
+# holders, which keeps gap≈0 because receivers also become active).
+#
+# CLAUDE.md anchor: founder-bootstrap arc -- "early-phase issuance
+# is calibrated so the founder can credibly secure the network solo
+# while it has only a handful of nodes, and progressively dilutes
+# toward broad democratization as more validators stake in".  The
+# 0/block delivery contradicts the front-loaded shape the anchor
+# calls for.  CLAUDE.md also anchors fee-market as the long-term
+# security funder, but the chain is in bootstrap and fees are
+# dormant by design -- 0 fees + 0 issuance = 0 validator pay.
+#
+# Fix: at and above ``DORMANCY_TARGET_RETUNE_HEIGHT`` the controller
+# uses ``DORMANCY_TARGET_ACTIVE_SUPPLY_V2 = 110_000_000`` instead of
+# the legacy 100M.  At founder=100M-active, gap = 110M - 100M = 10M;
+# raw_issuance = (10M * 1) // 200_000 = 50/block; ~2.6M tokens/yr
+# split across validators -- comparable to the legacy halving floor
+# era (4/block = ~210k/yr), generously front-loaded to satisfy the
+# bootstrap-arc anchor without overshooting.  As the founder
+# divests toward target, gap rises proportionally and the controller
+# scales up smoothly.
+#
+# Shape-preserving: still gap-driven, still dormancy-filtered, still
+# capped at MAX_ISSUANCE_PER_BLOCK, still zero at active >= target.
+# Only the equilibrium point moves from 100M -> 110M.
+#
+# Pre-fork blocks (height < DORMANCY_TARGET_RETUNE_HEIGHT) replay
+# byte-identically via the height gate; the legacy 100M target is
+# preserved on the pre-fork branch so every historical block under
+# the controller (heights 1710..2249) replays exactly.
+#
+# Activation height 2250 sits 50 blocks above Tier 59 (INACTIVITY_
+# LEAK_STAKE_SCALED_HEIGHT = 2200) -- ~8.3h cohort spacing matching
+# the Tier 49-59 pattern.
+DORMANCY_TARGET_ACTIVE_SUPPLY_V2 = 110_000_000
+DORMANCY_TARGET_RETUNE_HEIGHT = 2250  # Tier 60
+
+assert DORMANCY_TARGET_RETUNE_HEIGHT > INACTIVITY_LEAK_STAKE_SCALED_HEIGHT, (
+    "DORMANCY_TARGET_RETUNE_HEIGHT must follow Tier 59 -- operators "
+    "upgrade through Tier 59 before this controller-parameter change "
+    "binds, and the cohort spacing keeps consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
+)
+assert DORMANCY_TARGET_RETUNE_HEIGHT > DORMANCY_CONTROLLER_HEIGHT, (
+    "DORMANCY_TARGET_RETUNE_HEIGHT must follow Tier 47 "
+    "(DORMANCY_CONTROLLER_HEIGHT) -- Tier 60 retunes the controller "
+    "Tier 47 introduced, so Tier 47 must already be live"
+)
+assert DORMANCY_TARGET_ACTIVE_SUPPLY_V2 > DORMANCY_TARGET_ACTIVE_SUPPLY, (
+    "DORMANCY_TARGET_ACTIVE_SUPPLY_V2 must be strictly greater than "
+    "the legacy target -- the bootstrap-arc anchor calls for non-zero "
+    "front-loaded issuance, achieved by raising the target so gap > 0 "
+    "even when the founder is fully active"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
