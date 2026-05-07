@@ -426,8 +426,21 @@ def create_unstake_transaction(
     amount: int,
     nonce: int,
     fee: int = MIN_FEE,
+    *,
+    signing_keypair=None,
 ) -> UnstakeTransaction:
-    """Create and sign an unstake transaction."""
+    """Create and sign an unstake transaction.
+
+    `signing_keypair`: when provided, signs the tx with this keypair
+    instead of `entity.keypair`.  The tx still carries `entity.entity_id`
+    so the chain credits/debits the right validator -- only the
+    signature shifts.  This is the cold-authority path: post-
+    SetAuthorityKey, the chain verifies the signature against the cold
+    pubkey via `get_authority_key(entity_id)`, so an unstake signed by
+    `entity.keypair` (the hot key) is hard-rejected.  Default (None)
+    preserves the legacy hot-key signing path byte-for-byte for
+    entities that have not promoted a cold authority key.
+    """
     tx = UnstakeTransaction(
         entity_id=entity.entity_id,
         amount=amount,
@@ -437,7 +450,8 @@ def create_unstake_transaction(
         signature=Signature([], 0, [], b"", b""),  # placeholder
     )
     msg_hash = _hash(tx._signable_data())
-    tx.signature = entity.keypair.sign(msg_hash)
+    keypair = signing_keypair if signing_keypair is not None else entity.keypair
+    tx.signature = keypair.sign(msg_hash)
     tx.tx_hash = tx._compute_hash()
     return tx
 

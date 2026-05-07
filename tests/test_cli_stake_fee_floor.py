@@ -82,7 +82,7 @@ class TestCliStakeFeeFloor(unittest.TestCase):
 
         captured = {}
 
-        def _capture(entity, amount, *, nonce, fee):
+        def _capture(entity, amount, *, nonce, fee, signing_keypair=None):
             captured["fee"] = fee
             captured["amount"] = amount
             return fake_tx

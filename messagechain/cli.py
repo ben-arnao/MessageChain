@@ -326,6 +326,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Auto-fee aggressiveness.  See `send --urgency`.  Ignored "
              "when --fee is set.",
     )
+    unstake.add_argument(
+        "--cold-keyfile", type=str, default=None,
+        help="Path to the cold authority private-key file.  Required "
+             "when this entity has promoted a cold authority key via "
+             "`set-authority-key` -- the chain rejects unstake "
+             "transactions signed by the hot key in that case.  The "
+             "file may contain raw bytes or hex-encoded private key "
+             "(same format as `set-authority-key --cold-key-path`).",
+    )
+    unstake.add_argument(
+        "--cold-leaf", type=int, default=0,
+        help="Cold-key leaf index to sign at.  Cold-key WOTS+ leaf "
+             "state is NOT tracked on chain; the operator self-tracks. "
+             "Pass --cold-leaf N+1 on each subsequent cold-key signing "
+             "(SetAuthorityKey rebind / SetReceiptSubtreeRoot / unstake) "
+             "where N is the previously-burned leaf.  Mirrors "
+             "`set-receipt-subtree-root --cold-leaf`.",
+    )
 
     # --- bootstrap-seed ---
     bootstrap = sub.add_parser(
@@ -3629,6 +3647,84 @@ def cmd_unstake(args):
 
     from client import rpc_call
 
+    # Cold-authority gate.  If the on-chain authority key for this
+    # entity is NOT the hot signing key, the chain admission rule at
+    # _validate_unstake_tx_in_block will reject any unstake signed by
+    # the hot key with "Unstake must be signed by the authority (cold)
+    # key.  The hot signing key cannot authorize withdrawal."  Detect
+    # this pre-broadcast so the operator sees a clear "use --cold-keyfile"
+    # message instead of silently broadcasting a tx that round-trips to
+    # rejection.
+    cold_signing_keypair = None
+    auth_resp = rpc_call(host, port, "get_authority_key", {
+        "entity_id": entity.entity_id_hex,
+    })
+    on_chain_authority_pk = None
+    if auth_resp.get("ok"):
+        ak_hex = auth_resp["result"].get("authority_key")
+        if ak_hex:
+            on_chain_authority_pk = bytes.fromhex(ak_hex)
+    cold_required = (
+        on_chain_authority_pk is not None
+        and on_chain_authority_pk != entity.public_key
+    )
+    if cold_required:
+        cold_keyfile = getattr(args, "cold_keyfile", None)
+        if not cold_keyfile:
+            print(
+                "\nError: this entity has a cold authority key installed."
+            )
+            print(
+                "Unstake must be signed by the cold key -- the chain "
+                "rejects hot-key-signed unstakes (the whole point of "
+                "the cold-authority hardening)."
+            )
+            print(
+                "\nRe-run with --cold-keyfile <path> pointing at the "
+                "cold private-key file, and --cold-leaf <N> if this is "
+                "not your first cold-key signing (cold-key WOTS+ leaf "
+                "state is operator-tracked; --cold-leaf 0 on a key that "
+                "already signed something is leaf-reuse and will be "
+                "rejected)."
+            )
+            sys.exit(1)
+        try:
+            with open(cold_keyfile, "rb") as f:
+                cold_seed = f.read().strip()
+        except OSError as e:
+            print(f"Error: could not read cold key file {cold_keyfile!r}: {e}")
+            sys.exit(1)
+        # Hex-encoded private keys are also accepted (mirrors the
+        # personal-wallet keyfile convention used elsewhere).
+        try:
+            cold_seed = bytes.fromhex(cold_seed.decode("ascii"))
+        except (ValueError, UnicodeDecodeError):
+            pass  # already raw bytes
+        try:
+            cold_entity = Entity.create(cold_seed)
+        except Exception as e:
+            print(f"Error: cold key file did not yield a valid Entity: {e}")
+            sys.exit(1)
+        if cold_entity.public_key != on_chain_authority_pk:
+            print(
+                "Error: --cold-keyfile public key does not match the "
+                "currently-installed authority key on chain."
+            )
+            print(f"  installed: {on_chain_authority_pk.hex()}")
+            print(f"  provided:  {cold_entity.public_key.hex()}")
+            sys.exit(1)
+        # Advance past prior cold-key uses.  Mirrors
+        # cmd_set_receipt_subtree_root: cold-key leaf state is not on
+        # chain.  --cold-leaf N tells the keypair to sign at leaf N
+        # rather than 0.  Persistent on-disk cursor closes the
+        # "operator forgot --cold-leaf" footgun.
+        cold_leaf = max(0, int(getattr(args, "cold_leaf", 0)))
+        _bind_persistent_leaf_index(
+            cold_entity, chain_leaf=cold_leaf, data_dir=data_dir,
+        )
+        cold_signing_keypair = cold_entity.keypair
+        print(f"Signing with cold authority key: {cold_entity.entity_id_hex[:16]}...")
+
     nonce_resp = rpc_call(host, port, "get_nonce", {
         "entity_id": entity.entity_id_hex,
     })
@@ -3638,8 +3734,11 @@ def cmd_unstake(args):
     nonce = nonce_resp["result"]["nonce"]
 
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
-    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
+    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.  Only
+    # binds the HOT entity's leaf cursor; cold-key cursor is bound
+    # above via --cold-leaf.
+    if cold_signing_keypair is None:
+        _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
 
     # Default fee: route through the unified auto-fee helper.  Mirrors
     # cmd_stake; ``auto_fee`` already enforces the live admission floor
@@ -3672,7 +3771,10 @@ def cmd_unstake(args):
             current_height=target_height,
             mempool_estimate=mempool_estimate,
         )
-    tx = create_unstake_transaction(entity, args.amount, nonce=nonce, fee=fee)
+    tx = create_unstake_transaction(
+        entity, args.amount, nonce=nonce, fee=fee,
+        signing_keypair=cold_signing_keypair,
+    )
 
     print(f"Unstaking {args.amount} tokens (fee: {fee})...")
 
