@@ -4,6 +4,185 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.59.0] — 2026-05-06
+
+Minor release.  Audit round 28 top-3 ships: one new hard fork
+(Tier 53 -- proposer-cap clawback redistributes instead of burning,
+restoring ~50% of every dormancy-controller refill that was being
+incinerated on today's 2-validator mainnet) and two consensus-
+adjacent bugfixes (rotate-key hot-swap + boot-replay closes the
+validator-bricking time-bomb on the auto-rotate timer; censorship-
+evidence RPC admit-height drops the wait-gate bypass that let a
+single attacker grief the slashing pipeline).
+
+### Added
+
+  * **Tier 53 -- proposer-cap clawback redistributes (was burn).
+    Hard fork at height 1900 (~50 blocks above Tier 51 = 8.3h cohort
+    spacing).**  CLAUDE.md anchor: stake-concentration soft cap is
+    *compression of share* via diminishing returns, NOT punitive
+    burn of validator earnings.  ``SupplyTracker.mint_block_reward``
+    enforces a per-block cap on the proposer's combined earnings
+    (proposer share + their attester slot if they're on the
+    committee) at ``PROPOSER_REWARD_NUMERATOR / DENOMINATOR`` of
+    issuance.  Pre-fork, when the cap bound the trim was BURNED.
+    Post-Tier-21 (the halving-aware cap formula) ``effective_cap ==
+    proposer_share`` exactly, so the trim equals the proposer's
+    full attester slot every time the cap binds.
+
+    Live impact today: post-Tier-47 (``DORMANCY_CONTROLLER_HEIGHT
+    = 1710``) the dormancy controller can mint up to
+    ``MAX_ISSUANCE_PER_BLOCK = 500`` per block while the active-
+    supply gap closes.  On the live 2-validator mainnet each
+    validator both proposes and attests on the other's blocks --
+    the cap binds every block, and the per-slot attester reward
+    (~187 tokens at reward=500) burns instead of accruing.  Net
+    effect: ~50% of every dormancy-controller refill incinerates
+    back to ``total_burned`` instead of accruing to validators, so
+    the controller's gap-closing function lands at 50% efficiency
+    and the bootstrap-arc dilution toward broad democratization
+    runs at half pace.  Annualized at ~52K blocks/yr that's
+    ~9.7M tokens/yr that should have accrued to honest validators,
+    burned instead.
+
+    Tier 53 fix: when the cap binds and there is at least one
+    non-proposer attester with positive credit, the trim is
+    REDISTRIBUTED pro-rata among those attesters by their existing
+    credit.  Anti-disproportionate-capture intent preserved
+    (proposer net retention still tops out at ``effective_cap``);
+    total issuance accrues to validators (anchor honored); dormancy
+    controller's refill efficiency restored to ~100% on
+    2-validator mainnet.  When no non-proposer attester has
+    positive credit (sole-proposer-attester committee, or all
+    others zeroed by the per-validator attester cap), the trim
+    falls back to BURN -- preserves the cap's anti-
+    disproportionate intent without inventing a tie-breaker on
+    who "deserves" the trim.  Rounding remainder from pro-rata
+    distribution (< len(others) tokens per block) burns to keep
+    the net-inflation invariant tight.
+
+    Pre-fork blocks replay byte-identically: the legacy "claw back
+    proposer_att_reward in full and burn it" path is arithmetic-
+    equal to the new "trim full proposer_att_reward and fall back
+    to burn (no other-credit set)" path when ``overage ==
+    proposer_att_reward`` (the post-Tier-21 typical case).
+
+    Activation height 1900 sits above Tier 51
+    (``HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT = 1850``) with ~50 blocks
+    ≈ 8.3h cohort spacing at 600s blocks, matching the
+    1750/1800/1850 spacing pattern Tiers 49-51 used.  Two-
+    validator network, both operator-controlled.  Two-validator
+    coordinated upgrade.  4 new tests in
+    ``tests/test_proposer_cap_redistribute_tier53.py`` pin
+    pre-fork legacy replay, post-fork 2-attester redistribute,
+    post-fork 3-attester pro-rata, and sole-proposer-attester
+    fallback-to-burn.  Surfaced by audit r28 top-3 #3.  (5915d6f)
+
+### Fixed
+
+  * **``rotate-key`` had no daemon hot-swap and no boot replay --
+    every successful rotation stranded the running validator on
+    the retired Merkle tree, every block it produced was rejected,
+    and operator restart did NOT recover.**  After
+    ``cmd_rotate_key`` submitted a ``KeyRotationTransaction`` and
+    the chain applied it, the daemon's ``wallet_entity.keypair``
+    was the original (rotation 0) tree; chain canonical pubkey was
+    the rotated root.  Every subsequent block the daemon produced
+    verified against the old root (chain rejected), downtime
+    slashing accrued, and operator restart re-derived the original
+    tree (``Entity.create`` reads the signing seed; ``rotation_
+    number`` is chain-state, not seed-state) -- so the same code
+    path kept reproducing the bug.
+
+    This is the validator-bricking time-bomb on the auto-rotate
+    timer: when the leaf-watermark crosses 95% the timer fires
+    ``cmd_rotate_key`` unattended, the chain rotates, and the
+    daemon silently cannot sign.  On 2-validator mainnet this is
+    a chain-halt risk the moment either node first crosses 95%.
+    CLAUDE.md anchor: "key-rotation is a first-class tx type
+    whose result is 'same entity, new active key'" -- the result
+    was, but only at the chain level, not at the daemon level.
+
+    Two missing pieces, both wired:
+
+      (1) Boot replay.  After ``_load_or_create_entity`` returns
+      the base entity, the boot path now consults
+      ``server.blockchain.key_rotation_counts.get(entity.entity_
+      id, 0)`` and, if non-zero, calls ``_replay_chain_rotations``
+      -- a new server helper that derives the rotated keypair via
+      ``derive_rotated_keypair(base, rotation_number=count - 1)``
+      and builds a new Entity preserving entity_id and _seed
+      (anchor: identity continuity across rotation).
+
+      (2) Hot-swap.  Blockchain now exposes
+      ``register_post_key_rotation_callback(entity_id, callback)``
+      and fires the callback (a) directly inside
+      ``apply_key_rotation`` (no rollback risk on the RPC/test
+      path) and (b) post-commit in ``_append_block``, walking
+      ``block.authority_txs`` for ``KeyRotationTransaction`` and
+      dispatching after ``self.db.commit_transaction()``
+      succeeds.  Post-commit dispatch is what stops a state-root
+      rejection on the same block from racing the daemon into a
+      premature wallet-entity swap.  Best-effort: a raising
+      callback is logged and swallowed.
+
+    The server installs one callback per daemon at boot.  When
+    fired, it re-derives the rotated keypair on-the-fly (no
+    rotated-keypair cache yet -- the keygen cost is a one-time
+    per-rotation hit) and calls ``server.set_wallet_entity`` with
+    the rotated Entity.  The new tree's leaf cursor starts at 0
+    by definition (chain resets it in ``apply_key_rotation``), so
+    no leaf-advance dance is needed.  5 new tests in
+    ``tests/test_key_rotation_hot_swap.py`` pin every layer.
+    Surfaced by audit r28 top-3 #1.  (1f5f27c)
+
+  * **``server.py:_rpc_submit_censorship_evidence`` admit dropped
+    ``arrival_block_height``, defaulting to 0 -- bypassed the
+    ``FORCED_INCLUSION_WAIT_BLOCKS`` source-side wait gate on
+    every freshly-arrived ``CensorshipEvidenceTx`` the RPC
+    accepted.**  ``self.mempool.add_censorship_evidence_tx(tx)``
+    was called with no kwarg; mempool default-when-missing is 0
+    (see ``Mempool.add_censorship_evidence_tx`` in
+    ``messagechain/core/mempool.py``).  Source-side forced-
+    inclusion gate then sees ``current_height - 0 >= FORCED_
+    INCLUSION_WAIT_BLOCKS`` for the very NEXT block proposed --
+    the wait gate was bypassed entirely.
+
+    Concrete failure mode: an attacker bursts well-formed
+    ``CensorshipEvidenceTx``s against the running node.  Each
+    lands in the mempool with arrival=0; the next block must
+    include them or face the censorship-vote slash.  Honest
+    proposers either (a) burn block byte budget on adversarial
+    evidence, or (b) defer them at slashing risk to themselves.
+    A colluding watcher can race-flush competing evidence sets
+    with no aging delay.  Mainnet-reachable today with zero
+    adversarial setup -- the wallet's
+    ``submit_censorship_evidence`` RPC is the canonical CLI path
+    documented in the README.
+
+    CLAUDE.md anchor: "a tx that is well-formed, pays at least
+    the per-byte floor, and fits the byte budget cannot be
+    suppressed by anything weaker than a full validator-set
+    majority actively colluding."  The censorship-evidence
+    pipeline is the slashing teeth that backs that anchor; an
+    attacker that can flood the forced-inclusion path with no
+    aging dilutes the gate's purpose to zero.
+
+    Twin defect of the Tier 43 React-pool admit fix at
+    ``messagechain/network/submission_server.py:901-902`` --
+    same wiring, different surface, missed in that round
+    because the evidence-pool admit lives outside the
+    React/Message ingest paths.  Soft-fix: admit-side only, no
+    consensus-rule change.  Two-validator coordinated upgrade.
+    Test pin in
+    ``tests/test_rpc_evidence_arrival_height.py`` drives the
+    real ``Server._rpc_submit_censorship_evidence`` against a
+    real Blockchain + Mempool and asserts
+    ``mempool._evidence_arrival_heights[etx.tx_hash] ==
+    chain.height`` at admit time -- a future refactor cannot
+    drift the kwarg back off silently.  Surfaced by audit r28
+    top-3 #2.  (8fdda6c)
+
 ## [1.58.6] — 2026-05-06
 
 Patch release.  Audit round 27 top-3 ships, all bugfixes: one
