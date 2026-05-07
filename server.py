@@ -2899,9 +2899,13 @@ class Server(SharedRuntimeMixin):
 
         # Everything else signs with the entity's hot public_key.  Each
         # tx type names its sender field differently; try the common
-        # ones in order of specificity.
+        # ones in order of specificity.  Audit r33 added validator_id
+        # (Attestation) and signer_entity_id (FinalityVote) so the
+        # cross-pool sweep resolves the signing pubkey for every
+        # consensus-vote object kind, not just user-tx kinds.
         for attr in (
             "entity_id", "proposer_id", "voter_id", "submitter_id",
+            "validator_id", "signer_entity_id",
         ):
             eid = getattr(tx, attr, None)
             if eid is not None:
@@ -3000,6 +3004,30 @@ class Server(SharedRuntimeMixin):
                 and sig.leaf_index == incoming_leaf
             ):
                 return False
+        # Round-33: scan the consensus-vote pools too.  Pre-fix the
+        # sweep stopped at user-tx pools; a pending FinalityVote /
+        # SlashTransaction / CensorshipEvidenceTx at leaf=N from the
+        # same signer as an incoming user tx (or vice versa) would
+        # not collide -- both admit, both publish at the same WOTS+
+        # leaf, and the cross-publication leaks one-time-key
+        # preimages.  Validators emit finality votes every cycle so
+        # this trips strictly more often than the r31 user-tx case.
+        for pool_attr in (
+            "finality_pool", "slash_pool", "censorship_evidence_pool",
+        ):
+            pool = getattr(self.mempool, pool_attr, None) or {}
+            for existing in pool.values():
+                sig = getattr(existing, "signature", None)
+                if sig is None:
+                    continue
+                existing_signer = self._tx_signer_pubkey(existing)
+                if existing_signer is None:
+                    continue
+                if (
+                    existing_signer == incoming_signer
+                    and sig.leaf_index == incoming_leaf
+                ):
+                    return False
         return True
 
     def _check_leaf_by_entity_id(
@@ -3049,6 +3077,31 @@ class Server(SharedRuntimeMixin):
                 continue
             if eid == entity_id and sig.leaf_index == leaf_index:
                 return False
+        # Round-33: include the consensus-vote pools in the entity-
+        # id-keyed sweep too.  Each pool kind names its signer field
+        # differently (FinalityVote.signer_entity_id;
+        # SlashTransaction.submitter_id;
+        # CensorshipEvidenceTx.submitter_id), so the candidate-attr
+        # walk mirrors the signer-keyed branch's pubkey resolver.
+        for pool_attr, eid_attrs in (
+            ("finality_pool", ("signer_entity_id",)),
+            ("slash_pool", ("submitter_id",)),
+            ("censorship_evidence_pool", ("submitter_id",)),
+        ):
+            pool = getattr(self.mempool, pool_attr, None) or {}
+            for existing in pool.values():
+                sig = getattr(existing, "signature", None)
+                if sig is None:
+                    continue
+                eid = None
+                for attr in eid_attrs:
+                    eid = getattr(existing, attr, None)
+                    if eid is not None:
+                        break
+                if eid is None:
+                    continue
+                if eid == entity_id and sig.leaf_index == leaf_index:
+                    return False
         return True
 
     def _queue_authority_tx(self, tx, *, validate_fn) -> tuple[bool, str]:
@@ -5287,6 +5340,22 @@ class Server(SharedRuntimeMixin):
                     att.validator_id.hex()[:16],
                 )
 
+        # Audit r33 #1: cross-pool WOTS+ leaf check.  Attestations
+        # don't pool in mempool but do consume a hot-key WOTS+ leaf;
+        # if that leaf is already used by any pending tx from the
+        # same validator in any pool, processing + relaying this
+        # attestation would amplify the WOTS+ one-time-key leak.
+        # The equivocation watcher above has already seen the
+        # attestation so attestation-layer auto-slashing benefits
+        # from the evidence; we only refuse the broadcast/finality
+        # update.
+        if not self._check_leaf_across_all_pools(att):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX,
+                "attestation_leaf_collision",
+            )
+            return
+
         validator_stake = self.blockchain.supply.get_staked(att.validator_id)
         total_stake = sum(self.blockchain.supply.staked.values())
         self.blockchain.finality.add_attestation(
@@ -5316,6 +5385,18 @@ class Server(SharedRuntimeMixin):
         valid, reason = self.blockchain.validate_slash_transaction(slash_tx)
         if not valid:
             logger.debug(f"Invalid slash evidence from {peer.address}: {reason}")
+            return
+
+        # Audit r33 #1: cross-pool WOTS+ leaf check.  Same defect
+        # class as the finality-vote handler -- an incoming slash tx
+        # at a leaf already used by any pending tx from the same
+        # submitter is a WOTS+ collision precondition, drop and
+        # ban-score before pooling/relay.
+        if not self._check_leaf_across_all_pools(slash_tx):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX,
+                "slash_tx_leaf_collision",
+            )
             return
 
         logger.info(
@@ -5397,6 +5478,21 @@ class Server(SharedRuntimeMixin):
             self._maybe_auto_recover_from_fork_emergency()
         except Exception:
             logger.exception("fork-emergency auto-recovery raised")
+
+        # Audit r33 #1: cross-pool WOTS+ leaf check.  If this vote's
+        # leaf is already used by any pending tx from the same signer
+        # in any pool, admitting + relaying would amplify the WOTS+
+        # one-time-key leak onto the wire.  Drop without pooling and
+        # without relay; ban-score the source as a peer that is
+        # gossiping leaf-colliding objects.  observe_finality_vote
+        # above has already seen the vote so the fork-emergency
+        # detector still benefits from the evidence.
+        if not self._check_leaf_across_all_pools(vote):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX,
+                "finality_vote_leaf_collision",
+            )
+            return
 
         added = self.mempool.add_finality_vote(vote)
         if added:
