@@ -85,6 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes-nat", action="store_true",
         help="Acknowledge that this validator is behind NAT; continue despite a failed probe",
     )
+    start.add_argument(
+        "--accept-leaf-reuse-risk", action="store_true",
+        help="Bypass the leaf-index gate that catches the keyfile-"
+             "without-cursor restore disaster.  Set ONLY after manually "
+             "verifying the local cursor matches or exceeds every leaf "
+             "the chain has on record for this entity.  Otherwise the "
+             "first sign re-uses a burned leaf -> 100% slash for "
+             "equivocation evidence.",
+    )
     start.add_argument("--rpc-port", type=int, default=9334, help="RPC port (default: 9334)")
     start.add_argument(
         "--rpc-bind", type=str, default="127.0.0.1",
@@ -2618,6 +2627,45 @@ def cmd_start(args):
         entity = _srv_load_entity(
             private_key, MERKLE_TREE_HEIGHT, args.data_dir,
         )
+
+        # Audit r34 #2: gate the daemon's first signing opportunity on
+        # the same leaf-index check `messagechain doctor` runs.  r33 #3
+        # surfaced the keyfile-without-cursor restore disaster but
+        # only when the operator runs `doctor`.  An operator who
+        # restores from paper backup and (a) starts the daemon via
+        # `systemctl start messagechain-validator`, (b) skips
+        # `doctor` out of habit, or (c) runs `start --mine` straight,
+        # bypasses the gate -- on the next sign the keypair re-uses
+        # a leaf the chain already has a sig for, equivocation
+        # evidence lands, full stake slash.  Lifting the same check
+        # here closes that.  Bypass with --accept-leaf-reuse-risk
+        # after manual verification of the cursor situation.
+        from messagechain.runtime.onboarding import _check_leaf_index
+        _li_result = _check_leaf_index(
+            args.data_dir, entity.entity_id_hex,
+        )
+        if _li_result.level == 2:
+            print()
+            print(f"  [!] leaf-index check FAILED ({_li_result.status})")
+            print(f"      {_li_result.detail}")
+            if not getattr(args, "accept_leaf_reuse_risk", False):
+                print()
+                print("      Refusing to start --mine -- the next sign would")
+                print("      re-use a leaf the chain has already recorded a")
+                print("      signature for, producing equivocation evidence")
+                print("      and a 100% stake slash.")
+                print()
+                print("      Run `messagechain doctor` for the full check-")
+                print("      list, restore the leaf-index file from backup,")
+                print("      or pass --accept-leaf-reuse-risk if you have")
+                print("      manually verified the local cursor exceeds the")
+                print("      chain watermark for every prior sign.")
+                sys.exit(2)
+            print()
+            print("      --accept-leaf-reuse-risk set: continuing past the")
+            print("      gate.  Operator-acknowledged leaf-reuse risk.")
+        elif _li_result.level == 1:
+            print(f"  [warn] leaf-index check inconclusive: {_li_result.status}")
 
         # Advance keypair past used leaves
         leaves_used = server.blockchain.get_wots_leaves_used(entity.entity_id)
