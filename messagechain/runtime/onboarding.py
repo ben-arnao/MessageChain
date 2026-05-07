@@ -903,6 +903,164 @@ def _check_disk(data_dir: str, disk_usage_fn=None) -> CheckResult:
     return CheckResult(0, "disk free", f"{gb:.1f} GB")
 
 
+def _check_leaf_index(
+    data_dir: str,
+    entity_id_hex: str,
+    chaindb_open_fn=None,
+) -> CheckResult:
+    """Audit r33 #3: detect the keyfile-without-cursor restore disaster.
+
+    The README warns operators in prose to back up the keyfile AND
+    the leaf-index file together; restoring on a fresh disk with
+    keyfile-only re-uses leaf 0 on the next sign, which produces
+    equivocation evidence on chain and 100%-slashes the validator.
+    Pre-fix doctor's checklist did not exercise the leaf-index
+    state, so the catastrophic config silently passed GREEN.
+
+    State machine:
+
+      * data_dir or entity_id_hex unset -> WARN (skip, fresh
+        install before `init`).
+      * No chain.db AND no leaf_index.json -> GREEN (fresh node,
+        no signing history yet).
+      * chain.db absent (offline wallet) -> GREEN regardless of
+        cursor file: we cannot verify the chain watermark
+        locally, but a node without chain.db isn't going to
+        produce equivocation evidence on its own first sign.
+      * chain.db present, leaf_watermark[entity] == 0 -> GREEN
+        (entity has never signed; re-using leaf 0 is fine).
+      * chain.db present, leaf_watermark[entity] > 0 AND no
+        leaf_index.json -> RED (RESTORE WITHOUT CURSOR).
+      * chain.db present, leaf_watermark[entity] > 0 AND
+        leaf_index.json cursor < watermark -> RED (STALE CURSOR;
+        next sign re-uses a burned leaf).
+      * chain.db present, leaf_watermark[entity] > 0 AND
+        leaf_index.json cursor >= watermark -> GREEN.
+
+    Database access is via injectable `chaindb_open_fn` so the
+    unit tests can synthesize a minimal sqlite db.  Real-call
+    default opens chain.db read-only via sqlite3.
+    """
+    if not data_dir:
+        return CheckResult(1, "leaf-index", "data-dir unset", "skipping")
+    if not entity_id_hex:
+        return CheckResult(
+            1, "leaf-index", "entity-id unset",
+            "fresh install? run `messagechain init` first",
+        )
+
+    from messagechain.config import LEAF_INDEX_FILENAME
+    leaf_path = os.path.join(data_dir, LEAF_INDEX_FILENAME)
+    chain_db_path = os.path.join(data_dir, "chain.db")
+    leaf_present = os.path.exists(leaf_path)
+    chain_present = os.path.exists(chain_db_path)
+
+    # Offline-wallet / fresh-install branches: no chain.db means we
+    # can't verify against a watermark.  A node that hasn't synced
+    # the chain isn't about to produce a slashable double-sign on
+    # first attempt -- the daemon resyncs from peers BEFORE signing.
+    if not chain_present:
+        if leaf_present:
+            return CheckResult(
+                0, "leaf-index", "cursor present (offline wallet)",
+            )
+        return CheckResult(0, "leaf-index", "fresh install")
+
+    # chain.db present -- read the entity's watermark.
+    try:
+        watermark = _read_leaf_watermark(
+            chain_db_path, entity_id_hex,
+            chaindb_open_fn=chaindb_open_fn,
+        )
+    except Exception as e:
+        # Locked-by-daemon or corrupt db: don't fail RED, just warn
+        # so the operator inspects manually.  The daemon's own
+        # watermark gate is the production safety net.
+        return CheckResult(
+            1, "leaf-index", "chaindb read failed",
+            f"{type(e).__name__}: {str(e)[:80]}",
+        )
+
+    if watermark <= 0:
+        # Entity has no on-chain signing history yet.  Even a
+        # fresh leaf cursor (or a missing one) is safe.
+        return CheckResult(
+            0, "leaf-index",
+            "no on-chain signs yet" if not leaf_present else "cursor + chain in sync",
+        )
+
+    # Entity has signed before.  Cursor file MUST exist and MUST be
+    # at or above the chain watermark.
+    if not leaf_present:
+        return CheckResult(
+            2, "leaf-index", "MISSING but chaindb has signs",
+            f"chain watermark={watermark} -- next sign WILL re-use "
+            f"a burned leaf (100% slash).  Restore the leaf-index "
+            f"file from backup before starting the validator.",
+        )
+
+    try:
+        cursor = _read_leaf_cursor(leaf_path)
+    except Exception as e:
+        return CheckResult(
+            1, "leaf-index", "cursor file unreadable",
+            f"{type(e).__name__}: {str(e)[:80]}",
+        )
+
+    if cursor < watermark:
+        return CheckResult(
+            2, "leaf-index", "STALE cursor",
+            f"cursor={cursor} < chain watermark={watermark} -- "
+            f"next sign WILL re-use a burned leaf (100% slash).  "
+            f"Restore the leaf-index file from backup before "
+            f"starting the validator.",
+        )
+
+    return CheckResult(0, "leaf-index", f"cursor={cursor} (chain={watermark})")
+
+
+def _read_leaf_watermark(
+    chain_db_path: str,
+    entity_id_hex: str,
+    *,
+    chaindb_open_fn=None,
+) -> int:
+    """Return the on-chain leaf watermark for the entity, or 0 if
+    no row exists.  Read-only sqlite open by default; tests inject
+    `chaindb_open_fn` to short-circuit the file-open."""
+    if chaindb_open_fn is not None:
+        return int(chaindb_open_fn(chain_db_path, entity_id_hex))
+    import sqlite3
+    # uri=True + ?mode=ro keeps a daemon's exclusive lock
+    # uncontested: a busy daemon means we just can't read, which
+    # surfaces as the YELLOW warn branch in _check_leaf_index.
+    uri = f"file:{chain_db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=2.0)
+    try:
+        eid = bytes.fromhex(entity_id_hex)
+        row = conn.execute(
+            "SELECT next_leaf FROM leaf_watermarks WHERE entity_id = ?",
+            (eid,),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def _read_leaf_cursor(leaf_path: str) -> int:
+    """Return the on-disk cursor.  Format mirrors KeyPair's
+    `_next_leaf` JSON encoding."""
+    import json
+    with open(leaf_path, "r") as f:
+        data = json.load(f)
+    # Field name varies historically: prefer _next_leaf, fall back
+    # to next_leaf or leaf_index.
+    for k in ("_next_leaf", "next_leaf", "leaf_index"):
+        if k in data:
+            return int(data[k])
+    raise ValueError("no leaf-cursor field found in leaf-index file")
+
+
 def _check_port_bindable(port: int, bind_fn=None) -> CheckResult:
     """Return FAIL if unbindable and nothing identifies as messagechain."""
     fn = bind_fn or _try_bind
@@ -1017,11 +1175,19 @@ def run_doctor(
     cfg = onboard_cfg if onboard_cfg is not None else read_onboard_config()
     ddir = data_dir or cfg.get("data_dir") or default_data_dir()
     kf = cfg.get("keyfile") or default_keyfile()
+    eid_hex = cfg.get("entity_id_hex") or ""
 
     results: list[CheckResult] = [
         _check_python(),
         _check_data_dir(ddir),
         _check_keyfile(kf),
+        # Audit r33 #3: surface keyfile-without-cursor restore
+        # state BEFORE the operator starts the daemon.  A fresh
+        # disk with a copy of the keyfile but no leaf-index file
+        # re-uses leaf 0 on the first sign; without this check,
+        # the rest of the doctor checklist passes GREEN and the
+        # validator starts straight into a slashable misconfig.
+        _check_leaf_index(ddir, eid_hex),
         _check_disk(ddir, disk_usage_fn=disk_usage_fn),
         _check_port_bindable(9333, bind_fn=bind_fn),
         _check_port_bindable(9334, bind_fn=bind_fn),
