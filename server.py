@@ -3301,7 +3301,24 @@ class Server(SharedRuntimeMixin):
 
             # Admit to the mempool's evidence pool (already shipped in
             # 1.x; previously only writeable from in-process tests).
-            if not self.mempool.add_censorship_evidence_tx(tx):
+            #
+            # ``arrival_block_height`` is what the source-side forced-
+            # inclusion gate consults to age the evidence past
+            # ``FORCED_INCLUSION_WAIT_BLOCKS``.  Pre-fix the kwarg was
+            # omitted, the mempool defaulted to 0, and freshly-admitted
+            # evidence was IMMEDIATELY eligible for forced inclusion --
+            # an attacker bursting spurious well-formed evidence txs
+            # could grief honest proposers into burning block budget,
+            # or asymmetrically penalize proposers who legitimately
+            # deferred a bogus evidence tx.  Twin of the React pool's
+            # Tier 43 wiring at
+            # ``messagechain/network/submission_server.py:901-902``
+            # (``add_react_transaction(tx, arrival_block_height=...)``)
+            # -- this admit path is the same defect class on a
+            # different surface.  Surfaced by audit r28 top-3 #2.
+            if not self.mempool.add_censorship_evidence_tx(
+                tx, arrival_block_height=self.blockchain.height,
+            ):
                 return {
                     "ok": False,
                     "error": (
