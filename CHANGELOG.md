@@ -4,6 +4,141 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.67.0] — 2026-05-07
+
+Minor release.  Audit round 37 top-2 ships: one consensus-tightening
+soft fix (closes the fork-path / orphan-path Tier-18 unified-byte-
+budget + react-count bypass that let a colluding proposer admit
+oversized fork tips into the orphan/fork pool without any slashable
+trail) and one new hard fork (Tier 66 makes the per-voter governance
+reward cap adaptive in voter count, closing the Tier-65 residual
+where today's two-validator bootstrap mainnet still burns 50-75% of
+every proposal's voter surcharge).  No new wire format, no new tx
+kinds, no state-tree changes beyond a single new constant.
+
+### Added
+
+  * **Tier 66 -- adaptive per-voter governance reward cap (hard fork,
+    activation height 2550).**  Pre-fix Tier 65 (1.66.0) made
+    voter-reward cap-overflow REDISTRIBUTE to non-cap voters before
+    the burn fallback -- correct for skewed-stake distributions
+    (whale + small voter, pool now keeps 50% instead of 26%).  But
+    the redistribute loop only redistributes *within voters
+    present*; it cannot break the per-voter
+    ``VOTER_REWARD_MAX_SHARE_BPS`` cap.  When every voter is already
+    at the cap, the residual still burns.  At N=1 voter the lone
+    voter caps at 25% and 75% of the pool burns; at N=2 voters with
+    equal stake each caps at 25% and 50% burns.
+
+    Concrete bite: today's two-validator bootstrap mainnet has
+    founder ≈ 100% of stake; the typical participating-voter set on
+    a governance proposal is N=1 (founder alone) or N=2 (founder +
+    second validator if it votes).  After Tier 65 every governance
+    proposal STILL burns 50-75% of the voter surcharge.  CLAUDE.md
+    anchor at risk: governance economics anchor -- "voters who cast
+    a vote during the window receive a reward funded *out of the
+    proposal fee* -- the proposer pays the voters they're asking to
+    evaluate the proposal."  When the cap binds for every voter, the
+    surcharge isn't going to voters at all -- it's just supply
+    deflation.  Same anchor Tier 65 was protecting, viewed from a
+    different angle: Tier 65 closed the skewed-stake leak; Tier 66
+    closes the small-N leak.
+
+    Tier 66 fix: per-voter cap becomes adaptive in N_voters post-
+    activation::
+
+        effective_cap_bps = max(
+            VOTER_REWARD_MAX_SHARE_BPS,   # legacy floor (25%)
+            10_000 // n_voters,           # mathematical "even share"
+        )
+        cap = pool * effective_cap_bps // 10_000
+
+      N=1: max(2_500, 10_000) = 10_000 -> 100% (lone voter gets pool).
+      N=2: max(2_500,  5_000) =  5_000 -> 50%.
+      N=3: max(2_500,  3_333) =  3_333 -> 33.3%.
+      N=4: max(2_500,  2_500) =  2_500 -> 25% (legacy floor binds).
+      N=5+: max(2_500, ≤2_000) =  2_500 -> 25% (legacy floor binds).
+
+    For N >= 4 the legacy 25% cap is preserved exactly, so the
+    anchored "large-N anti-whale" shape is unchanged.  The Tier 65
+    redistribute loop runs unchanged on top of the new cap value --
+    a skewed N=2 distribution (whale=99 small=1 pool=100) goes whale
+    capped at 50 + small lifted to 50 by redistribute -> 100
+    distributed, 0 burned (vs Tier-65-only: whale 25 + small 25 = 50
+    distributed, 50 burned).
+
+    Hard fork because balance writes shift between the legacy cap
+    and the adaptive cap, which is consensus-visible.  Activation
+    height 2550 sits 50 blocks above Tier 65 (2500) -- ~8.3h cohort
+    spacing matching the Tier 49-65 pattern.  Pre-fork (current_block
+    < ``VOTER_REWARD_ADAPTIVE_CAP_HEIGHT``) the legacy 25% cap runs
+    byte-for-byte so historical proposals replay identically.  No
+    new wire format, no new tx kinds, no state-tree changes -- pure
+    function-shape change inside ``Governance.finalize_voter_rewards``
+    plus a single new constant.  13 regression tests in
+    ``tests/test_audit_r37_voter_reward_adaptive_cap_tier66.py``.
+    Surfaced by audit r37 top-3 #3.  (f287421)
+
+### Fixed
+
+  * **Fork-path & orphan-path validators enforce Tier-18 unified
+    byte budget + react count.**  Pre-fix
+    ``Blockchain.validate_block_standalone`` (the fork-path validator
+    dispatched from ``_handle_fork``) and the orphan-path pre-
+    validator inline in ``Blockchain.add_block`` both omitted
+    ``react_transactions`` from the cross-kind tx-count cap that
+    ``validate_block`` enforces post-Tier-18, and capped only
+    ``total_message_bytes`` (just the message payloads) -- the
+    unified ``MAX_BLOCK_TOTAL_BYTES`` budget was never applied on
+    either side path.
+
+    Concrete attack: a colluding proposer mints a fork tip whose
+    ``react_transactions`` count pushes the cross-kind total past
+    ``MAX_TXS_PER_BLOCK``, OR whose serialized tx bytes summed
+    across (message + transfer + react) exceed
+    ``MAX_BLOCK_TOTAL_BYTES``.  The canonical-chain ``validate_block``
+    rejects such a block; the standalone validator accepted it.
+    ``_handle_fork`` would then store the block in
+    ``_block_by_hash`` and register it as a fork tip in
+    ``fork_choice.tips`` without producing any slashable evidence.
+    A future ``_reorganize`` swap admits chain bloat above the
+    unified budget that every honest node tried to enforce on the
+    linear-extension path.  The orphan-path bypass is structurally
+    similar: bloated orphans defeat the "pre-validate before storing
+    to prevent garbage" hardening that the orphan pre-validator was
+    added for.
+
+    CLAUDE.md anchors at risk: "censorship resistance is a
+    *collective decision*" -- the Tier-18 budget IS the cross-kind
+    market mechanism that prevents one tx kind from drowning out
+    others; reorg-path divergence lets a colluding proposer escape
+    it without producing slashable evidence -- and "minimize chain
+    bloat & maximize storage efficiency."  Same defect class as the
+    unstake-release / cross-pool admission gaps closed in audit
+    rounds r12, r28, r31, r33 -- a security gate correctly enforced
+    on the canonical-chain path but silently absent from a sibling
+    block-entry path.
+
+    Soft-fix: pure tightening of fork-acceptance and orphan-
+    acceptance rules.  Every block already in the canonical chain
+    passed both gates on the linear-extension path, so the legacy
+    chain replays byte-identically; only adversarial fork tips and
+    bloated orphans are newly rejected.  No new tier, no new wire
+    format, no state-tree changes.  Both call sites mirror
+    ``validate_block``'s existing Tier-18 block: cross-kind count
+    includes ``react_transactions`` post-``TIER_18_HEIGHT``, and
+    total ``len(tx.to_bytes())`` summed across (message + transfer +
+    react) is capped at ``MAX_BLOCK_TOTAL_BYTES`` post-
+    ``TIER_18_HEIGHT``.  7 regression tests in
+    ``tests/test_audit_r37_fork_path_tier18_bypass.py``.  Surfaced
+    by audit r37 top-3 #1.  (4cf7f7a)
+
+Activation cohort spacing: Tier 66 = 2550 sits 50 blocks above Tier
+65 (2500) at ~8.3h gaps at 600s blocks, matching the Tier 49-65
+pattern.  Mainnet tip at ship time is height ~1837 (probed via
+``https://messagechain.org/v1/info``), so the upgrade window is ~5.0
+days at 600s blocks for Tier 66.  Two-validator coordinated upgrade.
+
 ## [1.66.0] — 2026-05-07
 
 Minor release.  Audit round 36 top-3 ships: two new hard forks (Tier
