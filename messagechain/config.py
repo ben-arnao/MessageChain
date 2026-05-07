@@ -6033,6 +6033,66 @@ assert HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT > VOTER_REWARD_INCLUSIVE_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 53 — proposer-cap clawback redistributes (no longer burns)
+# ─────────────────────────────────────────────────────────────────────
+# `SupplyTracker.mint_block_reward` enforces a per-block cap on the
+# proposer's combined earnings (proposer share + their attester slot
+# if they're on the committee).  Pre-fork the cap-overage was BURNED
+# from supply.  CLAUDE.md anchor: stake-concentration soft cap is
+# anchored as compression of *share* via diminishing returns, NOT
+# punitive burn of validator earnings.  The legacy burn defeats the
+# anchor and -- post-Tier-47 dormancy controller (height 1710) -- is
+# now incinerating ~50% of every issuance refill on today's
+# 2-validator mainnet (each validator both proposes and attests on
+# the other's blocks; cap binds every block; per-slot ≈ 187 tokens
+# burns).  Net effect: the controller's "close the gap to
+# DORMANCY_TARGET_ACTIVE_SUPPLY" function lands at 50% efficiency,
+# slowing the bootstrap-arc dilution toward broad democratization.
+#
+# Post-fork: the trim is REDISTRIBUTED pro-rata among non-proposer
+# attesters (those with positive attestor_rewards credit) instead of
+# burned.  The cap's anti-disproportionate-capture intent is
+# preserved (proposer's net retention still tops out at
+# effective_cap), but total issuance still accrues to validators.
+# When no non-proposer attester has positive credit (sole-proposer-
+# attester committee, all others zeroed by per-validator cap, etc.)
+# the trim falls back to BURN -- preserving the cap's intent without
+# inventing a tie-breaker.  Rounding remainder from pro-rata
+# distribution (< len(other_attesters) tokens per block) burns to
+# keep the net-inflation invariant tight.
+#
+# Pre-fork blocks replay byte-identically: when the cap binds and
+# `proposer_share == effective_cap` (the post-Tier-21 typical case)
+# the legacy "burn full proposer_att_reward" matches the new "trim
+# full proposer_att_reward and fall through to burn when no other
+# credited attester" path.  The behavioral split kicks in only on
+# multi-attester committees with at least one non-proposer holding
+# positive credit -- exactly the case the fix targets.
+#
+# Activation height 1900 sits above Tier 51
+# (HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT = 1850) with ~50 blocks ≈ 8.3h
+# cohort spacing at 600s blocks, matching the spacing pattern Tiers
+# 49-51 used (1750/1800/1850).  Two-validator network, both
+# operator-controlled, so the cutover is coordinated and the runway
+# bound is operational.
+PROPOSER_CAP_REDISTRIBUTE_HEIGHT = 1900  # Tier 53
+
+assert PROPOSER_CAP_REDISTRIBUTE_HEIGHT > HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT, (
+    "PROPOSER_CAP_REDISTRIBUTE_HEIGHT must follow Tier 51 — operators "
+    "upgrade through Tier 51 before this consensus-rule change binds, "
+    "and the cohort spacing keeps two consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
+)
+assert PROPOSER_CAP_REDISTRIBUTE_HEIGHT > PROPOSER_CAP_HALVING_HEIGHT, (
+    "PROPOSER_CAP_REDISTRIBUTE_HEIGHT must follow Tier 21 — Tier 21 "
+    "established the halving-aware cap; the redistribute fork only "
+    "changes what happens to the cap-overage (burn -> redistribute) "
+    "and assumes the cap itself is already binding via Tier 21's "
+    "post-halving formula"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

@@ -70,6 +70,7 @@ from messagechain.config import (
     DORMANCY_CONTROLLER_K_NUM,
     DORMANCY_CONTROLLER_K_DEN,
     DORMANCY_MAX_ISSUANCE_PER_BLOCK,
+    PROPOSER_CAP_REDISTRIBUTE_HEIGHT,
 )
 
 
@@ -943,11 +944,15 @@ class SupplyTracker:
             select_attester_committee() — this method does not know
             about seed identity or bootstrap_progress; it only credits.
           * Unfilled committee slots (attester_pool_tokens > len(committee))
-            send the excess to the treasury, same pattern as
-            PROPOSER_REWARD_CAP overflow.
+            BURN the excess (reduces total_supply); treasury is never
+            auto-credited by the reward pipeline.
           * If proposer is also in the committee, their combined
-            earnings are subject to the cap; overage is clawed back
-            from the attester credit and redirected to the treasury.
+            earnings are subject to the cap.  Pre-Tier-53 the cap-
+            overage was BURNED.  Post-Tier-53 the trim is
+            REDISTRIBUTED pro-rata among non-proposer attesters with
+            positive credit (anchor: issuance accrues to validators);
+            falls back to burn when no non-proposer attester has
+            positive credit.
 
         `attester_committee=None` or empty → proposer gets the full
         reward (minus cap overflow); used for genesis / bootstrap
@@ -1273,31 +1278,104 @@ class SupplyTracker:
         # prevents a mega-staker from capturing disproportionate
         # reward when they both propose AND sit on the committee.
         # Trim attester credit first (smaller), then proposer share.
-        # Trimmed tokens BURN (previously flowed to treasury).
+        #
+        # Pre-PROPOSER_CAP_REDISTRIBUTE_HEIGHT (Tier 53): trimmed
+        # tokens BURN.  This was a long-standing defect under the
+        # CLAUDE.md anchor "Issuance still accrues to validators on
+        # the existing reward curve, but its purpose is supply
+        # replenishment" -- punitive burn of the proposer's slot is
+        # NOT the share-compression the cap was sized for, and
+        # post-Tier-47 (when the dormancy controller can mint up to
+        # MAX_ISSUANCE_PER_BLOCK) the legacy burn was incinerating
+        # ~50% of every refill on today's 2-validator mainnet (each
+        # validator proposes-and-attests every block; cap binds
+        # every block; per-slot ≈ 187 tokens burn).
+        #
+        # Post-Tier 53: the trim is REDISTRIBUTED pro-rata among
+        # non-proposer attesters with positive credit, instead of
+        # burned.  Anti-disproportionate-capture intent preserved
+        # (proposer net stays at effective_cap); total issuance
+        # still accrues to validators.  When no non-proposer
+        # attester has positive credit (sole-proposer committee,
+        # everyone else zeroed by per-validator cap), the trim
+        # falls back to burn -- preserves the cap's intent without
+        # inventing a tie-breaker.
         proposer_att_reward = attestor_rewards.get(proposer_id, 0)
         proposer_total = proposer_share + proposer_att_reward
         if proposer_total > effective_cap:
-            self.balances[proposer_id] = (
-                self.balances.get(proposer_id, 0) - proposer_att_reward
+            cap_redistribute_active = (
+                block_height >= PROPOSER_CAP_REDISTRIBUTE_HEIGHT
             )
-            attestor_rewards[proposer_id] = 0
-            burned += proposer_att_reward
-            # ATTESTER_REWARD_CAP_HEIGHT: a PROPOSER_REWARD_CAP
-            # clawback of the proposer's committee slot must ALSO
-            # reverse the epoch-earnings tracker entry — the
-            # proposer never actually retained those tokens, so
-            # they should not count against the per-entity cap in
-            # subsequent blocks.  Pre-cap-activation the tracker is
-            # empty so this is a no-op.
-            if proposer_att_reward > 0 and (
+            overage = proposer_total - effective_cap
+            # Trim attester credit first (smaller component, by intent).
+            trim_from_att = min(proposer_att_reward, overage)
+            self.balances[proposer_id] = (
+                self.balances.get(proposer_id, 0) - trim_from_att
+            )
+            new_proposer_att = proposer_att_reward - trim_from_att
+            attestor_rewards[proposer_id] = new_proposer_att
+            # ATTESTER_REWARD_CAP_HEIGHT: reverse the epoch-earnings
+            # tracker entry by the actually-clawed amount -- the
+            # proposer never retained those tokens, so they should
+            # not count against the per-entity cap in subsequent
+            # blocks.  Pre-cap-activation the tracker is empty so
+            # this is a no-op.  Note: pre-Tier-53 the legacy code
+            # decremented by `proposer_att_reward` (the full slot);
+            # post-Tier-53 trim_from_att MAY equal proposer_att_reward
+            # in the typical post-Tier-21 case (proposer_share ==
+            # effective_cap implies overage == proposer_att_reward),
+            # so the decrement is byte-identical for that path.
+            if trim_from_att > 0 and (
                 self.attester_epoch_earnings.get(proposer_id, 0) > 0
             ):
                 self.attester_epoch_earnings[proposer_id] = max(
                     0,
                     self.attester_epoch_earnings[proposer_id]
-                    - proposer_att_reward,
+                    - trim_from_att,
                 )
-            proposer_att_reward = 0
+            proposer_att_reward = new_proposer_att
+
+            if cap_redistribute_active:
+                # Pro-rata redistribute trim_from_att among non-
+                # proposer attesters with positive credit.
+                other_credit = {
+                    aid: r for aid, r in attestor_rewards.items()
+                    if aid != proposer_id and r > 0
+                }
+                other_total = sum(other_credit.values())
+                if other_total > 0 and trim_from_att > 0:
+                    distributed = 0
+                    for aid, existing in other_credit.items():
+                        bonus = trim_from_att * existing // other_total
+                        if bonus > 0:
+                            self.balances[aid] = (
+                                self.balances.get(aid, 0) + bonus
+                            )
+                            attestor_rewards[aid] = existing + bonus
+                            distributed += bonus
+                    # Rounding remainder (< len(other_credit) tokens)
+                    # burns to keep the net-inflation invariant
+                    # tight without a tie-breaker on which attester
+                    # absorbs the leftover wei.
+                    remainder = trim_from_att - distributed
+                    if remainder > 0:
+                        burned += remainder
+                else:
+                    # No non-proposer attester has positive credit
+                    # (sole-proposer committee, or all others zeroed
+                    # by the per-validator cap).  Burn -- the cap's
+                    # anti-disproportionate intent doesn't tell us
+                    # who else "deserves" the trim, and minting it
+                    # to the proposer defeats the cap.
+                    burned += trim_from_att
+            else:
+                # Pre-Tier-53: trim burns.  Byte-identical to legacy
+                # in the typical post-Tier-21 case where overage ==
+                # proposer_att_reward (the legacy code's
+                # `burned += proposer_att_reward` matches our
+                # `burned += trim_from_att = proposer_att_reward`).
+                burned += trim_from_att
+
             if proposer_share > effective_cap:
                 burned += proposer_share - effective_cap
                 proposer_share = effective_cap
