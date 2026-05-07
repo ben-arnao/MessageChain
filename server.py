@@ -487,6 +487,58 @@ def _load_or_create_entity(
     return entity
 
 
+def _replay_chain_rotations(
+    base_entity: Entity,
+    rotation_count: int,
+    *,
+    data_dir: str | None,
+    no_cache: bool = False,
+) -> Entity:
+    """Return an Entity whose keypair matches the chain's current canonical
+    pubkey for ``base_entity.entity_id`` after *rotation_count* rotations.
+
+    Without this replay, the daemon boot path loads ``base_entity`` from
+    ``Entity.create`` (which derives the original tree from the signing
+    seed; rotation_number is chain-state, not seed-state) and then signs
+    against a pubkey the chain no longer accepts as canonical.  Every
+    block the daemon produces is rejected, downtime slashing accrues,
+    and the operator's restart loop *cannot* recover the bug because
+    the same code path keeps re-deriving the original tree.
+
+    When ``rotation_count == 0`` no rotation has happened and the base
+    entity is returned unchanged.
+
+    When ``rotation_count > 0``, ``derive_rotated_keypair`` is called at
+    ``rotation_number = rotation_count - 1`` (the most-recent rotation
+    transaction's ``rotation_number``).  ``entity_id`` and ``_seed`` are
+    preserved -- entity_id is derived from the *original* keypair's
+    public_key and is the chain-stable identity (CLAUDE.md anchor:
+    identity continuity across rotation), and ``_seed`` is what
+    subsequent rotations derive from.
+
+    The leaf-index path / height-sign-guard / merkle-node-cache are
+    re-attached to the rotated keypair.  When ``data_dir`` is None the
+    re-attaches are no-ops, matching ``_load_or_create_entity``'s
+    ephemeral-mode behaviour.
+    """
+    if rotation_count <= 0:
+        return base_entity
+
+    from messagechain.core.key_rotation import derive_rotated_keypair
+
+    rotated_kp = derive_rotated_keypair(
+        base_entity, rotation_number=rotation_count - 1,
+    )
+    rotated_entity = Entity(
+        entity_id=base_entity.entity_id,
+        keypair=rotated_kp,
+        _seed=base_entity._seed,
+    )
+    _bind_leaf_index_path(rotated_entity, data_dir)
+    attach_height_sign_guard(rotated_entity, data_dir)
+    return rotated_entity
+
+
 def _attach_merkle_node_cache(
     entity: Entity,
     private_key: bytes,
@@ -5781,6 +5833,32 @@ async def run(args):
             no_cache=getattr(args, "no_keypair_cache", False),
         )
 
+        # Replay any rotations that have already landed on chain.
+        # Without this, ``_load_or_create_entity`` returns the
+        # ORIGINAL Merkle tree (Entity.create derives from the signing
+        # seed; rotation_number is chain-state, not seed-state) and
+        # the daemon signs against a pubkey the chain no longer
+        # accepts as canonical -- every block it produces is rejected,
+        # downtime slashing accrues, and a naive restart cannot
+        # recover (same code path keeps re-deriving the original
+        # tree).  CLAUDE.md anchor: "key-rotation is a first-class tx
+        # type whose result is 'same entity, new active key'."
+        rotation_count = server.blockchain.key_rotation_counts.get(
+            entity.entity_id, 0,
+        )
+        if rotation_count > 0:
+            logger.info(
+                "Chain has %d prior rotation(s) for this entity -- "
+                "replaying derive_rotated_keypair to align signing "
+                "tree with the canonical pubkey",
+                rotation_count,
+            )
+            entity = _replay_chain_rotations(
+                entity, rotation_count,
+                data_dir=args.data_dir,
+                no_cache=getattr(args, "no_keypair_cache", False),
+            )
+
         # Advance WOTS+ keypair past all previously-used one-time signing keys.
         # Without this, restarting the server would reuse WOTS+ leaves, which
         # catastrophically compromises the one-time signature scheme.
@@ -5791,6 +5869,59 @@ async def run(args):
 
         server.set_wallet_entity(entity)
         logger.info(f"Authenticated as: {entity.entity_id_hex[:16]}...")
+
+        # Hot-swap hook: when a future ``KeyRotationTransaction`` for
+        # this entity lands in a block, the chain dispatches to this
+        # callback.  We re-derive the rotated keypair and call
+        # ``set_wallet_entity`` so the daemon keeps signing against
+        # the chain's canonical pubkey without operator intervention.
+        # Without this hook, the daemon would only pick up the new
+        # tree on the next restart -- and only if the boot replay
+        # above runs (it does, but the time between rotation-tx
+        # landing and the operator restarting the daemon is the
+        # downtime-slashing window the hot-swap closes).
+        _bound_private_key = private_key_input
+        _bound_tree_height = _resolved_th
+        _bound_data_dir = args.data_dir
+        _bound_no_cache = getattr(args, "no_keypair_cache", False)
+
+        def _on_rotation_committed(new_count: int) -> None:
+            # Re-derive on-the-fly: no rotated-keypair cache yet, so
+            # the swap costs ~one tree-keygen.  Acceptable here
+            # because (a) operators rotate infrequently (leaf budget
+            # is years on commodity hardware) and (b) leaf-watermark
+            # advancement on the new tree is 0 by definition (chain
+            # resets it at apply -- see apply_key_rotation), so the
+            # daemon is signing against an empty leaf cursor at the
+            # next block regardless.  A future patch can persist the
+            # rotated keypair under a rotation-aware cache key for a
+            # warm-restart fast path.
+            try:
+                rotated = _replay_chain_rotations(
+                    entity,
+                    new_count,
+                    data_dir=_bound_data_dir,
+                    no_cache=_bound_no_cache,
+                )
+                # New tree's leaf cursor starts at 0; nothing to
+                # advance.  set_wallet_entity also re-binds the
+                # equivocation watcher's submitter_entity.
+                server.set_wallet_entity(rotated)
+                logger.info(
+                    "Wallet entity hot-swapped to rotated keypair "
+                    "(rotation_count=%d)",
+                    new_count,
+                )
+            except Exception:
+                logger.exception(
+                    "Hot-swap to rotated keypair failed (rotation_count=%d) "
+                    "-- daemon may need restart to recover",
+                    new_count,
+                )
+
+        server.blockchain.register_post_key_rotation_callback(
+            entity.entity_id, _on_rotation_committed,
+        )
 
         # Receipt-subtree bootstrap (attestable submission receipts).
         # On first boot, generate a dedicated WOTS+ subtree for signing

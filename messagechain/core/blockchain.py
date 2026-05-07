@@ -299,6 +299,20 @@ class Blockchain:
         # In-memory rotation cooldown tracking (iter 6 H2).  See comment
         # at the _reset_state twin-init below for the rationale.
         self.key_rotation_last_height: dict[bytes, int] = {}
+        # Per-entity post-rotation callbacks invoked after a
+        # ``KeyRotationTransaction`` for that entity commits on this
+        # chain.  Used by the running validator daemon to swap its
+        # in-memory ``wallet_entity`` to the rotated keypair without
+        # operator intervention.  Without this hook the daemon keeps
+        # signing with the retired Merkle tree (chain canonical pubkey
+        # is now the rotated root), every block it produces is rejected,
+        # and downtime slashing accrues.  CLAUDE.md anchor: "key-
+        # rotation is a first-class tx type whose result is 'same
+        # entity, new active key'."  Best-effort: a raising callback
+        # logs and is otherwise swallowed -- the apply path has already
+        # committed the rotation, the callback failure is a daemon-side
+        # plumbing concern, not a chain-state concern.
+        self._post_key_rotation_callbacks: dict[bytes, "Callable[[int], None]"] = {}
         # R6-A: Historical public-key record per entity.  Maps
         # entity_id -> [(installed_at_height, public_key), ...] sorted
         # ascending by install height.  Captured on first install
@@ -3892,7 +3906,66 @@ class Blockchain:
         # the wrapper exists to provide.  Same surgical fix as
         # round-7 for `_record_receipt_subtree_root`.
 
+        # Direct apply path (RPC / test fixture) is no-rollback: the
+        # rotation has been written to in-memory state and the next
+        # `_persist_state` call will mirror it.  Fire the post-
+        # rotation callback here so test fixtures that drive
+        # ``apply_key_rotation`` directly observe the same hot-swap
+        # behaviour the production block-apply path delivers via the
+        # post-commit dispatch in `_append_block`.
+        self._dispatch_post_key_rotation_callback(tx.entity_id)
+
         return True, "Key rotated successfully"
+
+    def register_post_key_rotation_callback(
+        self, entity_id: bytes, callback,
+    ) -> None:
+        """Register *callback* to fire after a KeyRotationTransaction for
+        *entity_id* commits on this chain.
+
+        The callback is invoked with one argument -- the post-rotation value
+        of ``self.key_rotation_counts[entity_id]`` -- and is best-effort:
+        a raising callback is logged and swallowed (the rotation has
+        already committed; a daemon-side hot-swap failure is a separate
+        operational concern, not a chain-state concern).
+
+        Used by the running validator daemon to swap its in-memory
+        ``wallet_entity`` to the rotated keypair the moment a rotation
+        for its own entity_id lands.  Without this hook the daemon
+        keeps signing with the retired Merkle tree -- chain canonical
+        pubkey is now the rotated root, every block it produces is
+        rejected, and downtime slashing accrues.  CLAUDE.md anchor:
+        "key-rotation is a first-class tx type whose result is 'same
+        entity, new active key'."
+
+        At most one callback per entity_id; re-registering replaces the
+        prior callback (so a daemon can re-bind during reconfiguration
+        without leaking stale closures).  Production: the daemon
+        registers one callback for its own wallet_entity at boot.
+        """
+        self._post_key_rotation_callbacks[entity_id] = callback
+
+    def _dispatch_post_key_rotation_callback(self, entity_id: bytes) -> None:
+        """Fire the post-rotation callback for *entity_id*, if registered.
+
+        Best-effort: a raising callback is logged and swallowed.  Called
+        from two sites: ``apply_key_rotation`` (direct/test path, no
+        rollback risk) and ``_append_block`` post-commit (production
+        block-apply path -- only after the wrapping chaindb transaction
+        has committed, so a state-root rejection on the same block
+        cannot race a premature swap).
+        """
+        cb = self._post_key_rotation_callbacks.get(entity_id)
+        if cb is None:
+            return
+        new_count = self.key_rotation_counts.get(entity_id, 0)
+        try:
+            cb(new_count)
+        except Exception:
+            logger.exception(
+                "post-key-rotation callback raised for entity %s; ignoring",
+                entity_id.hex()[:16],
+            )
 
     def validate_set_receipt_subtree_root(
         self, tx: SetReceiptSubtreeRootTransaction,
@@ -14108,6 +14181,19 @@ class Blockchain:
                 "fork_emergency_detector.recheck_after_chain_advance "
                 "raised; ignoring",
             )
+
+        # Post-commit: dispatch any registered post-key-rotation
+        # callbacks for KeyRotationTransactions carried in this block.
+        # MUST run only after the wrapping chaindb transaction commits
+        # (line `self.db.commit_transaction()` above) -- a state-root
+        # rejection or supply-conservation reject earlier in the apply
+        # loop already returned False, so reaching this line means the
+        # block is durable.  Dispatching here (not from inside
+        # ``_apply_block_state``) is what stops a rolled-back block
+        # from racing the daemon into a premature wallet-entity swap.
+        for atx in block.authority_txs:
+            if isinstance(atx, KeyRotationTransaction):
+                self._dispatch_post_key_rotation_callback(atx.entity_id)
 
         return True, f"Block added (reward: {reward}, fees: {total_fees})"
 
