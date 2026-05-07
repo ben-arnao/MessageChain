@@ -4688,6 +4688,10 @@ class Blockchain:
             candidates.append(current)
         if not candidates:
             return False, "offender had no key at evidence height"
+        from messagechain.consensus.state_checkpoint import (
+            StateCheckpointDoubleSignEvidence,
+            verify_state_checkpoint_double_sign_evidence,
+        )
         if isinstance(tx.evidence, FinalityDoubleVoteEvidence):
             valid, reason = verify_finality_double_vote_evidence(
                 tx.evidence, candidates,
@@ -4696,6 +4700,41 @@ class Blockchain:
             valid, reason = verify_attestation_slashing_evidence(
                 tx.evidence, candidates,
             )
+        elif isinstance(tx.evidence, StateCheckpointDoubleSignEvidence):
+            # Tier 63 admission gate.  Pre-fork the slash kind=3 was
+            # never decoded by any deployed binary, so historical
+            # blocks at heights below STATE_CHECKPOINT_DOUBLE_SIGN_
+            # SLASH_HEIGHT cannot have carried a kind=3 slash tx.
+            # Refuse to admit one before the gate so a Tier-63-aware
+            # node replaying pre-fork blocks does not accept evidence
+            # that pre-fork peers would have rejected outright.
+            from messagechain.config import (
+                STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT,
+            )
+            if _height_for_fee < STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT:
+                return False, (
+                    "state-checkpoint double-sign slashing not yet "
+                    f"active (Tier 63: activation height "
+                    f"{STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT}, "
+                    f"current height {_height_for_fee})"
+                )
+            # The verifier only needs the actual signing pubkey -- the
+            # checkpoint signature is plain (no rotation evasion shape
+            # like FinalityDoubleVote, since both signed payloads carry
+            # the offender's signer_entity_id and a single height,
+            # already cross-checked inside the verifier).  Walk the
+            # candidate set so a rotated-key offender cannot dodge the
+            # slash by rotating between the two checkpoint signs.
+            valid = False
+            reason = "no candidate offender public keys"
+            for pk in candidates:
+                ok_pk, why = verify_state_checkpoint_double_sign_evidence(
+                    tx.evidence, pk,
+                )
+                if ok_pk:
+                    valid, reason = True, why
+                    break
+                reason = why
         else:
             valid, reason = verify_slashing_evidence(
                 tx.evidence, candidates,
@@ -4722,6 +4761,12 @@ class Blockchain:
             return evidence.header_a.block_number
         if hasattr(evidence, 'attestation_a'):
             return evidence.attestation_a.block_number
+        # Tier 63 -- state-checkpoint double-sign evidence carries the
+        # height inside checkpoint_a.block_number (matches checkpoint_b's
+        # block_number by construction; verify_state_checkpoint_double_
+        # sign_evidence rejects if they disagree).
+        if hasattr(evidence, 'checkpoint_a'):
+            return evidence.checkpoint_a.block_number
         if hasattr(evidence, 'vote_a'):
             # FinalityDoubleVoteEvidence: use the vote's SIGNING height,
             # NOT the target height.  Finality votes may be signed up to
@@ -4766,6 +4811,9 @@ class Blockchain:
             SlashingEvidence,
         )
         from messagechain.consensus.finality import FinalityDoubleVoteEvidence
+        from messagechain.consensus.state_checkpoint import (
+            StateCheckpointDoubleSignEvidence,
+        )
 
         ev = tx.evidence
         if isinstance(ev, SlashingEvidence):
@@ -4778,6 +4826,17 @@ class Blockchain:
             amb = Unambiguity.UNAMBIGUOUS
         elif isinstance(ev, FinalityDoubleVoteEvidence):
             kind = OffenseKind.FINALITY_DOUBLE_VOTE
+            amb = Unambiguity.UNAMBIGUOUS
+        elif isinstance(ev, StateCheckpointDoubleSignEvidence):
+            # Tier 63 -- snapshot state_root is a function of
+            # deterministically-replayed chain state, so two distinct
+            # values at the same height cannot be a benign restart
+            # shape (no merkle_root drift channel exists).  Always
+            # UNAMBIGUOUS: the offender deliberately chose two parallel
+            # post-states.  Same severity profile as ATTESTATION /
+            # FINALITY double-vote (100% on first-and-fresh-tenure / on
+            # any repeat).
+            kind = OffenseKind.STATE_CHECKPOINT_DOUBLE_SIGN
             amb = Unambiguity.UNAMBIGUOUS
         else:
             # Unknown evidence type — fall back to the legacy

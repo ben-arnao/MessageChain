@@ -338,12 +338,15 @@ def verify_attestation_slashing_evidence(
 class SlashTransaction:
     """A transaction that submits slashing evidence.
 
-    Supports three evidence types:
+    Supports four evidence types:
     - SlashingEvidence (double-proposal)
     - AttestationSlashingEvidence (double-attestation)
     - FinalityDoubleVoteEvidence (double-finality-vote, long-range defense)
+    - StateCheckpointDoubleSignEvidence (double-snapshot-root, bootstrap
+      fork defense -- admission gated by Tier 63
+      STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT)
     """
-    evidence: "SlashingEvidence | AttestationSlashingEvidence | FinalityDoubleVoteEvidence"
+    evidence: "SlashingEvidence | AttestationSlashingEvidence | FinalityDoubleVoteEvidence | StateCheckpointDoubleSignEvidence"
     submitter_id: bytes
     timestamp: float
     fee: int
@@ -392,14 +395,26 @@ class SlashTransaction:
 
     def to_bytes(self) -> bytes:
         """Binary: u8 evidence_kind (0=block, 1=attestation,
-        2=finality-vote) | u32 ev_len | ev | 32 submitter_id | f64
-        timestamp | u64 fee | u32 sig_len | sig | 32 tx_hash.
+        2=finality-vote, 3=state-checkpoint-double-sign) | u32 ev_len |
+        ev | 32 submitter_id | f64 timestamp | u64 fee | u32 sig_len |
+        sig | 32 tx_hash.
+
+        Kind=3 admission is gated post-Tier-63 by
+        ``Blockchain.validate_slash_transaction``; the encoder is
+        unconditional so a Tier-63-aware node can build evidence
+        objects ahead of the activation height (e.g. for tests / offline
+        construction).
         """
         from messagechain.consensus.finality import FinalityDoubleVoteEvidence
+        from messagechain.consensus.state_checkpoint import (
+            StateCheckpointDoubleSignEvidence,
+        )
         if isinstance(self.evidence, AttestationSlashingEvidence):
             kind = 1
         elif isinstance(self.evidence, FinalityDoubleVoteEvidence):
             kind = 2
+        elif isinstance(self.evidence, StateCheckpointDoubleSignEvidence):
+            kind = 3
         elif isinstance(self.evidence, SlashingEvidence):
             kind = 0
         else:
@@ -437,6 +452,11 @@ class SlashTransaction:
                 FinalityDoubleVoteEvidence,
             )
             evidence = FinalityDoubleVoteEvidence.from_bytes(ev_bytes)
+        elif kind == 3:
+            from messagechain.consensus.state_checkpoint import (
+                StateCheckpointDoubleSignEvidence,
+            )
+            evidence = StateCheckpointDoubleSignEvidence.from_bytes(ev_bytes)
         else:
             raise ValueError(f"Unknown slash evidence kind: {kind}")
         submitter_id = bytes(data[off:off + 32]); off += 32
@@ -473,6 +493,11 @@ class SlashTransaction:
                 FinalityDoubleVoteEvidence,
             )
             evidence = FinalityDoubleVoteEvidence.deserialize(ev_data)
+        elif ev_type == "state_ckpt_double_sign":
+            from messagechain.consensus.state_checkpoint import (
+                StateCheckpointDoubleSignEvidence,
+            )
+            evidence = StateCheckpointDoubleSignEvidence.deserialize(ev_data)
         else:
             evidence = SlashingEvidence.deserialize(ev_data)
         tx = cls(

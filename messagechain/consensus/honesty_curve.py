@@ -87,6 +87,18 @@ class OffenseKind(enum.Enum):
     # paths that bypassed the curve entirely.
     WITNESS_NON_RESPONSE = "witness_non_response"
     BOGUS_REJECTION = "bogus_rejection"
+    # Tier 63 (STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT): a validator
+    # who signed two distinct state_root values for the same checkpoint
+    # block_number was fragmenting bootstrap-from-checkpoint sync (new
+    # nodes adopt different post-states from a weak-subjectivity
+    # snapshot).  Always classified UNAMBIGUOUS -- the snapshot
+    # state_root is a function of deterministically-replayed chain
+    # state, so two distinct values cannot be a benign restart shape;
+    # the offender deliberately chose two parallel post-states.  Pre-
+    # fix the evidence type existed but no SlashTransaction kind, no
+    # pipeline dispatch, no enum entry.  See state_checkpoint.py for
+    # the evidence object and verifier.
+    STATE_CHECKPOINT_DOUBLE_SIGN = "state_checkpoint_double_sign"
 
 
 class Unambiguity(enum.Enum):

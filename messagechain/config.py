@@ -6619,6 +6619,47 @@ assert LOTTERY_DETERMINISTIC_HEIGHT > INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT, (
 )
 
 
+# ``STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT``: Tier 63 -- post-
+# activation a SlashTransaction carrying StateCheckpointDoubleSignEvidence
+# (a validator who signed two distinct ``state_root`` values for the
+# same checkpoint ``block_number``) is admitted and applies at the
+# UNAMBIGUOUS-evidence severity (100% on first-and-fresh-tenure / on
+# any repeat).  Pre-fix the evidence type and verifier existed in
+# ``messagechain.consensus.state_checkpoint`` and the docstring claimed
+# "Penalty: 100% stake + full escrow burn", but the slashing pipeline
+# only dispatched kinds 0/1/2 (block / attestation / finality-vote);
+# OffenseKind had no entry; SlashTransaction.{to,from}_bytes raised
+# 'Unknown slash evidence kind' on kind=3.  The slashable offense was
+# therefore unenforceable, leaving validator-collusion bootstrap-fork
+# attacks (different new nodes adopt different post-states from a
+# weak-subjectivity snapshot) without an on-chain penalty.
+#
+# Pre-fork (height < ``STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT``)
+# ``validate_slash_transaction`` rejects kind=3 with an explicit "Tier
+# 63" gate message so the admission rule is binary and historical
+# blocks (which never carried a kind=3 slash tx -- the encoder rejected
+# it pre-fix) replay byte-identically.  Post-fork the gate opens and
+# admission proceeds through the standard verify -> slashing-severity
+# -> apply path.  Severity classification: state-checkpoint double-
+# sign is UNAMBIGUOUS by construction -- the snapshot ``state_root`` is
+# a function of deterministically-replayed chain state, so two distinct
+# values for the same height cannot be a benign restart artifact.  The
+# offender deliberately chose two parallel post-states.
+#
+# Activation height 2400 sits 50 blocks above Tier 62 (height 2350) --
+# ~8.3h cohort spacing matching the Tier 49-62 pattern.  Two-validator
+# coordinated upgrade.  No new wire format on the unsigned-block path,
+# no new tx kinds beyond the kind=3 SlashTransaction discriminator, no
+# state-tree changes.
+STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT = 2400  # Tier 63
+
+assert STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT > LOTTERY_DETERMINISTIC_HEIGHT, (
+    "STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT must follow Tier 62 -- "
+    "consecutive consensus-rule activations need cohort spacing to "
+    "keep the validator-upgrade window from collapsing"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
