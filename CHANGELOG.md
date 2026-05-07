@@ -4,6 +4,181 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.62.0] — 2026-05-07
+
+Minor release.  Audit round 31 top-3 ships: one cryptographic-soundness
+fix on the admission gate (cross-pool WOTS+ leaf-reuse window where
+a message or transfer in ``mempool.pending`` at leaf=N could collide
+with a server-side stake / unstake / authority / governance / react
+tx at leaf=N from the same signer, leaking one-time-key secret
+material on the second signature), one new hard fork (Tier 57 routes
+the transfer apply path through ``pay_fee_with_burn`` so the
+attester-fee-funding split, DEFLATION_FLOOR_V2 rolling-fee-burn
+accumulator, and ``fee_burn_this_block`` ticker all accrue on
+transfer txs -- transfers were the only fee-paying tx kind silently
+bypassing these mechanisms), and one README correction (§1
+"Generate a private key" instructed users to back up the printed
+hex on paper, but ``generate-key``'s actual output prints the
+24-word BIP-39 phrase as the primary backup with a built-in
+checksum that the hex form lacks).  No new wire format, no new
+top-line CLI surface.
+
+### Added
+
+  * **Tier 57 -- transfer apply path routes through
+    ``pay_fee_with_burn`` (hard fork, activation height 2100).**
+    Pre-fix ``Blockchain._apply_transfer_with_burn`` hand-rolled
+    fee accounting (``balances[from] -= fee; balances[proposer]
+    += tip; total_supply -= burned``) instead of routing through
+    ``SupplyTracker.pay_fee_with_burn``.  Every other tx kind
+    (message, stake, governance, react, authority) routes through
+    the helper.  Transfers alone bypassed it.
+
+    Three CLAUDE.md anchors break silently as soon as transfer
+    volume matters: (a) the **attester-fee-funding split (Tier
+    4)** -- post-Tier-4 ``ATTESTER_FEE_SHARE_BPS / 10_000`` of
+    base_fee should redirect to ``attester_fee_pool_this_block``
+    (consumed by ``mint_block_reward``); transfers were silently
+    zeroing this; (b) the **DEFLATION_FLOOR_V2 rolling-fee-burn
+    accumulator** -- drives the supply-rebate floor in
+    ``calculate_block_reward`` when active-supply runs below
+    target; transfers were silently not accruing; (c) the
+    **``fee_burn_this_block`` ticker** -- redirects
+    ``ARCHIVE_BURN_REDIRECT_PCT`` into the archive reward pool at
+    end-of-block; transfers were silently not accruing.
+
+    Today's mainnet has near-zero transfer volume so the leak is
+    invisible.  That is the worst possible time to catch it -- the
+    moment the dual-purpose-token anchor pays off and transfers
+    become a real share of fee burn, the attester pool is
+    structurally under-sized by the transfer-share each block,
+    the deflation-floor rebate fires later/lower than intended,
+    and the archive-reward redirect undercounts.  CLAUDE.md
+    anchor: "auto-fee defaults adjust to fit this model -- don't
+    leave a tx kind defaulting to a stale flat fee while others
+    auto-bid by density."  The unified-fee intent is fee-flow
+    uniformity, not just floor uniformity.
+
+    Tier 57 splits the apply path on a height gate.  Pre-fork
+    (height < ``TRANSFER_FEE_UNIFIED_HEIGHT``) the legacy
+    hand-rolled accounting runs unchanged -- BYTE-IDENTICAL to
+    pre-Tier-57 code, so every historical transfer block replays
+    identically post-upgrade.  Post-fork the ``(tx.fee -
+    surcharge)`` base-fee+tip portion routes through
+    ``pay_fee_with_burn``; the helper handles attester-share /
+    rolling_fee_burn / fee_burn_this_block / total_fees_collected
+    for the base-fee portion uniformly with every other tx kind.
+    The ``NEW_ACCOUNT_FEE`` surcharge is a flat state-creation
+    tariff; it burns separately (sender debit, total_supply down,
+    total_burned up, fee_burn_this_block up, total_fees_collected
+    up) so the archive-reward redirect sees the full
+    transfer-share burn.
+
+    User-facing invariants preserved at the activation boundary:
+    sender total debit, recipient credit, and proposer tip are
+    byte-identical between pre- and post-fork apply on the same
+    tx.  The only divergence is the *split* between burn and
+    attester-pool growth -- exactly the fix's intent.
+
+    Activation height 2100 sits 50 blocks above Tier 56
+    (``TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT = 2050``) -- ~8.3h
+    cohort spacing at 600s blocks, matching the Tier 49-56
+    spacing pattern.  Two-validator coordinated upgrade.  7 new
+    regression tests in
+    ``tests/test_audit_r31_transfer_fee_unified_tier57.py`` pin
+    activation constant ordering, source shape, pre-fork legacy
+    replay, post-fork accrual on all three mechanisms, and the
+    user-facing invariant.  Surfaced by audit r31 top-3 #2.
+    (4645b4c)
+
+### Fixed
+
+  * **Cross-pool WOTS+ leaf-reuse admission gap leaks
+    one-time-key secret material.**  Pre-fix
+    ``Server._check_leaf_across_all_pools`` scanned every
+    server-side pool (``_pending_{stake,unstake,authority,
+    governance}_txs``) plus ``mempool.react_pool``, but NOT
+    ``mempool.pending`` (which holds both messages and
+    transfers).  The two RPC admission paths for messages
+    (``_rpc_submit_transaction``) and transfers
+    (``_rpc_submit_transfer``) both routed straight through
+    ``submit_transaction_to_mempool`` without ever calling
+    ``_check_leaf_across_all_pools`` themselves.
+
+    Concrete bite: a message tx admits to ``mempool.pending`` at
+    leaf=N.  A subsequent stake / unstake / authority /
+    governance / react tx at leaf=N from the same signer calls
+    ``_check_leaf_across_all_pools`` -- which scans server-side
+    pools but NOT ``mempool.pending`` -- finds no collision,
+    admits.  Both signed objects now carry the same WOTS+ leaf;
+    the second signature publishes enough one-time-key preimages
+    for any observer to forge an arbitrary signature at that
+    leaf.  Block-level dedupe (``Blockchain.validate_block``)
+    catches the in-block collision and rejects the proposer's
+    block -- but the leaked secret is already on the gossip
+    surface; the forged sig can be raced into a different
+    proposer's mempool before the legitimate watermark advances.
+    Twin-of-twin of the round-12 react_pool fix on the OTHER
+    side of the cross-pool boundary.
+
+    CLAUDE.md anchor: every signing path on this chain depends
+    on WOTS+ one-time-key soundness.  An admission gate that
+    lets two distinct payloads share a leaf is a forgery
+    primitive -- exactly the kind of foundational-crypto
+    regression the security principle (#1) forbids.
+
+    Three pieces, all source-pinned:
+
+      (1) ``_check_leaf_across_all_pools`` extended to scan
+      ``mempool.pending`` in BOTH the signer-keyed (default) and
+      entity-id-keyed (legacy call shape) branches.
+
+      (2) ``_rpc_submit_transaction`` (message path) calls
+      ``_check_leaf_across_all_pools(tx)`` before mempool
+      admission.
+
+      (3) ``_rpc_submit_transfer`` (transfer path) calls
+      ``_check_leaf_across_all_pools(tx)`` before mempool
+      admission.
+
+    The gossip-receiver branches already called
+    ``_check_leaf_across_all_pools`` and so pick up the fix
+    automatically once the helper itself scans
+    ``mempool.pending``.  Soft-fix: admission-side only, no
+    consensus rule change at the block validator.  Block-level
+    dedupe still catches anything that slips through admission,
+    so this is purely a tightening of the admission gate.  No
+    new tier, no new wire format.  4 new regression tests in
+    ``tests/test_audit_r31_cross_pool_leaf_mempool.py``.
+    Surfaced by audit r31 top-3 #1.  (44bbb66)
+
+### Changed
+
+  * **README §1 ("Generate a private key") now instructs users
+    to back up the 24-word BIP-39 phrase, not the hex form.**
+    Pre-fix the inline comment said ``# write the printed hex on
+    paper, 2-3 copies``, but ``cmd_generate_key``'s actual
+    output prints the 24-word phrase as the PRIMARY backup
+    ("write these down IN ORDER", "the phrase will NOT be shown
+    again") and labels hex only as "alternative."  Every new
+    user followed the README in order, transcribed a 64-char
+    hex string, and only learned later that the protocol-blessed
+    backup is a different artifact.  The hex form is a valid
+    backup but has NO typo-detection: a single typo on recovery
+    silently produces a different key and loses access
+    permanently.  The BIP-39 phrase has a built-in checksum
+    that catches single-word transcription errors.
+
+    Fix updates the §1 inline comment and adds a paragraph
+    explaining the BIP-39 checksum advantage so a reader
+    understands why the phrase is preferred over hex (without
+    the why, a user who "just prefers" a shorter backup would
+    still pick the hex form and lose error protection without
+    realizing it).  Pure docs change -- no code, no consensus
+    rule, no fork.  3 new content-pin tests in
+    ``tests/test_audit_r31_readme_step1_phrase_first.py``.
+    Surfaced by audit r31 top-3 #3.  (f0c0fb3)
+
 ## [1.61.1] — 2026-05-07
 
 Patch release.  Hotfix for a 1.61.0 consensus-replay regression in
