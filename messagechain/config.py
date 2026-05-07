@@ -6221,6 +6221,57 @@ assert INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT > HONESTY_CURVE_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 56 — TreasurySpendTransaction proposers pay VOTER_REWARD_SURCHARGE.
+# ─────────────────────────────────────────────────────────────────────
+# Pre-fix bug: ``Blockchain._validate_governance_tx`` required ``fee +
+# VOTER_REWARD_SURCHARGE`` for ``ProposalTransaction`` only; the
+# ``TreasurySpendTransaction`` branch fell through with
+# ``required = fee``.  The apply path tried to debit the surcharge
+# for both classes, but without a corresponding validation gate a
+# treasury-spend proposer with exactly ``fee`` balance silently
+# escrowed ``voter_reward_pool=0`` -- voters did the work of
+# evaluating the proposal and got paid nothing.
+#
+# Treasury spends are arguably the *most* economically consequential
+# governance class (they actually move treasury funds, vs. advisory
+# proposals that don't move money).  CLAUDE.md anchor: "voters who
+# cast a vote during the window receive a reward funded out of the
+# proposal fee -- the proposer pays the voters they're asking to
+# evaluate the proposal."  Pre-fix the most-money-moving proposal
+# class was exempt from the rule.
+#
+# Tier 56 makes the surcharge mandatory for both
+# ``ProposalTransaction`` and ``TreasurySpendTransaction`` post-
+# activation: validation rejects a treasury-spend whose proposer
+# cannot afford ``fee + SURCHARGE``; apply debits the surcharge into
+# ``voter_reward_pool`` symmetrically with the existing proposal
+# path.
+#
+# Pure admission-rule tightening + apply-path symmetrization; pre-
+# fork blocks replay byte-identically because the validation gate
+# stays loose below the activation height (the looser pre-fork rule
+# is the ground truth for any pre-fork block).  Activation height
+# 2050 sits 50 blocks above Tier 55 (INACTIVITY_LEAK_HONESTY_CURVE_
+# HEIGHT = 2000) -- ~8.3h cohort spacing at 600s blocks, matching
+# the Tier 49-55 spacing pattern.  Surfaced by audit r30 top-3 #3.
+TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT = 2050  # Tier 56
+
+assert TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT > INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT, (
+    "TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT must follow Tier 55 -- "
+    "operators upgrade through Tier 55 before this consensus-rule "
+    "change binds, and the cohort spacing keeps two consecutive "
+    "consensus-rule changes from collapsing into a single activation "
+    "window"
+)
+assert TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT > VOTER_REWARD_HEIGHT, (
+    "TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT must follow Tier 22 -- "
+    "the voter-reward-surcharge mechanism activates at Tier 22; the "
+    "Tier 56 fork only EXTENDS that mechanism to TreasurySpend, so "
+    "Tier 22 must already be active"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
