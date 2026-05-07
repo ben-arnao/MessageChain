@@ -4,6 +4,137 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.61.0] — 2026-05-07
+
+Minor release.  Audit round 30 top-3 ships: two new hard forks
+(Tier 55 routes the inactivity & coverage leaks through the
+honest-history relief multiplier so honest, long-tenured validators
+on a partition or fork-emergency halt no longer get bled at the same
+quadratic rate as a withholding cartel; Tier 56 makes
+``VOTER_REWARD_SURCHARGE`` mandatory for ``TreasurySpendTransaction``
+proposers so voters get paid on the most economically consequential
+proposal class) and one CLI/UX fix (``messagechain unstake`` now
+honors ``--cold-keyfile`` so cold-authority-hardened operators can
+actually retire from the CLI -- previously every operator who
+followed the recommended hardening recipe hit a hard chain rejection
+when they tried to unstake).  No new wire format, no new top-line
+CLI surface beyond the two ``unstake`` flags.
+
+### Added
+
+  * **Tier 55 -- inactivity & coverage leaks consult the honesty
+    curve (hard fork, activation height 2000).**  Pre-fix
+    ``compute_inactivity_penalty`` and ``compute_coverage_penalty``
+    were pure functions of ``(blocks_since_finality,
+    validator_stake)`` / ``(consecutive_misses, attester_stake)``.
+    Neither consulted ``slashing_severity``, ``_track_record``, or
+    ``_prior_offenses`` -- the entire Tier-23/24/51 honesty-curve
+    machinery every other slashing path uses.  An honest, long-
+    tenured validator on a partition or fork-emergency auto-halt
+    was bled quadratically at the same rate as a withholding cartel,
+    in direct violation of the CLAUDE.md "honest-operator insurance"
+    anchor.
+
+    Tier 55 routes both penalty paths through a new
+    ``honest_history_relief_multiplier_bps`` helper that mirrors the
+    AMBIGUOUS-path relief in ``slashing_severity``: same chain-state
+    inputs (``proposer_sig_counts``, ``reputation``,
+    ``slash_offense_counts``), same shape.  Returns 10000 bps (full
+    nominal) for fresh validators or repeat offenders, capped at
+    FLOOR_NUM/FLOOR_DEN = 1/5 = 2000 bps for long-tenured high-
+    honesty operators.  Pure function, integer-only arithmetic,
+    consensus-deterministic.  ``apply_inactivity_leak`` /
+    ``apply_coverage_leak`` accept optional
+    ``current_height``/``blockchain`` kwargs; pre-fork or legacy
+    callers get byte-identical legacy bleed.
+
+    Cartel-defense behavior is preserved: a withholding coalition
+    is by definition NOT long-tenured-high-honesty (the curve reads
+    *accepted* blocks + attestations, both of which a cartel can't
+    forge without doing real honest work first).  Activation height
+    2000 sits 50 blocks above Tier 54 (1950) -- ~8.3h cohort spacing
+    matching the Tier 49-54 pattern.  Two-validator coordinated
+    upgrade.  13 new regression tests in
+    ``tests/test_inactivity_leak_honesty_curve_tier55.py``.
+    Surfaced by audit r30 top-3 #2.  (793f152)
+
+  * **Tier 56 -- TreasurySpend proposers pay
+    ``VOTER_REWARD_SURCHARGE`` (hard fork, activation height 2050).**
+    Pre-fix ``Blockchain._validate_governance_tx`` required ``fee +
+    VOTER_REWARD_SURCHARGE`` for ``ProposalTransaction`` only; the
+    ``TreasurySpendTransaction`` branch fell through with
+    ``required = fee``.  The apply path tried to debit the surcharge
+    for both classes, but without a corresponding validation gate a
+    treasury-spend proposer with exactly ``fee`` balance silently
+    escrowed ``voter_reward_pool=0`` -- voters did the work of
+    evaluating the proposal and got paid nothing.  Treasury spends
+    are arguably the *most* economically consequential governance
+    class, and they were the only one whose voters didn't get paid
+    -- a 50k-token subsidy to treasury-spend proposers paid in
+    voter time.
+
+    Tier 56 extends the surcharge requirement to
+    ``TreasurySpendTransaction`` symmetrically: validation rejects
+    fee-only TreasurySpend admission post-activation; the apply
+    path debits the full surcharge into ``voter_reward_pool`` so the
+    existing ``finalize_voter_rewards`` distributes voter rewards
+    identically to advisory-proposal voters.  Per-class height gates
+    (Tier 22 ``VOTER_REWARD_HEIGHT`` for ProposalTransaction, Tier
+    56 ``TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT`` for TreasurySpend)
+    keep pre-fork TreasurySpend blocks byte-identical.  Activation
+    height 2050 sits 50 blocks above Tier 55 (2000), matching the
+    Tier 49-55 cohort spacing pattern.  5 new regression tests in
+    ``tests/test_treasury_spend_voter_surcharge_tier56.py``.
+    Surfaced by audit r30 top-3 #3.  (44855f6)
+
+### Fixed
+
+  * **``messagechain unstake`` silently signed with the hot key on
+    every cold-authority-hardened operator -- the recommended
+    hardening recipe broke the documented retirement path.**
+    Pre-fix ``cmd_unstake`` unconditionally signed the
+    ``UnstakeTransaction`` with ``_resolve_signing_entity(...)
+    .keypair`` (the hot key); the chain admission rule at
+    ``Blockchain._validate_unstake_tx_in_block`` hard-rejected with
+    "Unstake must be signed by the authority (cold) key.  The hot
+    signing key cannot authorize withdrawal."  Funds weren't lost
+    (the operator could build a cold-signed tx by hand) but the
+    documented retirement path -- the README's own ``messagechain
+    unstake`` instruction -- was broken on the documented hardened
+    setup.  CLAUDE.md anchor at risk: Principle #3 (Simplicity) +
+    token-as-tradable-asset quality bar.  Mainnet-reachable today
+    on the happy path: any operator who hardened and now wants to
+    retire hit this disaster path.
+
+    Two pieces, both wired:
+
+      (1) ``create_unstake_transaction`` accepts an optional
+      ``signing_keypair`` parameter.  When provided, the tx still
+      carries the validator's entity_id (so the chain debits the
+      right validator) but the signature is produced by
+      ``signing_keypair`` instead of ``entity.keypair``.  Default
+      None preserves the legacy hot-key signing path byte-for-byte
+      for entities that have not promoted a cold authority key.
+
+      (2) ``cmd_unstake`` adds ``--cold-keyfile`` and ``--cold-leaf``
+      flags (mirroring the existing pattern in
+      ``set-receipt-subtree-root`` / ``set-authority-key
+      --cold-key-path``).  Pre-flight: probe ``get_authority_key``
+      for the entity.  If the on-chain authority pubkey !=
+      ``entity.public_key`` (cold authority installed), require
+      ``--cold-keyfile``, load it as Entity, verify its public_key
+      matches the on-chain authority pubkey, and pass
+      ``signing_keypair=cold_entity.keypair`` through to
+      ``create_unstake_transaction``.  Refusing pre-broadcast saves
+      the operator the multi-minute hot-key Merkle keygen + RPC
+      round-trip a chain-rejected tx would otherwise cost.
+
+    Soft-fix; no consensus-rule change, no fork.  5 new tests in
+    ``tests/test_cli_unstake_cold_keyfile.py`` covering the helper
+    API, signature round-trip, chain admission with cold authority
+    installed, and the CLI behavior under both the gate and the
+    happy path.  Surfaced by audit r30 top-3 #1.  (7ae7481)
+
 ## [1.60.0] — 2026-05-06
 
 Minor release.  Audit round 29 top-3 ships: one new hard fork
