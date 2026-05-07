@@ -747,6 +747,18 @@ class ChainDB:
                 next_leaf INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Tier 58 cold-key WOTS+ leaf watermark.  Mirror of
+            -- leaf_watermarks but keyed by COLD PUBKEY BYTES (not
+            -- entity_id) -- one cold key may sign for multiple
+            -- entities (validator cluster pattern), so the per-key
+            -- ratchet is the right granularity.  Mirrored here for
+            -- cold-boot rehydration alongside the state-snapshot
+            -- _TAG_COLD_LEAF_WATERMARK section (v23+).
+            CREATE TABLE IF NOT EXISTS cold_leaf_watermarks (
+                cold_pubkey BLOB PRIMARY KEY,
+                next_leaf INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS authority_keys (
                 entity_id BLOB PRIMARY KEY,
                 authority_public_key BLOB NOT NULL
@@ -1928,6 +1940,30 @@ class ChainDB:
 
     def get_all_leaf_watermarks(self) -> dict[bytes, int]:
         cur = self._conn.execute("SELECT entity_id, next_leaf FROM leaf_watermarks")
+        return {bytes(row[0]): row[1] for row in cur.fetchall()}
+
+    # ── State: Cold-key Leaf Watermarks (Tier 58) ─────────────────────
+    # Same shape as leaf_watermarks, keyed by COLD PUBKEY BYTES.
+
+    def get_cold_leaf_watermark(self, cold_pubkey: bytes) -> int:
+        cur = self._conn.execute(
+            "SELECT next_leaf FROM cold_leaf_watermarks WHERE cold_pubkey = ?",
+            (cold_pubkey,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def set_cold_leaf_watermark(self, cold_pubkey: bytes, next_leaf: int):
+        self._conn.execute(
+            "INSERT OR REPLACE INTO cold_leaf_watermarks "
+            "(cold_pubkey, next_leaf) VALUES (?, ?)",
+            (cold_pubkey, next_leaf),
+        )
+
+    def get_all_cold_leaf_watermarks(self) -> dict[bytes, int]:
+        cur = self._conn.execute(
+            "SELECT cold_pubkey, next_leaf FROM cold_leaf_watermarks"
+        )
         return {bytes(row[0]): row[1] for row in cur.fetchall()}
 
     # -- State: Key-rotation last heights (cooldown gate) -----------

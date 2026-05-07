@@ -6329,6 +6329,74 @@ assert TRANSFER_FEE_UNIFIED_HEIGHT > ATTESTER_FEE_FUNDING_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 58 — Cold authority key chain-state WOTS+ leaf watermark
+# ─────────────────────────────────────────────────────────────────────
+# Pre-fix: ``Blockchain._validate_unstake_tx_in_block`` /
+# ``validate_revoke`` / ``validate_set_authority_key`` verified
+# signatures, nonces, balances -- but never tracked any chain-state
+# watermark for cold-key-signed leaves.  ``apply_revoke`` / unstake
+# apply / set-authority-key apply only bumped the HOT-key watermark
+# (and only when ``authority_pk == signing_pk`` for unstake).  No
+# ``cold_leaf_watermarks`` dict existed anywhere.
+#
+# Sibling of audit r31 #1 (cross-pool WOTS+ leaf-reuse on
+# mempool.pending) on the COLD-KEY side: r31 closed the hot-key
+# cross-pool admission gap; Tier 58 closes the same defect class
+# for cold-key-signed txs across BLOCKS.
+#
+# Concrete bite: an operator pre-signs an offline emergency revoke
+# at cold-key leaf=N (the documented hardening pattern in
+# emergency_revoke.py:21-30), then later signs an unstake / fresh
+# revoke / set-authority-key cold-counter-sig at the SAME cold-key
+# leaf=N from the same cold key.  Both txs admit and apply.  Anyone
+# observing both signatures recovers the WOTS+ one-time secret for
+# that leaf and forges arbitrary cold-key signatures -- including a
+# fresh RevokeTransaction, an Unstake of full balance, or a
+# SetAuthorityKey rebind.  Worst case for any operator who followed
+# the recommended hardening recipe: total stake loss + identity
+# hijack with no cold-key recovery path.
+#
+# Fix: a new ``Blockchain.cold_leaf_watermarks`` dict keyed by COLD
+# PUBKEY BYTES (NOT entity_id, since one cold key may sign for
+# multiple entities -- the documented cluster pattern at
+# blockchain.py:3046-3050).  At and above
+# ``COLD_LEAF_WATERMARK_HEIGHT``:
+#   * ``validate_revoke`` rejects when the cold sig's leaf_index is
+#     below ``cold_leaf_watermarks[authority_pk]``.
+#   * ``_validate_unstake_tx_in_block`` rejects ditto when the
+#     unstake was signed by a separate cold key (authority_pk !=
+#     signing_pk).
+#   * ``validate_set_authority_key`` rejects when the cold counter-
+#     signature's leaf_index is below
+#     ``cold_leaf_watermarks[existing_cold_pk]``.
+#   * Apply paths bump the watermark identically to the hot-key
+#     pattern at ``_bump_watermark``.
+#
+# Pre-fork (height < COLD_LEAF_WATERMARK_HEIGHT) the new check is
+# skipped entirely so historical blocks replay byte-identically --
+# every Revoke / Unstake / SetAuthorityKey accepted by the legacy
+# rules continues to be accepted.
+#
+# Activation height 2150 sits 50 blocks above Tier 57 (TRANSFER_FEE_
+# UNIFIED_HEIGHT = 2100) -- ~8.3h cohort spacing at 600s blocks,
+# matching the Tier 49-57 spacing pattern.  Two-validator network,
+# both operator-controlled, so the cutover is coordinated.
+COLD_LEAF_WATERMARK_HEIGHT = 2150  # Tier 58
+
+assert COLD_LEAF_WATERMARK_HEIGHT > TRANSFER_FEE_UNIFIED_HEIGHT, (
+    "COLD_LEAF_WATERMARK_HEIGHT must follow Tier 57 -- operators "
+    "upgrade through Tier 57 before this admission-rule change binds, "
+    "and the cohort spacing keeps two consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
+)
+assert COLD_LEAF_WATERMARK_HEIGHT > AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, (
+    "COLD_LEAF_WATERMARK_HEIGHT must follow Tier 46 (AUTHORITY_REBIND_"
+    "REQUIRES_COLD_HEIGHT) -- the cold counter-signature wire format "
+    "Tier 58 starts watermarking only exists at and above Tier 46"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

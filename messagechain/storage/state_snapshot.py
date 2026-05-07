@@ -319,7 +319,29 @@ from messagechain.crypto.hashing import default_hash
 #      hand-built dicts decode gracefully (graceful-degrade for
 #      pre-fork snapshots; binary decode of a v21 blob is rejected
 #      by the strict version check anyway).
-STATE_SNAPSHOT_VERSION = 22  # wire format version for encode/decode
+#  v23 — cold_leaf_watermarks added.  bytes->int dict mapping COLD
+#      PUBKEY BYTES (NOT entity_id) to the next-safe WOTS+ leaf
+#      index.  Tier 58 (COLD_LEAF_WATERMARK_HEIGHT): chain-state
+#      leaf-reuse defense for cold-key-signed txs (Revoke /
+#      Unstake / SetAuthorityKey cold counter-sig), parallel to the
+#      hot-key leaf_watermarks dict already in v1.  Pre-v23 the
+#      snapshot had ZERO coverage of this dict -- pre-Tier-58 the
+#      in-memory dict is empty everywhere (the apply paths only
+#      bump it post-activation) so a v22 snapshot restored under
+#      v23 with an empty cold_leaf_watermarks dict reproduces a
+#      non-divergent state.  Post-Tier-58 the absence is
+#      consensus-fatal: two state-synced nodes that disagree on
+#      this map admit different cold-key txs and silently fork at
+#      the next cold-leaf-reuse-bordering tx.  Wire layout:
+#      appended after v22's slash_offense_counts section -- u32
+#      entry_count followed by N sorted (u32 cold_pk_len || cold_pk
+#      || u64 next_leaf) records.  Mirrored into chaindb's
+#      `cold_leaf_watermarks` table at install time so cold restart
+#      on the synced node rehydrates from disk.  `deserialize_state`
+#      defaults the field to {} so older v22 hand-built dicts decode
+#      gracefully; binary decode of a v22 blob is rejected by the
+#      strict version check anyway.  Surfaced by audit r32 top-3 #1.
+STATE_SNAPSHOT_VERSION = 23  # wire format version for encode/decode
 STATE_ROOT_VERSION = _STATE_ROOT_VERSION
 MAX_STATE_SNAPSHOT_BYTES = _MAX_DEFAULT
 
@@ -334,6 +356,15 @@ _TAG_STAKE = b"stk"
 _TAG_PUBKEY = b"pub"
 _TAG_AUTHORITY = b"auth"
 _TAG_LEAF_WATERMARK = b"lwm"
+# v23: cold-key WOTS+ leaf watermark.  Tier 58.  Same shape as the
+# hot-key _TAG_LEAF_WATERMARK but keyed by COLD PUBKEY BYTES (not
+# entity_id) because one cold key may sign for multiple entities
+# (validator cluster pattern).  MUST participate in the state-root
+# commitment: two state-synced nodes that disagreed on this dict
+# would admit different cold-key txs at the next leaf-reuse-
+# bordering tx and silently fork.  See COLD_LEAF_WATERMARK_HEIGHT
+# in config.py for the full rationale.
+_TAG_COLD_LEAF_WATERMARK = b"clwm"
 _TAG_ROTATION = b"rot"
 # v18: key_rotation_last_height -- bytes->int dict mapping entity_id to
 # the block height at which that entity's most-recent KeyRotation was
@@ -583,6 +614,15 @@ def serialize_state(blockchain) -> dict:
         "public_keys": dict(blockchain.public_keys),
         "authority_keys": dict(blockchain.authority_keys),
         "leaf_watermarks": dict(blockchain.leaf_watermarks),
+        # v23: cold-key WOTS+ leaf watermark.  Tier 58.  See header
+        # comment for v23 in this module + COLD_LEAF_WATERMARK_HEIGHT
+        # in config.py.  ``getattr`` keeps backward compat with
+        # in-process tests that mock ``Blockchain`` and may not have
+        # the attribute set yet -- production Blockchain.__init__
+        # always defines it.
+        "cold_leaf_watermarks": dict(
+            getattr(blockchain, "cold_leaf_watermarks", {})
+        ),
         "key_rotation_counts": dict(blockchain.key_rotation_counts),
         # v18: per-entity last-rotation-height map.  Consensus-critical
         # for the KEY_ROTATION_COOLDOWN_BLOCKS gate -- see
@@ -960,6 +1000,10 @@ def deserialize_state(snapshot: dict) -> dict:
     out.setdefault("public_keys", {})
     out.setdefault("authority_keys", {})
     out.setdefault("leaf_watermarks", {})
+    # v23 (Tier 58): cold-key WOTS+ leaf watermark.  Default empty so
+    # pre-v23 hand-built snapshot dicts decode gracefully -- pre-fork
+    # the dict is empty everywhere on chain anyway.
+    out.setdefault("cold_leaf_watermarks", {})
     out.setdefault("key_rotation_counts", {})
     out.setdefault("revoked_entities", set())
     out.setdefault("slashed_validators", set())
@@ -1350,6 +1394,19 @@ def compute_state_root(snapshot: dict) -> bytes:
             _TAG_AUTHORITY, snap["authority_keys"])),
         _TAG_LEAF_WATERMARK: _merkle(_entries_for_section(
             _TAG_LEAF_WATERMARK, snap["leaf_watermarks"])),
+        # v23 (Tier 58): cold-key WOTS+ leaf watermark.  MUST
+        # participate in the state root: two state-synced nodes that
+        # disagreed on this section would admit different cold-key
+        # txs at the next leaf-reuse-bordering tx and silently fork
+        # at the slash block.  Pre-fork the dict is empty everywhere
+        # on chain, so the section root is deterministic-empty and
+        # adding it does not break pre-Tier-58 replay (it only
+        # changes the OUTER aggregation, which is what
+        # STATE_SNAPSHOT_VERSION=23 marks anyway).
+        _TAG_COLD_LEAF_WATERMARK: _merkle(_entries_for_section(
+            _TAG_COLD_LEAF_WATERMARK,
+            snap.get("cold_leaf_watermarks", {}),
+        )),
         _TAG_ROTATION: _merkle(_entries_for_section(
             _TAG_ROTATION, snap["key_rotation_counts"])),
         # v18: per-entity last-rotation-height.  Drives the
@@ -2185,6 +2242,15 @@ def encode_snapshot(snap: dict) -> bytes:
     out += _encode_bytes_int_dict(
         snap.get("slash_offense_counts", {}),
     )
+    # v23: cold_leaf_watermarks (bytes->int dict, keyed by COLD
+    # PUBKEY BYTES).  Strictly appended after v22's slash_offense_
+    # counts so a v22 blob is a strict prefix of a v23 blob.  See
+    # _TAG_COLD_LEAF_WATERMARK and the v23 entry in this module's
+    # version-history comment for why this MUST live in the state-
+    # root commitment.
+    out += _encode_bytes_int_dict(
+        snap.get("cold_leaf_watermarks", {}),
+    )
     return bytes(out)
 
 
@@ -2326,6 +2392,10 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
     # on v22+ blobs; pre-v22 blobs are rejected by the strict
     # version check above.
     slash_offense_counts, off = _decode_bytes_int_dict(blob, off)
+    # v23+: cold_leaf_watermarks (bytes->int dict, keyed by COLD
+    # PUBKEY BYTES).  Always present on v23+ blobs.  See header
+    # comment for v23 in this module.
+    cold_leaf_watermarks, off = _decode_bytes_int_dict(blob, off)
     if off != len(blob):
         raise ValueError(
             f"snapshot blob has trailing bytes "
@@ -2382,4 +2452,5 @@ def decode_snapshot(blob: bytes, max_bytes: int | None = None) -> dict:
         "key_history": key_history,
         "reaction_choices": reaction_choices,
         "slash_offense_counts": slash_offense_counts,
+        "cold_leaf_watermarks": cold_leaf_watermarks,
     }

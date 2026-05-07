@@ -237,11 +237,17 @@ class TestStateSnapshotRoundTrip(unittest.TestCase):
     """The slash_offense_counts dict participates in the v22
     snapshot wire format and snapshot-root commitment."""
 
-    def test_version_bumped_to_22(self):
-        self.assertEqual(
+    def test_version_at_least_22(self):
+        # v22 was the audit-r29 fix that added slash_offense_counts.
+        # Subsequent versions (v23 added cold_leaf_watermarks per
+        # audit r32 #1) only APPEND new fields after the v22 slot, so
+        # v22's wire-format guarantees survive every later bump.  This
+        # pin asserts the version did not regress below v22.
+        self.assertGreaterEqual(
             STATE_SNAPSHOT_VERSION, 22,
-            "Audit fix bumps STATE_SNAPSHOT_VERSION 21 -> 22 to carry "
-            "slash_offense_counts in the wire format and snapshot root.",
+            "STATE_SNAPSHOT_VERSION must be >= 22 -- the audit-r29 fix "
+            "that added slash_offense_counts to the wire format and "
+            "snapshot root cannot be undone without consensus regression.",
         )
 
     def test_state_snapshot_round_trip_includes_counts(self):

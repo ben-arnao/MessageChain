@@ -340,6 +340,16 @@ class Blockchain:
         # reorgs — a leaf that was ever published on any fork is permanently
         # burned because its private material is public knowledge.
         self.leaf_watermarks: dict[bytes, int] = {}
+        # Tier 58 — cold-key WOTS+ leaf watermark.  Keyed by COLD
+        # PUBKEY BYTES (not entity_id) because one cold key may sign
+        # for multiple entities (the documented cluster pattern at
+        # validate_set_authority_key:3046-3050).  At and above
+        # COLD_LEAF_WATERMARK_HEIGHT, validate_revoke /
+        # _validate_unstake_tx_in_block / validate_set_authority_key
+        # consult this dict; apply paths bump it.  Pre-fork blocks
+        # ignore it entirely so historical replay is byte-identical.
+        # See config.py Tier 58 block for the full rationale.
+        self.cold_leaf_watermarks: dict[bytes, int] = {}
         # Cold "authority" public key per entity, used to gate destructive
         # operations (unstake, emergency revoke) separately from the 24/7
         # hot signing key that lives on the validator server. If unset for
@@ -1045,6 +1055,16 @@ class Blockchain:
         # Restore leaf-reuse watermarks
         if hasattr(self.db, 'get_all_leaf_watermarks'):
             self.leaf_watermarks = self.db.get_all_leaf_watermarks()
+
+        # Tier 58 -- restore the per-cold-pubkey leaf watermark.
+        # ``hasattr`` keeps backward compat with chaindb instances on
+        # older binaries where the table doesn't yet exist; absent the
+        # method, the dict stays empty and the apply path repopulates
+        # it on the next post-Tier-58 cold-key tx.  Pre-Tier-58 chains
+        # have nothing to restore (the dict is empty everywhere) so
+        # this branch is a no-op until activation.
+        if hasattr(self.db, 'get_all_cold_leaf_watermarks'):
+            self.cold_leaf_watermarks = self.db.get_all_cold_leaf_watermarks()
 
         # Restore authority (cold) keys for hot/cold-separated validators
         if hasattr(self.db, 'get_all_authority_keys'):
@@ -1828,6 +1848,18 @@ class Blockchain:
             if hasattr(self.db, 'set_leaf_watermark'):
                 for eid, nxt in _scoped(self.leaf_watermarks):
                     self.db.set_leaf_watermark(eid, nxt)
+            # Tier 58 -- mirror cold_leaf_watermarks to chaindb.
+            # Keys are cold pubkeys (NOT entity_ids), so the
+            # ``_scoped`` per-affected-entity filter doesn't apply
+            # (the cold-pubkey -> entity mapping is many-to-one).
+            # Write the full dict on every flush; the table is
+            # bounded by the number of distinct cold keys ever
+            # promoted (~|validators| in practice), so the cost is
+            # trivial.  Conditional on ``hasattr`` so older chaindb
+            # binaries without the table don't crash here.
+            if hasattr(self.db, 'set_cold_leaf_watermark'):
+                for cold_pk, nxt in self.cold_leaf_watermarks.items():
+                    self.db.set_cold_leaf_watermark(cold_pk, nxt)
             if hasattr(self.db, 'set_authority_key'):
                 for eid, ak in _scoped(self.authority_keys):
                     self.db.set_authority_key(eid, ak)
@@ -2578,6 +2610,17 @@ class Blockchain:
         self.public_keys = dict(snap["public_keys"])
         self.authority_keys = dict(snap["authority_keys"])
         self.leaf_watermarks = dict(snap["leaf_watermarks"])
+        # v23 (Tier 58): cold-key WOTS+ leaf watermark.  ``.get`` with
+        # default {} so a v22 snapshot installed under v23 code (the
+        # snapshot blob is rejected by decode_snapshot's strict version
+        # check, but the dict-form deserialize_state path defaults the
+        # field to {}, so this branch must be defensively defaulted)
+        # produces an empty cold_leaf_watermarks dict.  Pre-Tier-58
+        # the dict is empty everywhere on chain, so this matches the
+        # semantic state.  Post-Tier-58 the dict is rebuilt by replay.
+        self.cold_leaf_watermarks = dict(
+            snap.get("cold_leaf_watermarks", {}),
+        )
         self.key_rotation_counts = dict(snap["key_rotation_counts"])
         # v18: per-entity last-rotation-height.  Drives the
         # KEY_ROTATION_COOLDOWN_BLOCKS gate; a cold-booted or state-
@@ -3041,6 +3084,27 @@ class Blockchain:
                     "currently-installed authority key (Tier 46)."
                 )
 
+            # Tier 58 -- cold-key WOTS+ leaf watermark.  The cold
+            # counter-signature consumes a leaf from the EXISTING cold
+            # key's tree.  At and above COLD_LEAF_WATERMARK_HEIGHT,
+            # reject when that leaf is already consumed by a prior
+            # cold-key-signed tx (revoke, unstake, prior rebind).
+            # Pre-fork: legacy bypass for replay determinism.
+            from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT
+            if chain_h >= COLD_LEAF_WATERMARK_HEIGHT:
+                wm = self.cold_leaf_watermarks.get(existing_cold_pk, 0)
+                cold_leaf = tx.cold_signature.leaf_index
+                if cold_leaf < wm:
+                    return False, (
+                        f"Cold-key counter-sig WOTS+ leaf {cold_leaf} "
+                        f"already consumed (cold watermark {wm}) — "
+                        "leaf reuse rejected.  The existing cold key "
+                        "has previously signed a tx at or above this "
+                        "leaf; signing the rebind at this leaf would "
+                        "leak one-time-key secret material on the "
+                        "wire."
+                    )
+
         # Reject the cold == hot no-op.  Operators legitimately share a
         # single cold wallet across multiple validators they control (the
         # standard cluster pattern), so we do NOT reject cross-entity
@@ -3062,6 +3126,12 @@ class Blockchain:
         tx: SetAuthorityKeyTransaction,
         proposer_id: bytes,
     ) -> tuple[bool, str]:
+        # Tier 58 -- snapshot the EXISTING cold pubkey BEFORE we
+        # overwrite it.  Required so the cold watermark bump for the
+        # rebind's cold-counter-sig (signed under the OLD cold key)
+        # lands in the correct cold-pubkey slot.
+        previous_cold_pk = self.authority_keys.get(tx.entity_id)
+
         ok, reason = self.validate_set_authority_key(tx)
         if not ok:
             return False, reason
@@ -3073,6 +3143,25 @@ class Blockchain:
         self.authority_keys[tx.entity_id] = tx.new_authority_key
         self.nonces[tx.entity_id] = tx.nonce + 1
         self._bump_watermark(tx.entity_id, tx.signature.leaf_index)
+
+        # Tier 58 -- when the rebind carried a Tier-46 cold counter-
+        # signature, that sig consumed a leaf from the OLD cold key's
+        # tree.  Bump cold_leaf_watermarks[previous_cold_pk] so any
+        # later cold-key tx (revoke, unstake, set-auth rebind) signed
+        # by the old cold key at the same leaf is rejected.  This
+        # closes the audit r32 #1 leak surface for the rebind path.
+        # Pre-fork: skipped for replay determinism.
+        from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT as _CLWH
+        chain_h = self.height + 1
+        if (
+            chain_h >= _CLWH
+            and tx.has_cold_signature()
+            and previous_cold_pk is not None
+        ):
+            self._bump_cold_watermark(
+                previous_cold_pk, tx.cold_signature.leaf_index,
+            )
+
         return True, "Authority key updated"
 
     def is_revoked(self, entity_id: bytes) -> bool:
@@ -3140,6 +3229,28 @@ class Blockchain:
                 "Invalid signature — revoke must be signed by the authority "
                 "(cold) key. The hot signing key cannot self-revoke."
             )
+
+        # Tier 58 -- cold-key WOTS+ leaf watermark.  At and above
+        # COLD_LEAF_WATERMARK_HEIGHT a revoke whose leaf_index is below
+        # cold_leaf_watermarks[authority_pk] is rejected.  This closes
+        # the audit r32 #1 gap: an operator who pre-signed an offline
+        # revoke at cold-leaf=N and later signs another cold-key tx at
+        # the same cold-leaf=N would publish two distinct payloads
+        # under the same WOTS+ leaf, leaking one-time-key secret
+        # material on the gossip surface.  Pre-fork: legacy bypass
+        # (no check) so historical blocks replay byte-identically.
+        from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT
+        if chain_h >= COLD_LEAF_WATERMARK_HEIGHT:
+            wm = self.cold_leaf_watermarks.get(authority_pk, 0)
+            if tx.signature.leaf_index < wm:
+                return False, (
+                    f"Cold-key WOTS+ leaf {tx.signature.leaf_index} "
+                    f"already consumed (cold watermark {wm}) — leaf "
+                    "reuse rejected.  The cold key has previously "
+                    "signed a tx at or above this leaf; signing again "
+                    "at this leaf would leak one-time-key secret "
+                    "material.  Advance the cold-key cursor and re-sign."
+                )
         return True, "Valid"
 
     def apply_revoke(
@@ -3182,6 +3293,25 @@ class Blockchain:
         # tracks the hot tree, which may continue to be used up until
         # the chain enforces a full halt of the revoked entity.
 
+        # Tier 58 -- bump the per-cold-pubkey watermark so a future
+        # cold-key tx (unstake, fresh revoke, set-authority cold
+        # counter-sig) at the same cold-leaf is rejected at validation.
+        # Pre-fork: skipped for replay determinism.  The cold pubkey
+        # was just resolved by validate_revoke; re-resolve here from
+        # the live entity (still pointing to the cold key whose sig
+        # this revoke just verified under).
+        from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT as _CLWH
+        chain_h = (
+            current_block + 1 if current_block is not None
+            else self.height + 1
+        )
+        if chain_h >= _CLWH:
+            authority_pk = self.get_authority_key(tx.entity_id)
+            if authority_pk is not None:
+                self._bump_cold_watermark(
+                    authority_pk, tx.signature.leaf_index,
+                )
+
         # Persist revocation immediately — this is a security-critical flag.
         if self.db is not None and hasattr(self.db, 'set_revoked'):
             self.db.set_revoked(tx.entity_id)
@@ -3210,6 +3340,30 @@ class Blockchain:
         current = self.leaf_watermarks.get(entity_id, 0)
         if nxt > current:
             self.leaf_watermarks[entity_id] = nxt
+
+    def get_cold_leaf_watermark(self, cold_pk: bytes) -> int:
+        """Tier 58: return the next-safe WOTS+ leaf for this cold key.
+
+        Keyed by cold pubkey (not entity_id) because one cold key may
+        sign for multiple entities (validator cluster pattern).  The
+        same per-key ratcheting invariant as the hot watermark: once a
+        leaf has been seen on any cold-key-signed tx, no later tx
+        signed at that leaf or below ever passes validation.
+        """
+        return self.cold_leaf_watermarks.get(cold_pk, 0)
+
+    def _bump_cold_watermark(self, cold_pk: bytes, leaf_index: int) -> None:
+        """Tier 58: ratchet the per-cold-key watermark past the leaf.
+
+        Mirror of _bump_watermark for the cold-leaf namespace.  Same
+        monotone-only invariant.  Caller is responsible for the height
+        gate -- this helper itself does not consult chain height; the
+        validate / apply paths gate the call.
+        """
+        nxt = leaf_index + 1
+        current = self.cold_leaf_watermarks.get(cold_pk, 0)
+        if nxt > current:
+            self.cold_leaf_watermarks[cold_pk] = nxt
 
     def _install_pubkey_direct(
         self,
@@ -10632,6 +10786,31 @@ class Blockchain:
                 "(cold) key. The hot signing key cannot authorize withdrawal."
             )
 
+        # Tier 58 -- cold-key WOTS+ leaf watermark.  At and above
+        # COLD_LEAF_WATERMARK_HEIGHT, an unstake whose cold-sig leaf
+        # is below the cold watermark for ``authority_pk`` is rejected.
+        # Same defect class as audit r31 #1 (cross-pool admission gap)
+        # but on the cold-key side, persistent across blocks.  Apply-
+        # path bumps the watermark identically to the hot-key pattern.
+        # Pre-fork: legacy bypass for historical replay determinism.
+        # Note: when a single-key entity uses the same key as both hot
+        # and cold (authority_pk == public_keys[entity_id]), this gate
+        # IS still checked -- a unified-key entity reusing its leaf is
+        # already caught by the hot-key watermark in _validate_message_
+        # tx_in_block etc., but enforcing here too is defense-in-depth.
+        from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT
+        chain_h = self.height + 1
+        if chain_h >= COLD_LEAF_WATERMARK_HEIGHT:
+            wm = self.cold_leaf_watermarks.get(authority_pk, 0)
+            if utx.signature.leaf_index < wm:
+                return False, (
+                    f"Cold-key WOTS+ leaf {utx.signature.leaf_index} "
+                    f"already consumed (cold watermark {wm}) — leaf "
+                    "reuse rejected.  The cold key has previously "
+                    "signed a tx at or above this leaf; signing again "
+                    "would leak one-time-key secret material."
+                )
+
         expected_nonce = pending_nonces.get(
             utx.entity_id, self.nonces.get(utx.entity_id, 0),
         )
@@ -12798,6 +12977,21 @@ class Blockchain:
             signing_pk = self.public_keys.get(utx.entity_id)
             if authority_pk == signing_pk:
                 self._bump_watermark(utx.entity_id, utx.signature.leaf_index)
+            else:
+                # Tier 58: cold key signed -- bump the cold watermark
+                # against the cold pubkey's leaf namespace.  Pre-fork:
+                # skipped for replay determinism (legacy chain has no
+                # cold-leaf tracking, so re-validating historical
+                # blocks under the new code must NOT advance the
+                # cold watermark either, or the dict would diverge
+                # from the dict a peer produces by replaying from a
+                # snapshot taken under the legacy code).
+                from messagechain.config import COLD_LEAF_WATERMARK_HEIGHT as _CLWH
+                if (block.header.block_number) >= _CLWH:
+                    if authority_pk is not None:
+                        self._bump_cold_watermark(
+                            authority_pk, utx.signature.leaf_index,
+                        )
 
         # Receive-to-exist: first-spend pubkey install happens inside
         # `_apply_transfer_with_burn` above.  No separate registration
