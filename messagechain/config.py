@@ -2034,8 +2034,25 @@ FORK_EMERGENCY_AUTO_RECOVERY = False
 # INACTIVITY_BASE_PENALTY: base penalty per missed attestation per block
 #   (in tokens).  Multiplied by (blocks_since_finality^2 / quotient).
 INACTIVITY_LEAK_ACTIVATION_THRESHOLD = 4
-INACTIVITY_PENALTY_QUOTIENT = 16_777_216  # ~2^24
+INACTIVITY_PENALTY_QUOTIENT = 16_777_216  # ~2^24 (legacy flat formula)
 INACTIVITY_BASE_PENALTY = 1
+# Tier 59 -- post-fork stake-scaled formula uses a separate
+# quotient.  At ``stake * BASE * blocks² / Q`` with the values below,
+# the cumulative drain over a 10000-block-stall window yields ~2% of
+# stake regardless of stake size -- matching the cumulative drain
+# the legacy formula imposed on a 1M-stake validator.  The shape
+# preserves cartel-defense (quadratic in blocks, fast-acceleration
+# under sustained stalls) while delivering the "fractional of
+# stake" property the CLAUDE.md honest-operator-insurance anchor
+# calls for.  Pre-fork blocks use ``INACTIVITY_PENALTY_QUOTIENT``
+# unchanged so historical replay is byte-identical.
+#
+# Calibration note: 16_777_216_000_000 = 2^24 * 1_000_000.  The
+# 1M factor reflects "the legacy formula was effectively calibrated
+# for 1M-stake validators -- whales -- whose 2% cumulative drain
+# survived as a fractional bound; we now apply that same fractional
+# bound to every validator size."
+INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT = 16_777_216_000_000
 
 # ─────────────────────────────────────────────────────────────────────
 # Coverage-divergence inactivity leak — defense against 1/3-cartel
@@ -6394,6 +6411,62 @@ assert COLD_LEAF_WATERMARK_HEIGHT > AUTHORITY_REBIND_REQUIRES_COLD_HEIGHT, (
     "COLD_LEAF_WATERMARK_HEIGHT must follow Tier 46 (AUTHORITY_REBIND_"
     "REQUIRES_COLD_HEIGHT) -- the cold counter-signature wire format "
     "Tier 58 starts watermarking only exists at and above Tier 46"
+)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Tier 59 — Inactivity-leak penalty stake-scaling
+# ─────────────────────────────────────────────────────────────────────
+# Pre-fix: ``compute_inactivity_penalty`` is FLAT in tokens
+# (``BASE * blocks² / quotient``); ``validator_stake`` is used only
+# as a CAP, not as a scale factor.  ``compute_coverage_penalty`` IS
+# stake-scaled (``stake * BASE * misses² / QUOTIENT``).  The two
+# leak paths diverge sharply at low- and high-stake extremes: a
+# 10k-stake honest-but-isolated validator hits zero stake at
+# ``blocks_since_finality≈12700`` (~88 days) while a 1M-stake whale
+# at the same blocks_since absorbs <0.06% of stake.  Tier 55
+# honesty-curve relief floors at 20% of nominal -- still a wipe for
+# the small validator on a long partition.
+#
+# CLAUDE.md anchor: "honest operators are insured against accidents
+# ... when an honest node IS slashed (transient evidence collision,
+# recoverable misconfig), the burn is a small *fraction* of stake,
+# not a wipe."  A flat-token penalty fundamentally breaks this for
+# the smallest validators on extended partitions or fork-emergency
+# halts -- exactly the operators the chain wants to recruit.
+#
+# Fix: at and above ``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT`` the
+# nominal penalty becomes ``stake * BASE * blocks² / QUOTIENT``,
+# mirroring ``compute_coverage_penalty`` exactly.  The Tier-55
+# honesty-curve relief layer wraps the new shape unchanged -- it
+# multiplies the nominal whatever shape the nominal takes.  Pre-
+# fork blocks replay byte-identically via a height gate; the
+# legacy flat formula is preserved on the pre-fork branch.
+#
+# Cartel-defense intent preserved: a 1/3-stake withholding cartel
+# under the new shape pays the SAME FRACTION of stake per block as
+# a small honest validator -- in absolute tokens the cartel's drain
+# is much larger because their stake is much larger.  Tier 55
+# honesty-curve relief still grades the cartel separately (cartels
+# don't accumulate the long honest-history a curve-relieved operator
+# does).
+#
+# Activation height 2200 sits 50 blocks above Tier 58 (COLD_LEAF_
+# WATERMARK_HEIGHT = 2150) -- ~8.3h cohort spacing at 600s blocks,
+# matching the Tier 49-58 pattern.
+INACTIVITY_LEAK_STAKE_SCALED_HEIGHT = 2200  # Tier 59
+
+assert INACTIVITY_LEAK_STAKE_SCALED_HEIGHT > COLD_LEAF_WATERMARK_HEIGHT, (
+    "INACTIVITY_LEAK_STAKE_SCALED_HEIGHT must follow Tier 58 -- "
+    "operators upgrade through Tier 58 before this consensus-rule "
+    "change binds, and the cohort spacing keeps consecutive consensus-"
+    "rule changes from collapsing into a single activation window"
+)
+assert INACTIVITY_LEAK_STAKE_SCALED_HEIGHT > INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT, (
+    "INACTIVITY_LEAK_STAKE_SCALED_HEIGHT must follow Tier 55 "
+    "(INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT) -- Tier 55's relief "
+    "multiplier wraps the nominal Tier 59 produces, so Tier 55 must "
+    "already be live before Tier 59's nominal-shape change kicks in"
 )
 
 

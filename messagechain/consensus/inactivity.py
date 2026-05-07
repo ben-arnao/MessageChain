@@ -57,6 +57,7 @@ provably WERE in 2/3+ of mempools).
 from messagechain.config import (
     INACTIVITY_LEAK_ACTIVATION_THRESHOLD,
     INACTIVITY_PENALTY_QUOTIENT,
+    INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT,
     INACTIVITY_BASE_PENALTY,
     COVERAGE_LEAK_BASE_PENALTY,
     COVERAGE_LEAK_QUOTIENT,
@@ -76,27 +77,76 @@ def is_leak_active(blocks_since_last_finalization: int) -> bool:
 def compute_inactivity_penalty(
     blocks_since_finality: int,
     validator_stake: int,
+    *,
+    current_height: int | None = None,
 ) -> int:
     """Compute the inactivity penalty for one non-attesting validator.
 
-    The penalty is quadratic in blocks_since_finality:
-        penalty = base_penalty * blocks_since_finality^2 / quotient
+    Two formulae, height-gated by Tier 59
+    (``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT``):
+
+      Pre-fork (``current_height`` is None or below
+      ``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT``) -- LEGACY FLAT shape::
+
+          penalty = base_penalty * blocks_since_finality^2 / quotient
+
+      ``validator_stake`` is used only as a cap.  Byte-identical to
+      the historical formula -- replay determinism on every in-leak
+      historical block depends on this branch.
+
+      Post-fork (``current_height >=
+      INACTIVITY_LEAK_STAKE_SCALED_HEIGHT``) -- STAKE-SCALED shape::
+
+          penalty = stake * base * blocks_since_finality^2 / QUOTIENT
+
+      Mirrors ``compute_coverage_penalty`` exactly.  Restores the
+      "fractional of stake, not flat tokens" property the CLAUDE.md
+      honest-operator-insurance anchor calls for: a small validator
+      and a whale on the same partition pay the SAME FRACTION of
+      stake; in absolute tokens the whale's drain is much larger.
+
+    The Tier-55 honesty-curve relief multiplier (applied in
+    ``apply_inactivity_leak``) wraps either shape unchanged -- it
+    multiplies whatever nominal this function produces.
 
     The result is capped at the validator's current stake (can't go
-    negative).  Returns 0 when not in leak mode or when the penalty
-    rounds to 0 (early blocks of a stall).
+    negative).  Returns 0 when not in leak mode, when the validator
+    has no stake, or when the penalty rounds to 0.
     """
     if blocks_since_finality <= INACTIVITY_LEAK_ACTIVATION_THRESHOLD:
         return 0
     if validator_stake <= 0:
         return 0
 
-    penalty = (
-        INACTIVITY_BASE_PENALTY
-        * blocks_since_finality
-        * blocks_since_finality
-        // INACTIVITY_PENALTY_QUOTIENT
-    )
+    # Tier 59 height gate: pre-fork uses the legacy flat formula
+    # byte-identically; post-fork scales nominal by stake.  Caller
+    # threads ``current_height`` from the apply path; legacy callers
+    # (None) get the pre-fork behavior.  See module docstring +
+    # config.py Tier 59 block for the full rationale.
+    from messagechain.config import INACTIVITY_LEAK_STAKE_SCALED_HEIGHT
+    if (
+        current_height is not None
+        and current_height >= INACTIVITY_LEAK_STAKE_SCALED_HEIGHT
+    ):
+        # Stake-scaled: separate quotient calibrated so cumulative
+        # drain over a full 10000-block stall window is ~2% of stake
+        # regardless of stake size.  See
+        # INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT in config.py for
+        # the calibration rationale.
+        penalty = (
+            validator_stake
+            * INACTIVITY_BASE_PENALTY
+            * blocks_since_finality
+            * blocks_since_finality
+            // INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT
+        )
+    else:
+        penalty = (
+            INACTIVITY_BASE_PENALTY
+            * blocks_since_finality
+            * blocks_since_finality
+            // INACTIVITY_PENALTY_QUOTIENT
+        )
     # Cap at current stake — can't drain below 0.
     return min(penalty, validator_stake)
 
@@ -185,8 +235,17 @@ def apply_inactivity_leak(
         if current_stake <= min_stake:
             continue
 
+        # Tier 59 -- thread current_height into the nominal compute
+        # so the stake-scaling height gate fires.  Pre-Tier-59
+        # callers either pass current_height=None (no kwarg) or
+        # pass a pre-fork height; both branches resolve to the
+        # legacy flat formula.  Post-Tier-59 the nominal becomes
+        # stake-scaled, restoring fractional-of-stake parity across
+        # the validator set per CLAUDE.md honest-operator-insurance
+        # anchor.
         nominal = compute_inactivity_penalty(
             blocks_since_finality, current_stake,
+            current_height=current_height,
         )
         if nominal <= 0:
             continue
