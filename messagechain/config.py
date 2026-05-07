@@ -6272,6 +6272,63 @@ assert TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT > VOTER_REWARD_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 57 — transfer apply path routes through ``pay_fee_with_burn``
+# so the attester-fee-funding split, the DEFLATION_FLOOR_V2 rolling-
+# fee-burn accumulator, and the ``fee_burn_this_block`` ticker accrue
+# on transfer txs.
+# ─────────────────────────────────────────────────────────────────────
+# Pre-fix bug: ``Blockchain._apply_transfer_with_burn`` hand-rolled
+# fee accounting (``balances[from] -= fee; balances[proposer] += tip;
+# total_supply -= burned``) instead of routing through
+# ``SupplyTracker.pay_fee_with_burn``.  Every other tx kind (message,
+# stake, governance, react, authority) routes through the helper.
+# Transfers alone bypassed it.
+#
+# Three CLAUDE.md anchors break silently as soon as transfer volume
+# matters:
+#   (a) ATTESTER_FEE_FUNDING split (Tier 4) -- attester pool silently
+#       missed the transfer-share of base-fee burn.
+#   (b) DEFLATION_FLOOR_V2 rolling-fee-burn accumulator -- fee-
+#       responsive issuance rebate undercounts transfer-share burns.
+#   (c) ``fee_burn_this_block`` ticker -- archive-reward redirect
+#       missed transfer-share burns.
+#
+# Today's mainnet has near-zero transfer volume so the leak is
+# invisible -- that is the worst possible time to catch it.  The
+# moment the dual-purpose-token anchor pays off and transfers become
+# a real share of fee burn, the under-accrual bites.
+#
+# Tier 57 splits the apply path on a height gate.  Pre-fork (height <
+# TRANSFER_FEE_UNIFIED_HEIGHT) the legacy hand-rolled accounting runs
+# unchanged -- byte-identical to pre-Tier-57 code, so every historical
+# transfer block replays identically post-upgrade.  Post-fork the
+# (tx.fee - surcharge) base-fee+tip portion routes through
+# pay_fee_with_burn; the NEW_ACCOUNT_FEE surcharge burns separately
+# (matching legacy "burned was the full base_fee + surcharge"
+# semantics for total-supply/total-burned, plus crediting fee_burn_
+# this_block so archive-reward redirect sees the full burn).
+#
+# Activation height 2100 sits 50 blocks above Tier 56 (TREASURY_SPEND_
+# VOTER_SURCHARGE_HEIGHT = 2050) -- ~8.3h cohort spacing at 600s
+# blocks, matching the Tier 49-56 spacing pattern.  Surfaced by audit
+# r31 top-3 #2.
+TRANSFER_FEE_UNIFIED_HEIGHT = 2100  # Tier 57
+
+assert TRANSFER_FEE_UNIFIED_HEIGHT > TREASURY_SPEND_VOTER_SURCHARGE_HEIGHT, (
+    "TRANSFER_FEE_UNIFIED_HEIGHT must follow Tier 56 -- operators "
+    "upgrade through Tier 56 before this consensus-rule change binds, "
+    "and the cohort spacing keeps two consecutive consensus-rule "
+    "changes from collapsing into a single activation window"
+)
+assert TRANSFER_FEE_UNIFIED_HEIGHT > ATTESTER_FEE_FUNDING_HEIGHT, (
+    "TRANSFER_FEE_UNIFIED_HEIGHT must follow Tier 4 (ATTESTER_FEE_"
+    "FUNDING_HEIGHT) -- the helper Tier 57 starts routing through "
+    "(pay_fee_with_burn) only internally activates the attester-"
+    "share split at Tier 4, so Tier 4 must already be live"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

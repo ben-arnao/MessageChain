@@ -11248,7 +11248,19 @@ class Blockchain:
         on-chain state at call time), NEW_ACCOUNT_FEE is burned in
         addition to the EIP-1559 base-fee burn.  Proposer tip is
         (tx.fee - base_fee - NEW_ACCOUNT_FEE).
+
+        Tier 57 (TRANSFER_FEE_UNIFIED_HEIGHT): post-activation the
+        base_fee+tip portion routes through ``pay_fee_with_burn`` so
+        the attester-fee-funding split (Tier 4), DEFLATION_FLOOR_V2
+        rolling-fee-burn accumulator, and ``fee_burn_this_block``
+        ticker all accrue on transfer txs -- closing the silent gap
+        where transfers were the only fee-paying tx kind whose burn
+        didn't flow through these mechanisms.  Pre-fork the legacy
+        hand-rolled accounting runs unchanged so historical transfer
+        blocks replay byte-identically.
         """
+        from messagechain.config import TRANSFER_FEE_UNIFIED_HEIGHT
+
         # Snapshot "is recipient new" BEFORE any state mutation.
         recipient_was_new = self._recipient_is_new(tx.recipient_id)
 
@@ -11272,6 +11284,79 @@ class Blockchain:
         # fee rose above the tx's ceiling post-admission).
         if effective_base_fee + surcharge > tx.fee:
             surcharge = max(0, tx.fee - effective_base_fee)
+
+        # Tier 57 height gate.  ``self.supply._current_block_height``
+        # is the in-flight block's number, set at the top of
+        # ``_apply_block_state``.  None falls back to the legacy path
+        # (off-chain audit / replay tooling that hasn't seeded the
+        # tunnel) -- mirrors how pay_fee_with_burn's own activation
+        # gates fall back when height is None.
+        current_height = self.supply._current_block_height
+        post_tier57 = (
+            current_height is not None
+            and current_height >= TRANSFER_FEE_UNIFIED_HEIGHT
+        )
+
+        if post_tier57:
+            # POST-FORK: route the (fee - surcharge) base-fee+tip
+            # portion through pay_fee_with_burn so attester-share /
+            # rolling_fee_burn / fee_burn_this_block accrue uniformly
+            # with every other tx kind.  The NEW_ACCOUNT_FEE surcharge
+            # is a flat state-creation tariff that burns separately.
+            #
+            # The recipient amount-credit and sender amount-debit are
+            # done OUTSIDE pay_fee_with_burn (which only handles the
+            # fee-flow) so the legacy "balance debit = amount + fee,
+            # recipient credit = amount, proposer credit = tip" net
+            # effect is preserved.
+            fee_minus_surcharge = tx.fee - surcharge
+            ok = self.supply.pay_fee_with_burn(
+                tx.entity_id, proposer_id, fee_minus_surcharge,
+                effective_base_fee,
+            )
+            if not ok:
+                # Defensive: validation enforces fee >= base_fee +
+                # surcharge AND balance >= amount + fee, so this path
+                # is unreachable on a well-validated tx.  Fall through
+                # to legacy handling so a future regression in
+                # validation doesn't silently zero the apply (which
+                # would break the bucket-sum invariant at end-of-block).
+                logger.error(
+                    f"Transfer {tx.tx_hash.hex()[:16]} pay_fee_with_burn "
+                    f"failed (fee {tx.fee} surcharge {surcharge} "
+                    f"base {effective_base_fee}); falling back to "
+                    f"legacy path for replay safety",
+                )
+            else:
+                # Surcharge burn (separate from base-fee burn).  Mirror
+                # the legacy "burned += effective_base_fee + surcharge"
+                # by burning the surcharge here -- pay_fee_with_burn
+                # only burns its (base_fee - attester_share) actual_burn.
+                # fee_burn_this_block also accrues the surcharge so the
+                # archive-reward redirect at end-of-block sees the full
+                # transfer-share burn (not just the base-fee portion).
+                if surcharge > 0:
+                    self.supply.balances[tx.entity_id] = (
+                        self.supply.get_balance(tx.entity_id) - surcharge
+                    )
+                    self.supply.total_supply -= surcharge
+                    self.supply.total_burned += surcharge
+                    self.supply.fee_burn_this_block += surcharge
+                    self.supply.total_fees_collected += surcharge
+                # Apply the value transfer (amount debit + recipient
+                # credit) on top of the fee mutation.
+                self.supply.balances[tx.entity_id] = (
+                    self.supply.get_balance(tx.entity_id) - tx.amount
+                )
+                self.supply.balances[tx.recipient_id] = (
+                    self.supply.get_balance(tx.recipient_id) + tx.amount
+                )
+                self.nonces[tx.entity_id] = tx.nonce + 1
+                return
+
+        # PRE-FORK (legacy): byte-identical to pre-Tier-57 code.  Every
+        # historical transfer block replays through this branch
+        # producing the same state as before the fork.
         tip = tx.fee - effective_base_fee - surcharge
         self.supply.balances[tx.entity_id] = self.supply.get_balance(tx.entity_id) - tx.amount - tx.fee
         self.supply.balances[tx.recipient_id] = self.supply.get_balance(tx.recipient_id) + tx.amount
