@@ -2142,6 +2142,23 @@ class Server(SharedRuntimeMixin):
                 submit_transaction_to_mempool,
             )
             tx = MessageTransaction.deserialize(params["transaction"])
+            # Round-31: cross-pool WOTS+ leaf dedupe BEFORE mempool
+            # admission.  Pre-fix the message path skipped this check
+            # entirely -- a message at leaf=N admitted to mempool.pending
+            # while a stake / unstake / authority / governance / react
+            # tx at leaf=N from the same signer was already pending in
+            # a server-side pool, both signed objects published the
+            # same WOTS+ leaf, and the second signature leaked
+            # one-time-key preimages.  Mirrors the gates on the
+            # stake/unstake/governance/react admit paths.
+            if not self._check_leaf_across_all_pools(tx):
+                return {
+                    "ok": False,
+                    "error": (
+                        "WOTS+ leaf already used by another pending tx"
+                        " — leaf reuse rejected"
+                    ),
+                }
             # Receipt issuance is OPT-IN per submission via the
             # x-mc-receipt parameter.  The default path skips the
             # receipt subtree entirely so submission stays fast even
@@ -2959,8 +2976,30 @@ class Server(SharedRuntimeMixin):
                 and sig.leaf_index == incoming_leaf
             ):
                 return False
-        # Mempool's internal guard covers message and transfer txs and
-        # is already signer-agnostic (same-entity hot-only).
+        # Round-31: scan mempool.pending too.  Pre-fix the cross-pool
+        # dedupe stopped at the server-side pools + react_pool, leaving
+        # mempool.pending (messages + transfers) outside the sweep.  A
+        # message or transfer at leaf=N already in mempool.pending would
+        # not collide with a subsequent stake / unstake / authority /
+        # governance tx at leaf=N from the same signer -- both admit,
+        # both signed objects publish the same WOTS+ leaf, and the
+        # second signature leaks enough one-time-key preimages for any
+        # observer to forge an arbitrary signature at that leaf.  Same
+        # defect class as the round-12 react_pool fix on the OTHER side
+        # of the cross-pool boundary.
+        mempool_pending = getattr(self.mempool, "pending", None) or {}
+        for existing in mempool_pending.values():
+            sig = getattr(existing, "signature", None)
+            if sig is None:
+                continue
+            existing_signer = self._tx_signer_pubkey(existing)
+            if existing_signer is None:
+                continue
+            if (
+                existing_signer == incoming_signer
+                and sig.leaf_index == incoming_leaf
+            ):
+                return False
         return True
 
     def _check_leaf_by_entity_id(
@@ -2994,6 +3033,18 @@ class Server(SharedRuntimeMixin):
         for existing in react_pool.values():
             sig = getattr(existing, "signature", None)
             eid = getattr(existing, "voter_id", None)
+            if sig is None or eid is None:
+                continue
+            if eid == entity_id and sig.leaf_index == leaf_index:
+                return False
+        # Round-31: include mempool.pending in the entity-id-keyed
+        # sweep too.  Same defect class as the signer-keyed path
+        # above.  Messages use entity_id; transfers also live in
+        # mempool.pending but key off entity_id (sender) too.
+        mempool_pending = getattr(self.mempool, "pending", None) or {}
+        for existing in mempool_pending.values():
+            sig = getattr(existing, "signature", None)
+            eid = getattr(existing, "entity_id", None)
             if sig is None or eid is None:
                 continue
             if eid == entity_id and sig.leaf_index == leaf_index:
@@ -3590,6 +3641,23 @@ class Server(SharedRuntimeMixin):
                 submit_transaction_to_mempool,
             )
             tx = TransferTransaction.deserialize(params["transaction"])
+            # Round-31: cross-pool WOTS+ leaf dedupe BEFORE mempool
+            # admission.  Pre-fix the transfer path skipped this check
+            # entirely -- a transfer at leaf=N admitted to mempool.pending
+            # while a stake / unstake / authority / governance / react
+            # tx at leaf=N from the same signer was already pending in
+            # a server-side pool, both signed objects published the
+            # same WOTS+ leaf, and the second signature leaked
+            # one-time-key preimages.  Mirrors the gates on the
+            # stake/unstake/governance/react admit paths.
+            if not self._check_leaf_across_all_pools(tx):
+                return {
+                    "ok": False,
+                    "error": (
+                        "WOTS+ leaf already used by another pending tx"
+                        " — leaf reuse rejected"
+                    ),
+                }
             # Pending nonce scans all pools (message + transfer + stake +
             # unstake + governance + react) so sequential tx of any type
             # work.  Threaded into the central helper via the
