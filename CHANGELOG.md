@@ -4,6 +4,128 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.60.0] — 2026-05-06
+
+Minor release.  Audit round 29 top-3 ships: one new hard fork
+(Tier 54 -- dormancy controller K_DEN retune so the linear band
+reaches MAX at gap = 100M instead of 10M, preventing the scheduled
+seed-divestment burn from pegging the controller at ~26%/yr
+sustained inflation), one infrastructure fix (HMAC-SHA256 envelope
+on persisted state-snapshot blobs so ``pickle.loads`` is unreachable
+on a tampered DB / restored backup), and one consensus-resilience
+fix (``FinalityCheckpoints._vote_by_signer_height`` now persisted
+to chaindb so a validator cannot evade local equivocation detection
+by timing a second conflicting finality vote to a network-wide
+restart window).  No new wire format, no new CLI surface.
+
+### Added
+
+  * **Tier 54 -- dormancy controller K_DEN retune (hard fork,
+    activation height 1950).**  Pre-Tier-54 the controller's gain
+    (K = 1 / 20_000) saturated the
+    ``DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500`` ceiling at gap = 10M
+    tokens.  Combined with the scheduled seed-divestment burn (~85M
+    of founder stake, 4 yr), mid-divestment gaps land in the 10–80M
+    range -- every one of which would peg the controller at MAX =
+    500/block ≈ 26.3M tokens/yr ≈ 26%/yr of TARGET sustained for
+    years until active supply recovers above 90M.  That regime
+    inverts two CLAUDE.md anchors at once: "the chain's nominal
+    token unit must hold its real economic weight across centuries"
+    (a 26%/yr regime for years inverts the promise) and "issuance's
+    purpose is supply replenishment, not security-funding" (at MAX
+    the controller dwarfs every other economic lever).
+
+    Tier 54 widens K_DEN to 200_000 so the linear band reaches MAX
+    only at gap = 100M (the founder-fully-dormant catastrophic
+    case).  At gap = 10M, raw = 50/block ≈ 2.6M tokens/yr -- order
+    of the documented burn rate, no saturation.  At gap = 45M
+    (plausible mid-divestment), raw = 225/block ≈ 11.8M tokens/yr
+    -- proportional to documented burn.  At gap = 100M, raw still
+    pegs at MAX, preserving worst-case crisis response capacity.
+
+    Pure parameter retune; no consensus-shape change.  Pre-fork
+    blocks (heights 1710..1949) replay byte-identically via the
+    in-function height-gate -- the legacy K_DEN is preserved on
+    the pre-fork branch.  Tier 54 sits 50 blocks ≈ 8.3h above
+    Tier 53 (1900), matching the cohort spacing pattern Tiers
+    49-53 used.  Two-validator coordinated upgrade.  16 new
+    regression tests in
+    ``tests/test_dormancy_controller_k_den_retune_tier54.py`` pin
+    pre/post-activation behavior, the activation boundary, and the
+    anchor-preservation properties (at-target zero, monotone-in-gap,
+    MAX binding at catastrophic gap).  Surfaced by audit r29 top-3
+    #2.  (1af0187)
+
+### Fixed
+
+  * **``pickle.loads`` on persisted state-snapshot blobs is a
+    local-RCE primitive on tampered DB / restored backup.**  Three
+    ``pickle.loads`` call sites in ``core/blockchain.py`` (cold-boot
+    rehydrate, reorg ancestor restore, fork-emergency rewind) ran
+    on whatever bytes lived in ``chain.db.state_snapshots`` -- a
+    tampered backup tape, a substituted row, a cross-node copy --
+    giving anyone with DB-write access local RCE at validator-process
+    privilege before any signature or state-root check fired.
+    CLAUDE.md "honest-operators-insurance" + "full-node accessibility
+    for centuries" both threatened: restore-from-backup was a silent
+    compromise vector.
+
+    Fix wraps every persisted snapshot blob in an HMAC-SHA256
+    envelope keyed by a per-node secret stored in chaindb.meta.  On
+    read, the envelope is verified in constant time before
+    ``pickle.loads`` is ever called; mismatch raises
+    ``SnapshotEnvelopeError`` and the caller's existing
+    ``try/except`` falls through to the legacy field-by-field load.
+    Threat surface: an attacker who can write the snapshot row
+    alone (backup-restore, filesystem permissions error, hostile
+    disk image) can no longer reach ``pickle.loads``.  An attacker
+    with full chaindb write access including ``meta`` is outside
+    scope -- they could tamper balances directly.  Source-level
+    pin in
+    ``tests/test_snapshot_envelope_blockchain_integration.py``
+    asserts exactly one ``pickle.loads`` call in
+    ``blockchain.py`` (inside ``_decode_snapshot_blob``) so a
+    future refactor cannot drift back to raw ``pickle.loads`` on
+    a chaindb row.  Surfaced by audit r29 top-3 #1.  (1649bca)
+
+  * **``FinalityCheckpoints._vote_by_signer_height`` was in-memory
+    only -- restart-window finality equivocation evaded local
+    auto-slash.**  Pre-fix attacker scenario: validator V signs
+    FinalityVote A for (target H, hash H1), the local node restarts
+    (release roll, OS update, validator reboot), V signs
+    FinalityVote B for (target H, hash H2 ≠ H1).  Local detection
+    has nothing to compare against because the restart flushed the
+    map, so the second vote registers as a fresh observation.  In
+    a network-wide restart window every node loses its local
+    evidence simultaneously -- auto-slash deterrent against
+    finality-vote collusion silently amnestied.  Honest peers that
+    saw both votes during the staging window still detect, but a
+    deliberate attacker times disclosure across the restart window
+    to collapse cross-node evidence too.  CLAUDE.md anchor at risk:
+    the "raise the evidentiary cost of suppression" frame depends
+    on the slashing-evidence backbone surviving operationally
+    normal events like a coordinated upgrade.
+
+    Fix mirrors the ``EquivocationWatcher.seen_signatures`` pattern.
+    New ``finality_votes_seen`` chaindb table keyed by (signer_id,
+    target_block_number); ``add_vote`` consults the persisted row
+    when the in-memory cache misses (cold cache after restart) and
+    persists each fresh observation as it lands.
+    ``rehydrate_from_chaindb`` is called from ``_load_from_db`` to
+    warm the cache on cold-restart so the gate fires on the first
+    post-restart conflicting observation even when the original was
+    made before the restart.  Persistence is opt-in via constructor
+    / ``bind_chaindb`` so legacy in-memory tests retain pre-fix
+    behavior unchanged (the persistent path is additive, not a
+    replacement).  Persistence failures (disk full, sqlite locked)
+    do not block consensus -- the in-memory cache still records the
+    vote so same-process equivocation still detects; only
+    across-restart evidence is at risk.  9 regression tests in
+    ``tests/test_finality_vote_persistence_r29.py`` pin the
+    round-trip, the restart-window detection, the legacy fallback,
+    and the persistence-failure isolation.  Surfaced by audit r29
+    top-3 #3.  (55c7543)
+
 ## [1.59.0] — 2026-05-06
 
 Minor release.  Audit round 28 top-3 ships: one new hard fork
