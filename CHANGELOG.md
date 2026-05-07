@@ -4,6 +4,141 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.63.0] — 2026-05-07
+
+Minor release.  Audit round 32 top-3 ships: three new hard forks,
+all anchored to the CLAUDE.md honest-operator-insurance / crypto-
+agility / bootstrap-arc anchors.
+
+  * **Tier 58 (height 2150) — cold-key WOTS+ leaf watermark**
+    closes the pre-signed-revoke leaf-reuse leak.  Sibling of
+    audit r31 #1 (cross-pool admission gap on ``mempool.pending``)
+    on the COLD-KEY side: r31 closed the hot-key cross-pool
+    admission gap; Tier 58 closes the same defect class for cold-
+    key-signed txs across BLOCKS.  An operator who pre-signed an
+    offline emergency revoke at cold-key leaf=N (the documented
+    hardening pattern at ``emergency_revoke.py:21-30``) and later
+    signed an unstake / fresh revoke / set-authority cold counter-
+    sig at the same cold-key leaf=N would publish two distinct
+    payloads under the same WOTS+ leaf, leaking the one-time-key
+    secret.  Anyone observing both signatures could forge
+    arbitrary cold-key signatures -- including a fresh revoke,
+    full-balance unstake, or set-authority rebind transferring
+    authority to the attacker.  Total stake loss + identity
+    hijack for any operator who followed the recommended
+    hardening recipe and slipped on cold-leaf cursor tracking.
+    Fix: new ``Blockchain.cold_leaf_watermarks: dict[bytes, int]``
+    keyed by COLD PUBKEY BYTES (NOT entity_id, since one cold key
+    may sign for multiple entities -- the documented cluster
+    pattern).  Validation gates in ``validate_revoke``,
+    ``_validate_unstake_tx_in_block``, ``validate_set_authority_
+    key`` reject cold-sig leaves below the watermark; apply paths
+    bump the watermark identically to the hot-key pattern.
+    Persistence via new chaindb table + state-snapshot bump
+    v22->v23 with ``_TAG_COLD_LEAF_WATERMARK`` participating in
+    the state-root commitment.  Pre-fork blocks replay byte-
+    identically via the height gate.  6 regression tests in
+    ``tests/test_audit_r32_cold_leaf_watermark_tier58.py``.
+    Surfaced by audit r32 top-3 #1.  (005b107)
+
+  * **Tier 59 (height 2200) — inactivity-leak penalty stake-
+    scaled** restores honest-operator-insurance for small
+    validators.  Pre-fix ``compute_inactivity_penalty`` was FLAT
+    in tokens (``BASE * blocks² / quotient``); ``validator_stake``
+    was used only as a CAP, not as a scale factor.
+    ``compute_coverage_penalty`` IS stake-scaled.  At
+    ``INACTIVITY_BASE_PENALTY=1``, ``quotient=2²⁴``,
+    ``threshold=4``: a 10k-stake (``VALIDATOR_MIN_STAKE_POST_RAISE``)
+    honest-but-isolated validator hits zero stake at
+    ``blocks_since_finality≈12700`` (~88 days) while a 1M-stake
+    whale at the same blocks_since absorbs <0.06% of stake.  Tier
+    55 honesty-curve relief floors at 20% of nominal -- still a
+    wipe for the small validator on a long partition.  CLAUDE.md
+    anchor at risk: "honest operators are insured against
+    accidents ... the burn is a small *fraction* of stake, not a
+    wipe."  Fix: post-Tier-59 nominal becomes
+    ``stake * BASE * blocks² / Q_V2`` where ``Q_V2 = 2^24 *
+    1_000_000`` is calibrated so the cumulative drain over a full
+    10000-block stall window is ~2% of stake regardless of stake
+    size -- matching the cumulative drain the legacy formula
+    imposed on a 1M-stake validator (the bound that survived
+    "fractionally" before).  Cartel-defense intent preserved: a
+    1/3-stake withholding cartel pays the same FRACTION of stake
+    per block as a small honest validator, but in absolute
+    tokens the cartel's drain is much larger.  Tier 55 honesty-
+    curve relief still wraps the new shape unchanged.  Pre-fork
+    blocks replay byte-identically via the height gate.  9
+    regression tests in ``tests/test_audit_r32_inactivity_leak_
+    stake_scaled_tier59.py``.  Surfaced by audit r32 top-3 #2.
+    (7b48817)
+
+  * **Tier 60 (height 2250) — DORMANCY_TARGET retune** restores
+    bootstrap-arc issuance.  Pre-fix
+    ``DORMANCY_TARGET_ACTIVE_SUPPLY = 100_000_000`` exactly
+    matches the founder's genesis balance (100M; treasury 40M is
+    excluded from active-supply per ``compute_active_supply``).
+    While the founder signs blocks, ``last_active`` bumps each
+    block, weight = 10000 bps, contribution = 100M.
+    ``gap = 100M - 100M = 0`` -> ``compute_dormancy_issuance``
+    returns 0/block, indefinitely.  The legacy halving-floor was
+    short-circuited at ``DORMANCY_CONTROLLER_HEIGHT`` (Tier 47).
+    Validators currently earn ~0/block of issuance during the
+    entire 25-year DORMANCY_WINDOW.  CLAUDE.md anchor: founder-
+    bootstrap arc -- "early-phase issuance is calibrated so the
+    founder can credibly secure the network solo while it has
+    only a handful of nodes, and progressively dilutes toward
+    broad democratization as more validators stake in".  The
+    0/block delivery contradicts the front-loaded shape the
+    anchor calls for.  Fix: post-Tier-60 the controller uses
+    ``DORMANCY_TARGET_ACTIVE_SUPPLY_V2 = 110_000_000``.  At
+    founder=100M-active, gap = 10M; raw_issuance = (10M * 1) //
+    200_000 = 50/block; ~2.6M tokens/yr split across validators
+    -- comparable to legacy halving-floor era (4/block = ~210k/yr),
+    generously front-loaded for the bootstrap arc without
+    overshooting.  Shape-preserving: still gap-driven, still
+    dormancy-filtered, still capped at MAX_ISSUANCE_PER_BLOCK,
+    still zero at active >= target.  Only the equilibrium point
+    moves from 100M -> 110M.  Pre-fork blocks replay byte-
+    identically via the height gate; the legacy 100M target is
+    preserved on the pre-fork branch so every historical block
+    under the controller (heights 1710..2249) replays exactly.
+    7 regression tests in ``tests/test_audit_r32_dormancy_
+    target_retune_tier60.py``.  Surfaced by audit r32 top-3 #3.
+    (eae7105)
+
+Activation cohort spacing: Tier 58 = 2150 -> Tier 59 = 2200 ->
+Tier 60 = 2250 (50-block / ~8.3h gaps at 600s blocks), matching
+the Tier 49-57 pattern.  Two-validator coordinated upgrade.  No
+new top-line CLI surface, no new tx kinds.  STATE_SNAPSHOT_VERSION
+bumps 22 -> 23 to carry the new ``cold_leaf_watermarks`` section
+in the wire format and snapshot-root commitment.
+
+### Added
+
+  * Tier 58 hard fork: cold-key WOTS+ leaf watermark
+    (``COLD_LEAF_WATERMARK_HEIGHT = 2150``).  See above.  (005b107)
+  * Tier 59 hard fork: inactivity-leak stake-scaled
+    (``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT = 2200``).  Adds
+    ``INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT = 16_777_216_000_000``
+    constant.  See above.  (7b48817)
+  * Tier 60 hard fork: dormancy controller TARGET retune
+    (``DORMANCY_TARGET_RETUNE_HEIGHT = 2250``,
+    ``DORMANCY_TARGET_ACTIVE_SUPPLY_V2 = 110_000_000``).  See
+    above.  (eae7105)
+  * State-snapshot ``v23``: new ``cold_leaf_watermarks`` section
+    + ``_TAG_COLD_LEAF_WATERMARK`` state-root tag.  Encoded
+    strictly after v22's ``slash_offense_counts`` so a v22 blob
+    is a strict prefix of a v23 blob through the end of v22's
+    final field.  ``deserialize_state`` defaults the field to
+    ``{}`` so older v22 hand-built dicts decode gracefully.
+    (005b107)
+  * Chaindb ``cold_leaf_watermarks`` table mirrors
+    ``leaf_watermarks`` but keyed by cold pubkey, with matching
+    ``get_cold_leaf_watermark`` / ``set_cold_leaf_watermark`` /
+    ``get_all_cold_leaf_watermarks`` methods.  Hydrated by
+    ``_load_from_db`` on cold restart; persisted from the
+    apply-commit path alongside the hot watermark.  (005b107)
+
 ## [1.62.0] — 2026-05-07
 
 Minor release.  Audit round 31 top-3 ships: one cryptographic-soundness
