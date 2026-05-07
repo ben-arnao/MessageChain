@@ -6717,6 +6717,56 @@ assert (
 )
 
 
+# ``VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT``: Tier 65 -- post-
+# activation ``Governance.finalize_voter_rewards`` REDISTRIBUTES
+# cap-overflow to non-cap voters before the burn fallback.
+#
+# Pre-fix (Tier 22 -> Tier 50 -> Tier 56 sequence) the distribution
+# was a single pass: pro-rata-by-stake share, capped at
+# ``VOTER_REWARD_MAX_SHARE_BPS / 10_000`` per voter, and BOTH
+# cap_excess and integer-division dust burned.  At today's bootstrap
+# (founder ≈ near-100% of active stake) the founder hits the 25% cap
+# on every proposal and the other 75% of the per-proposal pool burns.
+# After seed-divestment to the 10M founder + 90M elsewhere
+# distribution, a small voter with 10K stake on a 100M-staked network
+# would earn 50000 × 10K / 100M = 5 tokens -- below the vote-tx fee
+# floor of 100.  The mechanism currently *demotivates* voting at the
+# small end while burning the surcharge that was supposed to motivate
+# it.  CLAUDE.md anchor at risk: "voters who cast a vote during the
+# window receive a reward funded *out of the proposal fee* -- the
+# proposer pays the voters they're asking to evaluate the proposal."
+# When ≥75% of every proposal's voter pool incinerates instead of
+# paying voters, the anchor is materially inverted.
+#
+# Tier 65 fix: post-activation, cap_excess is REDISTRIBUTED to the
+# non-cap voters before the burn fallback.  The redistribution
+# iterates: each round, fill non-cap voters pro-rata-by-stake from
+# the remaining excess; voters that hit the cap during a round drop
+# out for the next round.  Convergence in O(N_voters) rounds because
+# every round either fills another voter to cap or distributes
+# everything to uncapped voters.  When no progress can be made (all
+# voters at cap, OR only one voter exists), the residual burns --
+# the same defensive invariant the legacy path enforces.  Integer-
+# division dust still burns (unavoidable at the per-token level).
+#
+# Hard fork: balance writes shift between the legacy single-pass-
+# and-burn path and the iterative redistribute path, which is
+# consensus-visible.  Pre-fork (close-block height < activation)
+# the legacy code runs byte-for-byte so historical proposals replay
+# identically.  Activation height 2500 sits 50 blocks above Tier 64
+# (2450) -- ~8.3h cohort spacing matching the Tier 49-64 pattern.
+VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT = 2500  # Tier 65
+
+assert (
+    VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT
+    > FORCED_INCLUSION_PER_ENTITY_CAP_HEIGHT
+), (
+    "VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT must follow Tier "
+    "64 -- consecutive consensus-rule activations need cohort "
+    "spacing to keep the validator-upgrade window from collapsing"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

@@ -1080,6 +1080,7 @@ class GovernanceTracker:
         from messagechain.config import (
             VOTER_REWARD_INCLUSIVE_HEIGHT,
             VOTER_REWARD_MAX_SHARE_BPS,
+            VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT,
         )
 
         state = self.proposals.get(proposal_id)
@@ -1156,7 +1157,7 @@ class GovernanceTracker:
         # Iterate in a deterministic order (sorted by entity_id) so
         # the dust calculation is reproducible across nodes.  The
         # individual share = pool * stake // winners_total; dust =
-        # pool - sum(shares) - sum(cap_excess).  Both burn.
+        # pool - sum(shares) - sum(cap_excess).
         payouts: dict[bytes, int] = {}
         capped_excess = 0
         distributed = 0
@@ -1168,7 +1169,82 @@ class GovernanceTracker:
             payouts[voter_id] = share
             distributed += share
 
-        # Credit each winner's balance.  No supply mutation — the
+        # Tier 65 -- redistribute cap_excess to non-cap voters before
+        # the burn fallback.  Pre-fix the cap_excess always burned,
+        # which at bootstrap distributions (founder ≈ 100% of active
+        # stake) burned ≥75% of every proposal's voter pool and
+        # inverted the "proposer pays voters" anchor.  Post-fix the
+        # cap-overflow flows back to the next-ranked uncapped voters
+        # pro-rata-by-stake; the redistribution iterates until either
+        # the remainder reaches zero, every voter is at cap, or the
+        # round makes no progress (defensive against integer-rounding
+        # dust trapping the loop).  Pre-fork the legacy single-pass
+        # behavior runs byte-identically so historical proposals
+        # replay unchanged.
+        if (
+            current_block >= VOTER_REWARD_REDISTRIBUTE_CAP_EXCESS_HEIGHT
+            and capped_excess > 0
+        ):
+            remaining = capped_excess
+            # MAX_VOTERS rounds upper-bound -- every round either
+            # fills another voter to cap or distributes everything
+            # to uncapped voters and exits.  In the worst case all
+            # voters get filled to cap one-at-a-time, which is N
+            # rounds for N voters.  The round_count guard is
+            # defensive against any pathological input that doesn't
+            # converge -- the loop exits cleanly and the residual
+            # falls into the same dust-burn path the legacy code
+            # uses.
+            max_rounds = len(winners)
+            for _round in range(max_rounds):
+                if remaining <= 0:
+                    break
+                # Uncapped winners are those whose current payout is
+                # still strictly below cap.
+                uncapped_total = sum(
+                    winners[v] for v in winners
+                    if payouts[v] < cap
+                )
+                if uncapped_total <= 0:
+                    # All voters at cap -- nothing more to
+                    # redistribute to.  Residual burns below.
+                    break
+                round_distributed = 0
+                round_excess = 0
+                # Iterate in the same deterministic entity_id order
+                # so the dust math is reproducible across nodes.
+                for voter_id in sorted(winners.keys()):
+                    if payouts[voter_id] >= cap:
+                        continue
+                    # Each uncapped voter receives a share of the
+                    # remaining pool weighted by their stake among
+                    # uncapped voters.  The cap on top of the
+                    # already-distributed amount may bind.
+                    raw_gain = remaining * winners[voter_id] // uncapped_total
+                    headroom = cap - payouts[voter_id]
+                    if raw_gain >= headroom:
+                        round_excess += raw_gain - headroom
+                        gain = headroom
+                    else:
+                        gain = raw_gain
+                    payouts[voter_id] += gain
+                    distributed += gain
+                    round_distributed += gain
+                # Remaining shrinks by what was actually paid out
+                # this round.  Round_excess (raw_gain above headroom
+                # that the cap rejected) is implicitly carried into
+                # the next round because we only deduct
+                # round_distributed -- the unpaid portion stays in
+                # remaining, available for redistribution to the
+                # voters that are still uncapped after this round.
+                # When no progress is made (round_distributed == 0),
+                # exit -- residual burns via the standard
+                # `burned = pool - distributed` path below.
+                remaining = remaining - round_distributed
+                if round_distributed == 0:
+                    break
+
+        # Credit each winner's balance.  No supply mutation -- the
         # tokens are moving from escrow (outside any balance) back
         # into circulation in the recipients' balances.
         for voter_id, amount in payouts.items():
@@ -1177,7 +1253,8 @@ class GovernanceTracker:
                     supply_tracker.balances.get(voter_id, 0) + amount
                 )
 
-        # Anything not paid out (dust + cap_excess) burns.
+        # Anything not paid out (dust + residual cap_excess that the
+        # redistribute loop couldn't place) burns.
         burned = pool - distributed
         if burned > 0:
             supply_tracker.total_supply -= burned
