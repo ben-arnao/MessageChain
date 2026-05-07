@@ -118,21 +118,44 @@ def compute_inactivity_penalty(
     if validator_stake <= 0:
         return 0
 
-    # Tier 59 height gate: pre-fork uses the legacy flat formula
-    # byte-identically; post-fork scales nominal by stake.  Caller
-    # threads ``current_height`` from the apply path; legacy callers
-    # (None) get the pre-fork behavior.  See module docstring +
-    # config.py Tier 59 block for the full rationale.
-    from messagechain.config import INACTIVITY_LEAK_STAKE_SCALED_HEIGHT
+    # Tier 59 / Tier 61 height gates: pre-Tier-59 uses the flat
+    # legacy formula byte-identically; Tier 59 stake-scales nominal
+    # but integer-truncates at the per-block level for stake<1M;
+    # Tier 61 switches to the cumulative-floor difference so the
+    # ~2% target holds for every stake size.  Caller threads
+    # ``current_height`` from the apply path; legacy callers
+    # (None) get the pre-Tier-59 behavior.
+    from messagechain.config import (
+        INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT,
+        INACTIVITY_LEAK_STAKE_SCALED_HEIGHT,
+    )
     if (
+        current_height is not None
+        and current_height >= INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT
+    ):
+        # Tier 61: cumulative-floor difference.  Per-block integer
+        # truncation moves to the cumulative level, where it rounds
+        # to <1% even at the smallest validator stake the chain
+        # admits -- preserving the ~2% calibration the Tier 59
+        # CHANGELOG advertised but couldn't deliver under integer
+        # arithmetic.  See config.py Tier 61 block for the
+        # numerical-derivation note.
+        penalty = (
+            _cumulative_inactivity_drain(
+                blocks_since_finality, validator_stake,
+            )
+            - _cumulative_inactivity_drain(
+                blocks_since_finality - 1, validator_stake,
+            )
+        )
+    elif (
         current_height is not None
         and current_height >= INACTIVITY_LEAK_STAKE_SCALED_HEIGHT
     ):
-        # Stake-scaled: separate quotient calibrated so cumulative
-        # drain over a full 10000-block stall window is ~2% of stake
-        # regardless of stake size.  See
-        # INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT in config.py for
-        # the calibration rationale.
+        # Tier 59: stake-scaled per-block-real.  Mathematically
+        # ~2% cumulative; integer-truncates to 0 for stake<~1M.
+        # Preserved here for byte-identical replay of historical
+        # blocks at heights [Tier 59, Tier 61).
         penalty = (
             validator_stake
             * INACTIVITY_BASE_PENALTY
@@ -149,6 +172,34 @@ def compute_inactivity_penalty(
         )
     # Cap at current stake — can't drain below 0.
     return min(penalty, validator_stake)
+
+
+def _cumulative_inactivity_drain(blocks: int, stake: int) -> int:
+    """Integer-floor of cumulative inactivity-leak drain through
+    `blocks` blocks of stall, under the Tier 59 stake-scaled
+    calibration constants.
+
+    Closed form: ``sum_{k=1..N} k² = N*(N+1)*(2N+1)/6``.  Used by
+    the Tier 61 per-block formula::
+
+        penalty_at_block_k = cum(k) - cum(k-1)
+
+    The cumulative-floor trick integer-truncates at the *cumulative*
+    level (which crosses 1-token boundaries even for tiny stakes
+    over realistic partitions) instead of at the per-block level
+    (which floored to 0 for stake<~1M under Tier 59 calibration).
+
+    Returns 0 for non-positive blocks so the boundary case
+    ``cum(blocks_since_finality - 1)`` at blocks_since_finality=1
+    is well-defined.
+    """
+    if blocks <= 0:
+        return 0
+    sum_squares = blocks * (blocks + 1) * (2 * blocks + 1) // 6
+    return (
+        stake * INACTIVITY_BASE_PENALTY * sum_squares
+        // INACTIVITY_PENALTY_STAKE_SCALED_QUOTIENT
+    )
 
 
 def get_inactive_validators(

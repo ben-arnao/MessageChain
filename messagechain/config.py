@@ -6539,6 +6539,55 @@ assert DORMANCY_TARGET_ACTIVE_SUPPLY_V2 > DORMANCY_TARGET_ACTIVE_SUPPLY, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 61 -- inactivity-leak penalty cumulative-floor formula.
+# Audit r33 top-3 #2.  Pre-fix the Tier 59 stake-scaled per-block
+# formula `stake * BASE * blocks² // Q` integer-truncated to zero for
+# any validator with stake < ~1M tokens at the calibrated quotient
+# (Q = 16_777_216_000_000).  Cumulative drain over a 10000-block stall
+# was the SUM of per-block penalties; if every per-block term floored
+# to 0, the SUM was also 0.  Net effect: the leak fired correctly for
+# whales, but the rank-and-file validator set (stake = 10K..100K)
+# experienced zero drain on arbitrarily long partitions -- breaking
+# cartel defense for any colluding subset of small-stake validators.
+#
+# Tier 61 fix is stateless and preserves the calibration constants:
+# compute the per-block penalty as the integer DIFFERENCE of
+# cumulative-floor values rather than the FLOOR of per-block-real::
+#
+#     cum(k) = stake * BASE * sum_{j=1..k} j² // Q
+#            = stake * BASE * (k * (k+1) * (2k+1) / 6) // Q
+#     penalty_at_block_k = cum(k) - cum(k-1)
+#
+# The cumulative-floor trick integer-truncates at the *cumulative*
+# level (well above 1 token for any realistic stake over a realistic
+# partition) instead of at the per-block level.  Over a 10000-block
+# stall:
+#
+#   * stake=10K:   cum(10000) ≈ 198 tokens (~2% drain) -- works.
+#   * stake=1M:    cum(10000) ≈ 19_842 tokens (~2%)    -- works.
+#   * stake=100M:  cum(10000) ≈ 1_984_226 tokens (~2%) -- works.
+#
+# Activation height 2300 sits 50 blocks above Tier 60 (DORMANCY_
+# TARGET_RETUNE_HEIGHT = 2250) -- ~8.3h cohort spacing matching the
+# Tier 49-60 pattern.  Pre-fork (height < 2300) the legacy Tier 59
+# formula runs unchanged so historical blocks replay byte-identically.
+# No new wire format, no state-tree changes -- pure function-shape
+# change inside compute_inactivity_penalty.
+INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT = 2300  # Tier 61
+
+assert INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT > DORMANCY_TARGET_RETUNE_HEIGHT, (
+    "INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT must follow Tier 60 -- "
+    "the cohort spacing keeps consecutive consensus-rule changes "
+    "from collapsing into a single activation window"
+)
+assert INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT > INACTIVITY_LEAK_STAKE_SCALED_HEIGHT, (
+    "INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT must follow Tier 59 -- "
+    "Tier 61 fixes the integer-truncation bug Tier 59 introduced, "
+    "so Tier 59 must already be live before the fix activates"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
