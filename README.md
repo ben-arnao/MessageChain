@@ -59,9 +59,16 @@ same way via `python -m messagechain <cmd>` if you prefer.
 ### 1. Generate a private key (offline)
 
 ```bash
-messagechain generate-key    # write the printed hex on paper, 2–3 copies
+messagechain generate-key    # write the 24-word recovery phrase on paper, 2–3 copies
 messagechain verify-key      # re-type to confirm the backup
 ```
+
+`generate-key` prints a **24-word BIP-39 recovery phrase** as the
+primary backup. The phrase has a built-in checksum that catches
+single-word transcription errors when you type it back on
+recovery — the hex form (also printed, labeled "alternative") has
+no such protection, so a single typo silently produces a
+different key and loses access.
 
 Paper beats files — files get swept by cloud sync, backups, and
 malware. Don't copy-paste (clipboard managers log history). Close
