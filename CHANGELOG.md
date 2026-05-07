@@ -4,6 +4,121 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.65.0] — 2026-05-07
+
+Minor release.  Audit round 34 top-2 ships: one new hard fork
+(Tier 62 swaps ``select_lottery_winner`` from ``math.log`` -- a
+libm call whose ULP-level rounding is not portable across glibc /
+musl / MSVC libm / macOS libm -- to ``decimal.Decimal.ln()`` at
+40-digit precision, eliminating the consensus-fork risk between
+heterogeneous-libc validators on the same chain) and one operator-
+UX gate (``messagechain start --mine`` now runs the same
+``_check_leaf_index`` audit r33 #3 added to ``doctor``, so an
+operator who restores from paper backup and skips ``doctor`` is
+caught before the daemon takes its first signing turn).  No new wire
+format, no new tx kinds, no state-tree changes.
+
+### Added
+
+  * **Tier 62 -- ``select_lottery_winner`` uses
+    ``decimal.Decimal.ln()`` (hard fork, activation height 2350).**
+    Pre-fix the lottery winner was selected by ranking candidates on
+    ``key = math.log(u) / w`` in ``float64``, then comparing keys
+    with float-equality tiebreak.  ``math.log`` delegates to a libm
+    whose ULP-level rounding is NOT portable across glibc / musl /
+    MSVC libm / macOS libm.  Two heterogeneous-libc validators on
+    the same chain could disagree on the lottery winner for the
+    same ``(randao_mix, candidates)`` input -- producing divergent
+    ``supply.balances`` / ``total_supply`` / ``total_minted``
+    mutations and a silent state-root split on every lottery
+    firing.
+
+    Today's mainnet runs homogeneous Linux glibc on both
+    validators, so the chain has not actually forked yet -- the fix
+    protects the moment a third validator joins on a different
+    libc.  CLAUDE.md anchor at risk: Mission ("permanent ledger");
+    honest-operator-insurance (a node bounced onto a minority fork
+    by a libm rounding difference accumulates resync cost it didn't
+    earn).
+
+    Tier 62 mirrors the same fix ``attester_committee.py`` already
+    received pre-mainnet for the same reason: drop into
+    ``decimal.Decimal.ln()`` at 40-digit precision inside a
+    ``localcontext()``, byte-identical everywhere CPython runs.
+    Algorithm shape (A-Res with k=1, log-key = ln(u_i) / w_i,
+    tiebreak on entity_id ascending) matches the legacy path so the
+    weighted-probability distribution is preserved -- only the
+    arithmetic backend changes.
+
+    Pre-fork (height < ``LOTTERY_DETERMINISTIC_HEIGHT = 2350``) the
+    legacy float-math branch runs unchanged so every historical
+    lottery-firing block replays byte-identically post-upgrade.
+    Post-fork the deterministic Decimal branch is the consensus
+    rule.  Both consensus call sites in ``core/blockchain.py`` (sim
+    path in ``compute_post_state_root`` + apply path in the
+    lottery-firing block) pass ``block_height=`` so the gate
+    actually activates.
+
+    Activation height 2350 sits 50 blocks above Tier 61 (2300) --
+    ~8.3h cohort spacing matching the Tier 49-61 pattern.  Mainnet
+    tip at ship time is height ~1837 (probed via
+    ``https://messagechain.org/v1/info``), so the upgrade window is
+    ~3.6 days at 600s blocks.  Two-validator coordinated upgrade.
+    10 regression tests in
+    ``tests/test_audit_r34_lottery_deterministic_tier62.py`` pin
+    activation constant ordering, pre-fork legacy byte-identity,
+    post-fork repeatability, post-fork helper does NOT reference
+    ``math.log``, weighted-probability shape preserved post-fork,
+    seed exclusion preserved post-fork, edge cases (empty / all-
+    seed / all-zero), and BOTH consensus call sites pass
+    ``block_height=``.  Surfaced by audit r34 top-3 #1.  (4f83ccb)
+
+### Fixed
+
+  * **``messagechain start --mine`` gates on the leaf-index check
+    before the daemon takes its first signing turn.**  Audit r33 #3
+    (1.64.0) added ``_check_leaf_index`` to the ``doctor``
+    checklist to catch the keyfile-on-fresh-disk-without-cursor
+    restore disaster: chain watermark > 0, no ``leaf_index.json``
+    on disk -> next sign re-uses a burned leaf -> 100%-slash
+    equivocation evidence.  The check is correct, but it only fires
+    when the operator runs ``messagechain doctor`` first.
+
+    An operator who restores from paper backup and (a) starts the
+    daemon via ``systemctl start messagechain-validator`` directly,
+    (b) follows older runbook habits and skips ``doctor``, or (c)
+    runs ``messagechain start --mine`` straight, bypassed the gate.
+    The next sign re-used the burned leaf; the on-chain watermark
+    caught the equivocation on the first observed conflict; full
+    stake loss on a documented operator workflow.
+
+    CLAUDE.md anchor at risk: "honest operators are insured against
+    accidents" -- a one-off restore that skips ``doctor`` is exactly
+    the kind of recoverable misconfig the anchor wants to insulate.
+
+    Fix lifts the same ``_check_leaf_index`` call into ``cmd_start``
+    right after entity resolution, BEFORE the daemon takes its
+    first signing turn.  Level=2 (RED) prints the diagnostic and
+    exits non-zero with the operator remediation message.  Level=1
+    (WARN / inconclusive) prints the warning and continues.
+    Level=0 (GREEN) is silent so healthy boots stay quiet.  New
+    ``--accept-leaf-reuse-risk`` flag mirrors the ``--yes-nat``
+    pattern on the reachability probe: operators who have manually
+    verified the local cursor exceeds the chain watermark for every
+    prior sign can bypass the gate (the bypass path still prints a
+    clear warning so the operator's choice is visible in startup
+    logs).
+
+    Soft-fix; no consensus rule change, no fork, no new wire
+    format.  The CLI surface adds exactly one flag to ``start``.
+    5 regression tests in
+    ``tests/test_audit_r34_start_leaf_index_gate.py`` pin: parser
+    includes the bypass flag, ``cmd_start`` source references
+    ``_check_leaf_index``, RED exits non-zero by default,
+    ``--accept-leaf-reuse-risk`` bypasses the RED exit (with
+    audible warning), GREEN is silent.  Surfaced by audit r34
+    top-3 #2.  (eb473aa)
+
 ## [1.64.0] — 2026-05-07
 
 Minor release.  Audit round 33 top-3 ships: one cryptographic-
