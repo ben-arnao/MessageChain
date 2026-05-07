@@ -4,6 +4,169 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.66.0] — 2026-05-07
+
+Minor release.  Audit round 36 top-3 ships: two new hard forks (Tier
+63 wires the documented-but-unenforced ``StateCheckpointDoubleSign
+Evidence`` into the slashing pipeline as a kind=3 ``SlashTransaction``
+discriminator, Tier 65 makes voter-reward cap-overflow redistribute
+to non-cap voters before the burn fallback so the per-proposal pool
+no longer ≥75%-burns at bootstrap), plus one soft-fork on the
+attester source set (Tier 64 caps per-entity slots in the forced-
+inclusion FORCED source set so a single-entity flood cannot evict
+a censored victim).  No new top-line CLI surface, no new tx kinds
+beyond the kind=3 ``SlashTransaction`` discriminator on the existing
+slash-tx wire form.
+
+### Added
+
+  * **Tier 63 -- ``StateCheckpointDoubleSignEvidence`` wired into
+    the slashing pipeline (hard fork, activation height 2400).**
+    Pre-fix the evidence type and verifier existed in
+    ``messagechain/consensus/state_checkpoint.py`` and the docstring
+    claimed "Penalty: 100% stake + full escrow burn, same as double-
+    proposal / double-attestation / double-finality-vote."  But the
+    slashing pipeline only dispatched kinds 0/1/2 (block /
+    attestation / finality-vote); ``OffenseKind`` had no entry;
+    ``SlashTransaction.{to,from}_bytes`` raised "Unknown slash
+    evidence kind" on kind=3; ``validate_slash_transaction`` had no
+    branch for it.  The documented slashable offense was therefore
+    unenforceable.
+
+    Concrete bite: a validator who signs two distinct ``state_root``
+    values for the same checkpoint ``block_number`` fragments
+    bootstrap-from-checkpoint sync -- new nodes adopting the >=2/3-
+    stake-signed snapshot land in different post-states.  The
+    promised 100% slash never fired because no code path could
+    carry the evidence into apply.  CLAUDE.md anchor at risk:
+    bootstrap survivability + validator-collusion (long-range /
+    weak-subjectivity attack on newly-joining full nodes).
+
+    Tier 63 is hard-fork-gated (admission, not decode) at activation
+    height 2400, sitting 50 blocks above Tier 62 (2350) -- ~8.3h
+    cohort spacing matching the Tier 49-62 pattern.  Five pieces:
+    new ``STATE_CHECKPOINT_DOUBLE_SIGN_SLASH_HEIGHT`` constant; new
+    ``OffenseKind.STATE_CHECKPOINT_DOUBLE_SIGN`` enum entry (always
+    UNAMBIGUOUS -- snapshot ``state_root`` is a function of
+    deterministically-replayed chain state, so two distinct values
+    at the same height cannot be a benign restart shape);
+    ``SlashTransaction.{to,from}_bytes`` / ``serialize`` /
+    ``deserialize`` gain kind=3 / ``type="state_ckpt_double_sign"``
+    dispatch (encoder unconditional, admission gated);
+    ``Blockchain._evidence_block_number`` returns
+    ``checkpoint_a.block_number`` for the new evidence shape;
+    ``Blockchain.validate_slash_transaction`` walks the multi-key
+    candidate set so a rotated-key offender cannot dodge the slash
+    by rotating between the two checkpoint signs.  Pre-fork blocks
+    replay byte-identically via the height gate.  12 regression
+    tests in
+    ``tests/test_audit_r36_state_checkpoint_double_sign_slashing.py``.
+    Surfaced by audit r36 top-3 #1.  (a94f90a)
+
+  * **Tier 64 -- per-entity cap on the forced-inclusion FORCED
+    SOURCE SET (soft fork, activation height 2450).**  Pre-fix
+    ``Mempool.get_forced_inclusion_set`` ranked qualifying txs by
+    ``(-fee_per_byte, arrival_height, tx_hash)`` and sliced the top
+    ``FORCED_INCLUSION_SET_SIZE`` with NO per-entity cap on the
+    source set itself.  Tier 37's per-entity cap fix
+    (``FORCED_INCLUSION_ENTITY_CAP_FIX_HEIGHT``) tightened excuse #3
+    on the proposer-validator axis, but the attester-side forced
+    *source* set this fix governs had no equivalent guard.
+
+    Concrete attack: a colluding cartel pays a high-stake entity to
+    flood the mempool with N high-fpb txs from a single
+    ``entity_id``.  After ``FORCED_INCLUSION_WAIT_BLOCKS`` those N
+    txs occupy the top ``FORCED_INCLUSION_SET_SIZE`` slots, evicting
+    the censored victim's lower-fpb tx from the forced set entirely.
+    The cartel proposer can then exclude the victim without
+    triggering excuse #1 (the victim's tx is no longer in the
+    forced set), excuse #3 (Tier 37 reads block-tx counts, not the
+    forced source set), or any other structural excuse.  CLAUDE.md
+    anchor at risk: "a tx that is well-formed, pays at least the
+    per-byte floor, and fits the byte budget cannot be suppressed
+    by anything weaker than a full validator-set majority actively
+    colluding AND willing to absorb the slashing risk that exposed
+    collusion produces."
+
+    Tier 64 caps the FORCED source set at
+    ``MAX_TXS_PER_ENTITY_PER_BLOCK = 3``.  Forcing more than 3 from
+    one entity is meaningless anyway -- the proposer cannot fit
+    them in one block under the existing block-validator cap;
+    capping the forced source set at the same constant therefore
+    preserves every honest forced-inclusion outcome while denying
+    the eviction primitive.  The freed slots fill with the next-
+    ranked txs from OTHER entities -- exactly the censored-victim
+    path the anchor protects.  Soft-fork because the forced source
+    set is per-attester local state, not consensus-relevant block
+    content; different attesters can see different mempool views
+    and the soft-vote aggregation handles divergence.  Pre-fork
+    (height < activation) the legacy uncapped path runs byte-
+    identically so historical attester votes replay byte-
+    identically.  Activation height 2450 sits 50 blocks above Tier
+    63 (2400).  6 regression tests in
+    ``tests/test_audit_r36_forced_inclusion_per_entity_cap_tier64.py``.
+    Surfaced by audit r36 top-3 #2.  (5cd3414)
+
+  * **Tier 65 -- voter-reward cap-overflow redistributes to non-cap
+    voters before the burn fallback (hard fork, activation height
+    2500).**  Pre-fix ``Governance.finalize_voter_rewards``
+    distributed the per-proposal voter pool pro-rata-by-stake,
+    capped each voter at ``VOTER_REWARD_MAX_SHARE_BPS / 10_000``
+    (25%) of the pool, and BURNED both cap_excess (overflow above
+    the per-voter cap) AND integer-division dust.
+
+    At today's bootstrap (founder ≈ near-100% of active stake) the
+    founder hits the 25% cap on every proposal and the other 75% of
+    the per-proposal pool burns.  Even after seed-divestment to a
+    10M-floor founder + 90M-elsewhere distribution, a small voter
+    with 10K stake on a 100M-staked network would earn 50000 × 10K
+    / 100M = 5 tokens -- below the vote-tx fee floor of 100.  The
+    mechanism currently *demotivates* voting at the small end while
+    burning the surcharge that was supposed to motivate it.
+
+    CLAUDE.md anchor at risk: "voters who cast a vote during the
+    window receive a reward funded *out of the proposal fee* -- the
+    proposer pays the voters they're asking to evaluate the
+    proposal."  When ≥75% of every proposal's voter pool incinerates
+    instead of paying voters, the anchor is materially inverted.
+
+    Tier 65 redistributes cap_excess to non-cap voters before the
+    burn fallback.  The redistribute loop iterates: each round, fill
+    non-cap voters pro-rata-by-stake from the remaining excess;
+    voters that hit the cap during a round drop out for the next
+    round.  Convergence in O(N_voters) rounds -- every round either
+    fills another voter to cap or distributes everything to uncapped
+    voters.  When no progress can be made (all voters at cap, OR
+    only one voter exists), the residual burns via the existing
+    ``burned = pool - distributed`` path.  Integer-division dust
+    still burns (unavoidable at the per-token level).  Pre-fork
+    (current_block < activation) the legacy single-pass code runs
+    byte-for-byte so historical proposals replay byte-identically.
+
+    Concrete improvement on the canonical bootstrap-skew shape
+    (whale=99 stake + small=1 stake, pool=100, cap=25):
+      Pre-fix: whale 25 + small 1 = 26 distributed, 74 burns.
+      Post-fix: whale 25 + small lifted-to-25 by redistribute = 50
+                distributed, 50 burns.
+    Permanent supply-deflation leak halved on this distribution.
+
+    Hard-fork because balance writes shift between the legacy
+    single-pass-and-burn path and the iterative redistribute path,
+    which is consensus-visible.  Activation height 2500 sits 50
+    blocks above Tier 64 (2450).  Two-validator coordinated upgrade.
+    No new wire format, no new tx kinds, no state-tree changes --
+    pure function-shape change inside ``finalize_voter_rewards``.
+    7 regression tests in
+    ``tests/test_audit_r36_voter_reward_redistribute_tier65.py``.
+    Surfaced by audit r36 top-3 #3.  (bd30d28)
+
+Activation cohort spacing: Tier 63 = 2400 -> Tier 64 = 2450 -> Tier
+65 = 2500 (50-block / ~8.3h gaps at 600s blocks), matching the Tier
+49-62 pattern.  Mainnet tip at ship time is height ~1837 (probed via
+``https://messagechain.org/v1/info``), so the upgrade window is ~3.9
+days at 600s blocks for Tier 63, ~4.3 days for Tier 64, ~4.7 days
+for Tier 65.  Two-validator coordinated upgrade.
+
 ## [1.65.1] — 2026-05-07
 
 Patch release.  Audit round 35 top-1 ships: pure removal of the
