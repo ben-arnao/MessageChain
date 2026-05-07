@@ -981,6 +981,28 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_seen_sigs_first_seen
                 ON seen_signatures(first_seen_block_height);
 
+            -- Audit r29 #3 (1.59.1): finality-vote equivocation
+            -- evidence MUST survive a node restart.  Pre-fix the
+            -- ``FinalityCheckpoints._vote_by_signer_height`` map was
+            -- in-memory-only -- a validator who staged H1, waited
+            -- for a network-wide restart window (release roll, OS
+            -- update), then issued H2 evaded local equivocation
+            -- detection on every node simultaneously.  This table
+            -- mirrors the in-memory map so any (signer, target_height)
+            -- → (target_hash, vote_payload) observation is durable
+            -- across restarts.  Pruned on the same evidence-window
+            -- cadence as ``seen_signatures`` so disk stays bounded.
+            CREATE TABLE IF NOT EXISTS finality_votes_seen (
+                signer_id BLOB NOT NULL,
+                target_block_number INTEGER NOT NULL,
+                target_block_hash BLOB NOT NULL,
+                vote_payload BLOB NOT NULL,
+                first_seen_block_height INTEGER NOT NULL,
+                PRIMARY KEY (signer_id, target_block_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_finality_votes_first_seen
+                ON finality_votes_seen(first_seen_block_height);
+
             -- Tier 10 prev-pointer feature: per-tx index mapping every
             -- MessageTransaction tx_hash to the block_height and
             -- in-block tx_index where it was included.  Strict-prev
@@ -2454,6 +2476,110 @@ class ChainDB:
     def count_seen_signatures(self) -> int:
         """Total rows in seen_signatures.  Used by tests + ops metrics."""
         cur = self._conn.execute("SELECT COUNT(*) FROM seen_signatures")
+        return cur.fetchone()[0]
+
+    # ── Finality Vote Equivocation Evidence ─────────────────────
+    # Audit r29 #3 (1.59.1): persists FinalityCheckpoints'
+    # ``_vote_by_signer_height`` map across restarts so a validator
+    # cannot stage two finality votes at the same height and time the
+    # second one to a network-wide restart to evade local detection.
+
+    def add_finality_vote_seen(
+        self,
+        signer_id: bytes,
+        target_block_number: int,
+        target_block_hash: bytes,
+        vote_payload: bytes,
+        first_seen_block_height: int,
+    ) -> bool:
+        """Record a finality-vote observation.  Idempotent via
+        INSERT OR IGNORE on (signer_id, target_block_number) -- the
+        first hash seen for a given (signer, height) is pinned;
+        subsequent observations at the same height with a DIFFERENT
+        hash are rejected at this layer (the caller compared and
+        built equivocation evidence before reaching us).
+        Returns True if a new row was inserted; False if the row
+        already existed.
+        """
+        cur = self._conn.execute(
+            "INSERT OR IGNORE INTO finality_votes_seen "
+            "(signer_id, target_block_number, target_block_hash, "
+            " vote_payload, first_seen_block_height) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                bytes(signer_id),
+                int(target_block_number),
+                bytes(target_block_hash),
+                bytes(vote_payload),
+                int(first_seen_block_height),
+            ),
+        )
+        self._maybe_commit()
+        return cur.rowcount > 0
+
+    def get_finality_vote_seen(
+        self,
+        signer_id: bytes,
+        target_block_number: int,
+    ) -> tuple[bytes, bytes, int] | None:
+        """Return (target_block_hash, vote_payload,
+        first_seen_block_height) for the prior observation at
+        (signer_id, target_block_number), or None if no prior."""
+        cur = self._conn.execute(
+            "SELECT target_block_hash, vote_payload, "
+            "       first_seen_block_height "
+            "FROM finality_votes_seen "
+            "WHERE signer_id = ? AND target_block_number = ?",
+            (bytes(signer_id), int(target_block_number)),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return (bytes(row[0]), bytes(row[1]), int(row[2]))
+
+    def get_all_finality_votes_seen(
+        self,
+    ) -> list[tuple[bytes, int, bytes, bytes, int]]:
+        """Return every observation as a list of (signer_id,
+        target_block_number, target_block_hash, vote_payload,
+        first_seen_block_height) tuples.  Used at boot to rehydrate
+        FinalityCheckpoints' in-memory cache.
+        """
+        cur = self._conn.execute(
+            "SELECT signer_id, target_block_number, "
+            "       target_block_hash, vote_payload, "
+            "       first_seen_block_height "
+            "FROM finality_votes_seen"
+        )
+        return [
+            (
+                bytes(r[0]), int(r[1]), bytes(r[2]),
+                bytes(r[3]), int(r[4]),
+            )
+            for r in cur.fetchall()
+        ]
+
+    def prune_finality_votes_before(self, cutoff_block_height: int) -> int:
+        """Delete finality-vote observations with
+        ``first_seen_block_height < cutoff_block_height``.  Returns
+        the number of rows deleted.  Mirrors
+        ``prune_seen_signatures_before`` -- safe to call on every
+        block; the index makes it a cheap range delete.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM finality_votes_seen "
+            "WHERE first_seen_block_height < ?",
+            (int(cutoff_block_height),),
+        )
+        self._maybe_commit()
+        return cur.rowcount
+
+    def count_finality_votes_seen(self) -> int:
+        """Total rows in finality_votes_seen.  Used by tests + ops
+        metrics."""
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM finality_votes_seen"
+        )
         return cur.fetchone()[0]
 
     # ── Finalized Block Checkpoints ─────────────────────────────

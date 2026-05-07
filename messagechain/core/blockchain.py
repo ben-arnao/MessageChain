@@ -407,7 +407,18 @@ class Blockchain:
         # persisted via ChainDB.add_finalized_block so the reorg-
         # rejection rule survives restart.  Loaded from disk in
         # _load_from_db; rehydrated empty for in-memory chains.
-        self.finalized_checkpoints: FinalityCheckpoints = FinalityCheckpoints()
+        # Bind chaindb so finality-vote equivocation evidence
+        # survives node restart (audit r29 #3).  Pre-fix the
+        # ``_vote_by_signer_height`` map was in-memory-only and a
+        # validator who staged H1, waited for a network-wide restart
+        # window, then issued H2 evaded local detection on every
+        # node simultaneously.  Rehydration from chaindb is wired in
+        # ``_load_from_db`` so the gate is hot before any new vote
+        # arrives post-restart.  In-memory tests pass ``db=None`` and
+        # keep the legacy non-durable path.
+        self.finalized_checkpoints: FinalityCheckpoints = (
+            FinalityCheckpoints(chaindb=self.db)
+        )
         # Fork-emergency detector — observes every signature-verified
         # FinalityVote (gossip-time AND block-apply-time) and flags
         # heights where 2/3+ of stake has committed to a block hash this
@@ -1082,6 +1093,22 @@ class Blockchain:
         if hasattr(self.db, 'get_all_finalized_blocks'):
             for bn, bh in self.db.get_all_finalized_blocks().items():
                 self.finalized_checkpoints.mark_finalized(bh, bn)
+
+        # Audit r29 #3: rehydrate finality-vote equivocation
+        # observations so the local detector fires on the first
+        # post-restart conflicting vote even when the original was
+        # observed before the restart.  ``rehydrate_from_chaindb`` is
+        # a no-op when the DB lacks the table (older chaindb / test
+        # stub) -- the legacy in-memory path still works.
+        try:
+            self.finalized_checkpoints.bind_chaindb(self.db)
+            self.finalized_checkpoints.rehydrate_from_chaindb()
+        except Exception:
+            logger.exception(
+                "finality-vote rehydrate failed; equivocation gate "
+                "will only see post-restart observations until the "
+                "next persist round-trip succeeds",
+            )
 
         # Restore processed-evidence set so a restart cannot re-apply an
         # already-consumed slashing evidence transaction (which would let

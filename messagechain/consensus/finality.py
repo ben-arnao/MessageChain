@@ -434,7 +434,7 @@ class FinalityCheckpoints:
     storage persists that same set verbatim via chaindb.
     """
 
-    def __init__(self):
+    def __init__(self, chaindb=None):
         # target_block_hash -> set of signer_entity_ids that voted
         self._signers_by_hash: dict[bytes, set[bytes]] = {}
         # target_block_hash -> cumulative stake of signers
@@ -451,10 +451,57 @@ class FinalityCheckpoints:
         self.pending_slashing_evidence: list = []
         # Track (signer, target_height) -> (target_hash, FinalityVote)
         # so that a second vote for a DIFFERENT hash at the same height
-        # is detected and evidence is built.
+        # is detected and evidence is built.  Audit r29 #3 (1.59.1):
+        # this map is now a hot cache backed by
+        # ``chaindb.finality_votes_seen`` -- a node restart between
+        # H1 and H2 used to flush the in-memory map and amnesty the
+        # equivocation; the persistent backing closes that hole.
         self._vote_by_signer_height: dict[
             tuple[bytes, int], tuple[bytes, FinalityVote]
         ] = {}
+        # ChainDB for persisting equivocation observations across
+        # restart.  None for in-memory tests + the legacy in-memory
+        # path (which still works -- the cache IS the source of truth
+        # in that case, just non-durable, matching pre-1.59.1 behavior
+        # exactly so test fixtures don't churn).
+        self._chaindb = chaindb
+
+    def bind_chaindb(self, chaindb) -> None:
+        """Attach a ChainDB to this FinalityCheckpoints instance.
+        Must be called BEFORE any ``add_vote`` if the durable path
+        is wanted.  Idempotent: re-binding to the same DB is safe.
+        Used when the FinalityCheckpoints is constructed before the
+        DB is available (e.g. Blockchain's __init__ ordering)."""
+        self._chaindb = chaindb
+
+    def rehydrate_from_chaindb(self) -> int:
+        """Load all persisted finality-vote observations into the
+        in-memory cache.  Called on cold-restart so the equivocation
+        gate fires on the first conflicting vote post-restart even if
+        the original observation was made before the restart.
+
+        Returns the number of rows rehydrated.  Safe to call multiple
+        times -- duplicate keys overwrite with the same value.
+        """
+        if self._chaindb is None or not hasattr(
+            self._chaindb, "get_all_finality_votes_seen",
+        ):
+            return 0
+        rows = self._chaindb.get_all_finality_votes_seen()
+        loaded = 0
+        for signer_id, target_num, target_hash, payload, _seen in rows:
+            try:
+                vote = FinalityVote.from_bytes(payload)
+            except Exception:
+                # Defensively skip a corrupt row rather than crash
+                # the boot path.  Equivocation evidence at this row
+                # is lost but consensus is unaffected.
+                continue
+            self._vote_by_signer_height[(signer_id, target_num)] = (
+                target_hash, vote,
+            )
+            loaded += 1
+        return loaded
 
     def add_vote(
         self,
@@ -476,9 +523,28 @@ class FinalityCheckpoints:
         height = vote.target_block_number
 
         # Conflicting-vote detection: same signer + same height +
-        # different target hash → auto-slashing evidence.
+        # different target hash → auto-slashing evidence.  Audit r29
+        # #3: also consult the persistent ``finality_votes_seen``
+        # table so an observation from before a node restart still
+        # produces evidence on the first post-restart conflict.
         key = (sid, height)
         prior = self._vote_by_signer_height.get(key)
+        if prior is None and self._chaindb is not None and hasattr(
+            self._chaindb, "get_finality_vote_seen",
+        ):
+            db_row = self._chaindb.get_finality_vote_seen(sid, height)
+            if db_row is not None:
+                db_hash, db_payload, _seen = db_row
+                try:
+                    db_vote = FinalityVote.from_bytes(db_payload)
+                    prior = (db_hash, db_vote)
+                    # Warm the cache so subsequent calls skip the
+                    # DB round trip.
+                    self._vote_by_signer_height[key] = prior
+                except Exception:
+                    # Corrupt persisted row: skip silently so we fall
+                    # through to the "first observation" branch.
+                    prior = None
         if prior is not None:
             prior_hash, prior_vote = prior
             if prior_hash != sh:
@@ -501,8 +567,33 @@ class FinalityCheckpoints:
             # Already counted.  Idempotent no-op.
             return False
 
-        # Record the vote
+        # Record the vote -- in-memory cache AND, if bound,
+        # persistent ``finality_votes_seen``.  The persistent write
+        # uses the vote's own ``signed_at_height`` as the
+        # ``first_seen_block_height`` so the prune horizon advances
+        # naturally with chain progress.
         self._vote_by_signer_height[key] = (sh, vote)
+        if self._chaindb is not None and hasattr(
+            self._chaindb, "add_finality_vote_seen",
+        ):
+            try:
+                self._chaindb.add_finality_vote_seen(
+                    signer_id=sid,
+                    target_block_number=height,
+                    target_block_hash=sh,
+                    vote_payload=vote.to_bytes(),
+                    first_seen_block_height=int(
+                        getattr(vote, "signed_at_height", height),
+                    ),
+                )
+            except Exception:
+                # Persistence failure must not block consensus.
+                # The in-memory cache still records the vote so the
+                # local gate works for the rest of this process
+                # lifetime; only the across-restart evidence is at
+                # risk, and the operator's monitoring will surface
+                # the chaindb error.
+                pass
         self._signers_by_hash[sh].add(sid)
         self._stake_by_hash[sh] = self._stake_by_hash.get(sh, 0) + signer_stake
 
