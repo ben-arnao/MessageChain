@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from decimal import Decimal, localcontext
 
 from messagechain.config import HASH_ALGO
 from messagechain.crypto.hashing import default_hash
@@ -75,37 +76,17 @@ def lottery_bounty_for_progress(
     return int(full_bounty * (1.0 - bootstrap_progress))
 
 
-def select_lottery_winner(
-    *,
+def _eligible_pool(
     candidates: list[tuple[bytes, int]],
     seed_entity_ids: frozenset[bytes],
-    randomness: bytes,
     reputation_cap: int,
-) -> bytes | None:
-    """Pick the single reputation-weighted winner.
+) -> list[tuple[bytes, int]]:
+    """Build the seed-filtered, cap-clamped, zero-fallback eligibility
+    pool shared by every selection backend.
 
-    Arguments:
-        candidates: list of (entity_id, reputation) tuples.  Typically
-            every validator with reputation > 0.  Entities with
-            reputation == 0 are eligible if passed but will only win
-            if every positive-reputation candidate is a seed.
-        seed_entity_ids: excluded from the draw.  Seeds already hold
-            majority stake and don't need the bootstrap lottery.
-        randomness: deterministic seed, typically the parent block's
-            randao_mix.  Every node must supply the same bytes.
-        reputation_cap: max effective reputation per candidate.  A
-            6-month-old honest validator stops gaining a selection
-            advantage once they hit the cap.
-
-    Returns the winning entity_id, or None if no eligible candidate
-    exists (empty pool, or all candidates are seeds).
-
-    Algorithm: A-Res weighted reservoir sampling with k=1.  Each
-    candidate gets a log-key `log(u_i) / w_i` where u_i is a pseudo-
-    random uniform derived from `hash(randomness || entity_id)`.
-    Largest log-key (least negative) wins — heavy reputation tilts
-    selection toward high-reputation candidates while leaving every
-    positive-reputation candidate some probability of winning.
+    Behavior identical across legacy + deterministic paths so a
+    backend swap at the activation height is a *math* change only,
+    never an *eligibility* change.
     """
     eligible = [
         (eid, effective_reputation(rep, reputation_cap))
@@ -113,14 +94,47 @@ def select_lottery_winner(
         if eid not in seed_entity_ids
     ]
     if not eligible:
-        return None
-
+        return []
     # If no candidate has positive reputation, fall back to uniform
     # — this is the degenerate "nobody has attested yet" case at
     # genesis + 1 lottery interval.  Keeps the draw working without
     # pathologically biasing to lexicographically-first entity_ids.
     if not any(r > 0 for _, r in eligible):
         eligible = [(eid, 1) for eid, _ in eligible]
+    return eligible
+
+
+def _select_lottery_winner_legacy_float(
+    *,
+    candidates: list[tuple[bytes, int]],
+    seed_entity_ids: frozenset[bytes],
+    randomness: bytes,
+    reputation_cap: int,
+) -> bytes | None:
+    """Pre-Tier-62 lottery selection — legacy float-math A-Res.
+
+    Kept byte-identical to the pre-fix implementation so historical
+    lottery-firing blocks (height < LOTTERY_DETERMINISTIC_HEIGHT)
+    replay byte-identically post-upgrade.
+
+    Algorithm: A-Res weighted reservoir sampling with k=1.  Each
+    candidate gets a log-key ``log(u_i) / w_i`` where u_i is a
+    pseudo-random uniform derived from ``hash(randomness ||
+    entity_id)``.  Largest log-key (least negative) wins.  Tiebreak
+    on entity_id bytes (ascending).
+
+    Cross-platform hazard: ``math.log`` delegates to a libm whose
+    ULP-level rounding is not portable across glibc / musl / MSVC
+    libm / macOS libm.  Two heterogeneous-libc validators on the
+    same chain could pick different winners for the same
+    (randomness, candidates) input.  Tier 62
+    (``LOTTERY_DETERMINISTIC_HEIGHT``) replaces this with a
+    Decimal-based path that is byte-identical everywhere CPython
+    runs.
+    """
+    eligible = _eligible_pool(candidates, seed_entity_ids, reputation_cap)
+    if not eligible:
+        return None
 
     best_key: float = float("-inf")
     best_eid: bytes | None = None
@@ -137,3 +151,100 @@ def select_lottery_winner(
             best_key = key
             best_eid = eid
     return best_eid
+
+
+def _select_lottery_winner_decimal(
+    *,
+    candidates: list[tuple[bytes, int]],
+    seed_entity_ids: frozenset[bytes],
+    randomness: bytes,
+    reputation_cap: int,
+) -> bytes | None:
+    """Post-Tier-62 lottery selection — platform-deterministic A-Res
+    using ``decimal.Decimal.ln()`` at 40-digit precision.
+
+    Algorithm matches the legacy path *shape* (A-Res with k=1, log-
+    key = ln(u_i) / w_i, tiebreak on entity_id ascending) but
+    computes ln() in pure-Python Decimal arithmetic, eliminating the
+    libm-rounding cross-platform risk.  Mirrors the pattern
+    ``attester_committee._deterministic_weighted_sample`` adopted
+    pre-mainnet for the same reason.
+    """
+    eligible = _eligible_pool(candidates, seed_entity_ids, reputation_cap)
+    if not eligible:
+        return None
+
+    best_key: Decimal | None = None
+    best_eid: bytes | None = None
+    with localcontext() as ctx:
+        ctx.prec = 40
+        denom = Decimal(2**64)
+        for eid, w in eligible:
+            if w <= 0:
+                continue
+            h = default_hash(randomness + eid)
+            # u in (0, 1] — match the legacy `+1` / `2**64` mapping
+            # so the post-fork branch produces structurally the same
+            # weighted A-Res distribution as the legacy path, just
+            # with deterministic Decimal arithmetic.
+            hash_int = int.from_bytes(h[:8], "big") + 1
+            u = Decimal(hash_int) / denom
+            key = u.ln() / Decimal(w)
+            # Decimal compare is exact — no floating-point ULP wobble.
+            # Tiebreak on entity_id bytes ascending matches legacy.
+            if (
+                best_key is None
+                or key > best_key
+                or (key == best_key and (best_eid is None or eid < best_eid))
+            ):
+                best_key = key
+                best_eid = eid
+    return best_eid
+
+
+def select_lottery_winner(
+    *,
+    candidates: list[tuple[bytes, int]],
+    seed_entity_ids: frozenset[bytes],
+    randomness: bytes,
+    reputation_cap: int,
+    block_height: int | None = None,
+) -> bytes | None:
+    """Pick the single reputation-weighted winner.
+
+    Arguments:
+        candidates: list of (entity_id, reputation) tuples.  Typically
+            every validator with reputation > 0.  Entities with
+            reputation == 0 are eligible if passed but will only win
+            if every positive-reputation candidate is a seed.
+        seed_entity_ids: excluded from the draw.  Seeds already hold
+            majority stake and don't need the bootstrap lottery.
+        randomness: deterministic seed, typically the parent block's
+            randao_mix.  Every node must supply the same bytes.
+        reputation_cap: max effective reputation per candidate.  A
+            6-month-old honest validator stops gaining a selection
+            advantage once they hit the cap.
+        block_height: the block whose lottery firing is being
+            evaluated.  Selects the legacy float backend (pre-Tier-62)
+            or the deterministic Decimal backend (post-Tier-62).
+            ``None`` routes to legacy, preserving back-compat for
+            tests and tooling that don't model the height gate.
+
+    Returns the winning entity_id, or None if no eligible candidate
+    exists (empty pool, or all candidates are seeds).
+    """
+    if block_height is not None:
+        from messagechain.config import LOTTERY_DETERMINISTIC_HEIGHT
+        if block_height >= LOTTERY_DETERMINISTIC_HEIGHT:
+            return _select_lottery_winner_decimal(
+                candidates=candidates,
+                seed_entity_ids=seed_entity_ids,
+                randomness=randomness,
+                reputation_cap=reputation_cap,
+            )
+    return _select_lottery_winner_legacy_float(
+        candidates=candidates,
+        seed_entity_ids=seed_entity_ids,
+        randomness=randomness,
+        reputation_cap=reputation_cap,
+    )

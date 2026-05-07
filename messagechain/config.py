@@ -6588,6 +6588,37 @@ assert INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT > INACTIVITY_LEAK_STAKE_SCALED_HEI
 )
 
 
+# ``LOTTERY_DETERMINISTIC_HEIGHT``: Tier 62 -- post-activation
+# ``select_lottery_winner`` uses ``decimal.Decimal.ln()`` at fixed
+# precision instead of ``math.log`` (a libm call whose ULP-level
+# rounding is not portable across glibc / musl / MSVC libm / macOS
+# libm).  Pre-fix, two heterogeneous-libc validators on the same
+# chain could disagree on the lottery winner for a given (randao,
+# candidates) input, producing divergent ``balances`` mutations and
+# a silent state-root split on every lottery firing.  The fix
+# mirrors the pattern ``attester_committee.py`` already adopted at
+# pre-mainnet for the same reason.
+#
+# Pre-fork (height < ``LOTTERY_DETERMINISTIC_HEIGHT``) the legacy
+# float-math branch runs unchanged -- byte-for-byte identical to
+# pre-fix code so every historical lottery-firing block replays
+# byte-identically post-upgrade.  Post-fork the deterministic
+# Decimal branch is the rule.
+#
+# Activation height 2350 sits 50 blocks above Tier 61 (height 2300)
+# -- ~8.3h cohort spacing matching the Tier 49-61 pattern.  Two-
+# validator coordinated upgrade.  No new wire format, no new tx
+# kinds, no state-tree changes -- pure consensus-rule swap inside
+# ``select_lottery_winner``.
+LOTTERY_DETERMINISTIC_HEIGHT = 2350  # Tier 62
+
+assert LOTTERY_DETERMINISTIC_HEIGHT > INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT, (
+    "LOTTERY_DETERMINISTIC_HEIGHT must follow Tier 61 -- consecutive "
+    "consensus-rule activations need cohort spacing to keep the "
+    "validator-upgrade window from collapsing"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

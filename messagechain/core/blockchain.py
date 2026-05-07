@@ -6805,6 +6805,13 @@ class Blockchain:
                     seed_entity_ids=self.seed_entity_ids,
                     randomness=parent_randao,
                     reputation_cap=_RC,
+                    # Tier 62 (LOTTERY_DETERMINISTIC_HEIGHT): post-
+                    # activation routes through the Decimal backend
+                    # so heterogeneous-libc validators can no longer
+                    # disagree on the winner.  Pre-fork heights pick
+                    # the legacy float path -- byte-identical to
+                    # pre-fix code so historical replay is exact.
+                    block_height=block_height,
                 )
                 if _winner is not None:
                     sim_balances[_winner] = (
@@ -13294,6 +13301,13 @@ class Blockchain:
                     seed_entity_ids=self.seed_entity_ids,
                     randomness=parent_randao,
                     reputation_cap=REPUTATION_CAP,
+                    # Tier 62 (LOTTERY_DETERMINISTIC_HEIGHT): post-
+                    # activation routes through the Decimal backend
+                    # so heterogeneous-libc validators can no longer
+                    # disagree on the winner.  Pre-fork heights pick
+                    # the legacy float path -- byte-identical to
+                    # pre-fix code so historical replay is exact.
+                    block_height=current_h,
                 )
                 if winner is not None:
                     self.supply.balances[winner] = (
