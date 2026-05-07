@@ -6155,6 +6155,72 @@ assert PROPOSER_CAP_REDISTRIBUTE_HEIGHT > PROPOSER_CAP_HALVING_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 55 — inactivity & coverage leaks consult the honesty curve.
+# ─────────────────────────────────────────────────────────────────────
+# Pre-Tier-55: ``compute_inactivity_penalty`` and
+# ``compute_coverage_penalty`` were pure functions of
+# ``(blocks_since_finality, validator_stake)`` /
+# ``(consecutive_misses, attester_stake)``.  Neither consulted
+# ``slashing_severity``, ``_track_record``, or ``_prior_offenses`` --
+# the entire Tier-23/24/51 honesty-curve machinery every other
+# slashing path uses.
+#
+# Worst case: a fork-emergency auto-halt (network/node.py correctly
+# halts attestation/finality voting on the minority side -- the right
+# thing) puts honest, long-tenured validators into the leak-eligible
+# set the moment finality stalls past
+# INACTIVITY_LEAK_ACTIVATION_THRESHOLD.  The validator is doing
+# exactly what the protocol asks; the chain bleeds their stake
+# quadratically as punishment, identical to a withholding cartel's
+# bleed.  CLAUDE.md anchor at risk: "long-tenured, high-volume,
+# high-honesty operators get fractional penalties at worst" -- the
+# inactivity leak silently exempted itself.
+#
+# Tier 55 routes both penalty paths through a relief multiplier
+# (``honest_history_relief_multiplier_bps``) that mirrors the
+# AMBIGUOUS-path relief in ``slashing_severity``:
+#
+#   * Validator with prior offenses: NO relief (10000 bps = full
+#     nominal penalty).  Repeat offenders pay full price.
+#   * Validator with track_record < HONEST_TRACK_THRESHOLD:
+#     NO relief.  Fresh validators carry less benefit-of-the-doubt.
+#   * Long-tenured high-honesty validator with no priors: relief
+#     multiplier capped at FLOOR_NUM/FLOOR_DEN = 1/5 = 2000 bps =
+#     20% of nominal penalty.
+#
+# Cartel-defense behavior is preserved: cartel members are by
+# definition NOT long-tenured-high-honesty (the curve reads
+# proposer_sig_counts + reputation, both of which a cartel can't
+# forge without doing tons of honest work first), so a 40% withholding
+# cartel still gets the full quadratic bleed.  The relief targets
+# the honest minority that ends up on the wrong side of a partition
+# or fork-emergency halt -- exactly the operators the
+# honest-operator-insurance anchor is for.
+#
+# Pure relief-multiplier post-pass; pre-fork blocks replay byte-
+# identically because the legacy 4-arg call shape stays the default
+# (``current_height=None, blockchain=None`` ⇒ no relief, byte-for-
+# byte legacy bleed).  Activation height 2000 sits above Tier 54
+# (DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT = 1950) with ~50 blocks ≈
+# 8.3h cohort spacing at 600s blocks, matching the spacing pattern
+# Tiers 49-54 used.  Surfaced by audit r30 top-3 #2.
+INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT = 2000  # Tier 55
+
+assert INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT > DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT, (
+    "INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT must follow Tier 54 -- "
+    "operators upgrade through Tier 54 before this consensus-rule "
+    "change binds, and the cohort spacing keeps two consecutive "
+    "consensus-rule changes from collapsing into a single activation "
+    "window"
+)
+assert INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT > HONESTY_CURVE_HEIGHT, (
+    "INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT must follow Tier 23 -- the "
+    "honesty-curve infrastructure activates at Tier 23; the "
+    "inactivity-leak path can only consult it after that activates"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

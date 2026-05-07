@@ -7051,8 +7051,17 @@ class Blockchain:
             }
             _inactive = _giv(_expected, _actual)
             if _inactive:
+                # Tier 55: thread current_height (= the block being
+                # simulated, self.height + 1 by the time
+                # compute_post_state_root runs at apply-time) and self
+                # so the sim mirrors the apply-time relief multiplier.
+                # Without these the sim path bleeds full nominal while
+                # the apply path bleeds relief-multiplied → state-root
+                # divergence on every long-tenured-honest validator.
                 _ail(sim_staked, sim_blocks_since_fin, _inactive,
-                     min_stake=VALIDATOR_MIN_STAKE)
+                     min_stake=VALIDATOR_MIN_STAKE,
+                     current_height=self.height + 1,
+                     blockchain=self)
 
         # Simulate censorship-evidence pipeline: submitter pays fee,
         # pending entries whose tx landed above get voided, then any
@@ -7739,7 +7748,9 @@ class Blockchain:
             if sim_active:
                 # apply_coverage_leak mutates `staked` AND
                 # `misses_counter` in place.  Use a local shadow so
-                # the live counter dict is untouched.
+                # the live counter dict is untouched.  Tier 55: thread
+                # current_height + self so the sim mirrors the
+                # apply-time honest-history relief multiplier.
                 sim_misses = dict(self.attester_coverage_misses)
                 _apply_cov_leak(
                     staked=sim_staked,
@@ -7747,6 +7758,8 @@ class Blockchain:
                     active_attesters=sim_active,
                     inclusion_list=inclusion_list,
                     min_stake=_COV_MIN_STAKE,
+                    current_height=block_height,
+                    blockchain=self,
                 )
 
         # ── Unstake-release: mirror apply ─────────────────────────
@@ -13088,11 +13101,17 @@ class Blockchain:
             actual = {att.validator_id for att in block.attestations}
             inactive = get_inactive_validators(expected, actual)
             if inactive:
+                # Tier 55: thread current_height + self into the leak so
+                # the post-fork honest-history relief multiplier scales
+                # per-validator nominal penalty.  Pre-fork: defaults
+                # produce byte-identical legacy bleed.
                 total_burned, deactivated = apply_inactivity_leak(
                     self.supply.staked,
                     self.blocks_since_last_finalization,
                     inactive,
                     min_stake=VALIDATOR_MIN_STAKE,
+                    current_height=block.header.block_number,
+                    blockchain=self,
                 )
                 if total_burned > 0:
                     self.supply.total_supply -= total_burned
@@ -13304,12 +13323,18 @@ class Blockchain:
         if not active:
             return
 
+        # Tier 55: thread current_height + self into the leak so the
+        # post-fork honest-history relief multiplier scales per-attester
+        # nominal penalty.  Pre-fork: defaults produce byte-identical
+        # legacy bleed.
         total_burned, deactivated = apply_coverage_leak(
             staked=self.supply.staked,
             misses_counter=self.attester_coverage_misses,
             active_attesters=active,
             inclusion_list=inclusion_list,
             min_stake=VALIDATOR_MIN_STAKE,
+            current_height=block_number,
+            blockchain=self,
         )
         if total_burned > 0:
             self.supply.total_supply -= total_burned

@@ -398,3 +398,74 @@ def _clamp_pct(v: int, lo: int, hi: int) -> int:
     if v > hi:
         return hi
     return v
+
+
+def honest_history_relief_multiplier_bps(
+    blockchain: "Blockchain",
+    validator_id: bytes,
+) -> int:
+    """Relief multiplier in basis points (0..10000) for non-slash
+    stake-burn paths (inactivity leak, coverage leak).
+
+    10000 = full nominal penalty (no relief).  Smaller values = relief
+    proportional to honest track record.
+
+    Mirrors the AMBIGUOUS-path relief in :func:`slashing_severity` --
+    same chain-state inputs (``proposer_sig_counts``, ``reputation``,
+    ``slash_offense_counts``), same shape (no relief on prior >= 1, no
+    relief on under-tenure validators, capped at FLOOR_NUM/FLOOR_DEN
+    for long-tenured high-honesty operators).  Pure function,
+    consensus-deterministic.
+
+    Used by Tier 55 (``INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT``):
+    inactivity & coverage leaks were pre-fork unweighted, bleeding
+    long-tenured honest operators identically to withholding cartels
+    -- a direct violation of the honest-operator-insurance anchor.
+    Cartel-defense behavior is preserved: cartel members are by
+    definition NOT long-tenured-high-honesty (the curve reads
+    *accepted* blocks + attestations, both of which a cartel can't
+    forge without doing real honest work first), so a withholding
+    coalition still gets the full quadratic bleed.
+    """
+    from messagechain.config import (
+        HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN,
+        HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM,
+        HONESTY_CURVE_HONEST_TRACK_THRESHOLD,
+    )
+
+    track = _track_record(blockchain, validator_id)
+    prior = _prior_offenses(blockchain, validator_id)
+
+    # Repeat offenders: no relief.  Same gate as slashing_severity's
+    # UNAMBIGUOUS-prior=>100% rule -- a validator who has already been
+    # slashed pays full nominal on subsequent inactivity/coverage
+    # bleeds.
+    if prior >= 1:
+        return 10_000
+
+    # Under-tenure validators: no relief.  Same gate as
+    # slashing_severity's "fresh validator with no track record =>
+    # treat as deliberate" rule.  Fresh validators carry less
+    # benefit-of-the-doubt.
+    if track < HONESTY_CURVE_HONEST_TRACK_THRESHOLD:
+        return 10_000
+
+    # Long-tenured high-honesty operator: relief = max(FLOOR_NUM/
+    # FLOOR_DEN, THRESHOLD/track), converted to bps.  As track grows,
+    # THRESHOLD/track shrinks; the floor binds at FLOOR_NUM/FLOOR_DEN.
+    # Cross-multiply comparison keeps the path integer-only for
+    # byte-stable consensus determinism (no IEEE-754 rounding).
+    if (
+        HONESTY_CURVE_HONEST_TRACK_THRESHOLD
+        * HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+        <= HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM * track
+    ):
+        # Floor binds.
+        return (
+            HONESTY_CURVE_HONEST_TRACK_FLOOR_NUM
+            * 10_000
+            // HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN
+        )
+    # Sliding region between threshold and floor: relief shrinks as
+    # track grows.
+    return HONESTY_CURVE_HONEST_TRACK_THRESHOLD * 10_000 // track

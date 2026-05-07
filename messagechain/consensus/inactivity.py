@@ -114,17 +114,61 @@ def get_inactive_validators(
     return expected_attesters - actual_attesters
 
 
+def _apply_honesty_curve_relief(
+    nominal_penalty: int,
+    validator_id: bytes,
+    current_height: int | None,
+    blockchain,
+) -> int:
+    """Tier 55: scale the per-validator nominal penalty by an honest-
+    history relief multiplier when both the chain has activated the
+    fork AND the caller threaded a blockchain reference for the
+    honesty-curve helpers to consult.
+
+    Pre-fork (current_height < INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT) or
+    legacy callers (blockchain is None): byte-identical legacy bleed
+    (return ``nominal_penalty`` untouched).
+
+    Post-fork: relief multiplier is :func:`honest_history_relief_
+    multiplier_bps` -- 10000 bps for fresh validators or repeat
+    offenders (full nominal), down to the FLOOR_NUM/FLOOR_DEN cap for
+    long-tenured high-honesty operators.  CLAUDE.md anchor: long-
+    tenured operators get fractional penalties at worst.
+    """
+    if blockchain is None or current_height is None:
+        return nominal_penalty
+    from messagechain.config import INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT
+    if current_height < INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT:
+        return nominal_penalty
+    from messagechain.consensus.honesty_curve import (
+        honest_history_relief_multiplier_bps,
+    )
+    bps = honest_history_relief_multiplier_bps(blockchain, validator_id)
+    return nominal_penalty * bps // 10_000
+
+
 def apply_inactivity_leak(
     staked: dict[bytes, int],
     blocks_since_finality: int,
     inactive_validators: set[bytes],
     min_stake: int = 0,
+    *,
+    current_height: int | None = None,
+    blockchain=None,
 ) -> tuple[int, set[bytes]]:
     """Apply inactivity penalties to inactive validators.
 
     Mutates `staked` in place.  Burns stake (reduces values) for each
     inactive validator.  Does NOT apply penalties to validators already
     below min_stake — they should be deactivated instead.
+
+    `current_height` and `blockchain`: optional Tier-55 hooks.  When
+    both are provided AND the chain has activated
+    ``INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT``, the per-validator
+    nominal penalty is scaled by an honest-history relief multiplier
+    routed through the same machinery as ``slashing_severity``.  Pre-
+    fork or legacy callers (defaults None): byte-identical legacy
+    bleed -- the leak fires at full quadratic rate as before.
 
     Returns:
         (total_burned, deactivated) — total tokens burned and the set
@@ -141,8 +185,14 @@ def apply_inactivity_leak(
         if current_stake <= min_stake:
             continue
 
-        penalty = compute_inactivity_penalty(
+        nominal = compute_inactivity_penalty(
             blocks_since_finality, current_stake,
+        )
+        if nominal <= 0:
+            continue
+
+        penalty = _apply_honesty_curve_relief(
+            nominal, vid, current_height, blockchain,
         )
         if penalty <= 0:
             continue
@@ -266,6 +316,9 @@ def apply_coverage_leak(
     active_attesters: set[bytes],
     inclusion_list,
     min_stake: int = 0,
+    *,
+    current_height: int | None = None,
+    blockchain=None,
 ) -> tuple[int, set[bytes]]:
     """Update per-attester coverage-miss counters from this inclusion
     list and burn stake from any whose counter exceeds the activation
@@ -279,6 +332,13 @@ def apply_coverage_leak(
     non-empty list actually forms count toward the
     consecutive-miss tally.  Cycles without a list don't tell us
     anything about who saw what, so we don't punish or reward.
+
+    `current_height` and `blockchain`: optional Tier-55 hooks.  When
+    both are provided AND the chain has activated
+    ``INACTIVITY_LEAK_HONESTY_CURVE_HEIGHT``, per-attester nominal
+    penalty is scaled by an honest-history relief multiplier (same
+    machinery as ``slashing_severity``).  Pre-fork or legacy callers:
+    byte-identical legacy bleed.
 
     Returns (total_burned, deactivated):
       * total_burned: sum of tokens burned this call.
@@ -315,7 +375,12 @@ def apply_coverage_leak(
             continue
         if current_stake <= min_stake:
             continue
-        penalty = compute_coverage_penalty(current_stake, consecutive)
+        nominal = compute_coverage_penalty(current_stake, consecutive)
+        if nominal <= 0:
+            continue
+        penalty = _apply_honesty_curve_relief(
+            nominal, vid, current_height, blockchain,
+        )
         if penalty <= 0:
             continue
         new_stake = max(0, current_stake - penalty)
