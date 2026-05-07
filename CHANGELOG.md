@@ -4,6 +4,202 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.64.0] — 2026-05-07
+
+Minor release.  Audit round 33 top-3 ships: one cryptographic-
+soundness fix on the consensus-vote admission gates (cross-pool
+WOTS+ leaf check missing on ``mempool.{finality_pool, slash_pool,
+censorship_evidence_pool}`` and on the three gossip-admit handlers
+``_handle_announce_{finality_vote, slash, attestation}``); one new
+hard fork (Tier 61 switches the inactivity-leak per-block formula
+from "floor of per-block-real" to "difference of cumulative-floors"
+so the ~2% target drain materialises for every stake size --
+pre-fix the Tier 59 stake-scaled formula integer-truncated to zero
+for any validator with stake < ~1M tokens, disabling cartel defense
+for the rank-and-file validator set); and one operator-side fix
+(``messagechain doctor`` now checks the leaf-index file's presence
++ freshness against the chaindb watermark, so the README's #1
+catastrophic footgun -- restoring on a fresh disk from
+keyfile-only backup, then starting the daemon and 100%-self-
+slashing on the first sign -- is detected before the daemon boots
+instead of going GREEN through the diagnostic).  No new wire
+format, no new top-line CLI surface.
+
+### Added
+
+  * **Tier 61 -- inactivity-leak cumulative-floor formula (hard
+    fork, activation height 2300).**  Pre-fix the Tier 59
+    stake-scaled per-block formula
+    ``stake * BASE * blocks_since_finality² // Q`` with
+    ``Q = 16_777_216_000_000`` integer-truncated to zero for any
+    validator with stake < ~1M tokens.  Concrete arithmetic at
+    stake=10K, blocks=10000:
+    ``10_000 * 1 * 10⁸ // 1.68e13 = 0``.  Cumulative drain over a
+    full 10000-block stall is the SUM of per-block penalties; if
+    every per-block term floors to 0, the SUM is also 0.  Net
+    effect: the inactivity leak fired correctly only for whales
+    (stake >= ~1M); the rank-and-file validator set
+    (stake = 10K..100K -- everyone post-FAUCET-DRIP at the
+    ``VALIDATOR_MIN_STAKE_POST_RAISE`` floor of 10K through every
+    operator in the bootstrap arc) experienced ZERO drain on
+    arbitrarily long partitions.
+
+    CLAUDE.md anchor at risk: "censorship resistance is a
+    *collective decision*" -- a 1/3-stake cartel composed of
+    small-stake validators withholds attestations indefinitely
+    without economic counter-pressure.  The leak is the
+    slashing-bearing path that makes coordinated suppression cost
+    real money; for small-stake cartels under Tier 59 it cost
+    nothing.  CHANGELOG claim "cumulative drain ~2% of stake
+    regardless of stake size" was mathematically correct in real
+    arithmetic, but the integer-arithmetic implementation lost the
+    small-stake half of the calibration target.
+
+    Tier 61 fix is stateless and preserves the calibration
+    constants: compute the per-block penalty as the integer
+    DIFFERENCE of cumulative-floor values rather than the FLOOR of
+    per-block-real::
+
+        cum(k) = stake * BASE * (k * (k+1) * (2k+1) / 6) // Q
+        penalty_at_block_k = cum(k) - cum(k-1)
+
+    The cumulative-floor trick integer-truncates at the
+    *cumulative* level (which crosses 1-token boundaries even for
+    small stakes over realistic partitions) instead of at the
+    per-block level (which floored to 0 for stake<~1M).
+    Verification arithmetic over a 10000-block stall:
+
+      * stake=10K:   cum(10000) ≈ 198 tokens (~2% drain).
+      * stake=1M:    cum(10000) ≈ 19_842 tokens (~2%).
+      * stake=100M:  cum(10000) ≈ 1_984_226 tokens (~2%).
+
+    The ``min(penalty, validator_stake)`` cap still applies
+    per-block.  Cartel-defense behaviour preserved: a withholding
+    coalition pays the same FRACTION of stake per partition window
+    as a small honest validator, but in absolute tokens the
+    cartel's drain is much larger.  Tier 55 honesty-curve relief
+    multiplier still wraps the new shape unchanged.  No new wire
+    format, no state-tree changes, no new chaindb table -- pure
+    function-shape change inside ``compute_inactivity_penalty``
+    plus a new private helper ``_cumulative_inactivity_drain``.
+
+    Activation height 2300 sits 50 blocks above Tier 60
+    (``DORMANCY_TARGET_RETUNE_HEIGHT = 2250``) -- ~8.3h cohort
+    spacing at 600s blocks, matching the Tier 49-60 pattern.
+    Two-validator coordinated upgrade.  Pre-fork (height <
+    ``INACTIVITY_LEAK_FRACTIONAL_DEBT_HEIGHT``) the legacy Tier 59
+    per-block formula runs unchanged so historical blocks at
+    heights [Tier 59, Tier 61) replay byte-identically.  8
+    regression tests in
+    ``tests/test_audit_r33_inactivity_leak_cumulative_tier61.py``.
+    Surfaced by audit r33 top-3 #2.  (ea35aba)
+
+### Fixed
+
+  * **Cross-pool WOTS+ leaf check missing on consensus-vote pools
+    and gossip-admit handlers.**  Pre-fix
+    ``Server._check_leaf_across_all_pools`` scanned every server-
+    side pool plus ``mempool.{react_pool, pending}``, but NOT
+    ``mempool.{finality_pool, slash_pool, censorship_evidence_pool}``.
+    Plus the three gossip handlers
+    ``_handle_announce_{finality_vote, slash, attestation}`` never
+    called the cross-pool sweep before pooling/processing.
+
+    Concrete bite: validator V signs a finality vote at leaf=N
+    every FINALITY_INTERVAL blocks.  V's local mempool also holds
+    a pending message tx at leaf=N (stale watermark, wallet bug,
+    race during a restart).  ``mempool.add_finality_vote`` admits
+    the vote because the finality_pool is keyed by consensus_hash,
+    not by (signer, leaf).  Both signed objects now carry the same
+    WOTS+ leaf; the two publications leak enough one-time-key
+    preimages for any observer to forge an arbitrary signature at
+    that leaf -- including a fresh revoke, full-balance unstake,
+    or set-authority rebind transferring authority to the
+    attacker.  Validators emit finality votes every cycle so this
+    trips strictly more often than the audit r31 user-tx case.
+
+    Same defect class as audit r31 #1 (cross-pool admission gap on
+    ``mempool.pending``) and r12 (``react_pool``), this time on
+    the consensus-vote side.  Three pieces, all source-pinned:
+
+      (1) ``_tx_signer_pubkey`` resolves ``validator_id``
+      (Attestation) and ``signer_entity_id`` (FinalityVote) in
+      addition to the existing
+      ``entity_id / proposer_id / voter_id / submitter_id``
+      fields, so the signer-keyed dedupe identifies the signing
+      pubkey for every pooled object kind.
+
+      (2) ``_check_leaf_across_all_pools`` extended to scan
+      ``mempool.finality_pool``, ``mempool.slash_pool``, and
+      ``mempool.censorship_evidence_pool`` in BOTH the signer-
+      keyed (default) and entity-id-keyed (legacy call shape)
+      branches.
+
+      (3) The three consensus-vote gossip handlers call
+      ``_check_leaf_across_all_pools(...)`` BEFORE the
+      ``mempool.add_*`` / ``finality.add_attestation`` step.  On
+      collision the source peer is ban-scored
+      (``OFFENSE_INVALID_TX``) and the object is dropped without
+      pooling or relay.  Existing ``observe_finality_vote`` and
+      ``equivocation_watcher.observe_attestation`` calls fire
+      BEFORE the cross-pool gate so the fork-emergency /
+      equivocation detectors still see the gossip as evidence.
+
+    Soft-fix: admission-side only, no consensus rule change at the
+    block validator.  Block-level dedupe still catches anything
+    that slips through admission, so this is purely a tightening
+    of the admission gate.  No new tier, no new wire format.  10
+    regression tests in
+    ``tests/test_audit_r33_cross_pool_consensus_votes.py``.
+    Surfaced by audit r33 top-3 #1.  (96aa6da)
+
+  * **`messagechain doctor` surfaces leaf-index missing/stale
+    state before validator boot.**  Pre-fix ``run_doctor`` checks:
+    python, data-dir, keyfile, disk, two ports, seeds, optional
+    systemd timers -- NO leaf-index check.  The README warns
+    operators in prose that a keyfile-without-leaf-index restore
+    is a 100% slash event ("Operating a live validator -> Back up
+    the keyfile AND the leaf-index files"), but the diagnostic
+    command operators are told to trust silently approved the
+    fatal config.
+
+    Concrete bite: operator restores on a fresh disk from
+    "keyfile only" backup.  Runs ``messagechain doctor`` -- GREEN.
+    Starts the validator; the chaindb gets rebuilt from peer sync,
+    but the leaf-index cursor starts at 0.  The first sign re-uses
+    leaf 0, publishing a second signature at a leaf the chain's
+    leaf_watermark already records as burned.  Equivocation
+    evidence lands; 100% stake slash.
+
+    CLAUDE.md anchor at risk: "honest operators are insured
+    against accidents... when an honest node IS slashed, the burn
+    is a small *fraction* of stake, not a wipe."  100% slash on
+    what is structurally a backup mistake is a wipe; the chain
+    could surface the misconfig before the slash fires.
+
+    Fix adds a new ``_check_leaf_index(data_dir, entity_id_hex,
+    chaindb_open_fn=None)`` helper to the doctor checklist with
+    this state machine: data_dir or entity_id_hex unset -> WARN;
+    chain.db absent -> GREEN regardless of cursor; chain.db
+    present with leaf_watermark[entity]==0 -> GREEN; chain.db
+    present with leaf_watermark[entity]>0 AND no leaf_index.json
+    -> RED (RESTORE WITHOUT CURSOR); chain.db present with
+    leaf_watermark[entity]>0 AND leaf_index.json cursor < watermark
+    -> RED (STALE CURSOR); chain.db present with
+    leaf_watermark[entity]>0 AND leaf_index.json cursor >= watermark
+    -> GREEN.  Database access is via injectable
+    ``chaindb_open_fn`` so unit tests can synthesize a minimal
+    sqlite db; real-call default opens chain.db read-only via
+    ``sqlite3.connect("file:...?mode=ro")`` so a running daemon's
+    exclusive lock is uncontested -- a busy daemon falls into the
+    YELLOW "chaindb read failed" branch rather than RED.
+
+    Soft-fix: doctor-only, no consensus rule change, no fork.  The
+    catastrophic config is detected before the daemon is started,
+    so the slash never fires.  9 regression tests in
+    ``tests/test_audit_r33_doctor_leaf_index.py``.  Surfaced by
+    audit r33 top-3 #3.  (5ddb425)
+
 ## [1.63.0] — 2026-05-07
 
 Minor release.  Audit round 32 top-3 ships: three new hard forks,
