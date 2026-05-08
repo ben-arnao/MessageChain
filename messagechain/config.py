@@ -6820,6 +6820,48 @@ assert (
 )
 
 
+# ``ATTESTER_COMMITTEE_DECIMAL_HEIGHT``: Tier 67 -- post-activation
+# the attester-committee weighted-reservoir sampler keeps the per-
+# candidate priority as ``decimal.Decimal`` end-to-end and sorts on
+# Decimal directly, eliminating the cross-platform IEEE-754 rank-
+# flip risk introduced by the legacy ``float(u.ln() / Decimal(w))``
+# cast at the sort key.  Decimal.ln IS deterministic (Tier 62
+# established this for ``select_lottery_winner``), but the cast back
+# to float at the sort key reintroduces an IEEE-754 ULP-level
+# rounding hazard -- two near-equal log-keys can rank-flip on
+# different libc / different CPython builds, producing different
+# attester sets on different platforms.  Committee selection is
+# consensus-critical (rewards land in ``mint_block_reward`` and are
+# committed in ``state_root``), so divergent committees mean
+# divergent state-roots -- a chain-wide partition class.
+#
+# Today's homogeneous-Linux-glibc mainnet hides the bug; the moment
+# a third validator joins on different libc / arch / CPython build,
+# partition risk goes live.  Same bug class, same fix shape as Tier
+# 62 (``LOTTERY_DETERMINISTIC_HEIGHT``) -- pure consensus-rule swap
+# inside the sampler, no new wire format, no new tx kinds, no
+# state-tree changes.
+#
+# Pre-fork (height < ``ATTESTER_COMMITTEE_DECIMAL_HEIGHT``) the
+# legacy float-cast branch runs unchanged so historical blocks
+# replay byte-identically.  Post-fork the deterministic Decimal
+# branch is the consensus rule.
+#
+# Activation height 2600 sits 50 blocks above Tier 66 (height 2550)
+# -- ~8.3h cohort spacing matching the Tier 49-66 pattern.  Two-
+# validator coordinated upgrade.
+ATTESTER_COMMITTEE_DECIMAL_HEIGHT = 2600  # Tier 67
+
+assert (
+    ATTESTER_COMMITTEE_DECIMAL_HEIGHT
+    > VOTER_REWARD_ADAPTIVE_CAP_HEIGHT
+), (
+    "ATTESTER_COMMITTEE_DECIMAL_HEIGHT must follow Tier 66 -- "
+    "consecutive consensus-rule activations need cohort spacing to "
+    "keep the validator-upgrade window from collapsing"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

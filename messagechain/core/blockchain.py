@@ -6600,6 +6600,7 @@ class Blockchain:
             bootstrap_progress=self.bootstrap_progress,
             randomness=parent_randao,
             committee_size=committee_size,
+            block_height=block_height,
         ) if attester_candidates else []
 
         if attester_committee:
@@ -13221,6 +13222,7 @@ class Blockchain:
             bootstrap_progress=self.bootstrap_progress,
             randomness=parent_randao,
             committee_size=committee_size,
+            block_height=block.header.block_number,
         )
 
         # Mint block reward: proposer share + committee slots

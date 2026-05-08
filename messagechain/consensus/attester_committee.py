@@ -107,31 +107,24 @@ def weights_for_progress(
     return weights
 
 
-def _deterministic_weighted_sample(
+def _deterministic_weighted_sample_legacy_float(
     items: list[bytes],
     weights: list[float],
     k: int,
     randomness: bytes,
 ) -> list[bytes]:
-    """Deterministic weighted sampling without replacement (A-Res).
+    """Pre-Tier-67 attester-committee sampler -- legacy float-cast A-Res.
 
-    Efraimidis-Spirakis weighted reservoir sampling, made deterministic
-    by seeding the per-item "uniform" from (randomness || item) rather
-    than drawing live randomness.  Every node computes the same keys
-    for the same inputs, so the committee is consensus-safe.
+    Kept byte-identical to the pre-fix implementation so historical
+    blocks (height < ``ATTESTER_COMMITTEE_DECIMAL_HEIGHT``) replay
+    byte-for-byte post-upgrade.
 
-    Algorithm: key_i = u_i^(1/w_i), select TOP-k by key.  Larger
-    weights push keys closer to 1; lighter items cluster near 0.
-    Selecting the k largest keys yields weighted sampling without
-    replacement — heavy items win proportionally more often.
-
-    Works in log-space to avoid precision issues: log(key_i) =
-    log(u_i) / w_i.  Since log(u_i) < 0 and w_i > 0, log-keys are
-    all negative; heaviest items have log-keys closest to 0 (least
-    negative), so we take the top-k by descending order.
-
-    Zero-weight items get log-key = -inf — selected only when there
-    are fewer than k eligible items to fill.
+    Cross-platform hazard: priorities are computed as Decimal but
+    immediately collapsed back to ``float`` before the sort key.
+    Two near-equal log-keys can rank-flip on different libc /
+    different CPython builds.  Tier 67 keeps the priority as Decimal
+    end-to-end, eliminating the hazard.  Same shape as Tier 62 for
+    the lottery.
     """
     if k >= len(items):
         # All items selected regardless of weight; still sort for
@@ -150,11 +143,10 @@ def _deterministic_weighted_sample(
                 # below every positive-weight item in descending order.
                 pri = float("-inf")
             else:
-                # Use Decimal.ln() instead of math.log() for platform-independent
-                # results.  math.log delegates to C libm which can differ at the
-                # ULP level across platforms/libc implementations — a consensus
-                # split risk.  Decimal with 40-digit precision is deterministic
-                # everywhere Python runs.
+                # Pre-Tier-67: Decimal.ln eliminates the libm hazard,
+                # but the float cast at the sort key reintroduces the
+                # IEEE-754 ULP rank-flip risk.  Tier 67 drops the
+                # cast.
                 u = Decimal(hash_int) / Decimal(2**64)
                 pri = float(u.ln() / Decimal(w))
             priorities.append((pri, item))
@@ -165,6 +157,82 @@ def _deterministic_weighted_sample(
     return [item for _, item in priorities[:k]]
 
 
+def _deterministic_weighted_sample_decimal(
+    items: list[bytes],
+    weights: list[float],
+    k: int,
+    randomness: bytes,
+) -> list[bytes]:
+    """Post-Tier-67 attester-committee sampler -- Decimal end-to-end.
+
+    Same A-Res algorithm shape as the legacy path (Efraimidis-
+    Spirakis weighted reservoir sampling, log-key = ln(u_i) / w_i,
+    seeded from hash(randomness || item)) but the per-candidate
+    priority stays as ``decimal.Decimal`` end-to-end and the sort
+    compares Decimals directly.  Decimal compare is exact, so
+    near-equal log-keys cannot rank-flip on cross-platform IEEE-754
+    rounding -- the consensus-split hazard the legacy float-cast
+    introduces is closed.
+
+    Mirrors the pattern ``select_lottery_winner`` adopted in Tier 62
+    for the same reason.
+    """
+    if k >= len(items):
+        return sorted(items)
+
+    # Use a Decimal sentinel for zero-weight items so the comparator
+    # remains a single homogeneous Decimal sort.  ``Decimal('-Inf')``
+    # is exact and below every finite Decimal.
+    NEG_INF = Decimal("-Infinity")
+
+    priorities: list[tuple[Decimal, bytes]] = []
+    with localcontext() as ctx:
+        ctx.prec = 40
+        denom = Decimal(2**64)
+        for item, w in zip(items, weights):
+            h = default_hash(randomness + item)
+            hash_int = int.from_bytes(h[:8], "big") + 1
+            if w <= 0:
+                pri: Decimal = NEG_INF
+            else:
+                u = Decimal(hash_int) / denom
+                pri = u.ln() / Decimal(w)
+            priorities.append((pri, item))
+
+    # Decimal supports exact comparison; sort descending by priority,
+    # tiebreak ascending by item bytes.  No float collapse anywhere
+    # on the sort-key path -- this is what Tier 67 closes.
+    priorities.sort(key=lambda p: (-p[0], p[1]))
+    return [item for _, item in priorities[:k]]
+
+
+def _deterministic_weighted_sample(
+    items: list[bytes],
+    weights: list[float],
+    k: int,
+    randomness: bytes,
+    block_height: int | None = None,
+) -> list[bytes]:
+    """Height-gated dispatcher between the legacy float-cast branch
+    (pre-Tier-67) and the Decimal end-to-end branch (post-Tier-67).
+
+    ``block_height=None`` routes to the legacy branch, preserving
+    back-compat for tests and tooling that don't model the height
+    gate.  Consensus call sites in ``core/blockchain.py`` MUST pass
+    ``block_height=`` so the Tier 67 fork actually activates at the
+    configured height.
+    """
+    if block_height is not None:
+        from messagechain.config import ATTESTER_COMMITTEE_DECIMAL_HEIGHT
+        if block_height >= ATTESTER_COMMITTEE_DECIMAL_HEIGHT:
+            return _deterministic_weighted_sample_decimal(
+                items, weights, k, randomness,
+            )
+    return _deterministic_weighted_sample_legacy_float(
+        items, weights, k, randomness,
+    )
+
+
 def select_attester_committee(
     *,
     candidates: list[tuple[bytes, int]],
@@ -172,6 +240,7 @@ def select_attester_committee(
     bootstrap_progress: float,
     randomness: bytes,
     committee_size: int,
+    block_height: int | None = None,
 ) -> list[bytes]:
     """Select up to `committee_size` attesters to reward for one block.
 
@@ -192,6 +261,12 @@ def select_attester_committee(
         committee_size: maximum K to select.  Callers typically set
             this to the attester_pool token count (so each slot pays
             ATTESTER_REWARD_PER_SLOT = 1 token).
+        block_height: the block whose committee is being selected.
+            Selects the legacy float-cast backend (pre-Tier-67) or
+            the Decimal end-to-end backend (post-Tier-67).  ``None``
+            routes to legacy, preserving back-compat for tests and
+            tooling that don't model the height gate.  Consensus
+            call sites in ``core/blockchain.py`` MUST pass it.
 
     Returns a list of entity_ids, sorted canonically.  Length is
     min(len(eligible_candidates), committee_size).
@@ -227,5 +302,6 @@ def select_attester_committee(
     weights = [w * t for w, t in zip(base_weights, tilt)]
     picked = _deterministic_weighted_sample(
         items, weights, committee_size, randomness,
+        block_height=block_height,
     )
     return sorted(picked)
