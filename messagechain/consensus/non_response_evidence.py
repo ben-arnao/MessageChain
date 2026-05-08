@@ -45,7 +45,7 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Iterable, Mapping, Union
 
 from messagechain.config import (
     CHAIN_ID, HASH_ALGO, MIN_FEE, SIG_VERSION_CURRENT,
@@ -333,25 +333,49 @@ def sign_non_response_evidence(
     )
 
 
+_PubkeyOrCandidates = Union[bytes, Iterable[bytes]]
+
+
+def _normalise_candidates(pk_or_candidates: _PubkeyOrCandidates) -> list[bytes]:
+    """Accept either a single 32-byte pubkey or an iterable of
+    candidates and return a list of bytes.  Used by the verifier to
+    accept both the legacy single-key shape and the multi-key
+    candidate-set shape (audit r38).
+    """
+    if isinstance(pk_or_candidates, (bytes, bytearray)):
+        return [bytes(pk_or_candidates)]
+    return [bytes(pk) for pk in pk_or_candidates]
+
+
 def verify_non_response_evidence_tx(
     tx: NonResponseEvidenceTx,
     submitter_public_key: bytes,
     *,
-    witness_public_keys: Mapping[bytes, bytes],
-    client_public_key: bytes,
+    witness_public_keys: Mapping[bytes, _PubkeyOrCandidates],
+    client_public_key: _PubkeyOrCandidates,
 ) -> tuple[bool, str]:
     """Stateless-ish verification of a NonResponseEvidenceTx.
 
     Checks (cheap-first):
       * fee >= MIN_FEE
       * client signature on the embedded SubmissionRequest verifies
-        under client_public_key
+        under SOME candidate in `client_public_key`
       * every WitnessObservation binds to tx.request.request_hash
       * no duplicate witness_id across observations
-      * every WitnessObservation signature verifies under the
-        corresponding entry in witness_public_keys
+      * every WitnessObservation signature verifies under SOME
+        candidate in the corresponding `witness_public_keys` entry
       * len(observations) >= WITNESS_QUORUM (after duplicate filter)
       * submitter signature verifies under submitter_public_key
+
+    `client_public_key` and each value in `witness_public_keys` may
+    be either a single 32-byte pubkey (legacy shape) OR an iterable
+    of candidate pubkeys (audit r38 multi-key shape).  Caller is
+    expected to pass `key_history + current` for any principal that
+    may have rotated between sign-time and evidence admission.  Each
+    candidate is a key the principal legitimately published so
+    matching ANY candidate is proof the principal produced the
+    signature -- attacker cannot exploit the candidate set to forge
+    evidence.
 
     Active-set membership is NOT checked here — that's a chain-state
     decision and lives in NonResponseEvidenceProcessor.process.
@@ -359,10 +383,21 @@ def verify_non_response_evidence_tx(
     if tx.fee < MIN_FEE:
         return False, f"fee below MIN_FEE ({MIN_FEE})"
 
-    # Client signature on the request.
-    ok, reason = verify_submission_request(tx.request, client_public_key)
-    if not ok:
-        return False, f"invalid request: {reason}"
+    # Client signature on the request -- walk the candidate set,
+    # admit on the first match.
+    client_candidates = _normalise_candidates(client_public_key)
+    if not client_candidates:
+        return False, "invalid request: no candidate client public keys"
+    last_reason = ""
+    request_ok = False
+    for cpk in client_candidates:
+        ok, reason = verify_submission_request(tx.request, cpk)
+        if ok:
+            request_ok = True
+            break
+        last_reason = reason
+    if not request_ok:
+        return False, f"invalid request: {last_reason}"
 
     seen_witnesses: set[bytes] = set()
     for o in tx.witness_observations:
@@ -374,14 +409,26 @@ def verify_non_response_evidence_tx(
                 f"{o.witness_id.hex()[:16]}"
             )
         seen_witnesses.add(o.witness_id)
-        wpk = witness_public_keys.get(o.witness_id)
-        if wpk is None:
+        wpks_raw = witness_public_keys.get(o.witness_id)
+        if wpks_raw is None:
             return False, (
                 f"witness {o.witness_id.hex()[:16]} has no public key on file"
             )
-        ok, reason = verify_witness_observation(o, wpk)
-        if not ok:
-            return False, f"invalid witness observation: {reason}"
+        wpks = _normalise_candidates(wpks_raw)
+        if not wpks:
+            return False, (
+                f"witness {o.witness_id.hex()[:16]} has no public key on file"
+            )
+        obs_ok = False
+        last_obs_reason = ""
+        for wpk in wpks:
+            ok, reason = verify_witness_observation(o, wpk)
+            if ok:
+                obs_ok = True
+                break
+            last_obs_reason = reason
+        if not obs_ok:
+            return False, f"invalid witness observation: {last_obs_reason}"
 
     if len(seen_witnesses) < WITNESS_QUORUM:
         return False, (

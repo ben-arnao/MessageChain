@@ -5468,21 +5468,41 @@ class Blockchain:
                 f"{self.leaf_watermarks[tx.submitter_id]}) — "
                 "leaf reuse rejected"
             )
-        # Re-derive the witness public-key map from chain state for the
-        # observations bound into the evidence.  An observation whose
-        # witness has no chain pubkey yet will surface here as a clear
-        # admission rejection rather than a silent drop.
-        witness_pks: dict[bytes, bytes] = {}
+        # Re-derive per-principal candidate pubkey sets from chain
+        # state for the observations bound into the evidence.  An
+        # observation whose witness has no chain pubkey yet will
+        # surface here as a clear admission rejection rather than a
+        # silent drop.  Audit r38: walk `key_history + current` for
+        # both client and each witness so a rotation between
+        # sign-time and evidence admission cannot defeat the
+        # evidence -- mirrors the multi-key candidate enumeration
+        # already shipped on the slash path (validate_slash_
+        # transaction) for AttestationSlashing / FinalityDoubleVote.
+        # Every candidate is a key the principal legitimately
+        # published, so matching ANY candidate is proof of authorship.
+        def _candidates_for(entity_id: bytes) -> list[bytes]:
+            seen: set[bytes] = set()
+            out: list[bytes] = []
+            for _installed_at, pk in self.key_history.get(entity_id, []):
+                if pk and pk not in seen:
+                    seen.add(pk)
+                    out.append(pk)
+            current = self.public_keys.get(entity_id)
+            if current and current not in seen:
+                out.append(current)
+            return out
+
+        witness_pks: dict[bytes, list[bytes]] = {}
         for o in tx.witness_observations:
-            wpk = self.public_keys.get(o.witness_id)
-            if wpk is None:
+            wpks = _candidates_for(o.witness_id)
+            if not wpks:
                 return False, (
                     f"witness {o.witness_id.hex()[:16]} has no public "
                     "key on chain"
                 )
-            witness_pks[o.witness_id] = wpk
-        client_pk = self.public_keys.get(tx.request.submitter_id)
-        if client_pk is None:
+            witness_pks[o.witness_id] = wpks
+        client_pks = _candidates_for(tx.request.submitter_id)
+        if not client_pks:
             return False, (
                 f"client {tx.request.submitter_id.hex()[:16]} has no "
                 "public key on chain"
@@ -5491,7 +5511,7 @@ class Blockchain:
         ok, reason = verify_non_response_evidence_tx(
             tx, submitter_pk,
             witness_public_keys=witness_pks,
-            client_public_key=client_pk,
+            client_public_key=client_pks,
         )
         if not ok:
             return False, reason
