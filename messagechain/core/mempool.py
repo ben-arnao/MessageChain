@@ -930,12 +930,15 @@ class Mempool:
 
     def add_censorship_evidence_tx(
         self, tx, arrival_block_height: int | None = None,
+        submitter_public_key_lookup=None,
     ) -> bool:
         """Admit a CensorshipEvidenceTx into the pool.
 
-        Returns True on insertion, False if the tx is already present
-        or the pool is full.  No fee-based eviction — evidence txs
-        are small and rare.  Strict FIFO (refuse new entries when
+        Returns True on insertion, False if the tx is already present,
+        the pool is full, the fee is below MIN_FEE, OR (when
+        `submitter_public_key_lookup` is provided) the stateless
+        verifier rejects the tx.  No fee-based eviction — evidence
+        txs are small and rare.  Strict FIFO (refuse new entries when
         full).
 
         Tier 43: `arrival_block_height` records the block height at
@@ -945,13 +948,59 @@ class Mempool:
         immediately eligible for forced inclusion); production
         callers should pass the current chain height so a long-
         waited evidence is distinguishable from a fresh arrival.
+
+        Audit r38 #3: `submitter_public_key_lookup` is an optional
+        callable `bytes -> bytes | None` that resolves a submitter
+        entity_id to its current chain pubkey.  When provided, the
+        admission gate runs `verify_censorship_evidence_tx` against
+        the resolved pubkey BEFORE inserting; on bad signature,
+        receipt mismatch, or any verifier failure, the tx is rejected
+        without touching pool state.  Live callers (server RPC, any
+        future gossip-relay path) MUST wire the lookup so the pool
+        cannot be free-flooded with forged evidence.  Legacy/test
+        callers may omit the kwarg for back-compat -- in that case
+        the pre-fix behaviour applies (admission relies on the
+        caller having pre-validated, the way the live RPC path
+        already does via `Blockchain.validate_censorship_evidence_tx`).
+        The censorship-evidence pool is registered as a forced-
+        inclusion source via `_external_forced_sources`, so
+        unverified entries can compete for forced-inclusion slots
+        against legitimate censored-tx evidence -- this gate
+        prevents that class of pool poisoning at the admission
+        boundary.
         """
+        # Cheap-first: dedup, capacity, fee floor *before* the
+        # signature-verify path, so a flooder is dropped before the
+        # expensive WOTS+ verification cost.
         with self._lock:
             if tx.tx_hash in self.censorship_evidence_pool:
                 return False
             if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
                 return False
             if tx.fee < MIN_FEE:
+                return False
+        # Signature verify (when caller provides the lookup) runs
+        # outside the lock so a slow verify cannot stall other
+        # pool operations.  The dedup recheck inside the lock
+        # below is what guarantees no double-insert under
+        # concurrent admits.
+        if submitter_public_key_lookup is not None:
+            from messagechain.consensus.censorship_evidence import (
+                verify_censorship_evidence_tx,
+            )
+            submitter_pk = submitter_public_key_lookup(tx.submitter_id)
+            if submitter_pk is None:
+                return False
+            ok, _reason = verify_censorship_evidence_tx(tx, submitter_pk)
+            if not ok:
+                return False
+        with self._lock:
+            # Re-check dedup + capacity after the verify window: a
+            # concurrent admit may have inserted the same tx, or
+            # filled the last slot, while we were verifying.
+            if tx.tx_hash in self.censorship_evidence_pool:
+                return False
+            if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
                 return False
             self.censorship_evidence_pool[tx.tx_hash] = tx
             self._evidence_arrival_heights[tx.tx_hash] = (

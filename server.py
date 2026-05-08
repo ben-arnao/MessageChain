@@ -3420,14 +3420,25 @@ class Server(SharedRuntimeMixin):
             # (``add_react_transaction(tx, arrival_block_height=...)``)
             # -- this admit path is the same defect class on a
             # different surface.  Surfaced by audit r28 top-3 #2.
+            # Audit r38 #3: thread the chain pubkey lookup so the
+            # mempool admission gate runs the stateless verifier
+            # against the submitter's current pubkey before
+            # inserting.  validate_censorship_evidence_tx above
+            # already covers this for the live RPC path; the lookup
+            # makes the same defense apply at the mempool boundary
+            # so any future caller (gossip-relay, secondary admit
+            # path, etc.) gets the same protection without having
+            # to remember to pre-validate.
             if not self.mempool.add_censorship_evidence_tx(
                 tx, arrival_block_height=self.blockchain.height,
+                submitter_public_key_lookup=self.blockchain.public_keys.get,
             ):
                 return {
                     "ok": False,
                     "error": (
                         "Censorship-evidence pool rejected tx "
-                        "(duplicate, full, or under-fee)"
+                        "(duplicate, full, under-fee, or signature "
+                        "verification failed)"
                     ),
                 }
 
