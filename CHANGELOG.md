@@ -4,6 +4,193 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.68.0] — 2026-05-07
+
+Minor release.  Audit round 38 top-3 ships: one new hard fork (Tier
+67 keeps the attester-committee weighted-reservoir sort priority as
+``decimal.Decimal`` end-to-end, eliminating the cross-platform
+IEEE-754 ULP rank-flip risk introduced by the legacy ``float(u.ln()
+/ Decimal(w))`` cast at the sort key) plus two security soft-fixes
+(non-response evidence verifier walks ``key_history + current``
+candidate sets so a key rotation between sign-time and evidence-
+admission can no longer defeat the silent-drop censorship slash;
+mempool censorship-evidence admission gate now optionally runs the
+stateless verifier so a future caller adding a gossip-relay path
+cannot free-flood the slashable-evidence pool).  No new top-line
+CLI surface, no new tx kinds.
+
+### Added
+
+  * **Tier 67 -- attester-committee Decimal end-to-end (hard fork,
+    activation height 2600).**  Pre-fix
+    ``_deterministic_weighted_sample`` (in
+    ``messagechain.consensus.attester_committee``) computed the per-
+    candidate priority as ``decimal.Decimal`` but immediately
+    collapsed back to ``float`` before the sort:
+
+        pri = float(u.ln() / Decimal(w))
+
+    Decimal.ln IS deterministic (Tier 62 lesson learned for the
+    lottery), but the cast back to float at the sort key
+    reintroduces an IEEE-754 rounding hazard.  Two near-equal
+    log-keys can rank-flip on different libc / different CPython
+    builds, producing different attester sets on different
+    platforms -- a chain-wide partition class.  Committee
+    selection is consensus-critical (rewards land in
+    ``mint_block_reward`` and are committed in ``state_root``), so
+    divergent committees mean divergent state-roots -- instant
+    network partition.
+
+    Today's homogeneous-Linux-glibc mainnet hides the bug; the
+    moment a third validator joins on different libc / arch /
+    Python build, partition risk goes live.  CLAUDE.md anchor at
+    risk: Mission ("permanent ledger"); honest-operator-insurance
+    (a node bounced onto a minority fork by a libc rounding
+    difference accumulates resync cost it didn't earn).
+
+    Tier 67 splits the sampler into legacy-float and Decimal-end-to-
+    end branches.  ``_deterministic_weighted_sample_legacy_float``
+    is byte-identical to the pre-fix implementation;
+    ``_deterministic_weighted_sample_decimal`` keeps ``pri`` as
+    ``Decimal`` and sorts on Decimal directly (zero-weight items
+    use ``Decimal('-Infinity')`` so the comparator stays
+    homogeneous).  ``select_attester_committee`` accepts a new
+    ``block_height: int | None`` kwarg; both consensus call sites
+    in ``core/blockchain.py`` (sim path in
+    ``compute_post_state_root`` + apply path in
+    ``_apply_block_state``) thread it through so the gate
+    activates -- without that thread the height-gate would be
+    wired but inert, the bug class belt-and-braces guarded against
+    in the Tier 62 ship.
+
+    Pre-fork (height < ``ATTESTER_COMMITTEE_DECIMAL_HEIGHT``) the
+    legacy float-cast branch runs unchanged so historical blocks
+    replay byte-identically.  Post-fork the deterministic Decimal
+    branch is the consensus rule.  Activation height 2600 sits 50
+    blocks above Tier 66 (2550) -- ~8.3h cohort spacing matching
+    the Tier 49-66 pattern.  Mainnet tip at ship time is height
+    ~1837, so the upgrade window is ~5.3 days at 600s blocks.
+    Two-validator coordinated upgrade.  No new wire format, no new
+    tx kinds, no state-tree changes -- pure consensus-rule swap
+    inside the sampler.  14 regression tests in
+    ``tests/test_audit_r38_committee_decimal_tier67.py``.
+    Surfaced by audit r38 top-3 #2.  (e16a0f2)
+
+### Fixed
+
+  * **Non-response evidence multi-key candidate set closes silent-
+    drop censorship rotation evasion.**  Pre-fix
+    ``Blockchain.validate_non_response_evidence_tx`` resolved the
+    CURRENT ``public_keys[client_id]`` and ``public_keys[witness_id]``
+    at admission, not the keys active when the SubmissionRequest /
+    WitnessObservation were signed.  Any rotation in the interval
+    between sign-time and evidence-admission defeated the evidence
+    -- the verifier saw a sig under K_old but resolved K_new and
+    rejected as "invalid request signature" / "invalid witness
+    observation".  ``KEY_ROTATION_COOLDOWN_BLOCKS`` (144) is well
+    within the ``EVIDENCE_EXPIRY_BLOCKS`` admission window, so the
+    rotation comfortably fits inside any non-response cycle.
+
+    Concrete attack: a coerced/colluding target validator silently
+    drops a witnessed SubmissionRequest.  Q honest peers sign
+    WitnessObservations and any entity packages them into a
+    NonResponseEvidenceTx.  Before the evidence is admitted, the
+    colluder bribes the client (or a quorum of witnesses) to
+    perform a routine key rotation -- the evidence becomes
+    unverifiable because admission resolves K_new, the request was
+    signed under K_old, and the witness pipeline that the chain's
+    primary collusion defense rests on has a documented dodge.
+
+    CLAUDE.md anchor at risk: "censorship resistance is a
+    *collective decision*" -- the witnessed-submission pipeline
+    IS the slashable-evidence layer that backs the collective
+    guarantee against silent-TCP-drop censorship.  Same bug class
+    as the multi-key candidate fixes already shipped on sibling
+    evidence paths: audit r6 (AttestationSlashing / double-
+    proposal SlashingEvidence), audit r11
+    (FinalityDoubleVoteEvidence), audit r33 (slash-tx submitter
+    path).  This patch propagates the same shape to non-response
+    evidence.
+
+    Soft-fix: pure verifier widening, no consensus rule change,
+    no fork, no new wire format.
+    ``verify_non_response_evidence_tx`` widens ``client_public_key``
+    and each entry in ``witness_public_keys`` to accept either a
+    single 32-byte pubkey (legacy shape, back-compat) OR an
+    iterable of candidate pubkeys.
+    ``Blockchain.validate_non_response_evidence_tx`` enumerates
+    ``key_history + current`` for both the client and each witness,
+    mirroring the slash path's candidate enumeration in
+    ``validate_slash_transaction``.  Every candidate is a key the
+    principal legitimately published, so matching ANY candidate is
+    proof of authorship -- attacker cannot exploit the candidate
+    set to forge evidence.  Pre-fix legitimate evidence (no
+    rotation) admits unchanged; only the rotation-evasion bypass
+    is closed.  6 regression tests in
+    ``tests/test_audit_r38_non_response_multi_key.py``.  Surfaced
+    by audit r38 top-3 #1.  (4adfbad)
+
+### Security
+
+  * **Mempool censorship-evidence admission gate optionally
+    verifies submitter signature (defense-in-depth).**  Pre-fix
+    ``Mempool.add_censorship_evidence_tx`` checked only ``tx_hash``
+    dedup, pool capacity, and ``tx.fee >= MIN_FEE`` at admission.
+    There was NO call to ``verify_censorship_evidence_tx`` /
+    ``validate_censorship_evidence_tx`` at insert time.  Today's
+    only LIVE caller (``server._rpc_submit_censorship_evidence``)
+    runs ``Blockchain.validate_censorship_evidence_tx`` BEFORE
+    admitting, so no live exploit exists -- but the admission
+    gate's correctness silently depended on every caller
+    remembering to pre-validate.
+
+    Defense-in-depth gap: the censorship-evidence pool is
+    registered as a forced-inclusion external source via
+    ``Mempool._external_forced_sources``, so any future caller that
+    forgets to validate (a gossip-relay path, a secondary admit
+    surface, etc.) opens a free-flood vector at one MIN_FEE per
+    slot.  Junk evidence saturates the 1000-entry cap, evicts
+    genuine evidence via FIFO, and competes for forced-inclusion
+    slots against legitimate censored-tx evidence -- the
+    slashable-evidence layer's evidentiary cost collapses to free.
+    Exactly the bug class the round-10 governance gossip fix
+    caught: admission gate trusted a single caller path; a future
+    contributor added a gossip-relay path; the new path forgot to
+    validate; the verify-before-admit pattern eventually had to be
+    lifted into the gate itself.  This patch lifts it
+    proactively, before a second caller appears.
+
+    CLAUDE.md anchor at risk: "any deviation from pure fee-per-
+    byte selection requires a coordinated majority -- exactly the
+    surface where slashable evidence is supposed to bite."  The
+    censorship-evidence pool IS that slashable-evidence layer.
+
+    Fix: add an OPTIONAL ``submitter_public_key_lookup:
+    Callable[[bytes], bytes | None]`` kwarg to
+    ``add_censorship_evidence_tx``.  When provided, run
+    ``verify_censorship_evidence_tx`` against the resolved pubkey
+    BEFORE inserting; reject (return False) on bad signature,
+    missing pubkey, or any verifier failure.  Cheap-first: dedup,
+    capacity, and fee floor still run BEFORE the WOTS+ verify so a
+    flooder is dropped before paying the expensive verification
+    cost.  Wire ``submitter_public_key_lookup=self.blockchain
+    .public_keys.get`` into ``_rpc_submit_censorship_evidence`` so
+    the live RPC path picks up the new defense layer.  Legacy
+    callers (no lookup) admit unchanged for back-compat with the
+    in-process test fixtures that build evidence txs without a
+    chain pubkey registry.  Soft-fix, no fork, no wire-format
+    change -- apply-time path already validates fully.  7
+    regression tests in ``tests/test_audit_r38_censorship_
+    evidence_admit_verify.py``.  Surfaced by audit r38 top-3 #3.
+    (1c50c88)
+
+Activation cohort spacing: Tier 67 = 2600 sits 50 blocks above
+Tier 66 (2550) at ~8.3h gaps at 600s blocks, matching the Tier
+49-66 pattern.  Mainnet tip at ship time is height ~1837 (probed
+via ``https://messagechain.org/v1/info``), so the upgrade window
+is ~5.3 days at 600s blocks for Tier 67.  Two-validator
+coordinated upgrade.
+
 ## [1.67.0] — 2026-05-07
 
 Minor release.  Audit round 37 top-2 ships: one consensus-tightening
