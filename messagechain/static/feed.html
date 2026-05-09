@@ -470,7 +470,8 @@
   /* Filter banner: visible only when the user is filtering the
      feed by a community handle (#community=<handle> in the URL).
      Click the · clear · link to drop the filter. */
-  #communityFilter {
+  #communityFilter,
+  #blockFilter {
     margin: 0 0 0.6rem;
     padding: 0.5rem 0.7rem;
     border: 1px solid var(--border);
@@ -479,17 +480,51 @@
     font-size: 0.85rem;
     color: var(--muted);
   }
-  #communityFilter .handle {
+  #communityFilter .handle,
+  #blockFilter .handle {
     color: var(--fg);
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   }
-  #communityFilter a {
+  #communityFilter a,
+  #blockFilter a {
     color: var(--accent);
     text-decoration: none;
     margin-left: 0.6rem;
   }
-  #communityFilter a:hover { text-decoration: underline; }
+  #communityFilter a:hover,
+  #blockFilter a:hover { text-decoration: underline; }
   .msg.filtered-out { display: none; }
+  .msg .meta .block-link {
+    color: inherit;
+    text-decoration: none;
+  }
+  .msg .meta .block-link:hover {
+    color: var(--accent);
+    text-decoration: underline;
+  }
+  /* Pagination footer — appears under the feed when more messages can
+     be revealed (either from data already fetched but display-clipped,
+     or by extending the fetch limit toward PUBLIC_FEED_MAX_LIMIT).
+     Block-filtered views still get the link so a user can pull older
+     blocks into view. */
+  #showMoreWrap {
+    text-align: center;
+    margin: 0.8rem 0 0.4rem;
+  }
+  #showMoreWrap a {
+    display: inline-block;
+    padding: 0.45rem 0.9rem;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.9rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--card);
+  }
+  #showMoreWrap a:hover {
+    text-decoration: underline;
+    border-color: var(--accent);
+  }
   .msg .meta .permalink {
     color: var(--accent);
     text-decoration: none;
@@ -659,7 +694,15 @@
     <span class="handle" id="communityFilterHandle"></span>
     <a href="#" id="communityFilterClear">· clear</a>
   </div>
+  <div id="blockFilter" hidden>
+    Filtering by block
+    <span class="handle" id="blockFilterHandle"></span>
+    <a href="#" id="blockFilterClear">· clear</a>
+  </div>
   <div id="feed"></div>
+  <div id="showMoreWrap" hidden>
+    <a href="#" id="showMoreLink">Show 10 more</a>
+  </div>
 </main>
 <footer id="chainFooter">
   <div class="row">chain_id <code id="chainId">…</code></div>
@@ -672,12 +715,24 @@
 (function () {
   "use strict";
   const POLL_MS = 15000;
-  const LIMIT = 30;
+  // Default visible-card budget; user expands by PAGE_SIZE per click of
+  // "Show 10 more", up to MAX_LIMIT (which mirrors the server's
+  // PUBLIC_FEED_MAX_LIMIT clamp).  We always fetch displayLimit+PAGE_SIZE
+  // (capped at MAX_LIMIT) so the show-more affordance can tell whether
+  // there are more messages to reveal without an extra round-trip.
+  const PAGE_SIZE = 10;
+  const MAX_LIMIT = 50;
+  let displayLimit = PAGE_SIZE;
   const statusEl = document.getElementById("status");
   const feedEl = document.getElementById("feed");
   const filterBannerEl = document.getElementById("communityFilter");
   const filterHandleEl = document.getElementById("communityFilterHandle");
   const filterClearEl = document.getElementById("communityFilterClear");
+  const blockFilterBannerEl = document.getElementById("blockFilter");
+  const blockFilterHandleEl = document.getElementById("blockFilterHandle");
+  const blockFilterClearEl = document.getElementById("blockFilterClear");
+  const showMoreWrapEl = document.getElementById("showMoreWrap");
+  const showMoreLinkEl = document.getElementById("showMoreLink");
   let seenHashes = new Set();
 
   // Tier 25 community filter — driven by `#community=<handle>` in
@@ -699,31 +754,52 @@
     }
     return COMMUNITY_HANDLE_RE.test(h) ? h : null;
   }
-  function applyCommunityFilter() {
+  // Block filter — `#block=<n>` in the URL hides every card whose
+  // block_number != n.  Same client-side scheme as community filter
+  // (no server round-trip), strict numeric validation against the
+  // fragment so a hostile hash can't inject markup via the banner.
+  function currentBlockFilter() {
+    const m = /^#block=(\d+)$/.exec(location.hash || "");
+    if (!m) return null;
+    const n = parseInt(m[1], 10);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return n;
+  }
+  function applyFilters() {
     const handle = currentCommunityFilter();
+    const blockNum = currentBlockFilter();
     const cards = feedEl.querySelectorAll(".msg");
-    if (!handle) {
+    if (handle) {
+      filterHandleEl.textContent = handle;
+      filterBannerEl.hidden = false;
+    } else {
       filterBannerEl.hidden = true;
-      cards.forEach(c => c.classList.remove("filtered-out"));
-      return;
     }
-    filterHandleEl.textContent = handle;
-    filterBannerEl.hidden = false;
+    if (blockNum !== null) {
+      blockFilterHandleEl.textContent = String(blockNum);
+      blockFilterBannerEl.hidden = false;
+    } else {
+      blockFilterBannerEl.hidden = true;
+    }
     cards.forEach(c => {
-      if (c.dataset.communityId === handle) {
-        c.classList.remove("filtered-out");
-      } else {
-        c.classList.add("filtered-out");
-      }
+      let hide = false;
+      if (handle && c.dataset.communityId !== handle) hide = true;
+      if (blockNum !== null && c.dataset.blockNumber !== String(blockNum)) hide = true;
+      c.classList.toggle("filtered-out", hide);
     });
   }
   filterClearEl.addEventListener("click", function (e) {
     e.preventDefault();
     // Strip the fragment without leaving a `#` in the URL bar.
     history.replaceState(null, "", location.pathname + location.search);
-    applyCommunityFilter();
+    applyFilters();
   });
-  window.addEventListener("hashchange", applyCommunityFilter);
+  blockFilterClearEl.addEventListener("click", function (e) {
+    e.preventDefault();
+    history.replaceState(null, "", location.pathname + location.search);
+    applyFilters();
+  });
+  window.addEventListener("hashchange", applyFilters);
 
   function shortHex(hex, head, tail) {
     if (!hex || hex.length <= head + tail + 1) return hex || "";
@@ -770,7 +846,23 @@
     entityLink.textContent = "from " + shortHex(m.entity_id, 10, 6);
     entity.appendChild(entityLink);
     const right = document.createElement("span");
-    right.textContent = "block " + m.block_number + " · " + formatTs(m.timestamp);
+    // Block number is a filter-link to `#block=<n>` so a click narrows
+    // the feed to "just messages from this block" — same client-side
+    // mechanism as the community filter, plus a banner with a clear
+    // link.  The rest of the meta-row (timestamp, verify) stays plain
+    // text after the link.
+    if (typeof m.block_number === "number") {
+      const blockLink = document.createElement("a");
+      blockLink.className = "block-link";
+      blockLink.href = "#block=" + m.block_number;
+      blockLink.title = "filter feed to block " + m.block_number;
+      blockLink.textContent = "block " + m.block_number;
+      right.appendChild(blockLink);
+      right.appendChild(document.createTextNode(" · " + formatTs(m.timestamp)));
+      card.dataset.blockNumber = String(m.block_number);
+    } else {
+      right.textContent = "block " + m.block_number + " · " + formatTs(m.timestamp);
+    }
     // Per-card permanent-verify affordance.  Links to /r/<tx_hash>
     // which renders inclusion proof + permanence framing — the
     // first-time visitor's path from "is this a real social feed"
@@ -788,7 +880,7 @@
     meta.appendChild(right);
     card.appendChild(meta);
     // Tier 25 community grouping — set the dataset attribute up
-    // front so the filter logic (applyCommunityFilter) can hide
+    // front so the filter logic (applyFilters) can hide
     // cards by community even before the bottom footer is appended
     // below.  L2 / app layer maps the handle to a display name;
     // protocol surface stays handle-only.
@@ -818,7 +910,7 @@
       ref.title = m.prev;
       // Anchor-jump to the referenced card when it's in the current
       // feed window.  When the target isn't rendered (older than the
-      // last LIMIT messages), mark the link as `missing` so styling
+      // current display window), mark the link as `missing` so styling
       // goes muted and pointer-events disable — the user sees there's
       // a reference but it's out of view rather than a broken click.
       if (knownHashes.has(m.prev)) {
@@ -882,8 +974,9 @@
     return card;
   }
 
-  function render(messages, height) {
+  function render(messages, height, fetchedLimit) {
     feedEl.replaceChildren();
+    showMoreWrapEl.hidden = true;
     if (!messages || !messages.length) {
       const empty = document.createElement("div");
       empty.className = "msg empty";
@@ -891,6 +984,10 @@
       feedEl.appendChild(empty);
       return;
     }
+    // Display-clip to the user-visible budget; we always fetch a
+    // PAGE_SIZE buffer beyond it so the show-more affordance can
+    // tell whether the chain has more to reveal.
+    const visible = messages.slice(0, displayLimit);
     // Build the set of tx_hashes present in THIS render pass so
     // renderMessage can decide whether a `prev` anchor has a target.
     // Out-of-window refs get muted styling instead of a dead link.
@@ -899,29 +996,41 @@
     // cross-author reply when the predecessor is in-view.
     const knownHashes = new Set();
     const hashToAuthor = new Map();
-    for (const m of messages) {
+    for (const m of visible) {
       if (m.tx_hash) {
         knownHashes.add(m.tx_hash);
         if (m.entity_id) hashToAuthor.set(m.tx_hash, m.entity_id);
       }
     }
-    for (const m of messages) {
+    for (const m of visible) {
       feedEl.appendChild(renderMessage(m, knownHashes, hashToAuthor));
     }
-    statusEl.textContent = "Chain height " + height + " · showing " + messages.length + " newest";
-    // Re-apply the community filter after each repaint so a poll()
+    statusEl.textContent =
+      "Chain height " + height + " · showing " + visible.length + " newest";
+    // Show-more affordance: visible iff (a) we have locally-fetched
+    // messages beyond the display clip, OR (b) we filled the fetch
+    // window and the display budget can still grow toward MAX_LIMIT
+    // (so a click would actually pull more rows from the chain).
+    const hasHidden = messages.length > displayLimit;
+    const couldFetchMore =
+      typeof fetchedLimit === "number" &&
+      messages.length === fetchedLimit &&
+      displayLimit < MAX_LIMIT;
+    showMoreWrapEl.hidden = !(hasHidden || couldFetchMore);
+    // Re-apply the active filter set after each repaint so a poll()
     // doesn't silently un-hide cards that should still be filtered
     // out.  Cheap: a single querySelectorAll + classList toggle.
-    applyCommunityFilter();
+    applyFilters();
     // If the URL already has a fragment (user landed here via an
     // inbound link or an earlier click), re-scroll to it now that the
     // target card has been re-rendered.  Without this, a poll()
     // repaint silently breaks the :target selector and the user
-    // loses their place.  Skip the scroll when the fragment is the
-    // community-filter form (#community=...) — that's a filter, not
-    // a card anchor.
+    // loses their place.  Skip the scroll when the fragment is one of
+    // the filter forms (#community=…, #block=…) — those are filters,
+    // not card anchors.
     if (location.hash &&
         !location.hash.startsWith("#community=") &&
+        !location.hash.startsWith("#block=") &&
         document.getElementById(location.hash.slice(1))) {
       const target = document.getElementById(location.hash.slice(1));
       target.scrollIntoView({ block: "center", behavior: "instant" });
@@ -957,16 +1066,28 @@
   }
 
   async function poll() {
+    // Fetch one PAGE_SIZE beyond the current display budget so the
+    // show-more affordance can tell whether the chain has more rows
+    // to reveal — capped at the server's PUBLIC_FEED_MAX_LIMIT mirror.
+    const fetchedLimit = Math.min(displayLimit + PAGE_SIZE, MAX_LIMIT);
     try {
-      const r = await fetch("/v1/latest?limit=" + LIMIT, { cache: "no-store" });
+      const r = await fetch(
+        "/v1/latest?limit=" + fetchedLimit, { cache: "no-store" },
+      );
       if (!r.ok) throw new Error("HTTP " + r.status);
       const data = await r.json();
       if (!data.ok) throw new Error(data.error || "unknown error");
-      render(data.messages, data.height);
+      render(data.messages, data.height, fetchedLimit);
     } catch (e) {
       statusEl.textContent = "Feed unreachable (" + e.message + "). Retrying…";
     }
   }
+  showMoreLinkEl.addEventListener("click", function (e) {
+    e.preventDefault();
+    if (displayLimit >= MAX_LIMIT) return;
+    displayLimit = Math.min(displayLimit + PAGE_SIZE, MAX_LIMIT);
+    poll();
+  });
 
   // --- Cold-start faucet UI -------------------------------------------------
   // Only render the form when the validator advertises faucet_enabled=true
