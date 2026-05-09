@@ -1367,6 +1367,27 @@ def build_parser() -> argparse.ArgumentParser:
              "--keyfile).",
     )
     backup.add_argument(
+        "--receipt-leaves", type=str, default=None,
+        dest="receipt_leaves",
+        help="Path to the receipt-subtree leaf-cursor "
+             "(receipt_leaf_index.json) for validators that issue "
+             "submission receipts.  Defaults to "
+             "<data_dir>/receipt_leaf_index.json.  Restoring a wallet "
+             "without it on a receipt-issuing validator re-uses one-"
+             "time WOTS+ leaves on the receipt subtree and produces "
+             "equivocation evidence on chain (geometric soft-slash "
+             "compounds toward total stake loss).  Pass "
+             "--no-receipt-leaves to opt out on validators that do "
+             "NOT issue receipts.",
+    )
+    backup.add_argument(
+        "--no-receipt-leaves", action="store_true",
+        dest="no_receipt_leaves", default=False,
+        help="Opt out of receipt-leaf inclusion (validators that do "
+             "NOT issue receipts).  Prints a warning so the choice is "
+             "visible in the operator's terminal.",
+    )
+    backup.add_argument(
         "--entity-id", type=str, default=None, dest="entity_id",
         help="Entity ID hex.  When omitted, derived from --keyfile.",
     )
@@ -8039,30 +8060,53 @@ def cmd_config(args):
 
 
 def cmd_backup_wallet(args):
-    """Tar up the keyfile + the matching leaf-cursor into one archive.
+    """Tar up the keyfile + ALL leaf-cursors into one archive.
 
     Local-only: never touches the chain, never opens a socket, never
-    requires a running daemon.  The command exists because the two
-    files that together constitute a complete wallet backup live in
+    requires a running daemon.  The command exists because the files
+    that together constitute a complete wallet backup live in
     different places by default (the keyfile wherever the user put
-    it; the leaf cursor under ``~/.messagechain/leaves/<entity>.idx``)
-    and a paper-only backup of the keyfile alone is a self-slash trap
-    -- restoring without the leaf cursor re-uses one-time WOTS+ leaves
-    and produces equivocation evidence on chain (100% slash on
-    detection at slashing-active heights).
+    it; the block-signing leaf cursor under
+    ``~/.messagechain/leaves/<entity>.idx``; the receipt-signing
+    leaf cursor under ``<data_dir>/receipt_leaf_index.json`` for
+    validators that issue receipts).  A paper-only backup of the
+    keyfile alone is a self-slash trap -- restoring without ANY of
+    the leaf cursors re-uses one-time WOTS+ leaves and produces
+    equivocation evidence on chain (geometric soft-slash compounds
+    ``(1 - 0.05)^N`` toward total stake loss as each re-used leaf
+    surfaces a distinct equivocation event).
 
     Inputs:
-      ``--keyfile``    path to the keyfile (or global --keyfile)
-      ``--leaves``     path to the leaf cursor (default derived from
-                       entity_id under ~/.messagechain/leaves/)
-      ``--entity-id``  entity_id hex (default: derived from keyfile)
-      ``--output``     tarball path (default:
-                       <entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz
-                       in CWD)
+      ``--keyfile``         path to the keyfile (or global --keyfile)
+      ``--leaves``          path to the block-signing leaf cursor
+                            (default: ~/.messagechain/leaves/<entity>.idx)
+      ``--receipt-leaves``  path to the receipt-subtree leaf cursor
+                            (default: <data_dir>/receipt_leaf_index.json
+                            when ``data_dir`` is set; absent on
+                            non-receipt-issuing validators)
+      ``--no-receipt-leaves`` opt out of receipt-leaf inclusion
+                            (validators that do NOT issue receipts);
+                            prints a visible warning so the choice
+                            is not silent
+      ``--entity-id``       entity_id hex (default: derived from keyfile)
+      ``--output``          tarball path (default:
+                            <entity_id_hex>-wallet-backup-<YYYYMMDD>.tar.gz
+                            in CWD)
 
-    Failure modes are clean: if either input file is missing, print a
-    message naming the missing path and exit non-zero.  Never produces
-    a partial archive.
+    Failure modes are clean: if a required input file is missing,
+    print a message naming the missing path and exit non-zero.
+    Never produces a partial archive.
+
+    Receipt-leaf inclusion (audit r39 #2): a receipt-issuing
+    validator that backs up only the keyfile + block-signing leaves
+    will, on disk-loss restore, re-sign already-burned WOTS+ leaves
+    on the receipt subtree.  Pre-fix this command silently dropped
+    ``receipt_leaf_index.json`` even though the README explicitly
+    names it as one of three security-critical files; this is now
+    fixed.  Default-resolution mirrors the existing block-signing
+    leaf path: ``<data_dir>/receipt_leaf_index.json``.  Non-receipt-
+    issuing validators don't have the file on disk and the command
+    proceeds cleanly without it.
     """
     import datetime as _dt
     import tarfile as _tar
@@ -8123,12 +8167,71 @@ def cmd_backup_wallet(args):
         )
         return 2
 
+    # Receipt-subtree leaf cursor resolution (audit r39 #2).  Same
+    # default-resolution pattern the block-signing leaf cursor above
+    # uses: explicit flag wins; else derive from data_dir; else absent
+    # (non-receipt-issuing validators don't have the file).  The
+    # silent-omission pre-fix bug turned every disk-loss restore into
+    # a guaranteed receipt-subtree equivocation slash; default-
+    # inclusion closes that trap.
+    _RECEIPT_LEAF_INDEX_FILENAME = "receipt_leaf_index.json"
+    no_receipt_leaves = bool(
+        getattr(args, "no_receipt_leaves", False),
+    )
+    receipt_leaves_path = getattr(args, "receipt_leaves", None)
+    data_dir = getattr(args, "data_dir", None)
+    if no_receipt_leaves:
+        if receipt_leaves_path is not None:
+            print(
+                "Error: --no-receipt-leaves is mutually exclusive with "
+                "--receipt-leaves.  Pick one."
+            )
+            return 2
+        # Surface the opt-out: warn naming the file we're skipping so
+        # the operator can't silently omit it on a receipt-issuing
+        # validator and discover the gap only on restore.
+        candidate = (
+            os.path.join(data_dir, _RECEIPT_LEAF_INDEX_FILENAME)
+            if data_dir else None
+        )
+        if candidate and os.path.exists(candidate):
+            print(
+                f"WARNING: --no-receipt-leaves opt-out: skipping "
+                f"receipt-subtree leaf cursor at {candidate}.  Only "
+                "safe on validators that do NOT issue submission "
+                "receipts.  A receipt-issuing validator that omits "
+                "this file will produce equivocation evidence on "
+                "disk-loss restore (geometric soft-slash compounding)."
+            )
+        receipt_leaves_path = None
+    elif receipt_leaves_path is None and data_dir is not None:
+        candidate = os.path.join(data_dir, _RECEIPT_LEAF_INDEX_FILENAME)
+        if os.path.exists(candidate):
+            receipt_leaves_path = candidate
+        # else: leave None -- non-receipt-issuing validator, file
+        # legitimately absent, do not synthesize.
+    elif receipt_leaves_path is not None:
+        # Explicit --receipt-leaves: must exist or this is an error
+        # (the operator named a file they expect to be in the backup).
+        if not os.path.exists(receipt_leaves_path):
+            print(
+                f"Error: receipt-subtree leaf cursor not found: "
+                f"{receipt_leaves_path}\n"
+                "If this validator issues submission receipts, the "
+                "receipt cursor MUST exist on this host -- restoring "
+                "without it re-uses one-time WOTS+ leaves on the "
+                "receipt subtree and produces equivocation evidence "
+                "on chain (slashable).  Pass --no-receipt-leaves if "
+                "this validator does NOT issue receipts."
+            )
+            return 2
+
     output = getattr(args, "output", None)
     if not output:
         today = _dt.date.today().strftime("%Y%m%d")
         output = f"{entity_hex}-wallet-backup-{today}.tar.gz"
 
-    # Both inputs are present.  Build into a tmp file and rename, so a
+    # All inputs are present.  Build into a tmp file and rename, so a
     # crash mid-write never leaves a half-archive at the requested
     # path -- callers should be able to retry without a stale file
     # tripping their next attempt.
@@ -8138,6 +8241,11 @@ def cmd_backup_wallet(args):
         with _tar.open(tmp_path, "w:gz") as tf:
             tf.add(keyfile, arcname=os.path.basename(keyfile))
             tf.add(leaves_path, arcname=os.path.basename(leaves_path))
+            if receipt_leaves_path is not None:
+                tf.add(
+                    receipt_leaves_path,
+                    arcname=os.path.basename(receipt_leaves_path),
+                )
         os.replace(tmp_path, output_abs)
     except Exception as e:
         # Best-effort cleanup of the partial.
@@ -8154,11 +8262,13 @@ def cmd_backup_wallet(args):
 
     print(f"Wrote wallet backup: {output_abs}")
     print(f"  entity_id: {entity_hex}")
+    if receipt_leaves_path is not None:
+        print(f"  includes receipt-subtree leaf cursor: {receipt_leaves_path}")
     print(
         "Store this archive somewhere offline (paper-equivalent: "
         "encrypted USB in a safe, NOT cloud sync). The keyfile and "
-        "leaf cursor are both security-critical -- never restore one "
-        "without the other."
+        "ALL leaf cursors are security-critical -- never restore one "
+        "without the others."
     )
     return 0
 
