@@ -4,6 +4,164 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.0] — 2026-05-09
+
+Minor release.  Audit round 39 top-3 ships: one new hard fork (Tier
+68 closes the silent-drop censorship 2-validator-collusion bypass
+on the witnessed-submission slashing pipeline), one operator-tool
+correctness fix (``backup-wallet`` now includes
+``receipt_leaf_index.json`` by default, eliminating a stake-loss
+trap on disk-loss restore for receipt-issuing validators), and one
+network-layer DoS gate (``ANNOUNCE_PENDING_TX`` gossip routes to
+its dedicated ``pending_tx`` rate-limit bucket instead of the wide
+``general`` bucket).  No new top-line CLI surface beyond two new
+``backup-wallet`` flags; no new tx kinds.
+
+### Added
+
+  * **Tier 68 -- witness-ack issuer-binding (hard fork, activation
+    height 2650).**  Pre-fix ``Blockchain.witness_ack_registry:
+    dict[bytes, int]`` was keyed only on ``request_hash``.  Any
+    registered validator's ack landing in the registry discharged
+    the silent-drop obligation of the request's ACTUAL target,
+    regardless of who issued the ack.
+
+    Concrete attack: validator V_target receives a witnessed
+    ``SubmissionRequest`` and silently drops it (TCP-level
+    censorship).  Q honest peers sign ``WitnessObservation``
+    records.  Before the assembled ``NonResponseEvidenceTx`` lands,
+    attacker validator V_attacker (any registered validator -- a
+    sybil under the registration burn is fine) signs a
+    ``SubmissionAck`` for the same request_hash and a colluding
+    proposer embeds it in ``acks_observed_this_block``.  The
+    chain's apply path writes ``witness_ack_registry[rh]`` keyed
+    only on ``rh``.  ``validate_non_response_evidence_tx`` and
+    ``NonResponseEvidenceProcessor.process`` then reject honest
+    evidence with "ack present in chain state: obligation was met"
+    -- discharging V_target's silent-drop obligation by V_attacker's
+    ack.  Net pre-fix: the entire silent-drop censorship arm of the
+    witnessed-submission slashing pipeline collapses to a 2-
+    validator collusion threshold.  CLAUDE.md anchor at risk:
+    "censorship resistance is a *collective decision* ... any new
+    inclusion / mempool / proposer rule must raise the evidentiary
+    cost of suppression."
+
+    Tier 68 fix: maintain a parallel per-issuer registry
+    ``witness_ack_by_issuer: dict[request_hash, dict[issuer_id,
+    ack_height]]`` populated at apply time alongside the legacy
+    registry.  Post-fork the discharge readers (admission gate, sim
+    path, NonResponseEvidenceProcessor.process) consult
+    ``witness_ack_by_issuer[rh].get(target_validator_id)`` so only
+    the TARGET's own ack discharges the obligation.  Pre-fork the
+    legacy single-key reader runs unchanged for byte-identical
+    replay of historical mainnet blocks.  First-write-wins per
+    ``(rh, issuer)`` so multiple distinct issuers each get tracked
+    under the same request_hash.  Pruning extends
+    ``_prune_witness_ack_registry`` to drop per-issuer entries
+    symmetrically with the legacy registry.
+
+    State-sync caveat: the per-issuer registry is in-memory only at
+    v23 of the snapshot envelope.  A node bootstrapping from a v23
+    snapshot at/after the activation height has an empty per-issuer
+    registry until the legacy registry's prune window passes;
+    during that window discharge-by-target-ack does not short-
+    circuit, so the slash gates run their deadline + active-set +
+    quorum checks (no incorrect slash, just no early discharge).
+    Next snapshot version bump will add the per-issuer registry to
+    the snapshot; deferred to keep the fix scope-tight.
+
+    Hard-fork gate.  Activation height 2650 sits 50 blocks above
+    Tier 67 (2600) -- ~8.3h cohort spacing matching the Tier 49-67
+    pattern.  Mainnet tip at ship time is height ~1837 (probed via
+    ``https://messagechain.org/v1/info``), so the upgrade window is
+    ~5.6 days at 600s blocks.  Two-validator coordinated upgrade.
+    No new wire format, no new tx kinds, no state-tree changes.
+    10 regression tests in
+    ``tests/test_audit_r39_witness_ack_issuer_binding_tier68.py``.
+    Surfaced by audit r39 top-3 #1.  (c6ed0ed)
+
+  * **``backup-wallet`` ``--receipt-leaves`` and
+    ``--no-receipt-leaves`` flags.**  Default-resolve the receipt-
+    subtree leaf cursor from the resolved ``data_dir``
+    (``<data_dir>/receipt_leaf_index.json``) and include it in the
+    backup tarball when present on disk.  ``--receipt-leaves PATH``
+    overrides the default location; ``--no-receipt-leaves`` opts
+    out (validators that do NOT issue receipts) and prints a
+    visible warning naming the file being skipped.  See the Fixed
+    section below for the operator-harm rationale.
+
+### Fixed
+
+  * **``backup-wallet`` includes ``receipt_leaf_index.json`` by
+    default.**  Pre-fix ``cmd_backup_wallet`` packed the keyfile
+    plus the block-signing leaf cursor only.  The receipt-signing
+    subtree's leaf cursor (``<data_dir>/receipt_leaf_index.json``)
+    was silently omitted even though README.md:300-326 names it as
+    one of three security-critical files an operator MUST back up,
+    and the documented manual ``tar`` example at README.md:339
+    includes it.
+
+    Concrete operator harm: a diligent validator who reads the
+    README, runs ``messagechain backup-wallet``, and trusts the
+    resulting tarball as a "complete" wallet backup will, on disk-
+    loss restore, re-sign already-burned WOTS+ leaves on the
+    receipt subtree -- producing equivocation evidence on chain.
+    Pre-Tier-20 the per-offense penalty was 100% stake; post-Tier-
+    20 the geometric soft-slash compounds ``(1 - 0.05)^N`` toward
+    total stake loss as each re-used leaf surfaces a distinct
+    equivocation event.  Operator did exactly what the
+    documentation said; tool dropped the load-bearing file.
+    CLAUDE.md anchor at risk: "Honest, well-configured nodes should
+    rarely if ever be slashed under normal operation."  No fork, no
+    consensus impact, no on-chain change -- pure operator-tool
+    ergonomics.  5 regression tests in
+    ``tests/test_audit_r39_backup_wallet_receipt_leaves.py``.
+    Surfaced by audit r39 top-3 #2.  (1870d17)
+
+### Security
+
+  * **``ANNOUNCE_PENDING_TX`` gossip routes to dedicated
+    ``pending_tx`` rate-limit bucket.**  Pre-fix
+    ``messagechain.network.dispatch.message_category`` had no case
+    for ``MessageType.ANNOUNCE_PENDING_TX``; the message type fell
+    through to the wide ``general`` bucket (RATE_GENERAL = 30/s,
+    burst 100) instead of the dedicated ``pending_tx`` bucket
+    (RATE_PENDING_TX = 2/s, burst 20) that ``ratelimit.py`` defines
+    and ``PeerRateLimiter._ensure_buckets`` provisions.
+
+    Concrete attack: ``ANNOUNCE_PENDING_TX`` carries WOTS+-signed
+    stake / unstake / authority / governance transactions.  Each
+    receipt forces the receiver to parse and WOTS+-verify the
+    signature -- ~2.7 KB of signature material and ~thousand hash
+    invocations per message.  With the legacy ``general`` bucket
+    gating, a single peer could sustain 30 WOTS+ verifies per
+    second indefinitely (with a 100-burst), an asymmetric CPU-DoS
+    targeting honest validators trying to keep up.  Same shape as
+    the ``signed_announce`` carve-out already shipped for
+    ``ANNOUNCE_ATTESTATION`` / ``ANNOUNCE_FINALITY_VOTE`` /
+    ``ANNOUNCE_SLASH`` / ``ANNOUNCE_CUSTODY_PROOF`` -- the
+    routing-layer DoS gate analogous to the WOTS+-verify-cost
+    asymmetry defense.  Pre-fix the bucket existed and was sized
+    correctly; only the dispatch routing was missing.  CLAUDE.md
+    anchor at risk: "Spam ceiling is block timing, not per-tx fee
+    inflation"; the gossip-layer rate limit is the analogous
+    defense-in-depth at the network layer.
+
+    Fix: one-line addition to ``message_category`` -- route
+    ``MessageType.ANNOUNCE_PENDING_TX`` to ``"pending_tx"``.  No
+    fork, no consensus impact, no wire-format change -- pure
+    network-layer DoS gate that activates immediately.  4
+    regression tests in
+    ``tests/test_audit_r39_pending_tx_dispatch_routing.py``.
+    Surfaced by audit r39 top-3 #3.  (e37c050)
+
+Activation cohort spacing: Tier 68 = 2650 sits 50 blocks above Tier
+67 (2600) at ~8.3h gaps at 600s blocks, matching the Tier 49-67
+pattern.  Mainnet tip at ship time is height ~1837 (probed via
+``https://messagechain.org/v1/info``), so the upgrade window is
+~5.6 days at 600s blocks for Tier 68.  Two-validator coordinated
+upgrade.
+
 ## [1.69.0] — 2026-05-09
 
 Minor release.  Public-feed UX polish + comparison-doc tightening
