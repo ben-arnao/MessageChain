@@ -4,6 +4,60 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.69.0] — 2026-05-09
+
+Minor release.  Public-feed UX polish + comparison-doc tightening
++ a cross-tenet economic-invariants test pin.  No protocol /
+consensus / wire-format changes; no new tx kinds; no new CLI
+surface.  Validators upgrading from 1.68.0 will replace the
+bundled `feed.html` static asset (the only operator-facing change
+they'll notice) and pick up the new test file.
+
+### Added
+
+  * **Public feed: paginate at 10 + clickable block-number filter
+    (`messagechain/static/feed.html`).**  Default render trims the
+    public feed (https://messagechain.org) to the 10 newest cards;
+    a "Show 10 more" link below the list expands the visible
+    budget by 10 per click, up to the server's
+    `PUBLIC_FEED_MAX_LIMIT` mirror (50).  Each fetch pulls one
+    PAGE_SIZE buffer beyond the display budget so the affordance
+    knows whether the chain has more rows to reveal without an
+    extra round-trip.  Block numbers in each card's meta row
+    become anchor links to `#block=<n>`; clicking filters the feed
+    to just that block, with its own banner + clear link
+    mirroring the existing community-filter pattern.  The two
+    filters stack (a card has to match both to remain visible).
+    Purely client-side; no server / API change. (0a6903e)
+
+  * **Cross-tenet economic invariants test
+    (`tests/test_economic_tenets_invariants.py`).**  Pin three
+    cross-cuts that hold the three Core Economic Tenets in
+    tension simultaneously, not just individually: (A)
+    `compute_dormancy_issuance` output unchanged across orders-of-
+    magnitude sweeps of fee/burn/mint bookkeeping fields
+    (Tenet 2's "issuance for supply integrity, not security-
+    budget funding" can't quietly drift); (B) at zero / low /
+    high / extreme fee throughputs, small validators strictly
+    earn more per-unit-stake revenue than large validators (the
+    concave attester-pool curve enforces this; the linear-in-
+    stake tip channel does not break the inequality); (C) at-
+    target / above-target / fixed-below-target controller
+    outputs are unchanged across 0× / 1× / 100× fee bookkeeping
+    (stable supply target invariant to fee throughput).  13
+    tests, ~1.9s.  No production-code changes. (3c2aeb6)
+
+### Changed
+
+  * **`COMPARISON.md`: top-5 competitor matrix with single
+    strongest advantage per row, plus 11-feature promise
+    matrix.**  Replaced the prior per-section narrative with a
+    high-level table that surfaces MessageChain's distinct
+    advantage against each of the top 5 nearby projects in one
+    line, then lays out an 11-feature promise matrix so a
+    visitor can see at a glance which guarantees MC ships vs. the
+    competitors. (4c9251b, 158b739, 018f775, 1b5826b)
+
 ## [1.68.0] — 2026-05-07
 
 Minor release.  Audit round 38 top-3 ships: one new hard fork (Tier
