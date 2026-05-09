@@ -27,6 +27,10 @@ def message_category(msg_type: MessageType) -> str:
                           gossip (each carries a WOTS+-class signature —
                           tight bucket so a flood can't force unbounded
                           signature-verify CPU spend)
+        pending_tx      — ANNOUNCE_PENDING_TX gossip carrying WOTS+-signed
+                          stake / unstake / authority / governance txs
+                          (same CPU-DoS shape as signed_announce; sized
+                          tighter still — see ratelimit.RATE_PENDING_TX)
         general         — handshakes, chain-height probes, everything else
 
     Any message type that isn't explicitly mapped falls into `general`.
@@ -53,6 +57,19 @@ def message_category(msg_type: MessageType) -> str:
         # Digest arrivals — additionally throttled per-peer by interval
         # (see Node._mempool_digest_last_seen / MEMPOOL_DIGEST_MIN_INTERVAL_SEC).
         return "mempool_digest"
+    if msg_type == MessageType.ANNOUNCE_PENDING_TX:
+        # Audit r39 #3: routes to the dedicated pending_tx bucket
+        # (RATE_PENDING_TX = 2/s, burst 20) instead of falling
+        # through to the wide general bucket (30/s, burst 100).
+        # ANNOUNCE_PENDING_TX carries WOTS+-signed stake / unstake /
+        # authority / governance txs; each receipt forces a WOTS+
+        # parse + verify (~2.7 KB sig, ~thousand hash invocations).
+        # Pre-fix the bucket existed and was sized correctly but the
+        # routing was missing, so a peer could sustain 30 WOTS+
+        # verifies per second indefinitely against an honest
+        # validator -- a real CPU-DoS vector.  See
+        # ratelimit.RATE_PENDING_TX for sizing rationale.
+        return "pending_tx"
     if msg_type in (
         MessageType.ANNOUNCE_ATTESTATION,
         MessageType.ANNOUNCE_FINALITY_VOTE,
