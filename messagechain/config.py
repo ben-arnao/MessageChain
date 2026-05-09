@@ -6862,6 +6862,71 @@ assert (
 )
 
 
+# ``WITNESS_ACK_ISSUER_BINDING_HEIGHT``: Tier 68 -- post-activation
+# the witnessed-submission discharge readers (admission gate, sim
+# path, ``NonResponseEvidenceProcessor.process``) consult a parallel
+# per-issuer registry ``witness_ack_by_issuer: dict[request_hash,
+# dict[issuer_id, ack_height]]`` instead of the legacy single-key
+# ``witness_ack_registry: dict[request_hash, ack_height]``.  Only the
+# request's TARGET validator's own ack discharges the silent-drop
+# obligation; an attacker validator's ack for the same request_hash
+# does NOT discharge the target's obligation.
+#
+# Pre-fix the legacy registry was keyed only on ``request_hash``, so
+# any registered validator's ack discharged the target's obligation.
+# Concrete attack: the target validator silently drops a witnessed
+# SubmissionRequest; an attacker validator (any registered validator
+# -- a sybil under the registration burn is fine) signs an ack for
+# the same request_hash and a colluding proposer embeds it in
+# ``acks_observed_this_block``.  The chain's apply path writes the
+# legacy registry keyed on ``rh``.  ``validate_non_response_evidence
+# _tx`` then rejects honest evidence with "ack present in chain
+# state: obligation was met" -- discharging the target's silent-drop
+# obligation by the attacker's ack.
+#
+# Net pre-fix: the entire silent-drop censorship arm of the
+# witnessed-submission slashing pipeline collapses to a 2-validator
+# collusion threshold (target + 1 ack-signer + a friendly proposer).
+# CLAUDE.md anchor at risk: "censorship resistance is a *collective
+# decision* … any new inclusion / mempool / proposer rule must raise
+# the evidentiary cost of suppression."  The witnessed-submission
+# pipeline IS that slashable-evidence layer for silent-drop censorship;
+# pre-fix it could be defeated by 2 validators.
+#
+# Tier 68 fix: maintain a parallel per-issuer registry, populated at
+# apply time alongside the legacy registry.  Discharge readers
+# post-activation consult ``witness_ack_by_issuer[rh].get(target_id)``
+# so only the target's own ack discharges.  Pre-fork the legacy
+# reader runs unchanged so historical blocks replay byte-identically.
+#
+# State-sync caveat: the per-issuer registry is in-memory only (not
+# serialized into the v23 snapshot envelope; the next snapshot
+# version bump will add it).  A node that bootstraps from a v23
+# snapshot at/after the activation height has an empty per-issuer
+# registry until the registry's prune window passes
+# (``WITNESS_OBSERVATION_RETENTION_BLOCKS +
+# WITNESS_RESPONSE_DEADLINE_BLOCKS``); during that window
+# discharge-by-target-ack does not short-circuit.  The worst-case
+# outcome is the slash check proceeds to the deadline + active-set +
+# quorum gates -- no incorrect slash, just no early discharge.
+#
+# Activation height 2650 sits 50 blocks above Tier 67 (height 2600)
+# -- ~8.3h cohort spacing matching the Tier 49-67 pattern.  Two-
+# validator coordinated upgrade.  No new wire format, no new tx
+# kinds, no state-tree changes -- pure consensus-rule swap inside
+# the discharge-reader path.
+WITNESS_ACK_ISSUER_BINDING_HEIGHT = 2650  # Tier 68
+
+assert (
+    WITNESS_ACK_ISSUER_BINDING_HEIGHT
+    > ATTESTER_COMMITTEE_DECIMAL_HEIGHT
+), (
+    "WITNESS_ACK_ISSUER_BINDING_HEIGHT must follow Tier 67 -- "
+    "consecutive consensus-rule activations need cohort spacing to "
+    "keep the validator-upgrade window from collapsing"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

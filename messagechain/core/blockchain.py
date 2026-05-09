@@ -755,6 +755,25 @@ class Blockchain:
         # _prune_witness_ack_registry.
         self.witness_ack_registry: dict[bytes, int] = {}
 
+        # Tier 68: per-issuer companion to ``witness_ack_registry``.
+        # Maps request_hash -> {issuer_id -> first ack_height}.
+        # Populated at apply time alongside the legacy registry; the
+        # post-fork discharge readers consult this so only the
+        # request's TARGET validator's own ack discharges the silent-
+        # drop obligation.  The pre-fix legacy registry conflates
+        # "ack observed for rh" with "obligation met by the target",
+        # collapsing the silent-drop censorship arm to a 2-validator
+        # collusion threshold.  Pruned symmetrically with the legacy
+        # registry; see ``_prune_witness_ack_registry``.  In-memory
+        # only at v23 of the snapshot envelope -- a state-synced node
+        # bootstraps with this empty until the registry's prune
+        # window passes.  During that window the slash gates run
+        # their deadline + active-set + quorum checks, so no
+        # incorrect slash, just no early discharge.  See
+        # WITNESS_ACK_ISSUER_BINDING_HEIGHT in config.py for the
+        # threat model.
+        self.witness_ack_by_issuer: dict[bytes, dict[bytes, int]] = {}
+
         # Tier 17 ReactTransaction state — owns the (voter, target,
         # target_is_user) -> latest_choice map and the per-target
         # denormalised aggregates (user_trust_score, message_score).
@@ -5449,11 +5468,36 @@ class Blockchain:
             return False, "Offender already slashed"
         if self.non_response_processor.has_processed(tx.evidence_hash):
             return False, "Evidence already processed"
-        if tx.request.request_hash in self.witness_ack_registry:
-            return False, (
-                "ack present in chain state: obligation was met for "
-                f"request_hash {tx.request.request_hash.hex()[:16]}"
+        # Tier 68: post-fork only the request's TARGET validator's
+        # own ack discharges the silent-drop obligation.  An
+        # attacker validator's ack for the same request_hash does
+        # NOT discharge -- closing the 2-validator-collusion bypass
+        # of the silent-drop censorship arm.  Pre-fork the legacy
+        # any-issuer-ack short-circuit runs unchanged for replay
+        # determinism on historical mainnet blocks.  See
+        # WITNESS_ACK_ISSUER_BINDING_HEIGHT in config.py for the
+        # threat model.
+        from messagechain.config import (
+            WITNESS_ACK_ISSUER_BINDING_HEIGHT as _T68_H,
+        )
+        _admission_height = self.height + 1
+        if _admission_height >= _T68_H:
+            target_id = tx.request.target_validator_id
+            by_issuer = self.witness_ack_by_issuer.get(
+                tx.request.request_hash, {},
             )
+            if target_id in by_issuer:
+                return False, (
+                    "ack present in chain state from target: "
+                    "obligation was met for request_hash "
+                    f"{tx.request.request_hash.hex()[:16]}"
+                )
+        else:
+            if tx.request.request_hash in self.witness_ack_registry:
+                return False, (
+                    "ack present in chain state: obligation was met for "
+                    f"request_hash {tx.request.request_hash.hex()[:16]}"
+                )
         if not self.supply.can_afford_fee(tx.submitter_id, tx.fee):
             return False, "Submitter cannot afford fee"
         # WOTS+ leaf-reuse gate at admission -- see comment on the
@@ -5546,6 +5590,19 @@ class Blockchain:
             if h < cutoff:
                 del self.witness_ack_registry[rh]
                 dropped += 1
+        # Tier 68: prune the per-issuer companion registry
+        # symmetrically.  Drop a request_hash entry when ALL its
+        # per-issuer ack heights are below the cutoff -- the same
+        # window the legacy registry uses, applied at the
+        # (rh, issuer) granularity.  Same-window pruning keeps the
+        # per-issuer registry footprint bounded by the same
+        # storage-discipline bound the legacy registry already had.
+        for rh, by_issuer in list(self.witness_ack_by_issuer.items()):
+            for iss, h in list(by_issuer.items()):
+                if h < cutoff:
+                    del by_issuer[iss]
+            if not by_issuer:
+                del self.witness_ack_by_issuer[rh]
         return dropped
 
     def get_median_time_past(self) -> float:
@@ -7851,10 +7908,25 @@ class Blockchain:
                 if etx.evidence_hash in sim_nre_processed:
                     continue
                 # ── Mirror NonResponseEvidenceProcessor.process() ──
-                # Ack-registry gate.
-                ack_h = self.witness_ack_registry.get(
-                    etx.request.request_hash,
+                # Ack-registry gate.  Tier 68: post-fork only the
+                # request's TARGET validator's ack discharges; an
+                # attacker validator's ack does NOT.  Pre-fork legacy
+                # any-issuer path runs for replay determinism.  See
+                # WITNESS_ACK_ISSUER_BINDING_HEIGHT in config.py.
+                from messagechain.config import (
+                    WITNESS_ACK_ISSUER_BINDING_HEIGHT as _NRE_T68_H,
                 )
+                if block_height >= _NRE_T68_H:
+                    by_issuer = self.witness_ack_by_issuer.get(
+                        etx.request.request_hash, {},
+                    )
+                    ack_h = by_issuer.get(
+                        etx.request.target_validator_id,
+                    )
+                else:
+                    ack_h = self.witness_ack_registry.get(
+                        etx.request.request_hash,
+                    )
                 if ack_h is not None and etx.witness_observations:
                     earliest_obs = min(
                         o.observed_height for o in etx.witness_observations
@@ -13648,9 +13720,27 @@ class Blockchain:
         # so historical mainnet blocks reapply unchanged.
         from messagechain.config import (
             ACK_BACKDATING_DEFENSE_HEIGHT as _ACK_BD_H,
+            WITNESS_ACK_ISSUER_BINDING_HEIGHT as _T68_H,
         )
         _use_inclusion_height = (
             int(block.header.block_number) >= _ACK_BD_H
+        )
+        # Tier 68: post-fork the apply path also populates a
+        # per-issuer companion registry so the discharge readers
+        # (admission gate, sim path, NonResponseEvidenceProcessor)
+        # can verify the ack was issued by the request's TARGET
+        # validator -- not by an attacker validator forging a
+        # discharge for a different target's request_hash.  The
+        # legacy single-key write is kept unconditionally so any
+        # consumer that still reads the legacy registry sees
+        # identical behavior, AND so a future read by an in-flight
+        # caller (e.g. the proposer's ack-gather skip-list) doesn't
+        # silently regress.  Pre-fork: per-issuer registry remains
+        # empty; only the legacy registry is populated.  See
+        # WITNESS_ACK_ISSUER_BINDING_HEIGHT in config.py for the
+        # threat model.
+        _populate_per_issuer = (
+            int(block.header.block_number) >= _T68_H
         )
         for ack in block_acks:
             rh = ack.request_hash
@@ -13664,6 +13754,23 @@ class Blockchain:
                     # commit_height verbatim.  Kept for replay
                     # determinism on historical blocks.
                     self.witness_ack_registry[rh] = int(ack.commit_height)
+            if _populate_per_issuer:
+                # Per-issuer is first-write-wins SCOPED to (rh,
+                # issuer_id) so multiple distinct issuers each get
+                # tracked under the same request_hash.  Recorded
+                # height matches the legacy registry's choice
+                # (post-Tier-39: inclusion height; pre-Tier-39:
+                # signed commit_height) so the deadline arithmetic
+                # in NonResponseEvidenceProcessor.process is
+                # consistent across both registries.
+                ack_h = (
+                    int(block.header.block_number)
+                    if _use_inclusion_height
+                    else int(ack.commit_height)
+                )
+                self.witness_ack_by_issuer.setdefault(rh, {}).setdefault(
+                    ack.issuer_id, ack_h,
+                )
         # Prune entries older than
         # WITNESS_OBSERVATION_RETENTION_BLOCKS + WITNESS_RESPONSE_DEADLINE_BLOCKS
         # — anything beyond that window is past evidence-assembly

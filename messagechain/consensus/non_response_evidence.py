@@ -535,11 +535,26 @@ class NonResponseEvidenceProcessor:
         from messagechain.config import (
             ACK_DEADLINE_GRACE_DEFENSE_HEIGHT as _T41_H,
             ACK_INCLUSION_GRACE as _T41_GRACE,
+            WITNESS_ACK_ISSUER_BINDING_HEIGHT as _T68_H,
         )
         _ack_grace = (
             _T41_GRACE if int(current_height) >= _T41_H else 0
         )
-        ack_h = blockchain.witness_ack_registry.get(request_hash)
+        # Tier 68: post-fork only the request's TARGET validator's
+        # own ack discharges the silent-drop obligation.  An attacker
+        # validator's ack for the same request_hash does NOT
+        # discharge -- closing the 2-validator-collusion bypass of
+        # the silent-drop censorship arm.  Pre-fork the legacy
+        # any-issuer-ack short-circuit runs unchanged for replay
+        # determinism.  See WITNESS_ACK_ISSUER_BINDING_HEIGHT in
+        # config.py for the threat model.
+        if int(current_height) >= _T68_H:
+            by_issuer = getattr(
+                blockchain, "witness_ack_by_issuer", {},
+            ).get(request_hash, {})
+            ack_h = by_issuer.get(tx.request.target_validator_id)
+        else:
+            ack_h = blockchain.witness_ack_registry.get(request_hash)
         if ack_h is not None and tx.witness_observations:
             earliest_obs = min(
                 o.observed_height for o in tx.witness_observations
