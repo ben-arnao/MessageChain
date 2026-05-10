@@ -4,6 +4,58 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.1] — 2026-05-10
+
+Patch release.  Audit round 40 top-3 #1 ships: pure CLI routing
+correctness fix on ``_parse_server`` (``messagechain/cli.py``).  No
+new wire format, no new tx kinds, no new CLI surface, no consensus
+impact -- the fix is bounded to the wallet-side helper that resolves
+``--server`` arguments to a ``(host, port)`` tuple for JSON-RPC
+clients.
+
+### Fixed
+
+  * **``_parse_server`` defaults to ``RPC_DEFAULT_PORT`` (9334), not
+    the P2P port (9333).**  Pre-fix the bare-host branch
+    (``--server seed.example.com`` with no explicit ``:port``) and
+    the dev-fallback branch (``--server`` unset, all seeds dead, last-
+    resort localhost) both resolved to ``DEFAULT_PORT = 9333`` -- the
+    P2P listener.  Every wallet-facing caller of this helper
+    (``send`` / ``transfer`` / ``balance`` / ``read`` / ``propose`` /
+    ``vote`` / ``react`` / ``receipt`` / ``validators`` / ``status``
+    when overriding default) speaks JSON-RPC and needs the RPC port
+    (9334).  Routing an RPC client to the P2P listener succeeds at
+    TCP-connect, mismatches at protocol, and surfaces to the user as
+    a generic ``Could not connect`` / hang with no hint that the port
+    is wrong.
+
+    Multi-year-stable footgun.  The sibling helper
+    ``_parse_server_local_default`` already does the right thing
+    (resolves bare-host and the localhost default to
+    ``RPC_DEFAULT_PORT``); the existing test
+    ``test_client_routing.py::test_explicit_host_only`` had encoded
+    the wrong behaviour as expected (``config.DEFAULT_PORT``), which
+    is exactly what kept the bug invisible across audit rounds --
+    test passed, code was wrong.  The matching ``_all_seeds_down``
+    fallback test pinned the same wrong port.
+
+    CLAUDE.md anchor at risk: Principle #3 (Simplicity) and the
+    E2E-newcomer-flow standing-focus item -- the user does exactly
+    what ``--help`` told them to and gets a silent connection
+    failure with no actionable diagnostic.  Same defect class as
+    the operator-side ``status``-routes-to-wrong-validator bug that
+    motivated ``_parse_server_local_default`` in the first place,
+    just on the wallet-side.
+
+    Soft fix; no fork, no consensus impact, no wire-format change --
+    pure CLI routing correctness.  Two-line code change plus a
+    docstring note calling out port-default discipline so future
+    contributors can't quietly re-introduce the bug.  13 regression
+    tests in ``tests/test_client_routing.py`` pass; the two
+    previously-wrong assertions are flipped to assert
+    ``RPC_DEFAULT_PORT`` for both bare-host and dev-fallback.
+    Surfaced by audit r40 top-3 #1.  (37d712e)
+
 ## [1.70.0] — 2026-05-09
 
 Minor release.  Audit round 39 top-3 ships: one new hard fork (Tier
