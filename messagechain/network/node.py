@@ -117,14 +117,25 @@ def _emit_pending_finality_slashes(*, blockchain, entity, mempool):
         existing = getattr(blockchain, "_pending_finality_slashes", []) or []
         blockchain._pending_finality_slashes = existing + pending
         return
-    from messagechain.consensus.slashing import create_slash_transaction
+    from messagechain.consensus.slashing import (
+        create_slash_transaction, compute_slash_tx_min_fee,
+    )
+    # Fee must clear BOTH the signature-aware admission floor (MIN_FEE
+    # per validate_slash_transaction) AND the current market base_fee.
+    # Audit r41 root cause: pre-fix this used base_fee alone, which
+    # decays to MARKET_FEE_FLOOR=1 at quiet mempool -- below MIN_FEE=100
+    # -- so the under-priced finality-double-vote slash tx admitted to
+    # mempool but stalled every block that included it.
     base_fee = getattr(
         getattr(blockchain, "supply", None), "base_fee", 100,
     )
+    current_height = getattr(blockchain, "height", None)
+    admission_floor = compute_slash_tx_min_fee(current_height)
+    fee = max(base_fee, admission_floor)
     for evidence in pending:
         try:
             slash_tx = create_slash_transaction(
-                entity, evidence, fee=base_fee,
+                entity, evidence, fee=fee,
             )
         except Exception:
             logger.exception(

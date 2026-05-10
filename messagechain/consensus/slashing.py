@@ -581,6 +581,54 @@ def verify_slashing_evidence(
     return True, "Valid double-sign evidence"
 
 
+def compute_slash_tx_min_fee(
+    current_height: int | None,
+    signature_bytes: int = 4096,
+) -> int:
+    """Smallest fee that clears ``Blockchain.validate_slash_transaction``.
+
+    Mirrors the validator's call shape
+    ``enforce_signature_aware_min_fee(..., flat_floor=MIN_FEE)`` so a
+    watcher building a slash tx can pre-compute the floor it must pay
+    instead of guessing (the canonical hands-off guess
+    ``supply.base_fee`` decays to MARKET_FEE_FLOOR=1 at quiet mempool,
+    which is well below MIN_FEE=100 and gets rejected at admission --
+    audit r41 stall root cause: the rejected slash tx sits in the
+    proposer's mempool, every block that includes it fails block
+    validation, chain wedges).
+
+    The validator's `flat_floor` for slash txs is ``MIN_FEE``, so the
+    binding minimum at today's regime (height >= MARKET_FEE_FLOOR_HEIGHT)
+    is just ``MIN_FEE``; older regimes (FEE_INCLUDES_SIGNATURE_HEIGHT
+    .. FLAT_FEE_HEIGHT) bound on the signature-aware adjustment.
+
+    ``signature_bytes`` is only used in the legacy
+    ``FEE_INCLUDES_SIGNATURE_HEIGHT <= height < FLAT_FEE_HEIGHT`` window;
+    a conservative high-end estimate is fine outside it.  Default 4096
+    covers any plausible WOTS+ witness size.
+    """
+    from messagechain.core.transaction import (
+        MIN_FEE, MIN_FEE_POST_FLAT, MARKET_FEE_FLOOR, calculate_min_fee,
+        FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT,
+        MARKET_FEE_FLOOR_HEIGHT,
+    )
+    floor = MIN_FEE
+    if current_height is None:
+        return floor
+    if current_height >= MARKET_FEE_FLOOR_HEIGHT:
+        return max(floor, MARKET_FEE_FLOOR)
+    if current_height >= FLAT_FEE_HEIGHT:
+        return max(floor, MIN_FEE_POST_FLAT)
+    if current_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
+        sig_min = calculate_min_fee(
+            b"",
+            signature_bytes=signature_bytes,
+            current_height=current_height,
+        )
+        return max(floor, sig_min)
+    return floor
+
+
 def create_slash_transaction(
     submitter_entity,
     evidence: SlashingEvidence | AttestationSlashingEvidence,

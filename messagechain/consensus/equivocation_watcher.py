@@ -367,17 +367,26 @@ class EquivocationWatcher:
             # None so callers know nothing hit the mempool.
             return None
 
-        # Fee must clear the current base_fee; pay_fee_with_burn rejects
-        # any slash tx whose fee is below base_fee.  Reading base_fee
-        # live from SupplyTracker keeps the watcher in step with fee
-        # market moves instead of hard-coding a number that eventually
-        # goes stale.
+        # Fee must clear BOTH the validator's signature-aware admission
+        # floor (``MIN_FEE`` per ``validate_slash_transaction``'s call
+        # to ``enforce_signature_aware_min_fee(flat_floor=MIN_FEE)``)
+        # AND the current market ``base_fee`` (``pay_fee_with_burn``
+        # rejects below base_fee).  Audit r41 root cause: pre-fix the
+        # watcher used ``supply.base_fee`` alone, which decays to
+        # ``MARKET_FEE_FLOOR=1`` at quiet mempool -- well below
+        # ``MIN_FEE=100``.  The under-priced slash tx admits to mempool
+        # but every block proposer that includes it fails block
+        # validation, stalling the chain.
+        from messagechain.consensus.slashing import compute_slash_tx_min_fee
         base_fee = getattr(
             getattr(self.blockchain, "supply", None), "base_fee", 100,
         )
+        current_height = getattr(self.blockchain, "height", None)
+        admission_floor = compute_slash_tx_min_fee(current_height)
+        fee = max(base_fee, admission_floor)
         try:
             slash_tx = create_slash_transaction(
-                self.submitter_entity, evidence, fee=base_fee,
+                self.submitter_entity, evidence, fee=fee,
             )
         except Exception as exc:
             logger.error(
