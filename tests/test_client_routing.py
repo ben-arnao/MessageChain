@@ -31,8 +31,13 @@ class TestManualOverride(unittest.TestCase):
         self.assertEqual((host, port), ("example.com", 12345))
 
     def test_explicit_host_only(self):
+        # Bare --server HOST must resolve to the RPC port (9334), not
+        # the P2P port (9333) — every wallet/CLI command speaks JSON-
+        # RPC.  Routing to the P2P listener gives a silent connect-
+        # then-protocol-mismatch failure that surfaces as a generic
+        # "Could not connect" with no hint the port is wrong.
         host, port = cli._parse_server("example.com")
-        self.assertEqual((host, port), ("example.com", config.DEFAULT_PORT))
+        self.assertEqual((host, port), ("example.com", config.RPC_DEFAULT_PORT))
 
 
 class TestAutoRouting(unittest.TestCase):
@@ -50,10 +55,13 @@ class TestAutoRouting(unittest.TestCase):
         config.CLIENT_SEED_ENDPOINTS = self._orig_seeds
 
     def test_all_seeds_down_falls_back_to_localhost(self):
-        """Every seed unreachable: last-resort dev fallback to localhost."""
+        """Every seed unreachable: last-resort dev fallback to localhost
+        on the RPC port (9334), not the P2P port (9333).  Same defect
+        class as ``test_explicit_host_only`` — the whole helper exists
+        to resolve targets for JSON-RPC clients."""
         with patch.object(cli, "_try_tcp_open", return_value=False):
             host, port = cli._parse_server(None)
-        self.assertEqual((host, port), ("127.0.0.1", 9333))
+        self.assertEqual((host, port), ("127.0.0.1", config.RPC_DEFAULT_PORT))
 
     def test_reachable_seed_with_no_other_validators_stays_on_seed(self):
         """When only seeds are validators (bootstrap), stick with the seed."""

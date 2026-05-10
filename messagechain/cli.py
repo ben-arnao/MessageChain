@@ -1565,7 +1565,7 @@ def _parse_server(server_str):
        outside validators come online and are reachable, load spreads
        across the network.
     3. If no non-seed validators have endpoints yet, stay on the seed.
-    4. Final fallback: localhost:9333 (useful for dev).
+    4. Final fallback: localhost:RPC_DEFAULT_PORT (useful for dev).
 
     Users always retain manual override via `--server`.
 
@@ -1573,19 +1573,28 @@ def _parse_server(server_str):
     / rotate-key-if-needed), use ``_parse_server_local_default``
     instead -- those questions are inherently local and the seed
     auto-pick silently returns the wrong answer.
+
+    Port-default discipline: every callsite of this helper feeds the
+    result into a JSON-RPC client (send / transfer / balance / read /
+    propose / vote / receipt / ...).  Both the bare-host branch and
+    the dev-fallback branch must therefore default to ``RPC_DEFAULT_PORT``
+    (9334), NOT the P2P port (9333) -- routing an RPC client to the
+    P2P listener succeeds at TCP-connect, mismatches at protocol, and
+    surfaces to the user as a generic "Could not connect" with no
+    hint the port is wrong.
     """
+    from messagechain.config import RPC_DEFAULT_PORT
     if server_str is not None and server_str != "":
         if ":" in server_str:
             host, port = server_str.rsplit(":", 1)
             return host, int(port)
-        from messagechain.config import DEFAULT_PORT
-        return server_str, DEFAULT_PORT
+        return server_str, RPC_DEFAULT_PORT
 
     endpoint = _auto_pick_endpoint()
     if endpoint is not None:
         return endpoint
     # Last-resort dev fallback so a local unconfigured node still works.
-    return "127.0.0.1", 9333
+    return "127.0.0.1", RPC_DEFAULT_PORT
 
 
 def _try_tcp_open(host: str, port: int, timeout: float = 2.0) -> bool:
