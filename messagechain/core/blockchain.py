@@ -12776,6 +12776,29 @@ class Blockchain:
         )
         curve_active = get_honesty_curve_active(block.header.block_number)
         slash_pct_for_block = get_slash_pct(block.header.block_number)
+        # Audit r41 #2: defer ``_bump_slash_offense_count`` until AFTER
+        # the inactivity / coverage leaks below for the same reason
+        # ``proposer_sig_counts`` is deferred (see deferred-bump note
+        # at the new bump location for the full rationale).  The
+        # honesty-curve helper ``_track_record`` reads
+        # ``self.slash_offense_counts`` (post-Tier-24
+        # ``HONESTY_CURVE_RATE_HEIGHT``) AND
+        # ``_prior_offenses`` reads it directly to gate the
+        # ``prior >= 1 -> no relief`` branch.  Sim does NOT mirror
+        # ``slash_offense_counts`` mutations (it's not in the state-
+        # tree leaf, see comment at line ~6357).  If a slash applies
+        # to an offender who is ALSO in the inactivity-leak inactive
+        # set, apply's relief multiplier reads post-bump priors while
+        # sim reads pre-bump priors -> different penalty -> different
+        # ``staked[offender]`` -> different state_root -> chain
+        # wedge, identical defect class to the proposer_sig_counts
+        # divergence shipped in 1.70.3.  Bites on every slash-bearing
+        # block at heights >= INACTIVITY_LEAK_STAKE_SCALED_HEIGHT
+        # where the slash offender is also inactive in this block,
+        # which is the canonical case in a 2-validator network whose
+        # equivocator (the slash target) is by definition not
+        # attesting to the slasher's block.
+        slash_offense_offenders_to_bump: list[bytes] = []
         for stx in block.slash_transactions:
             if not self.supply.pay_fee_with_burn(stx.submitter_id, proposer_id, stx.fee, current_base_fee):
                 logger.error(
@@ -12802,10 +12825,10 @@ class Blockchain:
                 stx.submitter_id,
                 slash_pct=stx_slash_pct,
             )
-            # Route through the chokepoint so the chaindb mirror picks
-            # up the bump.  Same cold-restart determinism reasoning as
-            # the apply_slash_transaction site above.
-            self._bump_slash_offense_count(stx.evidence.offender_id)
+            # Defer the slash_offense_counts bump.  Capture the offender
+            # id; a single deferred pass after the leak blocks below
+            # bumps every collected offender via the chokepoint.
+            slash_offense_offenders_to_bump.append(stx.evidence.offender_id)
             if stx_slash_pct == 100:
                 self.slashed_validators.add(stx.evidence.offender_id)
                 # Reputation reset: same policy as
@@ -13685,6 +13708,19 @@ class Blockchain:
         self.proposer_sig_counts[proposer_id] = (
             self.proposer_sig_counts.get(proposer_id, 0) + 1
         )
+
+        # Audit r41 #2: deferred slash_offense_counts bumps from the
+        # slash-tx loop above.  Bumping here -- AFTER the inactivity
+        # and coverage leaks have read `slash_offense_counts` via the
+        # honesty-curve relief multiplier -- ensures sim and apply
+        # both compute the relief against the SAME (pre-bump) priors
+        # value.  See the explanatory comment at the slash loop's
+        # deferral capture point for the full rationale.  Routed
+        # through `_bump_slash_offense_count` so the chaindb mirror
+        # picks up each bump (cold-restart determinism with
+        # uprestarted peers).
+        for _offender_id in slash_offense_offenders_to_bump:
+            self._bump_slash_offense_count(_offender_id)
 
         # Proof-of-custody archive rewards — redirect a fraction of
         # this block's fee-burn into the archive reward pool, and pay

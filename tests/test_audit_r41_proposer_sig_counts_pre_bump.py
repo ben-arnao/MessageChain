@@ -106,6 +106,84 @@ class TestStructuralSourcePinBumpDeferred(unittest.TestCase):
             "helper).",
         )
 
+    def test_slash_offense_counts_bump_after_inactivity_and_coverage_leak(
+        self,
+    ):
+        """Companion to ``test_proposer_sig_counts_bump_after_...``:
+        ``_bump_slash_offense_count`` is also a sim-vs-apply divergence
+        risk because ``_track_record`` (post-Tier-24
+        ``HONESTY_CURVE_RATE_HEIGHT``) and ``_prior_offenses`` BOTH
+        read ``slash_offense_counts``.  The honesty-curve relief
+        multiplier consults this dict -- if the slash-tx loop bumps
+        priors BEFORE the inactivity / coverage leaks (legacy order)
+        then apply sees post-bump priors while sim sees pre-bump (sim
+        doesn't mirror slash_offense_counts since it's not in the
+        state-tree leaf).  When the slash offender is ALSO in the
+        inactivity-leak inactive set (the canonical case in a 2-
+        validator network -- the slash target by definition isn't
+        attesting to the slasher's block) the divergence wedges the
+        chain.  Same defect class as the proposer_sig_counts pre-bump
+        bug (audit r41 #1).  This test pins the deferral by source
+        order so an accidental revert that re-bumps in the slash loop
+        body fails immediately.
+        """
+        src = inspect.getsource(blockchain_mod.Blockchain._apply_block_state)
+        leak_marker = "apply_inactivity_leak("
+        coverage_marker = "_apply_inclusion_list_coverage_leak("
+        # The actual bump call site that produces a side-effect.
+        # The deferred loop iterates over the captured offender list.
+        bump_marker = "self._bump_slash_offense_count(_offender_id)"
+        leak_idx = src.find(leak_marker)
+        coverage_idx = src.find(coverage_marker)
+        bump_idx = src.find(bump_marker)
+        self.assertGreater(
+            bump_idx, 0,
+            f"can't find {bump_marker} in _apply_block_state -- "
+            "either the deferred bump call moved or the search "
+            "marker drifted; the deferred bump is load-bearing (chain "
+            "wedges without it under post-Tier-59 + slash + inactive-"
+            "offender conditions)",
+        )
+        self.assertGreater(
+            bump_idx, leak_idx,
+            "self._bump_slash_offense_count(_offender_id) must appear "
+            "AFTER apply_inactivity_leak() in _apply_block_state's "
+            "source so the apply-time honesty-curve `_track_record` "
+            "and `_prior_offenses` read the same slash_offense_counts "
+            "value the sim path (compute_post_state_root) sees -- "
+            "which never mutates slash_offense_counts at all.",
+        )
+        self.assertGreater(
+            bump_idx, coverage_idx,
+            "self._bump_slash_offense_count(_offender_id) must appear "
+            "AFTER _apply_inclusion_list_coverage_leak() in "
+            "_apply_block_state's source so the coverage-leak path "
+            "also reads pre-bump priors (it consults the same "
+            "_apply_honesty_curve_relief helper).",
+        )
+
+    def test_slash_loop_does_not_inline_bump_slash_offense_count(self):
+        """Reverse pin: the legacy inline call inside the slash loop
+        body is GONE.  An accidental partial revert that adds the
+        inline bump back without removing the deferred one would
+        double-count every slash and silently inflate
+        ``slash_offense_counts[offender]`` per block.
+        """
+        src = inspect.getsource(blockchain_mod.Blockchain._apply_block_state)
+        # Count the literal call shape `self._bump_slash_offense_count(`.
+        # Post-fix the function has exactly ONE such occurrence:
+        # the deferred-loop call site.  Any other shape must trip
+        # this guard.
+        count = src.count("self._bump_slash_offense_count(")
+        self.assertEqual(
+            count, 1,
+            f"expected exactly ONE _bump_slash_offense_count call in "
+            f"_apply_block_state (the deferred loop after the inactivity "
+            f"and coverage leaks); found {count}.  An inline call inside "
+            f"the slash-tx loop body would double-count or restore the "
+            f"audit r41 #2 sim-vs-apply divergence.",
+        )
+
     def test_legacy_pre_bump_location_no_longer_carries_count_increment(
         self,
     ):
