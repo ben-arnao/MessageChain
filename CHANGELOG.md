@@ -4,6 +4,96 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.4] — 2026-05-10
+
+Patch release.  Companion hotfix to 1.70.3 -- same audit r41 root
+cause, second instance of the same defect class.  1.70.3 deferred
+the ``proposer_sig_counts`` bump until after the inactivity /
+coverage leaks; 1.70.4 does the same for the
+``slash_offense_counts`` bump in the inline slash-tx loop of
+``_apply_block_state``.
+
+### Fixed
+
+  * **``slash_offense_counts`` bump deferred until after inactivity-
+    leak + coverage-leak blocks (audit r41 #2 root cause).**  Pre-
+    fix the inline slash-tx loop in ``_apply_block_state`` called
+    ``self._bump_slash_offense_count(stx.evidence.offender_id)``
+    BEFORE the inactivity / coverage leaks below it.
+    ``compute_post_state_root_for_block``'s sim path doesn't mirror
+    ``slash_offense_counts`` mutations (the dict is not in the
+    state-tree leaf).  But the honesty-curve helper
+    ``_apply_honesty_curve_relief`` -- via ``_track_record`` (post-
+    Tier-24 ``HONESTY_CURVE_RATE_HEIGHT`` rate factor) AND via
+    ``_prior_offenses`` (the ``prior >= 1 -> no relief`` branch
+    gate) -- READS ``self.slash_offense_counts`` directly when the
+    inactivity / coverage leaks compute their per-validator relief
+    multiplier.
+
+    Concrete cascade: when a slash applies in block N to an
+    offender who is ALSO in the inactivity-leak inactive set (the
+    canonical case in a 2-validator network -- the slash target is
+    by definition NOT attesting to the slasher's block, so they're
+    "inactive" for that block), apply's relief multiplier reads
+    post-bump priors (``>= 1`` -> no relief, full nominal penalty)
+    while sim reads pre-bump priors (``0`` -> relief applies,
+    reduced penalty).  Different per-validator burn -> different
+    ``staked[offender]`` -> different state_root -> chain wedges
+    with ``Invalid state_root -- state commitment mismatch``,
+    identical fingerprint to the audit r41 #1 wedge that 1.70.3
+    closed.  Observed on validator-1 immediately after the 1.70.3
+    upgrade: the self-proposal at the post-boot catch-up slot
+    included v1's slash-against-v2 from the watcher's mempool, and
+    the inactivity-leak relief multiplier divergence on the
+    offender (v2) wedged the proposed block.
+
+    CLAUDE.md anchor at risk: same as audit r41 #1 -- "honest
+    operators are insured against accidents" via the inactivity-
+    leak relief multiplier; sim-vs-apply divergence on the
+    multiplier's inputs makes that anchor actively chain-wedging.
+
+    Permanent fix: capture each slash's ``offender_id`` during the
+    inline slash-tx loop into a deferred list, then bump
+    ``slash_offense_counts`` for every captured offender via the
+    ``_bump_slash_offense_count`` chokepoint AFTER both the
+    inactivity leak and the coverage leak have run.  Both leak
+    paths thus read ``slash_offense_counts`` at its pre-block
+    value -- matching what sim sees in
+    ``compute_post_state_root`` (which never mutates the dict).
+
+    All other slash mutations (``pay_fee_with_burn``, escrow drain,
+    ``slash_validator`` stake/pending/finder,
+    ``slashed_validators.add`` on 100% slashes,
+    ``_clear_reputation``, ``slash_sig_counts``, watermark bump)
+    keep their original position; only the
+    ``slash_offense_counts`` bump moves.  Pre-Tier-59 the reorder
+    is byte-identical to the legacy order on every historical
+    block (penalty=0 -> relief multiplier delta has nothing to
+    multiply).  Post-Tier-59 (no historical state) the new order
+    applies cleanly.
+
+    Soft fix.  No fork, no consensus rule change at the validator,
+    no new wire format, no new tx kinds, no new CLI surface.  2 new
+    structural regression tests in
+    ``tests/test_audit_r41_proposer_sig_counts_pre_bump.py`` pin:
+    (1) the deferred bump call must follow both leak call sites in
+    ``_apply_block_state`` source; (2) exactly ONE
+    ``_bump_slash_offense_count(`` call shape in the whole function
+    (a partial revert that adds an inline call back without
+    removing the deferred one would double-count every slash).
+    Surfaced post-1.70.3 rollout to validator-1 -- audit r41 #2
+    root cause (companion to #1).  (7d01cf3)
+
+Roll-out note: rolling 1.70.4 to validators currently on 1.70.3
+clears the in-memory mempool on restart and re-attempts block 2200
+with both deferrals in place; sim and apply now agree on every
+relief-multiplier input, the proposed block admits, the chain
+advances.  The original height-2199 transient race won't slash
+either validator -- the equivocation evidence in chaindb
+``seen_signatures`` requires a SECOND conflicting block at height
+2199 to retrigger and no such block will be gossiped now that the
+chain has moved on.
+
 ## [1.70.3] — 2026-05-10
 
 Patch release.  Root-cause hotfix for the 2026-05-10 mainnet stall
