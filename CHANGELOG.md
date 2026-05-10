@@ -4,6 +4,119 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.3] — 2026-05-10
+
+Patch release.  Root-cause hotfix for the 2026-05-10 mainnet stall
+at block 2200.  Defers the proposer's
+``proposer_sig_counts[proposer_id] += 1`` bump in
+``Blockchain._apply_block_state`` until after the inactivity-leak
+and coverage-leak blocks so the apply path reads the same
+``proposer_sig_counts`` value the sim path reads -- closing the
+sim-vs-apply divergence on the inactivity-leak honesty-curve
+relief multiplier that wedged the chain at exactly the height
+``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT`` (Tier 59) activated.  The
+slash-tx-fee fix shipped in 1.70.2 was a downstream cascade fix;
+this is the underlying defect.  No fork, no consensus rule change
+at the validator, no new wire format, no new tx kinds, no new CLI
+surface -- pure ordering correctness inside ``_apply_block_state``.
+
+### Fixed
+
+  * **``proposer_sig_counts`` bump deferred until after inactivity-
+    leak + coverage-leak blocks (audit r41 root cause).**  Pre-fix
+    ``Blockchain._apply_block_state`` bumped
+    ``proposer_sig_counts[proposer_id] += 1`` BEFORE the
+    inactivity-leak block (and the coverage-leak block).
+    ``compute_post_state_root_for_block``'s sim path mirrors NONE
+    of that -- it reads ``self.proposer_sig_counts`` directly (sim
+    never mutates ``proposer_sig_counts``) and computes the
+    inactivity-leak relief multiplier against the PRE-bump track
+    record.  Apply, in the same call, computed the relief
+    multiplier against the POST-bump track record.
+
+    Concrete cascade observed at block 2200: both validators have
+    BYTE-IDENTICAL pre-block state (verified during diagnosis via
+    ``state_root`` / ``balances_sha256`` / ``staked_sha256``
+    probes), but every block-2200 proposal -- whether proposed by
+    v1 or v2 -- failed internally on its own ``add_block`` because
+    the proposer's claimed state_root (computed via sim, pre-
+    bump) didn't match the actual state_root (computed via apply,
+    post-bump).  ``Invalid state_root -- state commitment
+    mismatch`` rejection on every proposal slot, no honest path
+    to advance.  The slash-tx-fee mismatch the watcher then
+    surfaced was a downstream cascade of equivocation re-detection
+    that the chain could no longer escape.
+
+    The bug only bites when ALL THREE of the following hold:
+
+      1. The chain crosses
+         ``INACTIVITY_LEAK_STAKE_SCALED_HEIGHT = 2200`` (Tier 59).
+         Pre-fork the legacy flat formula floors the per-block
+         penalty to 0 at every realistic stall length
+         (``blocks² < 2²⁴`` requires stalls > 4096 blocks ~28
+         days, which the chain has never sustained), so the
+         relief-multiplier delta has nothing to multiply -- masking
+         the bug for the entire history of the chain.
+      2. Finality has stalled past
+         ``INACTIVITY_LEAK_ACTIVATION_THRESHOLD = 4`` (so
+         ``is_leak_active`` returns True).
+      3. The proposer is in the inactive set (didn't attest in
+         their own block -- the canonical case in any 2-validator
+         network where a proposer's own slot vote is structurally
+         omitted from their own block).
+
+    All three preconditions hit on mainnet at exactly block 2200.
+
+    CLAUDE.md anchor at risk: "honest operators are insured
+    against accidents" -- the inactivity leak's relief multiplier
+    exists PRECISELY to insulate long-tenured operators during
+    stalls; sim-vs-apply divergence on the relief multiplier's
+    inputs makes that anchor not just toothless but actively
+    chain-wedging.  Same defect class as the 1.46.0 / 1.47.0
+    sim-vs-apply slash-divergence fixes called out in the
+    ``compute_post_state_root_for_block`` pre-check rationale
+    comments.
+
+    Permanent fix: defer
+    ``self.proposer_sig_counts[proposer_id] += 1`` from its legacy
+    location (just after the proposer watermark bump) until AFTER
+    both ``apply_inactivity_leak`` and
+    ``_apply_inclusion_list_coverage_leak``.  Both leak paths
+    route through the same ``_apply_honesty_curve_relief`` helper
+    which reads ``self.proposer_sig_counts`` via ``_track_record``;
+    with the bump deferred, sim and apply agree on the value at
+    relief-multiplier-read time.
+
+    The watermark bump (which IS in the state-tree leaf, and which
+    sim mirrors at the same point in its own ordering) stays where
+    it is -- only the COUNT bump moves.
+    ``attestation_sig_counts`` doesn't move (not read by
+    ``_track_record``).  ``slash_offense_counts`` is its own latent
+    companion divergence (read by ``_track_record`` post-Tier-24,
+    mutated by slash-apply pre-leak) but only fires when an
+    offender is ALSO in the inactive set; deferred to a follow-up
+    audit since it doesn't bite the current mainnet wedge.
+
+    Soft fix.  Pre-Tier-59 the reorder is byte-identical to the
+    legacy order on every historical block (penalty=0 -> nothing
+    to multiply -> bump-order doesn't matter) so chain replay is
+    unchanged.  Post-Tier-59 (no historical state -- chain has
+    produced zero blocks at >= 2200) the new order applies
+    cleanly.  3 regression tests in
+    ``tests/test_audit_r41_proposer_sig_counts_pre_bump.py`` pin
+    the structural ordering contract.  Surfaced by mainnet stall
+    at height 2200 on 2026-05-10 -- audit r41 top root cause.
+    (51d56b0)
+
+Roll-out note: rolling 1.70.3 to a stalled validator clears the
+in-memory mempool on restart and re-attempts block 2200 with the
+fixed apply order; sim and apply now agree, the proposed block
+admits, the chain advances.  No slashing fires for the original
+height-2199 transient race -- the equivocation evidence in chaindb
+``seen_signatures`` requires a SECOND conflicting block at height
+2199 to retrigger, and no such block will be gossiped now that the
+chain has moved on.
+
 ## [1.70.2] — 2026-05-10
 
 Patch release.  Hotfix for an observed mainnet stall (~9h, height
