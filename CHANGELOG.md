@@ -4,6 +4,108 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.5] — 2026-05-10
+
+Patch release.  ACTUAL root-cause hotfix for the 2026-05-10 mainnet
+stall.  1.70.2 / 1.70.3 / 1.70.4 closed real defects -- the slash-
+tx-fee admission floor and the proposer_sig_counts /
+slash_offense_counts bumps that diverge sim-vs-apply through the
+inactivity-leak honesty-curve relief multiplier -- but in-process
+diagnostic on validator-1 confirmed that the failing block at
+height 2199 is PRE-Tier-59 (the inactivity-leak stake-scaled gate
+sits at 2200), so the relief multiplier path is INACTIVE for the
+stuck block.  The actual wedge trigger is a separate defect class:
+the watcher self-slashing on operator restart cycles.
+
+### Fixed
+
+  * **Equivocation watcher must never self-slash (audit r41 #3 --
+    actual mainnet wedge trigger).**  Pre-fix
+    ``EquivocationWatcher._emit_slash``
+    (``messagechain/consensus/equivocation_watcher.py``) and the
+    finality-double-vote drain
+    ``_emit_pending_finality_slashes``
+    (``messagechain/network/node.py``) both built slash txs without
+    checking whether the offender is the same entity as the
+    watcher's submitter.  Concrete cascade observed at block 2199
+    on mainnet:
+
+      1. v1's chaindb ``seen_signatures`` table holds v1's signature
+         on a previous-attempt block #2199 (persisted by
+         ``add_seen_signature`` from a prior failed propose-block
+         attempt -- the sig was emitted, the block then failed to
+         add for an unrelated reason, but the sig was already
+         stored).
+      2. v1 boots.  The proposer slot fires, builds a NEW block
+         #2199.  Slightly different content (timestamp drift, fresh
+         block header) -> byte-different sig at the same
+         (validator, height, round).
+      3. Watcher.observe_block_header runs the new sig through
+         ``_check_equivocation``, sees the stored prior-attempt
+         sig, classifies the conflict as "equivocation".
+      4. ``_emit_slash`` builds a SlashTransaction with
+         ``offender_id = v1.entity_id`` and
+         ``submitter_id = v1.entity_id`` (self-slash).
+      5. Block #2199 candidate is built with the self-slash tx in
+         ``slash_transactions``.
+      6. ``add_block`` runs.  Sim and apply diverge on the self-
+         slash apply (integer-rounding edge in the fee + finder-
+         reward + stake-burn flow when ``submitter == offender ==
+         proposer`` are all the same entity).  ``Invalid
+         state_root -- state commitment mismatch`` rejection.
+         Chain wedges.  Watcher re-fires every slot.
+
+    CLAUDE.md anchor at risk: "honest operators are insured against
+    accidents" + "honest, well-configured nodes should rarely if
+    ever be slashed under normal operation."  An operator's own
+    restart cycle -- the canonical "operational mishap" the anchor
+    exists to insulate -- was being slashed at the WATCHER layer,
+    NOT at the chain consensus layer (the chain never even saw the
+    slash because ``add_block`` kept rejecting the block).  The
+    watcher slashing the operator for retrying their own propose
+    path is a textbook anchor violation.
+
+    Censorship-resistance is preserved: if a different honest
+    watcher genuinely sees us double-sign on the wire (vs.
+    observing our chaindb-replayed prior attempt), that watcher
+    emits the slash from THEIR submitter context and lands it on
+    chain via standard gossip.  The local watcher's job is
+    detection + on-chain emission ONLY when the local node was not
+    itself the offender.
+
+    Permanent fix: every watcher path that builds a slash tx drops
+    it when ``offender == submitter`` (= local entity).
+
+      * ``EquivocationWatcher._emit_slash`` gains an early-return
+        guard right after the ``submitter_entity is None`` detect-
+        only-mode short-circuit:
+        ``if validator_id == self.submitter_entity.entity_id:
+        return``.
+      * ``_emit_pending_finality_slashes`` gains the symmetric
+        guard inside the per-evidence loop:
+        ``if offender_id == entity.entity_id: continue``.
+
+    Soft fix.  No fork, no consensus rule change at the validator,
+    no new wire format, no new tx kinds, no new CLI surface -- pure
+    watcher-side behavior tightening.  No replay impact: every
+    slash tx already on-chain was admitted by the canonical block
+    validator, so any historical slash that landed had to clear
+    admission with a non-self submitter (or come from a peer's
+    watcher).  The legacy-self-slash code path's mempool-pooled-
+    but-never-confirmed txs were never durable consensus state.
+
+    3 regression tests in
+    ``tests/test_audit_r41_no_self_slash.py`` pin:
+    (1) watcher does NOT pool a slash tx when offender is the
+        submitter entity;
+    (2) symmetric must-not-regress: a DIFFERENT validator
+        equivocating still produces a slash tx (censorship-
+        resistance defense intact);
+    (3) companion guard for the finality-double-vote drain path.
+
+    Surfaced post-1.70.4 rollout to validator-1 -- audit r41 #3.
+    (f6ffc3b)
+
 ## [1.70.4] — 2026-05-10
 
 Patch release.  Companion hotfix to 1.70.3 -- same audit r41 root
