@@ -13553,10 +13553,14 @@ class Blockchain:
         # credited at mint time), just lifting the spendable-balance
         # restriction.
         self._escrow.pop_matured(block.header.block_number)
-        # Track proposer's block signature count (WOTS+ leaf consumed)
-        self.proposer_sig_counts[proposer_id] = (
-            self.proposer_sig_counts.get(proposer_id, 0) + 1
-        )
+        # Track proposer's block signature WOTS+ leaf consumption.  The
+        # COUNT bump (``proposer_sig_counts[proposer_id] += 1``) is
+        # DEFERRED to after the inactivity and coverage leaks below --
+        # see the deferred-bump note alongside its new location for the
+        # audit r41 sim-vs-apply divergence rationale.  The WATERMARK
+        # bump stays here because the watermark IS in the state-tree
+        # leaf and ``compute_post_state_root_for_block`` mirrors it at
+        # the same point in its own ordering (line ~6982).
         if block.header.proposer_signature is not None:
             self._bump_watermark(proposer_id, block.header.proposer_signature.leaf_index)
         # Track attestation signatures (each consumes a WOTS+ leaf from the validator)
@@ -13648,6 +13652,39 @@ class Blockchain:
             self._apply_inclusion_list_coverage_leak(
                 block_lst, block_number=block.header.block_number,
             )
+
+        # Track proposer's block signature count (WOTS+ leaf consumed).
+        # Deferred from its legacy location (just after the proposer
+        # watermark bump) until AFTER both the inactivity leak (above)
+        # and the coverage leak (above) so the honesty-curve helper
+        # ``_track_record`` reads the SAME ``proposer_sig_counts`` value
+        # at apply-time as the sim path does in
+        # ``compute_post_state_root`` -- which never mutates
+        # ``proposer_sig_counts`` at all.  Pre-fix the bump fired BEFORE
+        # the leaks, sim saw pre-bump, apply saw post-bump, the honesty-
+        # curve relief multiplier produced different per-validator
+        # penalty deltas in the two paths, and any block where the
+        # inactivity leak fires for the proposer (which happens whenever
+        # finality has stalled past
+        # ``INACTIVITY_LEAK_ACTIVATION_THRESHOLD`` and the proposer
+        # didn't attest to their own block) wedged at
+        # ``Invalid state_root -- state commitment mismatch``.  Pre-
+        # Tier-59 (``current_height < INACTIVITY_LEAK_STAKE_SCALED_HEIGHT``)
+        # the bug doesn't bite because the legacy flat formula floors
+        # the penalty to 0 at every realistic stall length
+        # (``blocks_since_finality² < INACTIVITY_PENALTY_QUOTIENT=2²⁴``
+        # requires stalls > 4096 blocks ~28 days, which the chain has
+        # never sustained), so the reorder is byte-identical to the
+        # legacy order on every historical block.  Surfaced as a
+        # mainnet stall at block 2200 on 2026-05-10 -- audit r41 top
+        # root cause.  CLAUDE.md anchor at risk: "honest operators are
+        # insured against accidents" -- the inactivity leak's relief
+        # multiplier exists precisely to insulate long-tenured operators
+        # during stalls; sim-vs-apply divergence on its inputs makes
+        # that anchor not just toothless but actively chain-wedging.
+        self.proposer_sig_counts[proposer_id] = (
+            self.proposer_sig_counts.get(proposer_id, 0) + 1
+        )
 
         # Proof-of-custody archive rewards — redirect a fraction of
         # this block's fee-burn into the archive reward pool, and pay
