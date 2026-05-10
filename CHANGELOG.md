@@ -4,6 +4,88 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.70.2] — 2026-05-10
+
+Patch release.  Hotfix for an observed mainnet stall (~9h, height
+2199, 2026-05-10).  Pure soft-fix on the equivocation watcher's
+slash-tx fee computation -- no fork, no consensus rule change at
+the validator, no new wire format, no new tx kinds, no new CLI
+surface.
+
+### Fixed
+
+  * **Equivocation watcher slash-tx fee clears MIN_FEE admission
+    floor.**  Pre-fix
+    ``EquivocationWatcher._emit_slash``
+    (``messagechain/consensus/equivocation_watcher.py``) and the
+    finality-double-vote drain
+    ``_emit_pending_finality_slashes``
+    (``messagechain/network/node.py``) both built slash txs with
+    ``fee = supply.base_fee``.  At quiet mempool the EIP-1559-style
+    controller decays ``base_fee`` toward ``MARKET_FEE_FLOOR=1``.
+    But ``Blockchain.validate_slash_transaction`` calls
+    ``enforce_signature_aware_min_fee(..., flat_floor=MIN_FEE)``,
+    whose first comparison ``tx_fee < flat_floor`` rejects any fee
+    below ``MIN_FEE=100``.
+
+    Concrete cascade observed at height 2199 on mainnet: both
+    validators independently produced two distinct block-2199
+    candidates (transient race / restart).  Each watcher detected
+    the other's equivocation and emitted a slash tx at
+    ``fee = supply.base_fee = 1``.  Mempool admission did not run
+    the chain-level fee gate, so the under-priced slash tx admitted
+    -- but every subsequent block-proposal slot included it from
+    mempool, called ``validate_slash_transaction``, got the "Fee 1
+    below signature-aware minimum" rejection, and the whole block
+    failed validation.  Chain wedged at height 2199 for ~9 hours
+    with no honest path to advance.
+
+    CLAUDE.md anchor at risk: "Honest operators are insured against
+    accidents" -- the slash mechanism that backs collective
+    censorship-resistance must not also be the mechanism that wedges
+    the chain under a quiet-mempool race.  Specifically the watcher
+    MUST produce a slash tx that admits to the chain it detected
+    the equivocation on; no permutation of ``base_fee`` should
+    produce an inadmissible slash.
+
+    Permanent fix: new helper ``compute_slash_tx_min_fee(
+    current_height, signature_bytes)`` in
+    ``messagechain/consensus/slashing.py`` mirrors the validator's
+    ``enforce_signature_aware_min_fee(..., flat_floor=MIN_FEE)``
+    height-aware logic and returns the smallest fee that clears
+    admission at any height regime.  Today's
+    ``MARKET_FEE_FLOOR_HEIGHT`` and beyond -> ``MIN_FEE``; legacy
+    ``[FEE_INCLUDES_SIGNATURE_HEIGHT, FLAT_FEE_HEIGHT)`` -> max
+    against the signature-aware bump; pre-
+    ``FEE_INCLUDES_SIGNATURE_HEIGHT`` -> ``MIN_FEE``.  Both watcher
+    call sites now compute
+    ``fee = max(supply.base_fee, compute_slash_tx_min_fee(height))``,
+    preserving the busy-mempool tracking property
+    (``pay_fee_with_burn`` rejects below ``base_fee``) AND the
+    admission-floor floor.
+
+    Soft fix.  Watchers are local-only paths that emit txs into
+    mempool; the chain-side validator is unchanged.  Pre-fix-shape
+    txs (fee < MIN_FEE) were already rejected at admission, so any
+    historical slash tx in chain history had to clear the floor;
+    the fix retroactively closes the rejection-loop case.  8
+    regression tests in
+    ``tests/test_audit_r41_slash_tx_fee_floor.py`` pin (1) the
+    helper's output across every height regime, (2)
+    ``EquivocationWatcher._emit_slash`` admission with
+    ``base_fee=1`` (the failing case), (3) busy-market high-
+    ``base_fee`` tracking, (4)
+    ``_emit_pending_finality_slashes`` admission with
+    ``base_fee=1``.  (17cc8e2)
+
+Roll-out note: rolling 1.70.2 to a stalled validator clears the
+in-memory mempool on restart and re-emits the outstanding slash
+txs at the correct fee, allowing the chain to advance.  Slashing
+will fire on the underlying double-proposal evidence -- expected
+post-unstick behaviour, severity governed by the honesty curve
+(long-tenured / high-volume / high-honesty operators get the
+fractional first-offense relief, not catastrophic loss).
+
 ## [1.70.1] — 2026-05-10
 
 Patch release.  Audit round 40 top-3 #1 ships: pure CLI routing
