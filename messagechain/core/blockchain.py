@@ -7349,16 +7349,37 @@ class Blockchain:
             }
             _inactive = _giv(_expected, _actual)
             if _inactive:
-                # Tier 55: thread current_height (= the block being
-                # simulated, self.height + 1 by the time
-                # compute_post_state_root runs at apply-time) and self
-                # so the sim mirrors the apply-time relief multiplier.
-                # Without these the sim path bleeds full nominal while
-                # the apply path bleeds relief-multiplied → state-root
-                # divergence on every long-tenured-honest validator.
+                # Tier 55: thread current_height + self so the sim
+                # mirrors the apply-time honest-history relief
+                # multiplier.  Without these the sim path bleeds full
+                # nominal while the apply path bleeds relief-multiplied
+                # → state-root divergence on every long-tenured-honest
+                # validator.
+                #
+                # Audit r41 #4: current_height MUST equal block_height
+                # (the block being simulated -- i.e.
+                # ``block.header.block_number`` from apply's POV).  Pre-
+                # fix passed ``self.height + 1`` here.  Since chain has
+                # exactly ``self.height`` blocks indexed 0..(height-1)
+                # before the new block is appended, the new block's
+                # number IS ``self.height``, NOT ``self.height + 1``.
+                # The off-by-one fired exactly at Tier-N activation
+                # boundaries: on a block at the activation height,
+                # apply correctly took the pre-fork branch
+                # (block.header.block_number == activation - 1) while
+                # sim incorrectly took the post-fork branch
+                # (self.height + 1 == activation).  Mainnet stall
+                # 2026-05-10 at block 2199: Tier 59
+                # (INACTIVITY_LEAK_STAKE_SCALED_HEIGHT) at 2200, so
+                # apply legacy formula floored penalty to 0 but sim's
+                # stake-scaled formula produced a non-zero penalty,
+                # mutating sim_staked[inactive_validator] -> state_root
+                # divergence -> chain wedge.  CLAUDE.md anchor at risk:
+                # Mission ("permanent ledger"); honest-operator
+                # insurance.
                 _ail(sim_staked, sim_blocks_since_fin, _inactive,
                      min_stake=VALIDATOR_MIN_STAKE,
-                     current_height=self.height + 1,
+                     current_height=block_height,
                      blockchain=self)
 
         # Simulate censorship-evidence pipeline: submitter pays fee,
