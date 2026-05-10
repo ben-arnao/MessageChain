@@ -367,6 +367,42 @@ class EquivocationWatcher:
             # None so callers know nothing hit the mempool.
             return None
 
+        # Audit r41 #3: never self-slash.  If the watcher's offender
+        # equals the watcher's own ``submitter_entity``, the
+        # "equivocation" is the operator's OWN previous-attempt
+        # signature being re-detected against the current attempt --
+        # canonical on operator restart cycles where ``chaindb``'s
+        # ``seen_signatures`` persisted a sig from a prior failed
+        # propose-block attempt and the next attempt produces a
+        # byte-different sig (timestamp drift, fresh nonce, mempool
+        # delta) at the same (height, round).  Slashing the operator
+        # for retrying their own propose path is a textbook violation
+        # of the CLAUDE.md "honest operators are insured against
+        # accidents" anchor: the canonical-chain block at this height
+        # has not yet landed (our previous attempt failed), no peer
+        # depends on either signature, the only damage was the
+        # operator's own WOTS+ leaf burn (which is durable on the
+        # signing-key side regardless).  Nor does the broader
+        # collective-censorship-resistance defense lose anything --
+        # if an OTHER honest watcher genuinely sees us double-sign on
+        # the wire (vs. observing our chaindb-replayed prior attempt),
+        # they will still emit the slash from their submitter
+        # context, which lands on chain via standard gossip.  The
+        # network's slashable-evidence layer remains intact; the only
+        # path closed is the operator self-slashing on their own
+        # restart cycle.
+        if validator_id == self.submitter_entity.entity_id:
+            logger.warning(
+                "Self-equivocation detected for validator=%s "
+                "type=%s -- skipping slash emission (would self-slash "
+                "on operator restart cycle, see audit r41 #3 / "
+                "CLAUDE.md honest-operator-insurance anchor).  Other "
+                "honest watchers will slash if this is a genuine "
+                "on-the-wire double-sign.",
+                validator_id.hex()[:16], message_type,
+            )
+            return None
+
         # Fee must clear BOTH the validator's signature-aware admission
         # floor (``MIN_FEE`` per ``validate_slash_transaction``'s call
         # to ``enforce_signature_aware_min_fee(flat_floor=MIN_FEE)``)

@@ -133,6 +133,28 @@ def _emit_pending_finality_slashes(*, blockchain, entity, mempool):
     admission_floor = compute_slash_tx_min_fee(current_height)
     fee = max(base_fee, admission_floor)
     for evidence in pending:
+        # Audit r41 #3: never self-slash.  Same anchor as the
+        # equivocation-watcher block / attestation paths -- a finality-
+        # double-vote whose offender equals the local entity is the
+        # operator's own previous-attempt vote being re-detected
+        # against the current attempt under restart cycles, NOT a
+        # genuine on-the-wire double-sign.  Slashing the operator for
+        # retrying their own propose path is a textbook "honest
+        # operators are insured against accidents" anchor violation.
+        # Other honest watchers on the wire will slash if the double-
+        # sign is genuinely byzantine; the local watcher's job is
+        # detection + on-chain emission only when the local node was
+        # not itself the offender.
+        offender_id = getattr(evidence, "offender_id", None)
+        if offender_id is not None and offender_id == entity.entity_id:
+            logger.warning(
+                "Self-equivocation in FinalityDoubleVote queue for "
+                "offender %s -- skipping slash emission (audit r41 #3 "
+                "/ CLAUDE.md honest-operator-insurance anchor).  Other "
+                "honest watchers will emit if this is genuine.",
+                offender_id.hex()[:16],
+            )
+            continue
         try:
             slash_tx = create_slash_transaction(
                 entity, evidence, fee=fee,
