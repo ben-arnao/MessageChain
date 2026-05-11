@@ -3716,10 +3716,36 @@ def cmd_transfer(args):
 
     if response.get("ok"):
         result = response["result"]
+        tx_hash_hex = result["tx_hash"]
         print(f"\nTransfer submitted!")
-        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  TX hash: {tx_hash_hex}")
         print(f"  Amount:  {result['amount']} tokens")
         print(f"  Fee:     {result['fee']} tokens")
+        # Audit r45 #3: persist the validator-issued SubmissionReceipt
+        # to disk so the user holds the on-chain-slashable-evidence
+        # artifact if a coerced validator silently drops this transfer.
+        # CLAUDE.md collective-censorship anchor: the slashable-
+        # evidence path applies to every well-formed tx, not just
+        # messages.  Pre-fix cmd_transfer dropped result["receipt"]
+        # on the floor while cmd_send saved it, leaving transfers
+        # without the bundle ``submit-evidence censorship --receipt``
+        # consumes.  Best-effort write -- a disk failure does NOT
+        # fail the transfer (the tx is already on the wire).
+        receipt_hex = result.get("receipt")
+        if receipt_hex:
+            try:
+                bundle_path = _save_receipt_bundle(
+                    tx_hash_hex=tx_hash_hex,
+                    receipt_hex=receipt_hex,
+                    tx=tx,
+                    tx_kind="transfer",
+                )
+                print(f"  Receipt saved: {bundle_path}")
+            except OSError as e:
+                print(
+                    f"  (warning: could not save receipt bundle to "
+                    f"disk: {e})"
+                )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -5301,9 +5327,29 @@ def cmd_react(args):
 
     if response.get("ok"):
         result = response["result"]
+        tx_hash_hex = result["tx_hash"]
         print(f"\nReaction submitted!")
-        print(f"  TX hash: {result['tx_hash']}")
+        print(f"  TX hash: {tx_hash_hex}")
         print(f"  Fee:     {result.get('fee', fee)} tokens")
+        # Audit r45 #3: persist the validator-issued SubmissionReceipt
+        # to disk so the user has a slashable-evidence artifact if a
+        # coerced validator silently drops this reaction.  Mirrors the
+        # same pattern as cmd_send / cmd_transfer.  Best-effort write.
+        receipt_hex = result.get("receipt")
+        if receipt_hex:
+            try:
+                bundle_path = _save_receipt_bundle(
+                    tx_hash_hex=tx_hash_hex,
+                    receipt_hex=receipt_hex,
+                    tx=tx,
+                    tx_kind="react",
+                )
+                print(f"  Receipt saved: {bundle_path}")
+            except OSError as e:
+                print(
+                    f"  (warning: could not save receipt bundle to "
+                    f"disk: {e})"
+                )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
