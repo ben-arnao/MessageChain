@@ -4,6 +4,167 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.73.0] — 2026-05-11
+
+Minor release.  Audit r43 top-2 ships: the per-message permanence-
+receipt page at `/r/<tx_hash>` now renders the message body
+itself (the value-prop demo moment lands as "[body] — Permanent",
+not as a bureaucratic hash-and-percentages explorer page), and
+`send-multi` (the censorship-resistance escape hatch) gains the
+smart-defaults parity with `cmd_send` it should have shipped with
+— auto-fee, auto-nonce, auto-leaf-watermark via a new optional
+`--server` for chain-state queries, plus a README "Defending
+against single-node suppression" subsection so the protocol's
+structural defense against validator collusion has a usable
+surface.  No new tx kinds, no new wire format, no consensus rule
+change at the validator, no hard fork.
+
+### Added
+
+  * **Receipt page renders the message body (audit r43 #2 --
+    value-prop top-1).**  Pre-fix the 1.71.0 shareable-receipt
+    URL at `/r/<tx_hash>` -- the URL every `cmd_send` success
+    now prints alongside the `Share:` line -- rendered only the
+    inclusion verdict + finality stats + Merkle inclusion proof.
+    A friend who followed the share link saw a `Permanent` badge
+    attached to an opaque 64-hex `tx_hash`, with no message
+    body visible.  The chain's headline mission ("your message
+    can never be deleted") was invisible at the exact moment a
+    share-receipt link should make it visceral.
+
+    CLAUDE.md anchor at risk: Mission + dual-purpose-token /
+    mainstream-asset quality bar -- the receipt page is the
+    value-prop in motion, and shipping it as a hash-and-
+    percentages explorer reads as "trust the verdict" rather
+    than "here's the permanent artifact."
+
+    Fix:
+
+      * `Blockchain.get_tx_status_public` (the public-feed HTTP
+        shim backing `/v1/tx_status`; consumed by `/r/<tx>`)
+        now includes the message body, author `entity_id`,
+        optional `community_id`, and optional `prev`-pointer
+        hash for an included `MessageTransaction`.  Fields are
+        surfaced only when meaningful -- `community_id` / `prev`
+        omitted when None, `message`-body only on
+        `MessageTransaction` (transfer / react / slash carry no
+        user-readable body).
+      * `Server._build_included_status` (the JSON-RPC twin
+        consumed by `messagechain receipt` CLI) mirrors the same
+        fields so the receipt UI sees a consistent schema
+        regardless of port hit.
+      * `messagechain/static/receipt.html` `renderIncluded` now
+        renders a new Message section between the verdict and
+        the block-stats grid: body text (`textContent`, XSS-safe
+        -- chain payloads are arbitrary user bytes),
+        `by <entity_id>` link to `/e/<hex>`, optional community
+        badge linking to `/?community=<handle>`, optional
+        reply-parent link to `/r/<prev>`.  Section is hidden
+        when `result.message` is absent so transfer / react
+        receipts and pre-fix browser caches stay clean.
+
+    Pure value-prop / read-only HTTP surface fix.  No fork, no
+    consensus rule change, no wire-format change, no new tx
+    kinds.  `get_tx_status_public` is read-only metadata about
+    txs already on chain -- every included tx's plaintext,
+    `entity_id`, `community_id`, and `prev` are already public
+    anyway via `canonical_block_tx_hashes` and full-block
+    fetches.
+
+    7 regression tests in `tests/test_audit_r43_receipt_renders_
+    message_body.py` pin: (1) `get_tx_status_public` returns
+    `message` + `entity_id` for an included message; (2)
+    `community_id` surfaces when set; (3) `community_id` omitted
+    when None (no empty placeholder); (4) `prev` surfaces when
+    set; (5) `Server._build_included_status` mirrors all four
+    fields for CLI parity; (6) `receipt.html` references
+    `result.message` in the JS source; (7) `receipt.html`
+    references `result.entity_id` and links to `/e/`.
+
+    Surfaced by audit r43 value-prop axis #1 -- every share-
+    receipt link issued from CLI or feed now lands on a page
+    that surfaces what was actually anchored, not just the
+    verdict that something was.  (dae6023)
+
+  * **`send-multi` auto-resolves fee + nonce + leaf watermark
+    (audit r43 #3 -- UX top-1).**  Pre-fix the censorship-
+    resistance escape hatch (the only CLI path that defends a
+    single user against validator collusion / single-RPC-node
+    suppression) required the user to hand-supply `--fee`
+    (`required=True`), defaulted `--nonce` to 0 (silently wrong
+    on any non-fresh account), and used `--nonce` as the
+    `--leaf-index` floor with no reconciliation against the
+    chain's actual watermark.  A dissident reaching for this
+    command under pressure was exactly the population that
+    would set `--nonce 0` from muscle memory and either bounce
+    off "nonce too low" or, on a fresh-machine + previously-
+    used keyfile combination, burn a WOTS+ leaf the chain had
+    already seen -- grounds for equivocation slashing.
+
+    The on-disk per-entity leaf cursor (1.40.x cross-process
+    defense, `_bind_persistent_leaf_index`) already closed the
+    same-machine reuse window, so the agent's "100% slash on
+    first reuse" framing overstated the risk in the common
+    case -- but the cross-machine fresh-disk + reused-keyfile
+    path was still uncovered, and the manual-everything
+    ergonomics kept the structural-defense surface effectively
+    invisible to the population it exists for.
+
+    CLAUDE.md anchors at risk: censorship resistance ("one
+    honest validator is enough" must be usable, not just
+    structurally true); honest-operator insurance (leaf-reuse-
+    via-default is a stake-destroying footgun); Simplicity
+    (principle #3 -- hidden complexity is fine, surfaced
+    complexity is not).
+
+    Fix:
+
+      * `--fee` is now optional; `cmd_send_multi_submit` routes
+        through the shared
+        `messagechain.economics.auto_fee.auto_fee` when omitted
+        (same path as `cmd_send`).  New `--urgency` argument
+        {low, normal, high} tunes the picker.
+      * `--nonce` is now optional; auto-resolved via the
+        `get_nonce` JSON-RPC against the new `--server`
+        (defaults to your local node).
+      * `--leaf-index` is now optional; auto-resolved to the
+        `leaf_watermark` returned by the same `get_nonce` RPC
+        -- parity with `cmd_send`.  The on-disk cursor
+        continues to floor it independently so two consecutive
+        runs cannot reuse the same leaf even on a fresh machine.
+        Together the two defenses close the cross-machine
+        fresh-disk + reused-keyfile window.
+      * New `--server host:port` argument is the SOURCE of
+        chain state for the auto-defaults above; it is
+        INDEPENDENT of the fan-out `--endpoint` set, which
+        continues to drive the multi-validator HTTPS submission.
+        For trust-minimisation, users should point `--server`
+        at their own node.
+      * README "Defending against single-node suppression"
+        subsection names `send-multi` directly with a worked
+        example, plus a one-liner in the CLI reference.  The
+        protocol's structural defense against validator
+        collusion now has a doc surface.
+
+    Pure CLI ergonomics + read-only RPC use; no fork, no
+    consensus rule change, no wire-format change, no new tx
+    kinds.  Explicit `--fee N` / `--nonce N` /
+    `--leaf-index N` overrides are preserved exactly as before;
+    the change is purely additive.
+
+    5 regression tests in `tests/test_audit_r43_send_multi_
+    smart_defaults.py` pin: (1) parser accepts `send-multi`
+    without `--fee`; (2) omitted `--nonce` resolves to the
+    chain's nonce via `get_nonce`, AND the resulting signature
+    uses the chain's `leaf_watermark` (not nonce-as-fallback);
+    (3) omitted `--fee` threads through `auto_fee` (sentinel
+    return value lands on the tx); (4) explicit `--fee`
+    overrides the auto-pick; (5) README mentions `send-multi`.
+
+    Surfaced by audit r43 UX axis #1 -- the chain's structural
+    defense against its primary adversary now has a usable
+    surface.  (c503a79)
+
 ## [1.72.0] — 2026-05-11
 
 Minor release.  Tier 69 hard fork — three coupled honesty-curve
