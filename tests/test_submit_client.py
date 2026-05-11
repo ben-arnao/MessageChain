@@ -876,16 +876,21 @@ class TestCliMultiSubmit(SubmitClientTestBase):
                     rc = cmd_send_multi_submit(args)
                     self.assertEqual(rc, 0, msg="CLI returned non-zero")
 
-                    # A receipt file should exist for the tx.
-                    files = os.listdir(receipts_dir)
+                    # A receipt file should exist for the tx.  Audit r44 #2
+                    # changed the on-disk format from raw .bin to JSON
+                    # bundles (so submit-evidence censorship --receipt
+                    # can consume the file directly); load via the
+                    # bundle reader and verify the embedded receipt.
+                    from messagechain.cli import _load_receipt_bundle
+                    files = [
+                        f for f in os.listdir(receipts_dir)
+                        if f.endswith(".json")
+                    ]
                     self.assertGreaterEqual(len(files), 1)
-                    # The receipt files should round-trip via from_bytes.
                     for fname in files:
-                        with open(
-                            os.path.join(receipts_dir, fname), "rb"
-                        ) as f:
-                            blob = f.read()
-                        rec = SubmissionReceipt.from_bytes(blob)
+                        rec, _msg_tx = _load_receipt_bundle(
+                            os.path.join(receipts_dir, fname)
+                        )
                         ok, _ = verify_receipt(rec)
                         self.assertTrue(ok)
                 finally:

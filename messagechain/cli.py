@@ -3435,14 +3435,37 @@ def cmd_send_multi_submit(args) -> int:
         os.path.expanduser("~"), ".messagechain", "receipts",
     )
     if result.receipts:
-        os.makedirs(receipts_dir, exist_ok=True)
+        # Audit r44 #2: write JSON bundles (the format
+        # ``_load_receipt_bundle`` / ``submit-evidence censorship
+        # --receipt`` consumes) instead of raw ``.bin`` blobs.
+        # Pre-fix the success path wrote ``<tx>_<issuer>.bin`` and
+        # the slashable-evidence CLI rejected those with "missing
+        # `message_tx` field" -- the censorship-resistance escape
+        # hatch produced evidence the same CLI could not consume.
         # One file per (tx_hash, issuer_id) so multiple validators'
         # receipts for the same tx don't overwrite each other.
+        bundle_failures: list[tuple[str, OSError]] = []
         for r in result.receipts:
-            fname = f"{r.tx_hash.hex()}_{r.issuer_id.hex()[:16]}.bin"
-            path = os.path.join(receipts_dir, fname)
-            with open(path, "wb") as f:
-                f.write(r.to_bytes())
+            try:
+                _save_receipt_bundle(
+                    tx_hash_hex=result.tx_hash.hex(),
+                    receipt_hex=r.to_bytes().hex(),
+                    tx=tx,
+                    tx_kind="message",
+                    receipts_dir=receipts_dir,
+                    filename_suffix=r.issuer_id.hex()[:16],
+                )
+            except OSError as e:
+                bundle_failures.append((r.issuer_id.hex()[:16], e))
+        if bundle_failures:
+            # Best-effort: the tx is already on the wire; surfacing
+            # write failures lets the user re-fetch from disk later
+            # without misleading them about the tx itself.
+            for iid_prefix, err in bundle_failures:
+                print(
+                    f"  (warning: could not save receipt bundle for "
+                    f"issuer {iid_prefix}: {err})"
+                )
 
     if result.successes < client.min_successes:
         return 1
@@ -6382,6 +6405,7 @@ def _save_receipt_bundle(
     tx,
     tx_kind: str = "message",
     receipts_dir: str | None = None,
+    filename_suffix: str | None = None,
 ) -> str:
     """Write a SubmissionReceipt + receipted-tx pair to the user's
     receipts directory and return the file path.
@@ -6395,6 +6419,13 @@ def _save_receipt_bundle(
     The directory is created with mkdir -p semantics so the user
     doesn't have to seed it first.
 
+    `filename_suffix` is appended to the tx_hash in the on-disk name
+    so multi-validator paths (``send-multi``) can write N receipts
+    for the same tx_hash without overwriting each other.  Callers
+    should pass e.g. the first 16 hex chars of the issuer_id.  When
+    None, the filename is just ``<tx_hash_hex>.json`` (single-receipt
+    case from ``cmd_send`` -- byte-identical to pre-multi behaviour).
+
     Returns the absolute path of the written file.  Raises OSError
     on unrecoverable write failure -- callers should treat this as
     best-effort and continue (the tx is already on the wire).
@@ -6403,7 +6434,11 @@ def _save_receipt_bundle(
 
     target_dir = receipts_dir or _default_receipts_dir()
     os.makedirs(target_dir, exist_ok=True)
-    bundle_path = os.path.join(target_dir, f"{tx_hash_hex}.json")
+    fname = (
+        f"{tx_hash_hex}_{filename_suffix}.json"
+        if filename_suffix else f"{tx_hash_hex}.json"
+    )
+    bundle_path = os.path.join(target_dir, fname)
     bundle = {
         # The validator returns the receipt as hex of to_bytes() in
         # the submit_transaction RPC response; _load_receipt_bundle
