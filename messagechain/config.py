@@ -2391,6 +2391,14 @@ PUBLIC_FEED_RATE_LIMIT_PER_SEC = 4
 PUBLIC_FEED_BURST = 30
 PUBLIC_FEED_MAX_LIMIT = 50
 
+# Canonical public-feed base URL used by client-side helpers (the
+# CLI's send-success path emits ``<PUBLIC_FEED_URL>/r/<tx_hash>`` so
+# the user gets a shareable link to the receipt page the moment
+# their tx is submitted).  Operator/testnet/alternative-feed
+# deployments override via ``config_local.py`` or env without
+# forking the CLI.  No trailing slash — the consumer appends one.
+PUBLIC_FEED_URL = "https://messagechain.org"
+
 # ─────────────────────────────────────────────────────────────────────
 # Attestable submission receipts + censorship-evidence slashing
 # ─────────────────────────────────────────────────────────────────────

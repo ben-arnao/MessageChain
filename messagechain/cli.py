@@ -18,7 +18,7 @@ import stat
 import sys
 
 from messagechain import __version__
-from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS
+from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS, PUBLIC_FEED_URL
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3190,12 +3190,27 @@ def cmd_send(args):
         # pivot for the validator-collusion threat model: a single RPC
         # node can't unilaterally forge inclusion if a second is asked
         # to confirm.
+        # ``PUBLIC_FEED_URL`` is the configurable base host
+        # (default ``https://messagechain.org``); the receipt page
+        # at ``/r/<tx_hash>`` reads the hash from its own URL and
+        # queries ``/v1/tx_status``, surfacing a polished "permanent
+        # -- this message is on-chain and can never be deleted" card
+        # any non-technical reader can verify.  Printing the URL
+        # here -- alongside the existing ``messagechain receipt``
+        # CLI verifier -- makes the chain's headline artifact
+        # shareable from the moment the tx is submitted, instead
+        # of being discoverable only by hunting through docs.
+        from messagechain import cli as _self  # late lookup for test override
+        feed_host = getattr(_self, "PUBLIC_FEED_URL", PUBLIC_FEED_URL)
+        share_url = f"{feed_host}/r/{tx_hash_hex}"
         print(
             "\n"
             "  Permanence: once this tx is included in a finalized block\n"
             "              (~10 min), the message is permanent and can\n"
             "              never be deleted by any party.  Validators\n"
             "              that drop or suppress it lose stake on chain.\n"
+            "\n"
+            f"  Share:  {share_url}\n"
             "\n"
             "  Verify inclusion:\n"
             f"    messagechain receipt {tx_hash_hex}\n"
