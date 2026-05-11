@@ -4,6 +4,155 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.75.0] — 2026-05-11
+
+Minor release.  Audit r46 top-3 ships: one hard fork (Tier 70 --
+stake-concentration soft cap), one consensus-layer determinism fix
+(gossip-ingress attestations must read pinned-at-target-height stake,
+not live), and one CLI / value-prop fix (``send-multi`` unified with
+``cmd_send``'s signing pipeline so the censorship-resistance escape
+hatch actually accepts the keyfile formats ``generate-key`` produces
+and handles first-spend through the fan-out path).
+
+### Changed (Tier 70, consensus-breaking)
+
+  * **Stake-concentration soft cap -- sublinear concave reward curve
+    (audit r46 #2 -- economics top-1).**  CLAUDE.md anchor "Stake
+    concentration is softly capped via diminishing returns -- rich-
+    get-richer in absolute terms, but their *share* of issuance
+    compresses over time."  Pre-Tier-70 the live code was strictly
+    linear: ``weights_for_progress`` blended uniform -> stake linearly
+    and at ``progress=1`` (always, after the ~2yr bootstrap)
+    weight = raw stake.  ``select_proposer_vrf`` and ``Blockchain._
+    selected_proposer_for_slot`` fallback both did cumulative-stake
+    walks on raw stake.  Founder-scale stake captured ~99% of proposer
+    slots AND ~99% of attester-committee picks indefinitely --
+    precisely the "permanent rent-extracting majority" CLAUDE.md says
+    is out of scope.  Sybil-fragmentation of a whale was also mildly
+    INCENTIVIZED (splitting 1M into 100x10k was reward-neutral to
+    positive).
+
+    Tier 70 introduces the rational soft-cap form
+
+        effective_weight(s) = s * C / (s + C)
+
+    with C = ``STAKE_CONCENTRATION_SOFT_CAP`` = 1_000_000 tokens.
+    Properties (matching the CLAUDE.md anchor exactly):
+      - monotonically increasing in s (whale's absolute reward still
+        rises -- 24/7 honest operation always preferred over withdraw)
+      - per-unit yield w(s)/s = C/(s+C) monotonically DECREASES in s
+        (smaller validators earn at a strictly higher per-unit rate)
+      - asymptote: w(s) -> C as s -> infinity ("asymptotic soft cap")
+      - no hard cap: w(s) < C always but approaches it
+      - concave; second derivative everywhere negative
+      - at s << C: w(s) ~= s (min-stake validators see no curve bite)
+      - at s >> C: whales see strongly diminishing returns
+
+    At founder-scale (50M stake) effective weight ~= 980k vs a min-
+    stake (200) validator's ~200; the per-unit-yield ratio at
+    progress=1 is ~51x -- a min-stake validator earns ~51 tokens of
+    weight for every 1 token the founder earns per unit staked, on
+    the strict letter of the anchor.
+
+    Single chokepoint: new ``effective_weight(stake, block_height)``
+    helper in ``consensus/attester_committee.py``.  All three
+    consensus-active call sites route through it:
+      - ``weights_for_progress`` (attester-committee weighting)
+      - ``select_proposer_vrf`` in ``consensus/vrf.py`` (active
+        proposer path)
+      - ``Blockchain._selected_proposer_for_slot`` fallback (pre-VRF /
+        very-early-chain proposer path)
+
+    Pre-fork ``effective_weight`` is the identity, so historical-block
+    replay is byte-identical and all pre-existing tests continue to
+    pass without modification.
+
+    Activation height 4500 sits 1800 blocks above Tier 69 (2700) --
+    ~12.5 days cohort spacing well above the Tier 49-69 tight-cohort
+    pattern.  An economic-distribution change is qualitatively
+    different from honesty-curve tightening, so the runway is longer
+    for validator coordination.  No new wire format, no new tx kinds,
+    no state-tree changes.  The asymptotic-soft-cap SHAPE is the
+    anchored choice; the soft cap C and the activation height are
+    tuning knobs a future Tier may re-tune.  (96a2cea)
+
+### Fixed
+
+  * **Gossip-ingress attestation must use pinned stake snapshot, not
+    live (audit r46 #1 -- security top-1).**  ``Node._handle_announce_
+    attestation`` and the local-broadcast path
+    (``Node._attest_block_if_allowed``) both read live ``supply.staked``
+    when computing the (validator_stake, total_stake) denominator
+    passed to ``finality.add_attestation``.  The consensus apply path
+    (``Blockchain._process_attestations``) reads the pinned-at-target-
+    height snapshot from ``self._stake_snapshots``; gossip-ingress
+    dedup is keyed ``(validator_id, height, hash)``, so whichever path
+    arrived first won the stake contribution.  During stake-churn
+    windows two honest peers could land different ``attested_stake[bh]``
+    totals on the same key and reach different ``is_finalized()``
+    answers -- splitting the persistent finalized set and forking the
+    chain on reorg-rejection.
+
+    CLAUDE.md adversary at risk: validator collusion (#1, primary).
+    On the currently-2-node mainnet, small-set arithmetic amplifies
+    the divergence: any peer holding minority stake could trigger
+    split finalization across the network during a stake-churn
+    window.  Honest-operator-insurance also threatened -- a benign
+    restart racing its gossip with a stake change was enough.
+
+    Abstraction fix: new ``Blockchain.resolve_pinned_attestation_
+    stake(att)`` helper is the single chokepoint every writer to the
+    FinalityTracker denominator now routes through.  Returns
+    ``(validator_stake, total_stake)`` from the pinned snapshot at
+    ``att.block_number``, or ``None`` when no pin exists.  Callers
+    must skip the finality update on the None path; substituting
+    live state is the divergence trap.  Three call sites --
+    ``_process_attestations`` (already consensus-correct, now DRY),
+    ``_handle_announce_attestation`` (was buggy, now fixed), and
+    ``_attest_block_if_allowed`` (was buggy, now fixed) -- share the
+    helper, so a new finality writer in the future can't silently
+    reintroduce the live-stake fallback.  Soft fix: no fork, no
+    consensus rule change, no wire-format change.  (95fdaea)
+
+  * **``cmd_send_multi_submit`` unified with ``cmd_send``'s signing
+    pipeline (audit r46 #3 -- UX x security x value-prop).**  The
+    censorship-resistance escape hatch had three coupled defects, all
+    rooted in one missing abstraction (the shared signing pipeline
+    ``cmd_send`` evolved but ``cmd_send_multi_submit`` never adopted):
+
+      (a) Keyfile load was hand-rolled ``bytes.fromhex(hex_key)`` --
+          only accepted bare 64-char hex.  Rejected 24-word BIP-39
+          mnemonics and 72-char checksummed hex, the only formats
+          the README's ``generate-key`` actually produces.  A user
+          who pasted their recovery phrase or checksummed backup
+          got "keyfile must contain a 64-char hex private key" and
+          fell back to ``cmd_send`` -- the single-RPC path the
+          escape hatch exists to AVOID.
+
+      (b) Skipped the Tier 11 first-spend pubkey-install probe.
+          A fresh-key first-spend through ``send-multi`` landed as
+          a v1 tx without ``sender_pubkey``, and every endpoint
+          rejected with "Unknown entity -- must register first."
+          The most likely use case for ``send-multi`` (a fresh-key
+          dissident's first controversial post) was silently
+          broken; the failure looked like validator-collusion
+          censorship but was actually missing pubkey install.
+
+      (c) ``--keyfile`` wasn't named in ``send-multi --help`` and
+          wasn't shown in the README example.
+
+    Abstraction fix: new ``_should_include_pubkey(host, port,
+    entity_id, target_height)`` helper is the single chokepoint for
+    the first-spend pubkey-install probe.  ``cmd_send`` and
+    ``cmd_send_multi_submit`` both route through it.  Adding a new
+    signing path that bypasses this helper reintroduces the audit
+    r46 #3 defect.  ``cmd_send_multi_submit`` now uses
+    ``_resolve_private_key(args, personal_wallet=True)`` -- the same
+    helper 27 other signing commands use.  Parser description and
+    README's send-multi example both name ``--keyfile``.  No fork,
+    no consensus rule change, no wire-format change, no new tx
+    kinds.  (18bb0f7)
+
 ## [1.74.1] — 2026-05-11
 
 Patch release.  Audit r45 top-3 ships: three independent bugfixes
