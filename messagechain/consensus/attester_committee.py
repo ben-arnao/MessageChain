@@ -65,22 +65,96 @@ def seed_weight_multiplier(bootstrap_progress: float) -> float:
     return bootstrap_progress / SEED_EXCLUSION_CROSSOVER
 
 
+def effective_weight(stake: int, block_height: int | None = None) -> int:
+    """Stake-concentration soft-cap curve — the single chokepoint every
+    place that maps stake → selection weight must route through.
+
+    Pre-Tier-70 (``block_height`` is ``None`` or below
+    ``STAKE_CONCENTRATION_SOFT_CAP_HEIGHT``):
+        identity — ``effective_weight(s) == s``.  Byte-identical to
+        legacy behavior, so historical blocks replay correctly.
+
+    Post-Tier-70:
+        rational form with asymptotic soft cap C:
+
+            effective_weight(s) = s * C / (s + C)
+
+        where C = ``STAKE_CONCENTRATION_SOFT_CAP`` = 1_000_000 tokens.
+
+        Properties (matching CLAUDE.md "Stake concentration is softly
+        capped via diminishing returns" anchor exactly):
+
+          * monotonically increasing in s — whale's absolute reward still
+            grows when adding stake (24/7 honest operation always preferred
+            over withdrawal)
+          * per-unit yield w(s)/s = C/(s+C) is monotonically DECREASING
+            in s — smaller validators earn at a strictly higher per-unit
+            rate than larger ones (anchor's load-bearing property)
+          * asymptote: w(s) → C as s → ∞ — anchor's "asymptotic soft cap"
+          * no hard cap: w(s) < C always
+          * concave; second derivative everywhere negative
+          * at s ≪ C: w(s) ≈ s — small stakers see no curve bite
+          * at s ≫ C: w(s) ≈ C - C²/s — whales see strongly diminishing
+            returns
+
+    Integer-only arithmetic: returns ``(stake * C) // (stake + C)``.
+    Down-rounding is consensus-safe (every node computes the same int)
+    and the truncation is at most 1 unit of weight per call.
+
+    Active call sites (every consensus path that turns stake into a
+    selection weight):
+
+      * ``weights_for_progress`` — attester-committee blend at
+        ``progress=1`` becomes effective_weight-based, not raw-stake-based
+      * ``select_proposer_vrf`` (consensus/vrf.py) — the active proposer-
+        selection path
+      * ``Blockchain._selected_proposer_for_slot`` fallback branch — the
+        pre-VRF / very-early-chain proposer-selection path
+
+    A new caller MUST route through this helper.  Reading raw stake into
+    a weighted sampler post-Tier-70 reintroduces the linear regime and
+    diverges state_root across peers that did vs. didn't apply the curve.
+    """
+    if stake <= 0:
+        return 0
+    # config import is deferred to function body so module import-time
+    # is not coupled to the (large) config module.
+    from messagechain.config import (
+        STAKE_CONCENTRATION_SOFT_CAP,
+        STAKE_CONCENTRATION_SOFT_CAP_HEIGHT,
+    )
+    if block_height is None or block_height < STAKE_CONCENTRATION_SOFT_CAP_HEIGHT:
+        return stake
+    C = STAKE_CONCENTRATION_SOFT_CAP
+    return (stake * C) // (stake + C)
+
+
 def weights_for_progress(
     stakes: list[int], bootstrap_progress: float,
+    block_height: int | None = None,
 ) -> list[float]:
     """Compute per-candidate selection weights at a given bootstrap progress.
 
     Linear blend between uniform weighting (1/N for all) and
-    stake-weighted (stake_i / total_stake):
+    stake-weighted:
 
-        weight_i = (1 - p) * (1/N) + p * (stake_i / total_stake)
+        weight_i = (1 - p) * uniform_unit + p * effective_weight(stake_i)
 
-    At p=0 this degenerates to uniform; at p=1 to pure stake-weighted.
-    In between, small stakers retain meaningful selection probability
-    while larger stakers enjoy graduated advantage.
+    where ``effective_weight`` applies the Tier 70 stake-concentration
+    soft cap at block heights ≥ ``STAKE_CONCENTRATION_SOFT_CAP_HEIGHT``
+    and is the identity below.  At p=0 the blend degenerates to uniform;
+    at p=1 to pure (effective-weight-weighted) stake selection.
+
+    Both halves of the blend use the same scale (effective weights), so
+    the uniform / stake-weighted mix stays well-formed across the fork.
 
     Returns raw weights (not normalized) — caller feeds them to a
     weighted sampler.
+
+    ``block_height`` defaults to ``None`` for back-compat with tests and
+    tooling that don't model the height gate; consensus call sites in
+    ``select_attester_committee`` MUST pass ``block_height=`` so the
+    Tier 70 fork actually activates at the configured height.
     """
     if not stakes:
         return []
@@ -90,19 +164,26 @@ def weights_for_progress(
         )
 
     n = len(stakes)
-    total_stake = sum(stakes)
+    # Apply Tier 70 stake-concentration soft cap.  Pre-fork this is the
+    # identity, so all existing tests and historical blocks see the
+    # original raw-stake blend.  Post-fork the weights are bounded by
+    # the rational soft-cap curve described in ``effective_weight``.
+    effective_stakes = [effective_weight(s, block_height) for s in stakes]
+    total = sum(effective_stakes)
 
-    # Uniform component: 1/N for all (scale by total_stake so both
-    # components live on the same scale and blend cleanly).
-    if total_stake <= 0:
+    # Uniform component: 1/N for all, scaled by total so both halves of
+    # the blend live on the same scale.  Pre-fork ``total`` equals
+    # ``sum(stakes)`` (effective is identity); post-fork it equals the
+    # sum of effective weights.  Either way the math composes cleanly.
+    if total <= 0:
         # All zero stakes — pure uniform is the only sensible output.
         return [1.0] * n
 
-    uniform_unit = total_stake / n  # each gets this "virtual stake" under uniform
+    uniform_unit = total / n
     weights = [
         (1.0 - bootstrap_progress) * uniform_unit
-        + bootstrap_progress * stake
-        for stake in stakes
+        + bootstrap_progress * eff_stake
+        for eff_stake in effective_stakes
     ]
     return weights
 
@@ -298,7 +379,9 @@ def select_attester_committee(
             eid for eid, t in zip(items, tilt) if t > 0.0
         )
 
-    base_weights = weights_for_progress(stakes, bootstrap_progress)
+    base_weights = weights_for_progress(
+        stakes, bootstrap_progress, block_height=block_height,
+    )
     weights = [w * t for w, t in zip(base_weights, tilt)]
     picked = _deterministic_weighted_sample(
         items, weights, committee_size, randomness,

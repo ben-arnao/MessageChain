@@ -7037,6 +7037,70 @@ assert HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69 >= HONESTY_CURVE_MIN_PCT, (
     "round up to MIN_PCT and the cap would be dead code)"
 )
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 70 — Stake-concentration soft cap (sublinear concave reward curve)
+# ─────────────────────────────────────────────────────────────────────
+# CLAUDE.md anchor: "rich nodes do not just keep getting richer -- small
+# nodes actually earn more than large nodes per unit staked."  Pre-Tier-70
+# proposer selection (``select_proposer_vrf``, ``_selected_proposer_for_
+# slot`` fallback) and attester-committee weighting (``weights_for_
+# progress``) all used raw stake as the selection weight -- strictly
+# linear stake-proportional.  Founder-scale stake captured proposer slots
+# and attester picks in proportion to raw stake, indefinitely.  That is
+# the "permanent rent-extracting majority" CLAUDE.md explicitly forbids.
+#
+# Tier 70 introduces the rational soft-cap form:
+#     effective_weight(s) = s * C / (s + C)
+#
+# Properties (matching the CLAUDE.md anchor exactly):
+#   * monotonically increasing in s  -- whale's absolute reward still
+#     rises when adding stake; 24/7 honest operation always preferred
+#     over withdrawal
+#   * per-unit yield w(s)/s = C/(s+C) is monotonically DECREASING in s
+#     -- smaller validators earn at a strictly higher per-unit rate
+#   * asymptote: w(s) -> C as s -> infinity  -- this is the "asymptotic
+#     soft cap" wording from the anchor
+#   * no hard cap: w(s) < C for all finite s, but approaches it
+#   * concave: second derivative is everywhere negative
+#   * at s << C: w(s) ~= s  -- small stakers see linear behavior, no
+#     artificial punishment of min-stake validators by the curve
+#   * at s >> C: w(s) ~= C - C^2/s  -- whales see strongly diminishing
+#     returns
+#
+# C = 1_000_000 tokens.  Tuning rationale:
+#   * a min-stake (200-token) validator sees w(200) ~= 199.96 -- the
+#     curve is essentially invisible at the floor
+#   * a founder-scale (50M-token) validator sees w(50M) ~= 980_000 --
+#     the founder's selection probability is bounded to ~1M units of
+#     weight regardless of stake size, so per-unit yield collapses to
+#     C/(50M+C) ~= 2% of the linear baseline
+#   * per-unit-yield ratio (small/founder) at progress=1 is ~51x -- a
+#     min-stake validator earns ~51 tokens for every 1 token the
+#     founder earns per unit staked
+#   * the parameter is tunable; a future Tier may re-tune.  The
+#     ASYMPTOTIC-SOFT-CAP SHAPE is the anchored choice; the value
+#     of C is not.
+#
+# Activation height 4500 sits 1800 blocks above Tier 69 (2700) -- ~12.5d
+# cohort spacing well above the Tier 49-69 tight-cohort pattern.  An
+# economic-distribution change is qualitatively different from honesty-
+# curve tightening, so the runway is longer for validator coordination.
+#
+# No new wire format, no new tx kinds, no state-tree changes.  Pure
+# consensus-rule swap inside the proposer-selection / attester-committee-
+# weighting paths.
+STAKE_CONCENTRATION_SOFT_CAP_HEIGHT = 4500  # Tier 70
+STAKE_CONCENTRATION_SOFT_CAP = 1_000_000  # tokens; ``C`` in the rational form
+
+assert STAKE_CONCENTRATION_SOFT_CAP_HEIGHT > HONESTY_CURVE_TIER69_HEIGHT, (
+    "STAKE_CONCENTRATION_SOFT_CAP_HEIGHT must follow Tier 69 -- "
+    "consecutive consensus-rule activations need cohort spacing"
+)
+assert STAKE_CONCENTRATION_SOFT_CAP > 0, (
+    "STAKE_CONCENTRATION_SOFT_CAP=0 would divide by zero in the "
+    "rational form AND collapse every weight to 0"
+)
+
 
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.

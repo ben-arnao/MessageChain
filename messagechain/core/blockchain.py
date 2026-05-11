@@ -3549,6 +3549,22 @@ class Blockchain:
 
         # Fallback: pre-VRF deterministic selection (VRF_ENABLED=False
         # or very early chain with only genesis block).
+        #
+        # Tier 70 stake-concentration soft cap: map raw stake through
+        # ``effective_weight`` before the cumulative walk.  Pre-fork
+        # this is the identity; post-fork raw stake is bounded by the
+        # rational soft-cap curve (see attester_committee.effective_
+        # weight) so per-unit yield diminishes for whales.  Apply at
+        # the same chokepoint as ``select_proposer_vrf`` for symmetry.
+        from messagechain.consensus.attester_committee import effective_weight
+        validators_eff = [
+            (eid, effective_weight(stake, block_height=height))
+            for eid, stake in validators
+        ]
+        total_eff = sum(s for _, s in validators_eff)
+        if total_eff == 0:
+            return None
+
         seed_input = (
             parent.block_hash
             + parent.header.randao_mix
@@ -3556,14 +3572,14 @@ class Blockchain:
             + b"proposer_selection"
         )
         seed = _hash(seed_input)
-        rand_value = int.from_bytes(seed, "big") % total
+        rand_value = int.from_bytes(seed, "big") % total_eff
 
         cumulative = 0
-        for entity_id, stake in validators:
+        for entity_id, stake in validators_eff:
             cumulative += stake
             if rand_value < cumulative:
                 return entity_id
-        return validators[-1][0]
+        return validators_eff[-1][0]
 
     def get_block(self, index: int) -> Block | None:
         if 0 <= index < len(self.chain):

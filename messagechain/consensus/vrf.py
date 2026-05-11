@@ -124,6 +124,16 @@ def select_proposer_vrf(
     Uses randao_mix (from VRF_LOOKAHEAD blocks ago) combined with the
     block number and round number for stake-weighted selection.
 
+    Tier 70 stake-concentration soft cap: at block heights >=
+    ``STAKE_CONCENTRATION_SOFT_CAP_HEIGHT``, each validator's raw stake
+    is mapped through ``effective_weight`` before the cumulative-walk
+    sums.  Pre-fork the mapping is the identity, so historical-block
+    replay is byte-identical.  Post-fork the per-validator weight is
+    bounded by the rational asymptotic soft cap described in
+    ``effective_weight``, and per-unit yield is strictly higher for
+    smaller validators — closing the linear-regime gap the audit r46 #2
+    finding surfaced.
+
     Args:
         randao_mix: the RANDAO mix from block (N - VRF_LOOKAHEAD)
         block_number: the block being proposed
@@ -136,7 +146,16 @@ def select_proposer_vrf(
     if not validators:
         return None
 
-    sorted_validators = sorted(validators.items(), key=lambda x: x[0])
+    # Apply Tier 70 stake-concentration soft cap before the cumulative
+    # walk.  Pre-fork ``effective_weight`` is the identity; post-fork
+    # raw stake is bounded by the rational soft-cap curve.  Sorting on
+    # (entity_id, effective_weight) gives the same deterministic order
+    # as legacy.
+    from messagechain.consensus.attester_committee import effective_weight
+    sorted_validators = [
+        (eid, effective_weight(stake, block_height=block_number))
+        for eid, stake in sorted(validators.items(), key=lambda x: x[0])
+    ]
     total = sum(s for _, s in sorted_validators)
     if total == 0:
         return None
