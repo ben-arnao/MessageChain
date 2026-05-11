@@ -4,6 +4,156 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.74.1] — 2026-05-11
+
+Patch release.  Audit r45 top-3 ships: three independent bugfixes
+spanning the network-layer ban subsystem, the CLI's transfer fee
+floor, and the censorship-evidence on-disk artifact path.  No new
+tx kinds, no new wire format, no consensus rule change at the
+validator, no hard fork.
+
+### Fixed
+
+  * **Ban auto-clear requires strictly-newer semver (audit r45 #1
+    -- security top-1).**  Pre-fix
+    ``PeerBanManager.clear_ban_on_version_change`` cleared a ban
+    whenever the reported version was any non-empty, non-``"unknown"``
+    string that differed from the stored ``peer_version``.  Bypass
+    cycle:
+
+      1. attacker earns ``OFFENSE_INVALID_TX`` (instant-ban),
+         ``peer_version="1.46.0"``;
+      2. reconnect with ``version="x"`` -> clear, ``peer_version="x"``;
+      3. attacker re-offends -> banned again, ``peer_version="x"``;
+      4. reconnect with ``version="y"`` -> clear; repeat indefinitely.
+
+    Every banscore-graded defense (gossip flood, invalid-tx flood,
+    invalid-block flood, protocol-violation flood) collapsed to
+    ~zero cost -- the ban subsystem was purely advisory.  CLAUDE.md
+    anchor at risk: Security (principle #1, never compromise).
+    Adversaries no longer defended: validator-collusion + AI-spam
+    flooding (both banscore-graded), plus the general "honest-
+    operator's network-layer defense surface" the ban subsystem
+    exists to provide.
+
+    Fix: the reported version must (a) parse as a valid semver per
+    ``parse_release_version``, AND (b) be strictly newer than the
+    stored ``peer_version`` per
+    ``release_version_is_strictly_newer`` -- the same comparator the
+    release-manifest consensus apply path uses.  An attacker's
+    bypass set is bounded by the chain's actual forward release-tag
+    progress, not by their choice of garbage strings.  The
+    legacy-empty-peer_version path (pre-1.48 ban entries that loaded
+    with no ``peer_version`` field) is preserved -- any valid semver
+    clears once, then subsequent bans go through the strict-newer
+    gate.  Pure network-layer hardening; no fork, no consensus rule
+    change, no wire-format change.
+
+    8 regression tests in
+    ``tests/test_audit_r45_ban_version_strict_newer.py``.  Existing
+    ``tests/test_ban_decay.py`` suite (10 cases) continues to pass
+    -- all its strings were already real semvers.  (c3e8e18)
+
+  * **CLI transfer fee follows server's live floor, not legacy
+    MIN_FEE (audit r45 #2 -- economics top-1).**  Pre-fix
+    ``cmd_transfer`` (and the ``client.py`` mirror) computed
+    ``required_floor = max(MIN_FEE, server_min_fee)``.  ``MIN_FEE``
+    is the legacy pre-FLAT_FEE_HEIGHT constant of 100.  Tier 49
+    (``UNIFIED_FEE_FLOOR_HEIGHT=1750``, long since live) collapsed
+    the unified transfer / stake / unstake admission floor to
+    ``MARKET_FEE_FLOOR=1``.  The server's ``estimate_fee`` RPC
+    returned this correctly via ``tx_floor`` (height-aware), and
+    ``auto_fee("transfer", ...)`` picked the right number via the
+    same helper.  But the CLI's local clamp inflated the result
+    back up to 100 -- silently over-charging every wallet user 100x
+    the protocol floor on every transfer since Tier 49 activated.
+
+    CLAUDE.md anchors at risk: dual-purpose-token /
+    "mainstream-asset quality bar" -- wallet, transfer, and balance-
+    handling code is held to mainstream-asset standards (a silent
+    100x overcharge is the canonical violation); and the fee-model
+    anchor ("when the fee model shifts, every auto-fee path shifts
+    with it -- don't leave a tx kind defaulting to a stale flat fee
+    while others auto-bid by density").
+
+    Fix: drop the ``max(MIN_FEE, server_min_fee)`` clamp and trust
+    ``server_min_fee`` directly (the height-aware ``tx_floor``
+    result).  ``auto_fee`` already enforces the right floor
+    internally; the post-auto-fee floor is now
+    ``max(auto_fee_result, server_min_fee)`` -- defense-in-depth
+    against a stale local height -- with no legacy ``MIN_FEE``
+    constant in the path.  Error messages on explicit under-payment
+    quote the live server floor, not the stale constant.  The
+    brand-new-recipient surcharge branch (the chain validator hard-
+    codes ``MIN_FEE + NEW_ACCOUNT_FEE``) stays correct via the
+    server returning that total on the ``recipient_is_new`` branch.
+
+    6 regression tests in
+    ``tests/test_audit_r45_cli_transfer_fee_floor_drift.py`` pin:
+    (1) auto-fee for existing-recipient transfer at post-Tier-49
+    height yields a fee < ``MIN_FEE``; (2) ``--fee 50`` at post-
+    Tier-49 height is accepted, not rejected with "below MIN_FEE
+    100"; (3) ``--fee`` below the live server floor is still
+    rejected, and the error text names ``server_min_fee`` not the
+    legacy constant; (4) new-recipient surcharge path still binds
+    correctly; (5) structural -- ``cli.py`` source no longer
+    contains ``max(MIN_FEE, server_min_fee)``; (6) structural --
+    ``client.py`` mirror.  (1164535)
+
+### Added
+
+  * **``cmd_transfer`` + ``cmd_react`` persist server-issued receipt
+    bundle (audit r45 #3 -- UX / value-prop top-1).**  Pre-fix only
+    ``cmd_send`` and ``cmd_send_multi_submit`` wrote the validator-
+    issued ``SubmissionReceipt`` to
+    ``~/.messagechain/receipts/<tx_hash>.json`` in the bundle shape
+    ``submit-evidence censorship --receipt <path>`` consumes.
+    ``cmd_transfer`` and ``cmd_react`` -- the only OTHER user-facing
+    signed-tx commands whose server admit path actually issues a
+    receipt (``Server._rpc_submit_transfer`` and
+    ``Server._rpc_submit_react`` both surface ``payload["receipt"]``
+    when the validator issued one) -- silently dropped
+    ``result["receipt"]`` on success.  Without the on-disk bundle,
+    the user holds no artifact to file as ``CensorshipEvidenceTx``
+    if a coerced validator silently drops the transfer or react.
+
+    CLAUDE.md collective-censorship-resistance anchor: "a tx that is
+    well-formed, pays at least the per-byte floor, and fits the
+    byte budget cannot be suppressed by anything weaker than a full
+    validator-set majority actively colluding *and* willing to
+    absorb the slashing risk."  The slashable-evidence path is the
+    structural defense; saving the receipt the moment the server
+    returns it is the user-facing surface that makes it accessible.
+    Also dual-purpose-token / "mainstream-asset quality bar" --
+    transfer is a first-class tx type and the censorship-evidence
+    promise must apply to transfers just like to messages.
+
+    Fix: route ``cmd_transfer`` and ``cmd_react`` success paths
+    through the same ``_save_receipt_bundle`` helper ``cmd_send``
+    uses, with ``tx_kind="transfer"`` / ``tx_kind="react"`` so
+    ``_load_receipt_bundle`` picks the right deserialiser.  Best-
+    effort write -- a disk failure logs a warning but does NOT fail
+    the command (the tx is already on the wire).  Receipt-absent
+    path is preserved (no bundle written when the server didn't
+    issue one, e.g. receipt-subtree-budget pressure).  Other signed-
+    tx commands (``cmd_stake`` / ``cmd_unstake`` / ``cmd_propose`` /
+    ``cmd_vote`` / ``cmd_rotate_key`` / ``cmd_emergency_revoke``)
+    are intentionally NOT in scope -- their server admit paths do
+    not issue receipts today; extending those is a separate,
+    larger structural change.
+
+    7 regression tests in
+    ``tests/test_audit_r45_transfer_react_save_receipt_bundle.py``
+    pin: (1) ``cmd_transfer`` with server-returned receipt writes
+    bundle; (2) bundle carries ``tx_kind="transfer"`` + serialized
+    ``TransferTransaction`` that round-trips through
+    ``deserialize()``; (3) ``cmd_transfer`` with NO server receipt
+    writes no bundle (and does not crash); (4) ``cmd_react`` with
+    server-returned receipt writes bundle; (5) bundle carries
+    ``tx_kind="react"`` + serialized ``ReactTransaction``; (6, 7)
+    structural -- ``cmd_transfer`` / ``cmd_react`` bodies invoke
+    ``_save_receipt_bundle``.  (02c1bed)
+
 ## [1.74.0] — 2026-05-11
 
 Minor release.  Audit r44 top-3 ships: three independent
