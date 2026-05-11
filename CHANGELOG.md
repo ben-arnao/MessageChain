@@ -4,6 +4,144 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.71.1] — 2026-05-11
+
+Patch release.  THE actual root-cause hotfix for the 2026-05-11
+v2 reorg-then-reject incident that the 1.71.0 rollout
+surfaced.  ``Blockchain._reorganize``'s forward-replay loop
+was applying each replayed block via ``_apply_block_state(blk)``
+ONLY -- it was silently skipping the two per-block bookkeeping
+calls the normal ``add_block`` path makes after apply:
+``_process_attestations(blk, self.supply.staked)`` (which bumps
+``self.reputation`` for every attester AND updates
+``self.finality``) and ``_record_stake_snapshot(blk.header.
+block_number)`` (which pins the per-block stake map for
+downstream finality vote validation).  No fork, no consensus
+rule change at the validator, no new wire format, no new tx
+kinds, no new CLI surface -- pure forward-apply / reorg-replay
+symmetry fix.
+
+### Fixed
+
+  * **``_reorganize`` replay loop calls ``_process_attestations``
+    and ``_record_stake_snapshot`` per replayed block (audit r42
+    #3 -- actual root cause of v2 incident).**  Pre-fix the
+    replay loop in ``Blockchain._reorganize`` was::
+
+        for blk in apply_blocks:
+            if self.height > 0:
+                valid, reason = self.validate_block(blk)
+                if not valid: ...
+            self._apply_block_state(blk)
+            self.chain.append(blk)
+            self._block_by_hash[blk.block_hash] = blk
+
+    The normal ``add_block`` path (the same file, ~250 lines
+    above) makes TWO additional calls after each
+    ``_apply_block_state``:
+
+      1. ``self._process_attestations(blk, self.supply.staked)``
+         -- consensus-visible: bumps ``self.reputation`` for
+         each attester in the block AND updates
+         ``self.finality`` (justified / finalized hashes).
+         Reputation drives ``select_lottery_winner`` at every
+         ``LOTTERY_INTERVAL`` block during bootstrap, which
+         MINTS tokens directly into the winner's balance.  A
+         frozen reputation tracker on the reorged node + a
+         bumped one on uprestarted peers picks different
+         lottery winners -> different per-entity balances ->
+         diverged supply.staked-sum -> diverged state_root on
+         the very next block apply.
+      2. ``self._record_stake_snapshot(blk.header.block_number)``
+         -- pins the per-block stake map for downstream
+         finality vote validation.  Without per-block pins on
+         replay, future finality vote processing for the
+         replayed range falls back to live ``supply.staked``,
+         diverging the 2/3 denominator from uprestarted peers.
+
+    Both calls were SILENTLY ABSENT from the reorg-replay loop.
+
+    Concrete cascade reproduced on validator-2 during the
+    2026-05-11 1.71.0 rollout (now landed v1.71.0 + this fix):
+
+      1. v2 had built its own 35-block losing fork from blocks
+         2199-2233.
+      2. v1 produced 46 blocks 2199-2244 on the canonical
+         chain.
+      3. v2 received v1's blocks via ``_handle_fork`` gossip
+         (stored to chaindb but kept v2's losing-fork blocks
+         too -- chaindb keys on block_hash, not block_number,
+         so both forks coexist).
+      4. ``_reorganize`` fired.  Reorg-restore at ancestor
+         #2198 from chaindb's snapshot row worked correctly
+         (snapshots at 2198 on both forks are functionally
+         identical -- diff verified during incident response).
+      5. Forward-replay applied v1's blocks 2199-2244 via
+         ``_apply_block_state(blk)`` only.  Reputation tracker
+         frozen at the #2198 value while v1's reputation
+         tracker bumped 46 times along the canonical fork.
+         Bootstrap lottery firing somewhere in the replayed
+         range consulted v2's frozen reputation map and picked
+         a different winner than v1 did.
+      6. v2's ``self.supply.balances`` diverged from v1's at
+         that block.  ``compute_current_state_root`` on v2
+         produced ``1d4af466e9c5757b...`` while v1's stored
+         header.state_root at #2244 was ``0ee75af765ec6ae9..``
+         (committed by v1's forward-apply path with all
+         per-block bookkeeping intact).
+      7. v1 produced block #2245 at 13:01:24 UTC.  v2's
+         ``add_block`` ran ``compute_post_state_root`` (sim)
+         and computed a state_root that did NOT match v1's
+         header.state_root for #2245 (because v2's pre-state
+         at #2244 was wrong).  v2 rejected with "Invalid
+         state_root -- state commitment mismatch" and banned
+         v1.
+      8. The 1.52.0 chain-load invariant correctly caught the
+         same divergence on the upgrade smoke test, refusing
+         to install 1.71.0 on v2.  Recovery: SQLite
+         online-backup of v1's canonical chain.db, scp to v2,
+         swap into ``/var/lib/messagechain/chain.db``, clear
+         ``ban_scores.json``, run standard upgrade.
+
+    CLAUDE.md anchor at risk: "Honest, well-configured nodes
+    should rarely if ever be slashed under normal operation"
+    -- the reorg-replay path is supposed to be transparent
+    state healing.  An incomplete replay that leaves the node
+    unable to accept canonical blocks is a textbook anchor
+    violation: the operator did everything right, the
+    protocol's own recovery machinery wedged them.
+
+    Permanent fix: the replay loop now matches normal
+    ``add_block`` ordering exactly::
+
+        for blk in apply_blocks:
+            ...
+            self._apply_block_state(blk)
+            self.chain.append(blk)
+            self._block_by_hash[blk.block_hash] = blk
+            self._process_attestations(blk, self.supply.staked)
+            self._record_stake_snapshot(blk.header.block_number)
+
+    Pre-fix, the reorg-replay loop would silently desync any
+    reorged node; post-fix reorg replay produces
+    byte-identical state to a node that forward-applied the
+    same blocks without reorging.  Soft fix -- no fork, no
+    consensus rule change at the validator, no new wire
+    format, no new tx kinds.
+
+    3 structural regression tests in
+    ``tests/test_reorg_replay_state_consistency.py`` pin the
+    symmetry: (1) ``_process_attestations(blk, self.supply.
+    staked)`` appears in ``_reorganize``'s body; (2)
+    ``_record_stake_snapshot(blk.header.block_number)`` does
+    too; (3) both calls appear AFTER
+    ``_apply_block_state(blk)`` so the apply happens before
+    the per-block bookkeeping (mirror add_block ordering).
+    Surfaced by audit r42 deep-dive on the live v2 incident.
+    Diverged-state diagnostic preserved at
+    ``/var/lib/messagechain/chain.db.diverged-20260511-131452``
+    on validator-2 for any future investigation.  (98a6654)
+
 ## [1.71.0] — 2026-05-11
 
 Minor release.  Audit round 42 top-2 ships: one consensus-layer
