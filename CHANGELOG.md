@@ -4,6 +4,166 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.71.0] — 2026-05-11
+
+Minor release.  Audit round 42 top-2 ships: one consensus-layer
+liveness fragility close (the fork-emergency detector no longer
+falls through to LIVE ``supply.staked`` for FinalityVotes whose
+target_block_number references a block this node has not yet
+appended) plus one value-prop CLI ergonomics fix (``cmd_send``'s
+success block now prints a shareable ``<PUBLIC_FEED_URL>/r/<tx_
+hash>`` receipt URL alongside the existing CLI verifier).  No
+new tx kinds, no new wire format, no consensus rule change at
+the validator, no hard fork.
+
+### Fixed
+
+  * **``observe_finality_vote`` refuses future-height votes
+    (audit r42 #1 -- liveness fragility close).**  Pre-fix
+    ``Blockchain.observe_finality_vote`` (the public hook
+    ``_handle_announce_finality_vote`` calls after gossip-time
+    sig verify so the fork-emergency detector sees votes BEFORE
+    they land in a block) resolved signer stake as
+    ``pinned = self._stake_snapshots.get(vote.target_block_
+    number); stake_map = pinned if pinned is not None else
+    dict(self.supply.staked)``.  Pinned snapshots only exist
+    for blocks the chain has actually appended.  A vote whose
+    ``target_block_number >= self.height``
+    (= ``len(self.chain)``, so valid indices are
+    ``0..height-1``) references a block this node has not yet
+    appended -- no snapshot, falls through to LIVE
+    ``supply.staked``.
+
+    Two operational consequences, both load-bearing for
+    liveness on today's bootstrap mainnet:
+
+      1. **Benign-bug class:** an honest validator's own
+         scheduler / replay / clock-skew misfire that emits a
+         signed FinalityVote at ``target > tip`` is enough to
+         single-fault the 2/3 detector threshold against live
+         stake (founder ~all-of-stake bootstrap distribution).
+         Detector flags an emergency, validators auto-halt
+         block production + finality voting per the
+         ``fork_emergency`` module's load-bearing contract.
+         The network freezes with no adversary at all.
+
+      2. **Adversarial:** any 2/3-stake holder (today the
+         founder; in general any post-bootstrap stake-majority
+         cartel) publishes well-formed signed FinalityVotes at
+         attacker-chosen future heights for any hash and
+         triggers the same auto-halt on every honest peer.
+         The votes do not produce slashable evidence -- the
+         signer is a registered staked validator, the only
+         thing "wrong" is that the target references a block
+         that does not yet exist locally.
+
+    CLAUDE.md anchor at risk: "censorship resistance is a
+    *collective decision* -- any new inclusion / mempool /
+    proposer rule must raise the evidentiary cost of
+    suppression."  The fork-emergency detector's halt is a
+    load-bearing safety mechanism; weaponising it via a one-
+    vote liveness halt collapses the evidentiary cost of
+    suppression to zero.
+
+    Fix: refuse future-height votes at the observe-hook
+    entry::
+
+        height = vote.target_block_number
+        if height >= self.height:
+            return
+
+    Honest gossip references already-appended blocks.  A vote
+    outside that window is either a bug (drop it) or an
+    attack (drop it).  Pinned-snapshot resolution and detector
+    ingestion are unchanged for past- and current-tip votes --
+    the legacy fallback to ``dict(self.supply.staked)`` for
+    past-height votes without a pin is preserved because the
+    consensus apply path uses the same fallback, so the
+    detector denominator continues to match consensus exactly
+    for legitimate ingest.
+
+    Soft fix.  No fork, no consensus rule change at the
+    validator, no new wire format, no new tx kinds, no new
+    CLI surface -- pure observe-hook narrowing.  The detector
+    is advisory by design (its halt only fires runtime-side;
+    consensus state is unchanged whether or not the detector
+    observes a vote), so dropping votes from the early-warning
+    path cannot diverge chain state across nodes.
+
+    3 regression tests in
+    ``tests/test_fork_emergency_future_height_guard.py`` pin
+    (1) a single supermajority-signed future-height vote does
+    NOT trigger the emergency; (2) a sweep of supermajority
+    votes at offsets 0 / 1 / 2 / 3 / 10 / 100 / 1000 from tip
+    likewise do not trigger; (3) must-not-regress -- a
+    divergent-hash vote at a real in-chain height from the
+    same supermajority signer STILL triggers the emergency
+    (the legitimate early-warning path remains intact).
+    Surfaced by audit r42 top-3 #1 (the only original-top-3
+    finding that survived live-code verification; the
+    inclusion-list-byte-budget and signature-aware-evidence-
+    fee findings did not -- see audit r42 transcript for the
+    full pool).  (ea26bef)
+
+### Added
+
+  * **``cmd_send`` success prints shareable receipt URL
+    (audit r42 #2).**  Pre-fix the success block named the
+    permanence guarantee + pointed at the
+    ``messagechain receipt <tx_hash>`` CLI verifier, but
+    stopped there.  A user who had just paid real tokens to
+    anchor a message had NO shareable artifact -- no URL to
+    hand to a journalist, a friend, or anyone who needs to
+    confirm the post is on chain.  The receipt page already
+    exists at ``<PUBLIC_FEED_URL>/r/<tx_hash_hex>`` (rendered
+    by the static-asset server, queries ``/v1/tx_status``
+    itself, surfaces a polished "permanent -- this message
+    is on-chain and can never be deleted" card any non-
+    technical reader can verify) but was discoverable only
+    by hunting through docs.  Net effect: every send was a
+    missed share-event, and the chain's headline value-prop
+    (permanence as a public artifact) was literally invisible
+    at the moment a user just paid to create one.
+
+    CLAUDE.md anchor at risk: dual-purpose-token / mainstream
+    -asset quality bar -- the receipt-page surface is the
+    value-prop in motion, and gating its discoverability
+    behind doc-spelunking inverts the bar.  Also Principle #3
+    (Simplicity) -- the user's gesture "let me share what I
+    just posted" had no one-step answer on the prior CLI.
+
+    Fix:
+
+      * New config constant ``PUBLIC_FEED_URL`` (default
+        ``https://messagechain.org``, no trailing slash) is
+        the canonical override knob for testnets /
+        alternative feed deployments so they do NOT need to
+        fork the CLI.
+      * ``cmd_send``'s success block now prints a ``Share:``
+        line immediately after the ``Permanence:`` paragraph,
+        naming the fully-qualified URL
+        ``<PUBLIC_FEED_URL>/r/<tx_hash>`` with the literal
+        hash substituted -- additive to the existing CLI
+        verifier pointer, not a replacement.  Failure path
+        is unchanged (no URL when no tx landed).
+      * Late-binds the host via ``getattr(cli_module,
+        "PUBLIC_FEED_URL", PUBLIC_FEED_URL)`` so a test can
+        monkey-patch the module attribute and exercise the
+        override path without rewriting the config import.
+
+    Pure CLI ergonomics fix.  No fork, no consensus rule
+    change, no wire-format change, no new tx kinds.  4
+    regression tests in
+    ``tests/test_cli_send_shareable_url.py`` pin: (1)
+    success block contains ``<feed_host>/r/<tx_hash>`` with
+    the literal hash; (2) URL appears alongside the existing
+    receipt-CLI pointer (additive); (3) ``PUBLIC_FEED_URL``
+    monkey-patch redirects the share URL cleanly (and the
+    production host doesn't leak); (4) failure path emits
+    NO ``/r/`` URL.  Surfaced by audit r42 value-prop axis
+    (recommended path-2 swap after the original-top-3
+    verification cycle).  (4d8c49f)
+
 ## [1.70.6] — 2026-05-10
 
 Patch release.  **THE actual root-cause hotfix for the 2026-05-10
