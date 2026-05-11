@@ -15686,6 +15686,43 @@ class Blockchain:
             self.chain.append(blk)
             self._block_by_hash[blk.block_hash] = blk
 
+            # Reorg-replay symmetry with the normal add_block path
+            # (lines around 14981-15017).  Without these per-block
+            # calls, the in-memory state diverges from the
+            # forward-apply state that uprestarted peers see:
+            #
+            #   * ``_process_attestations`` bumps ``self.reputation``
+            #     for every attester in the block AND updates
+            #     ``self.finality`` (justified / finalized hashes).
+            #     Reputation feeds the bootstrap lottery winner pick;
+            #     finality state feeds re-finalization decisions.
+            #     Skipping it on reorg-replay leaves both maps frozen
+            #     at the snapshot's pre-replay value while uprestarted
+            #     peers have them bumped 46x along the canonical
+            #     fork, producing a divergent state_root the moment
+            #     the chain advances one more block.  This was the
+            #     v2 2026-05-11 incident: 35-block losing fork →
+            #     reorg-restore at ancestor 2198 → replay 46 blocks
+            #     without ``_process_attestations`` → reputation frozen
+            #     at the 2198 value → v1's block #2245 rejected with
+            #     "Invalid state_root — state commitment mismatch".
+            #
+            #   * ``_record_stake_snapshot`` pins the per-block stake
+            #     map.  Without per-block pins on replay, subsequent
+            #     finality-vote processing for blocks in the replayed
+            #     range falls back to live ``supply.staked`` rather
+            #     than the historical stake map -- diverging the
+            #     2/3 denominator from uprestarted peers.
+            #
+            # Both are pure mirrors of the normal add_block per-block
+            # bookkeeping.  Pre-existing reorgs already at the tip
+            # don't re-trigger this code because reorg-replay starts
+            # from the post-snapshot-restore state; the calls run
+            # exactly once per replayed block, in lockstep with the
+            # forward-apply path.
+            self._process_attestations(blk, self.supply.staked)
+            self._record_stake_snapshot(blk.header.block_number)
+
         # Persist new state
         if self.db is not None:
             self._persist_state()
