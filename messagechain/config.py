@@ -7102,6 +7102,61 @@ assert STAKE_CONCENTRATION_SOFT_CAP > 0, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 71 -- effective_weight flows to per-slot attester reward sizing
+# ─────────────────────────────────────────────────────────────────────
+# Tier 70 (above) routed three call sites through ``effective_weight``:
+# ``weights_for_progress`` (attester-committee SELECTION),
+# ``select_proposer_vrf`` (active proposer-selection), and
+# ``Blockchain._selected_proposer_for_slot`` fallback.  But the per-
+# slot attester reward SIZING path in ``SupplyTracker.mint_block_reward``
+# (and its sim mirror in ``Blockchain._apply_block_state``) was still
+# reading RAW stake for the bps numerator and the total-active-stake
+# denominator:
+#
+#     total_active_stake = sum(self.staked.values())            # raw
+#     stake_bps = self.staked.get(eid, 0) * 10_000 // total     # raw
+#
+# Both halves linear in whale stake -- so the v4 reward-curve multiplier
+# was sizing per-slot reward off a raw bps distribution even when Tier
+# 70 had compressed the selection-weight distribution.  Tier 70's anchor
+# ("rich-get-richer in absolute terms but share of issuance compresses
+# over time") therefore landed at the SELECTION layer but stretched
+# back at the reward-sizing layer.
+#
+# Tier 71 closes the leak: both the numerator and denominator route
+# through ``effective_weight(stake, block_height)`` so per-slot reward
+# sizing inherits the same concave compression as selection.  Pre-fork
+# behavior is byte-identical (``effective_weight`` is the identity
+# below Tier 70, and Tier 71 is strictly above Tier 70 by construction
+# of the height ordering below).
+#
+# Activation height 6500 sits 2000 blocks above Tier 70 (4500) -- ~13.9d
+# cohort spacing matching the Tier 69→70 runway pattern.  Two
+# consecutive reward-distribution changes need their own cohorts; piling
+# both into the same window forces operators to absorb the combined
+# change in one upgrade cycle.
+#
+# No new wire format, no new tx kinds, no state-tree changes.  Pure
+# consensus-rule swap inside the per-slot reward-sizing path.  Both
+# the apply path (SupplyTracker.mint_block_reward) AND the sim mirror
+# (Blockchain._apply_block_state) flip in lockstep at the activation
+# block -- sim drives state_root, so any drift between sim and apply
+# at the activation block would fork the chain.
+EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT = 6500  # Tier 71
+
+assert (
+    EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT
+    > STAKE_CONCENTRATION_SOFT_CAP_HEIGHT
+), (
+    "EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT (Tier 71) must strictly "
+    "follow STAKE_CONCENTRATION_SOFT_CAP_HEIGHT (Tier 70) -- "
+    "effective_weight is the identity below Tier 70, so gating Tier 71 "
+    "below Tier 70 would be a no-op for live nodes and risk a sim-vs-"
+    "apply drift at the Tier-70 activation block."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

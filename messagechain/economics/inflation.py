@@ -1167,9 +1167,33 @@ class SupplyTracker:
             # Pre-Tier-42 callers continue to invoke v3 byte-for-byte;
             # replay determinism preserved across the fork ladder.
             curve_v4_active = block_height >= REWARD_CURVE_SMOOTH_V2_HEIGHT
-            total_active_stake = (
-                sum(self.staked.values()) if curve_active else 0
+            # Tier 71 -- per-slot reward sizing routes through the same
+            # Tier 70 ``effective_weight`` chokepoint that already gates
+            # attester-committee SELECTION and proposer-VRF SELECTION.
+            # Pre-Tier-71 the bps numerator and the total-active-stake
+            # denominator are raw stake, preserving byte-identical
+            # legacy behavior.  Post-Tier-71 both halves are compressed
+            # by the concave soft cap so per-slot reward sizing inherits
+            # the same anchored per-unit-yield compression that Tier 70
+            # already gave selection probability.
+            from messagechain.config import (
+                EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT,
             )
+            from messagechain.consensus.attester_committee import (
+                effective_weight as _effective_weight,
+            )
+            eff_weight_active = (
+                block_height >= EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT
+            )
+            if curve_active and eff_weight_active:
+                total_active_stake = sum(
+                    _effective_weight(s, block_height)
+                    for s in self.staked.values()
+                )
+            else:
+                total_active_stake = (
+                    sum(self.staked.values()) if curve_active else 0
+                )
             cap_per_entity = 0
             if cap_active:
                 epoch_start = (
@@ -1224,10 +1248,22 @@ class SupplyTracker:
                 # — same effect as legacy.  per_slot_reward == 0 is
                 # also a no-op (multiplier on 0 is 0).
                 if curve_active and per_slot_reward > 0 and total_active_stake > 0:
-                    stake_bps = (
-                        self.staked.get(eid, 0) * 10_000
-                        // total_active_stake
-                    )
+                    # Tier 71: numerator routes through effective_weight
+                    # in lockstep with the denominator above.  Pre-fork
+                    # path is the raw-stake read so historical replay
+                    # stays byte-identical.
+                    if eff_weight_active:
+                        stake_bps = (
+                            _effective_weight(
+                                self.staked.get(eid, 0), block_height,
+                            ) * 10_000
+                            // total_active_stake
+                        )
+                    else:
+                        stake_bps = (
+                            self.staked.get(eid, 0) * 10_000
+                            // total_active_stake
+                        )
                     if curve_v4_active:
                         num, den = reward_curve_multiplier_v4(stake_bps)
                     elif curve_v3_active:

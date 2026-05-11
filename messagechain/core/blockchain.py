@@ -6808,9 +6808,30 @@ class Blockchain:
                 # helper as the apply path so the state-root commitment
                 # matches bit-for-bit across the curve change.
                 _curve_v4_active = block_height >= _RCSV2H
-                _sim_total_stake = (
-                    sum(sim_staked.values()) if _curve_active else 0
+                # Tier 71 sim-mirror: both bps numerator and total-active-
+                # stake denominator route through ``effective_weight``
+                # in lockstep with the apply path's
+                # ``SupplyTracker.mint_block_reward``.  Pre-fork path is
+                # byte-identical to legacy (raw stake) so historical
+                # replay matches; post-fork the curve compresses both
+                # halves so sim and apply agree on every state_root.
+                from messagechain.config import (
+                    EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT
+                    as _EWRSH,
                 )
+                from messagechain.consensus.attester_committee import (
+                    effective_weight as _eff_weight,
+                )
+                _eff_weight_active = block_height >= _EWRSH
+                if _curve_active and _eff_weight_active:
+                    _sim_total_stake = sum(
+                        _eff_weight(s, block_height)
+                        for s in sim_staked.values()
+                    )
+                else:
+                    _sim_total_stake = (
+                        sum(sim_staked.values()) if _curve_active else 0
+                    )
                 _sim_epoch_earnings: dict[bytes, int] = {}
                 _cap_per_entity = 0
                 if _cap_active:
@@ -6859,10 +6880,21 @@ class Blockchain:
                         and per_slot_reward > 0
                         and _sim_total_stake > 0
                     ):
-                        _stake_bps = (
-                            sim_staked.get(eid, 0) * 10_000
-                            // _sim_total_stake
-                        )
+                        # Tier 71 sim-mirror: bps numerator routes
+                        # through effective_weight in lockstep with the
+                        # denominator above.
+                        if _eff_weight_active:
+                            _stake_bps = (
+                                _eff_weight(
+                                    sim_staked.get(eid, 0), block_height,
+                                ) * 10_000
+                                // _sim_total_stake
+                            )
+                        else:
+                            _stake_bps = (
+                                sim_staked.get(eid, 0) * 10_000
+                                // _sim_total_stake
+                            )
                         if _curve_v4_active:
                             _num, _den = _reward_curve_multiplier_v4(
                                 _stake_bps,
