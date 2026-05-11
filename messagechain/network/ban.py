@@ -297,8 +297,8 @@ class PeerBanManager:
     def clear_ban_on_version_change(
         self, address: str, current_version: str,
     ) -> bool:
-        """Auto-expire a ban when the peer reconnects on a different
-        software version than the one recorded at ban time.
+        """Auto-expire a ban when the peer reconnects on a strictly-
+        newer software version than the one recorded at ban time.
 
         Returns True iff a ban was cleared.
 
@@ -310,20 +310,35 @@ class PeerBanManager:
         A version change is the cheapest reliable signal that "the
         binary that earned the ban no longer exists."
 
+        Audit r45 #1 strict-newer gate: pre-r45 the gate accepted ANY
+        non-empty, non-"unknown" string that differed from the stored
+        ``peer_version`` — so an attacker could earn OFFENSE_INVALID_TX
+        (instant-ban), reconnect with ``version="x"``, get a clean
+        slate, re-offend, reconnect with ``"y"``, and so on
+        indefinitely.  Every banscore-graded defense (gossip flood,
+        invalid-tx flood, invalid-block flood, protocol-violation
+        flood) collapsed to ~zero cost.  Post-r45 the reported version
+        must (a) parse as a real semver, AND (b) be strictly newer
+        than the stored ``peer_version`` per
+        ``release_version_is_strictly_newer`` — the same comparator
+        the release-manifest consensus apply path uses, so an
+        attacker's bypass set is bounded by the chain's actual
+        forward release-tag progress.
+
         Gates:
           - peer must currently be banned (no-op otherwise),
-          - reported ``current_version`` must be non-empty and not the
-            literal "unknown" sentinel (a peer that omits the field
-            cannot launder out of a ban),
-          - either (a) the stored ``peer_version`` is non-empty and
-            differs from the reported version (the standard "they
-            shipped a new binary" path), or (b) the stored
-            ``peer_version`` is empty (the legacy / pre-1.48 path:
-            this ban predates the auto-clear feature itself, so we
-            have no version to compare against; clearing is the only
-            way the feature can recover such a ban without operator
-            surgery — exactly the scenario the feature was designed
-            to fix).
+          - reported ``current_version`` must parse as a valid semver
+            (rejects ``""``, ``"unknown"``, and arbitrary garbage like
+            ``"x"`` / ``"1.46.0.0"`` / ``"v1.47.0"``),
+          - if stored ``peer_version`` is non-empty, the reported
+            version must be strictly newer per
+            ``release_version_is_strictly_newer`` (rejects same-
+            version, downgrades, and same-core-plus-prerelease),
+          - if stored ``peer_version`` is empty, this is the pre-1.48
+            legacy-recovery path: any *valid semver* clears the entry
+            once.  Bounded to one clear because the post-clear path
+            stamps the reported version, so subsequent bans go through
+            the strict-newer gate.
 
         Empty-stored-version safety: the major instant-ban offenses
         (OFFENSE_INVALID_BLOCK, OFFENSE_INVALID_TX) fire in block /
@@ -331,17 +346,26 @@ class PeerBanManager:
         ``peer_version`` via the resolver.  So all FRESH instant-bans
         will have a real peer_version stamped — empty is an
         unforgeable marker for "this entry was written by code that
-        didn't have the field" (i.e. pre-1.48).  An attacker who
-        only ever offends pre-HANDSHAKE gets at most one legacy-clear
-        per restart of THIS node; their next post-HANDSHAKE offense
-        stamps a real version and the auto-clear gate works normally
-        from then on.
+        didn't have the field" (i.e. pre-1.48).
 
         Clearance is a clean slate (lifetime_score reset, offenses
         cleared) — same semantics as ``manual_unban`` — because we've
         decided the prior misbehavior was a stale-binary artifact.
         """
+        # Import here to avoid a module-level cycle with core.* — ban
+        # is loaded very early in the network stack.
+        from messagechain.core.release_version import (
+            parse_release_version,
+            release_version_is_strictly_newer,
+        )
+
         if not current_version or current_version == "unknown":
+            return False
+        # Reported version must parse as real semver.  Rejects "x" and
+        # every other non-semver string at the door.
+        try:
+            parse_release_version(current_version)
+        except (ValueError, TypeError):
             return False
         ip = self._get_ip(address)
         ps = self._scores.get(ip)
@@ -353,10 +377,15 @@ class PeerBanManager:
         #   - legacy: stored peer_version is empty (pre-1.48 ban entry,
         #     written before the auto-clear feature existed; the
         #     feature was added expressly to recover this scenario).
-        #   - normal: stored version is non-empty AND differs from
-        #     the freshly-reported version.
-        if ps.peer_version and ps.peer_version == current_version:
-            return False
+        #     Any valid semver clears once.
+        #   - normal: stored version is non-empty.  Require the
+        #     reported version to be STRICTLY NEWER — same comparator
+        #     used by the release-manifest apply path.
+        if ps.peer_version:
+            if not release_version_is_strictly_newer(
+                current_version, ps.peer_version,
+            ):
+                return False
         legacy_clear = not ps.peer_version
         old_version = ps.peer_version or "<unrecorded — pre-1.48>"
         ps.score = 0
