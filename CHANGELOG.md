@@ -4,6 +4,181 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.76.0] — 2026-05-11
+
+Minor release.  Audit r47 top-3 ships: one new hard fork (Tier 71 --
+``effective_weight`` flows to per-slot attester reward sizing,
+activation height 6500), one consensus-layer determinism refactor
+(fork-choice cumulative weight routes through a single pinned-stake
+chokepoint, same recurrence-pattern as the audit r46 #1 attestation
+fix), and one network-layer security fix (submission receipt
+suppressed when the validator's outbound relay raises, closing an
+honest-operator slashing-magnet under broken relay paths).
+
+### Changed (Tier 71, consensus-breaking, height-gated)
+
+  * **``effective_weight`` flows to per-slot attester reward sizing
+    (audit r47 #2 -- economics top-1).**  Tier 70 (1.75.0) introduced
+    the rational soft-cap ``effective_weight(s) = s * C / (s + C)``
+    and routed three selection-active call sites through it:
+    ``weights_for_progress`` (attester-committee SELECTION),
+    ``select_proposer_vrf`` (active proposer-selection), and
+    ``Blockchain._selected_proposer_for_slot`` fallback.  But the
+    per-slot attester reward SIZING path in
+    ``SupplyTracker.mint_block_reward`` (and its sim mirror in
+    ``Blockchain.compute_post_state_root``) was NOT routed through
+    the helper -- both the bps numerator and the total-active-stake
+    denominator read RAW stake:
+
+        total_active_stake = sum(self.staked.values())          # raw
+        stake_bps = self.staked.get(eid, 0) * 10_000 // total   # raw
+
+    The v4 reward-curve multiplier then sized each attester's per-
+    slot reward off that raw bps -- so on a chain with a single
+    dominant staker, the small-stake validator's ``stake_bps``
+    rounded toward 0 (e.g. at 200 / 50M = 0.04 bps -> 0 under
+    integer division) while the founder absorbed the bulk of the
+    per-slot pool via raw-bps weighting, even though Tier 70 had
+    already compressed the selection-probability distribution.
+
+    CLAUDE.md anchor at risk: "Stake concentration is softly capped
+    via diminishing returns -- rich-get-richer in absolute terms,
+    but their share of issuance compresses over time."  Tier 70
+    compressed SELECTION share; without this fix the per-slot reward
+    sizing path stretches the compression back out to linear.  The
+    anchor's load-bearing property ("smaller validators earn at a
+    strictly higher per-unit rate than larger ones") was therefore
+    only half-realized post-Tier-70.
+
+    Abstraction fix: Tier 71 routes the per-slot reward sizing
+    through the same ``effective_weight`` chokepoint Tier 70
+    anchored.  Both numerator and denominator flip to effective-
+    weight in lockstep so the bps share inherits the soft-cap
+    compression.  Pre-fork is byte-identical to legacy.  Post-fork
+    the small-stake validator's bps share becomes meaningfully non-
+    zero (~2 bps at 200/50M with C=1M), feeding through to the v4
+    multiplier's small-staker bonus.
+
+    Both code paths flip at the same height -- the apply path
+    (``SupplyTracker.mint_block_reward``) and the sim mirror
+    (``Blockchain.compute_post_state_root``) -- so the state-root
+    commitment matches the apply path bit-for-bit at the activation
+    block.
+
+    Activation height 6500 sits 2000 blocks above Tier 70 (4500) --
+    ~13.9d cohort spacing matching the Tier 69->70 runway.  Two
+    consecutive reward-distribution changes need their own cohorts;
+    piling reward-distribution changes into the same cohort forces
+    operators to absorb the combined change in one upgrade cycle.
+
+    Sibling holes audit r47 surfaced but DEFERRED:
+      - The proposer-cap redistribute path inherits the compression
+        automatically once ``attestor_rewards`` are effective-weight-
+        bps-sized.
+      - ``FINALITY_VOTE_INCLUSION_REWARD`` direct-mints to the
+        proposer outside both the cap and ``effective_weight``;
+        pooling into the attester pool is deferred to a later audit
+        cycle.
+      - ``ProofOfStake.select_proposer`` (dead but exported, uses
+        raw stake); currently unreached on the consensus path,
+        routing or hard-deleting is a separate refactor.
+
+    No new wire format, no new tx kinds, no state-tree changes.
+    (8b3ef24)
+
+### Fixed
+
+  * **Fork-choice cumulative weight routes through pinned-stake
+    helper (audit r47 #1 -- security top-1).**  ``Blockchain._append_
+    block`` computed fork-choice block weight against live
+    ``self.supply.staked``, then ``_process_attestations`` ran, then
+    the per-block stake snapshot was pinned at
+    ``_stake_snapshots[block_number]``.  Walk-back recompute paths
+    (``_compute_cumulative_weight`` and
+    ``_compute_full_cumulative_weight``) read the pinned snapshot.
+
+    Today nothing between weight-compute and pin mutates
+    ``supply.staked``, so the stored value and the walk-back value
+    coincide on the live mainnet.  But the SHAPE of the bookkeeping
+    -- "compute against live, pin later" -- is the same defect-shape
+    audit r46 #1 just closed for the attestation-finality denominator
+    (``resolve_pinned_attestation_stake``).  Any future refactor that
+    introduces a mutation between weight-compute and pin (slashing
+    on attestation processing, witness-tier post-finality stake
+    adjustments, etc.) would silently produce two values that
+    disagree -- and under the lex-smaller-hash fork-choice tie-break
+    a fork that should have lost wins a spurious reorg.
+
+    Abstraction fix: new ``Blockchain._pinned_stake_at(block_number)``
+    helper is the single chokepoint every cumulative-weight call
+    site routes through.  ``_append_block`` pins the snapshot BEFORE
+    computing fork-choice weight so weight and snapshot are sourced
+    from the same dict by construction; ``_compute_cumulative_weight``
+    and ``_compute_full_cumulative_weight`` replace their inline
+    pinned-with-fallback patterns with the same helper.  Distinct
+    from ``resolve_pinned_attestation_stake`` (strict, returns None
+    on missing pin) because fork-weight has legitimate snapshot-
+    pruned-era callers that need the live fallback to keep walking
+    back over ancient blocks.
+
+    Functional effect today is byte-identical; what changes is the
+    abstraction boundary.  Adding a new fork-weight caller in the
+    future without going through the helper is exactly the
+    recurrence-shape audit r46 #1 closed for the attestation path.
+    No fork, no consensus rule change at the validator boundary,
+    no wire-format change, no new tx kinds.  Pure refactor closing
+    a recurrence pattern.  (6aff303)
+
+  * **Suppress SubmissionReceipt when relay_callback raises (audit
+    r47 #3 -- security top-2).**  The HTTPS submit handler caught
+    any exception from the optional ``relay_callback`` hook, logged
+    it, and proceeded to write the JSON response including the
+    SubmissionReceipt the validator just signed.  The receipt was
+    made public; the validator was committed to a promise they could
+    not honor.
+
+    Scenario: an honest validator whose outbound relay surface
+    silently breaks (misconfigured firewall, transient partition,
+    peers churning) admits a tx to its mempool and issues a receipt.
+    The tx ages out of the validator's mempool TTL having never
+    reached another node -- no peer has it, so no proposer ever
+    includes it.  ``EVIDENCE_INCLUSION_WINDOW`` elapses; the
+    submitter files a ``CensorshipEvidenceTx``; the validator loses
+    ``CENSORSHIP_SLASH_BPS`` (10%) of stake per matured slash.
+
+    CLAUDE.md anchors at risk: honest-operator insurance ("honest,
+    well-configured nodes should rarely if ever be slashed under
+    normal operation") and validator-collusion defense (a
+    coordinated attacker can target small/honest validators with
+    broken relay paths and drain their stake one 10%-slice at a
+    time for the cost of a tx submission per filing -- mainnet-
+    exploitable on either validator).
+
+    Fix: on relay failure, suppress ``receipt_hex`` from the
+    response.  The tx is still admitted (200 OK with ``tx_hash``,
+    mempool entry intact), but no SubmissionReceipt bytes leave the
+    validator's process.  Without those bytes, the submitter cannot
+    weaponize this validator's signature into a CensorshipEvidenceTx
+    -- the slashing-magnet is closed.  The receipt-subtree leaf is
+    privately burnt (the WOTS+ key was used internally), but the
+    signed receipt was never published, so no PUBLIC commitment was
+    made -- the validator hasn't lied to anyone.
+
+    Senders who want a receipt can fan out via ``send-multi`` to peer
+    validators whose relay surface is intact.  This is the exact
+    "single validator can't be coerced into silent drop" escape
+    hatch the censorship-evidence pipeline exists to provide;
+    suppressing the receipt on the broken-relay validator routes the
+    submitter toward that fan-out, not toward a slash filing they
+    could later misuse.
+
+    The fix preserves the existing fail-open semantics from the
+    receipt-budget gate (audit 2026-04-28): a response with
+    ``ok=true`` and no receipt field is already a documented success
+    shape, so honest clients (including ``send-multi``) handle it
+    correctly.  No wire-format change, no consensus rule change, no
+    fork, no new tx kinds.  Pure network-layer hardening.  (ad2e845)
+
 ## [1.75.0] — 2026-05-11
 
 Minor release.  Audit r46 top-3 ships: one hard fork (Tier 70 --
