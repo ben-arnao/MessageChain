@@ -93,6 +93,33 @@
     color: var(--muted);
     word-break: break-all;
   }
+  /* Message card: the body of what was anchored.  Sits below the
+     verdict so a friend who follows a /r/<tx> share-link sees
+     "Permanent · here's what was made permanent" in one glance. */
+  .message-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+    margin: 0.4rem 0 1rem;
+  }
+  .message-meta {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }
+  .message-meta a { color: var(--accent); text-decoration: none; }
+  .message-meta a:hover { text-decoration: underline; }
+  .message-meta .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .message-body {
+    font-size: 1rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow-wrap: anywhere;
+  }
   .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -174,6 +201,21 @@
     <div class="narrative" id="verdictNarrative"></div>
   </div>
   <p class="status" id="status">Loading…</p>
+  <div class="section" id="messageSection" hidden>
+    <h2>Message</h2>
+    <div class="message-card">
+      <div class="message-meta">
+        <span>by <a id="messageBy" class="mono" href="#" title="">…</a></span>
+        <span id="messageCommunityWrap" hidden>
+          · in <a id="messageCommunityLink" href="#">…</a>
+        </span>
+        <span id="messageReplyWrap" hidden>
+          · reply to <a id="messageReplyLink" class="mono" href="#" title="">…</a>
+        </span>
+      </div>
+      <div class="message-body" id="messageBody"></div>
+    </div>
+  </div>
   <div id="details" hidden>
     <div class="section">
       <h2>Block</h2>
@@ -240,8 +282,48 @@
     }
   }
 
+  // Audit r43 #2: render the user-readable body so a friend who
+  // follows a /r/<tx> share-link sees WHAT was anchored, not just
+  // the verdict that something was.  textContent (not innerHTML) is
+  // load-bearing — chain payloads are arbitrary user bytes.
+  function renderMessageBody(result) {
+    const section = document.getElementById("messageSection");
+    if (typeof result.message !== "string") {
+      section.hidden = true;
+      return;
+    }
+    section.hidden = false;
+    document.getElementById("messageBody").textContent = result.message;
+    if (result.entity_id) {
+      const by = document.getElementById("messageBy");
+      by.textContent = shortHex(result.entity_id, 6, 4);
+      by.href = "/e/" + result.entity_id;
+      by.title = result.entity_id;
+    }
+    const cwrap = document.getElementById("messageCommunityWrap");
+    if (result.community_id) {
+      cwrap.hidden = false;
+      const cl = document.getElementById("messageCommunityLink");
+      cl.textContent = "#" + result.community_id;
+      cl.href = "/?community=" + encodeURIComponent(result.community_id);
+    } else {
+      cwrap.hidden = true;
+    }
+    const rwrap = document.getElementById("messageReplyWrap");
+    if (result.prev) {
+      rwrap.hidden = false;
+      const rl = document.getElementById("messageReplyLink");
+      rl.textContent = shortHex(result.prev, 6, 4);
+      rl.href = "/r/" + result.prev;
+      rl.title = result.prev;
+    } else {
+      rwrap.hidden = true;
+    }
+  }
+
   function renderIncluded(result, txHash) {
     clearGrids();
+    renderMessageBody(result);
     const finalised = !!result.finality_threshold_met;
 
     verdictEl.hidden = false;

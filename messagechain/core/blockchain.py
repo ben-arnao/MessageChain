@@ -17193,6 +17193,37 @@ class Blockchain:
         }
         if proof_dict is not None:
             result["merkle_proof"] = proof_dict
+        # Audit r43 #2 (value-prop top-1): surface the user-readable
+        # body so the public receipt page renders WHAT was anchored,
+        # not just the inclusion verdict.  Pre-fix the receipt page at
+        # /r/<tx> showed "Permanent · X of Y validators attested" with
+        # no message text -- the headline mission ("your message can
+        # never be deleted") was invisible at the exact moment a
+        # share-receipt link should make it visceral.  Only set for
+        # MessageTransaction; other tx kinds (transfer, react, slash,
+        # ...) carry no user-readable body, so the receipt UI keys
+        # the body section off of `message` being present.
+        located_tx = None
+        for tx in getattr(block, "transactions", []) or []:
+            if getattr(tx, "tx_hash", None) == tx_hash:
+                located_tx = tx
+                break
+        if located_tx is not None:
+            try:
+                result["message"] = located_tx.plaintext.decode(
+                    "utf-8", errors="replace",
+                )
+            except Exception:  # noqa: BLE001 -- best-effort decode
+                pass
+            entity_id = getattr(located_tx, "entity_id", None)
+            if entity_id:
+                result["entity_id"] = entity_id.hex()
+            community_id = getattr(located_tx, "community_id", None)
+            if community_id is not None:
+                result["community_id"] = community_id
+            prev = getattr(located_tx, "prev", None)
+            if prev:
+                result["prev"] = prev.hex()
         return result
 
     def get_chain_info(self) -> dict:

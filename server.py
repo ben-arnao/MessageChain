@@ -4268,6 +4268,32 @@ class Server(SharedRuntimeMixin):
         }
         if proof_dict is not None:
             result["merkle_proof"] = proof_dict
+        # Audit r43 #2 (value-prop top-1): mirror the message-body
+        # surface from Blockchain.get_tx_status_public so the receipt
+        # UI sees a consistent schema whether it hit the public-feed
+        # HTTP shim or this JSON-RPC port.  See blockchain.py:
+        # get_tx_status_public for the rationale.
+        located_tx = None
+        for tx in getattr(block, "transactions", []) or []:
+            if getattr(tx, "tx_hash", None) == tx_hash:
+                located_tx = tx
+                break
+        if located_tx is not None:
+            try:
+                result["message"] = located_tx.plaintext.decode(
+                    "utf-8", errors="replace",
+                )
+            except Exception:  # noqa: BLE001 -- best-effort decode
+                pass
+            entity_id = getattr(located_tx, "entity_id", None)
+            if entity_id:
+                result["entity_id"] = entity_id.hex()
+            community_id = getattr(located_tx, "community_id", None)
+            if community_id is not None:
+                result["community_id"] = community_id
+            prev = getattr(located_tx, "prev", None)
+            if prev:
+                result["prev"] = prev.hex()
         return {"ok": True, "result": result}
 
     # ── Block Production ────────────────────────────────────────────
