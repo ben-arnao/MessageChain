@@ -4,6 +4,166 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.74.0] — 2026-05-11
+
+Minor release.  Audit r44 top-3 ships: three independent
+public-surface / value-prop fixes covering the chain's headline
+value-prop demo URL, the censorship-resistance escape hatch's
+escalation path, and the social-platform framing of the entity
+profile page.  No new tx kinds, no new wire format, no consensus
+rule change at the validator, no hard fork.
+
+### Added
+
+  * **`/e/<entity_id>` profile page renders recent messages
+    (audit r44 #3 -- value-prop top-1).**  Pre-fix the profile page
+    rendered only four counter grids (Funds / Activity / Reputation
+    / Governance).  A visitor clicking "from mc1..." on any feed
+    card landed on a block-explorer-style page with no list of the
+    entity's actual messages.  No mainstream social product hides
+    the profile owner's posts; this gap broke the chain's
+    "decentralized reddit/twitter core" positioning at the third
+    click of every visitor's exploration loop.
+
+    CLAUDE.md anchor at risk: Positioning (decentralized social-
+    platform framing on the public surface).
+
+    Fix is three layers, all read-only, no protocol or wire-format
+    change:
+
+      * `Blockchain.get_recent_messages_by_entity(entity_id, count)`
+        -- new chain helper mirroring `get_recent_messages`' schema
+        (message / entity_id / timestamp / tx_hash / block_number /
+        ups / downs / up_pct / optional prev + community_id).
+        Filters on entity_id, returns newest-first, capped to
+        count.
+      * `GET /v1/entity_messages?id=<64-hex>&limit=N` -- new
+        public-feed HTTP endpoint.  id is validated as 64-hex;
+        limit is clamped to `PUBLIC_FEED_MAX_LIMIT`.  Returns
+        `{ok, height, messages}` with the same per-entry schema
+        as `/v1/latest` so the profile-page client reuses the
+        global feed's card pattern with no schema branching.
+      * `entity.html` gains a "Recent messages" section under
+        the existing four counter sections.  New CSS for
+        `.msg-card` matches the visual register of the global
+        feed.  `loadMessages(id)` runs in parallel with the
+        existing profile fetch so a slow chain scan doesn't
+        block the counters from rendering.  Each card carries
+        body text (textContent for XSS safety), a "Permanent"
+        permalink to `/r/<tx_hash>`, block number, relative
+        timestamp, optional community chip, vote summary, and
+        an optional reply-thread arrow linking to `/r/<prev>`.
+
+    9 regression tests in `tests/test_audit_r44_entity_recent_
+    messages.py` pin: chain helper schema/newest-first/filter/
+    count-cap behaviour, HTTP endpoint shape + malformed-id +
+    limit-clamp, and entity.html section + endpoint reference +
+    receipt-permalink wiring.
+
+    Surfaced by audit r44 value-prop axis #1.  (4985b24)
+
+### Fixed
+
+  * **Receipt page renders pending state (audit r44 #1 --
+    value-prop top-1).**  Pre-fix the dispatch in
+    `receipt.html`'s `loadStatus` was binary:
+
+        if (result.status === "included") renderIncluded(...);
+        else                              renderNotFound(...);
+
+    The public-feed shim `get_tx_status_public` deliberately
+    returns only `"included" | "not_found"` (no `"pending"` --
+    the public feed does not see the mempool, by design).  Net
+    effect: every share-URL printed by `cmd_send` opened in the
+    first ~10 min after submit landed on a red "Not found /
+    suspect censorship" card for a tx that was behaving
+    normally.  The chain's headline value-prop demo moment
+    (the 1.71.0 share-URL + 1.73.0 message-body render)
+    inverted itself on every successful send.
+
+    CLAUDE.md anchor at risk: Mission ("your message can never
+    be deleted") + Permanence -- the share-URL is THE public-
+    facing permanence demo, and shipping it as a suspect-
+    censorship card on the first ten minutes of every send
+    actively trained share-link recipients to distrust the
+    verdict.
+
+    Fix is purely in `receipt.html`; the public-feed shim's
+    "no mempool exposure" anchor is preserved.  New
+    `renderPending(txHash)` uses the existing `.verdict.pending`
+    CSS class (styled but unreached) and surfaces a "Waiting
+    for inclusion -- typical for ~10 min after submission"
+    verdict with a countdown of remaining retries.
+    `loadStatus`'s not_found branch routes through
+    `renderPending` for the first `PENDING_RETRY_BUDGET`=48
+    polls (48 * 15s = 12 min) and self-polls via setTimeout,
+    only falling through to `renderNotFound` (the existing
+    suppression narrative + slashable-evidence escalation
+    pointer) once the budget exhausts.
+
+    Pure client-side fix.  No server change, no public-feed
+    schema change.
+
+    6 regression tests in `tests/test_audit_r44_receipt_
+    pending_render.py` pin: `renderPending` exists, uses
+    `.verdict.pending` class, surfaces a reassuring "typical
+    wait" narrative, `loadStatus` dispatches not_found through
+    `renderPending`, auto-refresh via setTimeout is wired,
+    retry budget eventually falls through to `renderNotFound`.
+
+    Surfaced by audit r44 #1.  (77d8225)
+
+  * **`send-multi` writes JSON receipt bundles (audit r44 #2 --
+    censorship-defense escalation path).**  Pre-fix the
+    `send-multi` success path wrote `<tx_hash>_<issuer>.bin`
+    files containing raw `receipt.to_bytes()` -- a format the
+    slashable-evidence CLI cannot consume.
+    `_load_receipt_bundle` (the `submit-evidence censorship
+    --receipt <path>` loader) requires a JSON object with
+    `receipt` AND `message_tx` keys and raises
+    `ValueError("receipt bundle missing 'message_tx' field")`
+    on a raw .bin.
+
+    Net effect: a dissident reaches for `send-multi` (the only
+    CLI path that defends against validator collusion), the
+    censoring node silently drops their tx, they try
+    `submit-evidence censorship --receipt receipts/<tx>_<issuer>
+    .bin` to file the slashable evidence -- and the CLI rejects
+    their own receipt with "missing `message_tx`".  The
+    structural defense at the protocol level exists; the
+    user-facing path to invoke it was broken end-to-end.
+
+    CLAUDE.md anchors at risk: Censorship resistance ("one
+    honest validator is enough" must be USABLE, not just
+    structurally true); collective-decision framing -- the
+    chain's anti-suppression machinery demands that evidence
+    flow from individual users to the on-chain slashing path.
+
+    Fix: `_save_receipt_bundle` gains an optional
+    `filename_suffix` parameter (per-issuer keying for the
+    multi-validator case while preserving byte-identical
+    behaviour for the existing `cmd_send` single-receipt call);
+    `cmd_send_multi_submit`'s success-path receipt write loop
+    now calls `_save_receipt_bundle` with `filename_suffix=
+    r.issuer_id.hex()[:16]` instead of writing raw .bin.  Each
+    accepting validator's receipt lands as a JSON bundle the
+    slashable-evidence CLI consumes without translation.
+
+    Pure CLI ergonomics + on-disk format change; no protocol
+    change, no wire-format change, no consensus rule change, no
+    new tx kinds.
+
+    3 regression tests in `tests/test_audit_r44_send_multi_
+    json_receipts.py` pin: success path writes JSON (not .bin);
+    bundles are keyed per (tx_hash, issuer_id) so N validators'
+    receipts coexist; every written bundle round-trips through
+    `_load_receipt_bundle`.  Companion update to
+    `test_submit_client.py::TestCliMultiSubmit::test_cli_multi_
+    submit_against_real_validator_persists_receipts` mirrors
+    the format change.
+
+    Surfaced by audit r44 #2.  (5582a7d)
+
 ## [1.73.0] — 2026-05-11
 
 Minor release.  Audit r43 top-2 ships: the per-message permanence-
