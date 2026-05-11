@@ -8828,11 +8828,10 @@ class Blockchain:
             # missing pin must NOT also drop reputation, which would
             # be a second divergence axis.
             self._bump_reputation(att.validator_id)
-            target_block = att.block_number
-            pinned = self._stake_snapshots.get(target_block)
-            if pinned is None:
+            resolved = self.resolve_pinned_attestation_stake(att)
+            if resolved is None:
                 logger.error(
-                    f"Attestation target #{target_block} "
+                    f"Attestation target #{att.block_number} "
                     f"({att.block_hash.hex()[:16]}) has no pinned stake "
                     f"snapshot at apply time -- skipping finality update "
                     f"to avoid live-state denominator divergence across "
@@ -8840,9 +8839,7 @@ class Blockchain:
                     f"snapshot-mirror corruption."
                 )
                 continue
-            stakes_for_att = pinned
-            validator_stake = stakes_for_att.get(att.validator_id, 0)
-            total_stake = sum(stakes_for_att.values())
+            validator_stake, total_stake = resolved
             # Finality safety floor: independent of bootstrap_progress,
             # finalization always requires the active validator count
             # to meet the minimum.  Prevents a thinned-out chain from
@@ -9241,6 +9238,32 @@ class Blockchain:
         self._observe_vote_for_emergency(
             vote, signer_stake, total_stake, stake_map,
         )
+
+    def resolve_pinned_attestation_stake(self, att):
+        """Single source of truth for the (validator_stake, total_stake)
+        denominator used in ``finality.add_attestation`` calls.
+
+        Reads the stake distribution pinned at ``att.block_number`` from
+        ``self._stake_snapshots``.  Returns ``(validator_stake,
+        total_stake)`` when the pin exists, or ``None`` when it does not
+        (peer has not yet applied the target block, or pin was pruned past
+        the mirror window).  Callers MUST skip the finality update on the
+        ``None`` path — falling back to ``self.supply.staked`` reads live
+        post-churn state and produces divergent ``is_finalized()``
+        decisions across peers.
+
+        Every writer to the shared ``FinalityTracker`` accumulator must
+        route through this helper.  Today that's the consensus apply path
+        (``_process_attestations``), the gossip-ingress handler
+        (``Node._handle_announce_attestation``), and the local-broadcast
+        path (``Node._attest_block_if_allowed``).  Adding a new caller in
+        the future without using this helper reintroduces the divergence
+        trap audit r46 #1 closed.
+        """
+        pinned = self._stake_snapshots.get(att.block_number)
+        if pinned is None:
+            return None
+        return pinned.get(att.validator_id, 0), sum(pinned.values())
 
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.

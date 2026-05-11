@@ -1691,14 +1691,22 @@ class Node(SharedRuntimeMixin):
             return
 
         # Record our own attestation locally (we won't see it on the
-        # gossip path) and broadcast.
-        validator_stake = self.blockchain.supply.get_staked(self.entity.entity_id)
-        total_stake = sum(self.blockchain.supply.staked.values())
+        # gossip path) and broadcast.  Same divergence-trap as
+        # ``_handle_announce_attestation``: live ``supply.staked`` here
+        # would corrupt the finality denominator for peers comparing
+        # this node's attested_stake total to theirs.  Route through
+        # the shared pinned-stake helper.  If no pin exists for the
+        # target height, skip the local finality update and still
+        # broadcast — peers with the pin will fold our attestation
+        # into their own denominator correctly.
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
-        self.blockchain.finality.add_attestation(
-            att, validator_stake, total_stake,
-            min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
-        )
+        resolved = self.blockchain.resolve_pinned_attestation_stake(att)
+        if resolved is not None:
+            validator_stake, total_stake = resolved
+            self.blockchain.finality.add_attestation(
+                att, validator_stake, total_stake,
+                min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+            )
 
         msg = NetworkMessage(
             msg_type=MessageType.ANNOUNCE_ATTESTATION,
@@ -1759,17 +1767,32 @@ class Node(SharedRuntimeMixin):
                     f"{att.validator_id.hex()[:16]}"
                 )
 
-        # Record in finality tracker.  Finality safety floor: the active
-        # set must meet the minimum validator count regardless of
-        # bootstrap_progress — 2/3 of tiny stake is not finality.
-        # (Historical name: see config comment.)
+        # Record in finality tracker using the pinned-at-target-height
+        # stake snapshot — NOT live ``supply.staked``.  The apply path
+        # (`Blockchain._process_attestations`) reads pinned stake; if
+        # this gossip path read live stake instead, two honest peers
+        # could land different ``attested_stake`` totals on the same
+        # ``(validator_id, height, hash)`` key (whichever path arrived
+        # first wins dedup), producing divergent ``is_finalized()``
+        # decisions during stake-churn windows and forking the chain
+        # on reorg-rejection.  Routes through the shared
+        # ``Blockchain.resolve_pinned_attestation_stake`` helper so the
+        # apply path and the gossip path can't drift apart.  If no pin
+        # exists (target block not yet applied locally), skip the
+        # finality update — the attestation will be re-observed when
+        # this node catches up; still relay so other peers (some with
+        # the pin) can advance their own finality state.  Finality
+        # safety floor: independent of bootstrap_progress, finalization
+        # always requires the active validator count to meet the
+        # minimum.  (Historical name: see config comment.)
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
-        validator_stake = self.blockchain.supply.get_staked(att.validator_id)
-        total_stake = sum(self.blockchain.supply.staked.values())
-        self.blockchain.finality.add_attestation(
-            att, validator_stake, total_stake,
-            min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
-        )
+        resolved = self.blockchain.resolve_pinned_attestation_stake(att)
+        if resolved is not None:
+            validator_stake, total_stake = resolved
+            self.blockchain.finality.add_attestation(
+                att, validator_stake, total_stake,
+                min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+            )
 
         logger.debug(f"Received attestation from {att.validator_id.hex()[:16]} for block #{att.block_number}")
 
