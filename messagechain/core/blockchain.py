@@ -9281,6 +9281,39 @@ class Blockchain:
             return None
         return pinned.get(att.validator_id, 0), sum(pinned.values())
 
+    def _pinned_stake_at(self, block_number: int) -> dict[bytes, int]:
+        """Resolve the stake snapshot for fork-weight calculation at
+        ``block_number``.  Returns the pinned snapshot when available;
+        falls back to live ``self.supply.staked`` for the snapshot-
+        pruned era / bootstrap edge.
+
+        Single chokepoint for every cumulative-weight call site -- the
+        canonical add_block path and both walk-back recompute paths
+        (``_compute_cumulative_weight`` and
+        ``_compute_full_cumulative_weight``) route through here.  Adding
+        a new fork-weight caller in the future without going through
+        this helper is exactly the recurrence-shape audit r46 #1 closed
+        for the attestation-finality denominator and audit r47 #1
+        closed for fork-choice weight.
+
+        Distinct from ``resolve_pinned_attestation_stake``: that helper
+        is strict (returns None on missing pin, callers MUST skip the
+        finality update); fork-weight has legitimate snapshot-pruned-era
+        callers that need the live fallback to keep walking back over
+        ancient blocks whose pins were never recorded or have been
+        pruned past the mirror window.  Logged at debug so a healthy
+        chain stays quiet but a regression is grep-able.
+        """
+        pinned = self._stake_snapshots.get(block_number)
+        if pinned is not None:
+            return pinned
+        logger.debug(
+            "stake snapshot missing for block #%d -- falling back to "
+            "live supply.staked for fork-weight calculation",
+            block_number,
+        )
+        return self.supply.staked
+
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
 
@@ -15090,11 +15123,31 @@ class Blockchain:
             self.chain.append(block)
             self._block_by_hash[block.block_hash] = block
 
+            # Audit r47 #1 -- pin the per-block stake snapshot BEFORE
+            # computing fork-choice weight, so the value stored in
+            # fork_choice.tips and the value walk-back recompute paths
+            # read from `_stake_snapshots` are sourced from the same
+            # dict by construction.  Same defect-shape as audit r46 #1
+            # for the attestation-finality denominator (live vs pinned
+            # divergence under stake-churn ordering).  Today nothing
+            # between weight-compute and pin mutates supply.staked, so
+            # the two values coincide; pinning first is defense-in-depth
+            # against any future refactor that touches the stake dict
+            # in this window (slashing on attestation, witness-tier
+            # accounting, etc.).  Functional effect today is byte-
+            # identical because `dict(self.supply.staked)` snapshots
+            # the same map either way; what changes is the abstraction
+            # boundary -- fork-weight now reads from the snapshot, not
+            # from the live dict, so the recurrence pattern is closed.
+            self._record_stake_snapshot(block.header.block_number)
+
             # Update fork choice: remove old tip, add new
             old_tip = block.header.prev_hash
             old_tip_data = self.fork_choice.tips.get(old_tip)
             old_weight = old_tip_data[1] if old_tip_data else 0
-            block_weight = compute_block_stake_weight(block, self.supply.staked)
+            block_weight = compute_block_stake_weight(
+                block, self._pinned_stake_at(block.header.block_number),
+            )
             new_weight = old_weight + block_weight
 
             self.fork_choice.remove_tip(old_tip)
@@ -15104,11 +15157,9 @@ class Blockchain:
             # for the attestations' target block (N-1) rather than the
             # live post-N stake to avoid validator churn corrupting
             # the 2/3 check.
-            self._process_attestations(block, self.supply.staked)
-
-            # Pin the stake snapshot for this block so the NEXT
-            # block's attestations consult the right pin.
-            self._record_stake_snapshot(block.header.block_number)
+            self._process_attestations(
+                block, self._pinned_stake_at(block.header.block_number),
+            )
 
             # Persist (still inside the outer transaction — the
             # nested begin/commit in _persist_state is a no-op at
@@ -15418,20 +15469,7 @@ class Blockchain:
         while current and depth < MAX_REORG_DEPTH + 10:
             if current.header.prev_hash == b"\x00" * 32:
                 break
-            pinned = self._stake_snapshots.get(current.header.block_number)
-            if pinned is None:
-                # Snapshot unavailable (bootstrap edge, unapplied fork
-                # block, or ancient pruned state) — fall back to live
-                # stake.  Logged at debug because on a healthy chain
-                # this only fires for the fork-head block itself.
-                logger.debug(
-                    "stake snapshot missing for block #%d — falling back "
-                    "to live supply.staked for fork-weight calculation",
-                    current.header.block_number,
-                )
-                stakes = self.supply.staked
-            else:
-                stakes = pinned
+            stakes = self._pinned_stake_at(current.header.block_number)
             weight += compute_block_stake_weight(current, stakes)
             current = self.get_block_by_hash(current.header.prev_hash)
             depth += 1
@@ -15503,8 +15541,7 @@ class Blockchain:
 
         weight = base_weight
         for blk in reversed(walk):
-            pinned = self._stake_snapshots.get(blk.header.block_number)
-            stakes = pinned if pinned is not None else self.supply.staked
+            stakes = self._pinned_stake_at(blk.header.block_number)
             weight += compute_block_stake_weight(blk, stakes)
             self._block_full_cumulative_weight[blk.block_hash] = weight
         return weight
