@@ -3624,14 +3624,28 @@ def cmd_transfer(args):
         is_first_spend = pk_hex == ""
 
     # Fee policy:
-    #   * --fee explicit:  honor it if it clears the estimator floor
-    #     (which includes any NEW_ACCOUNT_FEE surcharge); else error.
+    #   * --fee explicit:  honor it if it clears the LIVE server floor
+    #     (server_min_fee == tx_floor("transfer", current_height, ...),
+    #     which already bundles the NEW_ACCOUNT_FEE surcharge when
+    #     applicable); else error.
     #   * --fee omitted:   use the unified auto-fee helper so every
     #     tx-submitting command shares one picker (CLAUDE.md anchor).
     #     The helper's tx_floor("transfer", ...) already bundles the
     #     surcharge when recipient_is_new.
+    #
+    # Audit r45 #2: trust server_min_fee directly.  Previously this
+    # code re-clamped the picked fee against the legacy MIN_FEE
+    # constant locally -- but MIN_FEE is the legacy pre-FLAT_FEE_HEIGHT
+    # value of 100, while Tier 49 (UNIFIED_FEE_FLOOR_HEIGHT=1750)
+    # collapsed the unified transfer floor to MARKET_FEE_FLOOR=1 for
+    # existing-recipient transfers.
+    # The local clamp silently over-charged every wallet user 100x the
+    # protocol floor on every transfer since Tier 49 went live.  The
+    # server's ``tx_floor`` is the height-aware source of truth; the
+    # new-account-surcharge path stays correct via the server returning
+    # MIN_FEE + NEW_ACCOUNT_FEE on that branch (validator code path
+    # unchanged).
     fee = args.fee
-    required_floor = max(MIN_FEE, server_min_fee)
     if fee is None:
         from messagechain.economics.auto_fee import (
             auto_fee, urgency_to_target_blocks,
@@ -3648,7 +3662,7 @@ def cmd_transfer(args):
         # Mempool percentile estimate at the urgency-derived rung.
         # Transfers don't compete in the message-byte-budget knapsack,
         # so the percentile estimate is mostly informational here --
-        # the type-specific MIN_FEE floor binds.
+        # the type-specific floor binds.
         est_resp = rpc_call(host, port, "estimate_fee", {
             "kind": "transfer",
             "recipient_id": recipient_id.hex(),
@@ -3666,18 +3680,22 @@ def cmd_transfer(args):
             mempool_estimate=mempool_estimate,
             recipient_is_new=recipient_is_new,
         )
-        # Reconcile with the live server's view of the floor -- server
-        # may already include surcharge details we computed locally.
-        fee = max(fee, required_floor)
-    elif fee < required_floor:
+        # Defence in depth: floor the picked fee at the server's live
+        # quote so a stale local auto_fee height doesn't underbid the
+        # validator's actual admission rule.  No legacy MIN_FEE clamp.
+        fee = max(fee, server_min_fee)
+    elif fee < server_min_fee:
         if recipient_is_new:
             print(
-                f"Error: fee {fee} is below required {required_floor} "
-                f"(MIN_FEE {MIN_FEE} + NEW_ACCOUNT_FEE {NEW_ACCOUNT_FEE} "
-                f"surcharge for brand-new recipient)."
+                f"Error: fee {fee} is below the chain's live floor "
+                f"{server_min_fee} (includes NEW_ACCOUNT_FEE "
+                f"{NEW_ACCOUNT_FEE} surcharge for brand-new recipient)."
             )
         else:
-            print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
+            print(
+                f"Error: fee {fee} is below the chain's live floor "
+                f"{server_min_fee}."
+            )
         sys.exit(1)
 
     tx = create_transfer_transaction(

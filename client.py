@@ -248,16 +248,27 @@ def cmd_transfer(args):
         recipient_is_new = bool(r.get("recipient_is_new", False))
         server_min_fee = int(r.get("min_fee", MIN_FEE))
 
-    required_floor = max(MIN_FEE, server_min_fee)
-    fee = args.fee if args.fee else required_floor
-    if fee < required_floor:
+    # Audit r45 #2: trust the server's live floor (height-aware
+    # ``tx_floor`` result for ``transfer``) instead of clamping back
+    # up to the legacy ``MIN_FEE`` constant locally.  Tier 49 collapsed
+    # the unified transfer floor to ``MARKET_FEE_FLOOR=1`` for existing
+    # recipients; the prior local clamp silently over-charged 100x
+    # for ~9 months of mainnet history.  The new-recipient surcharge
+    # stays correct via the server returning
+    # ``MIN_FEE + NEW_ACCOUNT_FEE`` on that branch.
+    fee = args.fee if args.fee else server_min_fee
+    if fee < server_min_fee:
         if recipient_is_new:
             print(
-                f"Error: fee {fee} is below required {required_floor} "
-                f"(MIN_FEE {MIN_FEE} + NEW_ACCOUNT_FEE {NEW_ACCOUNT_FEE})."
+                f"Error: fee {fee} is below the chain's live floor "
+                f"{server_min_fee} (includes NEW_ACCOUNT_FEE "
+                f"{NEW_ACCOUNT_FEE} surcharge)."
             )
         else:
-            print(f"Error: fee {fee} is below MIN_FEE {MIN_FEE}.")
+            print(
+                f"Error: fee {fee} is below the chain's live floor "
+                f"{server_min_fee}."
+            )
         sys.exit(1)
     tx = create_transfer_transaction(entity, recipient_id, args.amount, nonce=nonce, fee=fee)
 
