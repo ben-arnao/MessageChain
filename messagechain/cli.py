@@ -203,7 +203,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     send_multi.add_argument("message", type=str, help="Message text (1024 chars max)")
     send_multi.add_argument(
-        "--fee", type=int, required=True, help="Transaction fee (tokens)",
+        "--fee", type=int, default=None,
+        help="Transaction fee in tokens (auto-priced via --server if omitted)",
     )
     send_multi.add_argument(
         "--endpoint", dest="endpoints", action="append", default=[],
@@ -214,14 +215,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Accept self-signed validator TLS certs (TOFU mode)",
     )
     send_multi.add_argument(
-        "--nonce", type=int, default=0,
-        help="Tx nonce (default 0; useful for fresh accounts)",
+        "--server", type=str, default=None,
+        help=(
+            "host:port of a JSON-RPC node for chain-state queries "
+            "(nonce, leaf watermark, fee estimate).  Defaults to your "
+            "local node.  The fan-out --endpoint set is independent "
+            "and unaffected; --server only sources the auto-defaults "
+            "below.  For maximum trust-minimisation, point this at "
+            "your own node."
+        ),
+    )
+    send_multi.add_argument(
+        "--urgency", choices=("low", "normal", "high"), default="normal",
+        help="Auto-fee aggressiveness (ignored when --fee is set)",
+    )
+    send_multi.add_argument(
+        "--nonce", type=int, default=None,
+        help=(
+            "Tx nonce.  Auto-resolved via --server's get_nonce RPC "
+            "when omitted (the safe default)."
+        ),
     )
     send_multi.add_argument(
         "--leaf-index", dest="leaf_index", type=int, default=None,
         help=(
-            "WOTS+ signing leaf (defaults to nonce). Override when the "
-            "chain's leaf-watermark for this entity has drifted past nonce."
+            "WOTS+ signing leaf.  Auto-resolved to the chain's "
+            "leaf_watermark via --server when omitted (the safe "
+            "default).  The on-disk per-entity cursor independently "
+            "floors this so two consecutive runs cannot reuse the "
+            "same leaf even on a fresh machine."
         ),
     )
     send_multi.add_argument(
@@ -3297,23 +3319,99 @@ def cmd_send_multi_submit(args) -> int:
         return 1
     entity = _resolve_signing_entity(private_key, args)
 
-    nonce = int(getattr(args, "nonce", 0) or 0)
-    leaf_index = getattr(args, "leaf_index", None)
-    if leaf_index is None:
-        leaf_index = nonce
+    # Audit r43 #3 (UX top-1): auto-resolve nonce + leaf-watermark +
+    # fee via --server's JSON-RPC, mirroring cmd_send.  send-multi is
+    # the censorship-resistance escape hatch -- making it require
+    # hand-picked --nonce / --leaf-index / --fee defeated its own
+    # purpose, since a dissident reaching for it under pressure is
+    # exactly the population that would set --nonce 0 from muscle
+    # memory and either bounce off "nonce too low" or burn an
+    # already-used WOTS+ leaf.
+    #
+    # --server is the SOURCE of chain state, independent of the
+    # fan-out --endpoint set.  Defaults to localhost; for trust-
+    # minimisation users should point it at their own node.  The
+    # fan-out continues to use --endpoint exclusively.
+    from client import rpc_call as _rpc
+    state_host, state_port = _parse_server(getattr(args, "server", None))
+
+    explicit_nonce = getattr(args, "nonce", None)
+    explicit_leaf = getattr(args, "leaf_index", None)
+    if explicit_nonce is None or explicit_leaf is None:
+        nonce_resp = _rpc(state_host, state_port, "get_nonce", {
+            "entity_id": entity.entity_id_hex,
+        })
+        if not nonce_resp.get("ok"):
+            print(
+                f"Error: could not fetch nonce/leaf from --server "
+                f"{state_host}:{state_port}: "
+                f"{nonce_resp.get('error', 'rpc failed')}.  Pass --nonce "
+                f"and --leaf-index explicitly, or point --server at a "
+                f"reachable JSON-RPC node."
+            )
+            return 1
+        chain_nonce = int(nonce_resp["result"].get("nonce", 0))
+        chain_leaf = int(
+            nonce_resp["result"].get("leaf_watermark", chain_nonce)
+        )
+    else:
+        chain_nonce = int(explicit_nonce)
+        chain_leaf = int(explicit_leaf)
+
+    nonce = chain_nonce if explicit_nonce is None else int(explicit_nonce)
+    leaf_index = chain_leaf if explicit_leaf is None else int(explicit_leaf)
+
     # Cross-process WOTS+ leaf-reuse defense.  Multi-submit fans out
     # to N>=3 validators, but the leaf is still ONE WOTS+ leaf -- two
     # consecutive multi-submit runs at the same --leaf-index would
     # double-sign and disclose the leaf private key.  The on-disk
-    # cursor closes that window even when the operator forgot to
-    # advance --leaf-index between runs.
+    # cursor closes the same-machine window; the chain-watermark
+    # query above closes the cross-machine fresh-disk + reused-keyfile
+    # window the agent flagged.
     _bind_persistent_leaf_index(
         entity, chain_leaf=int(leaf_index),
         data_dir=getattr(args, "data_dir", None),
     )
 
+    # Auto-fee path: mirror cmd_send so a user posting under load
+    # actually competes for inclusion instead of being silently
+    # evicted at the floor.
+    fee = getattr(args, "fee", None)
+    if fee is None:
+        from messagechain.economics.auto_fee import (
+            auto_fee, urgency_to_target_blocks,
+        )
+        from messagechain.core.compression import encode_payload
+        urgency = getattr(args, "urgency", "normal") or "normal"
+        target_blocks = urgency_to_target_blocks(urgency)
+        info_resp = _rpc(state_host, state_port, "get_chain_info", {})
+        tip_height = 0
+        if info_resp.get("ok"):
+            tip_height = max(
+                int(info_resp["result"].get("height", 0) or 0) - 1, 0
+            )
+        target_height = tip_height + 1
+        est_resp = _rpc(state_host, state_port, "estimate_fee", {
+            "kind": "message",
+            "message": args.message,
+            "target_blocks": target_blocks,
+            "urgency": urgency,
+        })
+        mempool_estimate = (
+            int(est_resp["result"].get("mempool_fee", 0) or 0)
+            if est_resp.get("ok") else 0
+        )
+        stored_bytes, _ = encode_payload(args.message.encode("utf-8"))
+        fee = auto_fee(
+            "message",
+            stored_size=len(stored_bytes),
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+        )
+
     tx = create_transaction(
-        entity, args.message, fee=int(args.fee), nonce=nonce,
+        entity, args.message, fee=int(fee), nonce=nonce,
     )
 
     client = SubmitClient(

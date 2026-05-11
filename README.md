@@ -151,6 +151,29 @@ public key on-chain (the "first-spend pubkey install" path).
 Subsequent transactions verify against the installed key — the CLI
 handles this automatically.
 
+**Defending against single-node suppression.** The default `send`
+posts through one RPC endpoint. If you have reason to believe a
+single validator might suppress your tx — say, posting under a
+nation-state takedown threat — `send-multi` fans the signed tx out
+to N≥3 validator HTTPS submission endpoints in parallel, persists
+the signed receipts each accepting validator returns, and lets you
+file a `CensorshipEvidenceTx` later if any receipted tx fails to
+land. Fee / nonce / leaf-watermark auto-resolve via `--server`
+(same as `send`); only `--endpoint` (×3+) is required.
+
+```bash
+messagechain send-multi "message body" \
+    --endpoint val-a.example:8443 \
+    --endpoint val-b.example:8443 \
+    --endpoint val-c.example:8443
+```
+
+The protocol's structural defense against validator collusion is
+the slashable-suppression rule. `send-multi` is the user-side tool
+for invoking it: one honest validator in the fan-out set is enough
+to land the message, and any colluder that took the tx and dropped
+it produces evidence the chain will slash on.
+
 ### 4. Read messages back
 
 Wait one block (~10 minutes) for your message to be included, then:
@@ -204,6 +227,11 @@ messagechain balance                            # liquid + staked tokens
 messagechain send "hello"                       # post a message
 messagechain send "hi" --community-id mc-dev    # tag with a community
 messagechain send "reply" --prev <tx_hash>      # reply/chain to a prior message
+messagechain send-multi "msg" \
+    --endpoint host:port --endpoint host:port \
+    --endpoint host:port                        # multi-validator HTTPS fan-out
+                                                # (defends against single-node
+                                                # suppression; auto fee/nonce)
 messagechain react <tx_hash> --choice up        # up/down/clear-vote a message
 messagechain react <entity_id> --target-type user --choice up   # trust/flag a user
 messagechain transfer --to mc1… --amount 100    # send tokens
