@@ -1339,11 +1339,45 @@ class _SubmissionHandler(http.server.BaseHTTPRequestHandler):
 
         # Optional relay hook — fire-and-forget; errors in relay must
         # never cause an accepted tx to look rejected to the caller.
+        # But audit r47 #3: a relay-callback that RAISES means the
+        # validator's outbound propagation surface just failed.  If we
+        # still return the SubmissionReceipt, an honest validator with
+        # a broken firewall / transient partition / churning peer set
+        # becomes a CensorshipEvidenceTx slashing-magnet -- the
+        # receipted tx ages out of the local mempool TTL having never
+        # reached another node, EVIDENCE_INCLUSION_WINDOW elapses, the
+        # submitter files evidence, the validator loses
+        # CENSORSHIP_SLASH_BPS (10%) of stake per maturation.  CLAUDE.md
+        # honest-operator-insurance anchor violated.
+        #
+        # Fix: on relay failure, suppress receipt_hex from the response.
+        # The tx is still admitted (200 OK with tx_hash, mempool entry
+        # intact), but no signed receipt bytes leave the validator's
+        # process.  Without those bytes the submitter cannot weaponize
+        # this validator's signature into a CensorshipEvidenceTx --
+        # the slashing-magnet is closed.  The receipt-subtree leaf is
+        # privately burnt (the WOTS+ key was used internally), but the
+        # signed receipt was never published, so no PUBLIC commitment
+        # was made -- the validator hasn't lied to anyone.
+        #
+        # Senders who want a receipt can fan out via ``send-multi`` to
+        # peer validators whose relay surface is intact.  This is the
+        # exact "single validator can't be coerced into silent drop"
+        # escape hatch the censorship-evidence pipeline exists to
+        # provide; suppressing the receipt on the broken-relay validator
+        # routes the submitter toward that fan-out, not toward a slash
+        # filing they could later misuse.
         if ctx.relay_callback is not None and not result.duplicate:
             try:
                 ctx.relay_callback(tx)
             except Exception:  # noqa: BLE001 — relay is best-effort
-                logger.exception("submission relay hook raised")
+                logger.exception(
+                    "submission relay hook raised -- suppressing "
+                    "SubmissionReceipt to avoid CensorshipEvidenceTx "
+                    "slashing-magnet for an honest validator with "
+                    "broken outbound relay (audit r47 #3)",
+                )
+                result.receipt_hex = ""
 
         # JSON body.  Include receipt iff the server-side issuer
         # produced one — clients that don't care about censorship
