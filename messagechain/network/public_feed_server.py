@@ -607,6 +607,13 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/entity":
             self._serve_entity(ctx, split.query)
             return
+        if path == "/v1/entity_messages":
+            # Audit r44 #3: per-entity recent-messages feed for the
+            # /e/<entity_id> profile page's Recent messages section.
+            # Same JSON shape as /v1/latest (one entry per message)
+            # so the UI can reuse the global feed's card pattern.
+            self._serve_entity_messages(ctx, split.query)
+            return
         if path == "/v1/tx_status":
             # JSON proxy for the per-message permanence-receipt page.
             # Inclusion-only by design — the public feed has no
@@ -804,6 +811,64 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             "ok": True,
             "height": ctx.blockchain.height,
             "profile": profile,
+        })
+
+    def _serve_entity_messages(
+        self, ctx: "_FeedHandlerContext", query: str,
+    ):
+        """GET /v1/entity_messages?id=<64-hex>&limit=N
+
+        Returns the entity's most recent messages, newest first.
+        Same per-entry schema as /v1/latest (message, entity_id,
+        timestamp, tx_hash, block_number, ups, downs, up_pct, prev?,
+        community_id?) so the profile-page UI reuses the global
+        feed's card pattern.
+
+        Audit r44 #3 -- /e/<entity_id> profile page's Recent messages
+        section.  Pre-fix the page rendered only aggregate counters
+        and the Reddit/Twitter framing broke at the third click of
+        every visitor's exploration loop.
+        """
+        params = parse_qs(query)
+        raw_id = (params.get("id") or [""])[0].strip().lower()
+        if not raw_id or len(raw_id) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be a 64-char hex entity_id",
+            })
+            return
+        try:
+            entity_id = bytes.fromhex(raw_id)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be valid hex",
+            })
+            return
+        raw_limit = (params.get("limit") or ["20"])[0]
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "invalid limit"})
+            return
+        if limit < 1:
+            limit = 1
+        if limit > PUBLIC_FEED_MAX_LIMIT:
+            limit = PUBLIC_FEED_MAX_LIMIT
+
+        try:
+            messages = ctx.blockchain.get_recent_messages_by_entity(
+                entity_id, limit,
+            )
+        except Exception:
+            logger.exception("get_recent_messages_by_entity failed")
+            self._send_json(500, {"ok": False, "error": "chain read failed"})
+            return
+
+        self._send_json(200, {
+            "ok": True,
+            "height": ctx.blockchain.height,
+            "messages": messages,
         })
 
     def _serve_info(self, ctx: _FeedHandlerContext):

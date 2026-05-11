@@ -17094,6 +17094,67 @@ class Blockchain:
                     return messages
         return messages
 
+    def get_recent_messages_by_entity(
+        self, entity_id: bytes, count: int,
+    ) -> list[dict]:
+        """Most recent messages authored by `entity_id`, newest first.
+
+        Mirrors the schema of ``get_recent_messages`` so the public-
+        feed UI (``/e/<entity_id>`` profile page's Recent messages
+        section) can render entity-scoped posts with the same card
+        pattern as the global feed.  Audit r44 #3 -- pre-fix the
+        profile page rendered only aggregate counters, breaking the
+        Reddit/Twitter framing at the third click of every visitor's
+        exploration loop.
+
+        Returns up to ``count`` entries.  Vote aggregation (ups /
+        downs / up_pct), ``prev``, and ``community_id`` are
+        surfaced under the same rules as the global feed helper.
+        """
+        from messagechain.config import (
+            REACT_CHOICE_UP as _UP,
+            REACT_CHOICE_DOWN as _DOWN,
+        )
+        msg_votes: dict[bytes, list[int]] = {}
+        for (_voter, target, target_is_user), choice in (
+            self.reaction_state.choices.items()
+        ):
+            if target_is_user:
+                continue
+            counts = msg_votes.setdefault(target, [0, 0])
+            if choice == _UP:
+                counts[0] += 1
+            elif choice == _DOWN:
+                counts[1] += 1
+
+        messages: list[dict] = []
+        for block in reversed(self.chain):
+            for tx in reversed(block.transactions):
+                if tx.entity_id != entity_id:
+                    continue
+                ups, downs = msg_votes.get(tx.tx_hash, (0, 0))
+                total = ups + downs
+                entry = {
+                    "message": tx.plaintext.decode("utf-8", errors="replace"),
+                    "entity_id": tx.entity_id.hex(),
+                    "timestamp": tx.timestamp,
+                    "tx_hash": tx.tx_hash.hex(),
+                    "block_number": block.header.block_number,
+                    "ups": ups,
+                    "downs": downs,
+                    "up_pct": (100.0 * ups / total) if total > 0 else None,
+                }
+                prev = getattr(tx, "prev", None)
+                if prev is not None:
+                    entry["prev"] = prev.hex()
+                community_id = getattr(tx, "community_id", None)
+                if community_id is not None:
+                    entry["community_id"] = community_id
+                messages.append(entry)
+                if len(messages) >= count:
+                    return messages
+        return messages
+
     def get_tx_status_public(self, tx_hash: bytes) -> dict:
         """Inclusion-only tx status, suitable for the public web feed.
 

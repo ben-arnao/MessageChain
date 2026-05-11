@@ -111,6 +111,48 @@
   .section {
     margin-top: 1.4rem;
   }
+  /* Recent-messages list — same visual register as the global feed's
+     message cards so a visitor jumping between /e/<id> and / sees a
+     consistent surface.  Audit r44 #3: until this section landed the
+     profile page was counters-only and the Reddit/Twitter framing
+     broke at click 3. */
+  .messages-list .msg-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.7rem 0.85rem;
+    margin: 0.5rem 0;
+  }
+  .messages-list .msg-card .body {
+    font-size: 0.95rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    margin: 0 0 0.4rem;
+  }
+  .messages-list .msg-card .meta {
+    font-size: 0.78rem;
+    color: var(--muted);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.9rem;
+  }
+  .messages-list .msg-card .meta a { color: var(--accent); }
+  .messages-list .msg-card .community {
+    display: inline-block;
+    padding: 0.05rem 0.4rem;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.75rem;
+  }
+  .messages-list .msg-card .votes.pos { color: var(--pos); }
+  .messages-list .msg-card .votes.neg { color: var(--neg); }
+  .messages-list .empty {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+  }
   .section h2 {
     font-size: 0.95rem;
     margin: 0 0 0.5rem;
@@ -191,6 +233,12 @@
     <div class="section">
       <h2>Governance</h2>
       <div class="grid" id="governanceGrid"></div>
+    </div>
+    <div class="section">
+      <h2>Recent messages</h2>
+      <div id="messagesList" class="messages-list">
+        <p class="status" id="messagesStatus">Loading messages…</p>
+      </div>
     </div>
   </div>
 </main>
@@ -395,6 +443,116 @@
     profileEl.hidden = false;
   }
 
+  function renderMessages(messages) {
+    const list = document.getElementById("messagesList");
+    if (!list) return;
+    list.replaceChildren();
+    if (!messages || messages.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No messages from this entity yet.";
+      list.appendChild(empty);
+      return;
+    }
+    for (const m of messages) {
+      const card = document.createElement("div");
+      card.className = "msg-card";
+
+      const body = document.createElement("p");
+      body.className = "body";
+      // textContent for XSS safety — message bodies are arbitrary
+      // user bytes.  Mirrors the receipt-page message-card pattern.
+      body.textContent = m.message;
+      card.appendChild(body);
+
+      const meta = document.createElement("div");
+      meta.className = "meta";
+
+      // Permalink to /r/<tx_hash> — the per-message receipt page,
+      // i.e. the chain's headline permanence demo URL.
+      if (m.tx_hash) {
+        const perma = document.createElement("a");
+        perma.href = "/r/" + m.tx_hash;
+        perma.textContent = "Permanent";
+        meta.appendChild(perma);
+      }
+
+      if (typeof m.block_number === "number") {
+        const blk = document.createElement("span");
+        blk.textContent = "block " + m.block_number;
+        meta.appendChild(blk);
+      }
+
+      if (typeof m.timestamp === "number") {
+        const ts = document.createElement("span");
+        ts.textContent = fmtRelativeSince(m.timestamp);
+        ts.title = fmtTs(m.timestamp);
+        meta.appendChild(ts);
+      }
+
+      if (m.community_id) {
+        const comm = document.createElement("span");
+        comm.className = "community";
+        comm.textContent = "/" + m.community_id;
+        meta.appendChild(comm);
+      }
+
+      // Vote summary if present.
+      if (
+        typeof m.ups === "number" && typeof m.downs === "number"
+        && (m.ups + m.downs) > 0
+      ) {
+        const v = document.createElement("span");
+        const net = m.ups - m.downs;
+        v.className = "votes " + signClass(net);
+        v.textContent =
+          "▲ " + m.ups + " · ▼ " + m.downs
+          + (typeof m.up_pct === "number"
+              ? " · " + fmtPct(m.up_pct) + " up" : "");
+        meta.appendChild(v);
+      }
+
+      // Optional reply-thread pointer.
+      if (m.prev) {
+        const prevA = document.createElement("a");
+        prevA.href = "/r/" + m.prev;
+        prevA.textContent = "↳ reply to";
+        meta.appendChild(prevA);
+      }
+
+      card.appendChild(meta);
+      list.appendChild(card);
+    }
+  }
+
+  async function loadMessages(id) {
+    const list = document.getElementById("messagesList");
+    if (!list) return;
+    const statusMsg = document.getElementById("messagesStatus");
+    try {
+      const r = await fetch(
+        "/v1/entity_messages?id=" + encodeURIComponent(id) + "&limit=20",
+        { cache: "no-store" },
+      );
+      const data = await r.json();
+      if (!r.ok || !data.ok) {
+        if (statusMsg) {
+          statusMsg.className = "status error";
+          statusMsg.textContent =
+            "Messages lookup failed: "
+            + (data.error || ("HTTP " + r.status));
+        }
+        return;
+      }
+      renderMessages(data.messages || []);
+    } catch (e) {
+      if (statusMsg) {
+        statusMsg.className = "status error";
+        statusMsg.textContent = "Messages network error: " + e.message;
+      }
+    }
+  }
+
   async function load(id) {
     statusEl.className = "status";
     statusEl.textContent = "Loading…";
@@ -411,6 +569,11 @@
       }
       statusEl.textContent = "";
       render(data.profile, data.height);
+      // Fan out the recent-messages fetch in parallel — the
+      // profile-counters and the messages list are independent,
+      // and a slow chain scan for the messages should not block
+      // the counters from rendering.
+      loadMessages(id);
     } catch (e) {
       statusEl.className = "status error";
       statusEl.textContent = "Network error: " + e.message;
