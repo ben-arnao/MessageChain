@@ -198,7 +198,14 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Censorship-resistant submission: POST the signed tx in "
             "parallel to N>=3 validator HTTPS endpoints. Receipts are "
-            "persisted under --receipts-dir for later evidence use."
+            "persisted under --receipts-dir for later evidence use.\n"
+            "\n"
+            "Requires --keyfile (the GLOBAL flag, defined on the "
+            "top-level parser) pointing at your wallet file -- the "
+            "same one ``messagechain generate-key`` writes.  Mnemonic, "
+            "checksummed hex, and raw hex are all accepted; the CLI "
+            "will prompt interactively if --keyfile is omitted and "
+            "no auto-pickup is available."
         ),
     )
     send_multi.add_argument("message", type=str, help="Message text (1024 chars max)")
@@ -2903,6 +2910,48 @@ def _estimate_signature_size(keypair) -> int:
     )
 
 
+def _should_include_pubkey(
+    host: str, port: int, entity_id_hex: str, target_height: int,
+) -> bool:
+    """Decide whether the next signed tx from ``entity_id_hex`` should
+    carry ``sender_pubkey`` (Tier 11 first-spend pubkey install).
+
+    Returns True only when:
+      (1) target_height is past FIRST_SEND_PUBKEY_HEIGHT (v3 txs are
+          rejected pre-fork  --  including the pubkey would only get the
+          tx bounced), AND
+      (2) the chain reports the entity exists but has not yet had its
+          pubkey installed (the freshly-funded-via-receive-to-exist
+          case, where the entity has a balance but no on-chain key).
+
+    Single chokepoint for the first-spend decision so every signing
+    command (cmd_send, cmd_send_multi_submit, ...) agrees on the
+    probe semantics.  Adding a new signing path that bypasses this
+    helper reintroduces the audit r46 #3 defect  --  a fresh-key first
+    spend through that path gets rejected by every endpoint with
+    "Unknown entity  --  must register first", which looks like
+    censorship to the user but is actually missing pubkey-install.
+
+    Exception-safe: any RPC failure (unreachable node, malformed
+    response) falls back to False so the caller stays on v1/v2.
+    The chain returns "Unknown entity" if the entity truly doesn't
+    exist, which the caller's own error handler explains.
+    """
+    from messagechain.config import FIRST_SEND_PUBKEY_HEIGHT
+    if target_height < FIRST_SEND_PUBKEY_HEIGHT:
+        return False
+    try:
+        from client import rpc_call
+        resp = rpc_call(host, port, "get_entity", {
+            "entity_id": entity_id_hex,
+        })
+    except Exception:
+        return False
+    if not resp.get("ok"):
+        return False
+    return not resp["result"].get("pubkey_registered", True)
+
+
 def cmd_send(args):
     """Send a message to the chain."""
     from messagechain.identity.identity import Entity
@@ -3118,31 +3167,20 @@ def cmd_send(args):
             sys.exit(1)
         print(f"Fee: {fee} tokens")
 
-    # Tier 11: auto-include the sender's pubkey on first send.  Probe
-    # the chain for whether this entity's pubkey is already installed;
-    # if not (typical for a wallet that just received tokens via the
-    # cold-start faucet), build a v3 tx with sender_pubkey set so the
-    # apply path can install it.  Skip the probe if pre-fork --
-    # v3 txs would be rejected by verify_transaction's gate.
-    include_pubkey = False
-    if target_height >= FIRST_SEND_PUBKEY_HEIGHT:
-        get_resp = rpc_call(host, port, "get_entity", {
-            "entity_id": entity.entity_id_hex,
-        })
-        if get_resp.get("ok"):
-            pubkey_registered = get_resp["result"].get(
-                "pubkey_registered", True,
-            )
-            if not pubkey_registered:
-                include_pubkey = True
-                print(
-                    "\nFirst send from this wallet -- attaching pubkey "
-                    "(Tier 11 receive-to-exist install).  Subsequent "
-                    "sends will skip this and stay on v1/v2."
-                )
-        # An ok=False from get_entity means the entity isn't on chain
-        # at all (no balance even).  In that case we can't fund the
-        # tx fee anyway, so let the chain return its own clear error.
+    # Tier 11: auto-include the sender's pubkey on first send.  Routes
+    # through the shared ``_should_include_pubkey`` helper so cmd_send
+    # and cmd_send_multi_submit agree on the probe semantics  --  a future
+    # signing command can adopt the same first-spend behaviour by
+    # calling the helper rather than duplicating the inline probe.
+    include_pubkey = _should_include_pubkey(
+        host, port, entity.entity_id_hex, target_height,
+    )
+    if include_pubkey:
+        print(
+            "\nFirst send from this wallet -- attaching pubkey "
+            "(Tier 11 receive-to-exist install).  Subsequent "
+            "sends will skip this and stay on v1/v2."
+        )
 
     # Create, sign, submit.  Thread the live target_height so the
     # client-side fee floor matches the live (LINEAR-era) rule the
@@ -3306,17 +3344,15 @@ def cmd_send_multi_submit(args) -> int:
         for ep in endpoints:
             ep.insecure = True
 
-    keyfile = getattr(args, "keyfile", None)
-    if not keyfile or not os.path.exists(keyfile):
-        print("Error: --keyfile is required and must exist for multi-submit")
-        return 1
-    with open(keyfile, "r", encoding="ascii") as f:
-        hex_key = f.read().strip()
-    try:
-        private_key = bytes.fromhex(hex_key)
-    except ValueError:
-        print("Error: keyfile must contain a 64-char hex private key")
-        return 1
+    # Route keyfile load through the shared ``_resolve_private_key``
+    # helper.  This supports every form ``messagechain generate-key``
+    # produces  --  24-word BIP-39 mnemonic, 72-char checksummed hex, and
+    # raw 64-char hex (the only form the hand-rolled pre-fix accepted)  -- 
+    # plus an interactive prompt fall-through.  ``personal_wallet=True``
+    # mirrors ``cmd_send`` so ``sudo messagechain send-multi`` on a
+    # validator host does NOT silently sign with the validator's hot
+    # key (a fund-loss / identity-attribution footgun).
+    private_key = _resolve_private_key(args, personal_wallet=True)
     entity = _resolve_signing_entity(private_key, args)
 
     # Audit r43 #3 (UX top-1): auto-resolve nonce + leaf-watermark +
@@ -3373,6 +3409,17 @@ def cmd_send_multi_submit(args) -> int:
         data_dir=getattr(args, "data_dir", None),
     )
 
+    # Resolve target_height once for the auto-fee and pubkey-install
+    # branches below.  Hoisted out of the fee-branch so the pubkey-
+    # install probe sees it even when --fee is explicit.
+    info_resp = _rpc(state_host, state_port, "get_chain_info", {})
+    tip_height = 0
+    if info_resp.get("ok"):
+        tip_height = max(
+            int(info_resp["result"].get("height", 0) or 0) - 1, 0
+        )
+    target_height = tip_height + 1
+
     # Auto-fee path: mirror cmd_send so a user posting under load
     # actually competes for inclusion instead of being silently
     # evicted at the floor.
@@ -3384,13 +3431,6 @@ def cmd_send_multi_submit(args) -> int:
         from messagechain.core.compression import encode_payload
         urgency = getattr(args, "urgency", "normal") or "normal"
         target_blocks = urgency_to_target_blocks(urgency)
-        info_resp = _rpc(state_host, state_port, "get_chain_info", {})
-        tip_height = 0
-        if info_resp.get("ok"):
-            tip_height = max(
-                int(info_resp["result"].get("height", 0) or 0) - 1, 0
-            )
-        target_height = tip_height + 1
         est_resp = _rpc(state_host, state_port, "estimate_fee", {
             "kind": "message",
             "message": args.message,
@@ -3410,8 +3450,37 @@ def cmd_send_multi_submit(args) -> int:
             mempool_estimate=mempool_estimate,
         )
 
+    # Tier 11: auto-include the sender's pubkey on first send.  Routes
+    # through the shared ``_should_include_pubkey`` helper -- the same
+    # one cmd_send uses -- so a fresh-key dissident's FIRST send-multi
+    # post lands as v3 with sender_pubkey set, instead of being silently
+    # rejected by every endpoint with "Unknown entity -- must register
+    # first" (which would LOOK like validator-collusion censorship but
+    # actually be missing pubkey install).  send-multi is exactly the
+    # path a fresh-key dissident reaches for first, so closing this gap
+    # is what makes the censorship-resistance escape hatch actually
+    # usable on first attempt.
+    include_pubkey = _should_include_pubkey(
+        state_host, state_port, entity.entity_id_hex, target_height,
+    )
+    if include_pubkey:
+        print(
+            "First send from this wallet -- attaching pubkey "
+            "(Tier 11 receive-to-exist install).",
+        )
+
+    # Match cmd_send: do NOT thread current_height when we don't have
+    # confidence in target_height (state RPC may have failed).  Pre-fix
+    # ``create_transaction`` always ran with current_height=None and
+    # produced byte-identical wire form to what the chain's
+    # verify_transaction expects at any height (the legacy floor +
+    # tx-layout fall through to v1 baseline).  Threading
+    # target_height=1 from a failed RPC silently lowers the layout
+    # branch a tier-aware chain rejects.  include_pubkey still flows
+    # through so first-spend support works once activated.
     tx = create_transaction(
         entity, args.message, fee=int(fee), nonce=nonce,
+        include_pubkey=include_pubkey,
     )
 
     client = SubmitClient(

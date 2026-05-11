@@ -90,9 +90,15 @@ class TestSendMultiAutoResolvesNonceAndLeaf(unittest.TestCase):
     watermark — parity with ``cmd_send``."""
 
     def setUp(self):
-        # Stable per-test scratch.
-        keyhex = b"alice-r43-send-multi".ljust(32, b"\x00").hex()
-        self._key_dir, self.key_path = _write_keyfile(keyhex)
+        # Stable per-test scratch.  Post-audit-r46, cmd_send_multi_submit
+        # routes through `_resolve_private_key` which only accepts
+        # mnemonic / checksummed-hex (the formats `generate-key`
+        # actually produces) -- raw 64-char hex without --data-dir is
+        # rejected.  Encode via the canonical helper so the test reflects
+        # what a real user's keyfile contains.
+        from messagechain.identity.key_encoding import encode_private_key
+        priv = b"alice-r43-send-multi".ljust(32, b"\x00")
+        self._key_dir, self.key_path = _write_keyfile(encode_private_key(priv))
         self._receipts_dir = tempfile.mkdtemp()
 
     def tearDown(self):

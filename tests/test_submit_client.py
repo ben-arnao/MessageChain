@@ -843,11 +843,19 @@ class TestCliMultiSubmit(SubmitClientTestBase):
             receipts_dir = tempfile.mkdtemp()
             try:
                 # Pre-write the alice key to a temp file so the CLI
-                # can read it without prompting.
+                # can read it without prompting.  Post-audit-r46 the
+                # CLI's `_resolve_private_key` accepts mnemonic /
+                # checksummed-hex (the formats `generate-key` produces)
+                # -- write in checksummed-hex via the canonical helper.
+                from messagechain.identity.key_encoding import (
+                    encode_private_key,
+                )
                 key_dir = tempfile.mkdtemp()
                 key_path = os.path.join(key_dir, "key.txt")
                 with open(key_path, "w", encoding="ascii") as f:
-                    f.write(b"alice-submit-client".ljust(32, b"\x00").hex())
+                    f.write(encode_private_key(
+                        b"alice-submit-client".ljust(32, b"\x00"),
+                    ))
                 try:
                     # Read the chain's current leaf watermark + nonce so
                     # the CLI signs with the right leaf — initialize_genesis

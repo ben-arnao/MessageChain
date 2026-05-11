@@ -159,14 +159,18 @@ to N≥3 validator HTTPS submission endpoints in parallel, persists
 the signed receipts each accepting validator returns, and lets you
 file a `CensorshipEvidenceTx` later if any receipted tx fails to
 land. Fee / nonce / leaf-watermark auto-resolve via `--server`
-(same as `send`); only `--endpoint` (×3+) is required.
+(same as `send`); only `--keyfile` and `--endpoint` (×3+) are required.
 
 ```bash
-messagechain send-multi "message body" \
+messagechain --keyfile ~/.messagechain/keyfile send-multi "message body" \
     --endpoint val-a.example:8443 \
     --endpoint val-b.example:8443 \
     --endpoint val-c.example:8443
 ```
+
+`--keyfile` accepts the same formats `generate-key` produces — 24-word
+mnemonic, 72-char checksummed hex, or raw hex. Omit it to be prompted
+interactively for your recovery phrase.
 
 The protocol's structural defense against validator collusion is
 the slashable-suppression rule. `send-multi` is the user-side tool
@@ -227,7 +231,7 @@ messagechain balance                            # liquid + staked tokens
 messagechain send "hello"                       # post a message
 messagechain send "hi" --community-id mc-dev    # tag with a community
 messagechain send "reply" --prev <tx_hash>      # reply/chain to a prior message
-messagechain send-multi "msg" \
+messagechain --keyfile <path> send-multi "msg" \
     --endpoint host:port --endpoint host:port \
     --endpoint host:port                        # multi-validator HTTPS fan-out
                                                 # (defends against single-node

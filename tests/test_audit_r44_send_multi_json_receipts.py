@@ -100,8 +100,14 @@ class TestSendMultiWritesJsonBundles(unittest.TestCase):
     translation -- i.e. JSON bundles, not raw .bin blobs."""
 
     def setUp(self):
-        keyhex = b"alice-r44-bundles".ljust(32, b"\x00").hex()
-        self._key_dir, self.key_path = _write_keyfile(keyhex)
+        # Post-audit-r46: cmd_send_multi_submit routes keyfile through
+        # `_resolve_private_key`, which expects the checksummed-hex or
+        # mnemonic form (what `generate-key` produces), not raw 64-char
+        # hex.  Encode via the canonical helper for parity with real
+        # user keyfiles.
+        from messagechain.identity.key_encoding import encode_private_key
+        priv = b"alice-r44-bundles".ljust(32, b"\x00")
+        self._key_dir, self.key_path = _write_keyfile(encode_private_key(priv))
         self._receipts_dir = tempfile.mkdtemp()
 
     def tearDown(self):
