@@ -9149,8 +9149,27 @@ class Blockchain:
         Looks up signer stake at the vote's target height using the
         same pinned-snapshot rule as `_apply_finality_votes` so the
         2/3 denominator matches consensus exactly.
+
+        Future-height guard: a vote whose ``target_block_number``
+        references a block this node has not yet appended (i.e.
+        ``target >= self.height`` since ``height == len(self.chain)``
+        and valid indices are ``0..height-1``) has NO pinned stake
+        snapshot.  The legacy fallback to ``dict(self.supply.staked)``
+        scored such a vote against LIVE stake, which on a bootstrap
+        (or any post-bootstrap 2/3-concentration) network single-
+        faulted the 2/3 detector threshold from one signed vote and
+        auto-halted every honest peer.  Honest gossip never targets
+        an unmined block; the only realistic producers of a future-
+        height vote are (a) a benign bug (clock-skew misfire, stale
+        buffered vote replayed at boot, racing vote-scheduler) or
+        (b) an adversarial 2/3-stake holder weaponising the
+        liveness halt without producing slashable evidence.  In
+        both cases the right move is to drop the vote from the
+        early-warning path entirely.
         """
         height = vote.target_block_number
+        if height >= self.height:
+            return
         pinned = self._stake_snapshots.get(height)
         stake_map = pinned if pinned is not None else dict(self.supply.staked)
         signer_stake = stake_map.get(vote.signer_entity_id, 0)
