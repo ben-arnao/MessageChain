@@ -4,6 +4,97 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.72.0] — 2026-05-11
+
+Minor release.  Tier 69 hard fork — three coupled honesty-curve
+refinements that push the slashing curve further toward the
+CLAUDE.md "honest operators are insured against accidents" anchor
+without weakening the deliberate-Byzantine bar.  Activation at
+height 2700, ~8.3h cohort spacing above Tier 68.
+
+### Changed (Tier 69, consensus-breaking)
+
+- **``slash_offense_counts`` decay sweep.**  Pre-Tier-69 the per-
+  offender slash counter was monotonic — one transient slash
+  permanently disqualified a validator from Tier 24 amnesty AND
+  from full honest-history relief for the rest of their tenure.
+  That mismatched the third track-record factor ("good-vs-bad
+  RATE"): a long-tenured operator with one ancient slip and
+  millions of good blocks was treated as if the slip just
+  happened.  Post-Tier-69 every ``HONESTY_CURVE_DECAY_PERIOD_BLOCKS``
+  (= 4_320, ≈ 30 days at 600s blocks) of progress past activation
+  decays every positive prior by 1, so a single offense recovers
+  to amnesty-eligible after one period of clean operation.
+  Sustained bad actors accumulate priors faster than they decay,
+  so the deliberate-bad-actor curve is unchanged.  Sweep runs at
+  the END of ``_apply_block_state`` (after the audit-r41 deferred
+  bump loop) so sim and apply paths agree on the pre-decay
+  priors during severity computation — the decay takes effect
+  for the NEXT block.
+
+- **Restart-drift window widened 120s → 600s.**  Pre-Tier-69 the
+  AMBIGUOUS-vs-UNAMBIGUOUS classifier admitted block-header
+  restart-shape evidence only if the two timestamps differed by
+  ≤120s.  Honest restart cycles on heavy load (mempool rebuild +
+  disk fsync + WOTS+ leaf seek) routinely take longer; the
+  tight window was forcing legitimately-honest restart artifacts
+  onto the UNAMBIGUOUS path (50% floor on first, 100% repeat).
+  Post-Tier-69 the window widens to 600s (10 min).  Pure
+  classification change — restart-shape evidence carries no
+  fork-grinding economic value at any drift width (same parent,
+  same state_root, same checkpoint), so widening the window
+  cannot help an attacker.
+
+- **AMBIGUOUS-path cap tightened 10% → 3%.**  Pre-Tier-69 the
+  Tier-51 cap bounded AMBIGUOUS-path output at 10%.  10% is
+  "small fractional" against a wipe, but for a restart-shape
+  repeat-offense pattern it is still operationally painful (5
+  events compound to ~40% of stake lost over time).  Post-
+  Tier-69 the cap tightens to 3%, firmly in "operational
+  nuisance, recoverable" territory.  UNAMBIGUOUS path is
+  untouched — deliberate Byzantine evidence still carries the
+  50%+ first-offense floor and 100% repeat.
+
+### Added
+
+- ``_apply_slash_offense_decay`` — the decay-sweep chokepoint.
+  Routes each decrement through ``_bump_slash_offense_count`` so
+  the chaindb mirror picks up the writes at the same chokepoint
+  as the +1 path.  Iterates ``sorted(keys())`` for replay
+  determinism.
+
+- ``_bump_slash_offense_count`` now clamps at 0 — the decay sweep
+  calls it with ``delta=-1`` and must not underflow on a clean
+  validator.
+
+- New config constants: ``HONESTY_CURVE_TIER69_HEIGHT``,
+  ``HONESTY_CURVE_DECAY_PERIOD_BLOCKS``,
+  ``HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69``,
+  ``HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69``.  Asserts at the
+  bottom of the block enforce that the fork is a one-way leniency
+  move (wider drift, tighter cap).
+
+- ``classify_block_evidence`` takes an optional ``current_height``
+  parameter (default 0 for pre-fork legacy callers); the caller
+  in ``_compute_slash_pct`` passes ``self.height`` so the
+  classifier picks the active drift window deterministically.
+
+### Tests
+
+- ``tests/test_honesty_curve_tier69.py`` — 30 tests across the
+  three changes: constants exist with the right shape, pre-fork
+  byte-identical behavior, post-fork tightened cap binds,
+  UNAMBIGUOUS path untouched, drift-window boundary cases (≤120s
+  pre-fork AMBIGUOUS, 121–600s post-fork AMBIGUOUS, >600s
+  UNAMBIGUOUS), different-state_root / different-prev_hash still
+  UNAMBIGUOUS at the wider window, decay sweep no-op
+  pre-activation, decay sweep no-op on activation block, decay
+  sweep fires at first period boundary, repeated sweeps recover
+  high-prior validators, post-decay amnesty eligibility for a
+  long-tenured one-slip validator, ``_bump`` clamp at 0 for
+  negative-delta calls.
+
+
 ## [1.71.1] — 2026-05-11
 
 Patch release.  THE actual root-cause hotfix for the 2026-05-11

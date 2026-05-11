@@ -4419,16 +4419,74 @@ class Blockchain:
         different ``slash_pct`` → different ``supply.staked[offender]``
         → state_root mismatch).  Mirrors `_bump_reputation`.
 
+        ``delta`` may be negative (post-Tier-69 decay sweep uses
+        ``delta=-1``); the new count is clamped at 0 so a decay on
+        a clean validator is a no-op rather than a write of a
+        negative value.
+
         Returns the new count (post-increment) so callers can branch
         on it if needed.
         """
-        new = self.slash_offense_counts.get(entity_id, 0) + delta
+        new = max(0, self.slash_offense_counts.get(entity_id, 0) + delta)
         self.slash_offense_counts[entity_id] = new
         if self.db is not None and hasattr(
             self.db, "set_slash_offense_count",
         ):
             self.db.set_slash_offense_count(entity_id, new)
         return new
+
+    def _apply_slash_offense_decay(self, current_height: int) -> None:
+        """Tier 69: decay all positive slash_offense_counts by 1.
+
+        Fires deterministically at every height post-
+        ``HONESTY_CURVE_TIER69_HEIGHT`` that satisfies
+        ``(height - TIER69_HEIGHT) % HONESTY_CURVE_DECAY_PERIOD_BLOCKS
+        == 0`` (and ``> 0`` so the activation block itself doesn't
+        trigger).  No-op pre-fork.
+
+        Honest-operator recovery path: pre-Tier-69 the per-offender
+        slash counter was monotonic — one transient slash permanently
+        disqualified the validator from amnesty AND from full honest-
+        history relief.  Post-fork a validator recovers one prior per
+        decay period of clean operation, so a single ancient slip
+        no longer carries forward forever.  Sustained bad actors
+        accumulate priors faster than they decay, so the deliberate-
+        bad-actor curve is unchanged.
+
+        Iteration order is ``sorted(keys())`` so every replayer (and
+        the on-disk chaindb mirror) sees the same write sequence.
+        Each decrement routes through ``_bump_slash_offense_count``
+        so the chaindb mirror picks up the write at the same
+        chokepoint as the +1 path.
+
+        Called once from ``_apply_block_state`` AFTER the deferred
+        slash_offense_counts bump loop (audit r41 pattern).  Running
+        at end-of-block keeps sim and apply paths agreeing on the
+        pre-decay priors during severity computation — sim doesn't
+        run the sweep (slash_offense_counts isn't in the state-tree
+        leaf), apply mutates only AFTER every severity decision in
+        the block has been resolved.  Decay takes effect for the
+        NEXT block.  Same divergence-avoidance rationale as the
+        deferred bump it follows.
+        """
+        from messagechain.config import (
+            HONESTY_CURVE_DECAY_PERIOD_BLOCKS,
+            HONESTY_CURVE_TIER69_HEIGHT,
+        )
+        if current_height < HONESTY_CURVE_TIER69_HEIGHT:
+            return
+        elapsed = current_height - HONESTY_CURVE_TIER69_HEIGHT
+        if elapsed <= 0:
+            return
+        if elapsed % HONESTY_CURVE_DECAY_PERIOD_BLOCKS != 0:
+            return
+        # Snapshot keys to a sorted list — dict iteration during
+        # mutation is fine in CPython (we only mutate values, not the
+        # key set), but sorting is consensus-deterministic across
+        # replayers regardless of insertion order.
+        for eid in sorted(self.slash_offense_counts.keys()):
+            if self.slash_offense_counts.get(eid, 0) > 0:
+                self._bump_slash_offense_count(eid, delta=-1)
 
     def _set_finalization_stall_counter(self, value: int) -> None:
         """Set `self.blocks_since_last_finalization`, DB-mirrored.
@@ -4837,7 +4895,13 @@ class Blockchain:
         ev = tx.evidence
         if isinstance(ev, SlashingEvidence):
             kind = OffenseKind.BLOCK_DOUBLE_PROPOSAL
-            amb = classify_block_evidence(ev.header_a, ev.header_b)
+            # Tier 69 widens the restart-drift window 120s -> 600s.
+            # Pass current_height so the classifier picks the active
+            # window deterministically (pre-fork: 120s window for
+            # byte-identical replay).
+            amb = classify_block_evidence(
+                ev.header_a, ev.header_b, current_height=current_height,
+            )
         elif isinstance(ev, AttestationSlashingEvidence):
             kind = OffenseKind.ATTESTATION_DOUBLE_VOTE
             # Attestations have no wall-clock-driftable field — distinct
@@ -13761,6 +13825,29 @@ class Blockchain:
         # uprestarted peers).
         for _offender_id in slash_offense_offenders_to_bump:
             self._bump_slash_offense_count(_offender_id)
+
+        # Tier 69: honesty-curve decay sweep.  Every
+        # HONESTY_CURVE_DECAY_PERIOD_BLOCKS post-activation, decrement
+        # every positive slash_offense_counts entry by 1.  Honest
+        # operators recover from a single slip after one period of
+        # clean operation; sustained bad actors keep accumulating
+        # priors faster than they decay.
+        #
+        # Runs AFTER the deferred slash bumps above so:
+        #   * Severity computations in THIS block (apply path) and in
+        #     sim (compute_post_state_root) both read the SAME pre-
+        #     decay priors — no sim-vs-apply divergence at the slash
+        #     severity boundary.  Sim does not run the decay sweep
+        #     (slash_offense_counts is not in the state-tree leaf, so
+        #     sim never touches it); apply mutates the dict at the
+        #     END of the block, after every severity decision in the
+        #     block has been made against the original values.
+        #   * The decay takes effect for the NEXT block's severity
+        #     reads — both paths see the post-decay state on entry to
+        #     block N+1.
+        # Pre-Tier-69 the sweep is a no-op (byte-identical historical
+        # replay).
+        self._apply_slash_offense_decay(block.header.block_number)
 
         # Proof-of-custody archive rewards — redirect a fraction of
         # this block's fee-burn into the archive reward pool, and pay

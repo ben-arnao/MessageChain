@@ -129,13 +129,15 @@ class Unambiguity(enum.Enum):
 def classify_block_evidence(
     header_a: "BlockHeader",
     header_b: "BlockHeader",
+    current_height: int = 0,
 ) -> Unambiguity:
     """Decide if two conflicting headers look like a restart artifact.
 
-    Reads only the headers' bytes — pure function, suitable for
-    consensus-deterministic use.  Caller must already have verified
-    that both headers carry valid signatures from the offender (this
-    function does not re-verify; that happens upstream in
+    Reads only the headers' bytes (+ the current chain height for
+    drift-window selection) — pure function, suitable for consensus-
+    deterministic use.  Caller must already have verified that both
+    headers carry valid signatures from the offender (this function
+    does not re-verify; that happens upstream in
     ``verify_slashing_evidence``).
 
     Returns AMBIGUOUS iff:
@@ -144,16 +146,27 @@ def classify_block_evidence(
       * same ``prev_hash``
       * same ``state_root``
       * same ``state_root_checkpoint``
-      * timestamps differ by ≤ ``HONESTY_CURVE_RESTART_DRIFT_SECS``
-        seconds
+      * timestamps differ by ≤ the active restart-drift window:
+        ``HONESTY_CURVE_RESTART_DRIFT_SECS`` (120s) pre-Tier-69, or
+        ``HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69`` (600s) at/after
+        ``HONESTY_CURVE_TIER69_HEIGHT``
 
     Otherwise UNAMBIGUOUS.  ``merkle_root`` is allowed to differ
     (that's the whole point — the rebuilt mempool snapshot moved).
 
+    ``current_height`` defaults to 0 so legacy callers that pre-date
+    the Tier 69 fork (and existing tests of the legacy 120s window)
+    continue to see byte-identical pre-fork behavior.  The active
+    apply path passes ``self.height`` from ``_compute_slash_pct``.
+
     Note: ``mempool_snapshot_root`` is retired post-Tier-X and always
     zero on new blocks; no special-case needed.
     """
-    from messagechain.config import HONESTY_CURVE_RESTART_DRIFT_SECS
+    from messagechain.config import (
+        HONESTY_CURVE_RESTART_DRIFT_SECS,
+        HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69,
+        HONESTY_CURVE_TIER69_HEIGHT,
+    )
 
     # Same height/proposer/parent/state — restart-shape requirement.
     # If any of these differ the evidence cannot be a restart artifact
@@ -179,9 +192,16 @@ def classify_block_evidence(
     # Timestamp drift: |a - b| within tolerance is restart-shape.
     # Use int(...) to match the on-the-wire encoding (the timestamps
     # in signable_data are pack(">Q", int(timestamp))).
+    # Tier 69 widens the drift window from 120s to 600s — honest
+    # restart cycles under heavy mempool/disk load can exceed 120s.
+    # Pre-Tier-69 (and tests that pass current_height=0): 120s window.
+    if current_height >= HONESTY_CURVE_TIER69_HEIGHT:
+        drift_window = HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69
+    else:
+        drift_window = HONESTY_CURVE_RESTART_DRIFT_SECS
     ts_a = int(header_a.timestamp)
     ts_b = int(header_b.timestamp)
-    if abs(ts_a - ts_b) > HONESTY_CURVE_RESTART_DRIFT_SECS:
+    if abs(ts_a - ts_b) > drift_window:
         return Unambiguity.UNAMBIGUOUS
 
     # Everything else equal, only merkle_root and timestamp drift —
@@ -295,6 +315,7 @@ def slashing_severity(
         HONESTY_CURVE_AMBIGUOUS_BASE_PCT,
         HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT,
         HONESTY_CURVE_AMBIGUOUS_MAX_PCT,
+        HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69,
         HONESTY_CURVE_AMBIGUOUS_REPEAT_MULTIPLIER,
         HONESTY_CURVE_AMNESTY_TRACK_THRESHOLD,
         HONESTY_CURVE_HONEST_TRACK_FLOOR_DEN,
@@ -302,6 +323,7 @@ def slashing_severity(
         HONESTY_CURVE_HONEST_TRACK_THRESHOLD,
         HONESTY_CURVE_MIN_PCT,
         HONESTY_CURVE_RATE_HEIGHT,
+        HONESTY_CURVE_TIER69_HEIGHT,
         HONESTY_CURVE_UNAMBIGUOUS_FIRST_PCT,
     )
 
@@ -397,7 +419,19 @@ def slashing_severity(
     # restart-shape evidence pattern can never compound to a wipeout.
     # UNAMBIGUOUS path is untouched (the deliberate-Byzantine bar
     # stands).  Pre-fork: byte-identical legacy behavior.
-    if current_height >= HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT:
+    #
+    # Tier 69 — tightens the AMBIGUOUS cap further from 10% to 3%.
+    # The Tier-51 10% cap kept severity off "wipeout" territory but
+    # left 5 compounded restart-shape events at ~40% loss over time,
+    # which mismatches "small fraction" as the operator anchor intends
+    # — a transient hardware issue should be an operational nuisance,
+    # not a multi-month rebuild.  Pre-Tier-69 the 10% cap still binds;
+    # post-Tier-69 the 3% cap binds.  Ordering matters: the tighter
+    # cap check comes FIRST so an in-window height picks the right
+    # ceiling without falling through to the looser one.
+    if current_height >= HONESTY_CURVE_TIER69_HEIGHT:
+        sev_int = min(sev_int, HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69)
+    elif current_height >= HONESTY_CURVE_AMBIGUOUS_CAP_HEIGHT:
         sev_int = min(sev_int, HONESTY_CURVE_AMBIGUOUS_MAX_PCT)
 
     return _clamp_pct(sev_int, HONESTY_CURVE_MIN_PCT, 100)

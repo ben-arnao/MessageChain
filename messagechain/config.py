@@ -6935,6 +6935,109 @@ assert (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 69 — Honesty-curve leniency refinement
+# ─────────────────────────────────────────────────────────────────────
+# Three coupled tweaks that push the honesty curve further toward the
+# CLAUDE.md "honest operators are insured against accidents" anchor,
+# without weakening the deliberate-Byzantine bar:
+#
+#   1. ``slash_offense_counts`` decay.  Pre-Tier-69 the per-offender
+#      slash counter was monotonic — one transient slash in year 1
+#      permanently disqualified a validator from Tier 24 amnesty AND
+#      from full honest-history relief for the rest of their tenure.
+#      That mismatches the third anchor factor ("good-vs-bad RATE"):
+#      a long-tenured operator with one ancient slip and a million
+#      good blocks has a near-zero bad rate, but the curve was treating
+#      them as if the slip just happened.  Post-Tier-69 every
+#      ``HONESTY_CURVE_DECAY_PERIOD_BLOCKS`` of wall-clock progress
+#      decays every positive prior by 1, so a single offense recovers
+#      to amnesty-eligible after one period of clean operation.
+#      Sustained bad actors still accumulate priors faster than they
+#      decay — the deliberate-bad-actor curve is unchanged.
+#
+#   2. Restart drift window extension.  Pre-Tier-69 the AMBIGUOUS-vs-
+#      UNAMBIGUOUS classifier admitted block-header restart-shape
+#      evidence only if the two timestamps differed by ≤120s.  Honest
+#      restart cycles on heavy load (mempool rebuild + disk fsync +
+#      WOTS+ leaf seek) routinely take longer than that; the tight
+#      window was forcing legitimately-honest restart artifacts onto
+#      the UNAMBIGUOUS path (50% floor on first offense, 100% on
+#      repeat).  Post-Tier-69 the window widens to 600s.  Pure
+#      classification change — no attacker gains anything from a wider
+#      restart-shape window because the shape itself (same parent,
+#      same state_root, same checkpoint, only merkle_root + timestamp
+#      differ) has no fork-grinding economic value.
+#
+#   3. AMBIGUOUS-path cap tightening.  Pre-Tier-69 the Tier-51 cap
+#      bounded AMBIGUOUS-path output at 10%.  10% is "small fractional"
+#      against a wipe, but for a restart-shape repeat-offense pattern
+#      it is still operationally painful (5 events compound to ~40%
+#      of stake lost over time).  Post-Tier-69 the cap tightens to 3%,
+#      firmly in "operational nuisance, recoverable" territory.
+#      UNAMBIGUOUS path is untouched — deliberate Byzantine evidence
+#      still carries the 50%+ first-offense floor and 100% repeat.
+#
+# Activation height 2700 sits 50 blocks above Tier 68 (2650) -- ~8.3h
+# cohort spacing matching the Tier 49-68 pattern.  Two-validator
+# coordinated upgrade.  No new wire format, no new tx kinds, no
+# state-tree changes -- pure consensus-rule swap inside the slashing
+# severity / classifier paths.  ``slash_offense_counts`` storage shape
+# unchanged (still ``dict[bytes, int]``); the decay is a deterministic
+# sweep over existing entries at fixed-cadence heights.
+HONESTY_CURVE_TIER69_HEIGHT = 2700  # Tier 69
+
+# Decay cadence.  Every DECAY_PERIOD_BLOCKS of progress past activation,
+# every positive entry in ``slash_offense_counts`` decrements by 1
+# (clamped at 0).  4_320 ≈ 30 days at the 600s block target — short
+# enough that a honest operator's once-a-year slip-and-recover loop
+# completes well within a season, long enough that an attacker cannot
+# trivially clean their slate between repeat offenses (they'd need to
+# wait 30 days of clean operation per prior of decay).
+HONESTY_CURVE_DECAY_PERIOD_BLOCKS = 4_320
+
+# Widened restart-drift window.  600s (10 min) is the empirical p99
+# of restart-cycle wall-clock for a node under heavy mempool churn
+# plus on-disk WOTS+ leaf-index re-fsync, observed on the existing
+# mainnet validators 2026-04 to 2026-05.  120s caught only the
+# happy-path restart; 600s catches the heavy-load case too.  Beyond
+# 600s a single restart cycle is implausible — no realistic crash-
+# recovery sequence keeps a process alive that long between sign
+# attempts at the same height.
+HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69 = 600
+
+# Tightened AMBIGUOUS-path cap.  3% is below the Tier-20 SOFT_SLASH_PCT
+# floor (5%) and well below the prior Tier-51 cap (10%).  A 3%
+# restart-shape burn is an operational signal ("your node had an
+# evidence-producing restart, fix it") without being economically
+# catastrophic.  UNAMBIGUOUS path is unaffected — deliberate evidence
+# still carries the 50%+ first-offense floor.
+HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69 = 3
+
+assert HONESTY_CURVE_TIER69_HEIGHT > WITNESS_ACK_ISSUER_BINDING_HEIGHT, (
+    "HONESTY_CURVE_TIER69_HEIGHT must follow Tier 68 -- consecutive "
+    "consensus-rule activations need cohort spacing"
+)
+assert HONESTY_CURVE_DECAY_PERIOD_BLOCKS > 0, (
+    "HONESTY_CURVE_DECAY_PERIOD_BLOCKS must be positive -- a 0 period "
+    "would decay every block, immediately erasing every prior and "
+    "neutering the repeat-offense curve"
+)
+assert HONESTY_CURVE_RESTART_DRIFT_SECS_TIER69 > HONESTY_CURVE_RESTART_DRIFT_SECS, (
+    "Tier 69 restart-drift window must widen, not narrow, the AMBIGUOUS "
+    "classifier -- the fork is a one-way leniency move"
+)
+assert HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69 < HONESTY_CURVE_AMBIGUOUS_MAX_PCT, (
+    "Tier 69 AMBIGUOUS cap must tighten, not loosen, the previous cap "
+    "-- the fork is a one-way leniency move"
+)
+assert HONESTY_CURVE_AMBIGUOUS_MAX_PCT_TIER69 >= HONESTY_CURVE_MIN_PCT, (
+    "Tier 69 AMBIGUOUS cap must be at least MIN_PCT -- a cap below "
+    "the universal slash floor would be unreachable (the clamp would "
+    "round up to MIN_PCT and the cap would be dead code)"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
