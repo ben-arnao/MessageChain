@@ -2472,18 +2472,32 @@ class Server(SharedRuntimeMixin):
         return best
 
     def _admit_to_pool(self, pool_attr: str, tx) -> bool:
-        """Insert `tx` into a capped per-type pending pool with fee-based
-        eviction, mirroring Mempool's admission policy.
+        """Insert `tx` into a capped per-type pending pool with
+        fee-per-byte eviction, mirroring Mempool's admission policy.
 
         Returns True if the tx landed.  Returns False when the pool is
-        full AND the incoming fee does not beat the lowest-fee pending
-        tx — caller surfaces this as "pool full, raise your fee".
+        full AND the incoming tx's fee-per-stored-byte does not beat
+        the lowest-density pending tx — caller surfaces this as "pool
+        full, raise your fee".
+
+        CLAUDE.md anchor: "Selection priority is fee-per-byte, never
+        absolute fee. ... Don't carve out per-type fee logic; if a new
+        tx kind is added, slot it into this model rather than inventing
+        a parallel one."  Pre-audit-r48 the eviction key was raw
+        ``tx.fee``, so a 10 kB rotation paying fee=2000 evicted a
+        60-byte stake paying fee=1900 even though the stake offered
+        ~30× the revenue-per-stored-byte.  Single shared chokepoint
+        (``messagechain.core.mempool._fee_per_byte``) is now reused
+        across both this server-side eviction and the Mempool's own
+        message-tx ranking — adding a new non-message pool now picks
+        up the right ranking by construction.
 
         Uniform across every non-message-tx pool so an attacker can't
         fill any single pool with cheap junk: they'd have to keep
-        raising fees to maintain position.
+        raising density to maintain position.
         """
         from messagechain.config import PENDING_POOL_MAX_SIZE
+        from messagechain.core.mempool import _fee_per_byte
         pool = getattr(self, pool_attr, None)
         if pool is None:
             pool = {}
@@ -2494,8 +2508,8 @@ class Server(SharedRuntimeMixin):
         # Aggregate cap across ALL pending pools.  Without this, an attacker
         # can fill each pool individually for a total 4×PENDING_POOL_MAX_SIZE
         # memory footprint.  Count sitewide pending txs and refuse admission
-        # if we're above the global cap unless incoming fee beats the global
-        # lowest.
+        # if we're above the global cap unless incoming density beats the
+        # global lowest density.
         _GLOBAL_CAP = PENDING_POOL_MAX_SIZE * 2  # 2x per-pool, not 4x
         all_pool_attrs = (
             "_pending_stake_txs", "_pending_unstake_txs",
@@ -2503,24 +2517,26 @@ class Server(SharedRuntimeMixin):
             "_pending_registration_txs",
         )
         total_pending = 0
-        global_min: tuple | None = None  # (fee, pool_attr, tx_hash)
+        # (density, pool_attr, tx_hash) for the sitewide minimum-density tx.
+        global_min: tuple | None = None
         for attr in all_pool_attrs:
             p = getattr(self, attr, None)
             if not p:
                 continue
             total_pending += len(p)
             for th, t in p.items():
-                f = getattr(t, "fee", 0)
-                if global_min is None or f < global_min[0]:
-                    global_min = (f, attr, th)
+                d = _fee_per_byte(t)
+                if global_min is None or d < global_min[0]:
+                    global_min = (d, attr, th)
 
-        incoming_fee = getattr(tx, "fee", 0)
+        incoming_density = _fee_per_byte(tx)
 
         if total_pending >= _GLOBAL_CAP:
-            # At global cap — only accept if incoming beats the sitewide min.
-            if global_min is None or incoming_fee <= global_min[0]:
+            # At global cap — only accept if incoming density beats the
+            # sitewide min density.
+            if global_min is None or incoming_density <= global_min[0]:
                 return False
-            # Evict the sitewide min from its origin pool.
+            # Evict the sitewide min-density tx from its origin pool.
             _, ev_attr, ev_hash = global_min
             ev_pool = getattr(self, ev_attr, None)
             if ev_pool is not None and ev_hash in ev_pool:
@@ -2529,11 +2545,8 @@ class Server(SharedRuntimeMixin):
                 self._pending_pool_arrival_heights.pop(ev_hash, None)
 
         if len(pool) >= PENDING_POOL_MAX_SIZE:
-            min_tx = min(
-                pool.values(),
-                key=lambda t: getattr(t, "fee", 0),
-            )
-            if incoming_fee <= getattr(min_tx, "fee", 0):
+            min_tx = min(pool.values(), key=_fee_per_byte)
+            if incoming_density <= _fee_per_byte(min_tx):
                 return False
             del pool[min_tx.tx_hash]
             self._pending_pool_arrival_heights.pop(min_tx.tx_hash, None)
@@ -4410,14 +4423,31 @@ class Server(SharedRuntimeMixin):
         # these being included, `messagechain stake` and every governance
         # submission would be silently dropped — the server accepts them
         # into _pending_* dicts but nothing would ever include them in a
-        # block, so chain state never mutates.  Cap at MAX_TXS_PER_BLOCK
-        # each to keep block size bounded.
+        # block, so chain state never mutates.
+        #
+        # CLAUDE.md fee-model anchor: rank by fee-per-stored-byte, not
+        # insertion order, before truncating to MAX_TXS_PER_BLOCK.  Pre-
+        # audit-r48 these three pools sliced ``list(pool.values())[:cap]``
+        # in arrival order, so a low-density tx that arrived early
+        # silently displaced a high-density tx that arrived late even
+        # though the byte budget is the binding constraint and density
+        # is the right ranking.  Routes through the same
+        # ``_fee_per_byte`` chokepoint as ``_admit_to_pool`` and the
+        # Mempool's message-tx selection so adding a new non-message
+        # pool picks up the right ranking by construction.
+        from messagechain.core.mempool import _fee_per_byte
         pending_stake = getattr(self, "_pending_stake_txs", {})
-        stake_txs = list(pending_stake.values())[:MAX_TXS_PER_BLOCK]
+        stake_txs = sorted(
+            pending_stake.values(), key=_fee_per_byte, reverse=True,
+        )[:MAX_TXS_PER_BLOCK]
         pending_unstake = getattr(self, "_pending_unstake_txs", {})
-        unstake_txs = list(pending_unstake.values())[:MAX_TXS_PER_BLOCK]
+        unstake_txs = sorted(
+            pending_unstake.values(), key=_fee_per_byte, reverse=True,
+        )[:MAX_TXS_PER_BLOCK]
         pending_gov = getattr(self, "_pending_governance_txs", {})
-        governance_txs = list(pending_gov.values())[:MAX_TXS_PER_BLOCK]
+        governance_txs = sorted(
+            pending_gov.values(), key=_fee_per_byte, reverse=True,
+        )[:MAX_TXS_PER_BLOCK]
 
         # Drain the censorship-evidence pool so user-submitted slashing
         # claims actually land in blocks.  Without this drain, every
