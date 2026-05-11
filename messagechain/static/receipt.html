@@ -404,6 +404,41 @@
     detailsEl.hidden = true;
   }
 
+  // Block cadence is ~10 min (600s).  A just-submitted share-URL is
+  // expected to be invisible on the public-feed shim for one full
+  // block at minimum; the shim deliberately does not expose mempool
+  // state.  Auto-retry for ~12 min before falling through to the
+  // suppression narrative so the share-URL's first impression matches
+  // the chain's actual behaviour, not "suspect censorship" on every
+  // normal send.
+  const PENDING_RETRY_BUDGET = 48;       // 48 * 15s = 12 min
+  const PENDING_RETRY_INTERVAL_MS = 15000;
+  let pendingPollCount = 0;
+  let pendingTimer = null;
+
+  function renderPending(txHash) {
+    verdictEl.hidden = false;
+    verdictEl.classList.remove("permanent", "missing");
+    verdictEl.classList.add("pending");
+    verdictTitle.textContent = "Waiting for inclusion";
+    verdictLine.textContent =
+      "Not yet visible on this node — typical for ~10 min after submission.";
+    const remaining = Math.max(
+      0,
+      PENDING_RETRY_BUDGET - pendingPollCount,
+    );
+    const remainingMin = Math.ceil(
+      (remaining * PENDING_RETRY_INTERVAL_MS) / 60000,
+    );
+    verdictNarrative.textContent =
+      "Block cadence is ~10 min, so a freshly-submitted tx is expected " +
+      "to be invisible on the public feed for one block.  This page " +
+      "auto-refreshes every 15s; if the tx is still missing after " +
+      "~" + remainingMin + " min the page flips to the suppression " +
+      "narrative (with the slashable-evidence escalation pointer).";
+    detailsEl.hidden = true;
+  }
+
   async function loadInfo() {
     try {
       const r = await fetch("/v1/info", { cache: "no-store" });
@@ -444,8 +479,29 @@
       statusEl.textContent = "";
       const result = data.result || {};
       if (result.status === "included") {
+        if (pendingTimer !== null) {
+          clearTimeout(pendingTimer);
+          pendingTimer = null;
+        }
         renderIncluded(result, txHash);
+      } else if (pendingPollCount < PENDING_RETRY_BUDGET) {
+        // Public-feed shim returns only `included` / `not_found` (no
+        // `pending`).  Treat the first PENDING_RETRY_BUDGET polls of a
+        // not_found response as the normal pre-inclusion window and
+        // auto-retry.  Only after the budget exhausts do we render
+        // the suspect-suppression narrative.
+        renderPending(txHash);
+        pendingPollCount += 1;
+        if (pendingTimer !== null) clearTimeout(pendingTimer);
+        pendingTimer = setTimeout(
+          () => loadStatus(txHash),
+          PENDING_RETRY_INTERVAL_MS,
+        );
       } else {
+        if (pendingTimer !== null) {
+          clearTimeout(pendingTimer);
+          pendingTimer = null;
+        }
         renderNotFound(txHash);
       }
     } catch (e) {
