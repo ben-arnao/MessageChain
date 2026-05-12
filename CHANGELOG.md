@@ -4,6 +4,161 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.76.2] — 2026-05-11
+
+Patch release.  Audit r49 top-3 ships: three independent network /
+storage / mempool hardening fixes, all on long-stable surfaces.  No
+new tx kinds, no new wire format, no consensus rule change at the
+validator, no hard fork.
+
+### Fixed
+
+  * **``ChainDB.get_block_by_number`` returns the canonical-chain
+    sibling, not an arbitrary row (audit r49 #1 -- security top-1).**
+    CLAUDE.md anchors: honest-operator insurance + accidental-fork
+    auto-recovery -- a node ending up on a minority/unintentional fork
+    must auto-resync to the canonical chain without operator state
+    surgery, and must not accumulate slashable evidence solely from
+    being briefly on the wrong tip.
+
+    Pre-fix ``get_block_by_number(h)`` ran ``SELECT data FROM blocks
+    WHERE block_number=? LIMIT 1`` with no ``ORDER BY`` and no join
+    against ``chain_tips`` -- when fork siblings coexisted at the
+    same height (the steady-state after any reorg), sqlite returned
+    whichever sibling row it picked (typically insertion order).
+    Docstring claimed "the one on the best chain"; the SQL didn't
+    enforce it.
+
+    Callers walking ``range(tip_height + 1)`` to rebuild chain state
+    silently picked non-canonical siblings post-restart:
+    ``Blockchain._load_from_db`` (cold-load chain rehydration),
+    ``integrity.reindex_state``, ``ChainDB._migrate_v1_to_v2`` /
+    ``_migrate_v2_to_v3``, and the ``get_message_author`` tx-status
+    path.  A coerced/colluding proposer that gossips a competing
+    sibling at a recent height -- perfectly valid behaviour -- could
+    push some honest nodes' rebuilt chain into a state that diverges
+    from peers, blocking forward sync and creating slashable-evidence
+    opportunities against honest operators.
+
+    Abstraction-over-symptom fix: new ``ChainDB._build_canonical_hash_map``
+    helper walks back from best_tip via the ``(block_hash, prev_hash,
+    block_number)`` columns -- no Block.from_bytes() needed -- and
+    caches ``{block_number -> block_hash}`` for the canonical chain.
+    ``get_block_by_number`` now resolves the canonical block_hash at
+    the target height and loads via the unambiguous
+    ``get_block_by_hash`` path; a height not reachable from best_tip
+    returns ``None`` rather than a sibling guess.  The cache is
+    invalidated on every ``add_chain_tip`` / ``remove_chain_tip`` /
+    ``store_block`` mutation so a fork-choice swap or a newly-stored
+    block immediately reshapes the canonical view.
+
+    Three callers (cold-load, reindex, migration) and the tx-status
+    path all benefit from the single chokepoint -- adding a new
+    caller in the future cannot reintroduce the sibling-ambiguity
+    defect without bypassing the helper.  Callers that genuinely want
+    a non-canonical sibling must explicitly use ``get_block_by_hash``
+    or ``get_blocks_at_height`` and pick by hash; the silent fallback
+    is gone.  (fc7ce2c)
+
+  * **``/faucet`` + ``/quickpost`` reject non-JSON Content-Type to
+    close cross-origin CSRF (audit r49 #2 -- security top-2).**
+    CLAUDE.md adversaries: AI-spam flooding (primary defended-against)
+    plus the operator-side aspect of validator-collusion -- a coercer
+    who can drain the operator's faucet budget weakens the public-
+    square on-ramp the chain depends on.
+
+    Pre-fix the public-feed POST routes read ``Content-Length`` worth
+    of bytes and ran ``json.loads`` on whatever arrived, with no
+    Content-Type validation.  Response headers carry
+    ``Access-Control-Allow-Origin: *``.  A "simple CORS" POST with
+    ``Content-Type: text/plain`` is dispatched by the browser without
+    a preflight (simple-request rules ignore ``Allow-Methods``
+    entirely), so any cross-origin web page a wallet user visits
+    could drive either endpoint from the visitor's browser.
+
+    Faucet attack: the PoW challenge is bound to the recipient address
+    only (not the source IP).  An attacker who pre-mines a challenge
+    solution for ``attacker_addr`` could serve a malicious page (or
+    ad creative) to many visitors and silently siphon the operator's
+    per-/24 IP cooldown + per-window cap through the visitor pool --
+    the real attacker IP never appearing in access logs.  Same shape
+    covered ``/quickpost``.
+
+    Abstraction-over-symptom fix: new
+    ``_FeedHandler._content_type_is_json`` helper is the single
+    chokepoint every POST route consults at ``do_POST``.  Media-type
+    prefix match accepts ``application/json`` (and ``application/
+    json; charset=utf-8``) and refuses everything else with HTTP 415
+    BEFORE any rate-limit / PoW state is consulted.  Mirrors
+    ``submission_server``'s ``application/octet-stream`` gate -- one
+    helper covers ``/faucet``, ``/quickpost``, and any future POST
+    route adopting the same pattern.
+
+    Browser implications: ``fetch(..., {headers: {"Content-Type":
+    "application/json"}, body: JSON.stringify(...)})`` triggers a CORS
+    preflight; the preflight response does not advertise POST in
+    ``Allow-Methods``, so the browser blocks.  Non-browser CSRF
+    (curl, malicious CLIs) remains out of scope for a public, per-IP-
+    rate-limited faucet -- the per-/24 cooldown + window cap already
+    bound that surface, and the IP that originated the abuse is in
+    the operator's logs.  Bonus mitigations (challenge IP binding)
+    are separate follow-ups; this release is scoped to the
+    abstraction fix that closes the browser CSRF vector
+    deterministically.  (f77f538)
+
+  * **Mempool slash + censorship-evidence pools admit by fee-per-byte;
+    finality pool evicts oldest (audit r49 #3 -- security top-3).**
+    CLAUDE.md primary adversary: validator collusion -- a colluding
+    subset that can suppress slashing-evidence txs at trivial cost
+    silently disarms the chain's collective-defense anchor.  Also
+    CLAUDE.md fee-model anchor: "Selection priority is fee-per-byte,
+    never absolute fee.  Don't carve out per-type fee logic."
+
+    Pre-fix three mempool-resident pools admitted FIFO and refused
+    any new entry when full, with selectors returning insertion order
+    (``list(pool.values())``): ``slash_pool``,
+    ``censorship_evidence_pool``, ``finality_pool``.  Same defect-
+    shape the 1.76.1 release closed for the server-side
+    ``_pending_*_txs`` pools but never reached for the mempool-
+    resident pools.  A flooder paying the floor fee could fill either
+    fee-bearing pool (1000 / 1000 cap each) and crowd out higher-
+    density legitimate entries at trivial cost.  Cost to flood the
+    censorship-evidence pool: ``1000 * MARKET_FEE_FLOOR`` per refill
+    -- effectively free against a colluding-validator economic stake.
+
+    Abstraction-over-symptom fix: two new shared Mempool helpers,
+    each the single chokepoint its callers route through.
+
+      * ``Mempool._admit_with_density_eviction(pool, key, obj,
+        max_size)`` -- density-ranked admit for fee-bearing pools.
+        When full, finds the lowest-density existing entry; if the
+        incoming density is strictly higher, evicts and admits;
+        otherwise refuses.  Returns ``(inserted, evicted_key_or_None)``
+        so callers can tear down their own bookkeeping (e.g.
+        ``_evidence_arrival_heights``).  Density uses the same
+        ``_fee_per_byte`` helper messages already consult, with
+        ``self._stored_bytes`` as the shared by-tx_hash cache.
+
+      * ``Mempool._admit_with_oldest_eviction(pool, key, obj,
+        max_size, age_attr)`` -- oldest-by-attribute admit for fee-
+        less pools.  FinalityVote carries no fee (the flooder-pays-
+        floor attack does not apply -- a vote requires a real
+        validator key), but strict refuse-when-full was a liveness
+        gap under a saturated validator set.  When full, evicts the
+        entry with the smallest ``signed_at_height``.
+
+    Selectors now sort by density descending so the proposer pulls
+    the highest-revenue entries first when the byte budget binds.
+    Sibling cleanup for arrival-height bookkeeping is wired in to
+    ``add_censorship_evidence_tx`` so evicted entries no longer
+    leave stale rows behind in the forced-inclusion source walk.
+
+    Sibling defects DEFERRED (acknowledged in the audit r49
+    synthesis, out of scope for this release): RBF
+    (``try_replace_by_fee``) lifted to slash / censorship-evidence /
+    finality / react pools, keyed by ``(sender, nonce)`` or
+    analogous identity.  (2109b08)
+
 ## [1.76.1] — 2026-05-11
 
 Patch release.  Audit r48 top-3 ships: three independent local-only
