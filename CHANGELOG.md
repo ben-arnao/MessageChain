@@ -4,6 +4,136 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.77.1] — 2026-05-12
+
+Patch release.  Audit r50 top-3 ships: three independent signature-
+verification hardening fixes spanning the gossip-ingress, in-block,
+and proposer-side surfaces.  No new tx kinds, no new wire format,
+no consensus rule change at the validator boundary, no hard fork.
+
+### Fixed
+
+  * **Attestation gossip dedup inserts AFTER signature verify, not
+    before (audit r50 #1 -- security top-1).**  CLAUDE.md adversary
+    anchor: validator collusion (primary).  CLAUDE.md anchor:
+    censorship resistance is a *collective decision* -- "any
+    deviation from pure inclusion requires a coordinated majority
+    *and* willing to absorb the slashing risk that exposed
+    collusion produces."  A gossip-layer dedup poison sidesteps
+    the slashable surface entirely.
+
+    Pre-fix ``_handle_announce_attestation`` inserted the
+    ``(validator_id, block_number, block_hash)`` triple into the
+    ``_seen_attestations`` LRU on the line BEFORE calling
+    ``verify_attestation``.  All three components of the triple
+    are publicly predictable from chain state: ``validator_id``
+    is any committee member, ``block_number`` is parent+1,
+    ``block_hash`` is the just-accepted parent.  A peer who
+    pre-relayed a forged-signature attestation with the right
+    triple poisoned the LRU; the genuine, correctly-signed
+    attestation arriving later short-circuited at the dedup
+    membership check and never reached the FinalityTracker or
+    the relay broadcast.
+
+    Attack cost: one bogus packet per (validator, height) pair.
+    Reward: silent collective-decision censorship of any honest
+    validator's attestations -- no slashable evidence is produced
+    because no malformed block is ever proposed; the suppression
+    happens entirely at the gossip layer.
+
+    Abstraction fix: "seen" means "seen-AFTER-verify".  The
+    membership CHECK remains pre-verify (cheap gate skips
+    expensive verification of already-accepted entries), but the
+    INSERT moves below the ``verify_attestation`` success branch.
+    Discipline is documented inline so any future signed-gossip
+    handler that adds an explicit dedup cache inherits it by
+    convention.  (7fb2ed2)
+
+  * **Attestation + finality-vote verify routes through historical-
+    key candidate set (audit r50 #2 -- security top-2).**  CLAUDE.md
+    anchors at risk: honest-operator insurance, crypto-agility
+    (rotation is the migration mechanism), and collective-decision
+    censorship resistance (silent gossip-layer suppression of
+    valid signed messages sidesteps the slashable-evidence
+    surface).
+
+    Pre-fix four call sites verified attestation/finality-vote
+    signatures against ``self.public_keys[vid]`` -- the CURRENT
+    key at validation time: ``Blockchain._validate_attestations``
+    (in-block validation), ``Blockchain._validate_finality_votes``
+    (in-block validation), ``Node._handle_announce_attestation``
+    (gossip ingress), and ``Node._handle_announce_finality_vote``
+    (gossip ingress).  ``KEY_ROTATION_COOLDOWN_BLOCKS = 144`` is
+    << ``FINALITY_VOTE_MAX_AGE_BLOCKS = 1000``.  An honest
+    validator whose previously-signed finality votes are still in
+    flight when they rotate: those votes verify-fail under the
+    new key, get dropped from gossip, fail the entire block when
+    an honest proposer includes them, and the relaying peer is
+    hit with ``OFFENSE_INVALID_TX`` and banned by peers.
+    Inversely, an attacker can replay a rotator's pre-rotation
+    gossip votes to make honest peers ban each other -- forged-
+    data-free ban cascades that fragment the gossip mesh.  The
+    same shape silenced any attestation whose validator rotated
+    between sign-time and inclusion.
+
+    The slashing-evidence path already routes through a multi-
+    key candidate set: every distinct pubkey the offender ever
+    held plus the current key (see ``validate_slash_transaction``
+    / ``verify_slashing_evidence``).  Every candidate is a key
+    the entity legitimately published on-chain (each rotation
+    step is signed by the prior key), so matching any candidate
+    is proof the entity produced the signature -- attackers
+    cannot forge a match.  This release extends the same shape
+    to attestation and finality-vote verification.
+
+    Abstraction-over-symptom fix: new
+    ``Blockchain._verify_signer_at_height(obj, entity_id,
+    signed_at_height, verifier)`` chokepoint.  All four call
+    sites route through it, parameterised by the standalone
+    verifier function and the consensus-implied signing height
+    (``v.signed_at_height`` for FinalityVote, ``att.block_number``
+    for Attestation).  Adding a new signed-aggregation verifier
+    that goes around the helper reintroduces the defect by
+    definition.  (aabfbc4)
+
+  * **``propose_block`` pre-filters bad-sig attestations + finality
+    votes (audit r50 #3 -- security top-3).**  CLAUDE.md anchors
+    at risk: honest-operator insurance (a proposer who packs a
+    single planted bad-sig entry loses the entire block + a WOTS+
+    leaf -- cost without offense), and validator-collusion defense
+    (the cheap proposer-grief surface this round's signature-
+    aggregation lens flagged).
+
+    Pre-fix ``_validate_attestations`` and
+    ``_validate_finality_votes`` return False on the first invalid
+    signature, rejecting the whole block.  Mirroring the apply-side
+    ``survivors`` filter at validation time would change the
+    block-acceptance criterion (which votes count toward
+    finality) -- a hard-fork-required consensus change.  CLAUDE.md
+    anchor "minimize hard forks" rules that out for a defense-in-
+    depth concern already mostly closed by audit r50 #2's
+    historical-key candidate set on the gossip-ingress path.
+
+    Soft-fix shape -- a proposer-side pre-filter ensures an honest
+    proposer NEVER constructs a block with a bad signature in the
+    first place.  New ``Blockchain._partition_verified_aggregation(
+    objs, *, get_entity_id, get_signed_at_height, verifier)``
+    partitions any signed-aggregation list into (verified,
+    dropped), using audit r50 #2's ``_verify_signer_at_height``
+    helper for the candidate-set verify.  ``propose_block`` routes
+    both ``attestations`` and ``finality_votes`` through it; bad-
+    sig entries are dropped (and logged at WARNING) before block
+    assembly.  Adding a new signed-aggregation kind to
+    ``propose_block`` and routing it through the helper inherits
+    the discipline by construction.
+
+    Non-consensus, non-fork, defense-in-depth.  Old proposers (no
+    pre-filter) still produce valid blocks when their inputs are
+    clean; new proposers additionally survive a corrupted mempool
+    / finality-tracker without burning a leaf.  The in-block
+    validator path is unchanged: blocks containing bad sigs are
+    still rejected by every peer.  (fcf1127)
+
 ## [1.77.0] — 2026-05-12
 
 Minor release.  Adds **Tier 72: structured polls + structured votes**
