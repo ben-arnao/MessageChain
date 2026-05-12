@@ -7319,6 +7319,75 @@ assert ATTESTER_FEE_MIN_UNIT_HEIGHT > POLL_HEIGHT, (
 )
 
 
+# ─── Tier 74 (audit r52 #3) — proposer-share / per-block-cap min-unit
+# clamp ────────────────────────────────────────────────────────────────
+#
+# Tier 73 (r51 #3) clamped the attester-share integer-divide to a
+# minimum of 1 token whenever ``base_fee * 5000 // 10_000`` rounded to
+# zero.  The Tier 73 CHANGELOG explicitly deferred the wider abstraction:
+#
+#     "Sibling defect-shape DEFERRED (scope-bounded for this round): the
+#      wider abstraction calls for a shared ``_split_bps(amount, bps,
+#      denom=10_000, min_unit=1)`` helper to catch every future
+#      ``bps // 10_000`` site that could round to zero under a realistic
+#      minimum."
+#
+# The next site that bites the same shape is ``proposer_share`` in
+# ``SupplyTracker.mint_block_reward``:
+#
+#     proposer_share = reward * PROPOSER_REWARD_NUMERATOR
+#                    // PROPOSER_REWARD_DENOMINATOR    # = reward * 1 // 4
+#
+# At ``reward in {1, 2, 3}`` the proposer share silently rounds to zero
+# and the entire reward routes to the attester pool / per-block burn.
+# The dormancy-controller (Tier 47+) is *designed* to emit small per-
+# block issuance when ``active_supply`` is close to ``TARGET``, so the
+# small-reward regime is the steady state, not a corner case.  Same
+# shape on ``effective_cap`` (post-PROPOSER_CAP_HALVING_HEIGHT) -- the
+# per-block cap on combined proposer earnings also rounds to zero at
+# small ``reward``, silently turning OFF the clawback in the regime
+# it's anchored to bound.
+#
+# Pillar at risk: "Perpetual security via fees, not issuance" + "Stable
+# active supply" + "Mathematical decentralization over time" -- if the
+# small-issuance regime never actually pays the proposer their anchored
+# 25% share, the role economics invert in steady state.
+#
+# Tier 74 lands two changes:
+#   1. ``_split_bps(amount, num, den, *, min_unit=1, gate=False)`` --
+#      the deferred shared helper, exposed at module scope on
+#      ``messagechain.economics.inflation``.  Pre-fork callers
+#      (``gate=False``) get byte-identical floor-divide behavior; the
+#      gated path clamps to ``min_unit`` only when a positive
+#      ``amount`` would otherwise round to zero, and never exceeds
+#      the input ``amount`` so supply conservation cannot be silently
+#      manufactured into existence.
+#   2. ``PROPOSER_SHARE_MIN_UNIT_HEIGHT`` -- new activation height
+#      gating two consensus-visible sites in ``mint_block_reward``:
+#      ``proposer_share`` and ``effective_cap``.  Both refactored to
+#      call ``_split_bps`` with ``gate=(block_height >= ...)``.
+#      Pre-fork is byte-identical to legacy at every (reward, ...)
+#      combination so historical-block replay matches.
+#
+# Tier 73's attester-fee clamp is refactored to call ``_split_bps``
+# too -- byte-identical behavior on both sides of every fork so the
+# refactor doesn't tamper with the consensus-visible result.
+#
+# Activation height ``10500`` sits 2000 blocks above Tier 73 (8500)
+# -- the same ~13.9-day cohort spacing the Tier 70 → 71 → 73 runway
+# used.  Consecutive validator-economics retunes get their own cohort
+# so operators absorb each in its own upgrade cycle.
+PROPOSER_SHARE_MIN_UNIT_HEIGHT = 10500  # Tier 74
+
+assert PROPOSER_SHARE_MIN_UNIT_HEIGHT > ATTESTER_FEE_MIN_UNIT_HEIGHT, (
+    "PROPOSER_SHARE_MIN_UNIT_HEIGHT (Tier 74) must strictly follow "
+    "ATTESTER_FEE_MIN_UNIT_HEIGHT (Tier 73) -- both are validator-"
+    "economics retunes; consecutive reward-distribution changes "
+    "deserve their own cohort so operators absorb each in its own "
+    "upgrade cycle."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

@@ -74,7 +74,54 @@ from messagechain.config import (
     DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT,
     DORMANCY_MAX_ISSUANCE_PER_BLOCK,
     PROPOSER_CAP_REDISTRIBUTE_HEIGHT,
+    PROPOSER_SHARE_MIN_UNIT_HEIGHT,
 )
+
+
+def _split_bps(
+    amount: int,
+    num: int,
+    den: int,
+    *,
+    min_unit: int = 1,
+    gate: bool = False,
+) -> int:
+    """Integer-floor split with an optional non-zero-minimum clamp.
+
+    The deferred shared helper Tier 73's CHANGELOG named: every
+    ``bps // 10_000``-shape site silently rounded its share to zero
+    whenever the input amount was small enough that the floor-divide
+    underflowed.  At the dormancy controller's steady-state issuance
+    of a few tokens per block, that meant the proposer share (Tier 4
+    ``1/4`` split) and the per-block proposer cap (post-Tier-19
+    halving recompute) both rounded to zero -- silently inverting the
+    role economics in the regime the controller is anchored to
+    produce.
+
+    Behavior:
+      * ``gate=False`` (legacy / pre-fork callers): return
+        ``amount * num // den`` byte-identical to a hand-written
+        floor-divide.  This branch is what preserves historical-block
+        replay across the activation-height gate.
+
+      * ``gate=True`` AND ``amount > 0`` AND the floor would be 0:
+        return ``min(min_unit, amount)``.  Never exceeds the input
+        ``amount`` so supply conservation cannot be silently
+        manufactured.  ``amount == 0`` short-circuits to 0 regardless
+        of ``gate`` so off-chain audit / test paths with no input
+        don't manufacture pool credit from thin air.
+
+    Adding a new ``bps // den`` consensus site to the codebase should
+    route through this helper -- a new caller passing ``gate=False``
+    inherits byte-identical legacy behavior, and a future Tier that
+    wants the min-unit clamp flips its gate expression to a height
+    check.  The helper is pure, has no notion of activation height,
+    and is independently testable.
+    """
+    base = amount * num // den
+    if gate and amount > 0 and base == 0:
+        return min(min_unit, amount)
+    return base
 
 
 def reward_curve_multiplier(stake_bps: int) -> tuple[int, int]:
@@ -1014,18 +1061,39 @@ class SupplyTracker:
         # Bootstrap path is orthogonal: when no validator has staked
         # yet, the whole reward goes to the proposer regardless of
         # cap (genesis incentive).
+        # Tier 74 (audit r52 #3): both ``effective_cap`` (post-Tier-19
+        # halving recompute) and ``proposer_share`` (Tier 4 split) route
+        # through ``_split_bps`` so the deferred Tier 73 abstraction
+        # covers them too.  Pre-fork callers (``gate=False``) get
+        # byte-identical legacy floor-divide; post-fork callers clamp
+        # to 1 token whenever a positive ``reward`` would otherwise
+        # round to zero, never exceeding ``reward``.  Closes the
+        # silent-fee-redirect-to-zero defect on the proposer side --
+        # the same defect-shape Tier 73 closed on the attester side.
+        proposer_min_unit_gate = block_height >= PROPOSER_SHARE_MIN_UNIT_HEIGHT
         if bootstrap:
             effective_cap = reward
         elif block_height >= PROPOSER_CAP_HALVING_HEIGHT:
-            effective_cap = (
-                reward * PROPOSER_REWARD_NUMERATOR
-                // PROPOSER_REWARD_DENOMINATOR
+            effective_cap = _split_bps(
+                reward,
+                PROPOSER_REWARD_NUMERATOR,
+                PROPOSER_REWARD_DENOMINATOR,
+                min_unit=1,
+                gate=proposer_min_unit_gate,
             )
         else:
             effective_cap = PROPOSER_REWARD_CAP
 
-        # Proposer + attester pool split.
-        proposer_share = reward * PROPOSER_REWARD_NUMERATOR // PROPOSER_REWARD_DENOMINATOR
+        # Proposer + attester pool split.  Same min-unit gate as
+        # ``effective_cap`` -- they must move together so a clamp on
+        # proposer_share doesn't also push past the cap.
+        proposer_share = _split_bps(
+            reward,
+            PROPOSER_REWARD_NUMERATOR,
+            PROPOSER_REWARD_DENOMINATOR,
+            min_unit=1,
+            gate=proposer_min_unit_gate,
+        )
         attester_pool = reward - proposer_share
 
         # ATTESTER_FEE_FUNDING_HEIGHT hard fork: merge the per-block
@@ -1532,29 +1600,28 @@ class SupplyTracker:
             effective_height is not None
             and effective_height >= ATTESTER_FEE_FUNDING_HEIGHT
         ):
-            attester_share = base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
-            # Tier 73 (audit r51 #3): integer-divide rounds
-            # ``base_fee * 5000 // 10_000`` to 0 whenever
-            # ``base_fee < 2``.  At ``MARKET_FEE_FLOOR=1`` -- the
-            # steady-state base_fee whenever no spam wave has lifted
-            # it -- 100% of the fee silently burns and attesters get
-            # nothing from the fee channel.  Post-Tier-73, clamp the
-            # redirect to a minimum of 1 token whenever ``base_fee >
-            # 0`` so the long-horizon validator-security fee channel
-            # is never silently dead.  Gated on ``base_fee > 0`` so
-            # an off-chain audit / test path with no fee doesn't
-            # manufacture pool credit.  ``attester_share`` can never
-            # exceed ``base_fee`` -- at ``base_fee=1`` the clamp
-            # yields ``max(1, 0)=1`` which equals base_fee (zero
-            # actual burn that round, attester_share=1).  At
-            # ``base_fee >= 2`` the clamp is a no-op
-            # (``base_fee * 5000 // 10_000 >= 1`` already).
-            if (
-                effective_height >= ATTESTER_FEE_MIN_UNIT_HEIGHT
-                and base_fee > 0
-                and attester_share == 0
-            ):
-                attester_share = 1
+            # Tier 73 (audit r51 #3) clamped this site's integer-floor
+            # to a minimum of 1 token whenever ``base_fee * 5000 //
+            # 10_000`` would round to zero.  Tier 74 (audit r52 #3)
+            # extracted the deferred ``_split_bps`` shared helper named
+            # in the Tier 73 CHANGELOG; this site is the first caller.
+            # Behavior is byte-identical on both sides of the Tier 73
+            # gate:
+            #   * ``gate=False`` (pre-Tier-73): legacy
+            #     ``base_fee * 5000 // 10_000`` floor-divide.  At
+            #     ``base_fee=1`` returns 0 (the pre-Tier-73 defect).
+            #   * ``gate=True`` (post-Tier-73): clamps to 1 when the
+            #     floor would underflow to zero, never exceeding
+            #     ``base_fee``.  At ``base_fee=1`` returns 1; at
+            #     ``base_fee>=2`` the clamp is a no-op because the
+            #     floor is already non-zero.
+            attester_share = _split_bps(
+                base_fee,
+                ATTESTER_FEE_SHARE_BPS,
+                10_000,
+                min_unit=1,
+                gate=effective_height >= ATTESTER_FEE_MIN_UNIT_HEIGHT,
+            )
         actual_burn = base_fee - attester_share
 
         tip = fee - base_fee
