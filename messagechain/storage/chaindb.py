@@ -75,6 +75,12 @@ class ChainDB:
         """
         self.db_path = db_path
         self._local = threading.local()
+        # Audit r49 #1: canonical {block_number -> block_hash} map for
+        # the chain rooted at the current best_tip.  Resolves the
+        # "sibling at same height" ambiguity in get_block_by_number.
+        # Built lazily by _canonical_hash_at_height; invalidated when
+        # chain_tips or blocks change.
+        self._canonical_hash_cache: dict[int, bytes] | None = None
         self._init_schema()
         self._check_db_permissions()
         if not skip_schema_check:
@@ -1125,6 +1131,12 @@ class ChainDB:
             "INSERT OR REPLACE INTO blocks (block_hash, block_number, prev_hash, data) VALUES (?, ?, ?, ?)",
             (block.block_hash, block.header.block_number, block.header.prev_hash, data),
         )
+        # Storing a new block extends the row-set the canonical walk
+        # back from best_tip resolves over — invalidate the cache so
+        # the next get_block_by_number rebuilds it.  Replacing an
+        # existing hash (idempotent re-store under fork replay) is
+        # safe to invalidate too.
+        self._invalidate_canonical_cache()
         # Tier 10 prev-pointer: populate tx_locations index for every
         # message tx in this block.  Idempotent via INSERT OR REPLACE —
         # re-storing a block under fork replay cleanly refreshes its
@@ -1181,8 +1193,82 @@ class ChainDB:
                 block = attach_block_witnesses(block, witness_data)
         return block
 
+    def _build_canonical_hash_map(self) -> dict[int, bytes]:
+        """Walk back from best_tip via prev_hash, returning
+        ``{block_number -> block_hash}`` for blocks on the canonical
+        chain only.  Forked siblings (stored in the blocks table but
+        not on the chain rooted at best_tip) are absent from the map.
+
+        Walk-back uses the ``(block_hash, prev_hash, block_number)``
+        columns directly — no Block.from_bytes() — so the cost is one
+        indexed SQL row per chain entry.  Result is cached on
+        ``self._canonical_hash_cache`` until the next chain-tip or
+        block-storage mutation invalidates it.
+        """
+        best = self.get_best_tip()
+        if best is None:
+            return {}
+        tip_hash, tip_height, _ = best
+        canonical: dict[int, bytes] = {}
+        current_hash: bytes | None = bytes(tip_hash)
+        current_height = int(tip_height)
+        # Guard against malformed chains pointing in a cycle: bound
+        # the walk at ``tip_height + 1`` iterations.  Honest chains
+        # terminate at genesis (prev_hash = all-zeros) within
+        # ``tip_height`` steps.
+        for _ in range(current_height + 2):
+            if current_hash is None or current_height < 0:
+                break
+            canonical[current_height] = current_hash
+            if current_height == 0:
+                break
+            cur = self._conn.execute(
+                "SELECT prev_hash, block_number FROM blocks "
+                "WHERE block_hash = ? LIMIT 1",
+                (current_hash,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # Walked off the stored prefix — chain incomplete
+                # below this height.  Return what we have; callers
+                # asking for older heights get None, which is the
+                # honest signal that the canonical chain at that
+                # height is not reconstructable from on-disk state.
+                break
+            current_hash = bytes(row[0])
+            current_height = int(row[1]) - 1
+        return canonical
+
+    def _canonical_hash_at_height(self, block_number: int) -> bytes | None:
+        if self._canonical_hash_cache is None:
+            self._canonical_hash_cache = self._build_canonical_hash_map()
+        return self._canonical_hash_cache.get(block_number)
+
+    def _invalidate_canonical_cache(self) -> None:
+        self._canonical_hash_cache = None
+
     def get_block_by_number(self, block_number: int, state=None) -> Block | None:
-        """Get block by height. If multiple at same height (forks), returns the one on the best chain.
+        """Get the block at ``block_number`` on the canonical chain.
+
+        Audit r49 #1: pre-fix the SQL was
+        ``SELECT data FROM blocks WHERE block_number=? LIMIT 1`` with
+        no ``ORDER BY`` and no chain-tip filter, so when fork siblings
+        coexisted in the blocks table at the same height the row was
+        whichever sibling sqlite happened to pick (typically insertion
+        order).  Cold-load chain rehydration walks
+        ``range(tip_height + 1)`` calling this per height, so a stale
+        sibling silently poisoned the rebuilt ``self.chain`` after a
+        reorg + restart — a chain-divergence vector against honest
+        validators that had attended a brief minority fork.
+
+        The fix resolves the canonical block_hash at this height by
+        walking back from best_tip via prev_hash (see
+        ``_build_canonical_hash_map``), then loads the block by that
+        hash via the unambiguous ``get_block_by_hash`` path.  A height
+        not reachable from best_tip (no chain_tips written, or the
+        height is past best_tip) returns ``None`` — callers that need
+        a non-canonical sibling must use ``get_block_by_hash`` or
+        ``get_blocks_at_height`` and pick explicitly.
 
         `state` (if provided) is threaded to `Block.from_bytes` so
         any compact-form entity refs can be resolved to their full
@@ -1190,14 +1276,10 @@ class ChainDB:
         will fail loudly on any compact-form blob — which is the
         correct behavior for a standalone inspector.
         """
-        cur = self._conn.execute(
-            "SELECT data FROM blocks WHERE block_number = ? LIMIT 1",
-            (block_number,),
-        )
-        row = cur.fetchone()
-        if row is None:
+        canonical_hash = self._canonical_hash_at_height(block_number)
+        if canonical_hash is None:
             return None
-        return Block.from_bytes(bytes(row[0]), state=state)
+        return self.get_block_by_hash(canonical_hash, state=state)
 
     def get_blocks_at_height(self, block_number: int, state=None) -> list[Block]:
         """Get all blocks at a given height (for fork detection)."""
@@ -1249,10 +1331,16 @@ class ChainDB:
             "INSERT OR REPLACE INTO chain_tips (block_hash, block_number, cumulative_stake) VALUES (?, ?, ?)",
             (block_hash, block_number, cumulative_stake),
         )
+        # Adding (or upweighting) a tip can flip the best_tip and
+        # therefore the canonical chain — bust the cached map.
+        self._invalidate_canonical_cache()
         self._maybe_commit()
 
     def remove_chain_tip(self, block_hash: bytes):
         self._conn.execute("DELETE FROM chain_tips WHERE block_hash = ?", (block_hash,))
+        # Tip removal can drop best_tip back to a sibling on a
+        # different fork — bust the cached map.
+        self._invalidate_canonical_cache()
         self._maybe_commit()
 
     def get_best_tip(self) -> tuple[bytes, int, int] | None:
