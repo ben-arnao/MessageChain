@@ -177,6 +177,13 @@ class TestRpcSubmitCensorshipEvidenceArrivalHeight(unittest.TestCase):
         srv._tx_signer_pubkey = (
             Server._tx_signer_pubkey.__get__(srv, _ServerLike)
         )
+        # Audit r52 #2: bind the chokepoint helper + a no-op gossip
+        # scheduler so the chokepoint's validate -> admit -> gossip
+        # flow runs end-to-end in the in-process test (no peer table).
+        srv._rpc_submit_evidence = (
+            Server._rpc_submit_evidence.__get__(srv, _ServerLike)
+        )
+        srv._schedule_pending_tx_gossip = lambda kind, tx: None
 
         result = Server._rpc_submit_censorship_evidence(
             srv, {"transaction": etx.serialize()},

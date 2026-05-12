@@ -3390,43 +3390,63 @@ class Server(SharedRuntimeMixin):
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
 
-    def _rpc_submit_censorship_evidence(self, params: dict) -> dict:
-        """Accept a signed CensorshipEvidenceTx from a client.
+    def _rpc_submit_evidence(
+        self,
+        params: dict,
+        *,
+        kind: str,
+        tx_cls,
+        validate_fn,
+        admit_fn,
+        pool_full_error: str,
+        success_result_extra=None,
+    ) -> dict:
+        """Unified chokepoint for every signed evidence tx admitted via RPC.
 
-        Wires the user-side path to the slashing pipeline: a wallet
-        holding a SubmissionReceipt for a tx the validator never
-        included can now construct, sign, and submit a
-        CensorshipEvidenceTx via this RPC.  Without this surface,
-        every Tier 30-35 hardening of the slashing apply paths ships
-        a back end whose CLI entry point (`messagechain submit-evidence`)
-        was a print-only stub -- the end-to-end remedy the README
-        and COMPARISON.md promise was theatre.
+        Runs the canonical sequence:
 
-        Validates the tx via the same `validate_censorship_evidence_tx`
-        gate the apply path uses, then admits to the mempool's
-        censorship-evidence pool.  The proposer-side drain in
-        `_try_produce_block_sync` carries it into the next block
-        proposed by this node; gossiped peers see the same tx via
-        the P2P pending-tx relay.
+            deserialize -> validate -> cross-pool leaf check
+            -> mempool admit -> _schedule_pending_tx_gossip
 
-        Mutation discipline mirrors `_rpc_submit_proposal` /
-        `_rpc_submit_vote`: NEVER mutates chain state directly --
+        Every evidence kind (CensorshipEvidenceTx, BogusRejectionEvidenceTx,
+        NonResponseEvidenceTx, and any future kind) MUST land here so the
+        gossip step is structurally guaranteed -- pre-audit-r52 the CE
+        handler admitted to the pool without scheduling gossip, defeating
+        the chain's primary collusion-deterrence pipeline (CLAUDE.md
+        adversary anchor: validator collusion).
+
+        Parameters
+        ----------
+        params           Wire-form ``{"transaction": <dict>}`` from the RPC.
+        kind             Canonical kind string -- doubles as the gossip
+                         topic that ``_handle_announce_pending_tx``
+                         dispatches on, and as the error-namespace prefix.
+        tx_cls           Evidence tx class with a ``deserialize(dict) -> tx``
+                         classmethod.
+        validate_fn      ``(tx) -> (ok: bool, reason: str | None)`` invoked
+                         under the same admission gate the apply path uses.
+        admit_fn         ``(tx) -> bool`` -- mempool admit closure; returns
+                         False on duplicate / full / fee / verify failure.
+        pool_full_error  User-facing message when ``admit_fn`` returns False.
+        success_result_extra
+                         ``(tx) -> dict`` (or None) appended to the
+                         success-path ``result`` so each kind can return
+                         its kind-specific identifiers (evidence_hash,
+                         offender_id, ...) without forking the chokepoint.
+
+        Mutation discipline mirrors ``_rpc_submit_proposal`` /
+        ``_rpc_submit_vote``: NEVER mutates chain state directly --
         admission lands in the mempool only, and apply-time slashing
         runs through the standard block-application path so every
         node reaches the same outcome.
         """
         try:
-            from messagechain.consensus.censorship_evidence import (
-                CensorshipEvidenceTx,
-            )
-            tx = CensorshipEvidenceTx.deserialize(params["transaction"])
+            tx = tx_cls.deserialize(params["transaction"])
 
             # Run the live admission gate -- mirrors apply-time so a
             # client gets the same answer mempool admission gives,
             # without waiting for a block to land.
-            ok, reason = self.blockchain.validate_censorship_evidence_tx(
-                tx, chain_height=self.blockchain.height + 1,
-            )
+            ok, reason = validate_fn(tx)
             if not ok:
                 return {"ok": False, "error": reason}
 
@@ -3441,59 +3461,94 @@ class Server(SharedRuntimeMixin):
                     ),
                 }
 
-            # Admit to the mempool's evidence pool (already shipped in
-            # 1.x; previously only writeable from in-process tests).
-            #
-            # ``arrival_block_height`` is what the source-side forced-
-            # inclusion gate consults to age the evidence past
-            # ``FORCED_INCLUSION_WAIT_BLOCKS``.  Pre-fix the kwarg was
-            # omitted, the mempool defaulted to 0, and freshly-admitted
-            # evidence was IMMEDIATELY eligible for forced inclusion --
-            # an attacker bursting spurious well-formed evidence txs
-            # could grief honest proposers into burning block budget,
-            # or asymmetrically penalize proposers who legitimately
-            # deferred a bogus evidence tx.  Twin of the React pool's
-            # Tier 43 wiring at
-            # ``messagechain/network/submission_server.py:901-902``
-            # (``add_react_transaction(tx, arrival_block_height=...)``)
-            # -- this admit path is the same defect class on a
-            # different surface.  Surfaced by audit r28 top-3 #2.
-            # Audit r38 #3: thread the chain pubkey lookup so the
-            # mempool admission gate runs the stateless verifier
-            # against the submitter's current pubkey before
-            # inserting.  validate_censorship_evidence_tx above
-            # already covers this for the live RPC path; the lookup
-            # makes the same defense apply at the mempool boundary
-            # so any future caller (gossip-relay, secondary admit
-            # path, etc.) gets the same protection without having
-            # to remember to pre-validate.
-            if not self.mempool.add_censorship_evidence_tx(
-                tx, arrival_block_height=self.blockchain.height,
-                submitter_public_key_lookup=self.blockchain.public_keys.get,
-            ):
-                return {
-                    "ok": False,
-                    "error": (
-                        "Censorship-evidence pool rejected tx "
-                        "(duplicate, full, under-fee, or signature "
-                        "verification failed)"
-                    ),
-                }
+            # Mempool admit (kind-specific pool + sig-verify wiring lives
+            # in the caller-provided closure).
+            if not admit_fn(tx):
+                return {"ok": False, "error": pool_full_error}
 
-            return {"ok": True, "result": {
+            # Schedule peer-to-peer gossip so any honest proposer can
+            # pack the evidence, not just whichever validator received
+            # the RPC.  Pre-audit-r52 this call was simply absent from
+            # the CE submit path -- a user filing evidence against the
+            # very validator they'd just caught dropping a tx had no
+            # way to reach honest proposers.  Routing through the
+            # chokepoint makes the gossip step structurally guaranteed
+            # for every current and future evidence kind.
+            self._schedule_pending_tx_gossip(kind, tx)
+
+            result = {
                 "tx_hash": tx.tx_hash.hex(),
-                "evidence_hash": tx.evidence_hash.hex(),
-                "offender_id": tx.offender_id.hex(),
                 "fee": tx.fee,
                 "status": (
                     "pending — will be included in next block; slash "
                     "matures after EVIDENCE_MATURITY_BLOCKS unless "
-                    "the receipted tx lands in the meantime (which "
+                    "the obligation is met in the meantime (which "
                     "voids the evidence with no slash)"
                 ),
-            }}
+            }
+            if success_result_extra is not None:
+                result.update(success_result_extra(tx))
+            return {"ok": True, "result": result}
         except Exception as e:
             return {"ok": False, "error": sanitize_error(str(e))}
+
+    def _rpc_submit_censorship_evidence(self, params: dict) -> dict:
+        """Accept a signed CensorshipEvidenceTx from a client.
+
+        Thin per-kind wrapper around ``_rpc_submit_evidence``.  Wires the
+        user-side path to the slashing pipeline: a wallet holding a
+        SubmissionReceipt for a tx the validator never included can
+        construct, sign, and submit a CensorshipEvidenceTx via this
+        RPC.  The chokepoint guarantees the admit -> gossip flow --
+        pre-audit-r52 this handler admitted to the pool without
+        scheduling gossip, leaving the chain's primary collusion-
+        deterrence pipeline single-point-of-failure on the RPC-target
+        validator.
+        """
+        from messagechain.consensus.censorship_evidence import (
+            CensorshipEvidenceTx,
+        )
+
+        def _validate(tx):
+            return self.blockchain.validate_censorship_evidence_tx(
+                tx, chain_height=self.blockchain.height + 1,
+            )
+
+        def _admit(tx):
+            # Admit to the mempool's evidence pool.  ``arrival_block_height``
+            # is what the source-side forced-inclusion gate consults to age
+            # the evidence past ``FORCED_INCLUSION_WAIT_BLOCKS`` -- without
+            # it (legacy default 0) freshly-admitted evidence is
+            # immediately eligible for forced inclusion, opening the
+            # spurious-evidence griefing surface.
+            # ``submitter_public_key_lookup`` runs the stateless verifier
+            # at the pool boundary so any future caller path (gossip-
+            # relay, secondary admit) inherits the protection without
+            # having to remember to pre-validate.
+            return self.mempool.add_censorship_evidence_tx(
+                tx, arrival_block_height=self.blockchain.height,
+                submitter_public_key_lookup=self.blockchain.public_keys.get,
+            )
+
+        def _success_extra(tx):
+            return {
+                "evidence_hash": tx.evidence_hash.hex(),
+                "offender_id": tx.offender_id.hex(),
+            }
+
+        return self._rpc_submit_evidence(
+            params,
+            kind="censorship_evidence",
+            tx_cls=CensorshipEvidenceTx,
+            validate_fn=_validate,
+            admit_fn=_admit,
+            pool_full_error=(
+                "Censorship-evidence pool rejected tx "
+                "(duplicate, full, under-fee, or signature "
+                "verification failed)"
+            ),
+            success_result_extra=_success_extra,
+        )
 
     def _rpc_estimate_fee(self, params: dict) -> dict:
         """Price a prospective tx of any kind without submitting.
@@ -5978,6 +6033,33 @@ class Server(SharedRuntimeMixin):
                 if not self._check_leaf_across_all_pools(tx):
                     return
                 if not self._admit_to_pool("_pending_governance_txs", tx):
+                    return
+            elif kind == "censorship_evidence":
+                # Audit r52 #2: the gossip topic the
+                # ``_rpc_submit_evidence`` chokepoint broadcasts on
+                # MUST have a matching admit-branch here, otherwise the
+                # gossip arrives at every peer and is silently dropped.
+                # Validates via the same ``validate_censorship_evidence_tx``
+                # gate the RPC handler uses (so peers reach the same
+                # admission verdict as the originator), then admits to
+                # the mempool's CE pool with the submitter pubkey
+                # lookup wired -- mirroring the apply path.
+                from messagechain.consensus.censorship_evidence import (
+                    CensorshipEvidenceTx,
+                )
+                tx = CensorshipEvidenceTx.deserialize(tx_data)
+                ok, _ = self.blockchain.validate_censorship_evidence_tx(
+                    tx, chain_height=self.blockchain.height + 1,
+                )
+                if not ok:
+                    return
+                if not self._check_leaf_across_all_pools(tx):
+                    return
+                if not self.mempool.add_censorship_evidence_tx(
+                    tx,
+                    arrival_block_height=self.blockchain.height,
+                    submitter_public_key_lookup=self.blockchain.public_keys.get,
+                ):
                     return
             else:
                 return

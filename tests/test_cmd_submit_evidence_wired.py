@@ -496,6 +496,16 @@ class TestRpcSubmitCensorshipEvidence(unittest.TestCase):
         srv._tx_signer_pubkey = (
             Server._tx_signer_pubkey.__get__(srv, _ServerLike)
         )
+        # Audit r52 #2: bind the chokepoint helper + the gossip
+        # scheduler (no-op for this in-process test since there's no
+        # peer table to broadcast to).  Pre-fix the CE handler was
+        # one bespoke function; post-fix it routes through
+        # _rpc_submit_evidence which structurally guarantees the
+        # gossip call.
+        srv._rpc_submit_evidence = (
+            Server._rpc_submit_evidence.__get__(srv, _ServerLike)
+        )
+        srv._schedule_pending_tx_gossip = lambda kind, tx: None
 
         result = Server._rpc_submit_censorship_evidence(
             srv, {"transaction": etx.serialize()},
