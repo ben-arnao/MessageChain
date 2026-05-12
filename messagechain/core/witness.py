@@ -37,6 +37,7 @@ domain tags below (`_WITNESS_*_TAG`) exist precisely so the two trees
 are computationally distinguishable.
 """
 
+import dataclasses
 import hashlib
 import struct
 from messagechain.config import HASH_ALGO
@@ -322,20 +323,25 @@ def tx_has_witness(tx: MessageTransaction) -> bool:
 def strip_tx_witness(tx: MessageTransaction) -> MessageTransaction:
     """Return a copy of the transaction with its signature stripped.
 
-    Preserves tx_hash (which excludes the signature by design) and all
-    other fields.  The stripped tx carries the sentinel signature.
+    Preserves tx_hash (which excludes the signature by design) and
+    EVERY other MessageTransaction field — version / compression_flag
+    / prev / sender_pubkey / community_id / poll_options / vote_target
+    / witness_hash.  The stripped tx carries the sentinel signature.
+
+    Built on ``dataclasses.replace`` so every future MessageTransaction
+    field auto-survives the round-trip.  An explicit field list froze
+    the strip contract at the pre-Tier-10 set; ``ChainDB.strip_finalized_witnesses``
+    writes ``stripped.to_bytes()`` back into ``blocks.data``, so any
+    field not copied here is silently erased from primary block storage
+    on the next sweep past WITNESS_AUTO_SEPARATION_HEIGHT.  That
+    directly violates the "your message can never be deleted"
+    permanence anchor for every Tier 5+ optional field — exactly the
+    defect form the sibling ``strip_block_witnesses`` docstring already
+    calls out ("listing slots one-by-one was the defect form").
     """
-    return MessageTransaction(
-        entity_id=tx.entity_id,
-        message=tx.message,
-        timestamp=tx.timestamp,
-        nonce=tx.nonce,
-        fee=tx.fee,
+    return dataclasses.replace(
+        tx,
         signature=Signature([], 0, [], b"", b""),
-        version=tx.version,
-        compression_flag=tx.compression_flag,
-        tx_hash=tx.tx_hash,
-        witness_hash=tx.witness_hash,
     )
 
 
@@ -345,20 +351,14 @@ def get_tx_witness_data(tx: MessageTransaction) -> bytes:
 
 
 def attach_tx_witness(stripped_tx: MessageTransaction, witness_data: bytes) -> MessageTransaction:
-    """Reattach witness data to a stripped transaction."""
+    """Reattach witness data to a stripped transaction.
+
+    Inverse of ``strip_tx_witness``.  Built on ``dataclasses.replace``
+    so every non-signature field is preserved verbatim — same
+    anti-field-list discipline ``strip_tx_witness`` uses.
+    """
     sig = Signature.from_bytes(witness_data)
-    return MessageTransaction(
-        entity_id=stripped_tx.entity_id,
-        message=stripped_tx.message,
-        timestamp=stripped_tx.timestamp,
-        nonce=stripped_tx.nonce,
-        fee=stripped_tx.fee,
-        signature=sig,
-        version=stripped_tx.version,
-        compression_flag=stripped_tx.compression_flag,
-        tx_hash=stripped_tx.tx_hash,
-        witness_hash=stripped_tx.witness_hash,
-    )
+    return dataclasses.replace(stripped_tx, signature=sig)
 
 
 def strip_block_witnesses(block) -> "Block":
