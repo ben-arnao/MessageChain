@@ -7256,6 +7256,69 @@ assert 1 <= MAX_POLL_OPTION_BYTES <= 64, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 73 — Attester fee-share minimum unit (audit r51 #3)
+# ─────────────────────────────────────────────────────────────────────
+# Tier 4 redirected ``ATTESTER_FEE_SHARE_BPS / 10_000`` of every fee
+# burn into the per-block attester pool to fund long-horizon
+# validator security from fees rather than issuance (CLAUDE.md
+# pillar: "Perpetual security via fees, not issuance").  Integer
+# arithmetic silently breaks the redirect at the floor-binding regime
+# the chain spends most of its life in:
+#
+#     base_fee = 1                  # MARKET_FEE_FLOOR=1 binds
+#     ATTESTER_FEE_SHARE_BPS = 5000 # 50%
+#     attester_share = 1 * 5000 // 10_000 = 0
+#
+# At ``base_fee=1`` (the dominant regime on a low-utilization chain),
+# all 100% of the fee burns and attesters receive nothing from the
+# fee channel.  Same flooring at ``base_fee`` in {2, 3} (still rounds
+# to 1) -- but {2, 3} is at least non-zero; the {1} case is the live
+# defect because it's the literal steady-state value of base_fee
+# whenever no spam wave has lifted it.
+#
+# Tier 73 introduces a ``max(1, ...)`` clamp on the fee-share
+# integer-divide so the redirect channel is guaranteed non-zero
+# whenever a fee actually burns.  The clamp is gated on
+# ``base_fee > 0`` so an off-chain audit / test path with
+# ``base_fee = 0`` doesn't manufacture pool credit from thin air.
+#
+# Consensus-visible math change (every fee redirect that pre-fork
+# rounded to 0 now redirects 1 token) -- gated by activation height.
+# Pre-fork is byte-identical to legacy at every (base_fee, fee)
+# combination so historical-block replay matches.
+#
+# Activation height 8500 sits 2000 blocks above Tier 71 (6500,
+# EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT) -- ~13.9 days cohort
+# spacing matching the Tier 70→71 runway.  Tier 73 is the
+# next-scheduled fee/economics retune; consecutive economics
+# changes deserve their own cohort so operators can absorb each
+# in its own upgrade cycle.  Tier 72 (POLL_HEIGHT=2400) is below
+# this and disjoint -- a wire-format-only tier on the message-tx
+# admission path; the two tiers' apply paths do not interact.
+#
+# No new wire format, no new tx kinds, no state-tree changes.  Pure
+# consensus-rule swap inside ``SupplyTracker.pay_fee_with_burn``;
+# the sim-vs-apply parity falls out trivially because
+# ``pay_fee_with_burn`` is the single chokepoint both paths route
+# fee payments through.
+ATTESTER_FEE_MIN_UNIT_HEIGHT = 8500  # Tier 73
+
+assert (
+    ATTESTER_FEE_MIN_UNIT_HEIGHT > EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT
+), (
+    "ATTESTER_FEE_MIN_UNIT_HEIGHT (Tier 73) must strictly follow "
+    "EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT (Tier 71) -- both are "
+    "validator-economics retunes; consecutive reward-distribution "
+    "changes deserve their own cohort so operators can absorb each "
+    "in its own upgrade cycle."
+)
+assert ATTESTER_FEE_MIN_UNIT_HEIGHT > POLL_HEIGHT, (
+    "ATTESTER_FEE_MIN_UNIT_HEIGHT (Tier 73) must strictly follow "
+    "POLL_HEIGHT (Tier 72) to keep activation ordering monotone."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

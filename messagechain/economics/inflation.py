@@ -35,6 +35,7 @@ from messagechain.config import (
     get_unbonding_period,
     ATTESTER_REWARD_SPLIT_HEIGHT,
     ATTESTER_FEE_FUNDING_HEIGHT,
+    ATTESTER_FEE_MIN_UNIT_HEIGHT,
     ATTESTER_FEE_SHARE_BPS,
     TARGET_CIRCULATING_SUPPLY_FLOOR,
     DEFLATION_ISSUANCE_MULTIPLIER,
@@ -1532,6 +1533,28 @@ class SupplyTracker:
             and effective_height >= ATTESTER_FEE_FUNDING_HEIGHT
         ):
             attester_share = base_fee * ATTESTER_FEE_SHARE_BPS // 10_000
+            # Tier 73 (audit r51 #3): integer-divide rounds
+            # ``base_fee * 5000 // 10_000`` to 0 whenever
+            # ``base_fee < 2``.  At ``MARKET_FEE_FLOOR=1`` -- the
+            # steady-state base_fee whenever no spam wave has lifted
+            # it -- 100% of the fee silently burns and attesters get
+            # nothing from the fee channel.  Post-Tier-73, clamp the
+            # redirect to a minimum of 1 token whenever ``base_fee >
+            # 0`` so the long-horizon validator-security fee channel
+            # is never silently dead.  Gated on ``base_fee > 0`` so
+            # an off-chain audit / test path with no fee doesn't
+            # manufacture pool credit.  ``attester_share`` can never
+            # exceed ``base_fee`` -- at ``base_fee=1`` the clamp
+            # yields ``max(1, 0)=1`` which equals base_fee (zero
+            # actual burn that round, attester_share=1).  At
+            # ``base_fee >= 2`` the clamp is a no-op
+            # (``base_fee * 5000 // 10_000 >= 1`` already).
+            if (
+                effective_height >= ATTESTER_FEE_MIN_UNIT_HEIGHT
+                and base_fee > 0
+                and attester_share == 0
+            ):
+                attester_share = 1
         actual_burn = base_fee - attester_share
 
         tip = fee - base_fee
