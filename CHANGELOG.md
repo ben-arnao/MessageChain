@@ -4,6 +4,174 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.79.0] — 2026-05-12
+
+Audit r51 top-3 ships: one production-runtime security parity fix
+(soft, no fork), one value-prop public-surface rollout for the
+Tier 72 polls/votes feature shipped in 1.77.0/1.78.0 (soft, no fork),
+and one consensus-visible economics retune that closes the silent
+fee-redirect-to-zero defect at the steady-state base_fee (new
+Tier 73 hard fork, activation height 8500).
+
+### Fixed
+
+  * **r46/r50 chokepoint discipline lifted onto production
+    ``server.py`` (audit r51 #1 -- security top-1).**  CLAUDE.md
+    adversaries: validator collusion (primary), honest-operator
+    insurance, crypto-agility.  ``cli.py:2663`` instantiates
+    ``server.Server`` for the validator process; the audit r46 #1
+    + r50 #1 + r50 #2 fixes only landed in
+    ``messagechain/network/node.py``, leaving Server's three
+    parallel handlers each silently re-arming one of those defects
+    on the production code path:
+
+    -  ``_handle_announce_attestation`` inserted into
+       ``_seen_attestations`` BEFORE signature verification (r50 #1
+       gossip dedup-poison surface).
+    -  Same handler verified ``verify_attestation(att, pk)`` against
+       the CURRENT key, not the key active at
+       ``att.block_number`` -- a rotated validator's pre-rotation
+       attestation silently verify-failed under the new key, the
+       relayer took ``OFFENSE_INVALID_TX``, and honest peers banned
+       each other (r50 #2).
+    -  Same handler read live ``supply.get_staked(...)`` +
+       ``sum(supply.staked.values())`` for the finality denominator,
+       diverging from the apply path's pinned-at-target-height
+       snapshot during stake-churn windows and forking the chain on
+       reorg-rejection (r46 #1).
+    -  ``_handle_announce_finality_vote`` verified
+       ``verify_finality_vote(vote, pk)`` against the current key
+       with the same r50 #2 ban-cascade surface.
+       ``KEY_ROTATION_COOLDOWN_BLOCKS=144`` is far below
+       ``FINALITY_VOTE_MAX_AGE_BLOCKS=1000``, so an honest
+       validator's pre-rotation votes remain in flight for up to
+       1000 blocks after they rotate.
+    -  ``_maybe_attest_accepted_block`` (the local-broadcast path
+       -- this validator attesting a block it just accepted) read
+       live stake for the local finality update; same r46 #1
+       divergence trap as the gossip-ingress path.
+
+    Abstraction fix: lift the exact chokepoint shape from
+    ``Node._handle_announce_attestation`` /
+    ``Node._handle_announce_finality_vote`` /
+    ``Node._attest_block_if_allowed`` into Server.  The helpers
+    (``Blockchain._verify_signer_at_height`` and
+    ``Blockchain.resolve_pinned_attestation_stake``) already exist;
+    the production handlers route through them by construction.
+    Three call sites on Server now share the same denominator
+    source for ``FinalityTracker.add_attestation`` (apply path /
+    gossip-ingress / local broadcast); two gossip handlers now
+    route signed-message verification through
+    ``_verify_signer_at_height``.  Five structural guards in
+    ``tests/test_audit_r51_server_gossip_chokepoint_parity.py``
+    lock the discipline against Server source so a future
+    refactor cannot silently re-introduce any of the three
+    defect-shapes.  Soft fix: no fork, no consensus rule change,
+    no wire-format change.  Behavioural fix lands the moment a
+    validator upgrades.  (b914fc1)
+
+### Added
+
+  * **Tier 72 polls + structured votes surface end-to-end
+    (audit r51 #2 -- value-prop top-1).**  Tier 72 shipped its
+    wire format in 1.77.0 and its consensus rules in 1.77.0 /
+    1.78.0, but every public surface a newcomer touches had zero
+    awareness of the feature -- exact repeat of the Tier 25
+    community-handle ship-dead pattern.  CLAUDE.md positioning
+    anchor at risk: "decentralized reddit/twitter core" framing.
+
+    Single abstraction:
+    ``Blockchain._poll_vote_render_fields(tx)`` returns the
+    ``kind`` discriminator + ``poll_options`` / ``vote_target``
+    payload shape for any tx.  Consumed by all four JSON surfaces
+    (``get_recent_messages``, ``get_recent_messages_by_entity``,
+    ``get_tx_status_public``, ``Server._build_included_status``);
+    adding a future structured-tx kind surfaces on every UI by
+    extending the one helper.  Same "one schema, two ports"
+    pattern as audit r43 #2, lifted to kind-discriminated content
+    shapes.
+
+    Per-surface render additions:
+      - Receipt page (``/r/<tx_hash>``) dispatches
+        ``renderMessageBody`` on ``result.kind`` -- poll receipts
+        list options with a live tally aggregated from chain,
+        vote receipts read "Voted: green" with a clickable link
+        to the parent poll's receipt (the new ``poll_tally``
+        and ``vote_option_label`` schema fields mean one HTTP
+        round-trip suffices).
+      - Feed page (``/``) renderMessage dispatches on ``m.kind``
+        -- poll cards show question + option list + "open poll
+        receipt for live tally"; vote cards show "Vote on poll
+        (option #N) on poll <tx>" with the parent linked.
+
+    Docs: README adds two examples (--poll-option ×3 + --vote-
+    target); COMPARISON.md adds a "Structured polls + on-chain
+    votes with consensus-enforced tally" row (✓ for MC, ✗ for
+    every named competitor); ``guides/forum-primitives.md``
+    gains a §6 polls section documenting create / vote /
+    consensus-enforced uniqueness / binding-forever / no-close /
+    out-of-scope items.  Soft fix: no fork, no consensus rule
+    change, no wire-format change.  Visibility lands the moment
+    a validator upgrades and a feed-page visitor refreshes.
+    (da9c924)
+
+### Changed (Tier 73, consensus-breaking, height-gated)
+
+  * **Attester fee-share minimum unit -- the long-horizon
+    validator-security fee channel is never silently dead at the
+    floor (audit r51 #3 -- economics top-1).**  CLAUDE.md pillar
+    at risk: "Perpetual security via fees, not issuance."  Tier 4
+    redirected ``ATTESTER_FEE_SHARE_BPS / 10_000 = 50%`` of every
+    fee burn to the per-block attester pool; integer arithmetic
+    silently broke the redirect at the steady-state base_fee:
+
+        base_fee = 1                  # MARKET_FEE_FLOOR=1 binds
+        attester_share = 1 * 5000 // 10_000 = 0
+
+    At ``base_fee=1`` (the dominant regime on a low-utilization
+    chain whenever no spam wave has lifted base_fee above the
+    protocol floor), 100% of every fee burns and attesters
+    receive nothing from the fee channel.  The long-horizon
+    validator-security pillar quietly goes dark in the regime
+    the chain spends most of its life in.
+
+    Tier 73 clamps the redirect to a minimum of 1 token whenever
+    ``base_fee > 0`` so the channel is guaranteed non-zero
+    whenever a fee actually burns.  The clamp is gated on
+    ``base_fee > 0`` so off-chain audit / test paths with
+    ``base_fee = 0`` do not manufacture pool credit; the clamp
+    can never exceed ``base_fee`` (at ``base_fee=1`` the
+    redirect becomes 1 and the burn is 0 that round; at
+    ``base_fee >= 2`` the clamp is a no-op because the floor-
+    divide is already non-zero).
+
+    Activation height ``ATTESTER_FEE_MIN_UNIT_HEIGHT = 8500``
+    sits 2000 blocks above Tier 71 (6500) -- ~13.9 days cohort
+    spacing matching the Tier 70->71 runway.  Two consecutive
+    validator-economics retunes deserve their own cohorts so
+    operators can absorb each in its own upgrade cycle.  Tier 72
+    (POLL_HEIGHT=2400) is below this and disjoint -- wire format
+    only, no economic interaction.
+
+    Pre-fork is byte-identical to legacy at every (base_fee, fee)
+    combination so historical-block replay matches.  No new wire
+    format, no new tx kinds, no state-tree changes.  Pure
+    consensus-rule swap inside
+    ``SupplyTracker.pay_fee_with_burn``; sim-vs-apply parity
+    falls out trivially because ``pay_fee_with_burn`` is the
+    single chokepoint both paths route fee payments through.
+
+    Sibling defect-shape DEFERRED (scope-bounded for this round):
+    the wider abstraction calls for a shared
+    ``_split_bps(amount, bps, denom=10_000, min_unit=1)`` helper
+    to catch every future ``bps // 10_000`` site that could
+    round to zero under a realistic minimum.  Other current call
+    sites (``DEFLATION_REBATE_BPS // 10_000``,
+    ``ATTESTER_REWARD_SPLIT_BPS // 10_000``, etc.) do not round
+    to zero in the typical regime, so this round addresses only
+    the one site the audit demonstrated as producing user-
+    visible economic harm.  (aff161e)
+
 ## [1.78.0] — 2026-05-12
 
 Completes the **Tier 72 poll + vote** rollout from 1.77.0.  Adds
