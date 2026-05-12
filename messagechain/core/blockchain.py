@@ -4636,6 +4636,57 @@ class Blockchain:
                 break
         return active
 
+    def _partition_verified_aggregation(
+        self, objs, *, get_entity_id, get_signed_at_height, verifier,
+    ):
+        """Partition a signed-aggregation list into (verified, dropped).
+
+        Single chokepoint for proposer-side pre-filtering of signed
+        aggregation lists (Attestation, FinalityVote, any future
+        signed-aggregation kind).  Each entry is checked against the
+        historical-key candidate set via ``_verify_signer_at_height``;
+        entries that don't verify are dropped from the verified
+        output and returned in the dropped list (for logging /
+        telemetry).
+
+        ``get_entity_id`` and ``get_signed_at_height`` are accessors
+        the caller wires for the specific aggregation kind:
+            * Attestation -> ``a.validator_id`` / ``a.block_number``
+            * FinalityVote -> ``v.signer_entity_id`` / ``v.signed_at_height``
+
+        AUDIT r50 #3 -- the block-validation path's all-or-nothing
+        reject-on-first-bad-sig is a hard-fork-required consensus
+        change to soften.  The soft (non-fork) defense ensures an
+        honest proposer NEVER constructs a block with a bad signature
+        in the first place: ``propose_block`` calls this helper to
+        pre-filter both attestations and finality_votes through the
+        same historical-key candidate set the in-block validator
+        uses (audit r50 #2).  A bad-sig entry planted in the
+        proposer's mempool or finality-tracker by a malicious peer
+        is silently discarded before block assembly, so the proposer's
+        WOTS+ leaf is not burnt on a block destined to be rejected
+        by peers.
+
+        Adding a new signed-aggregation kind to ``propose_block`` and
+        routing it through this helper inherits the discipline by
+        construction.
+
+        Returns a 2-tuple of lists ``(verified, dropped)``.  Input
+        order is preserved within each list.
+        """
+        if not objs:
+            return [], []
+        verified = []
+        dropped = []
+        for obj in objs:
+            eid = get_entity_id(obj)
+            sat_h = get_signed_at_height(obj)
+            if self._verify_signer_at_height(obj, eid, sat_h, verifier):
+                verified.append(obj)
+            else:
+                dropped.append(obj)
+        return verified, dropped
+
     def _verify_signer_at_height(
         self, obj, entity_id: bytes, signed_at_height: int, verifier,
     ) -> bool:
@@ -8474,6 +8525,45 @@ class Blockchain:
         """
         prev = self.get_latest_block()
         block_height = prev.header.block_number + 1
+        # AUDIT r50 #3 -- proposer-side pre-filter on signed-aggregation
+        # inputs.  Each entry is verified against the historical-key
+        # candidate set (audit r50 #2's _verify_signer_at_height); any
+        # entry whose signature does not verify is silently dropped
+        # BEFORE block assembly so the proposer never burns a WOTS+
+        # leaf on a block destined to be rejected by peers.  Inputs
+        # SHOULD have come from gossip-ingress-verified sources, but
+        # treating this filter as defensive (not best-effort) means
+        # any future signed-aggregation kind added to propose_block
+        # picks up the discipline by routing through the chokepoint.
+        # Old proposers (no pre-filter) still produce valid blocks
+        # when their inputs are clean; this is a non-consensus,
+        # non-fork, defense-in-depth change.
+        if attestations:
+            attestations, _att_dropped = self._partition_verified_aggregation(
+                attestations,
+                get_entity_id=lambda a: a.validator_id,
+                get_signed_at_height=lambda a: a.block_number,
+                verifier=verify_attestation,
+            )
+            if _att_dropped:
+                logger.warning(
+                    "propose_block dropped %d attestation(s) failing "
+                    "historical-key verification (audit r50 #3).",
+                    len(_att_dropped),
+                )
+        if finality_votes:
+            finality_votes, _fv_dropped = self._partition_verified_aggregation(
+                finality_votes,
+                get_entity_id=lambda v: v.signer_entity_id,
+                get_signed_at_height=lambda v: v.signed_at_height,
+                verifier=verify_finality_vote,
+            )
+            if _fv_dropped:
+                logger.warning(
+                    "propose_block dropped %d finality vote(s) failing "
+                    "historical-key verification (audit r50 #3).",
+                    len(_fv_dropped),
+                )
         # Guard against WOTS+ leaf reuse: if the proposer also has
         # transactions in this block (signed earlier, possibly before a
         # keypair restart), the keypair's _next_leaf may not have been

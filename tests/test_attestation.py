@@ -193,7 +193,12 @@ class TestAttestationsInBlocks(unittest.TestCase):
         self.assertIn("wrong block", reason.lower())
 
     def test_block_with_invalid_attestation_signature_rejected(self):
-        """Attestation with forged signature is rejected."""
+        """Attestation with forged signature is rejected by the in-block
+        validator.  Bypasses ``propose_block`` (audit r50 #3 strips
+        bad sigs at proposer-side pre-filter); constructs the block
+        directly via ``consensus.create_block`` so the in-block
+        validator path is exercised.
+        """
         block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
@@ -201,8 +206,13 @@ class TestAttestationsInBlocks(unittest.TestCase):
         att = create_attestation(self.bob, block1.block_hash, block1.header.block_number)
         att.validator_id = self.carol.entity_id  # forge the validator_id
 
-        block2 = self.chain.propose_block(
-            self.consensus, self.alice, [], attestations=[att]
+        state_root = self.chain.compute_post_state_root(
+            [], self.alice.entity_id, block1.header.block_number + 1,
+            attestations=[att],
+        )
+        block2 = self.consensus.create_block(
+            self.alice, [], block1,
+            state_root=state_root, attestations=[att],
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
@@ -224,15 +234,26 @@ class TestAttestationsInBlocks(unittest.TestCase):
         self.assertIn("duplicate attestation", reason.lower())
 
     def test_attestation_from_unknown_entity_rejected(self):
-        """Attestation from unregistered entity is rejected."""
+        """Attestation from unregistered entity is rejected by the
+        in-block validator.  Bypasses ``propose_block`` (audit r50 #3
+        strips bad sigs at proposer-side pre-filter, including those
+        whose signer has no candidate keys); constructs the block
+        directly via ``consensus.create_block`` so the in-block
+        validator path is exercised.
+        """
         block1 = self.chain.propose_block(self.consensus, self.alice, [])
         self.chain.add_block(block1)
 
         stranger = Entity.create(b"stranger-private-key".ljust(32, b"\x00"))
         att = create_attestation(stranger, block1.block_hash, block1.header.block_number)
 
-        block2 = self.chain.propose_block(
-            self.consensus, self.alice, [], attestations=[att]
+        state_root = self.chain.compute_post_state_root(
+            [], self.alice.entity_id, block1.header.block_number + 1,
+            attestations=[att],
+        )
+        block2 = self.consensus.create_block(
+            self.alice, [], block1,
+            state_root=state_root, attestations=[att],
         )
         success, reason = self.chain.add_block(block2)
         self.assertFalse(success)
