@@ -860,26 +860,127 @@ class Mempool:
                     del self._orphan_sender_counts[tx.entity_id]
             return len(expired)
 
+    # ── Shared pool admission helpers (audit r49 #3) ────────────
+    #
+    # Replaces the strict-FIFO refuse-when-full pattern that the
+    # slash / censorship-evidence pools shared with the 1.76.1-fixed
+    # server-side ``_pending_*_txs`` pools.  Each helper is the
+    # single chokepoint its callers route through — adding a new
+    # fee-bearing pool means one ``_admit_with_density_eviction``
+    # call, not a fresh hand-rolled admit loop that risks
+    # reintroducing the FIFO defect.  Callers must hold ``self._lock``.
+
+    def _admit_with_density_eviction(
+        self,
+        pool: dict,
+        key: bytes,
+        obj,
+        max_size: int,
+    ) -> tuple[bool, bytes | None]:
+        """Density-ranked admit for fee-bearing pools.
+
+        Returns ``(inserted, evicted_key_or_None)``.  Behaviour:
+
+          * ``key`` already in pool  → ``(False, None)``  (dedup).
+          * pool not full            → insert, ``(True, None)``.
+          * pool full + incoming density > min(existing densities)
+                                     → evict lowest, insert, return
+                                       ``(True, evicted_key)``.
+          * pool full + incoming density ≤ min                  → ``(False, None)``.
+
+        Density is ``obj.fee / max(1, len(obj.to_bytes()))`` via the
+        same ``_fee_per_byte`` helper messages already use, with
+        ``self._stored_bytes`` as the shared by-tx_hash cache.
+
+        Caller is responsible for any bookkeeping torn down by the
+        eviction (e.g. arrival-height map).  The evicted-key return
+        is the integration point.
+        """
+        if key in pool:
+            return False, None
+        if len(pool) < max_size:
+            pool[key] = obj
+            return True, None
+        # Pool full — find lowest-density existing entry.
+        cache = self._stored_bytes
+        lowest_key = min(
+            pool, key=lambda k: _fee_per_byte(pool[k], cache=cache),
+        )
+        lowest_density = _fee_per_byte(pool[lowest_key], cache=cache)
+        incoming_density = _fee_per_byte(obj, cache=cache)
+        if incoming_density <= lowest_density:
+            return False, None
+        # Strictly higher density — evict + admit.  The stored-bytes
+        # cache for the evicted tx_hash is also torn down so the
+        # next density read recomputes if the same tx re-arrives.
+        self._stored_bytes.pop(lowest_key, None)
+        del pool[lowest_key]
+        pool[key] = obj
+        return True, lowest_key
+
+    def _admit_with_oldest_eviction(
+        self,
+        pool: dict,
+        key: bytes,
+        obj,
+        max_size: int,
+        age_attr: str,
+    ) -> tuple[bool, bytes | None]:
+        """Oldest-by-``age_attr`` admit for fee-less pools.
+
+        FinalityVote carries no fee — the flooder-pays-floor attack
+        does not apply (a vote requires a real validator key).  But
+        strict refuse-when-full would break liveness under a
+        saturated validator set.  When full, evict the entry with
+        the smallest ``getattr(obj, age_attr)`` so newest votes
+        always land.
+
+        Returns ``(inserted, evicted_key_or_None)``.
+        """
+        if key in pool:
+            return False, None
+        if len(pool) < max_size:
+            pool[key] = obj
+            return True, None
+        oldest_key = min(pool, key=lambda k: getattr(pool[k], age_attr))
+        oldest_age = getattr(pool[oldest_key], age_attr)
+        incoming_age = getattr(obj, age_attr)
+        if incoming_age <= oldest_age:
+            return False, None
+        del pool[oldest_key]
+        pool[key] = obj
+        return True, oldest_key
+
     def add_slash_transaction(self, slash_tx) -> bool:
         """Add a validated SlashTransaction to the slash pool.
 
-        Returns True on insertion, False if the tx is already present or
-        the pool is full. The pool is intentionally simple — slash txs
-        are rare and high-value, so we accept strict FIFO (refuse new
-        entries when full) rather than build another eviction scheme.
+        Audit r49 #3: routes through the shared
+        ``_admit_with_density_eviction`` helper so a flooder paying
+        the floor fee cannot brick the slashing-evidence pipeline
+        by filling the pool with low-density entries.  Returns True
+        on insertion (which may evict a strictly-lower-density
+        existing entry when the pool is full), False on dedup or
+        on a strictly-lower density admit against a full pool.
         """
         with self._lock:
-            if slash_tx.tx_hash in self.slash_pool:
-                return False
-            if len(self.slash_pool) >= self.slash_pool_max_size:
-                return False
-            self.slash_pool[slash_tx.tx_hash] = slash_tx
-            return True
+            inserted, _evicted = self._admit_with_density_eviction(
+                self.slash_pool,
+                slash_tx.tx_hash,
+                slash_tx,
+                self.slash_pool_max_size,
+            )
+            return inserted
 
     def get_slash_transactions(self, max_count: int | None = None) -> list:
-        """Return pending slash transactions for inclusion in a new block."""
+        """Return pending slash transactions, ordered by fee-per-byte
+        descending so the proposer pulls the highest-revenue entries
+        first when the byte budget binds."""
         with self._lock:
-            items = list(self.slash_pool.values())
+            items = sorted(
+                self.slash_pool.values(),
+                key=lambda t: _fee_per_byte(t, cache=self._stored_bytes),
+                reverse=True,
+            )
             if max_count is not None:
                 items = items[:max_count]
             return items
@@ -889,28 +990,33 @@ class Mempool:
         with self._lock:
             for h in tx_hashes:
                 self.slash_pool.pop(h, None)
+                self._stored_bytes.pop(h, None)
 
     # ── Finality vote pool ───────────────────────────────────────
 
     def add_finality_vote(self, vote) -> bool:
         """Add a validated FinalityVote to the finality pool.
 
-        Returns True on insertion, False if the vote is already
-        present or the pool is full.  Keyed by consensus_hash so a
-        peer can't silently dislodge an existing vote by re-sending
-        a structurally-identical one.
+        Audit r49 #3: routes through the shared
+        ``_admit_with_oldest_eviction`` helper keyed on
+        ``signed_at_height`` so the validator set's most recent
+        votes always land, even under saturation.  Pre-fix the pool
+        refused new entries when full, which silently broke
+        finality-vote liveness if the validator count outpaced the
+        cap.  Keyed by consensus_hash so a peer can't silently
+        dislodge an existing vote by re-sending a structurally-
+        identical one.
         """
-        # `vote.consensus_hash()` is a pure derivation on the vote
-        # object — no mempool re-entry, safe to compute under the lock
-        # (and required so the membership check + insert are atomic).
         with self._lock:
             key = vote.consensus_hash()
-            if key in self.finality_pool:
-                return False
-            if len(self.finality_pool) >= self.finality_pool_max_size:
-                return False
-            self.finality_pool[key] = vote
-            return True
+            inserted, _evicted = self._admit_with_oldest_eviction(
+                self.finality_pool,
+                key,
+                vote,
+                self.finality_pool_max_size,
+                age_attr="signed_at_height",
+            )
+            return inserted
 
     def get_finality_votes(self, max_count: int | None = None) -> list:
         """Return pending finality votes for inclusion in a new block."""
@@ -969,20 +1075,22 @@ class Mempool:
         prevents that class of pool poisoning at the admission
         boundary.
         """
-        # Cheap-first: dedup, capacity, fee floor *before* the
-        # signature-verify path, so a flooder is dropped before the
-        # expensive WOTS+ verification cost.
+        # Audit r49 #3: density-ranked admission via the shared
+        # _admit_with_density_eviction helper -- a flooder paying the
+        # floor fee can no longer brick the censorship-evidence
+        # pipeline by filling the pool with low-density entries.
+        # Cheap-first: dedup, fee floor *before* the signature-verify
+        # path (preserved); pool-full now triggers density check
+        # instead of unconditional refusal.
         with self._lock:
             if tx.tx_hash in self.censorship_evidence_pool:
-                return False
-            if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
                 return False
             if tx.fee < MIN_FEE:
                 return False
         # Signature verify (when caller provides the lookup) runs
         # outside the lock so a slow verify cannot stall other
-        # pool operations.  The dedup recheck inside the lock
-        # below is what guarantees no double-insert under
+        # pool operations.  The dedup + density recheck inside the
+        # lock below is what guarantees no double-insert under
         # concurrent admits.
         if submitter_public_key_lookup is not None:
             from messagechain.consensus.censorship_evidence import (
@@ -995,14 +1103,19 @@ class Mempool:
             if not ok:
                 return False
         with self._lock:
-            # Re-check dedup + capacity after the verify window: a
-            # concurrent admit may have inserted the same tx, or
-            # filled the last slot, while we were verifying.
-            if tx.tx_hash in self.censorship_evidence_pool:
+            inserted, evicted = self._admit_with_density_eviction(
+                self.censorship_evidence_pool,
+                tx.tx_hash,
+                tx,
+                self.censorship_evidence_pool_max_size,
+            )
+            if not inserted:
                 return False
-            if len(self.censorship_evidence_pool) >= self.censorship_evidence_pool_max_size:
-                return False
-            self.censorship_evidence_pool[tx.tx_hash] = tx
+            # Tear down arrival-height bookkeeping for the evicted
+            # entry so forced-inclusion source walks don't reference
+            # stale rows.
+            if evicted is not None:
+                self._evidence_arrival_heights.pop(evicted, None)
             self._evidence_arrival_heights[tx.tx_hash] = (
                 arrival_block_height
                 if arrival_block_height is not None
@@ -1011,8 +1124,20 @@ class Mempool:
             return True
 
     def get_censorship_evidence_txs(self, max_count: int | None = None) -> list:
+        """Return pending censorship-evidence txs, ordered by
+        fee-per-byte descending so the proposer pulls the highest-
+        revenue entries first when the byte budget binds.
+
+        Audit r49 #3: pre-fix this returned insertion order, which
+        gave low-density flood entries the same priority as
+        high-density legitimate evidence at the proposer.
+        """
         with self._lock:
-            items = list(self.censorship_evidence_pool.values())
+            items = sorted(
+                self.censorship_evidence_pool.values(),
+                key=lambda t: _fee_per_byte(t, cache=self._stored_bytes),
+                reverse=True,
+            )
             if max_count is not None:
                 items = items[:max_count]
             return items
@@ -1022,6 +1147,7 @@ class Mempool:
             for h in tx_hashes:
                 self.censorship_evidence_pool.pop(h, None)
                 self._evidence_arrival_heights.pop(h, None)
+                self._stored_bytes.pop(h, None)
 
     # ── Tier 17 ReactTransaction pool ────────────────────────────
 
