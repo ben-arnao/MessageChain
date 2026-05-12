@@ -1730,17 +1730,27 @@ class Node(SharedRuntimeMixin):
             return
 
         # Deduplicate: skip if already seen (prevents gossip amplification
-        # and redundant expensive signature verification)
+        # and redundant expensive signature verification).
+        #
+        # AUDIT r50 #1 -- "seen" means "seen-AFTER-verify".  The membership
+        # CHECK runs here (cheap gate skips expensive verification on
+        # already-accepted entries) but the INSERT is deferred until
+        # after ``verify_attestation`` succeeds below.  Pre-verify
+        # insertion lets a peer pre-relay a forged-signature attestation
+        # with the right (validator_id, block_number, block_hash)
+        # triple -- all three components are publicly predictable -- and
+        # poison the LRU so the genuine attestation arriving later
+        # short-circuits at dedup and never reaches the FinalityTracker
+        # or the relay broadcast.  CLAUDE.md adversary anchor: validator
+        # collusion (primary); a gossip-layer dedup poison silently
+        # suppresses honest finality without producing slashable
+        # evidence.  Same discipline applies to every future signed-
+        # gossip handler that maintains an explicit dedup cache.
         att_key = (att.validator_id, att.block_number, att.block_hash)
         if not hasattr(self, '_seen_attestations'):
             self._seen_attestations: OrderedDict = OrderedDict()
         if att_key in self._seen_attestations:
             return
-        # M11: LRU eviction instead of full wipe to prevent replay window
-        if len(self._seen_attestations) >= 50_000:
-            for _ in range(12_500):
-                self._seen_attestations.popitem(last=False)
-        self._seen_attestations[att_key] = True
 
         # Verify the attesting validator is known
         if att.validator_id not in self.blockchain.public_keys:
@@ -1753,6 +1763,15 @@ class Node(SharedRuntimeMixin):
                 peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
             )
             return
+
+        # Verify succeeded -- mark the triple as seen.  LRU eviction
+        # done here (M11: half-evict instead of full wipe to prevent
+        # replay window) so the cache only fills with attestations
+        # that actually passed verification.
+        if len(self._seen_attestations) >= 50_000:
+            for _ in range(12_500):
+                self._seen_attestations.popitem(last=False)
+        self._seen_attestations[att_key] = True
 
         # Equivocation watcher: record the (validator, height) and auto-
         # file slash evidence if we've seen a DIFFERENT signed attestation
