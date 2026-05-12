@@ -164,7 +164,69 @@ impossible at the consensus layer (no two visually-confusable
 handles can exist simultaneously). Display names that map onto a
 canonical ASCII handle are an app concern.
 
-## 6. Tags — same field
+## 6. Structured polls — `--poll-option` and `--vote-target`
+
+Beyond up/down reactions, the chain ships a **structured poll**
+primitive: a single tx defines a question and a fixed set of answer
+choices, and other entities cast a structured vote referencing the
+poll's tx_hash plus an option index. The tally is computable from
+chain alone.
+
+**Create a poll.** Set 1–4 `--poll-option` flags on a `send`. The
+message body is the question; the option list is the answer set.
+
+```bash
+messagechain send "favourite colour?" \
+    --poll-option red \
+    --poll-option green \
+    --poll-option blue
+```
+
+The option set is part of the signed payload, so once on chain a
+poll's choices are immutable — no edit, no append, no swap. Per
+CLAUDE.md: re-running the prompt for a different option set means a
+new poll tx with its own tx_hash, and votes from the old poll do not
+carry over.
+
+**Vote on a poll.** Reference the poll by tx_hash plus a 0-based
+option index:
+
+```bash
+messagechain send --vote-target <poll_tx_hash>:2
+```
+
+Properties (enforced at consensus, not deferred to indexers):
+
+- A vote MUST resolve to a real prior poll tx — vote-on-non-poll
+  rejects at admission.
+- The option index MUST be in `[0, len(target_poll.options))` — out-
+  of-range rejects at admission.
+- The poll's author cannot also vote on their own poll.
+- **One vote per (entity, poll) at consensus.** The first vote tx
+  from a given entity on a given poll is the one that counts; the
+  protocol rejects a second vote from the same entity on the same
+  poll. Indexers don't need any dedup logic — they can naively count
+  rows.
+- **Binding forever.** There is no in-protocol mechanism for a voter
+  to override their own prior vote. An entity that wants to register
+  a change of mind does so via app-layer messaging, not by replacing
+  their on-chain vote. This is the deliberate cost of
+  "tally-from-chain-alone simplicity."
+- **No protocol-level close.** A poll is open forever. An app layer
+  can choose to ignore votes after some height for display
+  purposes — but it cannot suppress them at the consensus layer.
+
+The poll's receipt page (`/r/<poll_tx_hash>`) renders the running
+tally aggregated from the chain; the vote's receipt page resolves
+the chosen option's label so the share-link reads "Voted: green"
+rather than "option #1."
+
+Out of scope without a new anchor: ranked-choice, weighted votes,
+secret ballot, vote revocation, close-heights, or any other voting
+machinery beyond "structured single-choice vote against a fixed
+option set, one vote per voter, forever."
+
+## 7. Tags — same field
 
 There's no separate "tag" or "topic" field beyond `community_id`.
 That's the entire categorical-tagging primitive. If you want
@@ -174,7 +236,7 @@ link them with `prev`. That's by design — adding more index fields
 is more bytes per message, more attack surface, and more complexity
 that L2 can deliver instead.
 
-## 7. Putting it together: what a forum gets, for free
+## 8. Putting it together: what a forum gets, for free
 
 | Forum feature | MessageChain primitive |
 |---------------|------------------------|
@@ -184,6 +246,8 @@ that L2 can deliver instead.
 | Upvote / downvote | React tx, `target_type=message`, choice up/down |
 | Retract a vote | React tx, choice clear |
 | Subreddit-style topic | `community-id` handle |
+| Structured poll | Message tx with `--poll-option` set |
+| Vote on a poll | Message tx with `--vote-target` set |
 | Vouch for a user | React tx, `target_type=user`, choice up |
 | Flag a user | React tx, `target_type=user`, choice down |
 | Permanent archive | The chain itself — every tx forever |
@@ -202,7 +266,7 @@ What a forum has to build itself, on top of these primitives:
   indexes off chain. The chain is a verification layer, not a
   search engine.
 
-## 8. What's intentionally missing
+## 9. What's intentionally missing
 
 - **No DMs.** Encryption is a strict no at the protocol level —
   every payload is fully public. (See CLAUDE.md.) Private messaging

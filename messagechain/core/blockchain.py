@@ -17468,6 +17468,93 @@ class Blockchain:
             result["tree_height"] = int(recorded_height)
         return result
 
+    @staticmethod
+    def _poll_vote_render_fields(tx) -> dict:
+        """Single chokepoint for the public-feed JSON shape of Tier 72
+        polls + structured votes.  Returns a dict of fields the public
+        JSON surfaces merge into each tx entry — at minimum a ``kind``
+        discriminator (``"message"`` / ``"poll"`` / ``"vote"``), and
+        for v6 txs the ``poll_options`` / ``vote_target`` payload
+        fields when set.
+
+        All three public surfaces (``get_recent_messages``,
+        ``get_recent_messages_by_entity``, ``get_tx_status_public``)
+        consume this helper, and ``Server._build_included_status``
+        mirrors it for JSON-RPC.  Adding a new structured-tx kind in
+        the future surfaces on every UI by extending this helper —
+        the audit r51 #2 abstraction-fix discipline.  Audit r43 #2
+        established the ``one schema, two ports`` pattern; this is the
+        same pattern lifted to ``kind``-discriminated content shapes.
+
+        Static (does not read instance state) so JSON-RPC callers
+        with a non-Blockchain ``self.blockchain`` (e.g. test
+        fixtures using ``SimpleNamespace``) can call it via
+        ``Blockchain._poll_vote_render_fields(tx)``.
+        """
+        fields: dict = {"kind": "message"}
+        poll_options = getattr(tx, "poll_options", None)
+        if poll_options is not None:
+            fields["kind"] = "poll"
+            fields["poll_options"] = list(poll_options)
+            return fields
+        vote_target = getattr(tx, "vote_target", None)
+        if vote_target is not None:
+            poll_txid, option_index = vote_target
+            fields["kind"] = "vote"
+            fields["vote_target"] = {
+                "poll_txid": poll_txid.hex(),
+                "option_index": int(option_index),
+            }
+        return fields
+
+    def _resolve_poll_lookup(self, poll_txid: bytes):
+        """Locate a poll-creating tx on chain by its tx_hash.
+
+        Returns the ``MessageTransaction`` whose ``poll_options`` is
+        set and whose ``tx_hash == poll_txid``, or ``None`` if not
+        found / not on chain / not a poll.  Used by the receipt-page
+        rendering path to resolve an option label for a vote tx and
+        to compute the per-poll tally.
+
+        Walks the chain linearly — acceptable while the chain is
+        small and the receipt page is the single caller.  At
+        century-scale this should route through a structured
+        ``poll_locations`` index analogous to ``tx_locations``; the
+        helper boundary above keeps that future optimisation a
+        single-site refactor.
+        """
+        for block in getattr(self, "chain", []) or []:
+            for tx in getattr(block, "transactions", []) or []:
+                if getattr(tx, "tx_hash", None) != poll_txid:
+                    continue
+                if getattr(tx, "poll_options", None) is None:
+                    return None
+                return tx
+        return None
+
+    def _compute_poll_tally(self, poll_txid: bytes, num_options: int) -> list[int]:
+        """Per-option vote count for ``poll_txid``.
+
+        Walks every message tx on chain whose ``vote_target.poll_txid``
+        matches ``poll_txid`` and increments the option counter.  No
+        dedup at this stage — consensus already enforces one vote per
+        (entity, poll) at admission (Tier 72 1.78.0), so the chain's
+        votes are already the deduped set.
+        """
+        tally = [0] * num_options
+        for block in getattr(self, "chain", []) or []:
+            for tx in getattr(block, "transactions", []) or []:
+                vt = getattr(tx, "vote_target", None)
+                if vt is None:
+                    continue
+                vp_txid, opt_idx = vt
+                if vp_txid != poll_txid:
+                    continue
+                opt_idx = int(opt_idx)
+                if 0 <= opt_idx < num_options:
+                    tally[opt_idx] += 1
+        return tally
+
     def get_recent_messages(self, count: int) -> list[dict]:
         """Get the most recent messages from the chain, newest first.
 
@@ -17484,6 +17571,12 @@ class Blockchain:
         per-(voter, target) choice in ReactionState — superseded
         votes don't double-count.  `up_pct` is null when the message
         has no UP/DOWN votes.
+
+        Each entry also carries a ``kind`` discriminator
+        (``"message"`` / ``"poll"`` / ``"vote"``) plus
+        ``poll_options`` / ``vote_target`` payload fields when this
+        is a v6 Tier 72 tx — see ``_poll_vote_render_fields``.  The
+        front-end dispatches its card-render branch on ``kind``.
         """
         # Pre-aggregate UP/DOWN counts per message tx_hash in one pass
         # over the ReactionState so the per-message lookup below is O(1).
@@ -17534,6 +17627,12 @@ class Blockchain:
                 community_id = getattr(tx, "community_id", None)
                 if community_id is not None:
                     entry["community_id"] = community_id
+                # Tier 72 poll/vote shape — single chokepoint in
+                # ``_poll_vote_render_fields`` so adding a new
+                # structured-tx kind surfaces here, on the entity
+                # twin, on the receipt page, AND on JSON-RPC by
+                # construction (audit r51 #2).
+                entry.update(Blockchain._poll_vote_render_fields(tx))
                 messages.append(entry)
                 if len(messages) >= count:
                     return messages
@@ -17595,6 +17694,9 @@ class Blockchain:
                 community_id = getattr(tx, "community_id", None)
                 if community_id is not None:
                     entry["community_id"] = community_id
+                # Tier 72 poll/vote shape via the shared helper —
+                # see ``get_recent_messages`` for the rationale.
+                entry.update(Blockchain._poll_vote_render_fields(tx))
                 messages.append(entry)
                 if len(messages) >= count:
                     return messages
@@ -17730,6 +17832,34 @@ class Blockchain:
             prev = getattr(located_tx, "prev", None)
             if prev:
                 result["prev"] = prev.hex()
+            # Tier 72 poll/vote shape on the receipt-page surface —
+            # same chokepoint the feed JSON uses (audit r51 #2).
+            # All three helpers are routed via the class so legacy
+            # test stubs that call ``Blockchain.get_tx_status_public(
+            # fake_chain, ...)`` keep working when their fake chain
+            # lacks the methods on its own type.
+            poll_vote_fields = Blockchain._poll_vote_render_fields(located_tx)
+            result.update(poll_vote_fields)
+            # Receipt-page extras for polls + votes: tally per-option
+            # for a poll, and resolve the chosen option's label for a
+            # vote (so a single round-trip suffices to render
+            # 'voted: green' without a follow-up query for the
+            # parent poll).
+            if poll_vote_fields["kind"] == "poll":
+                options = poll_vote_fields["poll_options"]
+                result["poll_tally"] = Blockchain._compute_poll_tally(
+                    self, tx_hash, len(options),
+                )
+            elif poll_vote_fields["kind"] == "vote":
+                poll_txid_hex = poll_vote_fields["vote_target"]["poll_txid"]
+                opt_idx = poll_vote_fields["vote_target"]["option_index"]
+                parent_poll = Blockchain._resolve_poll_lookup(
+                    self, bytes.fromhex(poll_txid_hex),
+                )
+                if parent_poll is not None:
+                    parent_opts = parent_poll.poll_options or ()
+                    if 0 <= opt_idx < len(parent_opts):
+                        result["vote_option_label"] = parent_opts[opt_idx]
         return result
 
     def get_chain_info(self) -> dict:

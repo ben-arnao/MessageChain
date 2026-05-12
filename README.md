@@ -126,6 +126,27 @@ piece with `--prev` pointing at the previous tx_hash. The chain
 requires each `--prev` target to be in a strictly earlier block,
 so you'll wait one block (~10 min) between pieces.
 
+**Run a poll.** `--poll-option TEXT` (repeat 1–4 times) turns a
+message into a structured on-chain poll. The message body is the
+question; the option list is the answer set. Options are immutable
+once on chain.
+
+```bash
+messagechain send "favourite colour?" \
+    --poll-option red --poll-option green --poll-option blue
+```
+
+**Vote on a poll.** `--vote-target POLL_TXID:INDEX` references the
+poll's tx_hash and the 0-based option you're picking. One vote per
+(entity, poll) is enforced at consensus — the first vote is binding
+forever, and the poll's author cannot vote on their own poll. The
+running tally is computable from chain alone; the receipt page
+(`/r/<poll_tx_hash>`) shows it live.
+
+```bash
+messagechain send --vote-target <poll_tx_hash>:2
+```
+
 **Up/down-vote a message.** `react <tx_hash> --choice up|down|clear`
 votes on a message. Re-voting supersedes; `--choice clear` retracts.
 Each (voter, target) pair has a single latest choice in consensus

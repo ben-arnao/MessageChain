@@ -286,14 +286,80 @@
   // follows a /r/<tx> share-link sees WHAT was anchored, not just
   // the verdict that something was.  textContent (not innerHTML) is
   // load-bearing — chain payloads are arbitrary user bytes.
+  //
+  // Audit r51 #2: dispatch on result.kind so Tier 72 polls + votes
+  // render with their own body shape instead of appearing as an
+  // opaque "message" with empty content.  Single chokepoint in the
+  // /v1/tx_status response (Blockchain._poll_vote_render_fields) +
+  // dispatch here keeps the renderer one switch per kind.
   function renderMessageBody(result) {
     const section = document.getElementById("messageSection");
-    if (typeof result.message !== "string") {
+    const kind = result.kind || "message";
+    if (kind === "message" && typeof result.message !== "string") {
       section.hidden = true;
       return;
     }
     section.hidden = false;
-    document.getElementById("messageBody").textContent = result.message;
+    const body = document.getElementById("messageBody");
+    body.replaceChildren();
+    if (kind === "poll") {
+      // Poll question lives in `result.message`; options + tally come
+      // from the audit r51 #2 schema additions.
+      const q = document.createElement("div");
+      q.textContent = result.message || "";
+      q.style.fontWeight = "600";
+      q.style.marginBottom = "0.6rem";
+      body.appendChild(q);
+      const list = document.createElement("ol");
+      list.style.margin = "0";
+      list.style.paddingLeft = "1.4rem";
+      const options = Array.isArray(result.poll_options)
+        ? result.poll_options : [];
+      const tally = Array.isArray(result.poll_tally) ? result.poll_tally : [];
+      const total = tally.reduce((a, b) => a + (b | 0), 0);
+      for (let i = 0; i < options.length; i++) {
+        const li = document.createElement("li");
+        const count = (tally[i] | 0);
+        const pct = total > 0 ? Math.round((100 * count) / total) : 0;
+        li.textContent = options[i] + " — " + count +
+          (total > 0 ? " (" + pct + "%)" : "");
+        list.appendChild(li);
+      }
+      body.appendChild(list);
+      const footer = document.createElement("div");
+      footer.style.marginTop = "0.5rem";
+      footer.style.fontSize = "0.8rem";
+      footer.style.color = "var(--muted)";
+      footer.textContent = total === 1
+        ? "1 vote on chain"
+        : total + " votes on chain";
+      body.appendChild(footer);
+    } else if (kind === "vote") {
+      const vt = result.vote_target || {};
+      const label = result.vote_option_label;
+      const line = document.createElement("div");
+      if (label) {
+        line.textContent = "Voted: " + label;
+        line.style.fontWeight = "600";
+      } else {
+        line.textContent = "Vote on poll (option #" + vt.option_index + ")";
+      }
+      body.appendChild(line);
+      if (vt.poll_txid) {
+        const parent = document.createElement("div");
+        parent.style.marginTop = "0.4rem";
+        parent.style.fontSize = "0.85rem";
+        const a = document.createElement("a");
+        a.href = "/r/" + vt.poll_txid;
+        a.textContent = "open the poll receipt";
+        parent.appendChild(document.createTextNode("on poll "));
+        parent.appendChild(a);
+        body.appendChild(parent);
+      }
+    } else {
+      // Plain message: textContent is load-bearing (arbitrary bytes).
+      body.textContent = result.message;
+    }
     if (result.entity_id) {
       const by = document.getElementById("messageBy");
       by.textContent = shortHex(result.entity_id, 6, 4);

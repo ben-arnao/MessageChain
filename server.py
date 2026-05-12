@@ -4307,6 +4307,42 @@ class Server(SharedRuntimeMixin):
             prev = getattr(located_tx, "prev", None)
             if prev:
                 result["prev"] = prev.hex()
+            # Audit r51 #2: Tier 72 poll/vote shape via the shared
+            # ``Blockchain._poll_vote_render_fields`` chokepoint
+            # (static — works against the tx alone), plus poll-tally
+            # / vote-option-label resolution against the live chain.
+            # Same "one schema, two ports" pattern as audit r43 #2 —
+            # the JSON-RPC twin and the HTTP shim render every kind
+            # identically.
+            from messagechain.core.blockchain import Blockchain
+            poll_vote_fields = Blockchain._poll_vote_render_fields(located_tx)
+            result.update(poll_vote_fields)
+            if poll_vote_fields["kind"] == "poll":
+                options = poll_vote_fields["poll_options"]
+                try:
+                    result["poll_tally"] = self.blockchain._compute_poll_tally(
+                        tx_hash, len(options),
+                    )
+                except AttributeError:
+                    # Test fixture / non-Blockchain shim — tally is
+                    # an enrichment, not a correctness invariant.
+                    pass
+            elif poll_vote_fields["kind"] == "vote":
+                vt = poll_vote_fields["vote_target"]
+                poll_txid_hex = vt["poll_txid"]
+                opt_idx = vt["option_index"]
+                try:
+                    parent_poll = self.blockchain._resolve_poll_lookup(
+                        bytes.fromhex(poll_txid_hex),
+                    )
+                except AttributeError:
+                    parent_poll = None
+                if parent_poll is not None:
+                    parent_opts = (
+                        getattr(parent_poll, "poll_options", None) or ()
+                    )
+                    if 0 <= opt_idx < len(parent_opts):
+                        result["vote_option_label"] = parent_opts[opt_idx]
         return {"ok": True, "result": result}
 
     # ── Block Production ────────────────────────────────────────────

@@ -16,6 +16,7 @@ shows how each delivers on MC's core promises.
 | Proof-of-Stake — no energy waste | ✓ | ✓ | ✓ | ✗ | ✓ | ✗ |
 | No special nodes | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ |
 | Built-in on-chain governance | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ |
+| Structured polls + on-chain votes with consensus-enforced tally | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | Self-funding in perpetuity — no reliance on good faith | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ |
 
 Tallies: **MC 11 · Hive 5 · DeSo 4 · Bastyon 3 · Nostr 2 · Arweave 2**.

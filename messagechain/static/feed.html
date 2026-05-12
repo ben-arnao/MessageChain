@@ -926,7 +926,61 @@
     }
     const text = document.createElement("div");
     text.className = "text";
-    text.textContent = m.message;
+    // Audit r51 #2: dispatch on m.kind so Tier 72 polls + votes
+    // render as distinct card content instead of an empty text body.
+    // Single chokepoint in /v1/latest (Blockchain._poll_vote_render_
+    // fields) + per-kind branch here keeps the renderer one switch.
+    const kind = m.kind || "message";
+    if (kind === "poll") {
+      const q = document.createElement("div");
+      q.textContent = m.message || "";
+      q.style.fontWeight = "600";
+      q.style.marginBottom = "0.4rem";
+      text.appendChild(q);
+      const options = Array.isArray(m.poll_options) ? m.poll_options : [];
+      const list = document.createElement("ol");
+      list.style.margin = "0";
+      list.style.paddingLeft = "1.4rem";
+      for (const opt of options) {
+        const li = document.createElement("li");
+        li.textContent = opt;
+        list.appendChild(li);
+      }
+      text.appendChild(list);
+      const note = document.createElement("div");
+      note.style.marginTop = "0.4rem";
+      note.style.fontSize = "0.85em";
+      note.style.opacity = "0.7";
+      const tallyLink = document.createElement("a");
+      tallyLink.href = "/r/" + m.tx_hash;
+      tallyLink.textContent = "open poll receipt for live tally";
+      note.appendChild(document.createTextNode("Poll · "));
+      note.appendChild(tallyLink);
+      text.appendChild(note);
+    } else if (kind === "vote") {
+      const vt = m.vote_target || {};
+      const line = document.createElement("div");
+      line.textContent =
+        "Vote on poll (option #" + vt.option_index + ")";
+      line.style.fontWeight = "600";
+      text.appendChild(line);
+      if (vt.poll_txid) {
+        const ref = document.createElement("div");
+        ref.style.marginTop = "0.3rem";
+        ref.style.fontSize = "0.85em";
+        ref.style.opacity = "0.85";
+        const a = document.createElement("a");
+        a.href = "/r/" + vt.poll_txid;
+        a.textContent = shortHex(vt.poll_txid, 10, 6);
+        a.title = vt.poll_txid;
+        ref.appendChild(document.createTextNode("on poll "));
+        ref.appendChild(a);
+        text.appendChild(ref);
+      }
+    } else {
+      // Plain message: textContent is load-bearing (arbitrary bytes).
+      text.textContent = m.message;
+    }
     card.appendChild(text);
 
     // Vote indicator: ▲N · ▼N · NN% up.  Hidden entirely when the
