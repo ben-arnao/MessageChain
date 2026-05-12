@@ -4636,6 +4636,74 @@ class Blockchain:
                 break
         return active
 
+    def _verify_signer_at_height(
+        self, obj, entity_id: bytes, signed_at_height: int, verifier,
+    ) -> bool:
+        """Verify ``obj``'s signature against the keys ``entity_id``
+        held around ``signed_at_height``.  Single chokepoint every
+        signed-message verifier for a rotating-key entity MUST route
+        through.
+
+        ``verifier`` is one of ``verify_attestation`` /
+        ``verify_finality_vote`` / any future ``(obj, pk) -> bool``
+        signed-message verifier.  ``signed_at_height`` is the
+        consensus-implied signing height: an explicit field on the
+        message (``v.signed_at_height`` for FinalityVote) or implied
+        by the consensus admission window (``att.block_number`` for
+        Attestation, since attestations are admissible only in the
+        parent+1 block).
+
+        Acceptance shape mirrors the slashing-evidence multi-key
+        candidate path (see ``_compute_slash_pct`` / the candidate
+        loop in ``validate_slash_transaction``): try every key the
+        offender ever held plus the current key, accept if ANY
+        matches.  Every candidate is a key the entity legitimately
+        published on-chain (each rotation step is signed by the prior
+        key), so matching any candidate is proof the entity produced
+        the signature -- no attacker can forge a match.  The
+        ``signed_at_height`` argument is retained for forward
+        compatibility (future verifiers that need to scope the
+        candidate set tighter -- e.g. to the most recent key as of
+        H -- still have the height to work with).
+
+        AUDIT r50 #2 -- the slashing-evidence path already resolves
+        the offender's key via a multi-key candidate set.  Attestation
+        and FinalityVote validation + gossip handlers did NOT,
+        silently dropping any signed message that crossed a rotation
+        boundary.  ``KEY_ROTATION_COOLDOWN_BLOCKS = 144`` is
+        << ``FINALITY_VOTE_MAX_AGE_BLOCKS = 1000`` so every rotation
+        event invalidated up to 1000 blocks of in-flight votes under
+        the new key, and the same defect-shape silenced any attestation
+        whose proposer had rotated between sign-time and inclusion.
+
+        CLAUDE.md anchors at risk: honest-operator insurance,
+        crypto-agility (rotation is the migration mechanism), and
+        collective-decision censorship resistance (silent gossip-
+        layer suppression sidesteps the slashable evidence surface).
+
+        Returns False when the entity has no candidate keys (never
+        registered) or when none of the candidates verify the
+        signature.  Adding a new signed-aggregation verifier that
+        goes around this helper reintroduces the defect by
+        definition -- the abstraction is load-bearing for forward-
+        compatibility, not just correctness today.
+        """
+        seen: set[bytes] = set()
+        candidates: list[bytes] = []
+        for _installed_at, pk in self.key_history.get(entity_id, []):
+            if pk and pk not in seen:
+                seen.add(pk)
+                candidates.append(pk)
+        current = self.public_keys.get(entity_id)
+        if current and current not in seen:
+            candidates.append(current)
+        if not candidates:
+            return False
+        for pk in candidates:
+            if verifier(obj, pk):
+                return True
+        return False
+
     def _record_receipt_subtree_root(
         self, entity_id: bytes, root_public_key: bytes,
     ) -> None:
@@ -8738,9 +8806,18 @@ class Blockchain:
                 return False, f"Duplicate attestation from {att.validator_id.hex()[:16]}"
             seen_validators.add(att.validator_id)
 
-            # Verify signature
-            pk = self.public_keys[att.validator_id]
-            if not verify_attestation(att, pk):
+            # Verify signature against the key active at signed-at
+            # height.  Attestations are admissible only in the
+            # parent+1 block (validated above: ``att.block_number ==
+            # block.header.block_number - 1``), so the signing height
+            # is effectively ``att.block_number``.  Routing through
+            # ``_verify_signer_at_height`` so a rotated validator's
+            # attestation for parent N -- signed with K_old before
+            # K_new was installed by a rotation tx at N+1 -- still
+            # verifies under K_old.  See audit r50 #2.
+            if not self._verify_signer_at_height(
+                att, att.validator_id, att.block_number, verify_attestation,
+            ):
                 return False, f"Invalid attestation signature from {att.validator_id.hex()[:16]}"
 
         return True, "Attestations valid"
@@ -8852,9 +8929,19 @@ class Blockchain:
                     f"{v.signed_at_height} predates target "
                     f"#{v.target_block_number}"
                 )
-            # Signature verification
-            pk = self.public_keys[v.signer_entity_id]
-            if not verify_finality_vote(v, pk):
+            # Signature verification against the key active at
+            # signed-at height.  KEY_ROTATION_COOLDOWN_BLOCKS=144 is
+            # << FINALITY_VOTE_MAX_AGE_BLOCKS=1000, so a finality
+            # vote signed with K_old can legitimately reach a block
+            # whose proposer's chain already holds K_new.  Routing
+            # through ``_verify_signer_at_height`` keeps the
+            # crypto-agility property load-bearing (CLAUDE.md anchor
+            # "identity continuity across key rotations") -- a
+            # rotation event no longer silently drops 1000 blocks of
+            # in-flight votes.  See audit r50 #2.
+            if not self._verify_signer_at_height(
+                v, v.signer_entity_id, v.signed_at_height, verify_finality_vote,
+            ):
                 return False, (
                     f"Invalid finality vote signature from "
                     f"{v.signer_entity_id.hex()[:16]}"

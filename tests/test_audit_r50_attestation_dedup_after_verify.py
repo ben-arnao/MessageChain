@@ -169,13 +169,27 @@ class TestDedupInsertHappensAfterVerify(unittest.TestCase):
         from messagechain.network.node import Node
         return inspect.getsource(Node._handle_announce_attestation)
 
+    def _verify_call_idx(self, src: str) -> int:
+        """Return the index of the signature-verify call in the handler
+        source.  Accepts either the direct ``verify_attestation(`` call
+        OR the audit r50 #2 historical-key chokepoint
+        ``_verify_signer_at_height(`` -- both are valid verify sites
+        and either may live in the handler at any given commit."""
+        candidates = [
+            src.find("_verify_signer_at_height("),
+            src.find("verify_attestation("),
+        ]
+        present = [i for i in candidates if i >= 0]
+        return min(present) if present else -1
+
     def test_verify_appears_before_dedup_insert(self):
         src = self._source()
-        verify_idx = src.find("verify_attestation(")
+        verify_idx = self._verify_call_idx(src)
         insert_idx = src.find("_seen_attestations[att_key]")
         self.assertGreater(
             verify_idx, 0,
-            "_handle_announce_attestation must call verify_attestation.",
+            "_handle_announce_attestation must call a signature-verify "
+            "primitive (verify_attestation or _verify_signer_at_height).",
         )
         self.assertGreater(
             insert_idx, 0,
@@ -184,7 +198,7 @@ class TestDedupInsertHappensAfterVerify(unittest.TestCase):
         )
         self.assertLess(
             verify_idx, insert_idx,
-            "verify_attestation(...) must execute BEFORE the "
+            "Signature verification must execute BEFORE the "
             "_seen_attestations[att_key] insert -- otherwise a forged-sig "
             "attestation poisons the dedup cache and silently suppresses "
             "honest finality (audit r50 #1).  'Seen' must mean "
@@ -200,12 +214,12 @@ class TestDedupInsertHappensAfterVerify(unittest.TestCase):
         What's not allowed is to INSERT into the cache before verify.
 
         This test pins the ordering: ``att_key in self._seen_attestations``
-        check appears before ``verify_attestation`` (cheap dedup gate
-        runs first), AND the INSERT appears after verify.
+        check appears before the verify call (cheap dedup gate runs
+        first), AND the INSERT appears after verify.
         """
         src = self._source()
         membership_idx = src.find("att_key in self._seen_attestations")
-        verify_idx = src.find("verify_attestation(")
+        verify_idx = self._verify_call_idx(src)
         insert_idx = src.find("_seen_attestations[att_key]")
         self.assertLess(
             membership_idx, verify_idx,

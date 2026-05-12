@@ -1756,9 +1756,16 @@ class Node(SharedRuntimeMixin):
         if att.validator_id not in self.blockchain.public_keys:
             return
 
-        # Verify signature
-        pk = self.blockchain.public_keys[att.validator_id]
-        if not verify_attestation(att, pk):
+        # Verify signature against the key active at signed-at height.
+        # Attestations are admissible only at parent+1 (validated by
+        # the in-block path), so the implicit signing height for sig
+        # resolution is ``att.block_number``.  Routing through
+        # ``Blockchain._verify_signer_at_height`` so a rotated
+        # validator's pre-rotation attestation does not silently
+        # verify-fail under the new key -- AUDIT r50 #2.
+        if not self.blockchain._verify_signer_at_height(
+            att, att.validator_id, att.block_number, verify_attestation,
+        ):
             self.ban_manager.record_offense(
                 peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
             )
@@ -1897,8 +1904,19 @@ class Node(SharedRuntimeMixin):
         if vote.signer_entity_id in self.blockchain.slashed_validators:
             return
 
-        pk = self.blockchain.public_keys[vote.signer_entity_id]
-        if not verify_finality_vote(vote, pk):
+        # Verify signature against the key active at signed-at height.
+        # KEY_ROTATION_COOLDOWN_BLOCKS=144 << FINALITY_VOTE_MAX_AGE_
+        # BLOCKS=1000, so an honest validator's pre-rotation votes
+        # remain in flight for up to 1000 blocks after they rotate.
+        # Without the historical-key resolver they verify-fail under
+        # the new key, the relayer takes OFFENSE_INVALID_TX, and
+        # honest peers ban each other over valid signed messages --
+        # the exact ban-cascade an attacker can weaponize by replaying
+        # a known rotator's prior gossip.  AUDIT r50 #2.
+        if not self.blockchain._verify_signer_at_height(
+            vote, vote.signer_entity_id, vote.signed_at_height,
+            verify_finality_vote,
+        ):
             self.ban_manager.record_offense(
                 peer.address, OFFENSE_INVALID_TX, "invalid_finality_vote_sig",
             )
