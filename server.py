@@ -5340,16 +5340,29 @@ class Server(SharedRuntimeMixin):
             )
             return
 
-        # Record locally (we won't see our own attestation on gossip)
-        # and broadcast.
+        # Record our own attestation locally (we won't see it on the
+        # gossip path) and broadcast.  Live ``supply.staked`` here
+        # would corrupt the finality denominator for peers comparing
+        # this node's attested_stake total to theirs — same
+        # divergence trap as ``_handle_announce_attestation``.  Route
+        # through ``Blockchain.resolve_pinned_attestation_stake`` so
+        # the apply path, the gossip-ingress path, and the local-
+        # broadcast path all share one denominator source by
+        # construction.  If no pin exists for the target height, skip
+        # the local finality update but still broadcast — peers with
+        # the pin will fold our attestation into their own
+        # denominator correctly.  Twin of
+        # ``messagechain/network/node.py:_attest_block_if_allowed``
+        # (audit r51 — r46 #1 chokepoint discipline lifted onto the
+        # production runtime).
         from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
-        validator_stake = self.blockchain.supply.get_staked(self.wallet_id)
-        total_stake = sum(self.blockchain.supply.staked.values())
-        self.blockchain.finality.add_attestation(
-            att, validator_stake, total_stake,
-            public_keys=self.blockchain.public_keys,
-            min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
-        )
+        resolved = self.blockchain.resolve_pinned_attestation_stake(att)
+        if resolved is not None:
+            validator_stake, total_stake = resolved
+            self.blockchain.finality.add_attestation(
+                att, validator_stake, total_stake,
+                min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+            )
 
         msg = NetworkMessage(
             msg_type=MessageType.ANNOUNCE_ATTESTATION,
@@ -5367,29 +5380,47 @@ class Server(SharedRuntimeMixin):
             )
             return
 
-        # H6: Deduplicate — skip if already seen (prevents gossip amplification
-        # and redundant expensive signature verification)
+        # H6: Deduplicate — cheap membership check skips expensive
+        # signature verification for already-accepted entries.  The
+        # INSERT into ``_seen_attestations`` is deferred until AFTER
+        # verify succeeds (audit r50 #1) so a forged-sig attestation
+        # cannot poison the LRU and silently suppress the genuine
+        # attestation arriving later.
         att_key = (att.validator_id, att.block_number, att.block_hash)
         if not hasattr(self, '_seen_attestations'):
             self._seen_attestations: OrderedDict = OrderedDict()
         if att_key in self._seen_attestations:
             return
-        # LRU eviction instead of full wipe (M11 pattern)
+
+        # Verify the attesting validator is known
+        if att.validator_id not in self.blockchain.public_keys:
+            return
+
+        # Verify signature against the key active at signed-at height.
+        # Attestations are admissible only at parent+1 (validated by
+        # the in-block path), so the implicit signing height is
+        # ``att.block_number``.  Routing through
+        # ``Blockchain._verify_signer_at_height`` so a rotated
+        # validator's pre-rotation attestation does not silently
+        # verify-fail under the new key — audit r50 #2.  Lifted onto
+        # Server (production runtime) by audit r51.
+        if not self.blockchain._verify_signer_at_height(
+            att, att.validator_id, att.block_number, verify_attestation,
+        ):
+            self.ban_manager.record_offense(
+                peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
+            )
+            return
+
+        # Verify succeeded — mark the triple as seen.  LRU eviction
+        # done here (half-evict instead of full wipe to bound the
+        # replay window) so the cache only fills with attestations
+        # that actually passed verification (audit r50 #1).
         if len(self._seen_attestations) >= 50_000:
             # Evict oldest 25%
             for _ in range(12_500):
                 self._seen_attestations.popitem(last=False)
         self._seen_attestations[att_key] = True
-
-        if att.validator_id not in self.blockchain.public_keys:
-            return
-
-        pk = self.blockchain.public_keys[att.validator_id]
-        if not verify_attestation(att, pk):
-            self.ban_manager.record_offense(
-                peer.address, OFFENSE_INVALID_TX, "invalid_attestation_sig"
-            )
-            return
 
         # Equivocation watcher: feed the verified attestation in so a
         # prior conflicting attestation from the same validator at the
@@ -5423,12 +5454,30 @@ class Server(SharedRuntimeMixin):
             )
             return
 
-        validator_stake = self.blockchain.supply.get_staked(att.validator_id)
-        total_stake = sum(self.blockchain.supply.staked.values())
-        self.blockchain.finality.add_attestation(
-            att, validator_stake, total_stake,
-            public_keys=self.blockchain.public_keys,
-        )
+        # Record in finality tracker using the pinned-at-target-height
+        # stake snapshot — NOT live ``supply.staked``.  Same
+        # divergence trap as Node._handle_announce_attestation: live
+        # stake would let two honest peers reach different
+        # ``attested_stake`` totals on the same ``(validator_id,
+        # height, hash)`` key during stake-churn windows, producing
+        # divergent ``is_finalized()`` decisions and forking the
+        # chain on reorg-rejection.  Routes through the shared
+        # ``Blockchain.resolve_pinned_attestation_stake`` helper so
+        # the apply path, the gossip-ingress path, and the local-
+        # broadcast path all share one denominator source.  If no
+        # pin exists (target block not yet applied locally), skip
+        # the finality update but still relay — peers with the pin
+        # will fold this attestation into their denominator
+        # correctly.  Audit r51 — r46 #1 chokepoint discipline
+        # lifted onto the production runtime.
+        from messagechain.config import MIN_VALIDATORS_TO_EXIT_BOOTSTRAP
+        resolved = self.blockchain.resolve_pinned_attestation_stake(att)
+        if resolved is not None:
+            validator_stake, total_stake = resolved
+            self.blockchain.finality.add_attestation(
+                att, validator_stake, total_stake,
+                min_validator_count=MIN_VALIDATORS_TO_EXIT_BOOTSTRAP,
+            )
 
         logger.debug(f"Received attestation from {att.validator_id.hex()[:16]}")
 
@@ -5524,8 +5573,23 @@ class Server(SharedRuntimeMixin):
         if vote.signer_entity_id in self.blockchain.slashed_validators:
             return
 
-        pk = self.blockchain.public_keys[vote.signer_entity_id]
-        if not verify_finality_vote(vote, pk):
+        # Verify signature against the key active at signed-at height.
+        # ``KEY_ROTATION_COOLDOWN_BLOCKS=144`` is far below
+        # ``FINALITY_VOTE_MAX_AGE_BLOCKS=1000``, so an honest
+        # validator's pre-rotation votes remain in flight for up to
+        # 1000 blocks after they rotate.  Without the historical-key
+        # resolver they verify-fail under the new key, the relayer
+        # takes ``OFFENSE_INVALID_TX``, and honest peers ban each
+        # other over valid signed messages — the exact ban-cascade
+        # an attacker can weaponize by replaying a known rotator's
+        # prior gossip.  Twin of
+        # ``Node._handle_announce_finality_vote`` (audit r51 —
+        # r50 #2 chokepoint discipline lifted onto the production
+        # runtime).
+        if not self.blockchain._verify_signer_at_height(
+            vote, vote.signer_entity_id, vote.signed_at_height,
+            verify_finality_vote,
+        ):
             self.ban_manager.record_offense(
                 peer.address, OFFENSE_INVALID_TX, "invalid_finality_vote_sig",
             )
