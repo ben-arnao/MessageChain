@@ -4,6 +4,61 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.79.1] — 2026-05-12
+
+Patch release.  Fixes a long-standing fresh-wallet-first-sign
+admission bug surfaced during the Tier 72 mainnet demo: every
+brand-new entity submitting its first signed tx (message, transfer,
+stake, etc. — anything routed through ``Server._rpc_submit_*``)
+was rejected with "WOTS+ leaf already used by another pending tx",
+even when no tx with that signer existed in any pool.
+
+### Fixed
+
+  * **``Server._tx_signer_pubkey`` resolves the signer pubkey from
+    ``tx.sender_pubkey`` when the entity is not yet on chain.**
+    CLAUDE.md anchor: receive-to-exist + Tier 11 first-spend reveal.
+    A v3+ MessageTransaction (or v3+ TransferTransaction) carrying
+    a ``sender_pubkey`` field reveals its pubkey on apply; that
+    install is the WHOLE POINT of the first-spend reveal.
+
+    Pre-fix, ``_tx_signer_pubkey`` did
+    ``return self.blockchain.public_keys.get(eid)`` and stopped
+    there.  For a fresh entity, ``public_keys`` does not contain
+    ``eid`` yet (install happens on apply, not on admission), so
+    the lookup returned None.  ``_check_leaf_across_all_pools``
+    hits the "incoming_signer is None — fail closed" branch and
+    rejects every fresh-wallet first sign with
+    ``"WOTS+ leaf already used by another pending tx — leaf
+    reuse rejected"`` -- a maximally misleading error string for a
+    tx that has no existing leaf to collide with.
+
+    Bite: surfaced during the Tier 72 mainnet demo (1.78.0).  Two
+    /faucet-funded fresh wallets each tried to post their first
+    message; both failed admission with the leaf-reuse error, even
+    though neither had any prior tx on chain or in any pool.  The
+    /quickpost path (server-side wallet generation + single message
+    sign) sidesteps this because it doesn't go through the public
+    submit_transaction RPC -- which is why the bug hadn't been
+    flagged before; every fresh wallet to ever post a message on
+    mainnet went through /quickpost.
+
+    Fix: when ``public_keys.get(eid)`` returns None, fall back to
+    ``tx.sender_pubkey`` IFF it derives back to ``eid`` (matching
+    the admission-validation rule that determines whether the tx
+    will be admitted at all).  When neither chain registration nor
+    a derive-matching ``sender_pubkey`` resolves, return None as
+    before — caller still fails closed for truly-unresolvable
+    signer cases.
+
+    Non-consensus, non-fork.  Mempool-dedupe-layer only.  Regression
+    test (``tests/test_fresh_wallet_first_sign_admission.py``) pins
+    four properties: (a) resolves from ``sender_pubkey`` when
+    unregistered, (b) prefers ``public_keys`` when registered,
+    (c) returns None for v1 tx without ``sender_pubkey``, and
+    (d) rejects a spoofed ``sender_pubkey`` that does not derive
+    to the claimed ``entity_id``.
+
 ## [1.79.0] — 2026-05-12
 
 Audit r51 top-3 ships: one production-runtime security parity fix

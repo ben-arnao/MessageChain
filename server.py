@@ -2922,7 +2922,32 @@ class Server(SharedRuntimeMixin):
         ):
             eid = getattr(tx, attr, None)
             if eid is not None:
-                return self.blockchain.public_keys.get(eid)
+                registered = self.blockchain.public_keys.get(eid)
+                if registered is not None:
+                    return registered
+                # First-spend / first-message reveal: when the entity
+                # is not yet on chain (this tx is supposed to install
+                # the pubkey via the optional sender_pubkey field —
+                # Tier 11 for messages/transfers and the implicit
+                # equivalent for any v3+ tx), trust the tx's own
+                # sender_pubkey IFF it derives back to the claimed
+                # ``eid``.  Without this fallback the cross-pool dedupe
+                # check fails-closed on every fresh-wallet first sign,
+                # rejecting at admission with "WOTS+ leaf already used
+                # by another pending tx" -- which is wrong because
+                # there IS no pending tx; we just can't resolve the
+                # signer.  Mirrors the admission-validation path in
+                # ``Blockchain.validate_transaction`` /
+                # ``validate_transfer_transaction``, which accept a v3+
+                # tx whose ``sender_pubkey`` hashes to ``entity_id``.
+                sender_pubkey = getattr(tx, "sender_pubkey", b"") or b""
+                if len(sender_pubkey) == 32:
+                    from messagechain.identity.identity import (
+                        derive_entity_id,
+                    )
+                    if derive_entity_id(sender_pubkey) == eid:
+                        return bytes(sender_pubkey)
+                return None
         return None
 
     def _check_leaf_across_all_pools(
