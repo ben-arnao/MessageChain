@@ -4,6 +4,220 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.80.0] — 2026-05-12
+
+Audit r52 top-3 ships: one production-active permanence-anchor fix
+(soft, no fork), one structural security-pipeline fix that unifies
+the slashable-evidence injection surface (soft, no fork), and one
+consensus-visible economics retune that closes the proposer-share
+silent-round-to-zero defect class the Tier 73 CHANGELOG explicitly
+deferred (new Tier 74 hard fork, activation height 10500).
+
+### Fixed
+
+  * **``strip_tx_witness`` / ``attach_tx_witness`` preserve every
+    MessageTransaction field (audit r52 #1 -- long-term-design /
+    security / value-prop top-1).**  CLAUDE.md anchor at risk: the
+    headline Mission promise -- "your message can never be deleted."
+    Threatened at the storage layer for every Tier 5+ optional field.
+
+    Pre-fix the helpers in ``messagechain/core/witness.py`` rebuilt
+    the stripped tx by hand-listing fields, frozen at the pre-Tier-10
+    set (entity_id / message / timestamp / nonce / fee / signature /
+    version / compression_flag / tx_hash / witness_hash).  Every
+    later optional field was silently dropped on the floor:
+
+      - ``prev``           (v2  -- reply / threading pointer)
+      - ``sender_pubkey``  (v3  -- first-spend pubkey install)
+      - ``community_id``   (v5  -- Reddit-style topic handle)
+      - ``poll_options``   (v6  -- structured poll's option list)
+      - ``vote_target``    (v6  -- structured vote's (poll, index))
+
+    ``ChainDB.strip_finalized_witnesses`` calls
+    ``strip_block_witnesses`` -> ``strip_tx_witness`` and UPDATEs
+    ``blocks.data`` with ``stripped.to_bytes()`` in place.
+    ``WITNESS_AUTO_SEPARATION_HEIGHT=1704`` sits well under live
+    mainnet tip, so the sweep was actively running against every
+    block past the ``WITNESS_RETENTION_BLOCKS`` finality window,
+    silently erasing Tier 5+ fields from primary block storage.
+    Effects:
+
+      - Tier 72 polls past finality+200 lost their option list --
+        vote-tx admission failed at ``_poll_lookup`` because
+        option_count read back as None.
+      - Threads (``prev``) lost their parent pointer.
+      - Community-tagged messages lost their handle.
+      - First-send-pubkey-install path lost its ``sender_pubkey``
+        reveal.
+
+    The companion ``strip_block_witnesses`` ten lines below the
+    defective ``strip_tx_witness`` already uses
+    ``dataclasses.replace`` and its docstring explicitly says
+    *"listing slots one-by-one was the defect form"* --
+    ``strip_tx_witness`` itself was the named defect form on the
+    sibling function.
+
+    Abstraction fix: both ``strip_tx_witness`` and
+    ``attach_tx_witness`` now route through ``dataclasses.replace``,
+    mirroring ``strip_block_witnesses``.  Every future
+    MessageTransaction field auto-survives the round-trip by
+    construction -- adding a Tier-10 optional field cannot regress
+    the strip contract because there is no field list to forget to
+    update.  Six tests in
+    ``tests/test_audit_r52_strip_tx_witness_preserves_optional_fields.py``
+    lock the property per field plus an end-to-end on-disk
+    round-trip (``strip_block_witnesses -> to_bytes -> from_bytes``).
+    Soft fix: no consensus rule change, no wire-format change, no
+    fork.  Behavioural fix lands the moment a validator upgrades;
+    data previously corrupted on validators that have already run
+    the sweep needs separate inspection (the original signed bytes
+    remain in the ``block_witnesses`` side-table, so the canonical
+    content can be reconstructed from the witness blob's pre-strip
+    preimage if a node still holds it).  (2c24213)
+
+  * **Every signed evidence tx admitted via RPC routes through one
+    chokepoint that gossips (audit r52 #2 -- security top-1).**
+    CLAUDE.md adversary anchor at risk: validator collusion
+    (primary).  The chain's primary collusion-deterrence pipeline --
+    a user filing slashable evidence against a coercing validator --
+    had a single-point-of-failure injection edge on the RPC-target
+    validator.
+
+    Pre-fix ``_rpc_submit_censorship_evidence`` (server.py:3393)
+    admitted to the mempool's censorship-evidence pool but NEVER
+    called ``_schedule_pending_tx_gossip``.  Every other non-message
+    tx pool admit (stake / unstake / authority / governance) DID
+    call gossip, so this was a verify-by-inspection regression
+    invisible at unit-test scope.  The handler's docstring even
+    claimed *"gossiped peers see the same tx via the P2P pending-
+    tx relay"* -- the claim was false.  Plus the matching gap on
+    the receiver side: ``_handle_announce_pending_tx`` had no
+    ``"censorship_evidence"`` kind branch, so even if some other
+    caller had been routing CE through gossip the peers would
+    silently drop the announce.
+
+    Abstraction-over-symptom fix.  Extract
+    ``_rpc_submit_evidence`` as the unified chokepoint for every
+    signed evidence tx admitted via RPC::
+
+        deserialize -> validate -> cross-pool leaf check
+        -> mempool admit -> _schedule_pending_tx_gossip
+
+    Parameterised over (kind, tx_cls, validate_fn, admit_fn,
+    pool_full_error, success_result_extra) so any future evidence
+    kind slots in via one row in a per-kind thin wrapper -- the
+    gossip step is structurally guaranteed.
+    ``_rpc_submit_censorship_evidence`` becomes a thin wrapper
+    around the chokepoint, with the CE-specific validator, mempool
+    admit (with submitter pubkey lookup wired), and result fields
+    supplied via callables.  The receiver side gains a matching
+    ``"censorship_evidence"`` branch in
+    ``_handle_announce_pending_tx`` that validates via the same
+    ``validate_censorship_evidence_tx`` gate and admits to the CE
+    pool with the same submitter pubkey lookup -- mirroring the
+    apply path so peers reach the same admission verdict as the
+    originator.  Soft fix: no consensus rule change, no wire-format
+    change, no fork.
+
+    Scope note (deferred follow-up): the original audit-r52 finding
+    also flagged ``BogusRejectionEvidenceTx`` and
+    ``NonResponseEvidenceTx`` having NO RPC submission path.
+    Closing that completely requires adding mempool pools for both
+    kinds, propose_block drain wiring, new RPC method names +
+    dispatcher rows, and CLI command implementations (the existing
+    CLI flags carry an explicit ``(NOT YET WIRED)`` placeholder).
+    That's a multi-component feature build, not a defect fix --
+    left to a follow-up audit round.  This commit lands the
+    chokepoint shape they will plug into when their mempool
+    plumbing arrives: a new wrapper passes a different
+    (kind, tx_cls, validate_fn, admit_fn) tuple and inherits the
+    gossip discipline by construction.  (9d678fa)
+
+### Changed (Tier 74, consensus-breaking, height-gated)
+
+  * **Proposer-share / per-block-cap min-unit clamp + shared
+    ``_split_bps`` helper (audit r52 #3 -- economics top-1).**
+    CLAUDE.md pillars at risk: "Perpetual security via fees, not
+    issuance" + "Stable active supply" + "Mathematical
+    decentralization over time".  The dormancy-controller (Tier 47+)
+    is *designed* to emit small per-block issuance when
+    ``active_supply`` is close to ``TARGET`` -- so the small-reward
+    regime is the steady state, not a corner case.  In that regime
+    the proposer + per-block-cap shares were silently rounding to
+    zero.
+
+    Pre-fix sites in ``SupplyTracker.mint_block_reward``::
+
+        proposer_share = reward * PROPOSER_REWARD_NUMERATOR
+                       // PROPOSER_REWARD_DENOMINATOR    # = reward * 1 // 4
+        # And, post-PROPOSER_CAP_HALVING_HEIGHT:
+        effective_cap  = reward * PROPOSER_REWARD_NUMERATOR
+                       // PROPOSER_REWARD_DENOMINATOR
+
+    At ``reward in {1, 2, 3}`` both silently round to 0 and the
+    entire issuance routes to the attester pool / per-block burn;
+    the per-block cap also silently turns OFF in the regime it's
+    anchored to bound (mega-staker capture of attester reward).
+    This was the exact "sibling defect-shape DEFERRED" the audit
+    r51 #3 (Tier 73) CHANGELOG named:
+
+        "the wider abstraction calls for a shared ``_split_bps(
+         amount, bps, denom=10_000, min_unit=1)`` helper to catch
+         every future ``bps // 10_000`` site that could round to
+         zero under a realistic minimum."
+
+    Two changes:
+
+      1. New module-level helper
+         ``messagechain.economics.inflation._split_bps``::
+
+             def _split_bps(amount, num, den, *, min_unit=1, gate=False) -> int
+
+         Pure function.  Pre-fork callers (``gate=False``) get
+         byte-identical floor-divide.  Post-fork callers
+         (``gate=True``) clamp to ``min_unit`` only when a positive
+         ``amount`` would otherwise round to zero, and NEVER exceed
+         the input amount -- supply conservation cannot be silently
+         manufactured.
+
+      2. New activation height
+         ``PROPOSER_SHARE_MIN_UNIT_HEIGHT = 10500`` (Tier 74),
+         gating two consensus-visible call sites in
+         ``mint_block_reward``:
+
+           - ``effective_cap`` (post-``PROPOSER_CAP_HALVING_HEIGHT``
+             branch)
+           - ``proposer_share``
+
+         Both refactored to call ``_split_bps`` with the matching
+         gate.  Pre-fork the gate evaluates False at every height
+         and the floor-divide matches legacy byte-for-byte --
+         historical block replay preserved.  Post-fork both clamp
+         to 1 token at ``reward in {1, 2, 3}``, so a small-issuance
+         block deterministically pays the proposer 1 and the
+         attester pool ``reward-1``.
+
+    Tier 73's attester-fee site (``SupplyTracker.pay_fee_with_burn``)
+    is refactored to call ``_split_bps`` too.  Byte-identical on
+    both sides of the Tier 73 gate -- the refactor proves
+    ``_split_bps`` generalizes the existing site rather than
+    diverging from it.  Adding a new ``bps // den`` caller in the
+    future cannot reintroduce the silent-round-to-zero defect
+    without bypassing the helper.
+
+    Activation height 10500 sits 2000 blocks above Tier 73 (8500) --
+    the same ~13.9-day cohort spacing the Tier 70 -> 71 -> 73
+    runway used.  Consecutive validator-economics retunes get their
+    own cohort so operators absorb each in its own upgrade cycle.
+    Eleven tests in ``tests/test_audit_r52_split_bps_helper.py``
+    lock the property surface: helper pure-math, mint_block_reward
+    legacy vs post-Tier-74 behavior at every (reward in {1..16})
+    combination, supply conservation across the clamp, Tier 73
+    attester-share preservation under the refactor, and the
+    height-ordering assertion between Tier 73 and Tier 74.  Pure
+    consensus-rule swap; no new wire format, no new tx kinds, no
+    state-tree changes.  (7184f23)
+
 ## [1.79.2] — 2026-05-12
 
 Patch release.  Fixes a long-standing gossip-receiver mempool
