@@ -403,6 +403,22 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
         # default.
         ctx = self.server._feed_context
         split = urlsplit(self.path)
+        # Audit r49 #2: Content-Type allowlist gate.  ``/faucet`` and
+        # ``/quickpost`` both expect a JSON body and the response
+        # carries ``Access-Control-Allow-Origin: *``.  Without this
+        # gate, a "simple CORS" POST with ``Content-Type: text/plain``
+        # is dispatched without a browser preflight -- any cross-
+        # origin web page a wallet user visits can drive either
+        # endpoint and siphon the operator's faucet budget through
+        # the visitor's IP / per-/24 cooldown.  The gate sits BEFORE
+        # the rate-limit check so a malformed cross-origin attempt
+        # does not even count against the visitor's bucket.
+        if split.path in ("/faucet", "/quickpost"):
+            if not self._content_type_is_json():
+                self._send_text(
+                    415, "Unsupported Media Type: application/json required",
+                )
+                return
         if split.path == "/faucet" and ctx.faucet is not None:
             if not ctx.rate_limit_check(self._client_ip()):
                 self._send_text(429, "Too Many Requests")
@@ -416,6 +432,23 @@ class _FeedHandler(http.server.BaseHTTPRequestHandler):
             self._serve_quickpost(ctx)
             return
         self._send_text(405, "Method Not Allowed")
+
+    def _content_type_is_json(self) -> bool:
+        """True iff the request's Content-Type is ``application/json``.
+
+        Tolerates ``application/json; charset=utf-8`` and similar
+        parameterised forms by checking the media type prefix only.
+        Browsers send ``application/json`` for ``fetch(..., {body:
+        JSON.stringify(...)})`` only when the caller explicitly sets
+        the header -- which triggers a CORS preflight whose response
+        does not advertise POST as an allowed method, so the browser
+        blocks.  The remaining attack surface is non-browser CSRF
+        (curl, malicious CLIs) which is out of scope for a per-IP-
+        rate-limited public faucet.
+        """
+        ct = self.headers.get("Content-Type", "") or ""
+        media = ct.split(";", 1)[0].strip().lower()
+        return media == "application/json"
 
     def _serve_faucet(self, ctx):
         """POST /faucet  body: {"address": "<entity_id_hex>"}.
