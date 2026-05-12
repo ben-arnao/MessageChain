@@ -9378,18 +9378,46 @@ class Blockchain:
         """
         stakes = dict(self.supply.staked)
         self._stake_snapshots[block_number] = stakes
+        # Prune both the in-memory map AND the chaindb mirror at the
+        # same ``FINALITY_VOTE_MAX_AGE_BLOCKS`` cutoff.  Pre-audit-r48
+        # only the chaindb mirror was pruned; the in-memory dict was
+        # append-only forever, on the rationale that "callers may want
+        # older pins for analytics."  Analytics is not a consensus need
+        # and the unbounded growth produced multi-GB resident state on
+        # long-running honest validators (~2.6M block-entries/year *
+        # ~50 validators * ~40 B per row), eroding both the honest-
+        # operator-insurance anchor (OOM-driven restart churn risks
+        # slashable false-positives) and the hobbyist-full-node
+        # accessibility anchor.
+        #
+        # No consensus consumer reads beyond the window:
+        #   * Attestations target the immediate parent (1 block back).
+        #   * Fork-choice walks <= MAX_REORG_DEPTH=100 blocks.
+        #   * FinalityVotes older than FINALITY_VOTE_MAX_AGE_BLOCKS
+        #     are rejected at validation before the consumer sees them.
+        #   * ``_pinned_stake_at`` already documents a live-state
+        #     fallback for snapshot-pruned-era callers.
+        # The chaindb mirror was already pruned at this cutoff, so a
+        # cold-restarted node only rehydrates the trailing window
+        # regardless -- the in-memory tail was just inconsistent with
+        # the disk-mirror contract.
+        from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
+        cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
+        if cutoff > 0:
+            self._prune_stake_snapshots_before(cutoff)
         if self.db is not None and hasattr(self.db, "add_stake_snapshot"):
             self.db.add_stake_snapshot(block_number, stakes)
-            # Prune persisted rows older than the oldest block any
-            # finality vote could legally target.  In-memory map
-            # stays untouched -- callers that still hold a
-            # Blockchain instance across the activation window may
-            # want the older pins for analytics; the consensus
-            # consumers never look that far back.
-            from messagechain.config import FINALITY_VOTE_MAX_AGE_BLOCKS
-            cutoff = block_number - FINALITY_VOTE_MAX_AGE_BLOCKS
             if cutoff > 0:
                 self.db.prune_stake_snapshots_before(cutoff)
+
+    def _prune_stake_snapshots_before(self, height_cutoff: int) -> None:
+        """Drop in-memory ``_stake_snapshots`` entries with height <=
+        ``height_cutoff``.  Mirror of ``chaindb.prune_stake_snapshots_
+        before``; single helper so both prune surfaces stay aligned.
+        """
+        stale = [h for h in self._stake_snapshots if h <= height_cutoff]
+        for h in stale:
+            del self._stake_snapshots[h]
 
     def _validate_custody_proofs(
         self, block: Block, parent: Block,
