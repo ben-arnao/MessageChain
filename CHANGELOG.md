@@ -4,6 +4,66 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.77.0] — 2026-05-12
+
+Minor release.  Adds **Tier 72: structured polls + structured votes**
+as a new message-tx capability (TX_VERSION_POLL = v6, activation at
+height ``POLL_HEIGHT = 8500``).  New CLAUDE.md anchor; no other
+behavior change.
+
+### Added
+
+  * **Tier 72 — Structured polls + structured votes.**  A message tx
+    may now carry EITHER a ``poll_options`` field (poll-creating mode:
+    1..4 short UTF-8 option strings, each ≤32 bytes, unique, NFC,
+    same charset whitelist as message body) OR a ``vote_target``
+    field (vote-casting mode: 32-byte ``poll_txid`` + 1-byte
+    ``option_index``).  Mutually exclusive at the wire level.  Counts
+    toward stored bytes for the per-stored-byte fee floor and the
+    proposer's fee-per-byte ranking.  Excluded from
+    ``MAX_MESSAGE_CHARS`` -- poll options are structural metadata,
+    not the user's speech, same treatment as ``community_id``.
+
+    Protocol-level enforcement of vote→poll resolution: a vote
+    admits only when its ``poll_txid`` resolves to a confirmed
+    poll-creating tx in a strictly earlier block AND its
+    ``option_index`` is in ``[0, len(target_poll.options))``.  No
+    free-text vote labels, no out-of-range indices, no votes on
+    non-poll messages, no same-block vote.  Resolution chains
+    ``ChainDB.get_tx_location`` (O(1)) → ``get_block_by_number`` →
+    tx at index → ``poll_options`` -- mirrors the Tier 27
+    ``get_message_author`` pattern.
+
+    **No protocol-level vote close** -- polls are open forever in
+    line with the permanence anchor.  **No protocol-level
+    one-vote-per-entity dedup** -- multiple votes from the same
+    entity are admissible at consensus; indexers compute
+    "current effective vote" per ``(voter, poll)`` as
+    last-vote-wins, and older votes remain on chain forever.
+
+    Wire format: v6 inherits the v5 trailer layout (length-prefixed
+    signable_data + always-emitted prev / sender_pubkey /
+    community_id presence-flag blocks) and appends two new
+    presence-flag blocks: ``poll_options`` (1B flag; when set, 1B
+    count + per-option [1B length + N UTF-8 bytes]) and
+    ``vote_target`` (1B flag; when set, 32B poll_txid + 1B option
+    index).  Pre-activation v6 admission is rejected; v1-v5 MUST
+    NOT carry either field (rejected at verify with a clear
+    structural error rather than as a generic signature failure).
+
+    New CLAUDE.md anchor: **"Polls are structured, votes are
+    minimal-payload references, neither closes."**  Reverting to a
+    free-text "labels are strings" tally model, opting into
+    protocol-level vote dedup, adding ranked-choice / weighted /
+    secret-ballot machinery, or enforcing a close-height is out of
+    scope without a new anchor justifying the conflict.
+
+    New config constants: ``POLL_HEIGHT = 8500``,
+    ``MAX_POLL_OPTIONS = 4``, ``MAX_POLL_OPTION_BYTES = 32``.
+    Mainnet tip at fork-design time is ~2400, so ~42 days of runway
+    above tip plus the standard 2000-block cohort buffer above the
+    previous tier.
+
 ## [1.76.2] — 2026-05-11
 
 Patch release.  Audit r49 top-3 ships: three independent network /

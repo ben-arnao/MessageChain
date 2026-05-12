@@ -7157,6 +7157,102 @@ assert (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 72 — Structured polls + structured votes
+# ─────────────────────────────────────────────────────────────────────
+# MessageChain's anti-spam-via-fees lever is enough to filter raw bulk
+# text, but threaded sentiment ("which of these options do you prefer")
+# has only had the free-text-reply escape hatch so far -- and free-text
+# replies are ambiguous (typo / synonym / sarcasm / language drift) and
+# uncountable without app-layer NLP that every indexer has to ship
+# separately.  Tier 72 promotes polls from an indexer convention to a
+# protocol primitive so the tally is unambiguous, computable from the
+# chain alone, and resistant to "we changed what the options meant
+# later" front-end revisionism.
+#
+# Wire shape (anchored, post-activation):
+#   * A poll-creating message tx carries an optional ``poll_options``
+#     field: 1..MAX_POLL_OPTIONS short UTF-8 strings.  The message body
+#     is the question; the options are the structured answers.  Options
+#     follow the same NFC + L/M/N/P/Zs whitelist that Tier 12 enforces
+#     on message text (homoglyph discipline) and each option is
+#     constrained to MAX_POLL_OPTION_BYTES UTF-8 bytes.  Options must
+#     be pairwise distinct within a single poll -- "Yes / No / Yes" is
+#     a structural error, not a vote-distribution accident.
+#   * A vote-casting message tx carries an optional ``vote_target``
+#     field: (poll_txid, option_index).  Only the index (0-based) is
+#     stored -- the option text is recovered by mapping the index back
+#     to the referenced poll, exactly like Reddit / Twitter / Strawpoll.
+#     This is what makes votes "minimal payload": no per-vote text bytes,
+#     no per-vote homoglyph surface, just a 33-byte reference.
+#   * A single tx is EITHER a poll OR a vote, never both.  Mutual
+#     exclusivity at the wire level keeps the validation rules sharp
+#     and the indexer aggregation trivial.
+#
+# Protocol-level enforcement (this is what makes votes structured and
+# not just free text):
+#   * The vote's ``poll_txid`` must resolve to a tx in a strictly
+#     earlier block whose ``poll_options`` is set.  A vote that points
+#     at a non-poll message, a poll in the future, or nothing at all
+#     is rejected at admission.
+#   * The vote's ``option_index`` must be in ``[0, len(options))`` of
+#     the resolved poll.  An index out of range is rejected.
+#   * Free-text vote labels are NOT admissible -- the structure IS the
+#     vote.  Indexers compute "votes per option" by scanning vote txs
+#     pointing at a poll and reading the index field.
+#
+# Dedup model (one-vote-per-entity): NOT enforced on chain.  Every vote
+# tx that satisfies the above is admissible, and the permanence anchor
+# forbids deleting a prior vote.  Indexers resolve "current effective
+# vote" per (voter, poll) as last-vote-wins -- the older votes stay on
+# chain forever (which is desirable: an entity changing their mind is
+# itself signal).  This keeps consensus stateless w.r.t. who has voted
+# on what; the only state the protocol cares about is the poll's option
+# set, which is immutable in the originating tx.
+#
+# No close condition: polls are open forever.  An optional close-height
+# was considered and rejected -- it adds wire-format surface for a
+# property the indexer can already express ("ignore votes after height
+# X") without baking it into consensus.  If a later proposal wants
+# enforced close, it can ride a future tier.
+#
+# Storage / fee: option bytes and the vote_target block are counted
+# toward stored bytes for the per-stored-byte fee floor and the
+# proposer's fee-per-byte ranking.  Excluded from MAX_MESSAGE_CHARS --
+# poll options are structural metadata, not the user's speech (same
+# treatment as community_id).
+#
+# Activation height 8500 sits 2000 blocks above Tier 71 (6500) --
+# matching the Tier 70 → 71 spacing pattern.  ~42 days of runway above
+# mainnet tip (block ~2400 at fork-design time), well past the two-
+# validator upgrade window.
+POLL_HEIGHT = 8500  # Tier 72
+MAX_POLL_OPTIONS = 4
+MAX_POLL_OPTION_BYTES = 32
+
+assert POLL_HEIGHT > EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT, (
+    "POLL_HEIGHT (Tier 72) must strictly follow "
+    "EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT (Tier 71) -- the new tx-"
+    "logic version (v6) for polls/votes inherits the v5 trailer "
+    "layout, and operators upgrade through Tier 71 before encountering "
+    "v6 wire bytes in admitted blocks"
+)
+assert MAX_POLL_OPTIONS >= 2, (
+    "MAX_POLL_OPTIONS must be at least 2 -- a single-option poll has "
+    "no choice to make and reduces to a regular message"
+)
+assert MAX_POLL_OPTIONS <= 4, (
+    "MAX_POLL_OPTIONS must stay at 4 -- the design anchor caps options "
+    "at four to keep the choice set legible (single-screen-readable on "
+    "any client) and the wire footprint tight"
+)
+assert 1 <= MAX_POLL_OPTION_BYTES <= 64, (
+    "MAX_POLL_OPTION_BYTES must be in [1, 64] -- short labels keep "
+    "the choice set legible and the per-tx stored-byte cost bounded "
+    "(4 options * 64B = 256B worst case plus 4 length bytes)"
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

@@ -32,6 +32,7 @@ from messagechain.config import (
     MESSAGE_TX_LENGTH_PREFIX_HEIGHT,
     MARKET_FEE_FLOOR, MARKET_FEE_FLOOR_HEIGHT,
     COMMUNITY_ID_HEIGHT, MAX_COMMUNITY_ID_LEN,
+    POLL_HEIGHT, MAX_POLL_OPTIONS, MAX_POLL_OPTION_BYTES,
 )
 
 # Tx-logic version that enables the optional `prev` pointer (Tier 10).
@@ -83,6 +84,22 @@ TX_VERSION_COMMUNITY_ID = 5
 # estimates; actual cost is computed dynamically per-tx since
 # handles vary in length.
 MAX_COMMUNITY_ID_STORED_BYTES = 1 + 1 + MAX_COMMUNITY_ID_LEN
+# Tx-logic version that enables structured polls + structured votes
+# (Tier 72 — POLL_HEIGHT).  v6 inherits the v5 trailer layout in full
+# (length-prefixed signable_data + always-emitted prev / sender_pubkey
+# / community_id presence-flag blocks) and appends two new
+# presence-flag blocks:
+#   * poll_options — 1B flag; when set, 1B count (1..MAX_POLL_OPTIONS)
+#     followed by per-option [1B length + N UTF-8 bytes].
+#   * vote_target  — 1B flag; when set, 32B poll_txid + 1B option_index.
+# A v6 tx may set EITHER poll_options OR vote_target (or neither), but
+# never both -- mutex enforced at verify time.  v1-v5 MUST NOT carry
+# either field.  See messagechain.config.POLL_HEIGHT for the full
+# motivation block.
+TX_VERSION_POLL = 6
+# Stored-byte cost of the vote_target block when set: 1B presence
+# flag + 32B poll_txid + 1B option_index.  When absent: 1B flag only.
+VOTE_TARGET_STORED_BYTES = 1 + 32 + 1
 # Allowed handle character set (interior bytes): lowercase letters,
 # digits, hyphen, underscore.  Frozenset for O(1) membership.
 _COMMUNITY_ID_ALLOWED = frozenset(
@@ -151,6 +168,125 @@ def _validate_community_id(handle: str) -> tuple[bool, str]:
                 f"community_id byte {bytes([b])!r} not in [a-z0-9_-]"
             )
     return True, "OK"
+
+
+def _poll_options_stored_bytes(
+    poll_options: "tuple[str, ...] | None", version: int
+) -> int:
+    """Stored-byte cost of the poll_options block at this version.
+
+    v1-v5: 0 (no block emitted).
+    v6+ with poll_options=None: 1 (presence flag only).
+    v6+ with poll_options set: 1 (flag) + 1 (count) + per-option
+        [1 (length) + N (UTF-8 bytes)].
+    """
+    if version < TX_VERSION_POLL:
+        return 0
+    if poll_options is None:
+        return 1
+    n = 1 + 1  # presence flag + count byte
+    for opt in poll_options:
+        n += 1 + len(opt.encode("utf-8"))
+    return n
+
+
+def _vote_target_stored_bytes(
+    vote_target: "tuple[bytes, int] | None", version: int
+) -> int:
+    """Stored-byte cost of the vote_target block at this version.
+
+    v1-v5: 0 (no block emitted).
+    v6+ with vote_target=None: 1 (presence flag only).
+    v6+ with vote_target set: 1 + 32 + 1 = VOTE_TARGET_STORED_BYTES.
+    """
+    if version < TX_VERSION_POLL:
+        return 0
+    if vote_target is None:
+        return 1
+    return VOTE_TARGET_STORED_BYTES
+
+
+def _validate_poll_options(
+    options: "tuple[str, ...]",
+) -> tuple[bool, str]:
+    """Structural validity of a poll's option set.
+
+    Anchored properties (see config.POLL_HEIGHT comment block):
+        * 1..MAX_POLL_OPTIONS options.  (A single-option poll has no
+          choice to make; >MAX_POLL_OPTIONS would push the choice set
+          beyond what we anchor as a legible short-form poll.)
+        * Each option is a non-empty NFC UTF-8 string passing the
+          Tier 12 L/M/N/P/Zs whitelist -- same rule as message text.
+          (Reusing the message validator means the homoglyph and
+          bidi-override discipline already in place for message
+          content carries through to poll options for free.)
+        * Each option fits in MAX_POLL_OPTION_BYTES UTF-8 bytes.
+        * Options are pairwise distinct -- duplicate options are a
+          structural error, not an accident of indexer arithmetic.
+    """
+    if not isinstance(options, tuple):
+        return False, "poll_options must be a tuple of str"
+    n = len(options)
+    if n < 1:
+        return False, "poll_options must have at least 1 option"
+    if n > MAX_POLL_OPTIONS:
+        return False, (
+            f"poll_options exceeds MAX_POLL_OPTIONS={MAX_POLL_OPTIONS} "
+            f"(got {n})"
+        )
+    seen: set[str] = set()
+    for i, opt in enumerate(options):
+        if not isinstance(opt, str):
+            return False, f"poll_options[{i}] must be a str"
+        if opt == "":
+            return False, f"poll_options[{i}] must be non-empty"
+        # NFC + Tier 12 whitelist: same rules as message text body.
+        ok, reason = _validate_message_intl(opt)
+        if not ok:
+            return False, f"poll_options[{i}]: {reason}"
+        if len(opt.encode("utf-8")) > MAX_POLL_OPTION_BYTES:
+            return False, (
+                f"poll_options[{i}] exceeds "
+                f"MAX_POLL_OPTION_BYTES={MAX_POLL_OPTION_BYTES} "
+                f"({len(opt.encode('utf-8'))} bytes)"
+            )
+        if opt in seen:
+            return False, (
+                f"poll_options[{i}] is a duplicate of an earlier option "
+                f"({opt!r})"
+            )
+        seen.add(opt)
+    return True, "OK"
+
+
+def _validate_vote_target(
+    vote_target: "tuple[bytes, int]",
+) -> tuple[bool, str]:
+    """Structural validity of a vote_target tuple, IGNORING chain context.
+
+    Checks:
+        * Two-element tuple of (poll_txid: bytes32, option_index: int).
+        * poll_txid is exactly 32 bytes.
+        * option_index is in [0, MAX_POLL_OPTIONS).  The actual upper
+          bound depends on the referenced poll's option count, which is
+          a chain-level check delegated to poll_lookup -- here we only
+          reject indices that cannot be in range for any poll.
+    """
+    if not isinstance(vote_target, tuple) or len(vote_target) != 2:
+        return False, "vote_target must be a 2-tuple (poll_txid, option_index)"
+    poll_txid, option_index = vote_target
+    if not isinstance(poll_txid, (bytes, bytearray)) or len(poll_txid) != 32:
+        return False, "vote_target poll_txid must be 32 bytes"
+    if not isinstance(option_index, int):
+        return False, "vote_target option_index must be an int"
+    if option_index < 0 or option_index >= MAX_POLL_OPTIONS:
+        return False, (
+            f"vote_target option_index {option_index} not in "
+            f"[0, {MAX_POLL_OPTIONS})"
+        )
+    return True, "OK"
+
+
 from messagechain.core.compression import (
     encode_payload, decode_payload, RAW_FLAG, COMPRESSED_FLAG,
 )
@@ -199,6 +335,23 @@ class MessageTransaction:
     # on-chain registry, no claim, no entity owns a community —
     # purely a category tag whose meaning lives at L2/app layer.
     community_id: str | None = None
+    # `poll_options` (optional, v6+): tuple of 1..MAX_POLL_OPTIONS short
+    # UTF-8 strings.  Only meaningful at version >= TX_VERSION_POLL.
+    # When set, this tx defines a structured poll whose question is
+    # the message body and whose answer set is this tuple.  Mutually
+    # exclusive with vote_target (a single tx is either a poll OR a
+    # vote, never both).  See _validate_poll_options for the per-
+    # option charset / length / uniqueness rules.
+    poll_options: "tuple[str, ...] | None" = None
+    # `vote_target` (optional, v6+): (poll_txid: bytes32, option_index:
+    # int) tuple.  Only meaningful at version >= TX_VERSION_POLL.  When
+    # set, this tx is a structured vote against the referenced poll.
+    # poll_txid must resolve to a confirmed tx in a strictly earlier
+    # block whose poll_options is set; option_index must be in
+    # [0, len(those options)).  Both checks are delegated to
+    # verify_transaction's poll_lookup callback.  Mutually exclusive
+    # with poll_options.
+    vote_target: "tuple[bytes, int] | None" = None
     tx_hash: bytes = b""
     witness_hash: bytes = b""  # hash covering signature (for relay-level dedup)
 
@@ -298,6 +451,38 @@ class MessageTransaction:
                     raise ValueError(reason)
                 cid_bytes = self.community_id.encode("ascii")
                 base += b"\x01" + struct.pack(">B", len(cid_bytes)) + cid_bytes
+        # Version 6 (Tier 72) appends two new presence-flag blocks:
+        # poll_options and vote_target.  Both are mutually exclusive at
+        # the semantic level (a tx is either a poll or a vote, never
+        # both), enforced in verify_transaction -- but the wire layout
+        # still emits both presence flags so the parse path is regular
+        # (no conditional branching on which one is set).  Including
+        # each flag and its payload in the signed payload prevents an
+        # attacker from grafting poll_options or vote_target onto a
+        # legitimately-signed v6 tx -- same rationale as prev /
+        # sender_pubkey / community_id.
+        if self.version >= TX_VERSION_POLL:
+            if self.poll_options is None:
+                base += b"\x00"
+            else:
+                ok, reason = _validate_poll_options(self.poll_options)
+                if not ok:
+                    raise ValueError(reason)
+                base += b"\x01" + struct.pack(">B", len(self.poll_options))
+                for opt in self.poll_options:
+                    opt_bytes = opt.encode("utf-8")
+                    base += struct.pack(">B", len(opt_bytes)) + opt_bytes
+            if self.vote_target is None:
+                base += b"\x00"
+            else:
+                ok, reason = _validate_vote_target(self.vote_target)
+                if not ok:
+                    raise ValueError(reason)
+                poll_txid, option_index = self.vote_target
+                base += (
+                    b"\x01" + bytes(poll_txid)
+                    + struct.pack(">B", option_index)
+                )
         return base
 
     @property
@@ -395,6 +580,24 @@ class MessageTransaction:
             and self.community_id is not None
         ):
             d["community_id"] = self.community_id
+        # Same omit-when-empty rule for poll_options / vote_target.
+        # poll_options serializes as a list of option strings (canonical
+        # human-readable form); vote_target as {poll_txid: hex,
+        # option_index: int}.
+        if (
+            self.version >= TX_VERSION_POLL
+            and self.poll_options is not None
+        ):
+            d["poll_options"] = list(self.poll_options)
+        if (
+            self.version >= TX_VERSION_POLL
+            and self.vote_target is not None
+        ):
+            poll_txid, option_index = self.vote_target
+            d["vote_target"] = {
+                "poll_txid": poll_txid.hex(),
+                "option_index": option_index,
+            }
         return d
 
     def to_bytes(self, state=None) -> bytes:
@@ -479,6 +682,28 @@ class MessageTransaction:
                 cid_bytes = self.community_id.encode("ascii")
                 parts.append(
                     b"\x01" + struct.pack(">B", len(cid_bytes)) + cid_bytes
+                )
+        # Version 6 wire form: poll_options + vote_target presence-flag
+        # blocks, both always emitted (presence-only when absent),
+        # immediately after community_id and before the signature.
+        # Layout matches _signable_data so wire bytes are byte-for-byte
+        # identical to what was signed.
+        if self.version >= TX_VERSION_POLL:
+            if self.poll_options is None:
+                parts.append(b"\x00")
+            else:
+                opt_block = b"\x01" + struct.pack(">B", len(self.poll_options))
+                for opt in self.poll_options:
+                    opt_bytes = opt.encode("utf-8")
+                    opt_block += struct.pack(">B", len(opt_bytes)) + opt_bytes
+                parts.append(opt_block)
+            if self.vote_target is None:
+                parts.append(b"\x00")
+            else:
+                poll_txid, option_index = self.vote_target
+                parts.append(
+                    b"\x01" + bytes(poll_txid)
+                    + struct.pack(">B", option_index)
                 )
         parts.extend([
             struct.pack(">I", len(sig_blob)),
@@ -608,6 +833,94 @@ class MessageTransaction:
                     f"MessageTransaction community_id flag must be "
                     f"0 or 1, got {cid_flag}"
                 )
+        # Version 6 wire form: poll_options presence-flag-then-count-
+        # then-per-option-[length+bytes] followed by vote_target
+        # presence-flag-then-poll_txid-then-option_index.  v1-v5 blobs
+        # skip entirely.  Parse-time rejects malformed structure
+        # (bad flag, truncated count, length out of range, truncated
+        # option bytes, non-UTF-8, etc); semantic validation (charset,
+        # uniqueness, vote-vs-poll mutex, option_index range) is
+        # delegated to verify_transaction.
+        poll_options: "tuple[str, ...] | None" = None
+        vote_target: "tuple[bytes, int] | None" = None
+        if version >= TX_VERSION_POLL:
+            if offset + 1 > len(data):
+                raise ValueError(
+                    "MessageTransaction poll_options flag truncated"
+                )
+            po_flag = data[offset]; offset += 1
+            if po_flag == 0x00:
+                poll_options = None
+            elif po_flag == 0x01:
+                if offset + 1 > len(data):
+                    raise ValueError(
+                        "MessageTransaction poll_options count truncated"
+                    )
+                opt_count = data[offset]; offset += 1
+                if opt_count < 1 or opt_count > MAX_POLL_OPTIONS:
+                    raise ValueError(
+                        f"MessageTransaction poll_options count "
+                        f"{opt_count} out of [1, {MAX_POLL_OPTIONS}]"
+                    )
+                opts: list[str] = []
+                for i in range(opt_count):
+                    if offset + 1 > len(data):
+                        raise ValueError(
+                            f"MessageTransaction poll_options[{i}] "
+                            f"length byte truncated"
+                        )
+                    opt_len = data[offset]; offset += 1
+                    if opt_len < 1 or opt_len > MAX_POLL_OPTION_BYTES:
+                        raise ValueError(
+                            f"MessageTransaction poll_options[{i}] "
+                            f"length {opt_len} out of "
+                            f"[1, {MAX_POLL_OPTION_BYTES}]"
+                        )
+                    if offset + opt_len > len(data):
+                        raise ValueError(
+                            f"MessageTransaction poll_options[{i}] "
+                            f"bytes truncated"
+                        )
+                    opt_bytes = bytes(data[offset:offset + opt_len])
+                    offset += opt_len
+                    try:
+                        opts.append(opt_bytes.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        raise ValueError(
+                            f"MessageTransaction poll_options[{i}] "
+                            f"bytes are not valid UTF-8"
+                        )
+                poll_options = tuple(opts)
+            else:
+                raise ValueError(
+                    f"MessageTransaction poll_options flag must be "
+                    f"0 or 1, got {po_flag}"
+                )
+            if offset + 1 > len(data):
+                raise ValueError(
+                    "MessageTransaction vote_target flag truncated"
+                )
+            vt_flag = data[offset]; offset += 1
+            if vt_flag == 0x00:
+                vote_target = None
+            elif vt_flag == 0x01:
+                if offset + 32 + 1 > len(data):
+                    raise ValueError(
+                        "MessageTransaction vote_target body truncated"
+                    )
+                poll_txid = bytes(data[offset:offset + 32]); offset += 32
+                option_index = data[offset]; offset += 1
+                if option_index >= MAX_POLL_OPTIONS:
+                    raise ValueError(
+                        f"MessageTransaction vote_target option_index "
+                        f"{option_index} not in [0, {MAX_POLL_OPTIONS})"
+                    )
+                vote_target = (poll_txid, option_index)
+            else:
+                raise ValueError(
+                    f"MessageTransaction vote_target flag must be "
+                    f"0 or 1, got {vt_flag}"
+                )
         sig_len = struct.unpack_from(">I", data, offset)[0]; offset += 4
         if offset + sig_len > len(data):
             raise ValueError("MessageTransaction signature truncated")
@@ -630,6 +943,8 @@ class MessageTransaction:
             prev=prev,
             sender_pubkey=sender_pubkey,
             community_id=community_id,
+            poll_options=poll_options,
+            vote_target=vote_target,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -682,6 +997,18 @@ class MessageTransaction:
         community_id = (
             community_id_str if community_id_str else None
         )
+        poll_options_raw = data.get("poll_options")
+        poll_options = (
+            tuple(poll_options_raw) if poll_options_raw else None
+        )
+        vote_target_raw = data.get("vote_target")
+        if vote_target_raw:
+            vote_target = (
+                bytes.fromhex(vote_target_raw["poll_txid"]),
+                int(vote_target_raw["option_index"]),
+            )
+        else:
+            vote_target = None
         tx = cls(
             entity_id=bytes.fromhex(data["entity_id"]),
             message=stored,
@@ -694,6 +1021,8 @@ class MessageTransaction:
             prev=prev_bytes,
             sender_pubkey=sender_pubkey,
             community_id=community_id,
+            poll_options=poll_options,
+            vote_target=vote_target,
         )
         # Recompute hash and verify integrity — never trust declared hashes
         expected_hash = tx._compute_hash()
@@ -963,6 +1292,8 @@ def create_transaction(
     *,
     include_pubkey: bool = False,
     community_id: str | None = None,
+    poll_options: "tuple[str, ...] | None" = None,
+    vote_target: "tuple[bytes, int] | None" = None,
 ) -> MessageTransaction:
     """
     Create and sign a new message transaction.
@@ -986,6 +1317,12 @@ def create_transaction(
     pubkey is on chain and subsequent sends should leave the flag at
     False.  Mirrors TransferTransaction's first-outgoing-transfer
     pubkey reveal.
+
+    ``poll_options`` / ``vote_target`` (Tier 72): opt the tx into v6
+    as either a poll-creating tx or a vote-casting tx.  Mutually
+    exclusive -- pass at most one.  See messagechain.config.POLL_HEIGHT
+    for the full motivation and _validate_poll_options /
+    _validate_vote_target for the per-field rules.
     """
     valid, reason = _validate_message(message, current_height=current_height)
     if not valid:
@@ -1093,6 +1430,54 @@ def create_transaction(
         tx_version = TX_VERSION_COMMUNITY_ID
         # 1B presence flag + 1B length + N ASCII handle bytes.
         prev_overhead += 1 + 1 + len(community_id.encode("ascii"))
+    # Tier 72: opting into poll_options OR vote_target bumps the tx to
+    # v6.  Mutually exclusive -- pass at most one.  v6 inherits the v5
+    # layout in full (so any prev / sender_pubkey / community_id
+    # overhead above carries through), and appends the poll_options +
+    # vote_target presence-flag blocks.  Non-poll, non-vote senders
+    # post-activation stay at v4/v5 (or v1-v3 pre-Tier-14) so the
+    # common-case footprint is unchanged.
+    if poll_options is not None and vote_target is not None:
+        raise ValueError(
+            "poll_options and vote_target are mutually exclusive — "
+            "a single tx is either a poll OR a vote, never both"
+        )
+    if poll_options is not None or vote_target is not None:
+        if poll_options is not None:
+            ok, reason = _validate_poll_options(poll_options)
+            if not ok:
+                raise ValueError(reason)
+        if vote_target is not None:
+            ok, reason = _validate_vote_target(vote_target)
+            if not ok:
+                raise ValueError(reason)
+        if (
+            current_height is not None
+            and current_height < POLL_HEIGHT
+        ):
+            raise ValueError(
+                f"poll_options / vote_target requires current_height >= "
+                f"POLL_HEIGHT ({POLL_HEIGHT}); got {current_height}"
+            )
+        # If we landed below v4/v5, promoting straight to v6 would skip
+        # the trailer presence-flag bytes the layout requires.  Add
+        # them now so wire / signed / fee accounting agree.
+        if tx_version < TX_VERSION_LENGTH_PREFIX:
+            if prev is None:
+                prev_overhead += 1  # prev presence flag (v3+ requirement)
+            if not include_pubkey:
+                prev_overhead += 1  # sender_pubkey presence flag
+        if tx_version < TX_VERSION_COMMUNITY_ID:
+            if community_id is None:
+                prev_overhead += 1  # community_id presence flag (v5+ requirement)
+        tx_version = TX_VERSION_POLL
+        # Always include BOTH presence flags at v6.
+        prev_overhead += _poll_options_stored_bytes(
+            poll_options, TX_VERSION_POLL
+        )
+        prev_overhead += _vote_target_stored_bytes(
+            vote_target, TX_VERSION_POLL
+        )
     if prev is not None and len(prev) != 32:
         raise ValueError(
             f"prev must be exactly 32 bytes, got {len(prev)}"
@@ -1108,7 +1493,9 @@ def create_transaction(
             f"({len(stored)} stored bytes, flag={flag}"
             f"{', prev=set' if prev is not None else ''}"
             f"{', sender_pubkey=set' if include_pubkey else ''}"
-            f"{', community_id=set' if community_id is not None else ''})"
+            f"{', community_id=set' if community_id is not None else ''}"
+            f"{', poll_options=set' if poll_options is not None else ''}"
+            f"{', vote_target=set' if vote_target is not None else ''})"
         )
 
     tx = MessageTransaction(
@@ -1123,6 +1510,8 @@ def create_transaction(
         prev=prev,
         sender_pubkey=entity.public_key if include_pubkey else b"",
         community_id=community_id,
+        poll_options=poll_options,
+        vote_target=vote_target,
     )
 
     # Sign the transaction data with quantum-resistant signature
@@ -1139,6 +1528,7 @@ def verify_transaction(
     public_key: bytes,
     current_height: int | None = None,
     prev_lookup=None,
+    poll_lookup=None,
 ) -> bool:
     """Verify a transaction's quantum-resistant signature and well-formedness.
 
@@ -1152,17 +1542,27 @@ def verify_transaction(
     unit tests keep validating.  Consensus verification MUST pass the
     applying block's height so the FEE_INCLUDES_SIGNATURE_HEIGHT gate
     kicks in — at/after activation, fee covers message + signature bytes.
+
+    `poll_lookup(tx_hash) -> (block_height, option_count) | None` —
+    Tier 72 chain-level resolver for vote_target references.  A vote
+    is admissible only when its poll_txid resolves to a confirmed
+    poll-creating tx in a strictly earlier block AND the option_index
+    is in [0, option_count).  Callers without chain context (isolated
+    unit tests, fixture builders) omit the argument and the reference
+    is treated as structurally valid but unresolved — same convention
+    as prev_lookup.
     """
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
         return False
-    # ── Version gate for tiers 10 / 11 / 12 / 14 / 21 ──
+    # ── Version gate for tiers 10 / 11 / 12 / 14 / 21 / 72 ──
     # Pre-activation: only version=1 txs are accepted.  A higher-
     # version tx arriving before its fork point would allow its
     # extra bytes (or, for v4, the new length-prefixed signable
-    # commitment, or for v5, the community_id block) to land in a
-    # block whose replay semantics don't know about the change, so
-    # we reject at the validation boundary.
+    # commitment, or for v5, the community_id block, or for v6, the
+    # poll_options / vote_target blocks) to land in a block whose
+    # replay semantics don't know about the change, so we reject at
+    # the validation boundary.
     #   Post-PREV_POINTER_HEIGHT: v1, v2 accepted.
     #   Post-FIRST_SEND_PUBKEY_HEIGHT: v3 also accepted.
     #   Post-MESSAGE_TX_LENGTH_PREFIX_HEIGHT: v4 also accepted (and is
@@ -1170,10 +1570,38 @@ def verify_transaction(
     #     v1/v2/v3 remain admissible for backward compatibility).
     #   Post-COMMUNITY_ID_HEIGHT: v5 also accepted (recommended path
     #     for new community-tagged txs).
-    # Any version above v5 is rejected until its own activation fork.
-    if tx.version > TX_VERSION_COMMUNITY_ID:
+    #   Post-POLL_HEIGHT: v6 also accepted (recommended path for new
+    #     poll-creating or vote-casting txs).
+    # Any version above v6 is rejected until its own activation fork.
+    if tx.version > TX_VERSION_POLL:
         return False
-    if tx.version >= TX_VERSION_COMMUNITY_ID:
+    if tx.version >= TX_VERSION_POLL:
+        if (
+            current_height is not None
+            and current_height < POLL_HEIGHT
+        ):
+            return False
+        # v6 inherits the full v5 trailer layout (prev + sender_pubkey +
+        # community_id presence-flag blocks always present) and adds
+        # the poll_options + vote_target blocks.  Mutex: a tx may set
+        # at most one of poll_options / vote_target.
+        if tx.poll_options is not None and tx.vote_target is not None:
+            return False
+        if tx.poll_options is not None:
+            ok, _reason = _validate_poll_options(tx.poll_options)
+            if not ok:
+                return False
+        if tx.vote_target is not None:
+            ok, _reason = _validate_vote_target(tx.vote_target)
+            if not ok:
+                return False
+        if tx.community_id is not None:
+            ok, _reason = _validate_community_id(tx.community_id)
+            if not ok:
+                return False
+        if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
+            return False
+    elif tx.version >= TX_VERSION_COMMUNITY_ID:
         if (
             current_height is not None
             and current_height < COMMUNITY_ID_HEIGHT
@@ -1192,6 +1620,10 @@ def verify_transaction(
                 return False
         if tx.sender_pubkey and len(tx.sender_pubkey) != 32:
             return False
+        # v1-v5 MUST NOT carry poll_options / vote_target — the fields
+        # were added at v6.
+        if tx.poll_options is not None or tx.vote_target is not None:
+            return False
     elif tx.version >= TX_VERSION_LENGTH_PREFIX:
         if (
             current_height is not None
@@ -1209,6 +1641,8 @@ def verify_transaction(
         # signature-doesn't-cover-this-field tampering attempt.
         if tx.community_id is not None:
             return False
+        if tx.poll_options is not None or tx.vote_target is not None:
+            return False
     elif tx.version >= TX_VERSION_FIRST_SEND_PUBKEY:
         if (
             current_height is not None
@@ -1220,11 +1654,15 @@ def verify_transaction(
         # v1-v3 also pre-date community_id; reject smuggling.
         if tx.community_id is not None:
             return False
+        if tx.poll_options is not None or tx.vote_target is not None:
+            return False
     else:
         # v1/v2 MUST NOT carry a sender_pubkey or community_id field.
         if tx.sender_pubkey:
             return False
         if tx.community_id is not None:
+            return False
+        if tx.poll_options is not None or tx.vote_target is not None:
             return False
     if tx.version >= TX_VERSION_PREV_POINTER:
         if current_height is not None and current_height < PREV_POINTER_HEIGHT:
@@ -1309,6 +1747,16 @@ def verify_transaction(
         prev_overhead += _community_id_stored_bytes(
             tx.community_id, tx.version
         )
+    # v6 adds the poll_options + vote_target blocks: each 1B presence
+    # flag when absent, larger when set.  Mirrors create_transaction's
+    # accounting.
+    if tx.version >= TX_VERSION_POLL:
+        prev_overhead += _poll_options_stored_bytes(
+            tx.poll_options, tx.version
+        )
+        prev_overhead += _vote_target_stored_bytes(
+            tx.vote_target, tx.version
+        )
     if tx.fee < calculate_min_fee(
         tx.message,
         signature_bytes=sig_len,
@@ -1341,5 +1789,25 @@ def verify_transaction(
                 # to exist in a prior block.
                 if prev_height >= current_height:
                     return False
+    # Tier 72 vote→poll resolution.  When chain context is supplied via
+    # `poll_lookup`, a vote_target's poll_txid MUST resolve to a
+    # confirmed poll-creating tx in a strictly earlier block AND the
+    # option_index must be in [0, option_count) of that poll.  Callers
+    # without chain context omit `poll_lookup` and the vote is treated
+    # as structurally valid but unresolved (same convention as
+    # prev_lookup).  Self-reference is rejected unconditionally.
+    if tx.vote_target is not None:
+        poll_txid, option_index = tx.vote_target
+        if poll_txid == tx.tx_hash:
+            return False
+        if poll_lookup is not None:
+            info = poll_lookup(poll_txid)
+            if info is None:
+                return False
+            poll_height, option_count = info
+            if current_height is not None and poll_height >= current_height:
+                return False
+            if option_index < 0 or option_index >= option_count:
+                return False
     msg_hash = default_hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

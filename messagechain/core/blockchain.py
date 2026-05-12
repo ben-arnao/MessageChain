@@ -3682,6 +3682,45 @@ class Blockchain:
             return None
         return self.db.get_tx_location(tx_hash)
 
+    def _poll_lookup(self, tx_hash: bytes) -> tuple[int, int] | None:
+        """Resolve a Tier 72 vote_target reference to its target poll.
+
+        Returns ``(block_height, option_count)`` if ``tx_hash`` resolves
+        to a confirmed MessageTransaction whose ``poll_options`` is set,
+        else None.  Used by verify_transaction's vote-resolution gate
+        to enforce "vote points at a real poll, with a valid option
+        index for that poll".
+
+        Implementation chains the tx_locations index (O(1)) → block
+        load → tx at index → ``poll_options``.  Mirrors the
+        ``get_message_author`` lookup pattern (Tier 27).  Without a
+        chain.db (ephemeral Blockchain fixtures) returns None —
+        verify_transaction treats that as "no chain context supplied"
+        and skips the strict-poll check, so unit tests constructing
+        standalone vote txs keep validating.
+        """
+        if self.db is None:
+            return None
+        loc = self.db.get_tx_location(tx_hash)
+        if loc is None:
+            return None
+        block_height, tx_index = loc
+        try:
+            blk = self.db.get_block_by_number(block_height, state=self)
+        except Exception:
+            return None
+        if blk is None:
+            return None
+        if tx_index < 0 or tx_index >= len(blk.transactions):
+            return None
+        tx = blk.transactions[tx_index]
+        if tx.tx_hash != tx_hash:
+            return None
+        options = getattr(tx, "poll_options", None)
+        if not options:
+            return None
+        return (int(block_height), len(options))
+
     def validate_transaction(
         self, tx: MessageTransaction, *, expected_nonce: int | None = None,
     ) -> tuple[bool, str]:
@@ -3761,6 +3800,9 @@ class Blockchain:
             current_height=self.height + 1,
             prev_lookup=(
                 self._prev_tx_lookup if self.db is not None else None
+            ),
+            poll_lookup=(
+                self._poll_lookup if self.db is not None else None
             ),
         ):
             return False, "Invalid signature"
@@ -10425,13 +10467,17 @@ class Blockchain:
 
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
             # applies to consensus verification.  prev_lookup resolves
-            # Tier 10 prev pointers against the tx_locations index.
+            # Tier 10 prev pointers; poll_lookup resolves Tier 72 vote
+            # references — both against the tx_locations index.
             if not verify_transaction(
                 tx, public_key,
                 current_height=block.header.block_number,
                 prev_lookup=(
                 self._prev_tx_lookup if self.db is not None else None
             ),
+                poll_lookup=(
+                    self._poll_lookup if self.db is not None else None
+                ),
             ):
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
 
@@ -11625,13 +11671,17 @@ class Blockchain:
                 pk = tx.sender_pubkey
             # Thread block height so FEE_INCLUDES_SIGNATURE_HEIGHT gate
             # applies to consensus verification.  prev_lookup resolves
-            # Tier 10 prev pointers against the tx_locations index.
+            # Tier 10 prev pointers; poll_lookup resolves Tier 72 vote
+            # references — both against the tx_locations index.
             if not verify_transaction(
                 tx, pk,
                 current_height=block.header.block_number,
                 prev_lookup=(
                 self._prev_tx_lookup if self.db is not None else None
             ),
+                poll_lookup=(
+                    self._poll_lookup if self.db is not None else None
+                ),
             ):
                 return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
             if known_pk is None:
