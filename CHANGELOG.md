@@ -4,6 +4,69 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.79.2] — 2026-05-12
+
+Patch release.  Fixes a long-standing gossip-receiver mempool
+eviction bug surfaced (again) during the Tier 72 mainnet demo:
+when a validator received a block via ``ANNOUNCE_BLOCK`` gossip
+from a peer, the post-apply mempool sweep stripped only the
+MessageTransactions in the block — confirmed TransferTransactions
+were left pending in ``mempool.pending`` forever.
+
+### Fixed
+
+  * **``server.py:_handle_p2p_message`` ANNOUNCE_BLOCK branch
+    sweeps both message + transfer txs from mempool after a
+    successful ``add_block``, not just messages.**
+    CLAUDE.md anchor: "transfer is a first-class, fully supported
+    tx type" — first-class includes mempool lifecycle parity with
+    messages.
+
+    Pre-fix at server.py:5252:
+
+    ```
+    self.mempool.remove_transactions(
+        [tx.tx_hash for tx in block.transactions]
+    )
+    ```
+
+    ``mempool.pending`` holds BOTH messages AND transfers (since
+    ``submit_transaction_to_mempool`` dispatches on tx class).
+    Stripping only ``block.transactions`` left every confirmed
+    transfer pending on the receiver's local view.
+
+    Bite: the next slot's proposer pulled the stale transfer
+    back via ``get_transactions_with_entity_cap``, the proposed
+    block failed ``add_block`` with "Invalid transfer ...:
+    Invalid nonce: expected N+1, got N" (the chain had advanced
+    past it), and the proposer wedged into re-proposing the same
+    stale block every slot.  Observed on mainnet during the Tier
+    72 demo: validator-2's faucet drips landed on validator-2's
+    self-proposed block (which had the correct sweep at
+    server.py:4580), validator-2 then saw validator-1 gossip
+    the same block back via ANNOUNCE_BLOCK, and the receiver
+    path's sweep left the drip transfer in validator-2's
+    mempool.  Every subsequent validator-2 proposal failed.
+    Two faucet drips were enough to halt new-tx inclusion for
+    ~40 minutes until an operator restart cleared the
+    in-memory mempool.
+
+    Fix: include ``block.transfer_transactions`` in the sweep.
+    Twin of the network/node.py:1321 path (which already had
+    both legs).  Non-consensus, non-fork.  Mempool lifecycle only.
+
+    Regression test
+    (``tests/test_mempool_gossip_block_transfer_eviction.py``)
+    pins three properties:
+    (a) ``Mempool.remove_transactions`` with combined message +
+        transfer hashes strips both kinds,
+    (b) stripping only message hashes leaves transfers stranded
+        (pins the bug shape so a future revert is caught), and
+    (c) source-level pin: ``Server._handle_p2p_message``'s
+        ANNOUNCE_BLOCK arm references both
+        ``block.transactions`` AND ``block.transfer_transactions``
+        in the sweep.
+
 ## [1.79.1] — 2026-05-12
 
 Patch release.  Fixes a long-standing fresh-wallet-first-sign

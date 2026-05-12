@@ -5249,7 +5249,29 @@ class Server(SharedRuntimeMixin):
             success, reason = self.blockchain.add_block(block, source_peer=address)
             self._drain_orphan_flood_offenses()
             if success:
-                self.mempool.remove_transactions([tx.tx_hash for tx in block.transactions])
+                # Sweep mempool of every tx kind the block confirmed,
+                # not just MessageTransactions.  ``mempool.pending``
+                # holds both messages AND transfers (and any future
+                # message-pool-resident tx type the proposer pulled via
+                # ``get_transactions_with_entity_cap``); stripping only
+                # ``block.transactions`` leaves the confirmed transfers
+                # behind, the next proposal re-picks them from
+                # ``mempool.pending`` (still pending from this node's
+                # POV), and ``add_block`` rejects the proposed block
+                # with "Invalid transfer ...: Invalid nonce: expected
+                # N+1, got N" because the chain has advanced past their
+                # nonce.  Result: a single confirmed faucet drip turned
+                # into a permanently wedged proposer that re-proposes
+                # the stale transfer every slot.  Twin of the same
+                # fix on the local-propose branch above (line 4580
+                # passes the full ``all_pending`` list, the
+                # network/node.py:1321 path passes both message + xfer
+                # hashes -- only this gossip-receiver path was missing
+                # the transfer leg).
+                self.mempool.remove_transactions(
+                    [tx.tx_hash for tx in block.transactions]
+                    + [tx.tx_hash for tx in block.transfer_transactions]
+                )
                 # Slashing + fork-emergency post-block hook.  Runs
                 # before the attester-duty broadcast so a fresh
                 # emergency that surfaces during apply gets the
