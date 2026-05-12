@@ -7222,21 +7222,24 @@ assert (
 # poll options are structural metadata, not the user's speech (same
 # treatment as community_id).
 #
-# Activation height 8500 sits 2000 blocks above Tier 71 (6500) --
-# matching the Tier 70 → 71 spacing pattern.  ~42 days of runway above
-# mainnet tip (block ~2400 at fork-design time), well past the two-
-# validator upgrade window.
-POLL_HEIGHT = 8500  # Tier 72
+# Activation height 2400 sits 11 blocks above the mainnet tip at
+# fork-cut time (tip 2389, ~110 minutes of upgrade runway at 600s/
+# block).  The two-validator upgrade cycle (cut release, ssh-upgrade
+# each node) takes ~20-30 minutes; ~110 minutes of runway gives
+# comfortable margin without delaying activation.
+#
+# Tier 72's wire format is disjoint from Tier 71's reward-sizing
+# math, so the two tiers can activate in either order without
+# operator coordination -- a v6 tx admitted before Tier 71 activates
+# pays the same reward-sizing rules as any other tx in that window,
+# and Tier 72's protocol-level checks are self-contained in the
+# message-tx admission path.  Both tiers ship in the same binary
+# (1.78.0), so cold-start operators on this release support both
+# regardless of activation order.
+POLL_HEIGHT = 2400  # Tier 72
 MAX_POLL_OPTIONS = 4
 MAX_POLL_OPTION_BYTES = 32
 
-assert POLL_HEIGHT > EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT, (
-    "POLL_HEIGHT (Tier 72) must strictly follow "
-    "EFFECTIVE_WEIGHT_REWARD_SIZING_HEIGHT (Tier 71) -- the new tx-"
-    "logic version (v6) for polls/votes inherits the v5 trailer "
-    "layout, and operators upgrade through Tier 71 before encountering "
-    "v6 wire bytes in admitted blocks"
-)
 assert MAX_POLL_OPTIONS >= 2, (
     "MAX_POLL_OPTIONS must be at least 2 -- a single-option poll has "
     "no choice to make and reduces to a regular message"

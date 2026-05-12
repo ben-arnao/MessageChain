@@ -3682,22 +3682,25 @@ class Blockchain:
             return None
         return self.db.get_tx_location(tx_hash)
 
-    def _poll_lookup(self, tx_hash: bytes) -> tuple[int, int] | None:
+    def _poll_lookup(
+        self, tx_hash: bytes
+    ) -> tuple[int, int, bytes] | None:
         """Resolve a Tier 72 vote_target reference to its target poll.
 
-        Returns ``(block_height, option_count)`` if ``tx_hash`` resolves
-        to a confirmed MessageTransaction whose ``poll_options`` is set,
-        else None.  Used by verify_transaction's vote-resolution gate
-        to enforce "vote points at a real poll, with a valid option
-        index for that poll".
+        Returns ``(block_height, option_count, author_entity_id)`` if
+        ``tx_hash`` resolves to a confirmed MessageTransaction whose
+        ``poll_options`` is set, else None.  Used by
+        verify_transaction's vote-resolution gate to enforce both
+        "vote points at a real poll with a valid option index" AND
+        "voter is not the poll's author" (no self-vote on own poll).
 
         Implementation chains the tx_locations index (O(1)) → block
-        load → tx at index → ``poll_options``.  Mirrors the
-        ``get_message_author`` lookup pattern (Tier 27).  Without a
-        chain.db (ephemeral Blockchain fixtures) returns None —
-        verify_transaction treats that as "no chain context supplied"
-        and skips the strict-poll check, so unit tests constructing
-        standalone vote txs keep validating.
+        load → tx at index → ``poll_options`` + ``entity_id``.
+        Mirrors the ``get_message_author`` lookup pattern (Tier 27).
+        Without a chain.db (ephemeral Blockchain fixtures) returns
+        None — verify_transaction treats that as "no chain context
+        supplied" and skips the strict-poll check, so unit tests
+        constructing standalone vote txs keep validating.
         """
         if self.db is None:
             return None
@@ -3719,7 +3722,28 @@ class Blockchain:
         options = getattr(tx, "poll_options", None)
         if not options:
             return None
-        return (int(block_height), len(options))
+        author = getattr(tx, "entity_id", None)
+        if author is None or len(author) != 32:
+            return None
+        return (int(block_height), len(options), bytes(author))
+
+    def _has_voted_canonical(
+        self, poll_txid: bytes, voter_id: bytes
+    ) -> bool:
+        """Return True iff the canonical chain already contains a
+        Tier 72 vote tx from ``voter_id`` on ``poll_txid``.
+
+        Drives the one-vote-per-(entity, poll) admission rule: a new
+        vote tx is rejected at verify time if this returns True.
+
+        Without a chain.db (ephemeral Blockchain fixtures) returns
+        False — verify_transaction treats that as "no chain context
+        supplied" and skips the dedup check, so unit tests
+        constructing standalone vote txs keep validating.
+        """
+        if self.db is None:
+            return False
+        return self.db.has_voted_canonical(poll_txid, voter_id)
 
     def validate_transaction(
         self, tx: MessageTransaction, *, expected_nonce: int | None = None,
@@ -3803,6 +3827,9 @@ class Blockchain:
             ),
             poll_lookup=(
                 self._poll_lookup if self.db is not None else None
+            ),
+            vote_check=(
+                self._has_voted_canonical if self.db is not None else None
             ),
         ):
             return False, "Invalid signature"
@@ -10597,6 +10624,26 @@ class Blockchain:
         pending_nonces: dict[bytes, int] = {}
         pending_balance_spent: dict[bytes, int] = {}
         pending_pubkey_installs: dict[bytes, bytes] = {}
+        # Tier 72 intra-block vote dedup: a single block must NOT
+        # contain two vote txs sharing the same (poll_txid, voter_id)
+        # pair.  The chain-level vote_check only catches votes already
+        # in PRIOR blocks; without this in-block set, a proposer could
+        # pack two votes from the same entity on the same poll into
+        # one block.
+        seen_votes_this_block: set[tuple[bytes, bytes]] = set()
+
+        def _intra_block_or_canonical_voted(
+            poll_txid: bytes, voter_id: bytes
+        ) -> bool:
+            key = (bytes(poll_txid), bytes(voter_id))
+            if key in seen_votes_this_block:
+                return True
+            if self.db is not None and self._has_voted_canonical(
+                poll_txid, voter_id
+            ):
+                return True
+            return False
+
         for tx in block.transactions:
             # Check nonce against chain state + any already-seen txs in this block
             expected_nonce = pending_nonces.get(
@@ -10646,6 +10693,8 @@ class Blockchain:
             # applies to consensus verification.  prev_lookup resolves
             # Tier 10 prev pointers; poll_lookup resolves Tier 72 vote
             # references — both against the tx_locations index.
+            # vote_check enforces one-vote-per-(entity, poll) across
+            # canonical-chain history AND within the current block.
             if not verify_transaction(
                 tx, public_key,
                 current_height=block.header.block_number,
@@ -10655,8 +10704,17 @@ class Blockchain:
                 poll_lookup=(
                     self._poll_lookup if self.db is not None else None
                 ),
+                vote_check=_intra_block_or_canonical_voted,
             ):
                 return False, f"Invalid tx {tx.tx_hash.hex()[:16]}: Invalid signature"
+
+            # Record this block's vote for intra-block dedup of LATER
+            # txs in the same block.  Skipped for non-vote txs.
+            if getattr(tx, "vote_target", None) is not None:
+                vt_poll_txid, _vt_idx = tx.vote_target
+                seen_votes_this_block.add(
+                    (bytes(vt_poll_txid), bytes(tx.entity_id))
+                )
 
             # First-send: surface this pubkey to later txs in the same block.
             if known_pk is None:
@@ -11828,6 +11886,22 @@ class Blockchain:
         )
         from messagechain.identity.identity import derive_entity_id
         pending_pk_installs_v: dict[bytes, bytes] = {}
+        # Tier 72 intra-block vote dedup, mirror of the primary
+        # validate_block path above.  Same shape; same check.
+        seen_votes_this_block_v: set[tuple[bytes, bytes]] = set()
+
+        def _intra_block_or_canonical_voted_v(
+            poll_txid: bytes, voter_id: bytes
+        ) -> bool:
+            key = (bytes(poll_txid), bytes(voter_id))
+            if key in seen_votes_this_block_v:
+                return True
+            if self.db is not None and self._has_voted_canonical(
+                poll_txid, voter_id
+            ):
+                return True
+            return False
+
         for tx in block.transactions:
             known_pk = self.public_keys.get(tx.entity_id) or pending_pk_installs_v.get(tx.entity_id)
             if known_pk is not None:
@@ -11850,6 +11924,8 @@ class Blockchain:
             # applies to consensus verification.  prev_lookup resolves
             # Tier 10 prev pointers; poll_lookup resolves Tier 72 vote
             # references — both against the tx_locations index.
+            # vote_check enforces one-vote-per-(entity, poll) across
+            # canonical-chain history AND within the current block.
             if not verify_transaction(
                 tx, pk,
                 current_height=block.header.block_number,
@@ -11859,10 +11935,16 @@ class Blockchain:
                 poll_lookup=(
                     self._poll_lookup if self.db is not None else None
                 ),
+                vote_check=_intra_block_or_canonical_voted_v,
             ):
                 return False, f"Invalid signature in tx {tx.tx_hash.hex()[:16]}"
             if known_pk is None:
                 pending_pk_installs_v[tx.entity_id] = tx.sender_pubkey
+            if getattr(tx, "vote_target", None) is not None:
+                vt_poll_txid, _vt_idx = tx.vote_target
+                seen_votes_this_block_v.add(
+                    (bytes(vt_poll_txid), bytes(tx.entity_id))
+                )
 
         for ttx in block.transfer_transactions:
             known_pk = self.public_keys.get(ttx.entity_id) or pending_pk_installs_v.get(ttx.entity_id)

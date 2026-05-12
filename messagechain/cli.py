@@ -190,6 +190,33 @@ def build_parser() -> argparse.ArgumentParser:
             "Activates at COMMUNITY_ID_HEIGHT."
         ),
     )
+    send.add_argument(
+        "--poll-option", dest="poll_options",
+        action="append", default=[],
+        metavar="TEXT",
+        help=(
+            "Make this message a structured poll.  Repeat 1..4 times "
+            "with the option label text (e.g. --poll-option Yes "
+            "--poll-option No).  Each option is short UTF-8 (<=32 "
+            "bytes) and follows the same charset whitelist as message "
+            "text.  Options must be pairwise distinct.  Mutually "
+            "exclusive with --vote-target.  Activates at POLL_HEIGHT."
+        ),
+    )
+    send.add_argument(
+        "--vote-target", dest="vote_target", type=str, default=None,
+        metavar="POLL_TXID:INDEX",
+        help=(
+            "Make this message a structured vote.  Format: "
+            "64-hex-char poll tx_hash, colon, decimal option index "
+            "(0-based).  The poll must already be on-chain in a "
+            "strictly earlier block, and the index must be in range "
+            "of that poll's option set.  An entity may cast at most "
+            "one vote per poll.  An entity cannot vote on a poll it "
+            "created.  Mutually exclusive with --poll-option.  "
+            "Activates at POLL_HEIGHT."
+        ),
+    )
 
     # --- send-multi ---
     send_multi = sub.add_parser(
@@ -3150,6 +3177,61 @@ def cmd_send(args):
             sys.exit(1)
         community_id_arg = normalized
 
+    # --poll-option / --vote-target (Tier 72).  Mutually exclusive.
+    # Validation here gives a fast pre-flight diagnostic; the chain's
+    # _validate_poll_options / _validate_vote_target re-enforces.
+    poll_options_arg: tuple[str, ...] | None = None
+    vote_target_arg: tuple[bytes, int] | None = None
+    raw_poll_opts = getattr(args, "poll_options", None) or []
+    raw_vote = getattr(args, "vote_target", None)
+    if raw_poll_opts and raw_vote:
+        print(
+            "Error: --poll-option and --vote-target are mutually "
+            "exclusive (a tx is either a poll OR a vote, never both)."
+        )
+        sys.exit(1)
+    if raw_poll_opts:
+        import unicodedata
+        opts_norm = tuple(
+            unicodedata.normalize("NFC", opt) for opt in raw_poll_opts
+        )
+        if len(opts_norm) < 1 or len(opts_norm) > 4:
+            print(
+                f"Error: --poll-option must be given 1..4 times "
+                f"(got {len(opts_norm)})."
+            )
+            sys.exit(1)
+        poll_options_arg = opts_norm
+    if raw_vote:
+        if ":" not in raw_vote:
+            print(
+                "Error: --vote-target must be POLL_TXID:INDEX "
+                "(64 hex chars + colon + 0-based int)."
+            )
+            sys.exit(1)
+        poll_hex, _, idx_str = raw_vote.partition(":")
+        poll_hex = poll_hex.strip()
+        if len(poll_hex) != 64:
+            print(
+                f"Error: --vote-target poll_txid must be 64 hex chars "
+                f"(got {len(poll_hex)})."
+            )
+            sys.exit(1)
+        try:
+            poll_txid = bytes.fromhex(poll_hex)
+        except ValueError:
+            print("Error: --vote-target poll_txid is not valid hex.")
+            sys.exit(1)
+        try:
+            option_index = int(idx_str)
+        except ValueError:
+            print(
+                f"Error: --vote-target option_index must be an integer "
+                f"(got {idx_str!r})."
+            )
+            sys.exit(1)
+        vote_target_arg = (poll_txid, option_index)
+
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
     # always take max(local_min, server_suggestion) to avoid silently
@@ -3193,6 +3275,28 @@ def cmd_send(args):
         )
         prev_overhead += _community_id_stored_bytes(
             community_id_arg, TX_VERSION_COMMUNITY_ID,
+        )
+    if poll_options_arg is not None or vote_target_arg is not None:
+        # Tier 72: v6 wire layout includes the v4/v5 trailer presence
+        # flags + the new poll_options + vote_target blocks.  Mirror
+        # create_transaction's accounting so the local fee floor
+        # matches what the chain enforces.
+        from messagechain.core.transaction import (
+            _poll_options_stored_bytes, _vote_target_stored_bytes,
+            TX_VERSION_POLL, TX_VERSION_LENGTH_PREFIX,
+            TX_VERSION_COMMUNITY_ID,
+        )
+        # If neither community_id nor prev/sender_pubkey were set, the
+        # v4/v5 trailer presence flags still cost 1B each at v6.
+        # create_transaction's promote-from-v1/v2 path adds them when
+        # bumping up; mirror that here so calculate_min_fee agrees.
+        if community_id_arg is None:
+            prev_overhead += 1  # community_id presence flag (v5+)
+        prev_overhead += _poll_options_stored_bytes(
+            poll_options_arg, TX_VERSION_POLL,
+        )
+        prev_overhead += _vote_target_stored_bytes(
+            vote_target_arg, TX_VERSION_POLL,
         )
     if target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT:
         # Signature size is deterministic for the scheme parameters baked
@@ -3271,11 +3375,18 @@ def cmd_send(args):
         current_height=target_height, prev=prev_bytes_arg,
         include_pubkey=include_pubkey,
         community_id=community_id_arg,
+        poll_options=poll_options_arg,
+        vote_target=vote_target_arg,
     )
     if prev_bytes_arg is not None:
         print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
     if community_id_arg is not None:
         print(f"Community: {community_id_arg}")
+    if poll_options_arg is not None:
+        print(f"Poll options: {list(poll_options_arg)}")
+    if vote_target_arg is not None:
+        vt_pid, vt_idx = vote_target_arg
+        print(f"Voting on poll {vt_pid.hex()[:16]}... option index {vt_idx}")
     print("Submitting...")
 
     response = rpc_call(host, port, "submit_transaction", {

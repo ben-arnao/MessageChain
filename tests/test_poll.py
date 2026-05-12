@@ -18,9 +18,10 @@ Vote rule:
       [0, len(target_poll.options)) by the chain-level poll_lookup.
     * Vote references a poll in a strictly EARLIER block.
     * Self-reference (poll_txid == tx.tx_hash) is rejected.
-
-Dedup is NOT enforced on chain — multiple votes from the same entity
-on the same poll are admissible; indexers resolve to last-vote-wins.
+    * Voter is NOT the poll's author (no self-vote on own poll).
+    * One vote per (entity, poll) at consensus — second vote from
+      same entity on same poll is rejected at admission.  First
+      vote is binding forever.
 """
 
 import unittest
@@ -511,33 +512,38 @@ class TestPollLookupChainGate(unittest.TestCase):
     def test_vote_accepted_when_poll_resolves_earlier(self):
         tx = self._make_vote(b"\x33" * 32, 1)
         # Poll at earlier height with 2 options; index 1 is valid.
+        # poll_lookup contract: (block_height, option_count, author_entity_id).
+        # A "different author" entity_id keeps the self-vote rule satisfied.
+        other_author = b"\xee" * 32
         self.assertTrue(
             verify_transaction(
                 tx, self.pk,
                 current_height=POLL_HEIGHT + 5,
-                poll_lookup=lambda h: (POLL_HEIGHT, 2),
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, other_author),
             )
         )
 
     def test_vote_rejected_when_index_out_of_range(self):
         tx = self._make_vote(b"\x44" * 32, 3)
+        other_author = b"\xee" * 32
         # Poll has 2 options; index 3 is past the end.
         self.assertFalse(
             verify_transaction(
                 tx, self.pk,
                 current_height=POLL_HEIGHT + 5,
-                poll_lookup=lambda h: (POLL_HEIGHT, 2),
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, other_author),
             )
         )
 
     def test_vote_rejected_when_poll_at_or_after_current_height(self):
         tx = self._make_vote(b"\x55" * 32, 0)
+        other_author = b"\xee" * 32
         # Same-block reference → reject.
         self.assertFalse(
             verify_transaction(
                 tx, self.pk,
                 current_height=POLL_HEIGHT,
-                poll_lookup=lambda h: (POLL_HEIGHT, 2),
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, other_author),
             )
         )
 
@@ -548,6 +554,97 @@ class TestPollLookupChainGate(unittest.TestCase):
         self.assertFalse(
             verify_transaction(tx, self.pk, current_height=POLL_HEIGHT)
         )
+
+    def test_vote_on_own_poll_rejected(self):
+        # No self-vote on own poll: when the resolved poll's
+        # author_entity_id equals the voter's entity_id, reject.
+        tx = self._make_vote(b"\x77" * 32, 0)
+        # Author == this voter's entity_id.
+        self.assertFalse(
+            verify_transaction(
+                tx, self.pk,
+                current_height=POLL_HEIGHT + 5,
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, tx.entity_id),
+            )
+        )
+
+    def test_vote_rejected_when_already_voted(self):
+        # vote_check returns True → canonical chain already has a
+        # vote from this entity on this poll → reject (one vote per
+        # (entity, poll)).
+        tx = self._make_vote(b"\x88" * 32, 0)
+        other_author = b"\xee" * 32
+        self.assertFalse(
+            verify_transaction(
+                tx, self.pk,
+                current_height=POLL_HEIGHT + 5,
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, other_author),
+                vote_check=lambda p, v: True,
+            )
+        )
+
+    def test_vote_accepted_when_not_yet_voted(self):
+        # vote_check returns False → no prior vote in canonical → accept.
+        tx = self._make_vote(b"\x99" * 32, 0)
+        other_author = b"\xee" * 32
+        self.assertTrue(
+            verify_transaction(
+                tx, self.pk,
+                current_height=POLL_HEIGHT + 5,
+                poll_lookup=lambda h: (POLL_HEIGHT, 2, other_author),
+                vote_check=lambda p, v: False,
+            )
+        )
+
+
+# ─── ChainDB has_voted_canonical: schema + filter ──────────────────────
+
+
+class TestVoteRecordsChainDB(unittest.TestCase):
+    """ChainDB.has_voted_canonical filters orphaned-branch rows so
+    a vote that landed in a now-non-canonical block does NOT block
+    a re-vote on the new canonical chain.
+    """
+
+    def _fresh_db(self):
+        import tempfile
+        import os
+        from messagechain.storage.chaindb import ChainDB
+        tmpdir = tempfile.mkdtemp()
+        return ChainDB(os.path.join(tmpdir, "test.db")), tmpdir
+
+    def test_empty_db_returns_false(self):
+        db, tmpdir = self._fresh_db()
+        try:
+            self.assertFalse(
+                db.has_voted_canonical(b"\x11" * 32, b"\x22" * 32)
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_orphaned_row_does_not_count(self):
+        # A row in vote_records whose block_hash is NOT on the canonical
+        # chain must be filtered out — the row is from an orphaned fork.
+        db, tmpdir = self._fresh_db()
+        try:
+            poll_txid = b"\x33" * 32
+            voter_id = b"\x44" * 32
+            # Insert directly without storing a block — no canonical
+            # chain exists, so the row's block_hash can't match.
+            db._conn.execute(
+                "INSERT INTO vote_records "
+                "(poll_txid, voter_id, block_hash, block_height, tx_hash) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (poll_txid, voter_id, b"\x55" * 32, 10, b"\x66" * 32),
+            )
+            db._conn.commit()
+            # Canonical map is empty (no chain_tips row), so this filters
+            # out and returns False.
+            self.assertFalse(db.has_voted_canonical(poll_txid, voter_id))
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ─── Poll fields do NOT eat MAX_MESSAGE_CHARS budget ───────────────────

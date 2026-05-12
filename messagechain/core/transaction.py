@@ -1529,6 +1529,7 @@ def verify_transaction(
     current_height: int | None = None,
     prev_lookup=None,
     poll_lookup=None,
+    vote_check=None,
 ) -> bool:
     """Verify a transaction's quantum-resistant signature and well-formedness.
 
@@ -1543,14 +1544,22 @@ def verify_transaction(
     applying block's height so the FEE_INCLUDES_SIGNATURE_HEIGHT gate
     kicks in — at/after activation, fee covers message + signature bytes.
 
-    `poll_lookup(tx_hash) -> (block_height, option_count) | None` —
-    Tier 72 chain-level resolver for vote_target references.  A vote
-    is admissible only when its poll_txid resolves to a confirmed
-    poll-creating tx in a strictly earlier block AND the option_index
-    is in [0, option_count).  Callers without chain context (isolated
-    unit tests, fixture builders) omit the argument and the reference
-    is treated as structurally valid but unresolved — same convention
-    as prev_lookup.
+    `poll_lookup(tx_hash) -> (block_height, option_count,
+    author_entity_id) | None` — Tier 72 chain-level resolver for
+    vote_target references.  A vote is admissible only when its
+    poll_txid resolves to a confirmed poll-creating tx in a strictly
+    earlier block, the option_index is in [0, option_count), AND the
+    voter is NOT the poll's author (no self-vote on own poll).
+    Callers without chain context (isolated unit tests, fixture
+    builders) omit the argument and the reference is treated as
+    structurally valid but unresolved — same convention as
+    prev_lookup.
+
+    `vote_check(poll_txid, voter_id) -> bool` — Tier 72 chain-level
+    one-vote-per-(entity, poll) dedup.  Returns True iff the canonical
+    chain already contains a vote tx from this voter on this poll, in
+    which case the new vote is rejected.  Callers without chain
+    context omit the argument and the dedup check is skipped.
     """
     # Size cap applies to stored (on-chain) bytes
     if len(tx.message) > MAX_MESSAGE_BYTES:
@@ -1791,11 +1800,19 @@ def verify_transaction(
                     return False
     # Tier 72 vote→poll resolution.  When chain context is supplied via
     # `poll_lookup`, a vote_target's poll_txid MUST resolve to a
-    # confirmed poll-creating tx in a strictly earlier block AND the
-    # option_index must be in [0, option_count) of that poll.  Callers
-    # without chain context omit `poll_lookup` and the vote is treated
-    # as structurally valid but unresolved (same convention as
-    # prev_lookup).  Self-reference is rejected unconditionally.
+    # confirmed poll-creating tx in a strictly earlier block, the
+    # option_index must be in [0, option_count) of that poll, AND
+    # the voter must NOT be the poll's own author (no self-vote on
+    # own poll).  Callers without chain context omit `poll_lookup`
+    # and the vote is treated as structurally valid but unresolved
+    # (same convention as prev_lookup).  Self-reference (vote tx
+    # pointing at its own tx_hash) is rejected unconditionally.
+    #
+    # When `vote_check` is supplied, the one-vote-per-(entity, poll)
+    # rule applies: the canonical chain must NOT already contain a
+    # vote from this voter on this poll.  Without `vote_check`, the
+    # dedup check is skipped — admission path callers always pass it
+    # (`Blockchain._has_voted_canonical`), isolated unit tests omit it.
     if tx.vote_target is not None:
         poll_txid, option_index = tx.vote_target
         if poll_txid == tx.tx_hash:
@@ -1804,10 +1821,17 @@ def verify_transaction(
             info = poll_lookup(poll_txid)
             if info is None:
                 return False
-            poll_height, option_count = info
+            poll_height, option_count, poll_author = info
             if current_height is not None and poll_height >= current_height:
                 return False
             if option_index < 0 or option_index >= option_count:
+                return False
+            # No self-vote on own poll: the poll-creator's signing
+            # entity cannot also cast a vote on that same poll.
+            if tx.entity_id == poll_author:
+                return False
+        if vote_check is not None:
+            if vote_check(poll_txid, tx.entity_id):
                 return False
     msg_hash = default_hash(tx._signable_data())
     return verify_signature(msg_hash, tx.signature, public_key)

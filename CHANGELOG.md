@@ -4,6 +4,62 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.78.0] — 2026-05-12
+
+Completes the **Tier 72 poll + vote** rollout from 1.77.0.  Adds
+two protocol-level constraints that the initial cut left to the
+indexer, lowers ``POLL_HEIGHT`` for immediate activation, and
+surfaces ``--poll-option`` / ``--vote-target`` on ``messagechain
+send``.  TX_VERSION_POLL stays at v6; the wire format is unchanged.
+
+### Added
+
+  * **No self-vote on own poll.**  ``_poll_lookup`` now returns
+    ``(block_height, option_count, author_entity_id)``; verify rejects
+    when ``vote_tx.entity_id == author_entity_id``.  A poll's
+    creator cannot also vote on their own poll.
+
+  * **One vote per (entity, poll) at consensus** -- protocol-level
+    reject, not indexer-side dedup.  New ChainDB table
+    ``vote_records`` indexes every confirmed vote tx by
+    ``(poll_txid, voter_id, block_hash)``; populated in
+    ``store_block``.  New ``ChainDB.has_voted_canonical`` filters
+    rows by canonical block_hash via the existing canonical-walk
+    cache, so a vote that landed in an orphaned branch does NOT
+    block a re-vote on the new canonical chain.  New
+    ``Blockchain._has_voted_canonical`` is wired into
+    ``verify_transaction`` via the new ``vote_check`` callback at
+    all three call sites (mempool admit + both block-validate
+    paths).
+
+  * **Intra-block vote dedup**: each block-validate path maintains
+    a ``seen_votes_this_block`` set so a proposer cannot pack two
+    votes from the same entity on the same poll into one block
+    (the canonical-chain check above only catches votes already in
+    PRIOR blocks).
+
+  * **CLI**: ``messagechain send`` learns ``--poll-option TEXT``
+    (repeat 1..4 times) and ``--vote-target POLL_TXID:INDEX``,
+    mutually exclusive.  Both pre-flight-validate locally before
+    burning a WOTS+ leaf on signing.
+
+  * **Permanence implication**: under one-vote-per-(entity, poll),
+    the FIRST vote is binding forever -- there is no in-protocol
+    mechanism to override.  An entity that wants to register a
+    change of mind must do so via app-layer messaging; the
+    consensus record stays with the first vote.  This is a
+    deliberate tradeoff for tally-from-chain-alone simplicity --
+    indexers can now naively count rows without any dedup logic.
+
+### Changed
+
+  * **``POLL_HEIGHT`` lowered from 8500 to 2400** -- immediate
+    activation, ~110 minutes of upgrade runway above tip (~2389 at
+    cut).  Tier 72 and Tier 71 are disjoint subsystems so the
+    earlier-than-Tier-71 ordering is operationally safe; the
+    previous ordering assertion was protective design intent, not
+    a correctness requirement.
+
 ## [1.77.1] — 2026-05-12
 
 Patch release.  Audit r50 top-3 ships: three independent signature-

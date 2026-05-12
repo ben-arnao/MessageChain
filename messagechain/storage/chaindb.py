@@ -479,6 +479,37 @@ class ChainDB:
             return None
         return (int(row[0]), int(row[1]))
 
+    def has_voted_canonical(
+        self, poll_txid: bytes, voter_id: bytes
+    ) -> bool:
+        """Return True iff the canonical chain has a Tier 72 vote tx
+        with this ``(poll_txid, voter_id)`` pair.
+
+        Walks every matching row in ``vote_records`` and filters by
+        canonical block_hash via ``_canonical_hash_at_height`` — this
+        is what makes the dedup reorg-aware: a vote that landed in
+        an orphaned branch does NOT count, so an entity whose first
+        vote was reorganized off the canonical chain is free to
+        vote again on the new canonical chain.
+
+        Typical row count per ``(poll_txid, voter_id)`` is 0 or 1;
+        multiple rows only arise under cross-fork double-inclusion,
+        which is rare.  Cost is therefore O(1) in steady state and
+        bounded by the fork depth in pathological cases.
+        """
+        cur = self._conn.execute(
+            "SELECT block_hash, block_height FROM vote_records "
+            "WHERE poll_txid = ? AND voter_id = ?",
+            (bytes(poll_txid), bytes(voter_id)),
+        )
+        for row in cur.fetchall():
+            row_hash = bytes(row[0])
+            row_height = int(row[1])
+            canonical = self._canonical_hash_at_height(row_height)
+            if canonical is not None and canonical == row_hash:
+                return True
+        return False
+
     def get_message_author(self, tx_hash: bytes, state=None) -> bytes | None:
         """Return the authoring entity_id of the MessageTransaction at
         `tx_hash`, or None if `tx_hash` is not a MessageTransaction in
@@ -1043,6 +1074,30 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_tx_locations_hash
                 ON tx_locations(tx_hash);
 
+            -- Tier 72 vote-dedup index: every Tier 72 vote tx
+            -- (MessageTransaction with vote_target set) adds a row
+            -- here at store-time.  The primary key is keyed on
+            -- (poll_txid, voter_id, block_hash) -- not just
+            -- (poll_txid, voter_id) -- so that competing-fork
+            -- inclusions of the same (poll, voter) pair across two
+            -- block_hashes don't collide on insertion; the
+            -- has_voted_canonical lookup filters by the canonical
+            -- block_hash set at query time.  Same shape as
+            -- tx_locations.  No deletion on reorg: orphaned-branch
+            -- rows are filtered out by the canonical check, and
+            -- permanence forbids deletion of consensus-relevant
+            -- records.
+            CREATE TABLE IF NOT EXISTS vote_records (
+                poll_txid BLOB NOT NULL,
+                voter_id BLOB NOT NULL,
+                block_hash BLOB NOT NULL,
+                block_height INTEGER NOT NULL,
+                tx_hash BLOB NOT NULL,
+                PRIMARY KEY (poll_txid, voter_id, block_hash)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vote_records_lookup
+                ON vote_records(poll_txid, voter_id);
+
             -- Tier 17 ReactTransaction state: ground-truth per-pair
             -- (voter, target, target_is_user) -> latest_choice map.
             -- Per-target aggregates (user_trust_score, message_score)
@@ -1157,6 +1212,26 @@ class ChainDB:
                         tx_index,
                     ),
                 )
+                # Tier 72 vote-dedup: a vote-bearing MessageTransaction
+                # gets a row in vote_records keyed on (poll_txid,
+                # voter_id, block_hash).  Idempotent via INSERT OR
+                # REPLACE.  Canonical filtering happens at lookup time.
+                vt = getattr(tx, "vote_target", None)
+                if vt is not None:
+                    poll_txid, _option_index = vt
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO vote_records "
+                        "(poll_txid, voter_id, block_hash, "
+                        " block_height, tx_hash) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            bytes(poll_txid),
+                            tx.entity_id,
+                            block.block_hash,
+                            block.header.block_number,
+                            tx.tx_hash,
+                        ),
+                    )
         self._maybe_commit()
 
     def get_block_by_hash(self, block_hash: bytes, state=None, include_witnesses=False) -> Block | None:
