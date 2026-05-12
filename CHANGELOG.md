@@ -4,6 +4,114 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.76.1] — 2026-05-11
+
+Patch release.  Audit r48 top-3 ships: three independent local-only
+fixes spanning the proposer-side selection model, validator in-memory
+state hygiene, and CLI fee-resolution discipline.  No new tx kinds,
+no new wire format, no consensus rule change at the validator, no
+hard fork.
+
+### Fixed
+
+  * **Non-message pending pools rank by fee-per-byte, not absolute
+    fee (audit r48 #1 -- economics top-1).**  CLAUDE.md fee-model
+    anchor: "Selection priority is fee-per-byte, never absolute fee.
+    ... Don't carve out per-type fee logic; if a new tx kind is added,
+    slot it into this model rather than inventing a parallel one."
+    Two parallel ranking surfaces silently violated the anchor:
+    ``Server._admit_to_pool`` evicted by raw ``tx.fee`` (within-pool
+    AND cross-pool ``global_min`` scan), and the proposer drain at
+    ``Server._select_block_transactions`` sliced
+    ``list(pending_<kind>.values())[:MAX_TXS_PER_BLOCK]`` in
+    insertion order for the stake, unstake, and governance pools.
+    A 10 kB rotation paying fee=2000 evicted a 60-byte stake paying
+    fee=1900 even though the stake offered ~30x the revenue-per-
+    stored-byte; an attacker could spam high-absolute-fee envelopes
+    to evict legitimate small bids across the global PENDING_POOL_MAX
+    _SIZE*2 cap; the proposer leaked revenue per block under byte-
+    budget pressure.
+
+    Abstraction-over-symptom fix: route every server-side ranking
+    site through the same
+    ``messagechain.core.mempool._fee_per_byte`` helper the Mempool
+    already uses for message-tx selection.  Single chokepoint;
+    adding a new non-message pool (or a new tx kind that joins an
+    existing pool) now picks up density ranking by construction.
+    Pre-fix and post-fix orderings are both valid blocks; selection
+    is local to the proposer; an old node and a new node producing
+    different blocks at the same height has always been allowed.
+    Sibling defects deferred to a follow-up cycle: RBF lifted to
+    every pool, and ``NEW_ACCOUNT_FEE`` / ``KEY_ROTATION_FEE`` flat
+    surcharges retuned to per-byte (hard-fork-gated economic
+    retune).  (523bd9f)
+
+  * **Prune in-memory ``Blockchain._stake_snapshots`` at the same
+    window as chaindb (audit r48 #2 -- security top-1).**  The
+    in-memory map was append-only forever even though the chaindb
+    mirror was already pruned at
+    ``FINALITY_VOTE_MAX_AGE_BLOCKS`` via
+    ``prune_stake_snapshots_before(cutoff)``.  A long-running honest
+    validator accumulated ~2.6M block-entries/year * ~50 validators
+    * ~40 B per row -> multi-GB resident state inside a year.  Two
+    CLAUDE.md anchors at risk: honest-operator insurance (OOM-driven
+    restart churn turns into slashable false-positives during
+    chaotic reboots) and hobbyist full-node accessibility for
+    centuries.
+
+    The "permanent in-memory stake snapshots" framing of commit
+    4af0c8d asserted a stronger property than the system actually
+    delivers, and was inconsistent with the chaindb prune added
+    later.  Specifically: the chaindb mirror is already pruned at
+    the same window, so a cold-restarted node only rehydrates the
+    trailing FINALITY_VOTE_MAX_AGE_BLOCKS worth of snapshots; if
+    those older snapshots were truly consensus-required, cold
+    restart would break the chain (it doesn't, because no consumer
+    reads beyond the window).  Stake snapshots are a deterministic
+    function of accumulated tx history -- a derived index, not a
+    primary record.
+
+    Abstraction-over-symptom fix: new
+    ``Blockchain._prune_stake_snapshots_before(height_cutoff)``
+    helper is the single chokepoint for the in-memory prune,
+    mirroring chaindb's helper of the same name.
+    ``_record_stake_snapshot`` computes the cutoff once from
+    FINALITY_VOTE_MAX_AGE_BLOCKS and applies it to BOTH surfaces in
+    lockstep.  Supersedes the stale
+    ``tests/test_stake_snapshot_permanence.py`` from 4af0c8d.
+    (248cb3c)
+
+  * **Unify signing-command fee floor through the server's live
+    quote (audit r48 #3 -- UX top-1).**  Pre-fix only ``cmd_transfer``
+    (audit r45 #2) consulted ``server_min_fee``.  Every other signing
+    command -- ``cmd_send``, ``cmd_react``, ``cmd_stake``,
+    ``cmd_unstake``, ``cmd_propose``, ``cmd_vote``, ``cmd_rotate_key``,
+    ``cmd_send_multi_submit`` -- validated explicit ``--fee`` against
+    a stale local constant (``calculate_min_fee``, ``KEY_ROTATION_FEE``,
+    ``GOVERNANCE_VOTE_FEE``, ``proposal_fee_floor``) or skipped the
+    floor check entirely.  CLAUDE.md anchors at risk: dual-purpose-
+    token / "mainstream-asset quality bar" (silent over/under-charge
+    is the canonical violation), and the fee-model anchor "when the
+    fee model shifts, every auto-fee path shifts with it -- don't
+    leave a tx kind defaulting to a stale flat fee while others
+    auto-bid by density."  Audit r45 #2 closed this for transfer;
+    this round extends the same closure to every other signing
+    command via a shared chokepoint.
+
+    Abstraction-over-symptom fix: new
+    ``cli._resolve_fee_with_server_floor(*, kind, host, port, args,
+    estimate_extra=None, auto_fee_extra=None, local_min_hint=None,
+    target_height=None)`` helper is the single chokepoint every
+    non-transfer signing command now routes through.  Calls
+    ``estimate_fee`` once to extract both ``server_min_fee`` AND
+    ``mempool_fee``, picks ``auto_fee`` if ``--fee`` is omitted,
+    floors the picked fee at ``max(server_min_fee, local_min_hint)``
+    as defense-in-depth, and ``sys.exit(1)``s on explicit ``--fee``
+    below the live floor with a friendly error that quotes the
+    server's number.  Adding a new signing path that bypasses this
+    helper reintroduces the audit r48 #3 defect by definition.
+    (4ae6c28)
+
 ## [1.76.0] — 2026-05-11
 
 Minor release.  Audit r47 top-3 ships: one new hard fork (Tier 71 --
