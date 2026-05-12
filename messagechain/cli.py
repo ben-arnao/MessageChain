@@ -2952,6 +2952,101 @@ def _should_include_pubkey(
     return not resp["result"].get("pubkey_registered", True)
 
 
+def _resolve_fee_with_server_floor(
+    *,
+    kind: str,
+    host: str,
+    port: int,
+    args,
+    estimate_extra: dict | None = None,
+    auto_fee_extra: dict | None = None,
+    local_min_hint: int | None = None,
+    target_height: int | None = None,
+) -> tuple[int, int]:
+    """Resolve a signing command's submission fee with the server's
+    live admission floor as the authoritative lower bound.
+
+    Pre-audit-r48 only ``cmd_transfer`` (audit r45 #2) consulted
+    ``server_min_fee``.  Every other signing command validated explicit
+    ``--fee`` against a stale local constant (``calculate_min_fee``,
+    ``KEY_ROTATION_FEE``, ``GOVERNANCE_VOTE_FEE``, ``proposal_fee_floor``)
+    or skipped the floor check entirely.  The recurrence-pattern r45 #2
+    closed for transfer extends to every signing command via this
+    helper, in lockstep with the CLAUDE.md fee-model anchor "when the
+    fee model shifts, every auto-fee path shifts with it -- don't
+    leave a tx kind defaulting to a stale flat fee while others auto-
+    bid by density."
+
+    Returns ``(fee, server_min_fee)``.  Exits on explicit ``--fee``
+    below the server's live floor.  Behavior is identical in shape to
+    ``cmd_transfer``'s pre-existing pattern; this helper is the single
+    chokepoint every other signing command now routes through.
+
+    ``estimate_extra`` and ``auto_fee_extra`` carry kind-specific
+    payload (``recipient_id`` for transfer, ``stored_size``/``message``
+    for send, etc.).  ``local_min_hint`` is an optional secondary floor
+    (e.g. ``calculate_min_fee`` for ``send``) layered on top of the
+    server's quote as defense-in-depth -- the server's quote is the
+    authoritative gate.
+    """
+    from client import rpc_call
+    from messagechain.config import MIN_FEE
+    from messagechain.economics.auto_fee import (
+        auto_fee, urgency_to_target_blocks,
+    )
+    estimate_extra = estimate_extra or {}
+    auto_fee_extra = auto_fee_extra or {}
+    urgency = getattr(args, "urgency", "normal")
+
+    est_payload = {
+        "kind": kind,
+        "target_blocks": urgency_to_target_blocks(urgency),
+        "urgency": urgency,
+        **estimate_extra,
+    }
+    est_resp = rpc_call(host, port, "estimate_fee", est_payload)
+    server_min_fee = MIN_FEE
+    mempool_estimate = 0
+    if est_resp.get("ok"):
+        r = est_resp["result"]
+        server_min_fee = int(r.get("min_fee", MIN_FEE))
+        mempool_estimate = int(r.get("mempool_fee", 0))
+
+    # Compose the final floor: server's live quote, plus the caller's
+    # local hint (e.g. a signature-aware floor that the server's quote
+    # may not include).  ``max`` is correct because both represent
+    # admission lower bounds.
+    floor = server_min_fee
+    if local_min_hint is not None:
+        floor = max(floor, int(local_min_hint))
+
+    fee = getattr(args, "fee", None)
+    if fee is None:
+        if target_height is None:
+            info_resp = rpc_call(host, port, "get_chain_info", {})
+            if info_resp.get("ok"):
+                count = info_resp["result"].get("height", 0) or 0
+                target_height = max(count - 1, 0) + 1
+        fee = auto_fee(
+            kind,
+            urgency=urgency,
+            current_height=target_height,
+            mempool_estimate=mempool_estimate,
+            **auto_fee_extra,
+        )
+        # Defense-in-depth: floor at the live server quote so a stale
+        # local auto_fee height never underbids the validator's actual
+        # admission rule.
+        fee = max(fee, floor)
+    elif fee < floor:
+        print(
+            f"Error: --fee {fee} is below the chain's live floor "
+            f"{floor} for {kind} tx."
+        )
+        sys.exit(1)
+    return fee, server_min_fee
+
+
 def cmd_send(args):
     """Send a message to the chain."""
     from messagechain.identity.identity import Entity
@@ -3116,55 +3211,36 @@ def cmd_send(args):
             current_height=target_height,
             prev_bytes=prev_overhead,
         )
-    fee = args.fee
-    if fee is None:
-        # Drive the auto-pick through the unified helper in
-        # `messagechain.economics.auto_fee` so every tx-submitting
-        # CLI command uses the same fee picker (CLAUDE.md anchor:
-        # "When the fee model shifts, every auto-fee path shifts with
-        # it").  The percentile rung is selected by --urgency (default
-        # "normal" = ~3 blocks = 75th percentile).
-        from messagechain.economics.auto_fee import (
-            auto_fee, urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        target_blocks = urgency_to_target_blocks(urgency)
-        # Server-side percentile estimate * stored bytes -- mirrors the
-        # proposer's selection axis (fee-per-byte) so a default send
-        # under load actually competes for inclusion instead of being
-        # silently evicted at the floor.
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "message",
-            "message": args.message,
-            "target_blocks": target_blocks,
-            "urgency": urgency,
-        })
-        if est_resp.get("ok"):
-            mempool_estimate = est_resp["result"].get("mempool_fee", 0)
-        else:
-            mempool_estimate = 0
-        fee = auto_fee(
-            "message",
-            stored_size=len(stored_bytes) + prev_overhead,
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
-        # Don't drop below the local floor either (auto_fee already
-        # enforces tx_floor, but the live signature-aware floor adds a
-        # term auto_fee doesn't see -- keep both checks).
-        fee = max(fee, local_min)
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper so the message-send
+    # path matches every other signing command's fee-resolution
+    # semantics (server's live admission floor is authoritative; local
+    # signature-aware floor is layered as defense-in-depth).  Pre-fix
+    # this path validated explicit ``--fee`` against ``local_min`` only
+    # and could silently bounce a sender who priced correctly against
+    # the chain's actual height-aware floor.
+    from messagechain.economics.auto_fee import urgency_to_target_blocks
+    urgency = getattr(args, "urgency", "normal")
+    target_blocks = urgency_to_target_blocks(urgency)
+    fee_was_explicit = args.fee is not None
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="message",
+        host=host,
+        port=port,
+        args=args,
+        estimate_extra={"message": args.message},
+        auto_fee_extra={
+            "stored_size": len(stored_bytes) + prev_overhead,
+        },
+        local_min_hint=local_min,
+        target_height=target_height,
+    )
+    if not fee_was_explicit:
         print(
             f"Fee: {fee} tokens (auto, target ~{target_blocks} blocks, "
             f"urgency={urgency})"
         )
     else:
-        if fee < local_min:
-            print(
-                f"Error: fee {fee} is below the minimum {local_min} for "
-                f"a {len(msg_bytes)}-byte message. Raise the fee or drop --fee."
-            )
-            sys.exit(1)
         print(f"Fee: {fee} tokens")
 
     # Tier 11: auto-include the sender's pubkey on first send.  Routes
@@ -3420,35 +3496,21 @@ def cmd_send_multi_submit(args) -> int:
         )
     target_height = tip_height + 1
 
-    # Auto-fee path: mirror cmd_send so a user posting under load
-    # actually competes for inclusion instead of being silently
-    # evicted at the floor.
-    fee = getattr(args, "fee", None)
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee, urgency_to_target_blocks,
-        )
-        from messagechain.core.compression import encode_payload
-        urgency = getattr(args, "urgency", "normal") or "normal"
-        target_blocks = urgency_to_target_blocks(urgency)
-        est_resp = _rpc(state_host, state_port, "estimate_fee", {
-            "kind": "message",
-            "message": args.message,
-            "target_blocks": target_blocks,
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            int(est_resp["result"].get("mempool_fee", 0) or 0)
-            if est_resp.get("ok") else 0
-        )
-        stored_bytes, _ = encode_payload(args.message.encode("utf-8"))
-        fee = auto_fee(
-            "message",
-            stored_size=len(stored_bytes),
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper so explicit ``--fee``
+    # validation uses the server's live floor.  cmd_send-multi shares
+    # the helper with cmd_send and every other signing command.
+    from messagechain.core.compression import encode_payload
+    stored_bytes, _ = encode_payload(args.message.encode("utf-8"))
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="message",
+        host=state_host,
+        port=state_port,
+        args=args,
+        estimate_extra={"message": args.message},
+        auto_fee_extra={"stored_size": len(stored_bytes)},
+        target_height=target_height,
+    )
 
     # Tier 11: auto-include the sender's pubkey on first send.  Routes
     # through the shared ``_should_include_pubkey`` helper -- the same
@@ -3900,32 +3962,15 @@ def cmd_stake(args):
     # constant: that 1000-token clamp was a stale artifact that
     # broke the Tier 29 anchored "1 faucet drip funds an end-to-end
     # validator stake" flow (drip=300 = 200 stake + 100 fee).
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee, urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        info_resp = rpc_call(host, port, "get_chain_info", {})
-        target_height = None
-        if info_resp.get("ok"):
-            count = info_resp["result"].get("height", 0) or 0
-            target_height = max(count - 1, 0) + 1
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "stake",
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee(
-            "stake",
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper so explicit ``--fee``
+    # validation uses the server's live floor.
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="stake",
+        host=host,
+        port=port,
+        args=args,
+    )
     tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
@@ -4072,32 +4117,14 @@ def cmd_unstake(args):
     # (post-Tier-16: MIN_FEE=100), and the urgency-driven percentile
     # estimate sits above it under load.  Do NOT re-clamp against
     # ``MIN_FEE_POST_FLAT`` -- same stale-floor bug as cmd_stake.
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee, urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        info_resp = rpc_call(host, port, "get_chain_info", {})
-        target_height = None
-        if info_resp.get("ok"):
-            count = info_resp["result"].get("height", 0) or 0
-            target_height = max(count - 1, 0) + 1
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "unstake",
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee(
-            "unstake",
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper.
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="unstake",
+        host=host,
+        port=port,
+        args=args,
+    )
     tx = create_unstake_transaction(
         entity, args.amount, nonce=nonce, fee=fee,
         signing_keypair=cold_signing_keypair,
@@ -4501,35 +4528,17 @@ def cmd_rotate_key(args):
         entity, rotation_number=current_rotation, progress=progress,
     )
 
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee as auto_fee_helper,
-            urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        info_resp = rpc_call(host, port, "get_chain_info", {})
-        target_height = None
-        if info_resp.get("ok"):
-            count = info_resp["result"].get("height", 0) or 0
-            target_height = max(count - 1, 0) + 1
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "rotate-key",
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee_helper(
-            "rotate-key",
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
-        # Defensive backstop on the type-specific floor.
-        fee = max(fee, KEY_ROTATION_FEE)
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper.  ``KEY_ROTATION_FEE``
+    # remains as a defense-in-depth local hint -- the server's live
+    # floor is the authoritative gate.
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="rotate-key",
+        host=host,
+        port=port,
+        args=args,
+        local_min_hint=KEY_ROTATION_FEE,
+    )
     rot_tx = create_key_rotation(
         entity, new_kp, rotation_number=current_rotation, fee=fee,
     )
@@ -5124,32 +5133,20 @@ def cmd_propose(args):
         len(args.title.encode("utf-8"))
         + len(args.description.encode("utf-8"))
     )
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee as auto_fee_helper,
-            urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "propose",
-            "payload_bytes": payload_bytes,
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee_helper(
-            "propose",
-            payload_bytes=payload_bytes,
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
-        # Defensive: never undercut the chain's own floor function.
-        fee = max(fee, proposal_fee_floor(payload_bytes, target_height))
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper.  ``proposal_fee_floor``
+    # is a chain-aware local hint -- defense-in-depth on top of the
+    # server's authoritative live quote.
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="propose",
+        host=host,
+        port=port,
+        args=args,
+        estimate_extra={"payload_bytes": payload_bytes},
+        auto_fee_extra={"payload_bytes": payload_bytes},
+        local_min_hint=proposal_fee_floor(payload_bytes, target_height),
+        target_height=target_height,
+    )
 
     # Fee preview + confirmation banner.  Governance proposals charge
     # the largest single fee in the protocol (GOVERNANCE_PROPOSAL_FEE
@@ -5237,34 +5234,17 @@ def cmd_vote(args):
         print(f"Error: Invalid proposal ID (must be 32 bytes hex): {args.proposal}")
         sys.exit(1)
 
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee as auto_fee_helper,
-            urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        info_resp = rpc_call(host, port, "get_chain_info", {})
-        target_height = None
-        if info_resp.get("ok"):
-            count = info_resp["result"].get("height", 0) or 0
-            target_height = max(count - 1, 0) + 1
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "vote",
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee_helper(
-            "vote",
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
-        fee = max(fee, GOVERNANCE_VOTE_FEE)
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper.  ``GOVERNANCE_VOTE_FEE``
+    # is a defense-in-depth local hint; server's live floor is the
+    # authoritative gate.
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="vote",
+        host=host,
+        port=port,
+        args=args,
+        local_min_hint=GOVERNANCE_VOTE_FEE,
+    )
 
     # Fee preview (no confirm prompt -- vote fees are small enough
     # that an extra interactive step is over-friction for the user).
@@ -5348,33 +5328,16 @@ def cmd_react(args):
         data_dir=getattr(args, "data_dir", None),
     )
 
-    fee = args.fee
-    if fee is None:
-        from messagechain.economics.auto_fee import (
-            auto_fee as auto_fee_helper,
-            urgency_to_target_blocks,
-        )
-        urgency = getattr(args, "urgency", "normal")
-        info_resp = rpc_call(host, port, "get_chain_info", {})
-        target_height = None
-        if info_resp.get("ok"):
-            count = info_resp["result"].get("height", 0) or 0
-            target_height = max(count - 1, 0) + 1
-        est_resp = rpc_call(host, port, "estimate_fee", {
-            "kind": "react",
-            "target_blocks": urgency_to_target_blocks(urgency),
-            "urgency": urgency,
-        })
-        mempool_estimate = (
-            est_resp["result"].get("mempool_fee", 0)
-            if est_resp.get("ok") else 0
-        )
-        fee = auto_fee_helper(
-            "react",
-            urgency=urgency,
-            current_height=target_height,
-            mempool_estimate=mempool_estimate,
-        )
+    # Audit r48 #3: route through the shared
+    # ``_resolve_fee_with_server_floor`` helper so explicit ``--fee``
+    # validation uses the server's live floor (not silently accepted
+    # only to bounce at the RPC).
+    fee, _server_min_fee = _resolve_fee_with_server_floor(
+        kind="react",
+        host=host,
+        port=port,
+        args=args,
+    )
 
     # Fee preview (no confirm prompt -- reaction fees are small).
     # Without this print the user had zero signal about cost between

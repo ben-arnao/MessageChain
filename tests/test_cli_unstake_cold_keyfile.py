@@ -312,7 +312,12 @@ class TestCliUnstakeColdKeyfile(_Base):
             if method == "get_chain_info":
                 return {"ok": True, "result": {"height": 5000}}
             if method == "estimate_fee":
-                return {"ok": True, "result": {"mempool_fee": 1}}
+                # Post-Tier-49 mainnet has MARKET_FEE_FLOOR=1; reflect
+                # that in the mock so the audit r48 #3 fee-floor preflight
+                # accepts fee=1.
+                return {"ok": True, "result": {
+                    "mempool_fee": 1, "min_fee": 1,
+                }}
             if method == "get_authority_key":
                 return {"ok": True, "result": {
                     "authority_key": cold.public_key.hex(),
