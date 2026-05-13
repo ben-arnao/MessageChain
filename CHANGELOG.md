@@ -4,6 +4,146 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.84.0] — 2026-05-13
+
+Audit r56 top-3 ships: one consensus-visible defense-rule retune
+that closes the retroactive-evidence sock-puppet collusion vector
+(new Tier 78 hard fork, activation height 18500), one structural
+wallet-UI hardening fix that lifts the audit r55 #1 cold-key
+chokepoint from per-call-site to a per-kind registry (soft, no fork),
+and one UX / value-prop fix that makes the slashable-evidence
+escalation path reachable from the public surface for the first time
+(soft, no fork).
+
+### Changed (Tier 78, consensus-breaking, height-gated)
+
+  * **Retroactive-evidence stake-pin defense via
+    `_stake_at_height` (audit r56 #1 -- security top-1).** CLAUDE.md
+    anchors defended: "Collective censorship-resistance" +
+    "Honest operators are insured".
+
+    Vector closed: retroactive consensus-quorum active-set checks
+    (NonResponseEvidence witness filter, InclusionList quorum
+    verifier) previously read `blockchain.supply.staked` -- the
+    LIVE map -- when deciding whether a witness/reporter was in the
+    active set AT the past `observed_height` / `report_height` they
+    claim to be reporting about.  An attacker who freshly stakes
+    `WITNESS_QUORUM` sock-puppet validators today can sign retroactive
+    `WitnessObservation` messages for an observed_height in the past
+    where they were NOT validators; the admission gate happily counts
+    their current stake to satisfy the active-set check and drives a
+    NonResponseEvidenceTx through against a victim.  Same shape on
+    the IL side: a recent-stake attacker could inflate per-entry
+    stake support by counting stake that wasn't present at report
+    time.
+
+    Tier 78 routes both retroactive checks through the pinned stake
+    snapshot at the relevant PAST height via a new
+    `Blockchain._stake_at_height(entity_id, height)` chokepoint --
+    strict on miss (returns 0 "not staked") rather than falling back
+    to live state.  Asymmetry vs. `_pinned_stake_at` is load-bearing:
+    fork-weight accumulation legitimately needs a live-fallback for
+    deep history; retroactive evidence must NEVER count fresh stake.
+
+    Production retention is comfortable: snapshot window is
+    `FINALITY_VOTE_MAX_AGE_BLOCKS` (10 * FINALITY_INTERVAL = 1000
+    blocks); worst-case retroactive lookback is
+    `WITNESS_OBSERVATION_RETENTION_BLOCKS` = 64 for NonResponse and
+    `INCLUSION_LIST_WAIT_BLOCKS` = 4 for IL -- both comfortably
+    inside the retention window.  A miss in normal operation
+    indicates a cold-restart pin gap, which the strict-0 fail-safe
+    correctly classifies as "not staked."
+
+    Activation height `RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT = 18500`
+    sits 2000 blocks above Tier 77 (16500), matching the Tier 70 ->
+    71 -> 73 -> 74 -> 75 -> 76 -> 77 ~13.9-day cohort spacing.  Pre-
+    fork the legacy live-map read runs unchanged for replay
+    determinism; historical-block replay across the activation gate
+    is byte-identical to legacy behavior.  Pure consensus-rule swap;
+    no new wire format, no new tx kinds, no state-tree changes.
+    (5cfec6d)
+
+### Fixed
+
+  * **Wallet-UI cold-key chokepoint covers EVERY op_* via
+    `_KIND_IS_COLD_GATED` registry (audit r56 #2 -- security top-1).**
+    CLAUDE.md anchors defended: honest-operator insurance + token-as-
+    tradable-asset mainstream-asset quality bar.
+
+    Audit r55 #1 closed the wallet-UI leaf-burn footgun on
+    `op_unstake` by routing it through `_require_hot_signable_via_rpc`
+    BEFORE leaf reservation.  That was symptom-level: the right
+    abstraction is that the wallet UI is a hot-key-only signing
+    surface, so the chokepoint belongs at the top of EVERY `op_*` --
+    not just the one cold-gated kind we knew about at the time.
+
+    Today only `unstake` is rejected by the chain when signed with the
+    hot key under a SetAuthorityKey, but a future tier widening cold-
+    key authority to another tx kind would otherwise have to re-
+    discover the leaf-burn defect from scratch on every wallet-UI
+    signing surface, with the burden on the implementer to remember
+    to wire each op_* call site.
+
+    Three changes: new `_KIND_IS_COLD_GATED` registry (single source
+    of truth for "which wallet ops does the chain reject when signed
+    hot under SetAuthorityKey?"); `_require_hot_signable_via_rpc`
+    consults the registry and short-circuits OK for non-cold-gated
+    kinds WITHOUT calling get_authority_key (preserves wallet-UI
+    usability for cold-key holders on non-gated ops); every op_*
+    (`op_send_message`, `op_transfer`, `op_stake`, `op_unstake`,
+    `op_react`, `op_propose`, `op_vote_proposal`) calls the
+    chokepoint at the top of the body, BEFORE any leaf-resolution
+    RPC.  Today the call is a no-op short-circuit for non-cold-gated
+    kinds; the structural pin matters -- the moment the registry
+    widens, every existing op inherits the leaf-burn prevention by
+    construction.  Soft fix: no consensus rule change, no wire-format
+    change, no fork. (5222ab2)
+
+  * **`_print_submit_success_footer` chokepoint + receipt-page
+    NOT_FOUND command + README escalation surface (audit r56 #3 --
+    UX / value-prop top-1).** CLAUDE.md anchor defended: "Collective
+    censorship-resistance" -- the structural defense erodes from the
+    operator-UX side even though the consensus rule is correct.
+
+    Pre-r56 three rungs of the slashable-evidence escalation chain
+    (`send -> bundle saved -> messagechain receipt <tx> ->
+    messagechain submit-evidence`) were broken or invisible:
+
+    (a) `cmd_send` / `cmd_transfer` / `cmd_react` each inlined the
+        same receipt-bundle-save + share-URL + permanence-framing
+        print pattern with subtle drift -- only cmd_send surfaced
+        the share URL and permanence framing.
+
+    (b) The web receipt page's NOT_FOUND branch told visitors to
+        "see the receipt CLI for slashable-evidence escalation"
+        but did NOT print the actual `messagechain submit-evidence
+        censorship --receipt ...` command -- while the CLI's
+        NOT_FOUND branch prints it verbatim.
+
+    (c) The README CLI reference omitted both `messagechain
+        receipt <tx_hash>` AND `messagechain submit-evidence` --
+        the middle and last rungs of the escalation chain.
+
+    Three sub-fixes share one root abstraction: new
+    `_print_submit_success_footer` chokepoint in cli.py absorbs the
+    receipt-bundle save + permanence framing + verify-CLI print
+    pattern; `share_url` parameter gates the `/r/<tx>` line so
+    message-shape txs get it and transfer/react don't.  Future
+    signing commands route through the helper instead of copy-
+    pasting.  `static/receipt.html`'s `renderNotFound` mirrors the
+    CLI's escalation text with both copy-pasteable command lines
+    (`textContent` preserves the audit r43 #2 XSS-load-bearing
+    invariant); `.verdict .narrative` gains `white-space: pre-wrap`
+    so the line breaks render.  `README.md` CLI reference adds both
+    escalation commands to the Personal-wallet section.
+
+    Audit r45 #3's structural pin (cmd_transfer / cmd_react must
+    save the receipt) is preserved with a small widening: both the
+    direct `_save_receipt_bundle` call AND the helper-routed
+    `_print_submit_success_footer` call satisfy the invariant.  Soft
+    fix: no consensus rule change, no wire-format change, no fork.
+    (924a9f5)
+
 ## [1.83.0] — 2026-05-13
 
 Audit r55 top-3 ships alongside the remaining wallet-UI feature
