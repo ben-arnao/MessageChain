@@ -70,8 +70,10 @@ import os
 import secrets
 import socketserver
 import threading
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qs, urlsplit
+
+from messagechain.config import CHAIN_ID, PUBLIC_FEED_MAX_LIMIT
 
 
 logger = logging.getLogger("messagechain.local_wallet")
@@ -163,7 +165,13 @@ class _WalletHandlerContext:
     """Per-server shared state.  Held on the server object so handler
     instances (one per request) can see it without globals."""
 
-    def __init__(self, blockchain, token: str, entity=None):
+    def __init__(
+        self,
+        blockchain,
+        token: str,
+        entity=None,
+        rpc_caller: Optional[Callable] = None,
+    ):
         # Optional in the empty-shell phase.  Becomes required when
         # real read/write routes land.
         self.blockchain = blockchain
@@ -172,6 +180,12 @@ class _WalletHandlerContext:
         # whose private key the server will use to sign /wallet/*
         # writes.  None for read-only / shell mode.
         self.entity = entity
+        # Callable `(method: str, params: dict) -> dict` returning the
+        # JSON-RPC response.  In production this is a thin wrapper
+        # around `client.rpc_call(host, port, ...)` for the local
+        # validator.  Tests inject a fake to avoid spinning a real
+        # validator just to exercise the wallet-side routing.
+        self.rpc_caller = rpc_caller
 
 
 class _WalletHandler(http.server.BaseHTTPRequestHandler):
@@ -293,7 +307,147 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
 
+        # Read endpoints — same JSON shape as PublicFeedServer's
+        # /v1/* surface so the same client JS works against either
+        # server.  Implemented as RPC-proxies to the local validator
+        # so the wallet UI is process-independent (does not require
+        # an in-process chain handle and does not depend on the
+        # public feed being enabled).
+        if path == "/v1/info":
+            self._serve_v1_info()
+            return
+        if path == "/v1/latest":
+            self._serve_v1_latest(split.query)
+            return
+        if path == "/v1/entity":
+            self._serve_v1_entity(split.query)
+            return
+        if path == "/v1/tx_status":
+            self._serve_v1_tx_status(split.query)
+            return
+
         self._send_text(404, "Not Found")
+
+    # --- read-side RPC proxies ----------------------------------------
+
+    def _rpc(self, method: str, params: dict):
+        """Call the configured RPC caller; return (ok, payload).
+
+        On connection failure / unconfigured caller, returns
+        ``(False, {"error": ...})`` so callers can map to a 503.  The
+        wallet server depends on the local validator being reachable;
+        when it is not, the right answer to the browser is "the chain
+        backend is unavailable", not a misleading 200 with empty data."""
+        ctx = self.server._wallet_context
+        if ctx.rpc_caller is None:
+            return False, {"error": "no RPC backend configured"}
+        try:
+            return True, ctx.rpc_caller(method, params)
+        except Exception as e:
+            logger.warning(
+                "wallet RPC %s failed: %s", method, type(e).__name__,
+            )
+            return False, {"error": f"RPC unreachable: {type(e).__name__}"}
+
+    def _serve_v1_info(self):
+        ok, info_resp = self._rpc("get_chain_info", {})
+        if not ok:
+            self._send_json(503, {"ok": False, **info_resp})
+            return
+        if not info_resp.get("ok"):
+            self._send_json(502, info_resp)
+            return
+        info = info_resp.get("result") or {}
+        # Reshape into the public-feed /v1/info contract so client JS
+        # written against the public feed renders verbatim here.
+        body = {
+            "ok": True,
+            "chain_id": CHAIN_ID.decode("ascii", errors="replace"),
+            "genesis_hash": info.get("genesis_hash"),
+            "tip_hash": info.get("tip_hash"),
+            "state_root": info.get("state_root"),
+            "height": info.get("height"),
+            "last_block_timestamp": info.get("last_block_timestamp"),
+            # Faucet / quickpost are operator-side public-feed knobs
+            # and have no analogue here — the wallet UI signs its own
+            # txs from the loaded entity.
+            "faucet_enabled": False,
+            "quickpost_enabled": False,
+        }
+        self._send_json(200, body)
+
+    def _serve_v1_latest(self, query: str):
+        params = parse_qs(query or "")
+        raw_limit = (params.get("limit") or ["20"])[0]
+        try:
+            limit = int(raw_limit)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "invalid limit"})
+            return
+        # Same clamp as PublicFeedServer so the UI cannot accidentally
+        # request a chain-walk by passing an absurd value.
+        limit = max(1, min(limit, PUBLIC_FEED_MAX_LIMIT))
+
+        ok_msgs, msgs_resp = self._rpc("get_messages", {"count": limit})
+        if not ok_msgs:
+            self._send_json(503, {"ok": False, **msgs_resp})
+            return
+        if not msgs_resp.get("ok"):
+            self._send_json(502, msgs_resp)
+            return
+        ok_info, info_resp = self._rpc("get_chain_info", {})
+        height = None
+        if ok_info and info_resp.get("ok"):
+            height = (info_resp.get("result") or {}).get("height")
+        messages = (msgs_resp.get("result") or {}).get("messages") or []
+        self._send_json(200, {
+            "ok": True,
+            "height": height,
+            "messages": messages,
+        })
+
+    def _serve_v1_entity(self, query: str):
+        params = parse_qs(query or "")
+        raw_id = (params.get("id") or [""])[0].strip().lower()
+        if not raw_id or len(raw_id) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "id must be a 64-char hex entity_id",
+            })
+            return
+        try:
+            bytes.fromhex(raw_id)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "id must be valid hex"})
+            return
+        ok, resp = self._rpc("get_entity", {"entity_id": raw_id})
+        if not ok:
+            self._send_json(503, {"ok": False, **resp})
+            return
+        # Pass the RPC payload through unchanged; the public-feed
+        # /v1/entity contract is identical to the RPC's get_entity
+        # result, so re-shaping would be lossy busy-work.
+        self._send_json(200 if resp.get("ok") else 404, resp)
+
+    def _serve_v1_tx_status(self, query: str):
+        params = parse_qs(query or "")
+        tx_hash = (params.get("tx_hash") or [""])[0].strip().lower()
+        if not tx_hash or len(tx_hash) != 64:
+            self._send_json(400, {
+                "ok": False,
+                "error": "tx_hash must be 64 hex chars",
+            })
+            return
+        try:
+            bytes.fromhex(tx_hash)
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "tx_hash must be valid hex"})
+            return
+        ok, resp = self._rpc("get_tx_status", {"tx_hash": tx_hash})
+        if not ok:
+            self._send_json(503, {"ok": False, **resp})
+            return
+        self._send_json(200 if resp.get("ok") else 404, resp)
 
     def _serve_landing_page(self):
         # Fall back to an inline placeholder if the static file is
@@ -337,6 +491,8 @@ class LocalWalletServer:
         bind: str = "127.0.0.1",
         token: Optional[str] = None,
         entity=None,
+        rpc_endpoint: tuple = ("127.0.0.1", 9334),
+        rpc_caller: Optional[Callable] = None,
     ):
         _validate_loopback_bind(bind)
         self.blockchain = blockchain
@@ -344,6 +500,20 @@ class LocalWalletServer:
         self.bind = bind
         self.token = token if token is not None else _generate_session_token()
         self.entity = entity
+        self.rpc_endpoint = tuple(rpc_endpoint)
+        # Tests inject `rpc_caller` directly to bypass the actual RPC
+        # round-trip.  In production we lazily wrap `client.rpc_call`
+        # against `rpc_endpoint`.
+        if rpc_caller is None:
+            host_, port_ = self.rpc_endpoint
+            from client import rpc_call as _rpc_call
+
+            def _default_caller(method: str, params: dict) -> dict:
+                return _rpc_call(host_, port_, method, params)
+
+            self.rpc_caller = _default_caller
+        else:
+            self.rpc_caller = rpc_caller
         self._httpd: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
@@ -369,6 +539,7 @@ class LocalWalletServer:
             blockchain=self.blockchain,
             token=self.token,
             entity=self.entity,
+            rpc_caller=self.rpc_caller,
         )
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,

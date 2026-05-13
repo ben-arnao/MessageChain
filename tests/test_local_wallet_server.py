@@ -278,5 +278,217 @@ class TestUrlProperty(unittest.TestCase):
         self.assertEqual(srv.url, "http://127.0.0.1:9999/?t=abc123")
 
 
+# -----------------------------------------------------------------
+# Read endpoints — /v1/info, /v1/latest, /v1/entity, /v1/tx_status.
+# These are RPC-proxies to the local validator.  The wallet UI reuses
+# the same JSON shape as PublicFeedServer's /v1/* surface so the
+# client JS works against either backend unchanged.
+#
+# All read endpoints are token-gated — the wallet UI is private to
+# the user, and even read scrapes (e.g. "what feed is the operator
+# looking at right now?") shouldn't be available to other local
+# processes.
+# -----------------------------------------------------------------
+def _make_fake_rpc(handlers):
+    """Build a (method, params) -> dict callable from a method->fn map.
+    Unmapped methods raise so a forgotten stub blows up loudly in tests."""
+    def _call(method, params):
+        if method not in handlers:
+            raise NotImplementedError(f"fake_rpc: no handler for {method!r}")
+        return handlers[method](params)
+    return _call
+
+
+class TestV1Info(_WalletServerTestBase):
+    def test_returns_chain_info_in_public_feed_shape(self):
+        rpc = _make_fake_rpc({
+            "get_chain_info": lambda p: {"ok": True, "result": {
+                "height": 42,
+                "last_block_timestamp": 1_700_000_999.0,
+                "genesis_hash": "ab" * 32,
+                "tip_hash": "cd" * 32,
+                "state_root": "ef" * 32,
+            }},
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/info", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["height"], 42)
+        self.assertEqual(data["last_block_timestamp"], 1_700_000_999.0)
+        self.assertEqual(data["genesis_hash"], "ab" * 32)
+        self.assertEqual(data["tip_hash"], "cd" * 32)
+        self.assertEqual(data["state_root"], "ef" * 32)
+        # Wallet server doesn't run a faucet/quickpost — surface
+        # always-false so the client-side check returns clean.
+        self.assertFalse(data["faucet_enabled"])
+        self.assertFalse(data["quickpost_enabled"])
+        # chain_id is the on-chain constant; should be a string.
+        self.assertIsInstance(data["chain_id"], str)
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        status, _, _ = self._request(port, "GET", "/v1/info")
+        self.assertEqual(status, 401)
+
+    def test_503_when_rpc_unreachable(self):
+        # Simulate the local validator being down — the RPC caller
+        # raises ConnectionError.  Wallet server should report 503,
+        # not crash, and not lie with a stale 200.
+        def _raises(method, params):
+            raise ConnectionError("validator not running")
+        srv, port = self._spin_up(rpc_caller=_raises)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/info", headers=headers,
+        )
+        self.assertEqual(status, 503)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+
+
+class TestV1Latest(_WalletServerTestBase):
+    def test_returns_messages_with_height(self):
+        sample = [
+            {
+                "message": "hello", "entity_id": "ab" * 32,
+                "timestamp": 1_700_000_000.0, "tx_hash": "cd" * 32,
+                "block_number": 5,
+            },
+        ]
+        rpc = _make_fake_rpc({
+            "get_messages": lambda p: {
+                "ok": True, "result": {"messages": sample},
+            },
+            "get_chain_info": lambda p: {
+                "ok": True, "result": {"height": 7},
+            },
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/latest?limit=10", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["height"], 7)
+        self.assertEqual(data["messages"], sample)
+
+    def test_clamps_limit_to_max(self):
+        captured = {}
+        def _gm(p):
+            captured["count"] = p.get("count")
+            return {"ok": True, "result": {"messages": []}}
+        rpc = _make_fake_rpc({
+            "get_messages": _gm,
+            "get_chain_info": lambda p: {"ok": True, "result": {"height": 0}},
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, _ = self._request(
+            port, "GET", "/v1/latest?limit=99999", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        # Same clamp as PublicFeedServer (PUBLIC_FEED_MAX_LIMIT).
+        from messagechain.config import PUBLIC_FEED_MAX_LIMIT
+        self.assertEqual(captured["count"], PUBLIC_FEED_MAX_LIMIT)
+
+    def test_invalid_limit_returns_400(self):
+        rpc = _make_fake_rpc({})  # never called
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/latest?limit=garbage", headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(body)["ok"])
+
+
+class TestV1Entity(_WalletServerTestBase):
+    def test_returns_entity_payload(self):
+        rpc = _make_fake_rpc({
+            "get_entity": lambda p: {
+                "ok": True,
+                "result": {
+                    "entity_id": p["entity_id"],
+                    "balance": 1234,
+                    "stake": 200,
+                    "pubkey_registered": True,
+                    "sigs_remaining": 10000,
+                },
+            },
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        eid = "ab" * 32
+        status, _, body = self._request(
+            port, "GET", f"/v1/entity?id={eid}", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"]["entity_id"], eid)
+        self.assertEqual(data["result"]["balance"], 1234)
+
+    def test_invalid_id_returns_400(self):
+        rpc = _make_fake_rpc({})  # never called
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/entity?id=not-hex", headers=headers,
+        )
+        self.assertEqual(status, 400)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_unknown_entity_returns_404(self):
+        rpc = _make_fake_rpc({
+            "get_entity": lambda p: {"ok": False, "error": "Entity not found"},
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, _ = self._request(
+            port, "GET", f"/v1/entity?id={'00' * 32}", headers=headers,
+        )
+        self.assertEqual(status, 404)
+
+
+class TestV1TxStatus(_WalletServerTestBase):
+    def test_returns_tx_status(self):
+        rpc = _make_fake_rpc({
+            "get_tx_status": lambda p: {
+                "ok": True,
+                "result": {
+                    "tx_hash": p["tx_hash"],
+                    "in_mempool": False,
+                    "block_height": 99,
+                },
+            },
+        })
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        tx = "12" * 32
+        status, _, body = self._request(
+            port, "GET", f"/v1/tx_status?tx_hash={tx}", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"]["block_height"], 99)
+
+    def test_invalid_tx_hash_returns_400(self):
+        rpc = _make_fake_rpc({})
+        srv, port = self._spin_up(rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, _ = self._request(
+            port, "GET", "/v1/tx_status?tx_hash=short", headers=headers,
+        )
+        self.assertEqual(status, 400)
+
+
 if __name__ == "__main__":
     unittest.main()
