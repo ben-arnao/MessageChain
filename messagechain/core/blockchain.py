@@ -17932,11 +17932,23 @@ class Blockchain:
         genesis_hash_hex = (
             self.chain[0].block_hash.hex() if self.chain else None
         )
+        latest_block_hash_hex = (
+            self.chain[-1].block_hash.hex() if self.chain else None
+        )
         return {
             "chain_id": _CHAIN_ID.decode("ascii"),
             "genesis_hash": genesis_hash_hex,
             "height": self.height,
-            "latest_block_hash": self.chain[-1].block_hash.hex() if self.chain else None,
+            "latest_block_hash": latest_block_hash_hex,
+            # Audit r55 #3: ``tip_hash`` and ``last_block_timestamp``
+            # are the canonical /v1/info contract key names that
+            # PublicFeedServer + LocalWalletServer both already emit
+            # downstream.  Add them as aliases (NOT a rename) so
+            # external API consumers of the legacy ``latest_*`` shape
+            # continue to work AND the wallet UI's /v1/info proxy
+            # stops surfacing ``?`` for tip-hash / last-block-ts on
+            # every session.
+            "tip_hash": latest_block_hash_hex,
             # state_root of the tip -- consumed by operators cutting a
             # weak-subjectivity checkpoint (see `messagechain cut-checkpoint`).
             # Already derivable from the chain, so no new information is
@@ -17945,6 +17957,7 @@ class Blockchain:
                 self.chain[-1].header.state_root.hex() if self.chain else None
             ),
             "latest_block_timestamp": latest_ts,
+            "last_block_timestamp": latest_ts,
             "seconds_since_last_block": seconds_since_last,
             "registered_entities": len(self.public_keys),
             "chain_tips": tip_count,

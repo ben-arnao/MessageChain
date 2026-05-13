@@ -63,12 +63,21 @@ class TestPingHappyPath(unittest.TestCase):
         The endpoint line is load-bearing: this is the ONLY way a user
         can tell whether they ended up on a seed, a non-seed validator,
         or a local node after the auto-discovery logic runs.
+
+        Audit r55 #3: ``fake_info`` now uses the canonical
+        ``get_chain_info`` return shape (tip_hash / registered_entities /
+        seconds_since_last_block).  The old fake (best_hash /
+        validator_count) was pinning the very key-name drift that
+        broke the README-promoted first-run command.
         """
         fake_info = {
+            "chain_id": "messagechain-v1",
             "height": 1234,
-            "best_hash": "ab" * 32,
-            "validator_count": 7,
+            "genesis_hash": "ab" * 32,
+            "tip_hash": "cd" * 32,
+            "registered_entities": 7,
             "total_supply": 1_000_000_000,
+            "seconds_since_last_block": 42,
         }
         fake_response = {"ok": True, "result": fake_info}
 
@@ -80,9 +89,10 @@ class TestPingHappyPath(unittest.TestCase):
             cli.cmd_ping(args)
 
         out = buf.getvalue()
-        self.assertIn("seed1.example:9334", out)  # resolved endpoint visible
-        self.assertIn("1234", out)                # chain height visible
-        self.assertIn("7", out)                   # validator count visible
+        self.assertIn("seed1.example:9334", out)   # resolved endpoint visible
+        self.assertIn("1234", out)                 # chain height visible
+        self.assertIn("7", out)                    # registered_entities visible
+        self.assertIn("messagechain-v1", out)      # chain_id visible
 
     def test_ping_does_not_require_private_key(self):
         """ping is a purely read-only sanity check: never prompts.
@@ -92,8 +102,9 @@ class TestPingHappyPath(unittest.TestCase):
         (the whole reason ping exists is the pre-key first-run check).
         """
         fake_response = {"ok": True, "result": {
-            "height": 0, "best_hash": "00" * 32,
-            "validator_count": 0, "total_supply": 0,
+            "chain_id": "messagechain-v1",
+            "height": 0, "tip_hash": "00" * 32,
+            "registered_entities": 0, "total_supply": 0,
         }}
         args = cli.build_parser().parse_args(["ping"])
         with patch.object(cli, "_parse_server", return_value=("x", 1)), \

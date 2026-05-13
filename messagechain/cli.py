@@ -7593,10 +7593,22 @@ def cmd_ping(args):
     info = response["result"]
     print(f"=== Connected to {host}:{port} ===\n")
     # Surface the fields a first-run user actually cares about.  Keep
-    # the key names literal so scripts can grep for them.
+    # the key names literal so scripts can grep for them.  Audit r55
+    # #3: the previous allowlist (best_hash / validator_count /
+    # block_number / supply / sync_status) drifted away from the
+    # actual ``get_chain_info`` return shape -- ``messagechain ping``
+    # silently dropped 5 of 7 fields and rendered ~3 lines where the
+    # README implies ~8.  Anchored on the canonical /v1/info names
+    # (tip_hash / last_block_timestamp) which both servers and the
+    # producer all now agree on.
     interesting_keys = (
-        "height", "best_hash", "validator_count", "total_supply",
-        "block_number", "supply", "sync_status",
+        "chain_id",
+        "height",
+        "genesis_hash",
+        "tip_hash",
+        "registered_entities",
+        "total_supply",
+        "seconds_since_last_block",
     )
     for key in interesting_keys:
         if key in info:
