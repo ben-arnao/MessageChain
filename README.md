@@ -262,6 +262,16 @@ messagechain react <entity_id> --target-type user --choice up   # trust/flag a u
 messagechain transfer --to mc1… --amount 100    # send tokens
 messagechain read --last 50                     # recent messages
 messagechain estimate-fee --tx-type message --message "hi"  # fee preview
+messagechain receipt <tx_hash>                  # cross-check inclusion +
+                                                # auto-prints next-step
+                                                # escalation command on
+                                                # NOT_FOUND / PENDING
+messagechain submit-evidence censorship \
+    --receipt ~/.messagechain/receipts/<tx_hash>.json
+                                                # file slashable evidence
+                                                # if validators are dropping
+                                                # your tx (receipt bundle is
+                                                # what `send` writes on submit)
 messagechain backup-wallet --keyfile <path>     # offline-signers only:
                                                 # bundle keyfile + leaf cursor
 ```

@@ -394,11 +394,21 @@ class TestReceiptSaveHelperCoversAllReceiptIssuingCommands(unittest.TestCase):
         # Function body ends at the next top-level def.
         end = src.index("\ndef ", start + 1)
         body = src[start:end]
-        self.assertIn(
-            "_save_receipt_bundle", body,
+        # Audit r56 #3 widened the structural pin: a command can
+        # either call ``_save_receipt_bundle`` directly OR route
+        # through ``_print_submit_success_footer`` (the chokepoint
+        # helper that absorbs the receipt-bundle save + permanence
+        # framing + verify-CLI print pattern).  Both forms preserve
+        # the r45 invariant -- the receipt is persisted in the
+        # success path -- while the helper-routed form is what
+        # ``cmd_send`` / ``cmd_transfer`` / ``cmd_react`` now share.
+        self.assertTrue(
+            "_save_receipt_bundle" in body
+            or "_print_submit_success_footer" in body,
             "cmd_transfer must route its success-path receipt save "
-            "through _save_receipt_bundle so submit-evidence "
-            "censorship --receipt can consume the bundle directly.",
+            "either through _save_receipt_bundle directly or through "
+            "_print_submit_success_footer (the r56 #3 chokepoint that "
+            "absorbs the save + footer print pattern).",
         )
 
     def test_cmd_react_calls_save_receipt_bundle(self):
@@ -407,10 +417,14 @@ class TestReceiptSaveHelperCoversAllReceiptIssuingCommands(unittest.TestCase):
         start = src.index("def cmd_react(")
         end = src.index("\ndef ", start + 1)
         body = src[start:end]
-        self.assertIn(
-            "_save_receipt_bundle", body,
+        # Audit r56 #3: see test_cmd_transfer_calls_save_receipt_bundle
+        # for the helper-routed pattern.
+        self.assertTrue(
+            "_save_receipt_bundle" in body
+            or "_print_submit_success_footer" in body,
             "cmd_react must route its success-path receipt save "
-            "through _save_receipt_bundle.",
+            "either through _save_receipt_bundle directly or through "
+            "_print_submit_success_footer (the r56 #3 chokepoint).",
         )
 
 

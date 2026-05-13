@@ -85,6 +85,11 @@
     color: var(--muted);
     font-size: 0.85rem;
     line-height: 1.5;
+    /* Honor explicit newlines in narrative text (audit r56 #3
+       NOT_FOUND escalation block uses \n\n to separate the
+       command lines from the surrounding prose). */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
   .id-row {
     margin: 0.4rem 0 1rem;
@@ -461,12 +466,36 @@
     verdictTitle.textContent = "Not found on this node";
     verdictLine.textContent =
       "No block on this node carries this tx hash.";
+    // Audit r56 #3: mirror the CLI's NOT_FOUND escalation text so a
+    // share-URL visitor under censorship suspicion has the actual
+    // copy-pasteable command line, not just a "see the CLI" pointer.
+    // Pre-r56 this branch hand-waved at "the receipt CLI"; the CLI
+    // itself prints the canonical `submit-evidence censorship
+    // --receipt <bundle>` form verbatim -- inconsistent surfaces
+    // were the audit-pool's exact gripe.
+    //
+    // Per audit r43 #2 the XSS-load-bearing field on this page is
+    // verdictNarrative (chain payloads can be arbitrary user bytes);
+    // textContent is the safe primitive.  txHash itself is sourced
+    // from txHashFromPath()'s strict 64-hex-char regex match, so
+    // splicing it in is safe, but we use textContent for the whole
+    // block anyway so the audit-r43 invariant is preserved by
+    // construction.
     verdictNarrative.textContent =
       "This is one of three things: the message was never submitted, " +
       "the node hasn't yet seen the block carrying it, or the tx hash " +
       "is malformed. If you submitted recently, wait a block and " +
       "refresh; if the message stays missing across multiple peers, " +
-      "see the receipt CLI for the slashable-evidence escalation.";
+      "MessageChain's slashable-evidence path is your remedy " +
+      "(validators caught dropping a well-formed tx lose stake on " +
+      "chain).\n\n" +
+      "Cross-check on a second node:\n" +
+      "  messagechain receipt " + txHash + " " +
+      "--cross-check-server <other_validator>\n\n" +
+      "Then file slashable evidence (the bundle path is what " +
+      "`messagechain send` writes on submit):\n" +
+      "  messagechain submit-evidence censorship " +
+      "--receipt ~/.messagechain/receipts/" + txHash + ".json";
     detailsEl.hidden = true;
   }
 

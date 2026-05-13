@@ -3609,70 +3609,19 @@ def cmd_send(args):
         print(f"\nMessage sent!")
         print(f"  TX hash: {tx_hash_hex}")
         print(f"  Fee:     {result['fee']} tokens")
-        # Audit-#2 fix (round 7): persist the validator-issued
-        # SubmissionReceipt to the canonical default location so the
-        # user has the evidence bundle on disk if their tx is later
-        # censored.  Pre-fix, cmd_send read tx_hash + fee and silently
-        # dropped result["receipt"] -- the slashing-backed permanence
-        # promise is the chain's headline guarantee, but the
-        # default-send path didn't save the artifact needed to
-        # actually escalate.  Bundle shape matches _load_receipt_bundle
-        # so `submit-evidence censorship --receipt <path>` consumes
-        # the file directly without translation.  Best-effort: a write
-        # failure is logged but does NOT fail the send (the tx is
-        # already on the wire; surfacing a confusing error after the
-        # accept message would erode the headline UX promise).
-        receipt_hex = result.get("receipt")
-        bundle_path = None
-        if receipt_hex:
-            try:
-                bundle_path = _save_receipt_bundle(
-                    tx_hash_hex=tx_hash_hex,
-                    receipt_hex=receipt_hex,
-                    tx=tx,
-                    tx_kind="message",
-                )
-            except OSError as e:
-                print(
-                    f"  (warning: could not save receipt bundle to disk: {e})"
-                )
-                bundle_path = None
-        if bundle_path:
-            print(f"  Receipt saved: {bundle_path}")
-        # Round-6 audit fix: name the headline promise of the project at
-        # the exact moment the user just paid for it, and point at the
-        # receipt CLI -- the verification surface that grounds the
-        # permanence claim in slashable evidence rather than marketing
-        # copy.  The `--cross-check-server` pointer is the paranoid-user
-        # pivot for the validator-collusion threat model: a single RPC
-        # node can't unilaterally forge inclusion if a second is asked
-        # to confirm.
-        # ``PUBLIC_FEED_URL`` is the configurable base host
-        # (default ``https://messagechain.org``); the receipt page
-        # at ``/r/<tx_hash>`` reads the hash from its own URL and
-        # queries ``/v1/tx_status``, surfacing a polished "permanent
-        # -- this message is on-chain and can never be deleted" card
-        # any non-technical reader can verify.  Printing the URL
-        # here -- alongside the existing ``messagechain receipt``
-        # CLI verifier -- makes the chain's headline artifact
-        # shareable from the moment the tx is submitted, instead
-        # of being discoverable only by hunting through docs.
-        from messagechain import cli as _self  # late lookup for test override
-        feed_host = getattr(_self, "PUBLIC_FEED_URL", PUBLIC_FEED_URL)
-        share_url = f"{feed_host}/r/{tx_hash_hex}"
-        print(
-            "\n"
-            "  Permanence: once this tx is included in a finalized block\n"
-            "              (~10 min), the message is permanent and can\n"
-            "              never be deleted by any party.  Validators\n"
-            "              that drop or suppress it lose stake on chain.\n"
-            "\n"
-            f"  Share:  {share_url}\n"
-            "\n"
-            "  Verify inclusion:\n"
-            f"    messagechain receipt {tx_hash_hex}\n"
-            f"    messagechain receipt {tx_hash_hex} "
-            "--cross-check-server <other_validator>"
+        # Audit r56 #3: route through the shared submit-success footer
+        # chokepoint that absorbs the receipt-bundle save + permanence
+        # framing + verify-CLI print pattern.  Pre-r56 cmd_send /
+        # cmd_transfer / cmd_react each inlined this with drift; the
+        # helper makes future signing commands inherit the slashable-
+        # evidence escalation chain's first rung by construction.
+        _print_submit_success_footer(
+            tx_hash_hex=tx_hash_hex,
+            kind="message",
+            fee=result["fee"],
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+            share_url=True,
         )
     else:
         err = response.get("error", "")
@@ -4245,31 +4194,20 @@ def cmd_transfer(args):
         print(f"  TX hash: {tx_hash_hex}")
         print(f"  Amount:  {result['amount']} tokens")
         print(f"  Fee:     {result['fee']} tokens")
-        # Audit r45 #3: persist the validator-issued SubmissionReceipt
-        # to disk so the user holds the on-chain-slashable-evidence
-        # artifact if a coerced validator silently drops this transfer.
-        # CLAUDE.md collective-censorship anchor: the slashable-
-        # evidence path applies to every well-formed tx, not just
-        # messages.  Pre-fix cmd_transfer dropped result["receipt"]
-        # on the floor while cmd_send saved it, leaving transfers
-        # without the bundle ``submit-evidence censorship --receipt``
-        # consumes.  Best-effort write -- a disk failure does NOT
-        # fail the transfer (the tx is already on the wire).
-        receipt_hex = result.get("receipt")
-        if receipt_hex:
-            try:
-                bundle_path = _save_receipt_bundle(
-                    tx_hash_hex=tx_hash_hex,
-                    receipt_hex=receipt_hex,
-                    tx=tx,
-                    tx_kind="transfer",
-                )
-                print(f"  Receipt saved: {bundle_path}")
-            except OSError as e:
-                print(
-                    f"  (warning: could not save receipt bundle to "
-                    f"disk: {e})"
-                )
+        # Audit r56 #3: route through the shared submit-success footer
+        # chokepoint (see cmd_send for the abstraction-over-symptom
+        # rationale).  Transfer txs aren't rendered on the public feed,
+        # so share_url=False; the receipt-bundle save + permanence
+        # framing + verify CLI pointer still apply -- the slashable-
+        # evidence path covers every well-formed tx, not just messages.
+        _print_submit_success_footer(
+            tx_hash_hex=tx_hash_hex,
+            kind="transfer",
+            fee=result["fee"],
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+            share_url=False,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -5811,25 +5749,18 @@ def cmd_react(args):
         print(f"\nReaction submitted!")
         print(f"  TX hash: {tx_hash_hex}")
         print(f"  Fee:     {result.get('fee', fee)} tokens")
-        # Audit r45 #3: persist the validator-issued SubmissionReceipt
-        # to disk so the user has a slashable-evidence artifact if a
-        # coerced validator silently drops this reaction.  Mirrors the
-        # same pattern as cmd_send / cmd_transfer.  Best-effort write.
-        receipt_hex = result.get("receipt")
-        if receipt_hex:
-            try:
-                bundle_path = _save_receipt_bundle(
-                    tx_hash_hex=tx_hash_hex,
-                    receipt_hex=receipt_hex,
-                    tx=tx,
-                    tx_kind="react",
-                )
-                print(f"  Receipt saved: {bundle_path}")
-            except OSError as e:
-                print(
-                    f"  (warning: could not save receipt bundle to "
-                    f"disk: {e})"
-                )
+        # Audit r56 #3: route through the shared submit-success footer
+        # (see cmd_send).  Reactions aren't rendered on the public feed,
+        # so share_url=False -- but the slashable-evidence path still
+        # applies.
+        _print_submit_success_footer(
+            tx_hash_hex=tx_hash_hex,
+            kind="react",
+            fee=result.get("fee", fee),
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+            share_url=False,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -7003,6 +6934,93 @@ def _save_receipt_bundle(
         json.dump(bundle, f)
     os.replace(tmp_path, bundle_path)
     return bundle_path
+
+
+def _print_submit_success_footer(
+    *,
+    tx_hash_hex: str,
+    kind: str,
+    fee: int,
+    receipt_hex: str | None,
+    tx,
+    share_url: bool = False,
+    receipts_dir: str | None = None,
+    filename_suffix: str | None = None,
+) -> None:
+    """Render the canonical submit-success footer for any signing
+    command that posts a tx to the chain.
+
+    Audit r56 #3 chokepoint.  Three rungs of the slashable-evidence
+    escalation chain (the chain's headline structural defense) share
+    one root: ``cmd_send`` / ``cmd_transfer`` / ``cmd_react`` each
+    inlined the same receipt-bundle-save + share-URL + permanence-
+    framing print pattern with subtle drift.  Future signing commands
+    that need the same envelope route through this helper instead of
+    copy-pasting the boilerplate (or worse, skipping it -- the
+    pre-r56 state of stake/unstake/propose/vote, which ended with a
+    bare hex hash).
+
+    Behaviour matrix:
+      * ``receipt_hex`` provided -> save the bundle via
+        ``_save_receipt_bundle``; on success print ``Receipt saved:``
+        with the bundle path; on OSError print a non-fatal warning.
+      * ``receipt_hex`` is None -> no bundle save attempt (some tx
+        kinds don't surface a receipt today; treat as a missing
+        capability rather than a failure).
+      * ``share_url=True`` -> print the configured public-feed
+        ``/r/<tx_hash>`` share URL (only meaningful for message-shape
+        txs that render on the feed).
+      * Always print the permanence framing + verify-CLI lines so the
+        slashable-evidence path is named at the moment the user just
+        paid for it.
+
+    Side-effect only: writes to stdout; returns None.  Caller is
+    responsible for the "Submitted!" header and any tx-kind-specific
+    detail lines (Amount/Choice/etc.) that precede this envelope.
+    """
+    bundle_path = None
+    if receipt_hex:
+        try:
+            bundle_path = _save_receipt_bundle(
+                tx_hash_hex=tx_hash_hex,
+                receipt_hex=receipt_hex,
+                tx=tx,
+                tx_kind=kind,
+                receipts_dir=receipts_dir,
+                filename_suffix=filename_suffix,
+            )
+        except OSError as e:
+            print(
+                f"  (warning: could not save receipt bundle to disk: {e})"
+            )
+            bundle_path = None
+    if bundle_path:
+        print(f"  Receipt saved: {bundle_path}")
+    # Permanence framing + verify-CLI: name the chain's headline
+    # structural defense at the moment the user just paid for it, and
+    # point at the receipt CLI -- the slashable-evidence escalation
+    # path's middle rung.  Pre-r56 only cmd_send did this; lifting it
+    # here is the abstraction-over-symptom fix that finds 1+9 from the
+    # r56 pool share.
+    if share_url:
+        from messagechain import cli as _self  # late lookup for test override
+        feed_host = getattr(_self, "PUBLIC_FEED_URL", PUBLIC_FEED_URL)
+        share_line = f"  Share:  {feed_host}/r/{tx_hash_hex}\n\n"
+    else:
+        share_line = ""
+    print(
+        "\n"
+        "  Permanence: once this tx is included in a finalized block\n"
+        "              (~10 min), it is permanent and can never be\n"
+        "              deleted by any party.  Validators that drop or\n"
+        "              suppress it lose stake on chain.\n"
+        "\n"
+        f"{share_line}"
+        "  Verify inclusion:\n"
+        f"    messagechain receipt {tx_hash_hex}\n"
+        f"    messagechain receipt {tx_hash_hex} "
+        "--cross-check-server <other_validator>"
+    )
 
 
 def _load_receipt_bundle(path: str) -> tuple[object, object]:
