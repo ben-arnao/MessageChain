@@ -66,24 +66,61 @@ def _safe_rpc(rpc_caller: Callable, method: str, params: dict):
         }
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Cold-gated-kind registry (audit r56 #2).
+# ─────────────────────────────────────────────────────────────────────
+#
+# Single source of truth for "which wallet ops does the chain reject
+# when signed with the hot key under a SetAuthorityKey?"  The wallet
+# UI never loads a cold key, so any such op is doomed to consume a
+# WOTS+ leaf for a tx the chain will reject -- the leaf-burn DoS audit
+# r55 #1 closed for unstake.
+#
+# Audit r56 lifts this from a per-callsite ``kind == "unstake"`` check
+# to a registry consulted by ``_require_hot_signable_via_rpc`` at the
+# top of EVERY ``op_*`` helper.  The structural property: future cold-
+# gated kinds slot in by adding a True entry here; the leaf-burn
+# prevention is inherited by construction, with no need to remember
+# to edit every op_* call site.
+#
+# Non-cold-gated kinds short-circuit through the helper without
+# calling ``get_authority_key`` -- both a performance win on the hot
+# path and a correctness pin: a user with a cold authority key set
+# for FUTURE cold-gated ops must still be able to send/transfer/react
+# through the wallet UI without surface-level refusals.
+_KIND_IS_COLD_GATED: dict[str, bool] = {
+    # Post-SetAuthorityKey, the chain requires the cold authority sig
+    # on UnstakeTransaction (see Blockchain._validate_block_signing_
+    # leaves' unstake_transactions branch).
+    "unstake": True,
+}
+
+
 def _require_hot_signable_via_rpc(
     rpc_caller: Callable, entity, *, kind: str,
 ) -> tuple[bool, Optional[dict]]:
     """Pre-flight chokepoint: refuse to hot-sign a cold-key-gated tx.
 
-    Audit r55 #1 root-cause closer.  Every CLI signing path that
-    operates on a cold-key-gated tx (``cmd_unstake`` and friends) takes
-    an explicit ``--cold-keyfile`` argument; the wallet UI cannot
-    load a cold key, so the right answer for the wallet path is to
-    REFUSE BEFORE reserving a leaf and surface a clear error.
+    Audit r55 #1 root-cause closer, generalized in audit r56 #2 from
+    per-call-site to per-kind via ``_KIND_IS_COLD_GATED``.
+
+    Every CLI signing path that operates on a cold-key-gated tx
+    (``cmd_unstake`` and friends) takes an explicit ``--cold-keyfile``
+    argument; the wallet UI cannot load a cold key, so the right
+    answer for the wallet path is to REFUSE BEFORE reserving a leaf
+    and surface a clear error.
 
     Without this check the wallet's hot-key signing burns one WOTS+
-    leaf per attempt for a tx the chain will reject with
-    "must be signed by the authority (cold) key" -- a wallet-token-
-    holder driving ``POST /wallet/unstake`` in a loop can exhaust the
+    leaf per attempt for a tx the chain will reject with "must be
+    signed by the authority (cold) key" -- a wallet-token-holder
+    driving ``POST /wallet/unstake`` in a loop can exhaust the
     entity's ~1M one-time leaves with zero on-chain progress.
 
     Failure modes:
+      * ``kind`` not flagged in ``_KIND_IS_COLD_GATED`` -> proceed
+        without calling RPC.  Refusing on a non-cold-gated kind when
+        the entity has set a cold key for some OTHER kind would
+        silently brick the wallet UI for any cold-key holder.
       * ``get_authority_key`` RPC unreachable / older node that does
         not implement it -> proceed.  The chain still rejects the
         ultimate tx; this helper is defense-in-depth, not a hard
@@ -97,10 +134,16 @@ def _require_hot_signable_via_rpc(
     shape so the caller can return the refusal verbatim and the HTTP
     boundary's ``_send_op_result`` maps to 502.
 
-    Abstraction note: future cold-key-gated wallet ops (set_authority_
-    key revocation, etc.) slot in by routing through this helper -- the
-    leaf-burn property is preserved by construction.
+    Abstraction note: every ``op_*`` calls this at the top.  A future
+    cold-gated kind needs only an entry in ``_KIND_IS_COLD_GATED`` to
+    inherit the leaf-burn-prevention property -- no need to remember
+    to edit every op call site, and no risk of a new op_X silently
+    re-opening the defect class.
     """
+    # Audit r56 #2: short-circuit non-cold-gated kinds before the RPC.
+    # The non-call IS the property -- see _KIND_IS_COLD_GATED docstring.
+    if not _KIND_IS_COLD_GATED.get(kind, False):
+        return True, None
     try:
         resp = rpc_caller(
             "get_authority_key", {"entity_id": entity.entity_id_hex},
@@ -196,6 +239,17 @@ def op_send_message(
     if not isinstance(fee, int) or fee < 0:
         return {"ok": False, "error": "fee must be a non-negative integer"}
 
+    # Audit r56 #2: cold-key chokepoint at the top of every op_* so
+    # any future widening of cold-gated kinds (registered in
+    # _KIND_IS_COLD_GATED) inherits the leaf-burn-prevention property
+    # by construction.  Today "send" is not cold-gated so this is a
+    # no-op short-circuit; the structural pin matters.
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="send",
+    )
+    if not hot_ok:
+        return hot_err
+
     entity_id_hex = entity.entity_id_hex
 
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity_id_hex)
@@ -270,6 +324,13 @@ def op_transfer(
     if entity.entity_id == bytes(recipient):
         return {"ok": False, "error": "cannot transfer to yourself"}
 
+    # Audit r56 #2: cold-key chokepoint (see op_send_message).
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="transfer",
+    )
+    if not hot_ok:
+        return hot_err
+
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
         return ctx
@@ -317,6 +378,13 @@ def op_stake(
         return {"ok": False, "error": "amount must be a positive integer"}
     if not isinstance(fee, int) or fee < 0:
         return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    # Audit r56 #2: cold-key chokepoint (see op_send_message).
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="stake",
+    )
+    if not hot_ok:
+        return hot_err
 
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
@@ -436,6 +504,13 @@ def op_react(
     if not isinstance(fee, int) or fee < 0:
         return {"ok": False, "error": "fee must be a non-negative integer"}
 
+    # Audit r56 #2: cold-key chokepoint (see op_send_message).
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="react",
+    )
+    if not hot_ok:
+        return hot_err
+
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
         return ctx
@@ -496,6 +571,13 @@ def op_propose(
     if not isinstance(reference_hash, (bytes, bytearray)):
         return {"ok": False, "error": "reference_hash must be bytes"}
 
+    # Audit r56 #2: cold-key chokepoint (see op_send_message).
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="propose",
+    )
+    if not hot_ok:
+        return hot_err
+
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
         return ctx
@@ -551,6 +633,13 @@ def op_vote_proposal(
         fee = GOVERNANCE_VOTE_FEE
     if not isinstance(fee, int) or fee < 0:
         return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    # Audit r56 #2: cold-key chokepoint (see op_send_message).
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="vote",
+    )
+    if not hot_ok:
+        return hot_err
 
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
