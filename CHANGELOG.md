@@ -4,6 +4,137 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.85.0] — 2026-05-13
+
+Audit r57 top-3 ships: one consensus-visible defense-rule retune that
+closes the censor-then-unstake admission-basis evasion (new Tier 79
+hard fork, activation height 20500), one structural economics fix that
+makes the auto-fee path aware of the live EIP-1559 ``supply.base_fee``
+so the CLI quote can't underbid the block-apply gate under congestion
+(soft, no fork), and one UX / value-prop chokepoint lift that routes
+every operator-facing signing command through the slashable-evidence
+escalation footer (soft, no fork).
+
+### Changed (Tier 79, consensus-breaking, height-gated)
+
+  * **Censorship-evidence admission basis widens to ``staked +
+    pending_unstakes`` via ``Blockchain._capture_slashable_basis``
+    (audit r57 #2 -- security top-1).**  CLAUDE.md anchors defended:
+    "Collective censorship-resistance" + "Honest operators are
+    insured".
+
+    Pre-r57 ``_apply_censorship_evidence_txs`` captured
+    ``staked_at_admission = supply.staked.get(offender_id, 0)`` at
+    admission time -- ``pending_unstakes`` excluded.
+    ``burn_slash_proportional(admission_basis=staked_at_admission)``
+    then capped the matured slash at that frozen staked-only number,
+    even though the helper itself drains both ``staked`` AND
+    ``pending_unstakes`` (Tier 31's apply-side basis is correct).
+    An accused validator who saw the CensorshipEvidenceTx land in the
+    mempool could pre-emptively unstake (move balance from ``staked``
+    -> ``pending_unstakes``) before admission and shrink the slash cap
+    by the pending portion -- defeating Tier 31's "censor-then-unstake
+    evasion closure" anchor on the basis-CAPTURE side (Tier 31 closed
+    it on the apply side; the admission-side snapshot was still too
+    narrow).
+
+    Tier 79 routes the admission-basis snapshot through one chokepoint
+    (``Blockchain._capture_slashable_basis(offender_id, *, height)``)
+    so the cap matches the apply-time slashable wealth exactly:
+
+      * pre-fork: returns ``supply.staked.get(offender_id, 0)`` --
+        legacy staked-only, byte-identical to pre-r57 behaviour so
+        historical-block replay across the activation gate is
+        preserved.
+      * post-fork: returns ``staked + supply.get_pending_unstake(
+        offender_id)`` -- mirroring the apply-side basis in
+        ``burn_slash_proportional``.
+
+    Abstraction-over-symptom fix.  The chokepoint is the single source
+    of truth for every evidence-admission basis snapshot.  A future
+    2-phase evidence kind (admit-now + slash-later) that bare-reads
+    ``supply.staked.get(...)`` silently re-introduces the same defect-
+    class bug; routing through the chokepoint inherits the wider basis
+    by construction.  Distinct from ``_stake_at_height`` (Tier 78),
+    which serves retroactive consensus-quorum active-set checks against
+    a PAST height; this helper captures CURRENT-tip slashable wealth at
+    admission time.
+
+    Activation height
+    ``SLASHABLE_BASIS_AT_ADMISSION_HEIGHT = 20500`` sits 2000 blocks
+    above Tier 78 (18500), matching the Tier 70 -> 71 -> 73 -> 74 ->
+    75 -> 76 -> 77 -> 78 ~13.9-day cohort spacing.  Persistent field
+    name ``_PendingEvidence.staked_at_admission`` is preserved (no
+    state-tree or snapshot-schema change) -- only the value semantics
+    widen.  Pure consensus-rule swap; no new wire format, no new tx
+    kinds, no state-tree changes. (6cbf439)
+
+### Fixed
+
+  * **Auto-fee + ``estimate-fee`` clear the live ``supply.base_fee``
+    (audit r57 #1 -- economics top-1).**  CLAUDE.md anchors: token-as-
+    tradable-asset mainstream-asset quality bar + "auto-fee defaults
+    bidding density correctly" + fee-volatility-is-legitimate-UX-
+    feedback.
+
+    Pre-r57 auto-fee was blind to the live EIP-1559 ``supply.base_fee``.
+    The chain admits txs to the mempool whenever ``tx.fee >=
+    per_kind_floor``, but ``SupplyTracker.pay_fee_with_burn`` rejects
+    any tx whose fee is below the current ``base_fee`` at block-apply
+    time.  Under any sustained over-target burst (base_fee climbing
+    +12.5%/block per the EIP-1559 controller), an honest CLI would
+    quote ``MARKET_FEE_FLOOR=1``, the mempool would admit, and every
+    block-include would reject with ``Fee payment failed (fee 1 vs
+    base_fee N)``.  Worst case: hours of failed-submit rolling between
+    mempool eviction and chain stamp for every tx kind (message,
+    transfer, stake, unstake, react, propose, vote, rotate-key).
+
+    Abstraction-over-symptom fix.  Single chokepoint widening:
+    ``tx_floor`` gains a ``base_fee: int = 0`` kwarg and returns
+    ``max(per_kind_floor, base_fee, 1)``; ``auto_fee`` plumbs through;
+    ``server.Server._rpc_estimate_fee`` reads
+    ``self.blockchain.supply.base_fee`` once at quote time, threads it
+    to ``tx_floor`` for every non-message kind, and folds it into the
+    parallel ``calculate_min_fee`` path used by the message branch.
+    The result dict surfaces ``base_fee`` so CLI and wallet UI can
+    display it.  Default ``base_fee=0`` keeps every pre-r57 caller
+    behaviorally byte-identical.  Soft fix: no consensus rule change,
+    no wire-format change, no fork. (53d921a)
+
+  * **``_print_submit_success_footer`` chokepoint lifted onto every
+    operator-facing signing command (audit r57 #3 -- UX / value-prop
+    top-1).**  CLAUDE.md anchor defended: "Collective censorship-
+    resistance" -- the slashable-evidence escalation chain is the
+    chain's headline structural defense, but it's only useful if the
+    user discovers it.
+
+    Audit r56 #3 landed the chokepoint at
+    ``cli._print_submit_success_footer`` for the canonical "Permanence
+    + verify-CLI + submit-evidence escalation pointer" footer.  Only
+    three sender-facing commands (``cmd_send`` / ``cmd_transfer`` /
+    ``cmd_react``) were lifted onto it.  The operator-facing high-
+    stakes commands still printed a bare ``TX hash: <hex>`` and
+    stopped.
+
+    Audit r57 #3 lifts the chokepoint onto the seven missing call
+    sites: ``cmd_stake``, ``cmd_unstake``, ``cmd_rotate_key``,
+    ``cmd_set_authority_key``, ``cmd_emergency_revoke``,
+    ``cmd_propose``, ``cmd_vote``.  ``cmd_send_multi_submit`` (its own
+    fan-out-aware footer), ``cmd_set_receipt_subtree_root`` (bespoke
+    cold-leaf-burned warning), ``_cmd_submit_censorship_evidence``
+    (evidence-specific maturity framing), ``cmd_broadcast_revoke`` and
+    ``cmd_bootstrap_seed`` are explicitly exempt and documented in the
+    test's ``CHOKEPOINT_EXEMPT`` set.
+
+    New ``tests/test_audit_r57_submit_success_footer_lift.py`` provides
+    the structural grep-based pin: every command in
+    ``CHOKEPOINT_REQUIRED_COMMANDS`` MUST call
+    ``_print_submit_success_footer`` in its body, asserted via
+    ``ast.walk`` on the cli.py source.  Soft fix: no consensus rule
+    change, no wire-format change, no fork.  Wallet UI submit-success
+    mirror (audit r57's secondary note) is deferred to a follow-up.
+    (f1e7ddc)
+
 ## [1.84.0] — 2026-05-13
 
 Audit r56 top-3 ships: one consensus-visible defense-rule retune
