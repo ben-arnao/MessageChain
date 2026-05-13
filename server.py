@@ -3623,6 +3623,19 @@ class Server(SharedRuntimeMixin):
         message_bytes = 0  # for the mempool size-aware estimator
         payload_bytes = 0
 
+        # Audit r57 #1: read the LIVE EIP-1559 base_fee and fold it into
+        # ``min_fee`` for every tx kind.  Pre-r57 the auto-fee path
+        # quoted only the per-kind admission floor (MARKET_FEE_FLOOR=1
+        # at current heights); under any sustained over-target burst
+        # the mempool would accept and ``pay_fee_with_burn`` would then
+        # reject ``tx.fee < base_fee`` at block-apply -- a silent wedge
+        # at the exact moment congestion matters.  Defensive ``getattr``
+        # because legacy / off-chain audit paths may pass a
+        # SupplyTracker stub without the ``base_fee`` attribute.
+        current_base_fee = int(
+            getattr(self.blockchain.supply, "base_fee", 0) or 0
+        )
+
         if kind == "message":
             msg = params.get("message", "")
             if not isinstance(msg, str):
@@ -3637,20 +3650,25 @@ class Server(SharedRuntimeMixin):
             # Live admission rule mirrors the legacy path so a quote
             # never under-prices vs what a submit will face.  Pre-Tier-16
             # signature-aware pricing is still respected if requested.
+            # Message kind takes the parallel `calculate_min_fee` path
+            # (legacy linear-in-stored-bytes formula at pre-Tier-16
+            # heights), so it must also clear ``base_fee`` -- the
+            # ``tx_floor`` chokepoint doesn't intercept this branch.
             sig_bytes = params.get("signature_bytes")
             if (
                 target_height >= FEE_INCLUDES_SIGNATURE_HEIGHT
                 and isinstance(sig_bytes, int)
                 and sig_bytes > 0
             ):
-                min_fee = calculate_min_fee(
+                per_kind_floor = calculate_min_fee(
                     msg_bytes, signature_bytes=sig_bytes,
                     current_height=target_height,
                 )
             else:
-                min_fee = calculate_min_fee(
+                per_kind_floor = calculate_min_fee(
                     msg_bytes, current_height=target_height,
                 )
+            min_fee = max(int(per_kind_floor), current_base_fee)
         elif kind == "transfer":
             recipient_id_hex = params.get("recipient_id")
             if recipient_id_hex:
@@ -3662,6 +3680,7 @@ class Server(SharedRuntimeMixin):
                 "transfer",
                 current_height=target_height,
                 recipient_is_new=recipient_is_new,
+                base_fee=current_base_fee,
             )
             stored_bytes = stored_size_for("transfer")
         elif kind == "propose":
@@ -3670,10 +3689,14 @@ class Server(SharedRuntimeMixin):
                 "propose",
                 payload_bytes=payload_bytes,
                 current_height=target_height,
+                base_fee=current_base_fee,
             )
             stored_bytes = stored_size_for("propose", payload_bytes=payload_bytes)
         elif kind in ("stake", "unstake", "react", "vote", "rotate-key"):
-            min_fee = tx_floor(kind, current_height=target_height)
+            min_fee = tx_floor(
+                kind, current_height=target_height,
+                base_fee=current_base_fee,
+            )
             stored_bytes = stored_size_for(kind)
         else:
             # TX_TYPES gate above already filtered, but be defensive.
@@ -3714,6 +3737,11 @@ class Server(SharedRuntimeMixin):
             "fee_per_byte": fee_per_byte,
             "min_fee": min_fee,
             "mempool_fee": mempool_fee,
+            # Audit r57 #1: surface the live EIP-1559 base_fee so the
+            # CLI / wallet UI can show "min_fee is X because base_fee
+            # is currently Y" -- fee volatility is legitimate UX
+            # feedback per CLAUDE.md, not "user error."
+            "base_fee": current_base_fee,
             "recommended_fee": recommended,
             "recipient_is_new": recipient_is_new,
         }

@@ -320,13 +320,17 @@ def tx_floor(
     payload_bytes: int = 0,
     current_height: int | None = None,
     recipient_is_new: bool = False,
+    base_fee: int = 0,
 ) -> int:
     """Return the protocol admission floor for ``tx_type`` at ``current_height``.
 
-    Always ``>= 1`` (CLAUDE.md anchor: "Minimum fee is 1, never 0.").
-    Heights are taken at face value — callers that don't know the
-    current height should pass ``None`` to get a conservative pre-fork
-    floor.
+    Always ``>= max(1, base_fee)`` (CLAUDE.md anchor: "Minimum fee is 1,
+    never 0." — audit r57 #1 widened the chokepoint to also clear the
+    live EIP-1559 ``supply.base_fee`` so a CLI quote at MARKET_FEE_FLOOR
+    can't underbid a block-include path that rejects ``tx.fee <
+    base_fee`` in ``SupplyTracker.pay_fee_with_burn``).  Heights are
+    taken at face value — callers that don't know the current height
+    should pass ``None`` to get a conservative pre-fork floor.
 
     Parameters
     ----------
@@ -344,6 +348,14 @@ def tx_floor(
     recipient_is_new
         For `transfer`: tags the recipient as a brand-new entity, so
         the NEW_ACCOUNT_FEE surcharge is included in the quote.
+    base_fee
+        Current EIP-1559 ``supply.base_fee``.  The per-kind floors above
+        (MARKET_FEE_FLOOR, NEW_ACCOUNT_FEE surcharge, Tier 19 propose
+        floor, etc.) are the *admission*-side gate; ``base_fee`` is the
+        *block-apply* gate enforced by ``pay_fee_with_burn``.  Both
+        must be cleared for a tx to land.  Default ``0`` preserves the
+        pre-r57 behaviour for any caller that does not yet plumb the
+        live base_fee through.
     """
     if tx_type == "message":
         floor = _message_floor(stored_size, current_height)
@@ -363,13 +375,14 @@ def tx_floor(
         floor = _rotate_key_floor(current_height)
     else:
         raise ValueError(f"unknown tx_type: {tx_type!r}")
-    # Defence in depth: never return 0.  Every per-kind branch should
-    # already produce >=1 (MARKET_FEE_FLOOR=1 is the universal lower
-    # bound at current heights), but this max() is the literal
-    # enforcement of the CLAUDE.md "Minimum fee is 1, never 0."
-    # anchor.  If a future tx kind branches without hitting one of the
-    # explicit floors above, this still keeps it from rounding down.
-    return max(int(floor), 1)
+    # Defence in depth: never return 0, and never under-quote the live
+    # ``supply.base_fee``.  Every per-kind branch should already
+    # produce >=1 (MARKET_FEE_FLOOR=1 is the universal lower bound at
+    # current heights); the ``base_fee`` arm is the audit r57 #1 fix
+    # that lifts the floor whenever the block-apply path's EIP-1559
+    # base-fee burn gate would reject the tx the per-kind admission
+    # path would otherwise let through.
+    return max(int(floor), int(base_fee), 1)
 
 
 # ── Auto-fee picker ─────────────────────────────────────────────────
@@ -384,6 +397,7 @@ def auto_fee(
     current_height: int | None = None,
     mempool_estimate: int = 0,
     recipient_is_new: bool = False,
+    base_fee: int = 0,
 ) -> int:
     """Pick the fee to bid for ``tx_type`` under current mempool conditions.
 
@@ -399,13 +413,17 @@ def auto_fee(
 
     The bid is therefore:
 
-        max(protocol_floor, percentile_estimate * stored_size)
+        max(protocol_floor, percentile_estimate * stored_size, base_fee)
 
     This helper does the ``max(...)`` step.  The caller is expected to
     have already produced ``mempool_estimate`` as the percentile result
     multiplied by ``stored_size`` for tx kinds where density ranking
     applies (currently `message`).  For non-message kinds the mempool
     estimate is typically 0 and the floor binds.
+
+    ``base_fee`` is plumbed through to ``tx_floor``; see that helper for
+    the audit r57 #1 rationale (block-apply EIP-1559 gate must be
+    cleared, not just the per-kind admission floor).
     """
     # Validate urgency at picker time — a typo here would silently
     # downgrade the bid to the floor without raising, which is the
@@ -417,6 +435,7 @@ def auto_fee(
         payload_bytes=payload_bytes,
         current_height=current_height,
         recipient_is_new=recipient_is_new,
+        base_fee=base_fee,
     )
     return max(floor, int(mempool_estimate))
 

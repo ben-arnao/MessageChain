@@ -7584,6 +7584,12 @@ def cmd_estimate_fee(args):
         print(f"  Mempool per byte:   {per_byte}")
     print(f"  Protocol minimum:   {result['min_fee']}")
     print(f"  Mempool suggestion: {result['mempool_fee']}")
+    # Audit r57 #1: surface the live EIP-1559 base_fee when non-zero so
+    # the user can see why their quote is above the per-kind admission
+    # floor -- it's the block-apply gate, not noise.
+    base_fee = result.get("base_fee", 0)
+    if base_fee:
+        print(f"  Live base fee:      {base_fee}")
     print(f"  Recommended fee:    {result['recommended_fee']}")
 
 
