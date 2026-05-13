@@ -7388,6 +7388,51 @@ assert PROPOSER_SHARE_MIN_UNIT_HEIGHT > ATTESTER_FEE_MIN_UNIT_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 75 - Punishment-side ``_split_bps`` min-unit clamp (audit r53 #3)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Tier 73 / Tier 74 closed the silent-round-to-zero defect class on
+# the REWARD side: every ``bps // den`` shape site that could underflow
+# to zero at the dormancy controller's steady-state low-issuance regime
+# now routes through ``_split_bps`` with a ``min_unit=1`` clamp.
+#
+# The PUNISHMENT side has the same defect on a different denominator:
+# ``slash_validator`` / ``burn_slash_proportional`` / ``EscrowLedger
+# .slash_all`` all compute the slash as ``basis * slash_pct // 100``.
+# At the Tier 20 anchored ``SOFT_SLASH_PCT = 5`` (honest-operator
+# insurance), any basis under 20 tokens rounds to zero and the
+# offender silently keeps their full stake / pending / escrow entry.
+# That inverts the CLAUDE.md anchor "Honest operators are insured ...
+# a pattern of bad behavior from a thin-history node is not laundered
+# by the same leniency" -- thin-history offenders are exactly where
+# the basis is small, and the integer-floor was silently laundering
+# every soft slash against them.
+#
+# Tier 75 routes the three slash sites through ``_split_bps`` with
+# ``min_unit=1, gate=block_height >= SLASH_MIN_UNIT_HEIGHT``.  Pre-fork
+# the gate evaluates False at every height and the floor-divide
+# matches legacy byte-for-byte -- historical-block replay preserved.
+# Post-fork the slash is clamped to at least 1 token whenever a
+# positive basis would otherwise round to zero, and never exceeds the
+# bucket's actual size so supply conservation is preserved.
+#
+# Activation height ``12500`` sits 2000 blocks above Tier 74 (10500),
+# matching the Tier 70 → 71 → 73 → 74 ~13.9-day cohort spacing.  A
+# punishment-shape change deserves its own operator runway -- piling
+# it into Tier 74's cohort would force operators to absorb a reward-
+# side AND a punishment-side retune in the same upgrade cycle.
+SLASH_MIN_UNIT_HEIGHT = 12500  # Tier 75
+
+assert SLASH_MIN_UNIT_HEIGHT > PROPOSER_SHARE_MIN_UNIT_HEIGHT, (
+    "SLASH_MIN_UNIT_HEIGHT (Tier 75) must strictly follow "
+    "PROPOSER_SHARE_MIN_UNIT_HEIGHT (Tier 74) -- both are validator-"
+    "economics retunes; consecutive reward/punishment-distribution "
+    "changes deserve their own cohort so operators absorb each in "
+    "its own upgrade cycle."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

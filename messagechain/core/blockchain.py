@@ -5201,8 +5201,13 @@ class Blockchain:
                 f"perfect-record + AMBIGUOUS evidence, no burn"
             )
             return True, "Validator amnestied (track_record + AMBIGUOUS evidence)"
+        # Tier 75 (audit r53 #3): thread the current block height
+        # through both slash sites so the min-unit clamp gate fires
+        # post-fork.  Pre-fork the gate evaluates False inside both
+        # helpers and the math is byte-identical to legacy.
         escrow_burned = self._escrow.slash_all(
             tx.evidence.offender_id, slash_pct=slash_pct,
+            block_height=self.height,
         )
         if escrow_burned > 0:
             # Reduce both balance (tokens were credited there at mint)
@@ -5220,6 +5225,7 @@ class Blockchain:
 
         slashed, finder_reward = self.supply.slash_validator(
             tx.evidence.offender_id, tx.submitter_id, slash_pct=slash_pct,
+            block_height=self.height,
         )
         self._processed_evidence.add(tx.evidence.evidence_hash)
         # Tier 23: bump the per-offender repeat counter so the NEXT
@@ -5327,6 +5333,7 @@ class Blockchain:
                 offender_id, sev_pct,
                 admission_basis=staked_at_admission,
                 blockchain=self,
+                block_height=self.height,
             )
         else:
             # Pre-Tier-31: legacy staked-only basis.  Cap at current
@@ -13355,8 +13362,11 @@ class Blockchain:
                 if curve_active
                 else slash_pct_for_block
             )
+            # Tier 75 (audit r53 #3): thread block height through both
+            # slash sites so the post-fork min-unit clamp gate fires.
             escrow_burned = self._escrow.slash_all(
                 stx.evidence.offender_id, slash_pct=stx_slash_pct,
+                block_height=block.header.block_number,
             )
             if escrow_burned > 0:
                 cur_balance = self.supply.balances.get(stx.evidence.offender_id, 0)
@@ -13369,6 +13379,7 @@ class Blockchain:
                 stx.evidence.offender_id,
                 stx.submitter_id,
                 slash_pct=stx_slash_pct,
+                block_height=block.header.block_number,
             )
             # Defer the slash_offense_counts bump.  Capture the offender
             # id; a single deferred pass after the leak blocks below

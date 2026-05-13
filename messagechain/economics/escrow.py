@@ -98,7 +98,13 @@ class EscrowLedger:
         self._entries = still_held
         return list(matured_by_eid.items())
 
-    def slash_all(self, entity_id: bytes, slash_pct: int = 100) -> int:
+    def slash_all(
+        self,
+        entity_id: bytes,
+        slash_pct: int = 100,
+        *,
+        block_height: int | None = None,
+    ) -> int:
         """Burn `slash_pct` of every escrow entry for this entity.
         Returns total burned.
 
@@ -111,11 +117,33 @@ class EscrowLedger:
         round to zero are dropped, others retain their original
         `unlock_at` so the escrow maturity schedule the offender
         accumulated is not extended by the slash.
+
+        Tier 75+ (audit r53 #3): when ``block_height`` is at/after
+        ``SLASH_MIN_UNIT_HEIGHT`` and ``slash_pct < 100``, route per-
+        entry burns through ``_split_bps`` with ``min_unit=1`` so a
+        small entry (e.g. an attester-batch reward of 10 tokens at
+        the dormancy controller's steady-state low-issuance regime)
+        cannot silently round to zero under the 5% soft slash --
+        the punishment-side recurrence of the Tier 73/74 reward-side
+        defect.  Pre-fork the gate evaluates False and the math is
+        byte-identical to the legacy floor-divide.
         """
         if not 0 < slash_pct <= 100:
             raise ValueError(
                 f"slash_pct must be in (0, 100], got {slash_pct}"
             )
+        # Import locally to avoid circular dependency with the
+        # inflation module (which itself imports from this file's
+        # neighborhood).  Pure-function helper, no global side effect.
+        from messagechain.economics.inflation import _split_bps
+        from messagechain.config import SLASH_MIN_UNIT_HEIGHT
+
+        min_unit_gate = (
+            block_height is not None
+            and block_height >= SLASH_MIN_UNIT_HEIGHT
+            and slash_pct < 100
+        )
+
         total_burned = 0
         still_held: list[EscrowEntry] = []
         for entry in self._entries:
@@ -125,7 +153,10 @@ class EscrowLedger:
             if slash_pct == 100:
                 total_burned += entry.amount
                 continue
-            burn = entry.amount * slash_pct // 100
+            burn = _split_bps(
+                entry.amount, slash_pct, 100,
+                min_unit=1, gate=min_unit_gate,
+            )
             total_burned += burn
             remaining = entry.amount - burn
             if remaining > 0:

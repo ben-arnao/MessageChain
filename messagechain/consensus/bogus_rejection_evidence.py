@@ -452,6 +452,7 @@ class BogusRejectionProcessor:
                         blockchain.supply.burn_slash_proportional(
                             offender_id, sev_pct,
                             blockchain=blockchain,
+                            block_height=blockchain.height,
                         )
                     )
                 else:

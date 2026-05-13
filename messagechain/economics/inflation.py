@@ -75,6 +75,7 @@ from messagechain.config import (
     DORMANCY_MAX_ISSUANCE_PER_BLOCK,
     PROPOSER_CAP_REDISTRIBUTE_HEIGHT,
     PROPOSER_SHARE_MIN_UNIT_HEIGHT,
+    SLASH_MIN_UNIT_HEIGHT,
 )
 
 
@@ -2022,6 +2023,8 @@ class SupplyTracker:
         offender_id: bytes,
         finder_id: bytes,
         slash_pct: int = 100,
+        *,
+        block_height: int | None = None,
     ) -> tuple[int, int]:
         """
         Slash a validator: burn `slash_pct` of stake + pending unstakes,
@@ -2039,6 +2042,17 @@ class SupplyTracker:
         unstakes stay in the slash basis on purpose — otherwise an
         equivocator could outrun evidence by unstaking immediately.
 
+        ``block_height`` selects the slash-math regime.  At/after
+        ``SLASH_MIN_UNIT_HEIGHT`` (Tier 75, audit r53 #3) every
+        per-bucket slash is routed through ``_split_bps`` with
+        ``min_unit=1``: a positive basis that would otherwise round
+        to zero burns 1 token instead, so the punishment side stops
+        silently laundering 5%-soft-slashes on thin-history offenders.
+        Pre-fork the gate evaluates False and the math is byte-
+        identical to the legacy floor-divide -- historical-block
+        replay preserved.  ``None`` for pre-Tier-75 callers (legacy
+        tests, off-chain audit tools) keeps the legacy behavior.
+
         Returns (total_slashed, finder_reward).
         """
         if not 0 < slash_pct <= 100:
@@ -2053,13 +2067,31 @@ class SupplyTracker:
         if basis == 0:
             return 0, 0
 
+        # Tier 75 gate (audit r53 #3): when active, route per-bucket
+        # slash through ``_split_bps`` with ``min_unit=1`` so a positive
+        # basis can never silently round to zero.  ``slash_pct == 100``
+        # is unaffected because the full-burn branch handles state
+        # transitions explicitly; the clamp matters only in the soft-
+        # slash regime where the integer floor underflows.
+        min_unit_gate = (
+            block_height is not None
+            and block_height >= SLASH_MIN_UNIT_HEIGHT
+            and slash_pct < 100
+        )
+
         # Compute per-bucket slash so rounding lands once per bucket
         # rather than redistributing a single combined slash —
         # otherwise a partial slash with stake=0 + pending=N would
         # have to drain pending, but a combined-then-apportioned path
         # would round it to staked=0 and lose the pending burn entirely.
-        stake_burn = staked_amount * slash_pct // 100
-        pending_burn = pending_amount * slash_pct // 100
+        stake_burn = _split_bps(
+            staked_amount, slash_pct, 100,
+            min_unit=1, gate=min_unit_gate,
+        )
+        pending_burn = _split_bps(
+            pending_amount, slash_pct, 100,
+            min_unit=1, gate=min_unit_gate,
+        )
         slashed_amount = stake_burn + pending_burn
 
         if slashed_amount == 0:
@@ -2092,7 +2124,15 @@ class SupplyTracker:
             if offender_id in self.pending_unstakes:
                 rebuilt = []
                 for amount, release_block in self.pending_unstakes[offender_id]:
-                    new_amount = amount - (amount * slash_pct // 100)
+                    # Tier 75 (audit r53 #3): per-entry burn also
+                    # clamps to ``min_unit=1`` post-fork, so a small
+                    # pending entry can't escape the slash via the
+                    # same integer-floor underflow.
+                    entry_burn = _split_bps(
+                        amount, slash_pct, 100,
+                        min_unit=1, gate=min_unit_gate,
+                    )
+                    new_amount = amount - entry_burn
                     if new_amount > 0:
                         rebuilt.append((new_amount, release_block))
                 if rebuilt:
@@ -2130,6 +2170,8 @@ class SupplyTracker:
         slash_pct: int,
         admission_basis: int | None = None,
         blockchain=None,
+        *,
+        block_height: int | None = None,
     ) -> int:
         """Pure-burn slash drawing from `staked` AND `pending_unstakes`.
 
@@ -2185,7 +2227,24 @@ class SupplyTracker:
         # then apportion proportionally to current staked vs pending.
         # Apportioning AFTER capping ensures the cap binds the total
         # burn, not the pre-cap fractions.
-        target_total = basis * slash_pct // 100
+        #
+        # Tier 75 (audit r53 #3): when ``block_height`` is at/after
+        # ``SLASH_MIN_UNIT_HEIGHT``, route through ``_split_bps`` with
+        # ``min_unit=1`` so the target total never silently rounds to
+        # zero at small basis -- the punishment-side recurrence of the
+        # Tier 73/74 reward-side defect.  ``slash_pct == 100`` is
+        # unaffected because the full-burn case is dominant and the
+        # clamp only matters under the soft-slash regime where the
+        # integer floor underflows.
+        target_total = _split_bps(
+            basis, slash_pct, 100,
+            min_unit=1,
+            gate=(
+                block_height is not None
+                and block_height >= SLASH_MIN_UNIT_HEIGHT
+                and slash_pct < 100
+            ),
+        )
         if target_total <= 0:
             return 0
 

@@ -658,6 +658,7 @@ class NonResponseEvidenceProcessor:
                 slash_amount = blockchain.supply.burn_slash_proportional(
                     offender_id, sev_pct,
                     blockchain=blockchain,
+                    block_height=blockchain.height,
                 )
             else:
                 # Curve amnesty (perfect-record veteran on first

@@ -1272,6 +1272,7 @@ def process_inclusion_list_violation(
         slash_amount = blockchain.supply.burn_slash_proportional(
             etx.accused_proposer_id, slash_pct_for_basis,
             blockchain=blockchain,
+            block_height=blockchain.height,
         )
     elif slash_amount > 0:
         blockchain.supply.staked[etx.accused_proposer_id] = (
