@@ -368,6 +368,12 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         if path == "/wallet/react":
             self._serve_wallet_react_post()
             return
+        if path == "/wallet/propose":
+            self._serve_wallet_propose_post()
+            return
+        if path == "/wallet/vote-proposal":
+            self._serve_wallet_vote_proposal_post()
+            return
 
         self._send_text(404, "Not Found")
 
@@ -657,6 +663,87 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             target_is_user=body["target_is_user"],
             choice=body.get("choice", 0),
             fee=body.get("fee", 0),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
+
+    def _serve_wallet_propose_post(self):
+        """POST /wallet/propose  -- {title, description, reference_hash?, fee?}
+
+        Governance proposals are deliberately expensive (CLAUDE.md
+        anchor) -- omit ``fee`` to use the height-aware floor."""
+        entity = self._require_entity_or_503()
+        if entity is None:
+            return
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        ref_hex = body.get("reference_hash") or ""
+        if ref_hex and (not isinstance(ref_hex, str) or len(ref_hex) % 2):
+            self._send_json(400, {
+                "ok": False, "error": "reference_hash must be hex",
+            })
+            return
+        try:
+            ref_bytes = bytes.fromhex(ref_hex) if ref_hex else b""
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "reference_hash must be valid hex",
+            })
+            return
+        from messagechain.network.wallet_ops import op_propose
+        ctx = self.server._wallet_context
+        result = op_propose(
+            entity, ctx.rpc_caller,
+            title=body.get("title", ""),
+            description=body.get("description", ""),
+            reference_hash=ref_bytes,
+            fee=body.get("fee"),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
+
+    def _serve_wallet_vote_proposal_post(self):
+        """POST /wallet/vote-proposal  -- {proposal_id_hex, approve, fee?}
+
+        Distinct from /wallet/send's poll-vote (which votes on a
+        message-tx poll).  This is governance: voting on a proposal
+        opened via /wallet/propose."""
+        entity = self._require_entity_or_503()
+        if entity is None:
+            return
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        pid_hex = body.get("proposal_id")
+        if not isinstance(pid_hex, str) or len(pid_hex) != 64:
+            self._send_json(400, {
+                "ok": False, "error": "proposal_id must be 64 hex chars",
+            })
+            return
+        try:
+            pid_bytes = bytes.fromhex(pid_hex)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "proposal_id must be valid hex",
+            })
+            return
+        if not isinstance(body.get("approve"), bool):
+            self._send_json(400, {
+                "ok": False, "error": "approve must be a boolean",
+            })
+            return
+        from messagechain.network.wallet_ops import op_vote_proposal
+        ctx = self.server._wallet_context
+        result = op_vote_proposal(
+            entity, ctx.rpc_caller,
+            proposal_id=pid_bytes,
+            approve=body["approve"],
+            fee=body.get("fee"),
             data_dir=getattr(ctx, "data_dir", None),
         )
         self._send_op_result(result)

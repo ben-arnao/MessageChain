@@ -46,6 +46,8 @@ __all__ = [
     "op_stake",
     "op_unstake",
     "op_react",
+    "op_propose",
+    "op_vote_proposal",
     "op_estimate_fee",
 ]
 
@@ -389,6 +391,116 @@ def op_react(
         "target": bytes(target).hex(),
         "choice": choice,
         "fee": fee,
+    }}
+
+
+def op_propose(
+    entity,
+    rpc_caller: Callable,
+    *,
+    title: str,
+    description: str,
+    reference_hash: bytes = b"",
+    fee: Optional[int] = None,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit a governance proposal."""
+    from messagechain.governance.governance import create_proposal
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(title, str) or not title.strip():
+        return {"ok": False, "error": "title must be a non-empty string"}
+    if not isinstance(description, str):
+        return {"ok": False, "error": "description must be a string"}
+    if fee is not None and (not isinstance(fee, int) or fee < 0):
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+    if not isinstance(reference_hash, (bytes, bytearray)):
+        return {"ok": False, "error": "reference_hash must be bytes"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_proposal(
+            entity, title=title, description=description,
+            reference_hash=bytes(reference_hash),
+            fee=fee,
+            current_height=ctx["tip"],
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "submit_proposal", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(),
+        "proposal_id": tx.tx_hash.hex(),
+        "fee": tx.fee,
+    }}
+
+
+def op_vote_proposal(
+    entity,
+    rpc_caller: Callable,
+    *,
+    proposal_id: bytes,
+    approve: bool,
+    fee: Optional[int] = None,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit a governance vote on an open proposal."""
+    from messagechain.governance.governance import create_vote, GOVERNANCE_VOTE_FEE
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(proposal_id, (bytes, bytearray)) or len(proposal_id) != 32:
+        return {"ok": False, "error": "proposal_id must be 32 bytes"}
+    if not isinstance(approve, bool):
+        return {"ok": False, "error": "approve must be a boolean"}
+    if fee is None:
+        fee = GOVERNANCE_VOTE_FEE
+    if not isinstance(fee, int) or fee < 0:
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_vote(
+            entity, bytes(proposal_id), approve, fee=fee,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "submit_vote", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(),
+        "proposal_id": bytes(proposal_id).hex(),
+        "approve": approve,
     }}
 
 

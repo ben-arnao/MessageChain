@@ -887,6 +887,81 @@ class TestWalletReact(_WalletServerTestBase, _RealEntityMixin):
         self.assertEqual(status, 400)
 
 
+class TestWalletPropose(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_proposal(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_proposal":
+                from messagechain.governance.governance import (
+                    ProposalTransaction,
+                )
+                tx = ProposalTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, data = self._post(port, "/wallet/propose", srv.token, {
+            "title": "Increase max message bytes",
+            "description": "Raise MAX_MESSAGE_CHARS from 1024 to 2048.",
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertIn("proposal_id", data["result"])
+        self.assertEqual(captured["tx"].title, "Increase max message bytes")
+
+
+class TestWalletVoteProposal(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_vote(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_vote":
+                from messagechain.governance.governance import (
+                    VoteTransaction,
+                )
+                tx = VoteTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        proposal_id = "ef" * 32
+        status, data = self._post(port, "/wallet/vote-proposal", srv.token, {
+            "proposal_id": proposal_id,
+            "approve": True,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(
+            captured["tx"].proposal_id, bytes.fromhex(proposal_id),
+        )
+        self.assertTrue(captured["tx"].approve)
+
+    def test_invalid_proposal_id_returns_400(self):
+        def _rpc(method, params):
+            raise AssertionError("RPC must NOT be called for malformed pid")
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, _ = self._post(port, "/wallet/vote-proposal", srv.token, {
+            "proposal_id": "short", "approve": True,
+        })
+        self.assertEqual(status, 400)
+
+
 class TestWalletEstimateFee(_WalletServerTestBase):
     def test_passes_message_bytes_through(self):
         captured = {}
