@@ -7624,6 +7624,51 @@ assert RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT > (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 79 — censorship-evidence admission basis widening
+# ─────────────────────────────────────────────────────────────────────
+# Audit r57 #2 closure.  Pre-r57 the censorship-evidence admission path
+# captured ``staked_at_admission = supply.staked.get(offender)`` --
+# ``pending_unstakes`` excluded.  ``burn_slash_proportional`` then
+# capped the matured slash at that staked-only snapshot, even though
+# the helper is willing to drain ``pending_unstakes`` too.  An accused
+# validator who saw the CensorshipEvidenceTx land in the mempool could
+# pre-emptively unstake (move balance from staked -> pending_unstakes)
+# before admission and shrink the slash cap by the pending portion --
+# defeating Tier 31's "censor-then-unstake evasion closure" anchor on
+# the basis-CAPTURE side.  (Tier 31 closed it on the apply side; the
+# admission-side snapshot was still too narrow.)
+#
+# Tier 79 routes the admission-basis snapshot through one chokepoint
+# (``Blockchain._capture_slashable_basis(offender_id, *, height)``):
+#   * pre-fork: returns ``supply.staked.get(offender_id, 0)``       (legacy,
+#     byte-identical to historical replay)
+#   * post-fork: returns ``staked + pending_unstakes``              (Tier 79)
+#
+# The chokepoint is the abstraction-over-symptom fix the audit called
+# out: every evidence-admission site routes through one helper, so a
+# future 2-phase evidence kind cannot silently re-acquire the same
+# narrow-basis bug.
+#
+# Pre-fork the legacy bare ``.staked.get`` capture is preserved so
+# replay of historical blocks across the activation gate is byte-
+# identical to legacy behavior.  Pure consensus-rule swap; no new
+# wire format, no new tx kinds, no state-tree changes.  Activation
+# height 20500 sits 2000 blocks above Tier 78 (18500), matching the
+# Tier 70 -> 71 -> 73 -> 74 -> 75 -> 76 -> 77 -> 78 ~13.9-day cohort
+# spacing -- one operator upgrade cycle per consensus-rule retune.
+SLASHABLE_BASIS_AT_ADMISSION_HEIGHT = 20500  # Tier 79
+
+assert SLASHABLE_BASIS_AT_ADMISSION_HEIGHT > (
+    RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT
+), (
+    "SLASHABLE_BASIS_AT_ADMISSION_HEIGHT (Tier 79) must strictly "
+    "follow RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT (Tier 78) -- "
+    "consecutive consensus-rule retunes deserve their own cohort so "
+    "operators absorb each in its own upgrade cycle."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

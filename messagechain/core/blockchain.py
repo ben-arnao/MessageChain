@@ -9664,6 +9664,65 @@ class Blockchain:
             return 0
         return int(snap.get(entity_id, 0))
 
+    def _capture_slashable_basis(
+        self, offender_id: bytes, *, height: int,
+    ) -> int:
+        """Snapshot ``offender_id``'s full slashable basis at admission.
+
+        Audit r57 #2 / Tier 79 chokepoint for evidence-admission basis
+        capture.  Pre-r57 the censorship-evidence admission site
+        captured ``staked_at_admission = supply.staked.get(offender)``
+        -- ``pending_unstakes`` excluded.  ``burn_slash_proportional``
+        then capped the matured slash at that staked-only snapshot,
+        even though the helper itself is willing to drain pending too.
+        An accused validator who saw the CensorshipEvidenceTx land in
+        the mempool could pre-emptively unstake (move balance from
+        ``staked`` -> ``pending_unstakes``) before admission and shrink
+        the cap by the pending portion -- defeating Tier 31's "censor-
+        then-unstake evasion closure" anchor on the basis-CAPTURE side
+        (Tier 31 closed it on the apply side; the snapshot was still
+        too narrow).
+
+        Height-gated:
+          * pre-Tier-79 (``height < SLASHABLE_BASIS_AT_ADMISSION_HEIGHT``):
+            returns ``supply.staked.get(offender_id, 0)`` -- legacy
+            staked-only.  Byte-identical to pre-r57 behaviour so
+            historical-block replay across the activation gate is
+            preserved.
+          * post-Tier-79: returns ``staked + supply.get_pending_unstake(
+            offender_id)`` -- the offender's full slashable wealth at
+            admission, mirroring the apply-side basis in
+            ``burn_slash_proportional`` (Tier 31 / inflation.py:2244-46).
+
+        Single source of truth: every evidence-admission site MUST
+        route through this helper.  A future 2-phase evidence kind
+        (admit-now + slash-later, like censorship-evidence's
+        EVIDENCE_MATURITY_BLOCKS window) that bare-reads
+        ``supply.staked.get(...)`` for its basis snapshot silently
+        reintroduces the same defect class.  Bogus-rejection / non-
+        response / IL-violation evidence kinds are 1-phase (admit-and-
+        slash-in-same-block) and have no admission/maturity gap, so
+        they're not currently routed through this helper -- but the
+        chokepoint is structurally available the moment one is.
+
+        Distinct from ``_stake_at_height`` (Tier 78), which serves
+        retroactive consensus-quorum active-set checks against a past
+        height; this helper captures CURRENT-tip slashable wealth at
+        admission time.
+        """
+        from messagechain.config import (
+            SLASHABLE_BASIS_AT_ADMISSION_HEIGHT as _T79_H,
+        )
+        staked = int(self.supply.staked.get(offender_id, 0))
+        if height < _T79_H:
+            return staked
+        # Tier 79: widen the basis to include ``pending_unstakes``.
+        # ``get_pending_unstake`` is the same accessor
+        # ``burn_slash_proportional`` uses on the apply side, so the
+        # cap matches the apply-time slashable wealth exactly.
+        pending = int(self.supply.get_pending_unstake(offender_id))
+        return staked + pending
+
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
 
@@ -13515,19 +13574,35 @@ class Blockchain:
                     f"failed — skipping"
                 )
                 continue
-            # Snapshot offender's `staked` AT ADMISSION — this is the
-            # basis for the slash computed when the evidence matures.
-            # Reading current stake at mature time would let the
-            # offender unstake during EVIDENCE_MATURITY_BLOCKS to
+            # Snapshot offender's slashable basis AT ADMISSION — this
+            # is the cap for the slash computed when the evidence
+            # matures.  Reading current state at mature time would let
+            # the offender unstake during EVIDENCE_MATURITY_BLOCKS to
             # shrink their realized slash by orders of magnitude.
-            staked_now = self.supply.staked.get(etx.offender_id, 0)
+            #
+            # Audit r57 #2 / Tier 79: route through
+            # ``_capture_slashable_basis`` so the snapshot includes
+            # ``pending_unstakes`` post-fork.  Pre-r57 the bare
+            # ``supply.staked.get(...)`` capture excluded the pending
+            # bucket, letting an accused validator who saw the
+            # CensorshipEvidenceTx in the mempool pre-emptively unstake
+            # before admission and shrink the basis cap by the pending
+            # portion -- defeating Tier 31's evasion-closure anchor on
+            # the basis-capture side.  Pre-fork the helper falls back
+            # to ``supply.staked.get(...)`` so historical-block replay
+            # is byte-identical.  Field name ``staked_at_admission`` is
+            # legacy; semantics widen behind the helper.
+            slashable_basis = self._capture_slashable_basis(
+                etx.offender_id,
+                height=block.header.block_number,
+            )
             admitted = self.censorship_processor.submit(
                 evidence_hash=etx.evidence_hash,
                 offender_id=etx.offender_id,
                 tx_hash=etx.message_tx.tx_hash,
                 admitted_height=block.header.block_number,
                 evidence_tx_hash=etx.tx_hash,
-                staked_at_admission=staked_now,
+                staked_at_admission=slashable_basis,
             )
             if not admitted:
                 logger.warning(
