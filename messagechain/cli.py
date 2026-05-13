@@ -21,6 +21,168 @@ from messagechain import __version__
 from messagechain.config import DEFAULT_PORT, MAX_MESSAGE_CHARS, PUBLIC_FEED_URL
 
 
+def _add_message_tx_flags(parser: argparse.ArgumentParser) -> None:
+    """Register the social-primitive flags on a message-tx subparser.
+
+    Single chokepoint for ``--prev`` / ``--community-id`` /
+    ``--poll-option`` / ``--vote-target`` so ``cmd_send`` and
+    ``cmd_send_multi_submit`` accept the exact same surface.  Adding
+    a new social primitive in the future MUST happen here so both
+    transports (single-RPC send + censorship-resistant fan-out) pick
+    it up by construction (audit r54 #3).
+    """
+    parser.add_argument(
+        "--prev", type=str, default=None, metavar="TX_HASH",
+        help=(
+            "Optional 64-hex-char tx_hash this message references as "
+            "its predecessor (reply, chained document, citation, etc). "
+            "The referenced tx must already be on-chain in a strictly "
+            "earlier block. Adds 33 bytes to the fee basis; does not "
+            "count against the 1024-char cap. Activates at "
+            "PREV_POINTER_HEIGHT."
+        ),
+    )
+    parser.add_argument(
+        "--community-id", dest="community_id", type=str, default=None,
+        metavar="NAME",
+        help=(
+            "Tag the message with a community handle (Reddit-style "
+            "topic grouping).  Short ASCII handle: 1-32 chars from "
+            "[a-z0-9_-], first/last char in [a-z0-9].  Input is "
+            "NFC-normalized and lowercased before submission.  "
+            "Activates at COMMUNITY_ID_HEIGHT."
+        ),
+    )
+    parser.add_argument(
+        "--poll-option", dest="poll_options",
+        action="append", default=[],
+        metavar="TEXT",
+        help=(
+            "Make this message a structured poll.  Repeat 1..4 times "
+            "with the option label text (e.g. --poll-option Yes "
+            "--poll-option No).  Each option is short UTF-8 (<=32 "
+            "bytes) and follows the same charset whitelist as message "
+            "text.  Options must be pairwise distinct.  Mutually "
+            "exclusive with --vote-target.  Activates at POLL_HEIGHT."
+        ),
+    )
+    parser.add_argument(
+        "--vote-target", dest="vote_target", type=str, default=None,
+        metavar="POLL_TXID:INDEX",
+        help=(
+            "Make this message a structured vote.  Format: "
+            "64-hex-char poll tx_hash, colon, decimal option index "
+            "(0-based).  The poll must already be on-chain in a "
+            "strictly earlier block, and the index must be in range "
+            "of that poll's option set.  An entity may cast at most "
+            "one vote per poll.  An entity cannot vote on a poll it "
+            "created.  Mutually exclusive with --poll-option.  "
+            "Activates at POLL_HEIGHT."
+        ),
+    )
+
+
+def _parse_message_tx_fields(args):
+    """Parse the social-primitive flags into a structured tuple.
+
+    Returns ``(prev_bytes, community_id, poll_options, vote_target)``.
+    Each field is None when its flag was omitted.  Validation mirrors
+    what ``cmd_send`` previously did inline; ``cmd_send`` and
+    ``cmd_send_multi_submit`` now share the parser via this chokepoint
+    so a future primitive added in ``_add_message_tx_flags`` only
+    needs the parsing code added here -- the chain's admission gate
+    re-enforces every property anyway, so the helper is for fast
+    fail-early diagnostics and uniform error strings.
+
+    On any parse error this helper ``sys.exit(1)``s with a friendly
+    message -- mirrors the legacy inline behavior so existing CLI
+    semantics are preserved byte-for-byte.
+    """
+    # --prev: 32-byte tx_hash hex.
+    prev_bytes_arg = None
+    raw_prev = getattr(args, "prev", None)
+    if raw_prev:
+        prev_hex = raw_prev.strip()
+        if len(prev_hex) != 64:
+            print(
+                f"Error: --prev must be exactly 64 hex chars "
+                f"(got {len(prev_hex)})."
+            )
+            sys.exit(1)
+        try:
+            prev_bytes_arg = bytes.fromhex(prev_hex)
+        except ValueError:
+            print("Error: --prev is not valid hex.")
+            sys.exit(1)
+
+    # --community-id: NFC + lowercase.  Chain validator enforces the
+    # charset + DNS-label-edge rule; we just normalize.
+    community_id_arg = None
+    raw_cid = getattr(args, "community_id", None)
+    if raw_cid:
+        import unicodedata
+        normalized = unicodedata.normalize("NFC", raw_cid.strip()).lower()
+        if not normalized:
+            print("Error: --community-id must not be empty.")
+            sys.exit(1)
+        community_id_arg = normalized
+
+    # --poll-option / --vote-target (Tier 72).  Mutually exclusive.
+    poll_options_arg = None
+    vote_target_arg = None
+    raw_poll_opts = getattr(args, "poll_options", None) or []
+    raw_vote = getattr(args, "vote_target", None)
+    if raw_poll_opts and raw_vote:
+        print(
+            "Error: --poll-option and --vote-target are mutually "
+            "exclusive (a tx is either a poll OR a vote, never both)."
+        )
+        sys.exit(1)
+    if raw_poll_opts:
+        import unicodedata
+        opts_norm = tuple(
+            unicodedata.normalize("NFC", opt) for opt in raw_poll_opts
+        )
+        if len(opts_norm) < 1 or len(opts_norm) > 4:
+            print(
+                f"Error: --poll-option must be given 1..4 times "
+                f"(got {len(opts_norm)})."
+            )
+            sys.exit(1)
+        poll_options_arg = opts_norm
+    if raw_vote:
+        if ":" not in raw_vote:
+            print(
+                "Error: --vote-target must be POLL_TXID:INDEX "
+                "(64 hex chars + colon + 0-based int)."
+            )
+            sys.exit(1)
+        poll_hex, _, idx_str = raw_vote.partition(":")
+        poll_hex = poll_hex.strip()
+        if len(poll_hex) != 64:
+            print(
+                f"Error: --vote-target poll_txid must be 64 hex chars "
+                f"(got {len(poll_hex)})."
+            )
+            sys.exit(1)
+        try:
+            poll_txid = bytes.fromhex(poll_hex)
+        except ValueError:
+            print("Error: --vote-target poll_txid is not valid hex.")
+            sys.exit(1)
+        try:
+            option_index = int(idx_str)
+        except ValueError:
+            print(
+                f"Error: --vote-target option_index must be an integer "
+                f"(got {idx_str!r})."
+            )
+            sys.exit(1)
+        vote_target_arg = (poll_txid, option_index)
+
+    return prev_bytes_arg, community_id_arg, poll_options_arg, vote_target_arg
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -162,61 +324,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Server address host:port (default: 127.0.0.1:9334)",
     )
     send.add_argument(
-        "--prev", type=str, default=None, metavar="TX_HASH",
-        help=(
-            "Optional 64-hex-char tx_hash this message references as "
-            "its predecessor (reply, chained document, citation, etc). "
-            "The referenced tx must already be on-chain in a strictly "
-            "earlier block. Adds 33 bytes to the fee basis; does not "
-            "count against the 1024-char cap. Activates at "
-            "PREV_POINTER_HEIGHT."
-        ),
-    )
-    send.add_argument(
         "--urgency", choices=("low", "normal", "high"), default="normal",
         help="Auto-fee aggressiveness (target_blocks rung in the "
              "percentile estimator).  high = ~1 block, normal = ~3 "
              "blocks (default), low = ~10 blocks.  Ignored when "
              "--fee is set.",
     )
-    send.add_argument(
-        "--community-id", dest="community_id", type=str, default=None,
-        metavar="NAME",
-        help=(
-            "Tag the message with a community handle (Reddit-style "
-            "topic grouping).  Short ASCII handle: 1-32 chars from "
-            "[a-z0-9_-], first/last char in [a-z0-9].  Input is "
-            "NFC-normalized and lowercased before submission.  "
-            "Activates at COMMUNITY_ID_HEIGHT."
-        ),
-    )
-    send.add_argument(
-        "--poll-option", dest="poll_options",
-        action="append", default=[],
-        metavar="TEXT",
-        help=(
-            "Make this message a structured poll.  Repeat 1..4 times "
-            "with the option label text (e.g. --poll-option Yes "
-            "--poll-option No).  Each option is short UTF-8 (<=32 "
-            "bytes) and follows the same charset whitelist as message "
-            "text.  Options must be pairwise distinct.  Mutually "
-            "exclusive with --vote-target.  Activates at POLL_HEIGHT."
-        ),
-    )
-    send.add_argument(
-        "--vote-target", dest="vote_target", type=str, default=None,
-        metavar="POLL_TXID:INDEX",
-        help=(
-            "Make this message a structured vote.  Format: "
-            "64-hex-char poll tx_hash, colon, decimal option index "
-            "(0-based).  The poll must already be on-chain in a "
-            "strictly earlier block, and the index must be in range "
-            "of that poll's option set.  An entity may cast at most "
-            "one vote per poll.  An entity cannot vote on a poll it "
-            "created.  Mutually exclusive with --poll-option.  "
-            "Activates at POLL_HEIGHT."
-        ),
-    )
+    # Audit r54 #3 -- the social-primitive flags (--prev /
+    # --community-id / --poll-option / --vote-target) are registered
+    # via a shared helper so cmd_send and cmd_send_multi_submit accept
+    # the same surface.  Pre-fix send-multi silently dropped every
+    # primitive: a dissident reaching for the censorship-escape hatch
+    # could not reply, tag, poll, or vote.
+    _add_message_tx_flags(send)
 
     # --- send-multi ---
     send_multi = sub.add_parser(
@@ -297,6 +417,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-receipts", dest="no_receipts", action="store_true",
         help="Don't request signed receipts (skips X-MC-Request-Receipt)",
     )
+    # Audit r54 #3 -- thread the social-primitive flags through send-
+    # multi so the censorship-escape hatch supports reply / community
+    # / poll / vote, not just bare top-level messages.  Shares the
+    # helper with cmd_send's parser above.
+    _add_message_tx_flags(send_multi)
 
     # --- transfer ---
     transfer = sub.add_parser(
@@ -3265,96 +3390,18 @@ def cmd_send(args):
     # persist-before-sign hook writes the post-sign cursor back.
     _bind_persistent_leaf_index(entity, chain_leaf=leaf, data_dir=data_dir)
 
-    # Parse the optional --prev pointer before we burn a WOTS+ leaf on
-    # signing.  Server will re-validate strict-prev against chain state;
-    # catching malformed input here avoids a doomed sign + reject round.
-    prev_bytes_arg: bytes | None = None
-    if getattr(args, "prev", None):
-        prev_hex = args.prev.strip()
-        if len(prev_hex) != 64:
-            print(
-                f"Error: --prev must be exactly 64 hex chars "
-                f"(got {len(prev_hex)})."
-            )
-            sys.exit(1)
-        try:
-            prev_bytes_arg = bytes.fromhex(prev_hex)
-        except ValueError:
-            print("Error: --prev is not valid hex.")
-            sys.exit(1)
-
-    # --community-id: pass the normalized ASCII handle straight to the
-    # chain.  Names are NFC-normalized and lowercased so "MyCommunity"
-    # / "mycommunity" / "MYCOMMUNITY" all map to the same handle; the
-    # chain validator (transaction._validate_community_id) enforces the
-    # 1-MAX_COMMUNITY_ID_LEN bytes from [a-z0-9_-] / DNS-label-edge
-    # rule -- no client-side hashing is involved.  No registry, no
-    # claim; the (handle, display-name) mapping lives in indexers.
-    community_id_arg: str | None = None
-    if getattr(args, "community_id", None):
-        import unicodedata
-        normalized = unicodedata.normalize(
-            "NFC", args.community_id.strip(),
-        ).lower()
-        if not normalized:
-            print("Error: --community-id must not be empty.")
-            sys.exit(1)
-        community_id_arg = normalized
-
-    # --poll-option / --vote-target (Tier 72).  Mutually exclusive.
-    # Validation here gives a fast pre-flight diagnostic; the chain's
-    # _validate_poll_options / _validate_vote_target re-enforces.
-    poll_options_arg: tuple[str, ...] | None = None
-    vote_target_arg: tuple[bytes, int] | None = None
-    raw_poll_opts = getattr(args, "poll_options", None) or []
-    raw_vote = getattr(args, "vote_target", None)
-    if raw_poll_opts and raw_vote:
-        print(
-            "Error: --poll-option and --vote-target are mutually "
-            "exclusive (a tx is either a poll OR a vote, never both)."
-        )
-        sys.exit(1)
-    if raw_poll_opts:
-        import unicodedata
-        opts_norm = tuple(
-            unicodedata.normalize("NFC", opt) for opt in raw_poll_opts
-        )
-        if len(opts_norm) < 1 or len(opts_norm) > 4:
-            print(
-                f"Error: --poll-option must be given 1..4 times "
-                f"(got {len(opts_norm)})."
-            )
-            sys.exit(1)
-        poll_options_arg = opts_norm
-    if raw_vote:
-        if ":" not in raw_vote:
-            print(
-                "Error: --vote-target must be POLL_TXID:INDEX "
-                "(64 hex chars + colon + 0-based int)."
-            )
-            sys.exit(1)
-        poll_hex, _, idx_str = raw_vote.partition(":")
-        poll_hex = poll_hex.strip()
-        if len(poll_hex) != 64:
-            print(
-                f"Error: --vote-target poll_txid must be 64 hex chars "
-                f"(got {len(poll_hex)})."
-            )
-            sys.exit(1)
-        try:
-            poll_txid = bytes.fromhex(poll_hex)
-        except ValueError:
-            print("Error: --vote-target poll_txid is not valid hex.")
-            sys.exit(1)
-        try:
-            option_index = int(idx_str)
-        except ValueError:
-            print(
-                f"Error: --vote-target option_index must be an integer "
-                f"(got {idx_str!r})."
-            )
-            sys.exit(1)
-        vote_target_arg = (poll_txid, option_index)
+    # Parse the optional social-primitive flags before we burn a
+    # WOTS+ leaf on signing.  Routes through the shared
+    # ``_parse_message_tx_fields`` chokepoint so cmd_send and
+    # cmd_send_multi_submit agree on the surface (audit r54 #3).  Pre-
+    # fix this block was inline and cmd_send_multi_submit dropped
+    # every primitive on the floor.
+    (
+        prev_bytes_arg,
+        community_id_arg,
+        poll_options_arg,
+        vote_target_arg,
+    ) = _parse_message_tx_fields(args)
 
     # Auto-detect fee (or use explicit). The actual minimum for a message
     # scales non-linearly with size (MIN_FEE + per-byte + quadratic), so
@@ -3748,19 +3795,64 @@ def cmd_send_multi_submit(args) -> int:
         )
     target_height = tip_height + 1
 
+    # Audit r54 #3: parse the social-primitive flags via the same
+    # shared chokepoint cmd_send uses.  Pre-fix the censorship-
+    # escape hatch silently dropped --prev / --community-id /
+    # --poll-option / --vote-target -- exactly the social primitives
+    # the dissident reaching for fan-out most needs (reply to a
+    # deleted thread, post into a community, vote on a coerced poll).
+    (
+        prev_bytes_arg,
+        community_id_arg,
+        poll_options_arg,
+        vote_target_arg,
+    ) = _parse_message_tx_fields(args)
+
     # Audit r48 #3: route through the shared
     # ``_resolve_fee_with_server_floor`` helper so explicit ``--fee``
     # validation uses the server's live floor.  cmd_send-multi shares
     # the helper with cmd_send and every other signing command.
+    #
+    # Compute the prev_overhead (audit r54 #3) so the auto-fee
+    # density bid accounts for the social-primitive trailer bytes.
+    # Mirrors cmd_send's accounting exactly so a fan-out tx and a
+    # single-RPC tx with the same payload pay the same fee.
     from messagechain.core.compression import encode_payload
+    from messagechain.core.transaction import (
+        PREV_POINTER_STORED_BYTES,
+    )
     stored_bytes, _ = encode_payload(args.message.encode("utf-8"))
+    prev_overhead = (
+        PREV_POINTER_STORED_BYTES if prev_bytes_arg is not None else 0
+    )
+    if community_id_arg is not None:
+        from messagechain.core.transaction import (
+            _community_id_stored_bytes, TX_VERSION_COMMUNITY_ID,
+        )
+        prev_overhead += _community_id_stored_bytes(
+            community_id_arg, TX_VERSION_COMMUNITY_ID,
+        )
+    if poll_options_arg is not None or vote_target_arg is not None:
+        # Tier 72 v6 wire layout -- mirror cmd_send's accounting.
+        from messagechain.core.transaction import (
+            _poll_options_stored_bytes, _vote_target_stored_bytes,
+            TX_VERSION_POLL,
+        )
+        if community_id_arg is None:
+            prev_overhead += 1  # community_id presence flag (v5+)
+        prev_overhead += _poll_options_stored_bytes(
+            poll_options_arg, TX_VERSION_POLL,
+        )
+        prev_overhead += _vote_target_stored_bytes(
+            vote_target_arg, TX_VERSION_POLL,
+        )
     fee, _server_min_fee = _resolve_fee_with_server_floor(
         kind="message",
         host=state_host,
         port=state_port,
         args=args,
         estimate_extra={"message": args.message},
-        auto_fee_extra={"stored_size": len(stored_bytes)},
+        auto_fee_extra={"stored_size": len(stored_bytes) + prev_overhead},
         target_height=target_height,
     )
 
@@ -3783,19 +3875,29 @@ def cmd_send_multi_submit(args) -> int:
             "(Tier 11 receive-to-exist install).",
         )
 
-    # Match cmd_send: do NOT thread current_height when we don't have
-    # confidence in target_height (state RPC may have failed).  Pre-fix
-    # ``create_transaction`` always ran with current_height=None and
-    # produced byte-identical wire form to what the chain's
-    # verify_transaction expects at any height (the legacy floor +
-    # tx-layout fall through to v1 baseline).  Threading
-    # target_height=1 from a failed RPC silently lowers the layout
-    # branch a tier-aware chain rejects.  include_pubkey still flows
-    # through so first-spend support works once activated.
+    # Audit r54 #3: thread the social-primitive fields through
+    # ``create_transaction``.  Pre-fix this call shipped them as
+    # silent None and the chain saw a bare top-level message even
+    # when the user asked for a reply / community post / poll / vote.
     tx = create_transaction(
         entity, args.message, fee=int(fee), nonce=nonce,
         include_pubkey=include_pubkey,
+        prev=prev_bytes_arg,
+        community_id=community_id_arg,
+        poll_options=poll_options_arg,
+        vote_target=vote_target_arg,
     )
+    if prev_bytes_arg is not None:
+        print(f"Referencing prior tx: {prev_bytes_arg.hex()[:16]}...")
+    if community_id_arg is not None:
+        print(f"Community: {community_id_arg}")
+    if poll_options_arg is not None:
+        print(f"Poll options: {list(poll_options_arg)}")
+    if vote_target_arg is not None:
+        vt_pid, vt_idx = vote_target_arg
+        print(
+            f"Voting on poll {vt_pid.hex()[:16]}... option index {vt_idx}"
+        )
 
     client = SubmitClient(
         endpoints=endpoints,
