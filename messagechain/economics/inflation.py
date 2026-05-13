@@ -74,6 +74,7 @@ from messagechain.config import (
     DORMANCY_CONTROLLER_K_DEN_RETUNE_HEIGHT,
     DORMANCY_MAX_ISSUANCE_PER_BLOCK,
     PROPOSER_CAP_REDISTRIBUTE_HEIGHT,
+    PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT,
     PROPOSER_SHARE_MIN_UNIT_HEIGHT,
     SLASH_MIN_UNIT_HEIGHT,
 )
@@ -1471,6 +1472,20 @@ class SupplyTracker:
             if cap_redistribute_active:
                 # Pro-rata redistribute trim_from_att among non-
                 # proposer attesters with positive credit.
+                #
+                # Audit r55 #2 / Tier 77: per-attester bonus routes
+                # through ``_split_bps`` with a min_unit clamp so a
+                # small ``trim_from_att`` spread across >= 2 attesters
+                # does not silently round every bonus to zero (the
+                # legacy floor-divide bug that re-inverted Tier 53's
+                # anti-burn intent back to burn-everything in the
+                # dormancy-controller's steady state).  Pre-fork
+                # (``gate=False``) the helper is byte-identical to
+                # the legacy floor-divide; historical-block replay
+                # across the gate is preserved.
+                cap_min_unit_active = (
+                    block_height >= PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT
+                )
                 other_credit = {
                     aid: r for aid, r in attestor_rewards.items()
                     if aid != proposer_id and r > 0
@@ -1479,17 +1494,32 @@ class SupplyTracker:
                 if other_total > 0 and trim_from_att > 0:
                     distributed = 0
                     for aid, existing in other_credit.items():
-                        bonus = trim_from_att * existing // other_total
+                        # Per-iteration supply-conservation clamp:
+                        # ``_split_bps`` itself never exceeds its
+                        # ``amount`` arg, but two consecutive min-
+                        # unit clamps could otherwise sum past
+                        # ``trim_from_att``.  Break out the moment
+                        # we've fully distributed.
+                        remaining = trim_from_att - distributed
+                        if remaining <= 0:
+                            break
+                        bonus = _split_bps(
+                            trim_from_att, existing, other_total,
+                            min_unit=1, gate=cap_min_unit_active,
+                        )
+                        bonus = min(bonus, remaining)
                         if bonus > 0:
                             self.balances[aid] = (
                                 self.balances.get(aid, 0) + bonus
                             )
                             attestor_rewards[aid] = existing + bonus
                             distributed += bonus
-                    # Rounding remainder (< len(other_credit) tokens)
-                    # burns to keep the net-inflation invariant
-                    # tight without a tie-breaker on which attester
-                    # absorbs the leftover wei.
+                    # Rounding remainder (< len(other_credit) tokens
+                    # pre-fork; <= 0 post-fork once the clamp absorbs
+                    # all of trim_from_att across enough attesters).
+                    # Burns to keep the net-inflation invariant tight
+                    # without a tie-breaker on which attester absorbs
+                    # the leftover wei.
                     remainder = trim_from_att - distributed
                     if remainder > 0:
                         burned += remainder

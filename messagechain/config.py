@@ -7510,6 +7510,58 @@ assert FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS < MAX_FINALITY_VOTES_PER_BLOCK,
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 77 -- PROPOSER_CAP_REDISTRIBUTE pro-rata min-unit clamp.
+# ─────────────────────────────────────────────────────────────────────
+# Audit r55 #2 closer.  The Tier 53 redistribute path (which made the
+# proposer-cap clawback redistribute trim pro-rata instead of burning
+# it) computes each non-proposer attester's share as:
+#
+#     bonus = trim_from_att * existing // other_total
+#
+# The same integer-floor-divide shape Tier 73 (audit r51 #3), Tier 74
+# (r52 #3), and Tier 75 (r53 #3) introduced ``_split_bps`` to clamp on
+# the reward / per-block-cap / attester-fee / slash sides.  The audit
+# r52 #3 CHANGELOG named the wider abstraction explicitly:
+#
+#     "the wider abstraction calls for a shared ``_split_bps`` helper
+#      to catch every future ``bps // den`` site that could round to
+#      zero under a realistic minimum."
+#
+# The bite: with N >= 2 non-proposer attesters and a small
+# ``trim_from_att``, every per-attester ``bonus`` rounds to 0 and the
+# entire trim flows to ``burned`` instead of redistributing -- silently
+# inverting Tier 53's "issuance accrues to validators" intent back to
+# the pre-Tier-53 burn-everything regime in the dormancy-controller's
+# anchored steady state.
+#
+# Tier 77 routes the redistribute loop's per-attester ``bonus`` through
+# ``_split_bps(trim_from_att, existing, other_total, min_unit=1,
+# gate=cap_min_unit_active)`` with a per-iteration ``remaining`` clamp
+# that prevents two consecutive min-unit clamps from over-distributing
+# past ``trim_from_att`` (supply conservation).
+#
+# Pre-fork (``gate=False``) the helper returns the byte-identical
+# floor-divide; historical-block replay across the activation gate is
+# preserved.  Post-fork small-trim redistributions land at least 1
+# token on the first eligible attester instead of silently burning.
+#
+# Activation height ``16500`` sits 2000 blocks above Tier 76 (14500),
+# matching the Tier 70 -> 71 -> 73 -> 74 -> 75 -> 76 ~13.9-day cohort
+# spacing.  Each issuance-discipline retune deserves its own operator
+# upgrade cycle.
+PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT = 16500  # Tier 77
+
+assert PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT > (
+    FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT
+), (
+    "PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT (Tier 77) must strictly "
+    "follow FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT (Tier 76) -- "
+    "consecutive issuance-discipline retunes deserve their own cohort "
+    "so operators absorb each in its own upgrade cycle."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
