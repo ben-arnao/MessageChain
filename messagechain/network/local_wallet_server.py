@@ -783,6 +783,11 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
                 "ok": True,
                 "mode": "read-only",
                 "entity_id": None,
+                # Audit r55 #1: ``address`` (the mc1... checksummed
+                # display form) is part of the contract in both modes
+                # so the UI's address-rendering code can switch on
+                # presence without a key-missing branch.
+                "address": None,
                 "balance": None,
                 "stake": None,
                 "pubkey_registered": None,
@@ -815,10 +820,19 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         else:
             sigs_remaining = None
 
+        # Audit r55 #1: surface the mc1...-checksummed address so the
+        # Identity tab can render the typo-protected form that the
+        # CLI's `cmd_account` already tells users to share when
+        # receiving funds.  Raw entity_id stays for back-compat /
+        # internal use; the UI prefers ``address``.
+        from messagechain.identity.address import encode_address
+        addr = encode_address(ctx.entity.entity_id)
+
         self._send_json(200, {
             "ok": True,
             "mode": "wallet",
             "entity_id": entity_id_hex,
+            "address": addr,
             "balance": on_chain.get("balance"),
             "stake": on_chain.get("stake"),
             "pubkey_registered": on_chain.get("pubkey_registered"),

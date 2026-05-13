@@ -720,11 +720,17 @@ function renderMessageCard(m) {
 }
 
 async function react(targetHex, choice) {
+  // Audit r55 #1: post-Tier-18 MARKET_FEE_FLOOR is 1; sending 100 was
+  // a silent 100x overpay on every click.  The CLI's react path runs
+  // through `_resolve_fee_with_server_floor`; until /wallet/estimate-
+  // fee gains a `kind=react` branch, sending the floor preserves the
+  // "don't burn money on every click" property and the chain's fee-
+  // market still rejects below-floor txs cleanly.
   const r = await apiPost("/wallet/react", {
     target: targetHex,
     target_is_user: false,
     choice: choice,
-    fee: 100,
+    fee: 1,
   });
   if (r.status === 200) {
     toast((choice === 1 ? "Upvoted " : "Downvoted ") + shortHex(targetHex, 8, 6), "ok");

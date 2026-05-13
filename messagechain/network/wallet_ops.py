@@ -66,6 +66,74 @@ def _safe_rpc(rpc_caller: Callable, method: str, params: dict):
         }
 
 
+def _require_hot_signable_via_rpc(
+    rpc_caller: Callable, entity, *, kind: str,
+) -> tuple[bool, Optional[dict]]:
+    """Pre-flight chokepoint: refuse to hot-sign a cold-key-gated tx.
+
+    Audit r55 #1 root-cause closer.  Every CLI signing path that
+    operates on a cold-key-gated tx (``cmd_unstake`` and friends) takes
+    an explicit ``--cold-keyfile`` argument; the wallet UI cannot
+    load a cold key, so the right answer for the wallet path is to
+    REFUSE BEFORE reserving a leaf and surface a clear error.
+
+    Without this check the wallet's hot-key signing burns one WOTS+
+    leaf per attempt for a tx the chain will reject with
+    "must be signed by the authority (cold) key" -- a wallet-token-
+    holder driving ``POST /wallet/unstake`` in a loop can exhaust the
+    entity's ~1M one-time leaves with zero on-chain progress.
+
+    Failure modes:
+      * ``get_authority_key`` RPC unreachable / older node that does
+        not implement it -> proceed.  The chain still rejects the
+        ultimate tx; this helper is defense-in-depth, not a hard
+        prerequisite.  Stranding a user on a transient RPC failure
+        would be a different kind of footgun.
+      * Cold authority not set (``None``) or matches the loaded hot
+        key -> proceed.
+      * Cold authority differs from the loaded hot key -> refuse.
+
+    Returns ``(ok, error_dict | None)``.  Mirrors the wallet_ops result
+    shape so the caller can return the refusal verbatim and the HTTP
+    boundary's ``_send_op_result`` maps to 502.
+
+    Abstraction note: future cold-key-gated wallet ops (set_authority_
+    key revocation, etc.) slot in by routing through this helper -- the
+    leaf-burn property is preserved by construction.
+    """
+    try:
+        resp = rpc_caller(
+            "get_authority_key", {"entity_id": entity.entity_id_hex},
+        )
+    except Exception:
+        # Older daemon / no daemon / transport blip -- fall through.
+        # Same residual hazard the broader signing path already accepts
+        # in _resolve_signing_leaf_via_caller's reserve_leaf fallback.
+        return True, None
+
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return True, None
+    ak_hex = (resp.get("result") or {}).get("authority_key")
+    if not ak_hex:
+        return True, None
+    try:
+        ak_bytes = bytes.fromhex(ak_hex)
+    except (TypeError, ValueError):
+        return True, None
+    hot_pk = getattr(entity, "public_key", None)
+    if hot_pk is None or ak_bytes == bytes(hot_pk):
+        return True, None
+    return False, {
+        "ok": False,
+        "error": (
+            f"cold authority key set for this entity; {kind} from the "
+            f"wallet UI is hot-key-only.  Run `messagechain {kind} "
+            f"--cold-keyfile <path>` from the CLI for the cold-key "
+            f"path -- the wallet UI does not load cold keys."
+        ),
+    }
+
+
 def _resolve_nonce_and_tip(rpc_caller: Callable, entity_id_hex: str):
     """Pull nonce + chain-tip + watermark for a tx build.
 
@@ -301,6 +369,17 @@ def op_unstake(
         return {"ok": False, "error": "amount must be a positive integer"}
     if not isinstance(fee, int) or fee < 0:
         return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    # Audit r55 #1: refuse before reserving a leaf if this entity has
+    # set a cold authority key distinct from the loaded hot key.  The
+    # check has to land BEFORE _resolve_signing_leaf_via_caller below
+    # -- once that runs, the per-wallet leaf cursor has advanced and
+    # the leaf is effectively spent even if the chain rejects the tx.
+    hot_ok, hot_err = _require_hot_signable_via_rpc(
+        rpc_caller, entity, kind="unstake",
+    )
+    if not hot_ok:
+        return hot_err
 
     ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
     if not ok:
