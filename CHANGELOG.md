@@ -4,6 +4,166 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.81.0] — 2026-05-12
+
+Audit r53 top-3 ships: one production-active permanence-anchor
+storage fix (soft, no fork), one operator-UX fix unwedging the
+README "Run a validator" first-spend flow (soft, no fork), and one
+consensus-visible economics retune that closes the punishment-side
+recurrence of the Tier 73/74 ``_split_bps`` defect class (new Tier
+75 hard fork, activation height 12500).
+
+### Fixed
+
+  * **``strip_block_witnesses`` / ``get_block_witness_data`` /
+    ``attach_block_witnesses`` cover every signed slot, not just
+    ``block.transactions`` (audit r53 #1 -- security / long-term-
+    design top-1).**  CLAUDE.md anchors at risk: chain-bloat
+    discipline + hobbyist-full-node accessibility for centuries +
+    the permanence-promise economics that rely on actual witness-
+    separation byte savings.
+
+    Pre-fix the strip path only iterated ``block.transactions``.
+    The 14+ other signed-body slots (attestations, transfer / stake
+    / unstake / governance / authority / reaction txs, finality_votes,
+    slash, custody, inclusion_list, the four evidence kinds) kept
+    their ~2.7 KB WOTS+ signatures inline in primary ``blocks.data``
+    forever despite ``WITNESS_AUTO_SEPARATION_HEIGHT=1704`` being
+    well below mainnet tip.  Attestations + finality_votes dominate
+    per-block witness mass, so the auto-separation sweep was
+    silently moving only ~5-20% of the witness bytes it claimed to
+    offload to the side table.  Every node running past the
+    activation height bled the hobbyist-accessibility anchor.
+
+    The sibling ``strip_block_witnesses`` docstring already called
+    out listing-slots-one-by-one as the defect form ("listing slots
+    one-by-one was the defect form") -- the function itself was the
+    named defect form.
+
+    Abstraction-over-symptom fix.  Three changes:
+
+      1. New ``_SIGNED_BLOCK_SLOTS`` registry in
+         ``messagechain/core/witness.py`` -- single source of truth
+         for every signed-body slot the witness_root commits to.
+         ``enumerate_block_signatures`` is refactored to iterate
+         the registry, preserving its byte-identical output order.
+
+      2. ``strip_block_witnesses`` walks the registry and replaces
+         every signed slot item's signature with the strip sentinel
+         via ``dataclasses.replace``.  Future signed-body additions
+         register themselves once and inherit the strip discipline
+         by construction.
+
+      3. ``get_block_witness_data`` emits a versioned v1 blob format
+         (magic 0xFF + version 0x01 + per-entry slot_id/item_index/
+         sig_bytes); ``attach_block_witnesses`` autodetects v1 vs
+         legacy (transactions-only) and routes accordingly so
+         blocks already stripped pre-fix continue to decode without
+         re-strip.
+
+    Soft fix: no consensus rule change, no wire-format change, no
+    fork.  Storage-format-only.  The witness_root commitment
+    recomputes from the restored block on attach exactly as before,
+    so the post-activation ``WitnessRootMismatchError`` integrity
+    check works unchanged for either blob shape.  Behavioral fix
+    lands the moment a validator upgrades; legacy on-disk blobs
+    continue to decode for the blocks already stripped pre-fix.
+    (12a4899)
+
+  * **Validator bootstrap first-spend stake admission (audit r53
+    #2 -- UX / value-prop top-1).**  CLAUDE.md anchors at risk:
+    Simplicity (principle #3) + validator-set growth as the
+    decentralization anchor.  The README "Run a validator" flow was
+    wedged at the stake step for every fresh validator install on
+    mainnet.
+
+    Pre-fix two coupled defects: ``cmd_stake`` (cli.py:4035) built
+    the StakeTransaction without ``include_pubkey=True`` (audit
+    r46 #3 wired ``_should_include_pubkey`` through cmd_send /
+    cmd_transfer / cmd_send_multi_submit; cmd_stake was the last
+    hold-out), AND ``Server._rpc_stake`` (server.py:2218) hard-
+    gated on ``entity_id in self.blockchain.public_keys`` BEFORE
+    consulting ``tx.sender_pubkey`` -- so even if the CLI had set
+    ``include_pubkey``, admission would still reject "Unknown
+    entity".
+
+    Net effect: a fresh validator literally following the README
+    -- ``generate-key`` -> fund via /faucet -> ``messagechain
+    stake --amount 200`` -- got "Unknown entity" on stake.  Faucet
+    funds had landed under their entity_id (transfers reveal the
+    SENDER's pubkey, not the recipient's), but the very next
+    signing op was rejected with no documented workaround.
+
+    Abstraction-over-symptom fix.  ``cmd_stake`` routes through
+    the shared ``_should_include_pubkey`` chokepoint every other
+    signing command uses.  ``Server._rpc_stake`` resolves the
+    public_key from ``public_keys.get(entity_id)`` first; if None,
+    falls back to ``tx.sender_pubkey`` IFF it derives back to
+    ``entity_id`` -- mirroring the audit r51 #1 chokepoint
+    discipline.  Spoofed ``sender_pubkey`` that doesn't derive to
+    ``entity_id`` is still rejected.  Scope-min fix: cmd_stake +
+    ``_rpc_stake`` only.  cmd_react / cmd_propose / cmd_vote have
+    the same shape defect but their tx classes lack the
+    ``sender_pubkey`` field entirely -- closing those requires a
+    wire-format change behind a hard-fork height gate, deferred
+    to a follow-up.  Soft fix: no consensus rule change, no
+    wire-format change, no fork.  (8088bc0)
+
+### Changed (Tier 75, consensus-breaking, height-gated)
+
+  * **Slash min-unit clamp via shared ``_split_bps`` helper (audit
+    r53 #3 -- economics top-1).**  CLAUDE.md anchor at risk:
+    "Honest operators are insured" -- slashing must produce *small
+    fractional* burns on transient hiccups, not *zero* burns that
+    silently launder offenses against thin-history offenders.
+
+    Same defect-class as the Tier 73 / Tier 74 ``_split_bps``
+    fixes (audit r51 #3 / r52 #3) on the REWARD side, but on the
+    PUNISHMENT side: ``slash_validator`` /
+    ``burn_slash_proportional`` / ``EscrowLedger.slash_all`` all
+    computed the slash as ``basis * slash_pct // 100``.  At the
+    Tier 20 anchored ``SOFT_SLASH_PCT = 5``, any basis under 20
+    tokens rounded the slash to zero -- the offender kept their
+    full stake / pending / escrow entry and the punishment was
+    silently a no-op.  Reward and punishment sides are now in
+    deliberate symmetry: both clamp positive non-zero results
+    away from the integer-floor underflow regime the dormancy
+    controller is anchored to produce in steady state.
+
+    Three call sites refactored through
+    ``_split_bps(..., min_unit=1, gate=block_height >=
+    SLASH_MIN_UNIT_HEIGHT and slash_pct < 100)``:
+
+      1. ``SupplyTracker.slash_validator`` per-bucket
+         (``stake_burn``, ``pending_burn``) plus the per-entry
+         pending loop.
+      2. ``SupplyTracker.burn_slash_proportional``'s
+         ``target_total`` (censorship / bogus-rejection / non-
+         response / IL-violation evidence apply paths consume this).
+      3. ``EscrowLedger.slash_all`` per-entry ``burn`` (attester-
+         batch reward escrow entries at the dormancy-controller's
+         low-issuance steady state are exactly where small entries
+         are common).
+
+    New activation height ``SLASH_MIN_UNIT_HEIGHT = 12500``
+    (Tier 75) sits 2000 blocks above Tier 74 (10500), matching
+    the Tier 70 -> 71 -> 73 -> 74 ~13.9-day cohort cadence.  A
+    punishment-shape change deserves its own operator-runway
+    cohort so operators don't absorb a reward-side AND a
+    punishment-side retune in the same upgrade cycle.
+
+    Pre-fork the gate evaluates False in all three helpers and
+    the math is byte-identical to the legacy floor-divide --
+    historical-block replay preserved.  Post-fork the slash is
+    clamped to at least 1 token whenever a positive basis would
+    otherwise round to zero, and ``_split_bps`` itself never
+    exceeds the input ``amount`` so supply conservation is
+    preserved.  ``slash_pct == 100`` short-circuits the clamp
+    because the full-burn case is unambiguous.
+
+    Pure consensus-rule swap; no new wire format, no new tx
+    kinds, no state-tree changes.  (90ecc85)
+
 ## [1.80.0] — 2026-05-12
 
 Audit r52 top-3 ships: one production-active permanence-anchor fix
