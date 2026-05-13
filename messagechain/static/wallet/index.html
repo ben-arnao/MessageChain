@@ -13,8 +13,11 @@
     --card: #f5f5f5;
     --border: #ddd;
     --accent: #0a5;
+    --accent-bg: #e6f7ee;
     --warn: #c70;
+    --warn-bg: #fff7e6;
     --error: #c33;
+    --error-bg: #fde8e8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -24,8 +27,11 @@
       --card: #1a1a1d;
       --border: #2a2a2e;
       --accent: #6c9;
+      --accent-bg: #14302a;
       --warn: #db5;
+      --warn-bg: #2e2410;
       --error: #f66;
+      --error-bg: #2e1414;
     }
   }
   * { box-sizing: border-box; }
@@ -35,77 +41,383 @@
     background: var(--bg);
     color: var(--fg);
     line-height: 1.45;
+    font-size: 15px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button {
+    font: inherit;
+    background: var(--card);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.4rem 0.8rem;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary {
+    background: var(--accent-bg);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 500;
+  }
+  input[type="text"], input[type="number"], textarea {
+    font: inherit;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem 0.7rem;
+    width: 100%;
+  }
+  textarea { font-family: inherit; resize: vertical; min-height: 4em; }
+
+  header.app-header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    padding: 0.7rem 1rem;
+  }
+  .you-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .you-row .brand {
+    font-weight: 600;
+    font-size: 1.05rem;
+    margin-right: 0.4rem;
+  }
+  .pill {
+    display: inline-block;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .pill.ok { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
+  .pill.error { color: var(--error); border-color: var(--error); background: var(--error-bg); }
+  .you-row .you-id {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .you-row .grow { flex-grow: 1; }
+  nav.tabs {
+    display: flex;
+    gap: 0.2rem;
+    margin-top: 0.7rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: -1px;
+  }
+  nav.tabs button {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 0.55rem 1rem;
+    color: var(--muted);
+  }
+  nav.tabs button.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
   }
   main {
     max-width: 720px;
     margin: 0 auto;
-    padding: 1.4rem 1.2rem;
+    padding: 1rem;
   }
-  h1 {
-    margin: 0 0 0.4rem;
-    font-size: 1.4rem;
-    letter-spacing: -0.01em;
-  }
-  .sub {
-    margin: 0 0 1.4rem;
-    color: var(--muted);
-    font-size: 0.9rem;
-  }
-  .card {
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  .composer {
     border: 1px solid var(--border);
     background: var(--card);
     border-radius: 8px;
-    padding: 1rem 1.1rem;
-    margin: 0.8rem 0;
+    padding: 0.9rem;
+    margin-bottom: 1rem;
   }
-  .pill {
-    display: inline-block;
-    padding: 0.1rem 0.55rem;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    border: 1px solid var(--border);
+  .composer .row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-top: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .composer .row label {
     color: var(--muted);
+    font-size: 0.85rem;
+    flex-shrink: 0;
   }
-  .pill.ok { color: var(--accent); border-color: var(--accent); }
-  .pill.warn { color: var(--warn); border-color: var(--warn); }
-  .pill.error { color: var(--error); border-color: var(--error); }
-  code {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-    font-size: 0.9em;
+  .composer .meta-line {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 0.4rem;
   }
+  .composer .meta-line .err { color: var(--error); }
+
+  .msg {
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem;
+    margin-bottom: 0.6rem;
+  }
+  .msg .meta {
+    font-size: 0.82rem;
+    color: var(--muted);
+    display: flex;
+    justify-content: space-between;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .msg .meta .entity {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .msg .text {
+    margin-top: 0.4rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .msg .actions {
+    margin-top: 0.5rem;
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .msg .actions button {
+    padding: 0.2rem 0.6rem;
+    font-size: 0.85rem;
+  }
+  .msg .prev {
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-top: 0.2rem;
+  }
+
+  .form-grid {
+    display: grid;
+    gap: 0.6rem;
+  }
+  .form-grid label {
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+  .panel {
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 8px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+  }
+  .panel h2 {
+    margin: 0 0 0.6rem;
+    font-size: 1.05rem;
+  }
+  .toast {
+    position: fixed;
+    bottom: 1rem;
+    right: 1rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    padding: 0.6rem 1rem;
+    border-radius: 6px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.2);
+    z-index: 100;
+    max-width: 22rem;
+    word-wrap: break-word;
+  }
+  .toast.ok { border-color: var(--accent); }
+  .toast.err { border-color: var(--error); color: var(--error); }
+  .row-2col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.6rem;
+  }
+  @media (max-width: 480px) { .row-2col { grid-template-columns: 1fr; } }
+
+  .hint { color: var(--muted); font-size: 0.85rem; }
+  .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
 </style>
 </head>
 <body>
-<main>
-  <h1>MessageChain Wallet</h1>
-  <p class="sub">
-    Local-only.  Loopback-bound.  Your private key never leaves this machine.
-  </p>
 
-  <div class="card">
-    <div>Status: <span id="status" class="pill">checking…</span></div>
-    <p id="hint" class="sub" style="margin-top: 0.6rem;">
-      The real wallet UI lands in follow-up commits.  This page just
-      verifies the server is up and the session token from the URL bar
-      is recognized.
+<header class="app-header">
+  <div class="you-row">
+    <span class="brand">MessageChain</span>
+    <span id="you-mode" class="pill">loading…</span>
+    <span id="you-id" class="you-id"></span>
+    <span class="grow"></span>
+    <span id="you-balance" class="pill"></span>
+    <span id="you-stake" class="pill"></span>
+    <span id="you-sigs" class="pill"></span>
+    <span id="you-chain" class="pill"></span>
+  </div>
+  <nav class="tabs">
+    <button data-tab="feed" class="active">Feed</button>
+    <button data-tab="wallet">Wallet</button>
+    <button data-tab="governance">Governance</button>
+    <button data-tab="identity">Identity</button>
+    <button data-tab="node">Node</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- ============================================================== Feed -->
+<section class="tab-panel active" id="tab-feed">
+  <div class="composer" id="composer">
+    <textarea id="composer-text" placeholder="What's on your mind?  (Bytes used and fee preview update as you type.)"></textarea>
+    <div class="row">
+      <label for="composer-community">Community:</label>
+      <input id="composer-community" type="text" placeholder="(optional, lowercase ascii)" style="max-width: 14rem;">
+      <label for="composer-prev" class="hint">Reply to:</label>
+      <input id="composer-prev" type="text" placeholder="(tx_hash, optional)" style="max-width: 14rem;">
+    </div>
+    <div class="row">
+      <span id="composer-meta" class="meta-line">0 bytes</span>
+      <span class="grow"></span>
+      <button id="composer-cancel-reply" style="display:none;">Cancel reply</button>
+      <button id="composer-post" class="primary" disabled>Post</button>
+    </div>
+  </div>
+
+  <div id="feed-list"></div>
+  <div id="feed-empty" class="empty" style="display:none;">No messages yet.</div>
+</section>
+
+<!-- ============================================================ Wallet -->
+<section class="tab-panel" id="tab-wallet">
+  <div class="panel">
+    <h2>Balance</h2>
+    <div id="wallet-balance" class="hint">loading…</div>
+  </div>
+
+  <div class="panel">
+    <h2>Send transfer</h2>
+    <div class="form-grid">
+      <label>Recipient entity_id (64 hex chars)
+        <input id="xfer-to" type="text" placeholder="abcdef…">
+      </label>
+      <div class="row-2col">
+        <label>Amount<input id="xfer-amount" type="number" min="1"></label>
+        <label>Fee<input id="xfer-fee" type="number" min="1" value="100"></label>
+      </div>
+      <label><input id="xfer-pubkey" type="checkbox"> First-spend (include sender pubkey)</label>
+      <button id="xfer-submit" class="primary">Send transfer</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Stake / unstake</h2>
+    <div class="form-grid">
+      <div class="row-2col">
+        <label>Stake amount<input id="stake-amount" type="number" min="1"></label>
+        <label>Fee<input id="stake-fee" type="number" min="1" value="100"></label>
+      </div>
+      <button id="stake-submit">Stake</button>
+      <div class="row-2col">
+        <label>Unstake amount<input id="unstake-amount" type="number" min="1"></label>
+        <label>Fee<input id="unstake-fee" type="number" min="1" value="100"></label>
+      </div>
+      <button id="unstake-submit">Unstake (hot key)</button>
+      <span class="hint">
+        Cold-authority unstake (post-SetAuthorityKey) belongs in the
+        CLI with <code>--cold-keyfile</code>.  The wallet UI does not
+        load cold keys.
+      </span>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= Governance -->
+<section class="tab-panel" id="tab-governance">
+  <div class="panel">
+    <h2>New proposal</h2>
+    <div class="form-grid">
+      <label>Title<input id="prop-title" type="text"></label>
+      <label>Description<textarea id="prop-desc"></textarea></label>
+      <label>Reference hash <span class="hint">(optional, hex)</span>
+        <input id="prop-ref" type="text" placeholder="">
+      </label>
+      <label>Fee <span class="hint">(blank = chain's height-aware floor)</span>
+        <input id="prop-fee" type="number">
+      </label>
+      <button id="prop-submit" class="primary">Open proposal</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Vote on a proposal</h2>
+    <div class="form-grid">
+      <label>Proposal ID (64 hex chars)
+        <input id="vote-pid" type="text">
+      </label>
+      <div class="row">
+        <button id="vote-yes" class="primary">Vote YES</button>
+        <button id="vote-no">Vote NO</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========================================================= Identity -->
+<section class="tab-panel" id="tab-identity">
+  <div class="panel">
+    <h2>Wallet identity</h2>
+    <div id="identity-info" class="hint">loading…</div>
+  </div>
+  <div class="panel">
+    <h2>Backup</h2>
+    <p class="hint">
+      Your private key never leaves this machine.  The keyfile you
+      passed to <code>messagechain ui --keyfile</code> IS your backup
+      -- copy it to a second secure location (paper, steel, USB,
+      another machine) and treat it like a password.  There is no
+      "recover wallet" path on the chain (per CLAUDE.md): lost key =
+      lost wallet, by design.
     </p>
   </div>
+  <div class="panel">
+    <h2>Key rotation</h2>
+    <p class="hint">
+      WOTS+ leaves are one-time signatures.  When the
+      <em>sigs remaining</em> count above gets low, run
+      <code>messagechain rotate-key</code> on the CLI -- the new-tree
+      keygen takes minutes and is not yet wired to the wallet UI
+      (would block the HTTP request past every reasonable browser
+      timeout).
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================== Node -->
+<section class="tab-panel" id="tab-node">
+  <div class="panel">
+    <h2>Chain</h2>
+    <div id="node-info" class="hint">loading…</div>
+  </div>
+</section>
+
 </main>
+
+<div id="toast" class="toast" style="display:none;"></div>
 
 <script>
 "use strict";
 
-// --- session token bootstrap -------------------------------------------
-// The CLI prints `http://127.0.0.1:<port>/?t=<token>`.  On first load we
-// read `t` out of the URL, stash it in sessionStorage, and strip it from
-// the URL bar so it doesn't end up in browser history if the user
-// bookmarks the page.  Subsequent fetches send it as Authorization.
-//
-// sessionStorage (not localStorage) — the token rotates on every server
-// restart, so persisting it across browser sessions is pointless and
-// just leaves a stale credential lying around.
+// =========================================================== token / fetch
+// Same bootstrap as the placeholder version: the CLI prints
+// `http://127.0.0.1:<port>/?t=<token>`, the page reads `t` once,
+// stashes it in sessionStorage, and strips it from the URL bar.
 const TOKEN_KEY = "mc.wallet.token";
-
 function bootstrapToken() {
   const url = new URL(window.location.href);
   const fromUrl = url.searchParams.get("t");
@@ -116,54 +428,463 @@ function bootstrapToken() {
   }
   return sessionStorage.getItem(TOKEN_KEY);
 }
-
-async function walletFetch(path, opts) {
+async function api(path, opts) {
   const token = sessionStorage.getItem(TOKEN_KEY);
-  const headers = Object.assign({}, (opts && opts.headers) || {});
-  if (token) {
-    headers["Authorization"] = "Bearer " + token;
+  const init = Object.assign({}, opts || {});
+  init.headers = Object.assign({}, init.headers || {});
+  if (token) init.headers["Authorization"] = "Bearer " + token;
+  if (init.body && !init.headers["Content-Type"]) {
+    init.headers["Content-Type"] = "application/json";
   }
-  return fetch(path, Object.assign({}, opts || {}, { headers: headers }));
+  const r = await fetch(path, init);
+  let data = null;
+  try { data = await r.json(); } catch (_) { data = null; }
+  return { status: r.status, data: data };
+}
+async function apiPost(path, body) {
+  return api(path, { method: "POST", body: JSON.stringify(body) });
 }
 
-async function probe() {
-  const statusEl = document.getElementById("status");
-  const hintEl = document.getElementById("hint");
-  const token = bootstrapToken();
-  if (!token) {
-    statusEl.textContent = "no session token";
-    statusEl.className = "pill error";
-    hintEl.textContent =
-      "Restart the server with `messagechain ui` and open the printed " +
-      "URL — it carries the session token in the ?t= query string.";
+// =========================================================== UI helpers
+function $(id) { return document.getElementById(id); }
+function shortHex(hex, head, tail) {
+  if (!hex) return "";
+  if (hex.length <= head + tail + 1) return hex;
+  return hex.slice(0, head) + "…" + hex.slice(-tail);
+}
+function formatTs(sec) {
+  if (typeof sec !== "number") return "";
+  const d = new Date(sec * 1000);
+  if (isNaN(d.getTime())) return "";
+  return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+}
+let _toastTimer = null;
+function toast(msg, kind) {
+  const t = $("toast");
+  t.className = "toast " + (kind || "");
+  t.textContent = msg;
+  t.style.display = "block";
+  if (_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { t.style.display = "none"; }, 4500);
+}
+
+// =========================================================== tab switching
+document.querySelectorAll("nav.tabs button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const tab = btn.dataset.tab;
+    document.querySelectorAll("nav.tabs button").forEach(b =>
+      b.classList.toggle("active", b === btn));
+    document.querySelectorAll(".tab-panel").forEach(p =>
+      p.classList.toggle("active", p.id === "tab-" + tab));
+    if (tab === "wallet") refreshWallet();
+    if (tab === "node") refreshNode();
+    if (tab === "identity") refreshIdentity();
+  });
+});
+
+// =========================================================== "you" header
+async function refreshMe() {
+  const youMode = $("you-mode");
+  try {
+    const r = await api("/wallet/me");
+    if (r.status !== 200) {
+      youMode.textContent = "error " + r.status;
+      youMode.className = "pill error";
+      return null;
+    }
+    const m = r.data;
+    if (m.mode === "read-only") {
+      youMode.textContent = "read-only";
+      youMode.className = "pill warn";
+      $("you-id").textContent = "(no key loaded)";
+      $("you-balance").textContent = "";
+      $("you-stake").textContent = "";
+      $("you-sigs").textContent = "";
+      // Hide composer in read-only mode -- writes will 503.
+      $("composer").style.display = "none";
+    } else {
+      youMode.textContent = "wallet";
+      youMode.className = "pill ok";
+      $("you-id").textContent = shortHex(m.entity_id, 10, 6);
+      $("you-id").title = m.entity_id;
+      if (m.balance != null) {
+        $("you-balance").textContent = m.balance + " bal";
+      }
+      if (m.stake != null && m.stake > 0) {
+        $("you-stake").textContent = m.stake + " stake";
+      }
+      if (m.sigs_remaining != null) {
+        const s = $("you-sigs");
+        s.textContent = m.sigs_remaining + " sigs";
+        s.className = "pill" + (m.sigs_remaining < 100 ? " warn" : "");
+      }
+    }
+    return m;
+  } catch (e) {
+    youMode.textContent = "unreachable";
+    youMode.className = "pill error";
+    return null;
+  }
+}
+
+async function refreshChainStatus() {
+  try {
+    const r = await api("/v1/info");
+    const c = $("you-chain");
+    if (r.status !== 200) {
+      c.textContent = "chain offline";
+      c.className = "pill error";
+      return;
+    }
+    c.textContent = "h=" + r.data.height;
+    c.className = "pill ok";
+  } catch (_) {
+    $("you-chain").textContent = "chain offline";
+    $("you-chain").className = "pill error";
+  }
+}
+
+// ============================================================= Feed tab
+const composerText = $("composer-text");
+const composerMeta = $("composer-meta");
+const composerPost = $("composer-post");
+const composerPrev = $("composer-prev");
+const composerCommunity = $("composer-community");
+const composerCancelReply = $("composer-cancel-reply");
+
+function utf8Bytes(s) { return new TextEncoder().encode(s).length; }
+
+let _lastFeeMessageBytes = -1;
+async function updateComposerMeta() {
+  const text = composerText.value;
+  const bytes = utf8Bytes(text);
+  let line = bytes + " bytes";
+  if (text.trim().length === 0) {
+    composerPost.disabled = true;
+  } else {
+    composerPost.disabled = false;
+  }
+  composerMeta.textContent = line;
+  // Debounced fee preview -- one round-trip per meaningful change.
+  if (bytes > 0 && bytes !== _lastFeeMessageBytes) {
+    _lastFeeMessageBytes = bytes;
+    try {
+      const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
+      if (r.status === 200 && r.data && r.data.result) {
+        const fee = r.data.result.fee_estimate;
+        composerMeta.textContent = bytes + " bytes  ·  ~" + fee + " token fee";
+      }
+    } catch (_) {}
+  }
+}
+composerText.addEventListener("input", updateComposerMeta);
+
+composerCancelReply.addEventListener("click", () => {
+  composerPrev.value = "";
+  composerCancelReply.style.display = "none";
+});
+
+composerPost.addEventListener("click", async () => {
+  const text = composerText.value.trim();
+  if (!text) return;
+  // Pull fee fresh -- the auto-fee in updateComposerMeta is only a
+  // hint; submit at the chain's current minimum + a small headroom
+  // to absorb mempool drift between estimate and submit.
+  let fee = 100;
+  try {
+    const fr = await api("/wallet/estimate-fee?message_bytes=" + utf8Bytes(text));
+    if (fr.status === 200 && fr.data && fr.data.result) {
+      fee = Math.max(1, fr.data.result.fee_estimate);
+    }
+  } catch (_) {}
+  const body = { message: text, fee: fee };
+  if (composerPrev.value.trim()) body.prev = composerPrev.value.trim();
+  if (composerCommunity.value.trim()) body.community_id = composerCommunity.value.trim();
+  composerPost.disabled = true;
+  composerPost.textContent = "Posting…";
+  try {
+    const r = await apiPost("/wallet/send", body);
+    if (r.status === 200) {
+      toast("Posted: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+      composerText.value = "";
+      composerPrev.value = "";
+      composerCommunity.value = "";
+      composerCancelReply.style.display = "none";
+      _lastFeeMessageBytes = -1;
+      updateComposerMeta();
+      refreshFeed();
+      refreshMe();  // balance/sigs change after a send
+    } else {
+      toast("Send failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+    }
+  } finally {
+    composerPost.disabled = false;
+    composerPost.textContent = "Post";
+  }
+});
+
+async function refreshFeed() {
+  const list = $("feed-list");
+  const empty = $("feed-empty");
+  try {
+    const r = await api("/v1/latest?limit=30");
+    if (r.status !== 200) {
+      list.innerHTML = "";
+      empty.style.display = "block";
+      empty.textContent = "Feed unavailable (" + r.status + ").";
+      return;
+    }
+    const msgs = r.data.messages || [];
+    if (msgs.length === 0) {
+      list.innerHTML = "";
+      empty.style.display = "block";
+      empty.textContent = "No messages on chain yet.";
+      return;
+    }
+    empty.style.display = "none";
+    list.innerHTML = "";
+    msgs.forEach(m => list.appendChild(renderMessageCard(m)));
+  } catch (_) {
+    list.innerHTML = "";
+    empty.style.display = "block";
+    empty.textContent = "Chain offline.";
+  }
+}
+
+function renderMessageCard(m) {
+  const card = document.createElement("div");
+  card.className = "msg";
+
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const ent = document.createElement("span");
+  ent.className = "entity";
+  ent.title = m.entity_id || "";
+  ent.textContent = "from " + shortHex(m.entity_id, 10, 6);
+  meta.appendChild(ent);
+  const right = document.createElement("span");
+  right.textContent = (typeof m.block_number === "number" ?
+    "block " + m.block_number + "  ·  " : "") + formatTs(m.timestamp);
+  meta.appendChild(right);
+  card.appendChild(meta);
+
+  if (m.prev) {
+    const prev = document.createElement("div");
+    prev.className = "prev";
+    prev.textContent = "↳ in reply to " + shortHex(m.prev, 10, 6);
+    prev.title = m.prev;
+    card.appendChild(prev);
+  }
+
+  const text = document.createElement("div");
+  text.className = "text";
+  text.textContent = m.message || "";
+  card.appendChild(text);
+
+  if (m.community_id) {
+    const tag = document.createElement("div");
+    tag.className = "hint";
+    tag.style.marginTop = "0.3rem";
+    tag.textContent = "/c/" + m.community_id;
+    card.appendChild(tag);
+  }
+
+  // Wallet-affordances row.  Hidden in read-only mode (composer
+  // also hidden; toolbar disabled at refreshMe time).
+  if (m.tx_hash) {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const reply = document.createElement("button");
+    reply.textContent = "Reply";
+    reply.addEventListener("click", () => {
+      composerPrev.value = m.tx_hash;
+      composerCancelReply.style.display = "inline-block";
+      composerText.focus();
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+    const up = document.createElement("button");
+    up.textContent = "▲";
+    up.title = "Upvote (react choice=1)";
+    up.addEventListener("click", () => react(m.tx_hash, 1));
+    const down = document.createElement("button");
+    down.textContent = "▼";
+    down.title = "Downvote (react choice=2)";
+    down.addEventListener("click", () => react(m.tx_hash, 2));
+    actions.appendChild(reply);
+    actions.appendChild(up);
+    actions.appendChild(down);
+    card.appendChild(actions);
+  }
+
+  return card;
+}
+
+async function react(targetHex, choice) {
+  const r = await apiPost("/wallet/react", {
+    target: targetHex,
+    target_is_user: false,
+    choice: choice,
+    fee: 100,
+  });
+  if (r.status === 200) {
+    toast((choice === 1 ? "Upvoted " : "Downvoted ") + shortHex(targetHex, 8, 6), "ok");
+    refreshMe();
+  } else {
+    toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+}
+
+// ============================================================ Wallet tab
+async function refreshWallet() {
+  const me = await refreshMe();
+  const w = $("wallet-balance");
+  if (!me || me.mode === "read-only") {
+    w.textContent = "Wallet not loaded -- restart with --keyfile.";
     return;
   }
-  try {
-    const r = await walletFetch("/wallet/ping");
-    if (r.status === 200) {
-      statusEl.textContent = "ready";
-      statusEl.className = "pill ok";
-    } else if (r.status === 401) {
-      sessionStorage.removeItem(TOKEN_KEY);
-      statusEl.textContent = "stale token";
-      statusEl.className = "pill warn";
-      hintEl.textContent =
-        "The wallet server has restarted and the previous token is no " +
-        "longer valid.  Re-open the URL printed by `messagechain ui`.";
-    } else {
-      statusEl.textContent = "error " + r.status;
-      statusEl.className = "pill error";
-    }
-  } catch (e) {
-    statusEl.textContent = "unreachable";
-    statusEl.className = "pill error";
-    hintEl.textContent =
-      "The wallet server stopped responding.  It may have been shut " +
-      "down — check the terminal where you ran `messagechain ui`.";
-  }
+  w.innerHTML = "<strong>" + (me.balance || 0) + "</strong> tokens" +
+    (me.stake ? " ·  staked: <strong>" + me.stake + "</strong>" : "");
 }
 
-probe();
+$("xfer-submit").addEventListener("click", async () => {
+  const to = $("xfer-to").value.trim();
+  const amount = parseInt($("xfer-amount").value);
+  const fee = parseInt($("xfer-fee").value);
+  const includePk = $("xfer-pubkey").checked;
+  if (to.length !== 64 || !amount || !fee) {
+    toast("Recipient must be 64 hex chars; amount + fee required", "err");
+    return;
+  }
+  const r = await apiPost("/wallet/transfer", {
+    recipient_id: to, amount: amount, fee: fee, include_pubkey: includePk,
+  });
+  if (r.status === 200) {
+    toast("Transfer sent: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    $("xfer-to").value = "";
+    $("xfer-amount").value = "";
+    refreshWallet();
+  } else {
+    toast("Transfer failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+});
+
+$("stake-submit").addEventListener("click", async () => {
+  const amount = parseInt($("stake-amount").value);
+  const fee = parseInt($("stake-fee").value);
+  if (!amount || !fee) { toast("Amount + fee required", "err"); return; }
+  const r = await apiPost("/wallet/stake", { amount: amount, fee: fee });
+  if (r.status === 200) {
+    toast("Staked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    $("stake-amount").value = "";
+    refreshWallet();
+  } else {
+    toast("Stake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+});
+
+$("unstake-submit").addEventListener("click", async () => {
+  const amount = parseInt($("unstake-amount").value);
+  const fee = parseInt($("unstake-fee").value);
+  if (!amount || !fee) { toast("Amount + fee required", "err"); return; }
+  const r = await apiPost("/wallet/unstake", { amount: amount, fee: fee });
+  if (r.status === 200) {
+    toast("Unstaked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
+    $("unstake-amount").value = "";
+    refreshWallet();
+  } else {
+    toast("Unstake failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+});
+
+// ========================================================== Governance tab
+$("prop-submit").addEventListener("click", async () => {
+  const title = $("prop-title").value.trim();
+  const desc = $("prop-desc").value.trim();
+  const ref = $("prop-ref").value.trim();
+  const feeStr = $("prop-fee").value.trim();
+  if (!title) { toast("Title required", "err"); return; }
+  const body = { title: title, description: desc };
+  if (ref) body.reference_hash = ref;
+  if (feeStr) body.fee = parseInt(feeStr);
+  const r = await apiPost("/wallet/propose", body);
+  if (r.status === 200) {
+    toast("Proposal opened: " + shortHex(r.data.result.proposal_id, 8, 6), "ok");
+    $("prop-title").value = "";
+    $("prop-desc").value = "";
+    $("prop-ref").value = "";
+    $("prop-fee").value = "";
+  } else {
+    toast("Propose failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+});
+
+async function castVote(approve) {
+  const pid = $("vote-pid").value.trim();
+  if (pid.length !== 64) { toast("Proposal id must be 64 hex chars", "err"); return; }
+  const r = await apiPost("/wallet/vote-proposal", {
+    proposal_id: pid, approve: approve,
+  });
+  if (r.status === 200) {
+    toast("Vote " + (approve ? "YES" : "NO") + " cast", "ok");
+  } else {
+    toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+}
+$("vote-yes").addEventListener("click", () => castVote(true));
+$("vote-no").addEventListener("click", () => castVote(false));
+
+// ============================================================ Identity tab
+async function refreshIdentity() {
+  const me = await refreshMe();
+  const el = $("identity-info");
+  if (!me || me.mode === "read-only") {
+    el.textContent = "Wallet not loaded.";
+    return;
+  }
+  el.innerHTML =
+    "<div><strong>Entity ID:</strong> <code>" + (me.entity_id || "") + "</code></div>" +
+    "<div><strong>Public-key registered:</strong> " +
+      (me.pubkey_registered ? "yes" : "no (next outgoing tx will install it)") + "</div>" +
+    "<div><strong>WOTS+ leaves remaining:</strong> " + (me.sigs_remaining ?? "?") + "</div>";
+}
+
+// ================================================================= Node tab
+async function refreshNode() {
+  const r = await api("/v1/info");
+  const el = $("node-info");
+  if (r.status !== 200 || !r.data) {
+    el.textContent = "Validator unreachable.";
+    return;
+  }
+  const i = r.data;
+  el.innerHTML =
+    "<div><strong>Chain ID:</strong> " + (i.chain_id || "?") + "</div>" +
+    "<div><strong>Height:</strong> " + (i.height ?? "?") + "</div>" +
+    "<div><strong>Tip hash:</strong> <code>" +
+      (shortHex(i.tip_hash, 12, 8) || "?") + "</code></div>" +
+    "<div><strong>State root:</strong> <code>" +
+      (shortHex(i.state_root, 12, 8) || "?") + "</code></div>" +
+    "<div><strong>Genesis:</strong> <code>" +
+      (shortHex(i.genesis_hash, 12, 8) || "?") + "</code></div>" +
+    "<div><strong>Last block ts:</strong> " +
+      formatTs(i.last_block_timestamp) + "</div>";
+}
+
+// =================================================================== boot
+(async function init() {
+  const t = bootstrapToken();
+  if (!t) {
+    toast("No session token in URL.  Restart with `messagechain ui`.", "err");
+    return;
+  }
+  await Promise.all([refreshMe(), refreshChainStatus()]);
+  await refreshFeed();
+  // Light periodic refresh -- the chain advances every few seconds,
+  // so re-render the feed and the chain-status pill on a slow tick.
+  setInterval(refreshChainStatus, 8000);
+  setInterval(refreshFeed, 12000);
+  setInterval(refreshMe, 20000);
+})();
 </script>
 </body>
 </html>

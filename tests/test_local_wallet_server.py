@@ -1001,5 +1001,55 @@ class TestWalletEstimateFee(_WalletServerTestBase):
         self.assertEqual(status, 401)
 
 
+# -----------------------------------------------------------------
+# Wallet UI HTML.  The landing page is served at GET /, must NOT be
+# token-gated (token isn't available until the page parses ?t=…),
+# and must surface the key affordances (composer, tabs, route URLs)
+# the JS expects.  These checks would catch the file going missing
+# or someone collapsing it back to a placeholder.
+# -----------------------------------------------------------------
+class TestWalletIndexHtml(_WalletServerTestBase):
+    def test_landing_page_loads_unauthenticated(self):
+        srv, port = self._spin_up()
+        status, headers, body = self._request(port, "GET", "/")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            headers.get("Content-Type"),
+            "text/html; charset=utf-8",
+        )
+        # No CORS even on the static page -- the wallet origin is
+        # private to the user; no other origin should be loading it.
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_landing_page_contains_full_wallet_ui_markers(self):
+        # If this test fails after a refactor, you've either deleted
+        # the SPA shell or renamed the elements its JS depends on.
+        srv, port = self._spin_up()
+        _, _, body = self._request(port, "GET", "/")
+        body_text = body.decode("utf-8", errors="replace")
+        for needle in [
+            "MessageChain Wallet",
+            'id="composer-text"',
+            'id="tab-feed"',
+            'id="tab-wallet"',
+            'id="tab-governance"',
+            'id="tab-identity"',
+            'id="tab-node"',
+            "/wallet/send",
+            "/wallet/transfer",
+            "/wallet/stake",
+            "/wallet/unstake",
+            "/wallet/react",
+            "/wallet/propose",
+            "/wallet/vote-proposal",
+            "/v1/info",
+            "/v1/latest",
+        ]:
+            self.assertIn(
+                needle, body_text,
+                f"wallet/index.html no longer contains {needle!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
