@@ -7433,6 +7433,83 @@ assert SLASH_MIN_UNIT_HEIGHT > PROPOSER_SHARE_MIN_UNIT_HEIGHT, (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 76 - Finality-vote inclusion-reward per-block cap (audit r54 #1)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Pre-Tier-76, ``_apply_finality_votes`` mints
+# ``FINALITY_VOTE_INCLUSION_REWARD = 1`` tokens of direct mint to the
+# proposer for EVERY survivor of the pre-filter, up to
+# ``MAX_FINALITY_VOTES_PER_BLOCK = 200``.  The mint never routes
+# through any of the issuance-discipline plumbing every other reward
+# path now goes through:
+#   * ``_split_bps`` (Tier 73/74/75 round-to-zero clamp + supply-
+#     conservation invariant)
+#   * ``effective_weight`` (Tier 70/71 stake-concentration soft cap)
+#   * the ``mint_block_reward`` per-block-cap / redistribute logic
+#   * the ``DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500`` dormancy controller
+#     clamp
+#
+# Pillars at risk:
+#   * "Mathematical decentralization over time" -- whale proposers
+#     receive a per-vote inclusion bonus that scales linearly with
+#     their proposer-slot share (which itself is sublinear via Tier
+#     70/71 effective_weight, so the linear-on-top compounds back
+#     toward the plutocracy regime Tier 70 anchored against).
+#   * "Stable active supply" -- 200 tokens/block of mint outside the
+#     dormancy controller's regulated band leaks the anchored
+#     issuance envelope.  At the controller's small-issuance steady
+#     state (~50 tokens/block) the finality-mint actually dominates
+#     the bounded path 4:1.
+#
+# Tier 76 caps the per-block finality-mint TOTAL at
+# ``FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS =
+# MAX_FINALITY_VOTES_PER_BLOCK // 8`` = 25.  Cap is grounded in the
+# DoS-guard cap (``MAX_FINALITY_VOTES_PER_BLOCK``), not a magic
+# number.  Real chains sit ~1 vote/block on average
+# (FINALITY_INTERVAL=100), so the cap leaves 25x headroom for
+# finality-vote backlogs without exposing the controller envelope to
+# saturation.
+#
+# Pre-fork: byte-identical to legacy at every (n_votes, ...)
+# combination so historical-block replay matches.
+# Post-fork: the first ``cap`` survivors mint
+# ``FINALITY_VOTE_INCLUSION_REWARD`` each; further survivors still
+# contribute to the 2/3 finality tally (checkpoint safety/liveness
+# is uncapped on purpose -- finalization must still cross 2/3 at
+# high vote count) but produce no mint -- the inclusion service is
+# unpaid past the budget.  Honest proposers including <= 25 votes/
+# block see zero change.  Whales packing 200 votes/block see their
+# bonus capped at 25 -- bound to the dormancy-controller envelope.
+#
+# Activation height ``14500`` sits 2000 blocks above Tier 75 (12500),
+# matching the Tier 70 -> 71 -> 73 -> 74 -> 75 ~13.9-day cohort
+# spacing.  A reward-distribution retune deserves its own operator
+# runway -- piling it into Tier 75's cohort would force operators to
+# absorb a punishment-side AND an issuance-discipline retune in the
+# same upgrade cycle.
+FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT = 14500  # Tier 76
+FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS = (
+    MAX_FINALITY_VOTES_PER_BLOCK // 8
+)
+
+assert FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT > SLASH_MIN_UNIT_HEIGHT, (
+    "FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT (Tier 76) must strictly "
+    "follow SLASH_MIN_UNIT_HEIGHT (Tier 75) -- consecutive issuance-"
+    "discipline retunes deserve their own cohort so operators absorb "
+    "each in its own upgrade cycle."
+)
+assert FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS > 0, (
+    "FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS must be positive -- "
+    "a cap of zero would silently disable the inclusion bonus, "
+    "breaking the proposer-incentive anchor entirely."
+)
+assert FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS < MAX_FINALITY_VOTES_PER_BLOCK, (
+    "FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS must be strictly below "
+    "MAX_FINALITY_VOTES_PER_BLOCK or the fork is a no-op."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

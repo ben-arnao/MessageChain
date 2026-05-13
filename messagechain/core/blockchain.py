@@ -9225,9 +9225,26 @@ class Blockchain:
             FINALITY_VOTE_INCLUSION_REWARD, TREASURY_ENTITY_ID,
             FINALITY_REWARD_FROM_ISSUANCE_HEIGHT,
             MAX_FINALITY_VOTES_PER_BLOCK, FINALITY_VOTE_CAP_HEIGHT,
+            FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT,
+            FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS,
         )
         block_height = block.header.block_number
         fork_active = block_height >= FINALITY_REWARD_FROM_ISSUANCE_HEIGHT
+        # Tier 76 -- per-block finality-mint TOTAL cap.  Pre-fork the
+        # budget is None (unlimited, byte-identical to legacy).  Post-
+        # fork, the first ``cap`` tokens of mint flow to the proposer;
+        # further survivors still contribute to the 2/3 finality tally
+        # (checkpoint safety/liveness uncapped on purpose) but produce
+        # no mint.  Caps the worst-case (200 votes/block) issuance
+        # leak outside the dormancy controller envelope at 25 tokens
+        # vs 200 pre-fork.
+        finality_mint_budget_active = (
+            block_height >= FINALITY_VOTE_REWARD_PER_BLOCK_CAP_HEIGHT
+        )
+        finality_mint_budget = (
+            FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS
+            if finality_mint_budget_active else None
+        )
         # Apply-path clamp (defense-in-depth, FINALITY_VOTE_CAP_HEIGHT
         # fork).  `_validate_finality_votes` is the first line of
         # defense: it rejects oversize blocks outright.  But under the
@@ -9322,26 +9339,40 @@ class Blockchain:
             self._bump_watermark(v.signer_entity_id, v.signature.leaf_index)
             if FINALITY_VOTE_INCLUSION_REWARD <= 0:
                 continue
+            # Tier 76: clamp the per-vote mint against the per-block
+            # finality-mint budget.  Pre-fork ``finality_mint_budget``
+            # is None and ``per_vote_mint`` stays at
+            # ``FINALITY_VOTE_INCLUSION_REWARD`` -- byte-identical to
+            # legacy.  Post-fork the budget is exhausted once
+            # ``FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS`` tokens
+            # have been minted in this block; remaining survivors
+            # still bump the watermark (above) and still contribute
+            # to the checkpoint tally (below) but produce no mint.
+            per_vote_mint = FINALITY_VOTE_INCLUSION_REWARD
+            if finality_mint_budget is not None:
+                per_vote_mint = min(per_vote_mint, finality_mint_budget)
+                if per_vote_mint <= 0:
+                    continue
+                finality_mint_budget -= per_vote_mint
             if fork_active:
                 # Post-fork: mint the reward directly.  Bumps
                 # total_supply AND total_minted so the end-of-apply
                 # supply-invariant assertion (total_supply ==
                 # GENESIS_SUPPLY + total_minted - total_burned) holds.
-                # Annual cost at FINALITY_INTERVAL=100 and ~100
-                # validators ≈ 52,600 tokens/year ≈ 0.038% of 140M
-                # supply — trivial next to block issuance.
-                self.supply.total_supply += FINALITY_VOTE_INCLUSION_REWARD
-                self.supply.total_minted += FINALITY_VOTE_INCLUSION_REWARD
+                # Post-Tier-76 the per-block total is capped at
+                # FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS.
+                self.supply.total_supply += per_vote_mint
+                self.supply.total_minted += per_vote_mint
                 self.supply.balances[proposer_id] = (
                     self.supply.balances.get(proposer_id, 0)
-                    + FINALITY_VOTE_INCLUSION_REWARD
+                    + per_vote_mint
                 )
             else:
                 # Pre-fork legacy: treasury-spend with silent
                 # zero-fallback.  Preserved byte-for-byte for
                 # historical replay.
                 treasury_bal = self.supply.balances.get(TREASURY_ENTITY_ID, 0)
-                payout = min(FINALITY_VOTE_INCLUSION_REWARD, treasury_bal)
+                payout = min(per_vote_mint, treasury_bal)
                 if payout > 0:
                     self.supply.balances[TREASURY_ENTITY_ID] = (
                         treasury_bal - payout
