@@ -2227,8 +2227,35 @@ class Server(SharedRuntimeMixin):
             tx = StakeTransaction.deserialize(params["transaction"])
             entity_id = tx.entity_id
 
-            if entity_id not in self.blockchain.public_keys:
-                return {"ok": False, "error": "Unknown entity"}
+            # First-spend pubkey resolution.  Pre-r53 #2 ``_rpc_stake``
+            # hard-gated on ``entity_id in public_keys`` BEFORE
+            # consulting ``tx.sender_pubkey``, so the README "Run a
+            # validator" flow -- which has the operator's stake be
+            # their FIRST on-chain spend, immediately after a faucet
+            # drip -- was wedged: faucet funds landed under the
+            # operator's entity_id but no pubkey was registered on
+            # chain yet (transfers reveal the SENDER's pubkey, not
+            # the recipient's), so the very next ``messagechain
+            # stake`` call was rejected as "Unknown entity".
+            #
+            # Route through the same first-spend resolver used by
+            # ``_tx_signer_pubkey`` / ``submit_transaction`` /
+            # the gossip-ingress paths: if the entity isn't yet on
+            # chain, trust ``tx.sender_pubkey`` IFF it derives back
+            # to ``entity_id``.  StakeTransaction has carried the
+            # ``sender_pubkey`` field since Tier 11; this just
+            # finishes wiring it through admission.
+            public_key = self.blockchain.public_keys.get(entity_id)
+            if public_key is None:
+                sender_pubkey = getattr(tx, "sender_pubkey", b"") or b""
+                if len(sender_pubkey) == 32:
+                    from messagechain.identity.identity import (
+                        derive_entity_id,
+                    )
+                    if derive_entity_id(sender_pubkey) == entity_id:
+                        public_key = bytes(sender_pubkey)
+                if public_key is None:
+                    return {"ok": False, "error": "Unknown entity"}
 
             # Order matters: run cheap nonce/leaf/balance checks BEFORE
             # the expensive WOTS+ verify.  An attacker flooding malformed
@@ -2249,7 +2276,9 @@ class Server(SharedRuntimeMixin):
                 return {"ok": False, "error": "WOTS+ leaf already used by another pending tx - leaf reuse rejected"}
 
             # Cheap gates passed; now run the expensive WOTS+ verify.
-            public_key = self.blockchain.public_keys[entity_id]
+            # ``public_key`` was already resolved above (either from
+            # the chain or from tx.sender_pubkey via the first-spend
+            # gate); no further lookup needed.
             if not verify_stake_transaction(
                 tx, public_key,
                 block_height=self.blockchain.height,

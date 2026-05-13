@@ -4082,7 +4082,36 @@ def cmd_stake(args):
         port=port,
         args=args,
     )
-    tx = create_stake_transaction(entity, args.amount, nonce=nonce, fee=fee)
+
+    # First-spend pubkey reveal (Tier 11).  The README "Run a validator"
+    # flow has the stake step be the operator's FIRST on-chain spend
+    # (faucet drip -> stake), so without ``include_pubkey`` the chain
+    # has no record of the new validator's signing key and admission
+    # rejects with "Unknown entity".  Route through the shared
+    # ``_should_include_pubkey`` chokepoint (audit r46 #3) so every
+    # signing command agrees on the probe semantics; ``cmd_stake``
+    # being the last hold-out is what made the bootstrap path wedge
+    # for every fresh validator install (audit r53 #2).
+    info_resp = rpc_call(host, port, "get_chain_info", {})
+    include_pubkey = False
+    if info_resp.get("ok"):
+        count = info_resp["result"].get("height", 0) or 0
+        target_height = max(count - 1, 0) + 1
+        include_pubkey = _should_include_pubkey(
+            host, port, entity.entity_id_hex, target_height,
+        )
+    if include_pubkey:
+        print(
+            "\nFirst spend from this wallet -- attaching pubkey "
+            "(Tier 11 receive-to-exist install).  Subsequent stake "
+            "txs will skip this."
+        )
+
+    tx = create_stake_transaction(
+        entity, args.amount,
+        nonce=nonce, fee=fee,
+        include_pubkey=include_pubkey,
+    )
 
     print(f"Staking {args.amount} tokens (fee: {fee})...")
 

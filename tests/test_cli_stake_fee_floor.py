@@ -82,7 +82,11 @@ class TestCliStakeFeeFloor(unittest.TestCase):
 
         captured = {}
 
-        def _capture(entity, amount, *, nonce, fee, signing_keypair=None):
+        def _capture(entity, amount, *, nonce, fee, **kwargs):
+            # ``**kwargs`` absorbs any tx-kind-specific signing kwargs
+            # (``signing_keypair`` for unstake; ``include_pubkey``
+            # threaded through cmd_stake post-r53 #2 for the validator-
+            # bootstrap first-spend pubkey reveal).
             captured["fee"] = fee
             captured["amount"] = amount
             return fake_tx
