@@ -2596,6 +2596,45 @@ def _reserve_leaf_via_rpc(host, port, entity_id_hex):
     return leaf
 
 
+def _resolve_signing_leaf_via_caller(
+    rpc_caller, entity, *, data_dir, watermark_fallback,
+):
+    """RPC-caller variant of _resolve_signing_leaf.
+
+    Same chokepoint contract (atomic reserve via RPC + bind persistent
+    cursor before sign) but takes a generic callable instead of
+    (host, port).  Used by surfaces that hold their own rpc_caller
+    abstraction -- e.g. messagechain.network.wallet_ops, where tests
+    inject a fake caller to exercise the signing flow without a real
+    RPC server.
+
+    Both this and _resolve_signing_leaf converge on the same final
+    _bind_persistent_leaf_index call so the audit r54 #2 single-
+    chokepoint invariant holds across CLI + wallet-UI signing
+    surfaces.
+    """
+    leaf = None
+    try:
+        r = rpc_caller(
+            "reserve_leaf", {"entity_id": entity.entity_id_hex},
+        )
+        if isinstance(r, dict) and r.get("ok"):
+            cand = (r.get("result") or {}).get("leaf_index")
+            if isinstance(cand, int):
+                leaf = cand
+    except Exception:
+        # Older daemon, no daemon, or transport failure -- fall through
+        # to the watermark.  Same residual hazard the (host, port)
+        # variant accepts; same single-process safety floor preserved.
+        leaf = None
+    if leaf is None:
+        leaf = int(watermark_fallback)
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=leaf, data_dir=data_dir,
+    )
+    return leaf
+
+
 def _resolve_signing_leaf(
     host, port, entity, *, data_dir, watermark_fallback,
 ):
@@ -9021,6 +9060,7 @@ def cmd_ui(args):
             token=args.auth_token,
             entity=entity,
             rpc_endpoint=(rpc_host, rpc_port),
+            data_dir=getattr(args, "data_dir", None),
         )
     except LoopbackBindError as e:
         print(f"Error: {e}")

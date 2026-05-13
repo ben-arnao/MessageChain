@@ -581,5 +581,193 @@ class TestV1TxStatus(_WalletServerTestBase):
         self.assertEqual(status, 400)
 
 
+# -----------------------------------------------------------------
+# POST /wallet/send + GET /wallet/estimate-fee.
+# Tests use a real Entity at the test conftest's reduced
+# MERKLE_TREE_HEIGHT (height=4 -> 16 leaves), so signing happens
+# end-to-end and the fake RPC just observes the serialized tx.
+# This catches integration bugs the stub-entity tests would miss
+# (signature shape, leaf-cursor binding, fee enforcement).
+# -----------------------------------------------------------------
+class TestWalletSend(_WalletServerTestBase):
+    def _build_real_entity(self):
+        # Conftest pins MERKLE_TREE_HEIGHT=4; Entity.create with that
+        # height takes ~50ms.  Deterministic private_key for repeatable
+        # entity_id; matches the fixture pattern used elsewhere.
+        from messagechain.identity.identity import Entity
+        return Entity.create(bytes(range(32)))
+
+    def test_read_only_mode_returns_503(self):
+        srv, port = self._spin_up()  # no entity
+        headers = {
+            "Authorization": f"Bearer {srv.token}",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps({"message": "hello", "fee": 100})
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", "/wallet/send", body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        data = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(status, 503)
+        self.assertFalse(data["ok"])
+        self.assertIn("read-only", data["error"])
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(
+            "POST", "/wallet/send",
+            body=json.dumps({"message": "hi", "fee": 1}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        status = resp.status
+        conn.close()
+        self.assertEqual(status, 401)
+
+    def test_signs_and_submits_real_tx(self):
+        # The fake RPC inspects the submitted serialized tx and
+        # confirms the wallet flow round-trips: get_nonce ->
+        # reserve_leaf -> get_chain_info -> create_transaction
+        # (signs) -> submit_transaction.
+        captured = {}
+
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                # Older nodes may not implement this -- treat as
+                # not-found.  Wallet should fall back to leaf_watermark.
+                return {"ok": False, "error": "method not found"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_transaction":
+                captured["tx_hex"] = params["transaction"]
+                # Validate the serialized tx round-trips via deserialize.
+                from messagechain.core.transaction import MessageTransaction
+                tx = MessageTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {
+                    "tx_hash": tx.tx_hash.hex(), "fee": tx.fee,
+                }}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        headers = {
+            "Authorization": f"Bearer {srv.token}",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps({"message": "hello chain", "fee": 100_000})
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/wallet/send", body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        data = json.loads(resp.read())
+        conn.close()
+
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertIn("tx_hash", data["result"])
+        # The submitted tx really was built + signed by the loaded
+        # entity -- the captured tx's entity_id matches.
+        self.assertEqual(captured["tx"].entity_id, entity.entity_id)
+        self.assertEqual(captured["tx"].fee, 100_000)
+
+    def test_chain_rejects_low_fee_returns_502(self):
+        # Fee below the chain's minimum -- wallet_ops bubbles up the
+        # validator's error.  502 maps to "upstream rejected" and
+        # makes the UI show the reason verbatim.
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_transaction":
+                return {"ok": False, "error": "Fee must be at least 200"}
+            raise NotImplementedError(method)
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        headers = {
+            "Authorization": f"Bearer {srv.token}",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps({"message": "x", "fee": 1_000_000})
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/wallet/send", body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        data = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(status, 502, msg=data)
+        self.assertFalse(data["ok"])
+        self.assertIn("Fee", data["error"])
+
+    def test_invalid_prev_hex_returns_400_without_signing(self):
+        # Bad prev hex -> 400 BEFORE any sign or RPC call.
+        # Critical: signing first would burn a WOTS+ leaf on a
+        # doomed tx.
+        def _rpc(method, params):
+            raise AssertionError("RPC must NOT be called for malformed prev")
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        headers = {
+            "Authorization": f"Bearer {srv.token}",
+            "Content-Type": "application/json",
+        }
+        body = json.dumps({
+            "message": "x", "fee": 100, "prev": "not-hex" * 8,
+        })
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", "/wallet/send", body=body, headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        conn.close()
+        self.assertEqual(status, 400)
+
+
+class TestWalletEstimateFee(_WalletServerTestBase):
+    def test_passes_message_bytes_through(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_fee_estimate":
+                captured["params"] = params
+                return {"ok": True, "result": {"fee_estimate": 250}}
+            raise NotImplementedError(method)
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/wallet/estimate-fee?message_bytes=42",
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["result"]["fee_estimate"], 250)
+        self.assertEqual(captured["params"]["message_bytes"], 42)
+
+    def test_invalid_param_returns_400(self):
+        def _rpc(method, params):
+            raise AssertionError("RPC must NOT be called on bad input")
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, _ = self._request(
+            port, "GET", "/wallet/estimate-fee?message_bytes=abc",
+            headers=headers,
+        )
+        self.assertEqual(status, 400)
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        status, _, _ = self._request(
+            port, "GET", "/wallet/estimate-fee?message_bytes=10",
+        )
+        self.assertEqual(status, 401)
+
+
 if __name__ == "__main__":
     unittest.main()

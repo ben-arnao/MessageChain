@@ -337,8 +337,201 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/tx_status":
             self._serve_v1_tx_status(split.query)
             return
+        if path == "/wallet/estimate-fee":
+            self._serve_wallet_estimate_fee(split.query)
+            return
 
         self._send_text(404, "Not Found")
+
+    def do_POST(self):
+        if not self._check_host_header_or_reject():
+            return
+        split = urlsplit(self.path)
+        path = split.path
+        # Every POST route is a write op -- token-required, no
+        # bypass-listing.  Do the token check before any body parse.
+        if not self._check_token_or_reject(split.query):
+            return
+
+        if path == "/wallet/send":
+            self._serve_wallet_send_post()
+            return
+
+        self._send_text(404, "Not Found")
+
+    # --- shared POST helpers ------------------------------------------
+
+    def _read_json_body(self) -> tuple[bool, object]:
+        """Read + parse a JSON request body.  Returns (ok, payload)."""
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        # Cap body size -- wallet write requests are small (text +
+        # a few bytes of params).  10 KB is generous enough for the
+        # max message + every other field, and small enough to not
+        # let a misbehaving client wedge a handler thread.
+        if length < 0 or length > 10_000:
+            return False, {"error": "Content-Length missing or out of range"}
+        if length == 0:
+            return True, {}
+        try:
+            raw = self.rfile.read(length)
+        except Exception as e:
+            return False, {"error": f"body read failed: {type(e).__name__}"}
+        try:
+            return True, json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            return False, {"error": f"invalid JSON body: {type(e).__name__}"}
+
+    # --- wallet write routes ------------------------------------------
+
+    def _serve_wallet_send_post(self):
+        """POST /wallet/send -- sign + submit a message tx.
+
+        Body (JSON):
+            {
+              "message": "<text>",
+              "fee": <int>,
+              "prev": "<64-hex>" | null,             # optional reply pointer
+              "community_id": "<handle>" | null,     # optional grouping
+              "include_pubkey": <bool>,              # first-spend flag
+              "poll_options": ["A","B"] | null,      # poll-creating tx
+              "vote_target": ["<poll_txid_hex>", <int>] | null  # vote tx
+            }
+
+        Returns the tx_hash on success.  Rejects when no entity is
+        loaded (read-only mode), the validator is unreachable, or the
+        chain rejects the tx (e.g. fee too low, leaf consumed)."""
+        ctx = self.server._wallet_context
+        if ctx.entity is None:
+            self._send_json(503, {
+                "ok": False,
+                "error": "wallet running in read-only mode (no key loaded)",
+            })
+            return
+
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+
+        # Optional fields normalized + validated cheaply BEFORE the
+        # signing call so we never burn a WOTS+ leaf on a doomed tx.
+        prev_bytes = None
+        prev_hex = body.get("prev")
+        if prev_hex:
+            if not isinstance(prev_hex, str) or len(prev_hex) != 64:
+                self._send_json(400, {
+                    "ok": False, "error": "prev must be 64 hex chars",
+                })
+                return
+            try:
+                prev_bytes = bytes.fromhex(prev_hex)
+            except ValueError:
+                self._send_json(400, {
+                    "ok": False, "error": "prev must be valid hex",
+                })
+                return
+
+        community_id = body.get("community_id")
+        if community_id is not None and not isinstance(community_id, str):
+            self._send_json(400, {
+                "ok": False, "error": "community_id must be a string",
+            })
+            return
+
+        poll_options = body.get("poll_options")
+        if poll_options is not None:
+            if not isinstance(poll_options, list) or not all(
+                isinstance(x, str) for x in poll_options
+            ):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "poll_options must be a list of strings",
+                })
+                return
+            poll_options = tuple(poll_options)
+
+        vote_target = body.get("vote_target")
+        if vote_target is not None:
+            if (
+                not isinstance(vote_target, list)
+                or len(vote_target) != 2
+                or not isinstance(vote_target[0], str)
+                or not isinstance(vote_target[1], int)
+            ):
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "vote_target must be [poll_txid_hex, option_index_int]",
+                })
+                return
+            if len(vote_target[0]) != 64:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "vote_target poll_txid must be 64 hex chars",
+                })
+                return
+            try:
+                vt_pid = bytes.fromhex(vote_target[0])
+            except ValueError:
+                self._send_json(400, {
+                    "ok": False,
+                    "error": "vote_target poll_txid must be valid hex",
+                })
+                return
+            vote_target = (vt_pid, vote_target[1])
+
+        from messagechain.network.wallet_ops import op_send_message
+        result = op_send_message(
+            ctx.entity,
+            ctx.rpc_caller,
+            message=body.get("message", ""),
+            fee=body.get("fee", 0),
+            prev=prev_bytes,
+            community_id=community_id,
+            poll_options=poll_options,
+            vote_target=vote_target,
+            include_pubkey=bool(body.get("include_pubkey", False)),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        # 200 on chain accept; 400 on caller-fixable validation;
+        # 502 on chain reject (e.g. fee too low, entity unknown);
+        # 503 on RPC unreachable.  Map by sniffing the error string
+        # since wallet_ops returns a flat shape.
+        if result.get("ok"):
+            self._send_json(200, result)
+            return
+        err = (result.get("error") or "").lower()
+        if "unreachable" in err:
+            status = 503
+        elif "must" in err and "string" in err:  # input-validation
+            status = 400
+        else:
+            status = 502
+        self._send_json(status, result)
+
+    def _serve_wallet_estimate_fee(self, query: str):
+        """GET /wallet/estimate-fee?message_bytes=N
+
+        Pure RPC pass-through to the validator's get_fee_estimate.
+        Surfaced as a wallet route so the composer can render a
+        "this will cost ~X tokens" line BEFORE the user signs."""
+        params = parse_qs(query or "")
+        raw_bytes = (params.get("message_bytes") or ["0"])[0]
+        try:
+            mb = int(raw_bytes)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "message_bytes must be an integer",
+            })
+            return
+        ctx = self.server._wallet_context
+        from messagechain.network.wallet_ops import op_estimate_fee
+        result = op_estimate_fee(ctx.rpc_caller, message_bytes=mb)
+        if result.get("ok"):
+            self._send_json(200, result)
+        else:
+            err = (result.get("error") or "").lower()
+            self._send_json(503 if "unreachable" in err else 502, result)
 
     # --- wallet identity / "you" panel --------------------------------
 
@@ -558,6 +751,7 @@ class LocalWalletServer:
         entity=None,
         rpc_endpoint: tuple = ("127.0.0.1", 9334),
         rpc_caller: Optional[Callable] = None,
+        data_dir: Optional[str] = None,
     ):
         _validate_loopback_bind(bind)
         self.blockchain = blockchain
@@ -566,6 +760,16 @@ class LocalWalletServer:
         self.token = token if token is not None else _generate_session_token()
         self.entity = entity
         self.rpc_endpoint = tuple(rpc_endpoint)
+        # Optional: validator co-host data dir.  When set, the wallet
+        # server's leaf-cursor binder routes through
+        # <data_dir>/leaf_index.json (the same file the daemon owns)
+        # so cross-process WOTS+ leaf coordination is exact.  Unset
+        # falls back to the per-user
+        # ~/.messagechain/leaves/<entity>.idx file -- safe for
+        # off-validator wallets but does NOT coordinate with a daemon
+        # signing on the same key.  cmd_ui defaults this from the
+        # global --data-dir flag.
+        self.data_dir = data_dir
         # Tests inject `rpc_caller` directly to bypass the actual RPC
         # round-trip.  In production we lazily wrap `client.rpc_call`
         # against `rpc_endpoint`.
@@ -600,12 +804,14 @@ class LocalWalletServer:
             address_family = family
 
         self._httpd = _BoundServer((self.bind, self.port), _WalletHandler)
-        self._httpd._wallet_context = _WalletHandlerContext(
+        ctx = _WalletHandlerContext(
             blockchain=self.blockchain,
             token=self.token,
             entity=self.entity,
             rpc_caller=self.rpc_caller,
         )
+        ctx.data_dir = self.data_dir
+        self._httpd._wallet_context = ctx
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
             name=f"mc-local-wallet-{self.port}",
