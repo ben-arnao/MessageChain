@@ -457,6 +457,97 @@ class TestV1Entity(_WalletServerTestBase):
         self.assertEqual(status, 404)
 
 
+# -----------------------------------------------------------------
+# /wallet/me — the "you" panel.  Composes loaded-Entity local data
+# (entity_id, WOTS+ leaf accounting) with on-chain stats fetched via
+# RPC (balance, stake, pubkey_registered).  Read-only mode (no key
+# loaded) returns ok=true with mode="read-only" so the UI can render
+# a "load a wallet" affordance.
+# -----------------------------------------------------------------
+class TestWalletMe(_WalletServerTestBase):
+    def test_read_only_when_no_entity_loaded(self):
+        # No entity passed to the server -- the cmd_ui --read-only
+        # path takes this branch.  Should NOT 503; the UI needs a
+        # 200 to render its "load a wallet" call-to-action.
+        srv, port = self._spin_up()
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/wallet/me", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "read-only")
+        self.assertIsNone(data["entity_id"])
+        self.assertIsNone(data["balance"])
+        self.assertIsNone(data["sigs_remaining"])
+
+    def test_with_loaded_entity_returns_id_and_chain_stats(self):
+        eid_hex = "ab" * 32
+        fake_entity = SimpleNamespace(
+            entity_id_hex=eid_hex,
+            entity_id=bytes.fromhex(eid_hex),
+            keypair=SimpleNamespace(num_leaves=1024, _next_leaf=42),
+        )
+        rpc = _make_fake_rpc({
+            "get_entity": lambda p: {
+                "ok": True,
+                "result": {
+                    "entity_id": p["entity_id"],
+                    "balance": 9001,
+                    "stake": 100,
+                    "pubkey_registered": True,
+                },
+            },
+        })
+        srv, port = self._spin_up(entity=fake_entity, rpc_caller=rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/wallet/me", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["mode"], "wallet")
+        self.assertEqual(data["entity_id"], eid_hex)
+        self.assertEqual(data["balance"], 9001)
+        self.assertEqual(data["stake"], 100)
+        self.assertTrue(data["pubkey_registered"])
+        # 1024 leaves total, 42 used -> 982 remaining.
+        self.assertEqual(data["sigs_remaining"], 1024 - 42)
+
+    def test_chain_unreachable_still_returns_local_fields(self):
+        # An offline validator should NOT take the entire panel
+        # offline.  The page can still render entity_id +
+        # sigs_remaining (both purely local) with a "chain offline"
+        # banner; that's far better UX than a 503 wipe.
+        eid_hex = "cd" * 32
+        fake_entity = SimpleNamespace(
+            entity_id_hex=eid_hex,
+            entity_id=bytes.fromhex(eid_hex),
+            keypair=SimpleNamespace(num_leaves=2048, _next_leaf=0),
+        )
+        def _raises(method, params):
+            raise ConnectionError("validator down")
+        srv, port = self._spin_up(entity=fake_entity, rpc_caller=_raises)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/wallet/me", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["entity_id"], eid_hex)
+        self.assertEqual(data["sigs_remaining"], 2048)
+        self.assertIsNone(data["balance"])
+        self.assertIsNone(data["stake"])
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        status, _, _ = self._request(port, "GET", "/wallet/me")
+        self.assertEqual(status, 401)
+
+
 class TestV1TxStatus(_WalletServerTestBase):
     def test_returns_tx_status(self):
         rpc = _make_fake_rpc({

@@ -307,6 +307,18 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
 
+        if path == "/wallet/me":
+            # The "you" panel pinned in the wallet UI's header.
+            # Composed from two sources: the loaded Entity (entity_id,
+            # WOTS+ leaf accounting -- in-process and free) and the
+            # local validator (balance, stake, pubkey_registered --
+            # one RPC).  In read-only mode (no key loaded) the
+            # entity-side fields are null and `mode: read-only` so
+            # the UI can render a "load a wallet" affordance instead
+            # of error-state.
+            self._serve_wallet_me()
+            return
+
         # Read endpoints — same JSON shape as PublicFeedServer's
         # /v1/* surface so the same client JS works against either
         # server.  Implemented as RPC-proxies to the local validator
@@ -327,6 +339,59 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             return
 
         self._send_text(404, "Not Found")
+
+    # --- wallet identity / "you" panel --------------------------------
+
+    def _serve_wallet_me(self):
+        ctx = self.server._wallet_context
+        if ctx.entity is None:
+            # Read-only mode -- the page renders this as "no wallet
+            # loaded; restart with --keyfile to enable signing".
+            self._send_json(200, {
+                "ok": True,
+                "mode": "read-only",
+                "entity_id": None,
+                "balance": None,
+                "stake": None,
+                "pubkey_registered": None,
+                "sigs_remaining": None,
+            })
+            return
+
+        entity_id_hex = ctx.entity.entity_id_hex
+
+        # Best-effort RPC pull for on-chain stats.  An unreachable
+        # validator should NOT take the whole panel down -- the local
+        # entity_id + leaf accounting are still useful, so return
+        # what we have with the on-chain fields set to null.
+        ok, ent_resp = self._rpc("get_entity", {"entity_id": entity_id_hex})
+        on_chain: dict = {}
+        if ok and isinstance(ent_resp, dict) and ent_resp.get("ok"):
+            on_chain = ent_resp.get("result") or {}
+
+        # WOTS+ remaining-signature count.  Each `_next_leaf` advance
+        # consumes one one-time leaf; running out is a hard signing
+        # stop.  Surfaced so the UI can warn the user before it bites
+        # (the rotate-key flow is what they need next).  Pulled from
+        # private attrs because the public surface doesn't expose them
+        # -- an internal-only read, never written.
+        keypair = getattr(ctx.entity, "keypair", None)
+        num_leaves = getattr(keypair, "num_leaves", None)
+        next_leaf = getattr(keypair, "_next_leaf", None)
+        if isinstance(num_leaves, int) and isinstance(next_leaf, int):
+            sigs_remaining = max(0, num_leaves - next_leaf)
+        else:
+            sigs_remaining = None
+
+        self._send_json(200, {
+            "ok": True,
+            "mode": "wallet",
+            "entity_id": entity_id_hex,
+            "balance": on_chain.get("balance"),
+            "stake": on_chain.get("stake"),
+            "pubkey_registered": on_chain.get("pubkey_registered"),
+            "sigs_remaining": sigs_remaining,
+        })
 
     # --- read-side RPC proxies ----------------------------------------
 

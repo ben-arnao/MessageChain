@@ -8774,11 +8774,11 @@ def cmd_notify_status(args):
 def cmd_ui(args):
     """Run the local wallet UI server.
 
-    Empty-shell phase: starts the loopback HTTP server with the
-    landing page + /health + /wallet/ping.  Real wallet routes
-    (/wallet/send, /wallet/transfer, etc.) and keyfile loading land
-    in follow-up commits.  See messagechain/network/local_wallet_server.py
-    for the threat model.
+    Loads the user's private key into process memory (unless
+    ``--read-only``), then starts the loopback HTTP wallet server.
+    See messagechain/network/local_wallet_server.py for the threat
+    model and the four foot-gun defenses (loopback bind, Host-header
+    allowlist, per-session bearer token, no CORS).
     """
     from messagechain.network.local_wallet_server import (
         LocalWalletServer,
@@ -8787,27 +8787,36 @@ def cmd_ui(args):
 
     print("=== MessageChain Local Wallet UI ===\n")
 
+    entity = None
     if args.read_only:
-        print("Mode: read-only (no key load; no signing routes)\n")
+        print("Mode: read-only (no key loaded; no signing routes)\n")
     else:
-        # Empty-shell note.  The keyfile load + signing routes land
-        # in follow-up commits; the flag is accepted now so the same
-        # invocation works at every phase.
-        if args.keyfile:
-            print(
-                f"--keyfile {args.keyfile} accepted but not yet loaded "
-                f"(empty-shell phase; signing routes land later).\n"
-            )
+        # Resolve and load the wallet key.  First-ever load on a host
+        # without the keypair_cache pays the WOTS+ keygen cost up
+        # front (~minutes); subsequent starts are cache HITs in ms.
+        # Doing this BEFORE the server starts means the operator
+        # never sees a wallet route hang on a slow first sign.
+        try:
+            private_key = _resolve_private_key(args, personal_wallet=True)
+        except KeyFileError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print("Loading wallet keys (this may take minutes the first time)...")
+        entity = _resolve_signing_entity(private_key, args)
+        print(f"Loaded entity: {entity.entity_id_hex[:16]}...\n")
 
-    # Empty shell: blockchain stays None until the read endpoints land.
-    blockchain = None
+    # Resolve the local validator's RPC endpoint for chain reads
+    # (/v1/*) and tx submission (/wallet/* writes, in follow-ups).
+    rpc_host, rpc_port = _parse_server(args.server)
 
     try:
         server = LocalWalletServer(
-            blockchain=blockchain,
+            blockchain=None,
             port=args.port,
             bind=args.bind,
             token=args.auth_token,
+            entity=entity,
+            rpc_endpoint=(rpc_host, rpc_port),
         )
     except LoopbackBindError as e:
         print(f"Error: {e}")
