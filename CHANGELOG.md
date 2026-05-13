@@ -4,6 +4,199 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.83.0] — 2026-05-13
+
+Audit r55 top-3 ships alongside the remaining wallet-UI feature
+commits queued after 1.82.0: one consensus-visible economics retune
+that closes the last unclamped `bps // den` site in the issuance
+plumbing (new Tier 77 hard fork, activation height 16500), one
+structural wallet-UI hardening fix that closes a cold-key WOTS+ leaf-
+burn DoS and a 100x react fee overpay (soft, no fork), and one UX /
+value-prop fix that lands the README-promoted `messagechain ping`
+first-run command and unblanks the wallet UI Node tab's chain-
+identity panel (soft, no fork).
+
+### Added
+
+  * **Wallet UI signing endpoints + full SPA** (queued after 1.82.0,
+    shipping here): four POST routes
+    (`/wallet/send` + `GET /wallet/estimate-fee` — 41fae23;
+    `/wallet/transfer` + `/wallet/stake` + `/wallet/unstake` +
+    `/wallet/react` — 6900161; `/wallet/propose` +
+    `/wallet/vote-proposal` — 12b9b10) plus the full single-page-app
+    bundle (Feed / Wallet / Governance / Identity / Node tabs —
+    32e4631) consuming the /v1/* + /wallet/* surface against the
+    LocalWalletServer scaffolding shipped in 1.82.0.  No wire-format
+    change, no consensus rule change; net-new optional surface only.
+
+  * **`Blockchain.get_chain_info()` adds canonical /v1/info aliases
+    (audit r55 #3 -- UX / value-prop top-1).** CLAUDE.md anchor:
+    Principle #3 (Simplicity) + the value-prop newcomer funnel.
+
+    Pre-fix two consumers had drifted away from the producer:
+    ``cli.cmd_ping``'s ``interesting_keys`` allowlist requested
+    ``best_hash``, ``validator_count``, ``block_number``, ``supply``,
+    ``sync_status`` -- none of which ``get_chain_info`` emits.  Only
+    ``height`` and ``total_supply`` overlapped.  The README-promoted
+    first-run sanity check therefore rendered ~3 lines where the
+    docs imply ~8 -- the highest-leverage funnel break in the audit
+    pool.  And the wallet UI's `_serve_v1_info` proxy read
+    ``info.get("tip_hash")`` / ``info.get("last_block_timestamp")``
+    against a producer that returned ``latest_block_hash`` /
+    ``latest_block_timestamp`` -- both silently None.  The wallet UI
+    Node tab rendered Tip-hash / Last-block-ts as ``?`` on every
+    session.
+
+    Abstraction-over-symptom fix has two halves: (1) producer-side,
+    ``get_chain_info`` adds ``tip_hash`` and ``last_block_timestamp``
+    as ALIASES (not renames) of the legacy ``latest_block_hash`` /
+    ``latest_block_timestamp`` keys -- the canonical /v1/info
+    contract names that ``PublicFeedServer`` + ``LocalWalletServer``
+    both already emit downstream.  Both legacy keys remain so any
+    external API consumer that grew around them continues to work.
+    (2) consumer-side, ``cmd_ping``'s allowlist swaps to the
+    canonical names (chain_id / height / genesis_hash / tip_hash /
+    registered_entities / total_supply / seconds_since_last_block)
+    -- the fields a first-run user actually cares about, all of
+    which the producer actually emits.
+
+    A new constraint test
+    (``tests/test_audit_r55_chain_info_key_contract.py``) pins both
+    consumers' allowlists as subsets of ``get_chain_info()``'s actual
+    return keys, so a future producer-side rename surfaces as an
+    explicit broken test, not a silent partial output.  Also pins
+    the additive-alias property: ``tip_hash`` MUST equal
+    ``latest_block_hash`` and ``last_block_timestamp`` MUST equal
+    ``latest_block_timestamp`` at every chain state.
+    ``tests/test_light_client.py::TestPingHappyPath`` updated --
+    its fake_info was pinning the very key-name drift this commit
+    fixes.  Soft fix: no consensus rule change, no wire-format
+    change, no fork. (9ce9448)
+
+### Changed (Tier 77, consensus-breaking, height-gated)
+
+  * **PROPOSER_CAP_REDISTRIBUTE pro-rata min-unit clamp via
+    `_split_bps` (audit r55 #2 -- security / economics / long-term
+    design top-1).**  CLAUDE.md pillars at risk: "Mathematical
+    decentralization over time" + "Stable active supply".
+
+    The Tier 53 proposer-cap clawback was designed to REDISTRIBUTE
+    the trimmed proposer slot pro-rata among non-proposer attesters
+    with positive credit -- preserving the dormancy controller's
+    gap-closing function at 100% efficiency under the anchored
+    "issuance accrues to validators, its purpose is supply
+    replenishment" intent.  The per-attester bonus math:
+
+        bonus = trim_from_att * existing // other_total
+
+    is a raw integer-floor divide -- the same shape Tier 73 / 74 /
+    75 each introduced ``_split_bps`` to fix on the proposer-share /
+    per-block-cap / attester-fee / slash sides.  The audit r52 #3
+    CHANGELOG explicitly named the wider abstraction:
+
+        "the wider abstraction calls for a shared ``_split_bps``
+         helper to catch every future ``bps // den`` site that
+         could round to zero under a realistic minimum."
+
+    This site was the next stragglers-list instance of that defect
+    class.  With N >= 2 non-proposer attesters and a small
+    ``trim_from_att`` (the dormancy controller's steady-state
+    regime is *exactly* the small-issuance regime, by design),
+    every per-attester bonus rounded to 0 and the entire trim
+    flowed to ``burned`` instead of redistributing -- silently
+    inverting Tier 53's "issuance accrues to validators" intent
+    back to the pre-Tier-53 burn-everything regime in the regime
+    Tier 47+ is anchored to produce.
+
+    Tier 77 lands two changes:
+
+      1. New activation height
+         ``PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT = 16500``
+         gating the redistribute loop's per-attester bonus through
+         ``_split_bps(trim_from_att, existing, other_total,
+         min_unit=1, gate=cap_min_unit_active)``.
+
+      2. Per-iteration ``remaining = trim_from_att - distributed``
+         clamp inside the redistribute loop, with a ``break``
+         short-circuit.  ``_split_bps`` itself never exceeds its
+         ``amount`` arg, but two consecutive min-unit clamps could
+         otherwise sum past ``trim_from_att``; the remaining-clamp
+         keeps supply conservation tight post-fork.  In legacy mode
+         the legacy floor-divide is provably bounded
+         (``sum(trim * e // total) <= trim`` for ``e <= total``), so
+         the clamp is a no-op and pre-fork is byte-identical to
+         legacy at every (trim_from_att, attester-credit-vector)
+         combination.
+
+    Activation height 16500 sits 2000 blocks above Tier 76 (14500)
+    -- matching the Tier 70 -> 71 -> 73 -> 74 -> 75 -> 76 ~13.9-day
+    cohort spacing.  Each issuance-discipline retune deserves its
+    own operator upgrade cycle.
+
+    Pre-fork byte-identical (verified by replay-shape test at the
+    small-trim many-attester scenario where the legacy code burns
+    all ``trim_from_att``).  Post-fork the same scenario distributes
+    at least 1 token to the first eligible attester and zero burn
+    from the redistribute path.  Pure consensus-rule swap; no new
+    wire format, no new tx kinds, no state-tree changes. (aaf8e6e)
+
+### Fixed
+
+  * **Wallet UI cold-key footgun + react 100x overpay + checksummed
+    address surfaced (audit r55 #1 -- UX / Economics / Security
+    top-1).** CLAUDE.md anchors: "token-as-tradable-asset mainstream-
+    asset quality bar" + "auto-fee defaults bidding density
+    correctly" + "honest operators are insured" (leaf-burn DoS).
+
+    Three sub-defects share one root: the LocalWalletServer's
+    ``/wallet/*`` signing routes (shipped 1.82.0 + 1.83.0) took the
+    path-of-least-resistance where every CLI signing command has a
+    hardened guard.
+
+    (a) ``op_unstake`` signed with the hot key even when the entity
+        had a SetAuthorityKey to a separate cold key.  The chain
+        rejects the tx, but the per-wallet leaf cursor has already
+        advanced -- a wallet-token-holder driving POST
+        /wallet/unstake in a loop could exhaust the entity's ~1M
+        one-time leaves with zero on-chain progress.
+
+    (b) The SPA's react() function hard-coded ``fee: 100`` against
+        a post-Tier-18 MARKET_FEE_FLOOR of 1 -- 100x silent overpay
+        every click.  The CLI's react path runs through
+        ``_resolve_fee_with_server_floor``; the wallet UI's button
+        did not.
+
+    (c) ``/wallet/me`` returned the raw 64-hex entity_id only, so
+        the Identity tab displayed the typo-prone hex form.  The
+        CLI's cmd_account tells users to share the checksummed
+        ``mc1...`` form when receiving funds; the SPA never had it.
+
+    Abstraction-over-symptom fix.  New
+    ``_require_hot_signable_via_rpc(rpc_caller, entity, *, kind)``
+    chokepoint in ``wallet_ops`` queries ``get_authority_key`` and
+    refuses BEFORE leaf reservation if a distinct cold authority is
+    set.  Future cold-key-gated wallet ops inherit the leaf-burn
+    property by construction.  Transient ``get_authority_key``
+    failures fall through to proceed -- defense-in-depth, not a
+    hard prerequisite; the chain still rejects the ultimate tx, and
+    stranding a user on a transient RPC blip would be a different
+    kind of footgun.
+
+    ``op_unstake`` routes through the chokepoint.  ``react()``
+    drops to ``fee: 1`` (the actual floor); a follow-up will extend
+    ``/wallet/estimate-fee`` to take ``kind=react`` so the SPA can
+    auto-fee like the CLI.  ``/wallet/me`` returns ``address`` (the
+    ``mc1...`` form) in both wallet and read-only modes for shape
+    consistency.
+
+    Soft fix: no consensus rule change, no wire-format change, no
+    fork.  Tests pin the helper's four behavioural regimes (no
+    authority / matches hot / differs / RPC unreachable), the
+    op_unstake leaf-burn closure (refusal does NOT call reserve_leaf
+    or submit_unstake), the /wallet/me address contract in both
+    modes, and a structural grep pin against the react() body
+    against the fee:100 hard-code regression. (1f9e9a1)
+
 ## [1.82.0] — 2026-05-13
 
 Audit r54 top-3 ships alongside the first three commits of the new
