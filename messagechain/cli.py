@@ -4354,6 +4354,18 @@ def cmd_stake(args):
         print(f"\nStake submitted!")
         print(f"  TX hash: {result['tx_hash']}")
         print(f"  Status:  {result.get('status', 'pending')}")
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint so the slashable-evidence escalation chain
+        # (Permanence framing + verify-CLI + submit-evidence pointer)
+        # is reachable from the operator's terminal at the moment they
+        # just put stake on the line.
+        _print_submit_success_footer(
+            tx_hash_hex=result["tx_hash"],
+            kind="stake",
+            fee=fee,
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -4527,6 +4539,17 @@ def cmd_unstake(args):
         print(f"\nUnstake submitted!")
         print(f"  TX hash: {result['tx_hash']}")
         print(f"  Status:  {result.get('status', 'pending')}")
+        # Audit r57 #3: same chokepoint lift as cmd_stake.  Unstake is
+        # the highest-stakes operator-facing exit operation -- the user
+        # has an active interest in verifying the tx actually lands
+        # (and submitting evidence if a colluding validator drops it).
+        _print_submit_success_footer(
+            tx_hash_hex=result["tx_hash"],
+            kind="unstake",
+            fee=fee,
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -4844,6 +4867,18 @@ def cmd_set_authority_key(args):
         print(f"  TX hash:       {result['tx_hash']}")
         print(f"\nFuture unstake and emergency-revoke operations must be signed")
         print("by the authority (cold) key you just designated.")
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint.  Set-authority-key is a one-shot irreversible
+        # operator commitment -- the slashable-evidence escalation
+        # path is the user's recourse if a colluding validator drops
+        # the tx.
+        _print_submit_success_footer(
+            tx_hash_hex=result["tx_hash"],
+            kind="set-authority-key",
+            fee=fee,
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -4955,6 +4990,19 @@ def cmd_rotate_key(args):
         print(f"\nYour entity ID is unchanged - wallet address and stake all")
         print("carry over. You can now continue signing with the fresh tree.")
         print("Back up any new derivation metadata if needed.")
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint.  Key rotation IS the crypto-agility primitive
+        # (CLAUDE.md anchor) -- naming the slashable-evidence escalation
+        # path here matters because rotate-key is the user's
+        # compromise-recovery surface; if a colluder drops the rotation
+        # tx, the dissident has the same evidence path available.
+        _print_submit_success_footer(
+            tx_hash_hex=rot_tx.tx_hash.hex(),
+            kind="rotate-key",
+            fee=fee,
+            receipt_hex=result.get("receipt"),
+            tx=rot_tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -5211,6 +5259,18 @@ def cmd_emergency_revoke(args):
         print(
             f"will release to your balance after the unbonding period "
             f"({_describe_unbonding_period(revoke_tip)})."
+        )
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint.  Emergency-revoke is the cold-key kill-switch --
+        # the user explicitly wants confirmation that the tx landed
+        # AND the slashable-evidence escalation path is on offer if a
+        # colluder drops it.
+        _print_submit_success_footer(
+            tx_hash_hex=result["tx_hash"],
+            kind="emergency-revoke",
+            fee=getattr(tx, "fee", 0),
+            receipt_hex=result.get("receipt"),
+            tx=tx,
         )
     else:
         print(f"\nFailed: {response.get('error')}")
@@ -5574,6 +5634,20 @@ def cmd_propose(args):
         print(f"\nProposal created!")
         print(f"  Proposal ID: {result['proposal_id']}")
         print(f"  Fee:         {result['fee']} tokens")
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint.  Governance proposals are deliberately expensive
+        # (CLAUDE.md anchor: voters paid from the proposal fee) -- the
+        # proposer wants confirmation that the tx landed AND has the
+        # slashable-evidence escalation path on offer if a colluding
+        # validator suppresses a politically-charged proposal.  The
+        # proposal_id IS the tx_hash for governance proposals.
+        _print_submit_success_footer(
+            tx_hash_hex=result["proposal_id"],
+            kind="propose",
+            fee=int(result["fee"]),
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
@@ -5647,6 +5721,18 @@ def cmd_vote(args):
         print(f"\nVote submitted!")
         print(f"  Vote:    {'YES' if approve else 'NO'}")
         print(f"  TX hash: {result['tx_hash']}")
+        # Audit r57 #3: route through the submit-success footer
+        # chokepoint.  Governance votes are recorded permanently on
+        # chain -- the voter's recourse if a colluding validator drops
+        # a politically-charged vote is the slashable-evidence
+        # escalation path the footer surfaces.
+        _print_submit_success_footer(
+            tx_hash_hex=result["tx_hash"],
+            kind="vote",
+            fee=fee,
+            receipt_hex=result.get("receipt"),
+            tx=tx,
+        )
     else:
         print(f"\nFailed: {response.get('error')}")
         sys.exit(1)
