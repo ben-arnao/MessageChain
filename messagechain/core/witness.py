@@ -184,11 +184,64 @@ def _safe_signature(obj) -> Signature | None:
     return None
 
 
+# ── Canonical signed-slot registry ───────────────────────────────────
+#
+# Single source of truth for every signed-body slot in a Block.  Three
+# call sites depend on it — ``enumerate_block_signatures`` (drives the
+# consensus-binding witness_root), ``strip_block_witnesses`` (sentinels
+# every signed slot for the auto-separation sweep), and the v1 witness
+# blob codec (``get_block_witness_data`` / ``attach_block_witnesses``,
+# routes WOTS+ bytes to/from the chaindb side table).  All three walk
+# the same table so a new signed slot only needs ONE row here to plug
+# into the entire strip/attach/witness-root surface — no parallel
+# explicit lists to forget to update.  Pre-r53 #1 the strip and blob
+# codec each maintained their own (wrong) tx-only list; the registry
+# is the abstraction the audit demanded.
+#
+# Tuple shape: (slot_id, attribute_name, is_singleton).  ``is_singleton``
+# distinguishes the one optional scalar slot (``inclusion_list``) from
+# the per-list slots; the strip and blob codec both honor the
+# distinction.  Order matches the historical
+# ``enumerate_block_signatures`` emit sequence and is consensus-binding
+# — reordering changes witness_root.
+#
+# SLOT_VALIDATOR_SIG (0x0B) is deliberately omitted: validator_signatures
+# are post-sign signatures over ``block_hash`` and are not folded into
+# witness_root by design.  See ``enumerate_block_signatures`` docstring.
+_SIGNED_BLOCK_SLOTS: list[tuple[int, str, bool]] = [
+    (SLOT_TX_MESSAGE,                   "transactions",                          False),
+    (SLOT_TX_TRANSFER,                  "transfer_transactions",                 False),
+    (SLOT_TX_STAKE,                     "stake_transactions",                    False),
+    (SLOT_TX_UNSTAKE,                   "unstake_transactions",                  False),
+    (SLOT_TX_GOVERNANCE,                "governance_txs",                        False),
+    (SLOT_TX_AUTHORITY,                 "authority_txs",                         False),
+    (SLOT_TX_REACTION,                  "react_transactions",                    False),
+    (SLOT_FINALITY_VOTE,                "finality_votes",                        False),
+    (SLOT_SLASH_TX,                     "slash_transactions",                    False),
+    (SLOT_ATTESTATION,                  "attestations",                          False),
+    (SLOT_CUSTODY_PROOF,                "custody_proofs",                        False),
+    (SLOT_INCLUSION_LIST,               "inclusion_list",                        True),
+    (SLOT_CENSORSHIP_EVIDENCE,          "censorship_evidence_txs",               False),
+    (SLOT_BOGUS_REJECT_EVIDENCE,        "bogus_rejection_evidence_txs",          False),
+    (SLOT_INCLUSION_VIOLATION_EVIDENCE, "inclusion_list_violation_evidence_txs", False),
+    (SLOT_NON_RESPONSE_EVIDENCE,        "non_response_evidence_txs",             False),
+]
+
+
+# Fast lookup from slot_id → (attr_name, is_singleton) for the attach
+# decoder's item-routing step.  Built once at module import; never
+# mutated.
+_SLOT_ID_TO_ATTR: dict[int, tuple[str, bool]] = {
+    slot_id: (attr_name, is_singleton)
+    for slot_id, attr_name, is_singleton in _SIGNED_BLOCK_SLOTS
+}
+
+
 def enumerate_block_signatures(block) -> list[tuple[int, int, Signature]]:
     """Walk a block in canonical order, yielding (slot_id, index, signature).
 
     Iteration order is fixed and consensus-binding:
-        1. Slots are visited in SLOT_* numeric order defined above.
+        1. Slots are visited in the order defined by ``_SIGNED_BLOCK_SLOTS``.
         2. Within a slot, items appear in their stored list order.
         3. Items whose `.signature` is None or absent contribute nothing.
 
@@ -208,51 +261,28 @@ def enumerate_block_signatures(block) -> list[tuple[int, int, Signature]]:
     """
     out: list[tuple[int, int, Signature]] = []
 
-    def _emit(slot_id: int, attr_name: str, sig_extractor):
-        # getattr with [] default — tolerant of duck-typed block-likes
-        # (e.g. the SimpleNamespace pos.create_block builds before the
-        # real Block exists) that may not carry every slot attribute.
-        # Treats a missing attribute as an empty list, NOT as a fatal
-        # error: the proposer simply has no items in that slot.
-        items = getattr(block, attr_name, None) or []
-        for i, item in enumerate(items):
-            sig = sig_extractor(item)
+    for slot_id, attr_name, is_singleton in _SIGNED_BLOCK_SLOTS:
+        if is_singleton:
+            # Optional scalar slot (inclusion_list).  getattr with None
+            # default keeps duck-typed block-likes that omit the
+            # attribute working without raising.
+            obj = getattr(block, attr_name, None)
+            if obj is None:
+                continue
+            sig = _safe_signature(obj)
             if sig is not None:
-                out.append((slot_id, i, sig))
-
-    _emit(SLOT_TX_MESSAGE, "transactions", _safe_signature)
-    _emit(SLOT_TX_TRANSFER, "transfer_transactions", _safe_signature)
-    _emit(SLOT_TX_STAKE, "stake_transactions", _safe_signature)
-    _emit(SLOT_TX_UNSTAKE, "unstake_transactions", _safe_signature)
-    _emit(SLOT_TX_GOVERNANCE, "governance_txs", _safe_signature)
-    _emit(SLOT_TX_AUTHORITY, "authority_txs", _safe_signature)
-    _emit(SLOT_TX_REACTION, "react_transactions", _safe_signature)
-    _emit(SLOT_FINALITY_VOTE, "finality_votes", _safe_signature)
-    _emit(SLOT_SLASH_TX, "slash_transactions", _safe_signature)
-    _emit(SLOT_ATTESTATION, "attestations", _safe_signature)
-
-    # SLOT_VALIDATOR_SIG (0x0B) deliberately skipped — see docstring.
-
-    _emit(SLOT_CUSTODY_PROOF, "custody_proofs", _safe_signature)
-
-    inclusion_list = getattr(block, "inclusion_list", None)
-    if inclusion_list is not None:
-        sig = _safe_signature(inclusion_list)
-        if sig is not None:
-            out.append((SLOT_INCLUSION_LIST, 0, sig))
-
-    _emit(SLOT_CENSORSHIP_EVIDENCE, "censorship_evidence_txs", _safe_signature)
-    _emit(SLOT_BOGUS_REJECT_EVIDENCE, "bogus_rejection_evidence_txs", _safe_signature)
-    _emit(
-        SLOT_INCLUSION_VIOLATION_EVIDENCE,
-        "inclusion_list_violation_evidence_txs",
-        _safe_signature,
-    )
-    _emit(
-        SLOT_NON_RESPONSE_EVIDENCE,
-        "non_response_evidence_txs",
-        _safe_signature,
-    )
+                out.append((slot_id, 0, sig))
+        else:
+            # getattr with [] default — tolerant of duck-typed block-likes
+            # (e.g. the SimpleNamespace pos.create_block builds before the
+            # real Block exists) that may not carry every slot attribute.
+            # Treats a missing attribute as an empty list, NOT as a fatal
+            # error: the proposer simply has no items in that slot.
+            items = getattr(block, attr_name, None) or []
+            for i, item in enumerate(items):
+                sig = _safe_signature(item)
+                if sig is not None:
+                    out.append((slot_id, i, sig))
 
     return out
 
@@ -361,55 +391,133 @@ def attach_tx_witness(stripped_tx: MessageTransaction, witness_data: bytes) -> M
     return dataclasses.replace(stripped_tx, signature=sig)
 
 
+def _sentinel_signature() -> Signature:
+    """Return the strip-sentinel: a Signature object with all empty fields.
+
+    Structurally valid (the dataclass accepts it) but trivially
+    distinguishable from any real WOTS+ signature.  Used by every site
+    that needs to clear a slot item's signature in lockstep — strip
+    plus any future "set to placeholder before reattach" sites — so the
+    sentinel shape stays consistent.
+    """
+    return Signature([], 0, [], b"", b"")
+
+
+def _replace_slot_item_signature(item):
+    """Return ``dataclasses.replace(item, signature=sentinel)`` if
+    ``item`` is a dataclass carrying a Signature, else ``item`` unchanged.
+
+    Centralised so strip + the v1 attach blob codec produce the exact
+    same sentinel shape per item; an item that doesn't carry a
+    Signature (no ``.signature`` attribute, or attribute is None) flows
+    through untouched.
+    """
+    sig = getattr(item, "signature", None)
+    if not isinstance(sig, Signature):
+        return item
+    return dataclasses.replace(item, signature=_sentinel_signature())
+
+
 def strip_block_witnesses(block) -> "Block":
-    """Return a new Block with all tx signatures stripped.
+    """Return a new Block with EVERY signed-slot signature stripped.
+
+    Walks the canonical ``_SIGNED_BLOCK_SLOTS`` registry and replaces
+    each item's signature with the strip sentinel.  Pre-r53 #1 this
+    only iterated ``block.transactions`` — attestations, transfer /
+    stake / unstake / governance / authority / reaction txs,
+    finality_votes, slash, custody, inclusion_list, and all four
+    evidence kinds kept their ~2.7 KB WOTS+ signatures inline in
+    primary ``blocks.data`` forever despite the auto-separation sweep
+    being live.  Routing through the central slot registry guarantees
+    every signed-body slot inherits the strip discipline by
+    construction; a new signed slot only needs to register itself in
+    ``_SIGNED_BLOCK_SLOTS`` and the strip + blob codec + witness_root
+    all pick it up.
 
     The witness_root in the header is preserved — it was computed from
     the original witnesses before stripping.  The block_hash changes
     because the block is reconstructed, but the header data (including
     witness_root) remains identical, so the block_hash still matches.
-
-    Every signed-body slot the block carries MUST round-trip through
-    this function — the witness_root commitment folds in leaves from
-    every slot ``enumerate_block_signatures`` walks (reactions, custody
-    proofs, inclusion list, the four evidence kinds, ...), so any slot
-    silently dropped here means the stripped block recomputes a
-    different witness_root post-activation and ``attach_block_witnesses``
-    raises ``WitnessRootMismatchError`` on every read.  We use
-    ``dataclasses.replace`` rather than an explicit field list so future
-    block-shape additions inherit the correct strip semantics
-    automatically — listing slots one-by-one was the defect form.
     """
     import copy
-    import dataclasses
 
-    stripped_txs = [strip_tx_witness(tx) for tx in block.transactions]
+    # Build per-slot override dict.  Slots with no signed items in the
+    # input block are omitted from the dict so ``dataclasses.replace``
+    # carries them through unchanged.
+    overrides: dict = {}
+    for slot_id, attr_name, is_singleton in _SIGNED_BLOCK_SLOTS:
+        if is_singleton:
+            obj = getattr(block, attr_name, None)
+            if obj is None:
+                continue
+            sig = getattr(obj, "signature", None)
+            if isinstance(sig, Signature):
+                overrides[attr_name] = _replace_slot_item_signature(obj)
+            # else: singleton lacks a Signature — pass through unchanged.
+        else:
+            items = getattr(block, attr_name, None)
+            if not items:
+                continue
+            new_items = [_replace_slot_item_signature(item) for item in items]
+            overrides[attr_name] = new_items
 
     # Deep-copy header so callers that hold the original block see no
-    # mutation; replace() carries every other Block field through
-    # unchanged so reactions / custody / inclusion list / evidence
-    # slots are preserved alongside the slots we explicitly override.
+    # mutation; ``replace()`` carries every non-overridden Block field
+    # through unchanged.
     stripped_block = dataclasses.replace(
         block,
         header=copy.deepcopy(block.header),
-        transactions=stripped_txs,
         block_hash=b"",
+        **overrides,
     )
     # block_hash is header-derived, so it should match the original.
     stripped_block.block_hash = stripped_block._compute_hash()
     return stripped_block
 
 
-def get_block_witness_data(block) -> bytes:
-    """Serialize all witness data from a block for separate storage.
+# v1 blob format magic + version.  See ``get_block_witness_data`` /
+# ``attach_block_witnesses`` for the wire shape.  Choice of 0xFF as
+# the magic byte: the legacy blob format starts with the high byte of
+# ``u32 tx_count``, which is 0x00 for any plausible tx_count (< 16M),
+# so 0xFF can never collide on the first byte and autodetect is
+# trivial.
+_WITNESS_BLOB_MAGIC = 0xFF
+_WITNESS_BLOB_VERSION_V1 = 0x01
 
-    Format: u32 tx_count | for each tx: u32 witness_len | witness_bytes
+
+def get_block_witness_data(block) -> bytes:
+    """Serialize EVERY signed-slot signature from a block.
+
+    v1 format:
+        magic (1B = 0xFF) | version (1B = 0x01) | entry_count (u32 BE)
+        per entry: slot_id (1B) | item_index (u32 BE)
+                 | sig_len (u32 BE) | sig_bytes
+
+    Walks the canonical ``_SIGNED_BLOCK_SLOTS`` registry via
+    ``enumerate_block_signatures`` so the witness blob covers every
+    slot the strip path sentinels.  Pre-r53 #1 only packed
+    ``transactions`` — the round-trip was a tautology for non-tx slots
+    because the strip also left those slots intact, and the audit
+    promise that "every signed-body witness moves to the side table"
+    held only for messages.
+
+    The magic-byte prefix makes the new format autodetectable by
+    ``attach_block_witnesses``; legacy on-disk blobs (which start with
+    ``u32 tx_count`` and thus 0x00 high byte) still decode via the
+    legacy path so a node upgrading past r53 #1 doesn't brick on its
+    own historical ``block_witnesses`` side table.
     """
-    parts = [struct.pack(">I", len(block.transactions))]
-    for tx in block.transactions:
-        w = get_tx_witness_data(tx)
-        parts.append(struct.pack(">I", len(w)))
-        parts.append(w)
+    entries = enumerate_block_signatures(block)
+    parts: list[bytes] = [
+        bytes([_WITNESS_BLOB_MAGIC, _WITNESS_BLOB_VERSION_V1]),
+        struct.pack(">I", len(entries)),
+    ]
+    for slot_id, item_index, sig in entries:
+        sig_bytes = sig.to_bytes()
+        parts.append(bytes([slot_id]))
+        parts.append(struct.pack(">I", item_index))
+        parts.append(struct.pack(">I", len(sig_bytes)))
+        parts.append(sig_bytes)
     return b"".join(parts)
 
 
@@ -444,30 +552,15 @@ class WitnessRootMismatchError(Exception):
         )
 
 
-def attach_block_witnesses(stripped_block, witness_data: bytes):
-    """Reattach witness data to a stripped block, verifying integrity.
+def _attach_block_witnesses_legacy(stripped_block, witness_data: bytes):
+    """Legacy decoder: ``u32 tx_count | per-tx (u32 sig_len | sig_bytes)``.
 
-    Post-activation (block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT):
-        Re-derives `compute_block_witness_root(restored)` and asserts
-        equality with `restored.header.witness_root`.  Mismatch raises
-        `WitnessRootMismatchError` — never silently returns a tampered
-        block.
-
-    Pre-activation (block_number < WITNESS_ROOT_ACTIVATION_HEIGHT):
-        The header field is the all-zero default by design (the
-        commitment was not yet enforced when the block was produced),
-        so verification is skipped — enforcing would reject every
-        historical block on chain today.
-
-    The activation gate matches `pos.create_block` (which only
-    populates the field post-activation) and `Blockchain.validate_block`
-    (which only checks it post-activation); all three must agree or a
-    block accepted at validate-time could fail reattach later.
+    Covers blocks that were stripped pre-r53 #1 and stored in
+    ``block_witnesses`` under the old tx-only blob shape.  Non-tx slots
+    on those rows were never sentineled on the ``blocks.data`` side
+    either, so they carry their real signatures inline and the stripped
+    block flows through unchanged on those slots.
     """
-    from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
-    import copy
-    import dataclasses
-
     offset = 0
     tx_count = struct.unpack_from(">I", witness_data, offset)[0]
     offset += 4
@@ -486,16 +579,137 @@ def attach_block_witnesses(stripped_block, witness_data: bytes):
         offset += w_len
         restored_txs.append(attach_tx_witness(tx, w_bytes))
 
-    # Replace carries every Block field through unchanged — reactions,
-    # custody proofs, inclusion list, and the four evidence kinds all
-    # contribute leaves to ``compute_block_witness_root``, so dropping
-    # any of them here would make the post-activation witness_root
-    # check below fire on legitimate reattach.  Same defect class as
-    # the strip path's previous explicit-field-list form.
-    restored = dataclasses.replace(
+    return dataclasses.replace(
         stripped_block,
-        header=copy.deepcopy(stripped_block.header),
         transactions=restored_txs,
+    )
+
+
+def _attach_block_witnesses_v1(stripped_block, witness_data: bytes):
+    """v1 decoder: every signed slot routed back to its named attribute.
+
+    Walks the wire entries in stored order; each entry carries an
+    explicit (slot_id, item_index) so the decoder can route the
+    signature back to its origin slot regardless of pack order.  Builds
+    one override dict per slot attribute and applies all overrides via
+    a single ``dataclasses.replace`` at the end so non-touched slots
+    pass through unchanged.
+    """
+    # Skip past magic + version (2 bytes); entry_count follows.
+    offset = 2
+    entry_count = struct.unpack_from(">I", witness_data, offset)[0]
+    offset += 4
+
+    # Build per-attribute working copies of the slot item lists (and
+    # the singleton).  Only attrs with at least one entry in the blob
+    # get reconstructed; the rest stay on the stripped_block as-is.
+    per_attr_items: dict[str, list] = {}
+    per_attr_singleton: dict[str, object] = {}
+
+    for _ in range(entry_count):
+        slot_id = witness_data[offset]
+        offset += 1
+        item_index = struct.unpack_from(">I", witness_data, offset)[0]
+        offset += 4
+        sig_len = struct.unpack_from(">I", witness_data, offset)[0]
+        offset += 4
+        sig_bytes = witness_data[offset:offset + sig_len]
+        offset += sig_len
+
+        slot_meta = _SLOT_ID_TO_ATTR.get(slot_id)
+        if slot_meta is None:
+            # Unknown slot from a future fork — skip rather than fail.
+            # Pre-fix the decoder would have crashed on any unfamiliar
+            # byte; tolerant skip lets a downgraded node still decode
+            # a forward-version blob enough to read its known slots.
+            continue
+        attr_name, is_singleton = slot_meta
+
+        if is_singleton:
+            base_obj = getattr(stripped_block, attr_name, None)
+            if base_obj is None:
+                continue
+            per_attr_singleton[attr_name] = attach_tx_witness(
+                base_obj, sig_bytes,
+            ) if hasattr(base_obj, "signature") else base_obj
+        else:
+            if attr_name not in per_attr_items:
+                # Snapshot the stripped block's current list — we'll
+                # mutate it via index assignment.
+                base_items = getattr(stripped_block, attr_name, None) or []
+                per_attr_items[attr_name] = list(base_items)
+            items = per_attr_items[attr_name]
+            if item_index >= len(items):
+                raise ValueError(
+                    f"witness blob slot 0x{slot_id:02x} index {item_index} "
+                    f"out of range for {attr_name} (len={len(items)})",
+                )
+            items[item_index] = attach_tx_witness(items[item_index], sig_bytes)
+
+    overrides: dict = {}
+    overrides.update(per_attr_items)
+    overrides.update(per_attr_singleton)
+
+    return dataclasses.replace(stripped_block, **overrides)
+
+
+def attach_block_witnesses(stripped_block, witness_data: bytes):
+    """Reattach witness data to a stripped block, verifying integrity.
+
+    Two on-disk blob formats are autodetected from the first byte:
+
+      * v1 (r53 #1+, leading byte == 0xFF): every signed-body slot
+        round-trips.  Routes each signature back to its (slot, item)
+        origin via the canonical slot registry.
+
+      * Legacy (leading byte != 0xFF, i.e. ``u32 tx_count`` high byte
+        which is 0x00 for any plausible count): pre-r53 #1 shape, only
+        ``transactions`` were packed.  Non-tx slot signatures were
+        never stripped on the corresponding ``blocks.data`` row, so
+        they flow through from the stripped block unchanged.
+
+    Post-activation (block_number >= WITNESS_ROOT_ACTIVATION_HEIGHT):
+        Re-derives `compute_block_witness_root(restored)` and asserts
+        equality with `restored.header.witness_root`.  Mismatch raises
+        `WitnessRootMismatchError` — never silently returns a tampered
+        block.  Works for either blob shape because the recomputed
+        root depends on the FINAL signatures on the restored block,
+        not on the blob byte layout.
+
+    Pre-activation (block_number < WITNESS_ROOT_ACTIVATION_HEIGHT):
+        The header field is the all-zero default by design (the
+        commitment was not yet enforced when the block was produced),
+        so verification is skipped — enforcing would reject every
+        historical block on chain today.
+
+    The activation gate matches `pos.create_block` (which only
+    populates the field post-activation) and `Blockchain.validate_block`
+    (which only checks it post-activation); all three must agree or a
+    block accepted at validate-time could fail reattach later.
+    """
+    from messagechain.config import WITNESS_ROOT_ACTIVATION_HEIGHT
+    import copy
+
+    if len(witness_data) == 0:
+        raise ValueError("witness blob is empty")
+
+    if witness_data[0] == _WITNESS_BLOB_MAGIC:
+        if len(witness_data) < 2 or witness_data[1] != _WITNESS_BLOB_VERSION_V1:
+            raise ValueError(
+                f"unknown witness blob version: magic=0x{witness_data[0]:02x}, "
+                f"got version byte 0x{witness_data[1]:02x} (only v1=0x01 is supported)",
+            )
+        restored = _attach_block_witnesses_v1(stripped_block, witness_data)
+    else:
+        restored = _attach_block_witnesses_legacy(stripped_block, witness_data)
+
+    # Deep-copy header so any downstream mutation by the caller does
+    # not bleed back into the stripped_block (same discipline strip
+    # uses).  Reset block_hash and recompute so the post-attach hash
+    # is derived from the actually-carried fields.
+    restored = dataclasses.replace(
+        restored,
+        header=copy.deepcopy(restored.header),
         block_hash=b"",
     )
     header = restored.header

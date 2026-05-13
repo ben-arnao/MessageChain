@@ -155,9 +155,11 @@ class TestAttachBlockWitnessesPostActivation(unittest.TestCase):
             post_activation=True,
         )
         blob = bytearray(get_block_witness_data(block))
-        # Past the 4-byte tx_count + 4-byte first-sig-len prefixes —
+        # v1 blob layout: 2B magic+version | 4B entry_count |
+        # per-entry [1B slot | 4B item_index | 4B sig_len | sig_bytes].
+        # Offset 30 sits well past the first entry's 13B header and
         # lands inside the first signature payload.
-        blob[12] ^= 0xFF
+        blob[30] ^= 0xFF
         stripped = strip_block_witnesses(block)
         with self.assertRaises(WitnessRootMismatchError) as cm:
             attach_block_witnesses(stripped, bytes(blob))
@@ -230,9 +232,11 @@ class TestChainDBReattachVerification(unittest.TestCase):
         """
         block, blob = self._store_post_activation_block()
         # Tamper a byte inside the first signature in the side-table
-        # row.  We overwrite the whole row via the public store helper.
+        # row.  Offset 30 lands inside the first sig payload in the v1
+        # blob format (2B magic+version + 4B entry_count + 13B first
+        # entry header puts the first sig payload at byte 19+).
         bad = bytearray(blob)
-        bad[12] ^= 0xFF
+        bad[30] ^= 0xFF
         self.db.store_witness_data(block.block_hash, bytes(bad))
 
         with self.assertRaises(WitnessRootMismatchError):
@@ -304,7 +308,15 @@ class TestStripAttachPreservesAllSignedSlots(unittest.TestCase):
         # One real Signature is enough — every leaf is keyed by
         # (slot_id, item_index, signature.canonical_bytes()), so reusing
         # the same sig across stubs still produces 7 distinct leaves.
-        sig = entity.keypair.sign(b"witness-stub-signable-bytes")
+        # ``sign`` requires a 32-byte message_hash; signing arbitrary
+        # text produces a malformed WOTS+ sig with fewer than
+        # WOTS_KEY_CHAINS chains, which used to slip through pre-r53 #1
+        # because non-tx slot sigs were never round-tripped through
+        # ``Signature.from_bytes`` (the strip kept them inline and the
+        # legacy blob ignored them).  Post-r53 #1 every signed slot
+        # round-trips through ``to_bytes``/``from_bytes``, so the
+        # fixture must produce a well-formed signature.
+        sig = entity.keypair.sign(_hash(b"witness-stub-signable-bytes"))
         stub = _SignedStub(signature=sig, tx_hash=b"\xaa" * 32)
 
         msg_tx = create_transaction(entity, "msg 0", 10_000, 0)
@@ -345,9 +357,13 @@ class TestStripAttachPreservesAllSignedSlots(unittest.TestCase):
         blob = get_block_witness_data(block)
         stripped = strip_block_witnesses(block)
 
-        # Every populated slot must survive ``strip``.  The pre-fix code
-        # constructed ``stripped`` from only 10 of 17 slots; this is the
-        # assertion that fails on pre-fix ``origin/main``.
+        # Post-r53 #1: every populated slot's items survive strip with
+        # the SAME tx_hash / non-sig fields, but with the sentinel
+        # signature in place of the real WOTS+ bytes.  Pre-r53 #1 the
+        # strip path only sentineled ``transactions`` — non-tx slots
+        # flowed through with real sigs still inline in primary
+        # ``blocks.data``, which is the bloat-anchor erosion the audit
+        # surfaced.
         for slot_name in (
             "react_transactions",
             "custody_proofs",
@@ -356,20 +372,40 @@ class TestStripAttachPreservesAllSignedSlots(unittest.TestCase):
             "inclusion_list_violation_evidence_txs",
             "non_response_evidence_txs",
         ):
+            stripped_items = list(getattr(stripped, slot_name))
+            orig_items = list(getattr(block, slot_name))
             self.assertEqual(
-                list(getattr(stripped, slot_name)),
-                list(getattr(block, slot_name)),
-                f"{slot_name} lost on strip — witness_root commitment broken",
+                len(stripped_items), len(orig_items),
+                f"{slot_name} list length changed on strip",
             )
-        self.assertIs(stripped.inclusion_list, block.inclusion_list)
+            # Non-signature payload (tx_hash for the stub) survives.
+            self.assertEqual(stripped_items[0].tx_hash, orig_items[0].tx_hash)
+            # Signature is sentineled.
+            self.assertEqual(stripped_items[0].signature.wots_signature, [])
+            self.assertEqual(stripped_items[0].signature.wots_public_key, b"")
+            # And the original was not sentinel-shaped pre-strip.
+            self.assertNotEqual(
+                orig_items[0].signature.wots_signature, [],
+                f"{slot_name} fixture broken — already sentinel pre-strip",
+            )
+        # Singleton inclusion_list: same shape — non-sig fields survive,
+        # signature is sentineled.
+        self.assertEqual(stripped.inclusion_list.tx_hash, block.inclusion_list.tx_hash)
+        self.assertEqual(stripped.inclusion_list.signature.wots_signature, [])
+        # archive_proof_bundle is NOT a signed slot in the witness
+        # registry — it passes through unchanged.
         self.assertIs(stripped.archive_proof_bundle, block.archive_proof_bundle)
 
         # Reattach must succeed without raising — every slot's leaves
         # are present, so the recomputed witness_root equals the
-        # committed header.witness_root.  Pre-fix this raises
-        # WitnessRootMismatchError because the seven slots are empty
-        # on the restored block and their leaves are missing from the
-        # recomputed root.
+        # committed header.witness_root.  Pre-r53 #1 this raises
+        # WitnessRootMismatchError on any post-activation block that
+        # carries any non-tx signed slot because the strip+attach
+        # bloat-fix never sentineled those slots, so a corrupted blob
+        # on the side table couldn't be detected via the recomputed
+        # root.  Post-r53 #1 the recomputed root depends on every
+        # restored slot's signature exactly matching the committed
+        # leaf — round-trip clean iff the blob is intact.
         restored = attach_block_witnesses(stripped, blob)
         for slot_name in (
             "react_transactions",
@@ -379,11 +415,18 @@ class TestStripAttachPreservesAllSignedSlots(unittest.TestCase):
             "inclusion_list_violation_evidence_txs",
             "non_response_evidence_txs",
         ):
+            restored_items = list(getattr(restored, slot_name))
+            orig_items = list(getattr(block, slot_name))
+            self.assertEqual(len(restored_items), len(orig_items))
             self.assertEqual(
-                list(getattr(restored, slot_name)),
-                list(getattr(block, slot_name)),
+                restored_items[0].signature.canonical_bytes(),
+                orig_items[0].signature.canonical_bytes(),
+                f"{slot_name} signature failed to restore on attach",
             )
-        self.assertIs(restored.inclusion_list, block.inclusion_list)
+        self.assertEqual(
+            restored.inclusion_list.signature.canonical_bytes(),
+            block.inclusion_list.signature.canonical_bytes(),
+        )
         self.assertEqual(
             compute_block_witness_root(restored), header.witness_root,
         )
@@ -405,7 +448,9 @@ class TestActivationGateMatchesValidator(unittest.TestCase):
             post_activation=True,
         )
         blob = bytearray(get_block_witness_data(block))
-        blob[12] ^= 0xFF
+        # See test_tampered_signature_raises for the v1 blob layout
+        # rationale — offset 30 lands inside the first signature payload.
+        blob[30] ^= 0xFF
         stripped = strip_block_witnesses(block)
         with self.assertRaises(WitnessRootMismatchError):
             attach_block_witnesses(stripped, bytes(blob))
