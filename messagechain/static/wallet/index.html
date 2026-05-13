@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MessageChain Wallet</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #111;
+    --muted: #666;
+    --card: #f5f5f5;
+    --border: #ddd;
+    --accent: #0a5;
+    --warn: #c70;
+    --error: #c33;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e0e10;
+      --fg: #eee;
+      --muted: #888;
+      --card: #1a1a1d;
+      --border: #2a2a2e;
+      --accent: #6c9;
+      --warn: #db5;
+      --error: #f66;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.45;
+  }
+  main {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 1.4rem 1.2rem;
+  }
+  h1 {
+    margin: 0 0 0.4rem;
+    font-size: 1.4rem;
+    letter-spacing: -0.01em;
+  }
+  .sub {
+    margin: 0 0 1.4rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+  }
+  .card {
+    border: 1px solid var(--border);
+    background: var(--card);
+    border-radius: 8px;
+    padding: 1rem 1.1rem;
+    margin: 0.8rem 0;
+  }
+  .pill {
+    display: inline-block;
+    padding: 0.1rem 0.55rem;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .pill.ok { color: var(--accent); border-color: var(--accent); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.error { color: var(--error); border-color: var(--error); }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: 0.9em;
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>MessageChain Wallet</h1>
+  <p class="sub">
+    Local-only.  Loopback-bound.  Your private key never leaves this machine.
+  </p>
+
+  <div class="card">
+    <div>Status: <span id="status" class="pill">checking…</span></div>
+    <p id="hint" class="sub" style="margin-top: 0.6rem;">
+      The real wallet UI lands in follow-up commits.  This page just
+      verifies the server is up and the session token from the URL bar
+      is recognized.
+    </p>
+  </div>
+</main>
+
+<script>
+"use strict";
+
+// --- session token bootstrap -------------------------------------------
+// The CLI prints `http://127.0.0.1:<port>/?t=<token>`.  On first load we
+// read `t` out of the URL, stash it in sessionStorage, and strip it from
+// the URL bar so it doesn't end up in browser history if the user
+// bookmarks the page.  Subsequent fetches send it as Authorization.
+//
+// sessionStorage (not localStorage) — the token rotates on every server
+// restart, so persisting it across browser sessions is pointless and
+// just leaves a stale credential lying around.
+const TOKEN_KEY = "mc.wallet.token";
+
+function bootstrapToken() {
+  const url = new URL(window.location.href);
+  const fromUrl = url.searchParams.get("t");
+  if (fromUrl) {
+    sessionStorage.setItem(TOKEN_KEY, fromUrl);
+    url.searchParams.delete("t");
+    window.history.replaceState({}, "", url.toString());
+  }
+  return sessionStorage.getItem(TOKEN_KEY);
+}
+
+async function walletFetch(path, opts) {
+  const token = sessionStorage.getItem(TOKEN_KEY);
+  const headers = Object.assign({}, (opts && opts.headers) || {});
+  if (token) {
+    headers["Authorization"] = "Bearer " + token;
+  }
+  return fetch(path, Object.assign({}, opts || {}, { headers: headers }));
+}
+
+async function probe() {
+  const statusEl = document.getElementById("status");
+  const hintEl = document.getElementById("hint");
+  const token = bootstrapToken();
+  if (!token) {
+    statusEl.textContent = "no session token";
+    statusEl.className = "pill error";
+    hintEl.textContent =
+      "Restart the server with `messagechain ui` and open the printed " +
+      "URL — it carries the session token in the ?t= query string.";
+    return;
+  }
+  try {
+    const r = await walletFetch("/wallet/ping");
+    if (r.status === 200) {
+      statusEl.textContent = "ready";
+      statusEl.className = "pill ok";
+    } else if (r.status === 401) {
+      sessionStorage.removeItem(TOKEN_KEY);
+      statusEl.textContent = "stale token";
+      statusEl.className = "pill warn";
+      hintEl.textContent =
+        "The wallet server has restarted and the previous token is no " +
+        "longer valid.  Re-open the URL printed by `messagechain ui`.";
+    } else {
+      statusEl.textContent = "error " + r.status;
+      statusEl.className = "pill error";
+    }
+  } catch (e) {
+    statusEl.textContent = "unreachable";
+    statusEl.className = "pill error";
+    hintEl.textContent =
+      "The wallet server stopped responding.  It may have been shut " +
+      "down — check the terminal where you ran `messagechain ui`.";
+  }
+}
+
+probe();
+</script>
+</body>
+</html>

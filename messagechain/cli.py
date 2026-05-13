@@ -1473,6 +1473,71 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # --- ui ---
+    # Local wallet UI.  Loopback-only HTTP server that serves the same
+    # read views as the public messagechain.org feed plus signing
+    # routes for messages, transfers, stake, votes, governance, and key
+    # rotation.  See messagechain/network/local_wallet_server.py for
+    # the threat model and the four foot-gun defenses (loopback bind,
+    # Host-header allowlist, per-session bearer token, no CORS).
+    ui = sub.add_parser(
+        "ui",
+        help="Run the local wallet UI (loopback-only HTTP)",
+        description=(
+            "Run the local wallet UI: a loopback-only HTTP server that "
+            "the user opens in their own browser.  The user's private "
+            "key (from --keyfile) is loaded into the wallet-server "
+            "process and used to sign transactions; it never reaches "
+            "the browser.  Bind is hard-pinned to a literal loopback "
+            "IP (127.0.0.1 or ::1) and the server refuses to start on "
+            "anything else."
+        ),
+    )
+    ui.add_argument(
+        "--port", type=int, default=9335,
+        help="Wallet UI port (default: 9335)",
+    )
+    ui.add_argument(
+        "--bind", type=str, default="127.0.0.1",
+        help=(
+            "Loopback bind address.  Only literal 127.0.0.1 or ::1 "
+            "are accepted -- any other value causes startup to fail "
+            "(the wallet server exposes signing routes; non-loopback "
+            "binds would expose your private key to the network)."
+        ),
+    )
+    ui.add_argument(
+        "--server", type=str, default=None,
+        help=(
+            "host:port of the validator JSON-RPC the wallet UI talks "
+            "to for chain reads / nonce / submit_tx.  Defaults to "
+            "127.0.0.1:9334 (your local node).  Pointing this at a "
+            "remote node shifts read-trust to that operator; signing "
+            "is still local."
+        ),
+    )
+    ui.add_argument(
+        "--read-only", action="store_true",
+        help=(
+            "Skip wallet-route registration (no key load, no signing "
+            "endpoints).  Useful for browse-only operators who want "
+            "the same UI as a logged-in user but with no wallet "
+            "affordances."
+        ),
+    )
+    ui.add_argument(
+        "--no-browser", action="store_true",
+        help="Do not auto-open the printed URL in the system browser.",
+    )
+    ui.add_argument(
+        "--auth-token", type=str, default=None,
+        help=(
+            "Use a pre-supplied session token instead of generating "
+            "a fresh random one.  For testing / scripting only -- the "
+            "random default is what you want for normal use."
+        ),
+    )
+
     return parser
 
 
@@ -8706,6 +8771,75 @@ def cmd_notify_status(args):
     print(_notify.format_status(cfg, last_sent=last_sent))
 
 
+def cmd_ui(args):
+    """Run the local wallet UI server.
+
+    Empty-shell phase: starts the loopback HTTP server with the
+    landing page + /health + /wallet/ping.  Real wallet routes
+    (/wallet/send, /wallet/transfer, etc.) and keyfile loading land
+    in follow-up commits.  See messagechain/network/local_wallet_server.py
+    for the threat model.
+    """
+    from messagechain.network.local_wallet_server import (
+        LocalWalletServer,
+        LoopbackBindError,
+    )
+
+    print("=== MessageChain Local Wallet UI ===\n")
+
+    if args.read_only:
+        print("Mode: read-only (no key load; no signing routes)\n")
+    else:
+        # Empty-shell note.  The keyfile load + signing routes land
+        # in follow-up commits; the flag is accepted now so the same
+        # invocation works at every phase.
+        if args.keyfile:
+            print(
+                f"--keyfile {args.keyfile} accepted but not yet loaded "
+                f"(empty-shell phase; signing routes land later).\n"
+            )
+
+    # Empty shell: blockchain stays None until the read endpoints land.
+    blockchain = None
+
+    try:
+        server = LocalWalletServer(
+            blockchain=blockchain,
+            port=args.port,
+            bind=args.bind,
+            token=args.auth_token,
+        )
+    except LoopbackBindError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    server.start()
+    print(f"Wallet UI listening on {server.url}")
+    print()
+    print("This URL contains a per-session token.  Treat it like a password:")
+    print("anyone who can read it can drive the wallet routes.  The token")
+    print("rotates on every restart; sharing the URL across machines is unsafe.")
+    print()
+
+    if not args.no_browser:
+        try:
+            import webbrowser
+            webbrowser.open(server.url)
+        except Exception:
+            # Headless environment / no browser available --
+            # operator can paste the URL themselves.
+            pass
+
+    print("Press Ctrl+C to stop.\n")
+    try:
+        import time as _time
+        while True:
+            _time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nShutting down wallet UI...")
+        server.stop()
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -8759,6 +8893,7 @@ def main():
         "notify-test": cmd_notify_test,
         "notify-status": cmd_notify_status,
         "backup-wallet": cmd_backup_wallet,
+        "ui": cmd_ui,
     }
 
     handler = commands.get(args.command)
