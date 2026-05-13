@@ -4,6 +4,161 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.82.0] — 2026-05-13
+
+Audit r54 top-3 ships alongside the first three commits of the new
+wallet-UI scaffolding: one consensus-visible economics retune that
+closes the last unbounded direct-mint path on the issuance side
+(new Tier 76 hard fork, activation height 14500), one structural
+security-pipeline fix that unifies the WOTS+ leaf-reservation
+chokepoint across every signing command (soft, no fork), and one
+value-prop fix that lifts the social-primitive flag surface
+(--prev / --community-id / --poll-option / --vote-target) onto
+the censorship-resistant `send-multi` escape hatch (soft, no fork).
+
+### Added
+
+  * **Local wallet UI scaffolding (`messagechain ui` CLI +
+    `LocalWalletServer`).** Empty-shell HTTP server that the future
+    browser-side wallet front-end will consume. Three commits land
+    incrementally: the empty shell + `messagechain ui` subcommand
+    (fe7d9d8), four read endpoints (`/v1/info`, `/v1/latest`,
+    `/v1/entity`, `/v1/tx_status`) consumed via the same JSON-RPC
+    fan-out as the public feed (b86a103), and keyfile-load +
+    `/wallet/me` so the operator's local UI can identify itself
+    without an interactive prompt (74dcff5). No wire-format change,
+    no consensus rule change; net-new optional surface only.
+
+### Changed (Tier 76, consensus-breaking, height-gated)
+
+  * **Finality-vote inclusion-reward per-block cap (audit r54 #1 --
+    economics top-1).** CLAUDE.md pillars at risk: "Mathematical
+    decentralization over time" + "Stable active supply".
+
+    Pre-Tier-76, ``_apply_finality_votes`` minted
+    ``FINALITY_VOTE_INCLUSION_REWARD = 1`` tokens of direct mint to
+    the proposer for EVERY survivor of the pre-filter, up to
+    ``MAX_FINALITY_VOTES_PER_BLOCK = 200``. The mint never routed
+    through any of the issuance-discipline plumbing every other
+    reward path now goes through: ``_split_bps`` (Tier 73/74/75
+    round-to-zero clamp + supply-conservation invariant),
+    ``effective_weight`` (Tier 70/71 stake-concentration soft cap),
+    the ``mint_block_reward`` per-block-cap / redistribute logic, or
+    the ``DORMANCY_MAX_ISSUANCE_PER_BLOCK = 500`` dormancy
+    controller clamp.
+
+    Whale proposers received a per-vote inclusion bonus that scaled
+    linearly with their proposer-slot share (itself sublinear via
+    Tier 70/71 effective_weight) -- the linear-on-top compounded
+    back toward the plutocracy regime Tier 70 anchored against. And
+    200 tokens/block of mint outside the dormancy controller's
+    regulated band leaked the anchored issuance envelope: at the
+    controller's small-issuance steady state (~50 tokens/block) the
+    finality-mint actually dominated the bounded path 4:1.
+
+    Tier 76 caps the per-block finality-mint TOTAL at
+    ``FINALITY_VOTE_REWARD_PER_BLOCK_CAP_TOKENS =
+    MAX_FINALITY_VOTES_PER_BLOCK // 8`` = 25. Cap is grounded in the
+    DoS-guard cap (``MAX_FINALITY_VOTES_PER_BLOCK``), not a magic
+    number. Pre-fork: byte-identical to legacy at every (n_votes,
+    ...) combination so historical-block replay matches. Post-fork:
+    the first ``cap`` survivors mint
+    ``FINALITY_VOTE_INCLUSION_REWARD`` each; further survivors
+    still contribute to the 2/3 finality tally (checkpoint
+    safety/liveness uncapped on purpose -- finalization must still
+    cross 2/3 at high vote count) but produce no mint -- the
+    inclusion service is unpaid past the budget. Honest proposers
+    including <= 25 votes/block see zero change; whales packing 200
+    votes/block see their bonus capped at 25.
+
+    Activation height ``14500`` sits 2000 blocks above Tier 75
+    (12500), matching the Tier 70 -> 71 -> 73 -> 74 -> 75 ~13.9-day
+    cohort spacing. (87ca207)
+
+### Fixed
+
+  * **``_resolve_signing_leaf`` chokepoint -- atomic WOTS+ leaf
+    reservation on every signing command (audit r54 #2 -- security
+    top-1).** CLAUDE.md anchors: honest-operator-insurance +
+    crypto-agility.
+
+    Pre-fix only ``cmd_send`` / ``cmd_transfer`` / ``cmd_stake`` /
+    ``cmd_submit_evidence`` (4 commands) called
+    ``_reserve_leaf_via_rpc`` -- the server-side atomic primitive
+    that closes the CLI-vs-daemon race where two processes pick the
+    same chain watermark and each sign a different tx at the same
+    WOTS+ leaf (publishing both signatures discloses the leaf's
+    private chunks -- 100% slash on detection). Every OTHER signing
+    command (``cmd_unstake``, ``cmd_rotate_key``, ``cmd_react``,
+    ``cmd_propose``, ``cmd_vote``, ``cmd_set_authority_key``,
+    ``cmd_bootstrap_seed``, ``cmd_send_multi_submit``) only bound the
+    on-disk cursor against the chain watermark -- no atomic
+    reservation. Same parallel-paths defect-shape audit r46 #3
+    closed for ``cmd_send_multi_submit``'s signing-pipeline
+    unification, still alive on the leaf-reservation discipline.
+
+    A vet operator running ``rotate-key`` (the crypto-agility
+    primitive) or ``unstake`` on the typical co-resident validator
+    host could collide with the daemon's signing loop and produce
+    slashable evidence with zero malicious intent.
+
+    Abstraction-over-symptom fix. New ``_resolve_signing_leaf(host,
+    port, entity, *, data_dir, watermark_fallback)`` chokepoint --
+    one helper above the four existing call sites that previously
+    inlined the same pattern. Every CLI signing command now routes
+    through it: ``_reserve_leaf_via_rpc`` -> watermark fallback ->
+    ``_bind_persistent_leaf_index``. Cold-key signing paths
+    (operator-held, not validator-daemon-managed) continue to call
+    ``_bind_persistent_leaf_index`` directly with an operator-
+    supplied leaf floor.
+
+    Five tests pin the property surface, including a STRUCTURAL
+    grep-based pin that no ``cmd_*`` function body still calls
+    ``_bind_persistent_leaf_index`` without a chokepoint reservation
+    or a documented cold-key / explicit-leaf carve-out above it.
+    Soft fix: no consensus rule change, no wire-format change, no
+    fork. (b007531)
+
+  * **``send-multi`` accepts reply / community / poll / vote
+    (audit r54 #3 -- value-prop top-1).** CLAUDE.md anchor:
+    collective censorship-resistance via fan-out.
+
+    Pre-fix the censorship-resistant fan-out path called
+    ``create_transaction`` with no ``prev`` / ``community_id`` /
+    ``poll_options`` / ``vote_target`` plumbed through, AND the
+    ``send-multi`` subparser never registered those flags. Every
+    social-primitive shipped on ``cmd_send`` since Tier 5
+    (``--prev``), Tier 25 (``--community-id``), and Tier 72
+    (``--poll-option`` / ``--vote-target``) was invisible on
+    ``send-multi``. The dissident reaching for ``send-multi`` under
+    pressure could not reply to a deleted-from-mainstream thread,
+    post into a community, vote on a politically-charged poll, or
+    create a poll -- the most-likely-to-be-suppressed message
+    shapes were the only ones the suppression-resistance path
+    could not transmit.
+
+    Abstraction-over-symptom fix. Two new helpers consumed by both
+    ``cmd_send`` and ``cmd_send_multi_submit``:
+    ``_add_message_tx_flags(parser)`` registers --prev,
+    --community-id, --poll-option, --vote-target on a subparser so
+    the flag surface is DRY (adding a future social primitive adds
+    it on both transports by construction); and
+    ``_parse_message_tx_fields(args)`` returns the parsed
+    ``(prev_bytes, community_id, poll_options, vote_target)`` tuple
+    with NFC-normalization, mutual-exclusion checks, and pre-flight
+    diagnostics centralized.
+
+    ``cmd_send_multi_submit`` now parses via the shared chokepoint,
+    computes prev/community/poll/vote overhead bytes for the auto-
+    fee density bid (mirroring cmd_send's accounting exactly so a
+    fan-out tx and a single-RPC tx with the same payload pay the
+    same fee), and threads the parsed fields through
+    ``create_transaction``. Eleven tests pin the parser surface,
+    helper shape, NFC normalization, and an end-to-end mock-and-
+    capture pin that ``cmd_send_multi_submit`` threads each field
+    through to ``create_transaction``. Soft fix: no consensus rule
+    change, no wire-format change, no fork. (30e5707)
+
 ## [1.81.0] — 2026-05-12
 
 Audit r53 top-3 ships: one production-active permanence-anchor
