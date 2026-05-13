@@ -587,7 +587,26 @@ class NonResponseEvidenceProcessor:
                     ),
                 )
             # Witness must be in the active set at observed_height.
-            stake = blockchain.supply.staked.get(o.witness_id, 0)
+            #
+            # Tier 78 (audit r56 #1): post-fork query the pinned stake
+            # snapshot AT ``o.observed_height`` via the
+            # ``_stake_at_height`` chokepoint, not the live
+            # ``supply.staked`` map.  Closes the sock-puppet collusion
+            # vector where an attacker who freshly stakes
+            # ``WITNESS_QUORUM`` puppets today fabricates signed
+            # ``WitnessObservation``s for a past observed_height where
+            # they were not in the active set.  Pre-fork the legacy
+            # live-map read runs unchanged for replay determinism.  See
+            # ``RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT`` in config.py.
+            from messagechain.config import (
+                RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT as _T78_H,
+            )
+            if int(current_height) >= _T78_H:
+                stake = blockchain._stake_at_height(
+                    o.witness_id, o.observed_height,
+                )
+            else:
+                stake = blockchain.supply.staked.get(o.witness_id, 0)
             if stake < VALIDATOR_MIN_STAKE:
                 # Drop this observation.  We don't fail-fast here so a
                 # single rogue observation doesn't poison an evidence

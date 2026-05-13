@@ -9630,6 +9630,40 @@ class Blockchain:
         )
         return self.supply.staked
 
+    def _stake_at_height(self, entity_id: bytes, height: int) -> int:
+        """Resolve ``entity_id``'s staked balance at a past block
+        ``height`` via the pinned stake snapshot.
+
+        Audit r56 #1 / Tier 78 chokepoint for retroactive consensus-
+        quorum active-set checks (``NonResponseEvidence`` witness
+        filter, ``InclusionList`` quorum verifier, future retroactive-
+        evidence kinds).  Strict on miss: returns 0 ("not staked")
+        rather than falling back to ``self.supply.staked``.  This
+        asymmetry is load-bearing -- the whole point of the helper is
+        that a retroactive evidence path must NOT count fresh stake.
+
+        Distinct from ``_pinned_stake_at(block_number)`` which serves
+        fork-weight accumulation with documented live-fallback
+        semantics for the snapshot-pruned-era / deep-history case.
+        Adding a new retroactive-evidence call site in the future
+        without routing through this helper reintroduces the audit r56
+        sock-puppet collusion vector.
+
+        The retention window is ``FINALITY_VOTE_MAX_AGE_BLOCKS``
+        (currently ``10 * FINALITY_INTERVAL`` = 1000 blocks).  Tier 78
+        retroactive evidence is admitted only when ``observed_height``
+        / ``report_height`` are well inside that window
+        (``WITNESS_OBSERVATION_RETENTION_BLOCKS = 64`` and
+        ``INCLUSION_LIST_WAIT_BLOCKS = 4`` respectively), so a miss in
+        normal operation indicates a cold-restart pin gap rather than
+        deep-history retrieval -- treating it as "not staked" is the
+        fail-safe answer.
+        """
+        snap = self._stake_snapshots.get(int(height))
+        if snap is None:
+            return 0
+        return int(snap.get(entity_id, 0))
+
     def _record_stake_snapshot(self, block_number: int):
         """Pin the current stake map for a block.
 
@@ -11221,9 +11255,30 @@ class Blockchain:
                 f"inclusion list publish_height {lst.publish_height} "
                 f"does not match block number {block_number}"
             )
+        # Tier 78 (audit r56 #1): post-fork the quorum verifier consults
+        # the pinned stake snapshot at ``publish_height - 1`` (the
+        # latest legal report_height -- reports are signed within
+        # ``[publish_height - INCLUSION_LIST_WAIT_BLOCKS,
+        # publish_height - 1]``).  Closes the recent-stake-attacker
+        # shape: a reporter who staked AFTER report_height cannot be
+        # counted toward the 2/3 quorum threshold by reading live
+        # ``supply.staked`` post-hoc.  Pre-fork the legacy live-map
+        # read runs unchanged for replay determinism.  See
+        # ``RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT`` in config.py.
+        from messagechain.config import (
+            RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT as _T78_H,
+        )
+        if int(block_number) >= _T78_H:
+            pin_height = max(0, int(lst.publish_height) - 1)
+            pinned = self._stake_snapshots.get(pin_height)
+            stakes_for_quorum = (
+                pinned if pinned is not None else self.supply.staked
+            )
+        else:
+            stakes_for_quorum = self.supply.staked
         ok, reason = verify_inclusion_list_quorum(
             lst,
-            stakes=self.supply.staked,
+            stakes=stakes_for_quorum,
             public_keys=self.public_keys,
         )
         if not ok:

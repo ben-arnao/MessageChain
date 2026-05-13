@@ -7562,6 +7562,68 @@ assert PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT > (
 )
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Tier 78 — Retroactive-evidence stake-pin defense (audit r56 #1).
+# ─────────────────────────────────────────────────────────────────────
+#
+# CLAUDE.md anchors defended:
+#   * Collective censorship-resistance: a colluding subset must not be
+#     able to fabricate slashable evidence against honest validators.
+#   * Honest-operator insurance: long-tenured operators must not be
+#     slashed by attackers who freshly stake sock-puppets in the
+#     immediate past.
+#
+# The vector closed: retroactive consensus-quorum active-set checks
+# (NonResponseEvidence witness filter, InclusionList quorum verifier)
+# previously read `blockchain.supply.staked` -- the LIVE map -- when
+# deciding whether a witness/reporter was in the active set AT the
+# past `observed_height` / `report_height` they claim to be reporting
+# about.  An attacker who stakes up `WITNESS_QUORUM` sock-puppet
+# validators today can therefore sign retroactive `WitnessObservation`
+# messages for an observed_height in the past where they were NOT
+# validators, and the admission gate happily counts their CURRENT
+# stake to satisfy the active-set check.  Same shape on the
+# InclusionList side: a recent-stake attacker could inflate per-entry
+# stake support by counting stake that wasn't present at report time.
+#
+# Tier 78 routes both retroactive checks through the pinned stake
+# snapshot at the relevant PAST height instead of the live map, via
+# a new `_stake_at_height` chokepoint on `Blockchain` that consults
+# `self._stake_snapshots`.  The helper is strict on miss (returns 0
+# -- "not staked") rather than falling back to live state: a missing
+# pin must NEVER cause a retroactive check to read fresh-stake.
+#
+# Activation `18500` sits 2000 blocks above Tier 77 (16500), matching
+# the Tier 70 -> 71 -> 73 -> 74 -> 75 -> 76 -> 77 ~13.9-day cohort
+# spacing.  A defense-rule change deserves its own operator runway.
+#
+# Pre-fork the legacy `supply.staked` read runs unchanged for replay
+# determinism.  Post-fork:
+#   * `non_response_evidence.NonResponseEvidenceProcessor.process`
+#     filters witnesses by stake at `o.observed_height`.
+#   * `Blockchain._validate_inclusion_list_quorum` sources `stakes`
+#     from `_stake_snapshots[lst.publish_height - 1]` (the latest
+#     legal report_height -- since reports are in the
+#     `[publish_height - INCLUSION_LIST_WAIT_BLOCKS, publish_height - 1]`
+#     window and the IL is committed at `publish_height`).
+#
+# Pinned-snapshot retention window is `FINALITY_VOTE_MAX_AGE_BLOCKS`
+# (== 10 * FINALITY_INTERVAL == 1000 blocks).  Maximum lookback for
+# retroactive evidence is `WITNESS_OBSERVATION_RETENTION_BLOCKS` (64)
+# on the NonResponse side and `INCLUSION_LIST_WAIT_BLOCKS` (4) on the
+# IL side -- both comfortably inside the retention window.
+RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT = 18500  # Tier 78
+
+assert RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT > (
+    PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT
+), (
+    "RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT (Tier 78) must strictly "
+    "follow PROPOSER_CAP_REDISTRIBUTE_MIN_UNIT_HEIGHT (Tier 77) -- "
+    "consecutive consensus-rule retunes deserve their own cohort so "
+    "operators absorb each in its own upgrade cycle."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 
