@@ -42,6 +42,10 @@ logger = logging.getLogger("messagechain.wallet_ops")
 
 __all__ = [
     "op_send_message",
+    "op_transfer",
+    "op_stake",
+    "op_unstake",
+    "op_react",
     "op_estimate_fee",
 ]
 
@@ -171,6 +175,221 @@ def op_send_message(
             "fee": fee,
         },
     }
+
+
+def op_transfer(
+    entity,
+    rpc_caller: Callable,
+    *,
+    recipient: bytes,
+    amount: int,
+    fee: int,
+    include_pubkey: bool = False,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit a transfer transaction."""
+    from messagechain.core.transfer import create_transfer_transaction
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(recipient, (bytes, bytearray)) or len(recipient) != 32:
+        return {"ok": False, "error": "recipient must be 32 bytes"}
+    if not isinstance(amount, int) or amount <= 0:
+        return {"ok": False, "error": "amount must be a positive integer"}
+    if not isinstance(fee, int) or fee < 0:
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+    if entity.entity_id == bytes(recipient):
+        return {"ok": False, "error": "cannot transfer to yourself"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_transfer_transaction(
+            entity, bytes(recipient), amount, ctx["nonce"],
+            fee=fee, include_pubkey=include_pubkey,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "submit_transfer", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(), "amount": amount, "fee": fee,
+    }}
+
+
+def op_stake(
+    entity,
+    rpc_caller: Callable,
+    *,
+    amount: int,
+    fee: int,
+    include_pubkey: bool = False,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit a stake transaction."""
+    from messagechain.core.staking import create_stake_transaction
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(amount, int) or amount <= 0:
+        return {"ok": False, "error": "amount must be a positive integer"}
+    if not isinstance(fee, int) or fee < 0:
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_stake_transaction(
+            entity, amount, ctx["nonce"], fee=fee,
+            include_pubkey=include_pubkey,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "stake", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(), "amount": amount, "fee": fee,
+    }}
+
+
+def op_unstake(
+    entity,
+    rpc_caller: Callable,
+    *,
+    amount: int,
+    fee: int,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit an unstake transaction.
+
+    Hot-key path only.  Cold-authority unstake (post-SetAuthorityKey)
+    requires the offline cold key, which the wallet UI does NOT load
+    -- power users must run cmd_unstake on the CLI with --cold-keyfile
+    for that case.  See cli.py cmd_unstake for the full rationale."""
+    from messagechain.core.staking import create_unstake_transaction
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(amount, int) or amount <= 0:
+        return {"ok": False, "error": "amount must be a positive integer"}
+    if not isinstance(fee, int) or fee < 0:
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_unstake_transaction(
+            entity, amount, ctx["nonce"], fee=fee,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "unstake", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(), "amount": amount, "fee": fee,
+    }}
+
+
+def op_react(
+    entity,
+    rpc_caller: Callable,
+    *,
+    target: bytes,
+    target_is_user: bool,
+    choice: int,
+    fee: int,
+    data_dir: Optional[str] = None,
+) -> dict:
+    """Build, sign, submit a react transaction.
+
+    ``target_is_user``: True for entity-trust votes (target is a 32B
+    entity_id), False for message-quality votes (target is a 32B
+    tx_hash).  ``choice``: messagechain.core.reaction.REACT_CHOICE_*
+    -- CLEAR=0, UP=1, DOWN=2 in the current wire."""
+    from messagechain.core.reaction import create_react_transaction
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    if not isinstance(target, (bytes, bytearray)) or len(target) != 32:
+        return {"ok": False, "error": "target must be 32 bytes"}
+    if not isinstance(choice, int):
+        return {"ok": False, "error": "choice must be an integer"}
+    if not isinstance(fee, int) or fee < 0:
+        return {"ok": False, "error": "fee must be a non-negative integer"}
+
+    ok, ctx = _resolve_nonce_and_tip(rpc_caller, entity.entity_id_hex)
+    if not ok:
+        return ctx
+
+    _resolve_signing_leaf_via_caller(
+        rpc_caller, entity,
+        data_dir=data_dir,
+        watermark_fallback=ctx["watermark"],
+    )
+
+    try:
+        tx = create_react_transaction(
+            entity,
+            target=bytes(target),
+            target_is_user=bool(target_is_user),
+            choice=choice,
+            nonce=ctx["nonce"],
+            fee=fee,
+        )
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    ok_s, submit_resp = _safe_rpc(
+        rpc_caller, "submit_react", {"transaction": tx.serialize()},
+    )
+    if not ok_s:
+        return submit_resp
+    if not submit_resp.get("ok"):
+        return submit_resp
+    return {"ok": True, "result": {
+        "tx_hash": tx.tx_hash.hex(),
+        "target": bytes(target).hex(),
+        "choice": choice,
+        "fee": fee,
+    }}
 
 
 def op_estimate_fee(

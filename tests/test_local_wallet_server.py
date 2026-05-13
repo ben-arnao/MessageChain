@@ -730,6 +730,163 @@ class TestWalletSend(_WalletServerTestBase):
         self.assertEqual(status, 400)
 
 
+# -----------------------------------------------------------------
+# /wallet/transfer, /wallet/stake, /wallet/unstake, /wallet/react.
+# Each is a thin HTTP wrapper around the matching wallet_ops.op_*
+# helper -- the input-validation + read-only + chain-rejection +
+# RPC-unreachable codepaths share the same _send_op_result helper as
+# /wallet/send (already covered in TestWalletSend).  These tests
+# focus on the per-route happy path: real signing + correct submit_X
+# RPC method called + correct response shape.
+# -----------------------------------------------------------------
+class _RealEntityMixin:
+    def _build_real_entity(self):
+        from messagechain.identity.identity import Entity
+        return Entity.create(bytes(range(32)))
+
+    def _post(self, port, path, token, body_dict):
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", path, body=json.dumps(body_dict), headers=headers)
+        resp = conn.getresponse()
+        status = resp.status
+        body = json.loads(resp.read())
+        conn.close()
+        return status, body
+
+
+class TestWalletTransfer(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_transfer(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_transfer":
+                from messagechain.core.transfer import TransferTransaction
+                tx = TransferTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        recipient = "ab" * 32
+        status, data = self._post(port, "/wallet/transfer", srv.token, {
+            "recipient_id": recipient, "amount": 50, "fee": 100,
+            "include_pubkey": True,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertIn("tx_hash", data["result"])
+        self.assertEqual(captured["tx"].recipient_id, bytes.fromhex(recipient))
+        self.assertEqual(captured["tx"].amount, 50)
+
+
+class TestWalletStake(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_stake(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "stake":
+                from messagechain.core.staking import StakeTransaction
+                tx = StakeTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, data = self._post(port, "/wallet/stake", srv.token, {
+            "amount": 1000, "fee": 100,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["tx"].amount, 1000)
+
+
+class TestWalletUnstake(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_unstake(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "unstake":
+                from messagechain.core.staking import UnstakeTransaction
+                tx = UnstakeTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, data = self._post(port, "/wallet/unstake", srv.token, {
+            "amount": 500, "fee": 100,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["tx"].amount, 500)
+
+
+class TestWalletReact(_WalletServerTestBase, _RealEntityMixin):
+    def test_signs_and_submits_react(self):
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_react":
+                from messagechain.core.reaction import ReactTransaction
+                tx = ReactTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        target_tx_hash = "cd" * 32
+        # choice=1 (REACT_CHOICE_UP), target_is_user=False (a message react)
+        status, data = self._post(port, "/wallet/react", srv.token, {
+            "target": target_tx_hash,
+            "target_is_user": False,
+            "choice": 1,
+            "fee": 100,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["tx"].target, bytes.fromhex(target_tx_hash))
+        self.assertFalse(captured["tx"].target_is_user)
+        self.assertEqual(captured["tx"].choice, 1)
+
+    def test_invalid_target_returns_400_without_signing(self):
+        def _rpc(method, params):
+            raise AssertionError("RPC must NOT be called for malformed target")
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, _ = self._post(port, "/wallet/react", srv.token, {
+            "target": "short", "target_is_user": False, "choice": 1, "fee": 1,
+        })
+        self.assertEqual(status, 400)
+
+
 class TestWalletEstimateFee(_WalletServerTestBase):
     def test_passes_message_bytes_through(self):
         captured = {}

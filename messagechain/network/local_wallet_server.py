@@ -356,6 +356,18 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         if path == "/wallet/send":
             self._serve_wallet_send_post()
             return
+        if path == "/wallet/transfer":
+            self._serve_wallet_transfer_post()
+            return
+        if path == "/wallet/stake":
+            self._serve_wallet_stake_post()
+            return
+        if path == "/wallet/unstake":
+            self._serve_wallet_unstake_post()
+            return
+        if path == "/wallet/react":
+            self._serve_wallet_react_post()
+            return
 
         self._send_text(404, "Not Found")
 
@@ -383,6 +395,37 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
 
     # --- wallet write routes ------------------------------------------
 
+    def _send_op_result(self, result: dict):
+        """Map a wallet_ops flat result dict to an HTTP response.
+
+        200 -- chain accepted; 400 -- caller-fixable input;
+        502 -- chain rejected; 503 -- RPC unreachable / read-only."""
+        if result.get("ok"):
+            self._send_json(200, result)
+            return
+        err = (result.get("error") or "").lower()
+        if "unreachable" in err or "read-only" in err:
+            status = 503
+        elif "must" in err and (
+            "string" in err or "integer" in err or "bytes" in err
+            or "positive" in err
+        ):
+            status = 400
+        else:
+            status = 502
+        self._send_json(status, result)
+
+    def _require_entity_or_503(self):
+        """Return ctx.entity if loaded, otherwise send 503 and return None."""
+        ctx = self.server._wallet_context
+        if ctx.entity is None:
+            self._send_json(503, {
+                "ok": False,
+                "error": "wallet running in read-only mode (no key loaded)",
+            })
+            return None
+        return ctx.entity
+
     def _serve_wallet_send_post(self):
         """POST /wallet/send -- sign + submit a message tx.
 
@@ -400,12 +443,8 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         Returns the tx_hash on success.  Rejects when no entity is
         loaded (read-only mode), the validator is unreachable, or the
         chain rejects the tx (e.g. fee too low, leaf consumed)."""
-        ctx = self.server._wallet_context
-        if ctx.entity is None:
-            self._send_json(503, {
-                "ok": False,
-                "error": "wallet running in read-only mode (no key loaded)",
-            })
+        entity = self._require_entity_or_503()
+        if entity is None:
             return
 
         ok, body = self._read_json_body()
@@ -481,8 +520,9 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             vote_target = (vt_pid, vote_target[1])
 
         from messagechain.network.wallet_ops import op_send_message
+        ctx = self.server._wallet_context
         result = op_send_message(
-            ctx.entity,
+            entity,
             ctx.rpc_caller,
             message=body.get("message", ""),
             fee=body.get("fee", 0),
@@ -493,21 +533,133 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             include_pubkey=bool(body.get("include_pubkey", False)),
             data_dir=getattr(ctx, "data_dir", None),
         )
-        # 200 on chain accept; 400 on caller-fixable validation;
-        # 502 on chain reject (e.g. fee too low, entity unknown);
-        # 503 on RPC unreachable.  Map by sniffing the error string
-        # since wallet_ops returns a flat shape.
-        if result.get("ok"):
-            self._send_json(200, result)
+        self._send_op_result(result)
+
+    def _serve_wallet_transfer_post(self):
+        """POST /wallet/transfer  -- {recipient_id_hex, amount, fee, include_pubkey?}"""
+        entity = self._require_entity_or_503()
+        if entity is None:
             return
-        err = (result.get("error") or "").lower()
-        if "unreachable" in err:
-            status = 503
-        elif "must" in err and "string" in err:  # input-validation
-            status = 400
-        else:
-            status = 502
-        self._send_json(status, result)
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+
+        rid_hex = body.get("recipient_id")
+        if not isinstance(rid_hex, str) or len(rid_hex) != 64:
+            self._send_json(400, {
+                "ok": False, "error": "recipient_id must be 64 hex chars",
+            })
+            return
+        try:
+            recipient_bytes = bytes.fromhex(rid_hex)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "recipient_id must be valid hex",
+            })
+            return
+
+        from messagechain.network.wallet_ops import op_transfer
+        ctx = self.server._wallet_context
+        result = op_transfer(
+            entity, ctx.rpc_caller,
+            recipient=recipient_bytes,
+            amount=body.get("amount", 0),
+            fee=body.get("fee", 0),
+            include_pubkey=bool(body.get("include_pubkey", False)),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
+
+    def _serve_wallet_stake_post(self):
+        """POST /wallet/stake  -- {amount, fee, include_pubkey?}"""
+        entity = self._require_entity_or_503()
+        if entity is None:
+            return
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        from messagechain.network.wallet_ops import op_stake
+        ctx = self.server._wallet_context
+        result = op_stake(
+            entity, ctx.rpc_caller,
+            amount=body.get("amount", 0),
+            fee=body.get("fee", 0),
+            include_pubkey=bool(body.get("include_pubkey", False)),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
+
+    def _serve_wallet_unstake_post(self):
+        """POST /wallet/unstake  -- {amount, fee}
+
+        Hot-key path only.  Cold-authority unstake belongs in the CLI
+        with --cold-keyfile -- the wallet UI does not load cold keys."""
+        entity = self._require_entity_or_503()
+        if entity is None:
+            return
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        from messagechain.network.wallet_ops import op_unstake
+        ctx = self.server._wallet_context
+        result = op_unstake(
+            entity, ctx.rpc_caller,
+            amount=body.get("amount", 0),
+            fee=body.get("fee", 0),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
+
+    def _serve_wallet_react_post(self):
+        """POST /wallet/react  -- {target_hex, target_is_user, choice, fee}
+
+        ``target_is_user``: True for entity-trust votes (target is a
+        32B entity_id), False for message-quality votes (target is a
+        32B tx_hash).  ``choice`` is the on-wire react int (CLEAR=0,
+        UP=1, DOWN=2)."""
+        entity = self._require_entity_or_503()
+        if entity is None:
+            return
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        target_hex = body.get("target")
+        if not isinstance(target_hex, str) or len(target_hex) != 64:
+            self._send_json(400, {
+                "ok": False, "error": "target must be 64 hex chars",
+            })
+            return
+        try:
+            target_bytes = bytes.fromhex(target_hex)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "target must be valid hex",
+            })
+            return
+        if not isinstance(body.get("target_is_user"), bool):
+            self._send_json(400, {
+                "ok": False, "error": "target_is_user must be a boolean",
+            })
+            return
+        from messagechain.network.wallet_ops import op_react
+        ctx = self.server._wallet_context
+        result = op_react(
+            entity, ctx.rpc_caller,
+            target=target_bytes,
+            target_is_user=body["target_is_user"],
+            choice=body.get("choice", 0),
+            fee=body.get("fee", 0),
+            data_dir=getattr(ctx, "data_dir", None),
+        )
+        self._send_op_result(result)
 
     def _serve_wallet_estimate_fee(self, query: str):
         """GET /wallet/estimate-fee?message_bytes=N
