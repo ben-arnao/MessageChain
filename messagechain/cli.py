@@ -2471,6 +2471,65 @@ def _reserve_leaf_via_rpc(host, port, entity_id_hex):
     return leaf
 
 
+def _resolve_signing_leaf(
+    host, port, entity, *, data_dir, watermark_fallback,
+):
+    """Atomically reserve a WOTS+ leaf and bind the on-disk cursor.
+
+    Single chokepoint every CLI signing command MUST route through.
+    Bypassing this re-opens the cross-process leaf-reuse race window
+    that audit r46 #3 closed for ``cmd_send`` / ``cmd_transfer`` /
+    ``cmd_stake`` / ``cmd_submit_evidence`` -- a defect-shape audit
+    r54 #2 then flagged as still alive on every OTHER signing command
+    (cmd_unstake / cmd_rotate_key / cmd_react / cmd_propose /
+    cmd_vote / cmd_set_authority_key / cmd_emergency_revoke /
+    cmd_set_receipt_subtree_root / cmd_bootstrap_seed /
+    cmd_send_multi_submit).
+
+    Strategy:
+
+      1. Try the server-side ``reserve_leaf`` RPC.  This is the
+         atomic primitive that prevents the CLI-vs-daemon collision
+         where two processes might each pick the same chain watermark
+         and each sign a different tx at the same leaf -- publishing
+         both signatures discloses the leaf's WOTS+ private chunks
+         (100% slash on detection of the disclosure).
+
+      2. If the RPC is unavailable (older daemon, no daemon running,
+         standalone-CLI flow), fall back to ``watermark_fallback``
+         (typically the ``leaf_watermark`` field the
+         ``get_nonce`` / ``get_key_status`` RPC already returned).
+         The single-process safety floor is preserved; the cross-
+         process race window is the residual hazard the operator
+         implicitly accepts by running CLI signing against a daemon
+         that doesn't expose the atomic primitive.
+
+      3. Bind the on-disk leaf cursor via
+         ``_bind_persistent_leaf_index`` -- closes the same-machine
+         residual where two parallel CLI invocations (or one CLI
+         plus a daemon without the RPC) might each carry a fresh
+         memory view of an earlier sign.
+
+    Returns the resolved leaf index (>= the chain watermark, >= the
+    on-disk cursor after bind).
+
+    Note: cold-key signing paths (``cmd_unstake`` /
+    ``cmd_set_receipt_subtree_root`` ``--cold-keyfile``) bind a
+    cold-key cursor directly without RPC reservation -- the cold key
+    is operator-held, not validator-daemon-managed, so the CLI-vs-
+    daemon race window doesn't apply.  Those sites continue to call
+    ``_bind_persistent_leaf_index`` directly with an operator-
+    supplied leaf floor.
+    """
+    leaf = _reserve_leaf_via_rpc(host, port, entity.entity_id_hex)
+    if leaf is None:
+        leaf = int(watermark_fallback)
+    _bind_persistent_leaf_index(
+        entity, chain_leaf=leaf, data_dir=data_dir,
+    )
+    return leaf
+
+
 _VALIDATOR_HOT_KEY_DEFAULT_PATH = "/etc/messagechain/keyfile"
 
 
@@ -3652,14 +3711,31 @@ def cmd_send_multi_submit(args) -> int:
     # Cross-process WOTS+ leaf-reuse defense.  Multi-submit fans out
     # to N>=3 validators, but the leaf is still ONE WOTS+ leaf -- two
     # consecutive multi-submit runs at the same --leaf-index would
-    # double-sign and disclose the leaf private key.  The on-disk
-    # cursor closes the same-machine window; the chain-watermark
-    # query above closes the cross-machine fresh-disk + reused-keyfile
-    # window the agent flagged.
-    _bind_persistent_leaf_index(
-        entity, chain_leaf=int(leaf_index),
-        data_dir=getattr(args, "data_dir", None),
-    )
+    # double-sign and disclose the leaf private key.
+    if explicit_leaf is None:
+        # Audit r54 #2: route through the unified
+        # ``_resolve_signing_leaf`` chokepoint so the daemon's atomic
+        # reservation closes the co-resident same-host race.  This
+        # is the common case (operator runs send-multi from the
+        # validator host itself).  ``watermark_fallback`` is the
+        # leaf_watermark we already fetched above via ``get_nonce``,
+        # so older daemons without ``reserve_leaf`` keep working.
+        leaf_index = _resolve_signing_leaf(
+            state_host, state_port, entity,
+            data_dir=getattr(args, "data_dir", None),
+            watermark_fallback=leaf_index,
+        )
+    else:
+        # Explicit --leaf-index supersedes the chokepoint -- operator
+        # is asserting "sign at exactly this leaf" (typical for
+        # offline-signing or air-gapped flows where the daemon's
+        # reservation is irrelevant because the daemon is unreachable
+        # by design).  Bind the on-disk cursor at the explicit value
+        # so a subsequent run still advances past it.
+        _bind_persistent_leaf_index(
+            entity, chain_leaf=int(leaf_index),
+            data_dir=getattr(args, "data_dir", None),
+        )
 
     # Resolve target_height once for the auto-fee and pubkey-install
     # branches below.  Hoisted out of the fee-branch so the pubkey-
@@ -4311,11 +4387,15 @@ def cmd_unstake(args):
     nonce = nonce_resp["result"]["nonce"]
 
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.  Only
-    # binds the HOT entity's leaf cursor; cold-key cursor is bound
-    # above via --cold-leaf.
+    # Cross-process WOTS+ leaf-reuse defense -- routes through the
+    # unified ``_resolve_signing_leaf`` chokepoint (audit r54 #2).
+    # Only binds the HOT entity's leaf cursor; cold-key cursor is
+    # bound above via --cold-leaf.
     if cold_signing_keypair is None:
-        _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
+        _resolve_signing_leaf(
+            host, port, entity,
+            data_dir=data_dir, watermark_fallback=watermark,
+        )
 
     # Default fee: route through the unified auto-fee helper.  Mirrors
     # cmd_stake; ``auto_fee`` already enforces the live admission floor
@@ -4449,9 +4529,15 @@ def cmd_bootstrap_seed(args):
             return None, None
         n = resp["result"]["nonce"]
         w = resp["result"].get("leaf_watermark", n)
-        _bind_persistent_leaf_index(
-            entity, chain_leaf=w,
+        # Audit r54 #2 -- atomic leaf reservation via the unified
+        # chokepoint.  Two consecutive ``bootstrap-seed`` runs (or a
+        # partial first run + retry) racing the daemon's own signing
+        # at the same chain watermark would otherwise produce
+        # slashable equivocation.
+        _resolve_signing_leaf(
+            host, port, entity,
             data_dir=getattr(args, "data_dir", None),
+            watermark_fallback=w,
         )
         return n, w
 
@@ -4568,8 +4654,12 @@ def cmd_set_authority_key(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
-    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
+    # Cross-process WOTS+ leaf-reuse defense via unified chokepoint
+    # (audit r54 #2).
+    _resolve_signing_leaf(
+        host, port, entity,
+        data_dir=data_dir, watermark_fallback=watermark,
+    )
 
     # Default fee: post-flat floor is safe pre- and post-activation.
     from messagechain.config import MIN_FEE_POST_FLAT
@@ -4715,8 +4805,15 @@ def cmd_rotate_key(args):
         sys.exit(1)
     current_rotation = status["result"]["rotation_number"]
     watermark = status["result"]["leaf_watermark"]
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
-    _bind_persistent_leaf_index(entity, chain_leaf=watermark, data_dir=data_dir)
+    # Cross-process WOTS+ leaf-reuse defense via unified chokepoint
+    # (audit r54 #2).  Critical for rotate-key in particular: the
+    # rotation tx itself burns a leaf on the current tree, AND
+    # operators typically run this on the validator host where the
+    # daemon's block-signing loop is also racing on the same tree.
+    _resolve_signing_leaf(
+        host, port, entity,
+        data_dir=data_dir, watermark_fallback=watermark,
+    )
 
     # Display the watermark against the entity's stored tree_height
     # rather than the global config -- personal wallets at h=16 and
@@ -5315,12 +5412,13 @@ def cmd_propose(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.  cmd_propose
-    # has no --data-dir surface today, so this routes to the home-dir
-    # default unconditionally.
-    _bind_persistent_leaf_index(
-        entity, chain_leaf=watermark,
+    # Cross-process WOTS+ leaf-reuse defense via unified chokepoint
+    # (audit r54 #2).  cmd_propose has no --data-dir surface today, so
+    # this routes to the home-dir default unconditionally.
+    _resolve_signing_leaf(
+        host, port, entity,
         data_dir=getattr(args, "data_dir", None),
+        watermark_fallback=watermark,
     )
 
     # Query the live chain tip so the auto-fee picks the right floor
@@ -5427,10 +5525,12 @@ def cmd_vote(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
-    _bind_persistent_leaf_index(
-        entity, chain_leaf=watermark,
+    # Cross-process WOTS+ leaf-reuse defense via unified chokepoint
+    # (audit r54 #2).
+    _resolve_signing_leaf(
+        host, port, entity,
         data_dir=getattr(args, "data_dir", None),
+        watermark_fallback=watermark,
     )
 
     from messagechain.validation import parse_hex
@@ -5527,10 +5627,12 @@ def cmd_react(args):
         sys.exit(1)
     nonce = nonce_resp["result"]["nonce"]
     watermark = nonce_resp["result"].get("leaf_watermark", nonce)
-    # Cross-process WOTS+ leaf-reuse defense -- see cmd_send.
-    _bind_persistent_leaf_index(
-        entity, chain_leaf=watermark,
+    # Cross-process WOTS+ leaf-reuse defense via unified chokepoint
+    # (audit r54 #2).
+    _resolve_signing_leaf(
+        host, port, entity,
         data_dir=getattr(args, "data_dir", None),
+        watermark_fallback=watermark,
     )
 
     # Audit r48 #3: route through the shared
