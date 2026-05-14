@@ -7669,6 +7669,59 @@ assert SLASHABLE_BASIS_AT_ADMISSION_HEIGHT > (
 )
 
 
+# ─── Tier 80 — multi-key re-verify on slashing & inclusion paths ────
+#
+# Audit r58 #1 (security top-1).  Three slashing / inclusion re-verify
+# paths still read ``public_keys.get(entity_id)`` (single CURRENT key)
+# while the existing ``_verify_signer_at_height`` multi-key chokepoint
+# covers only Attestation + FinalityVote validation/gossip (audit r50
+# #2):
+#
+#   * ``inclusion_list.verify_inclusion_list_quorum`` -- reporter sig
+#     recheck on AttesterMempoolReports (rejects the WHOLE list on a
+#     single bad sig, defeating the forced-inclusion-list arm).
+#   * ``NonResponseEvidenceProcessor.process`` (and the proposer-sim
+#     mirror in ``Blockchain._sim_apply_block`` non-response branch) --
+#     witness observation sig recheck (drops below WITNESS_QUORUM and
+#     dismisses the slash).
+#   * ``BogusRejectionProcessor.process`` -- embedded ``message_tx``
+#     sig recheck (treats a rotation-affected tx as "honest rejection"
+#     and lets the lying validator escape slashing).
+#
+# In every case a colluding entity that rotates between the relevant
+# observation-time and apply-time silently invalidates the verify --
+# directly threatening the CLAUDE.md "collective censorship-resistance"
+# and "honest-operator insurance" anchors that the slashable-evidence
+# arm is built on.  ``KEY_ROTATION_COOLDOWN_BLOCKS = 144`` is short
+# enough to make the timing trivial: 4 blocks for InclusionList, 64
+# blocks for NRE, full evidence-TTL for BogusRejection.
+#
+# Tier 80 routes all three sites through the existing multi-key
+# candidate set:
+#
+#   * pre-fork: legacy single-current-key behaviour                   (legacy,
+#     byte-identical to historical replay)
+#   * post-fork: try every key the offender ever held + the current
+#     key, accept if ANY matches; on InclusionList, a report whose sig
+#     fails ALL candidates is DROPPED (fail-soft, same shape as the
+#     existing unknown-reporter / stale-window skips) rather than
+#     failing the whole list.
+#
+# Abstraction-over-symptom fix.  Adding a new signed-aggregation
+# re-verify site that goes around the multi-key chokepoint reintroduces
+# the same defect class by definition.  Activation height 22500 sits
+# 2000 blocks above Tier 79 (20500), matching the Tier 70 -> 71 -> 73
+# -> 74 -> 75 -> 76 -> 77 -> 78 -> 79 ~13.9-day cohort spacing -- one
+# operator upgrade cycle per consensus-rule retune.
+MULTI_KEY_RE_VERIFY_HEIGHT = 22500  # Tier 80
+
+assert MULTI_KEY_RE_VERIFY_HEIGHT > SLASHABLE_BASIS_AT_ADMISSION_HEIGHT, (
+    "MULTI_KEY_RE_VERIFY_HEIGHT (Tier 80) must strictly follow "
+    "SLASHABLE_BASIS_AT_ADMISSION_HEIGHT (Tier 79) -- consecutive "
+    "consensus-rule retunes deserve their own cohort."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

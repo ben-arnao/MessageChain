@@ -4766,6 +4766,32 @@ class Blockchain:
         definition -- the abstraction is load-bearing for forward-
         compatibility, not just correctness today.
         """
+        candidates = self._candidate_keys_for(entity_id)
+        if not candidates:
+            return False
+        for pk in candidates:
+            if verifier(obj, pk):
+                return True
+        return False
+
+    def _candidate_keys_for(self, entity_id: bytes) -> list[bytes]:
+        """Return the multi-key candidate set for ``entity_id`` -- every
+        key the entity legitimately published on-chain plus the current
+        key, deduped.
+
+        Single-source helper for every site that re-verifies a signed
+        message against a rotating-key entity.  ``_verify_signer_at_
+        height`` uses it directly; ``_validate_inclusion_list_quorum``
+        passes it as ``signer_resolver`` post-Tier-80 so
+        ``verify_inclusion_list_quorum`` can try each candidate when an
+        AttesterMempoolReport's signer rotated between report_height
+        and publish_height.
+
+        Returns an empty list when the entity has no on-chain key.
+        Adding a new signed-re-verify site that builds its own
+        candidate set instead of routing through here reintroduces the
+        audit r58 #1 defect class by definition.
+        """
         seen: set[bytes] = set()
         candidates: list[bytes] = []
         for _installed_at, pk in self.key_history.get(entity_id, []):
@@ -4775,12 +4801,7 @@ class Blockchain:
         current = self.public_keys.get(entity_id)
         if current and current not in seen:
             candidates.append(current)
-        if not candidates:
-            return False
-        for pk in candidates:
-            if verifier(obj, pk):
-                return True
-        return False
+        return candidates
 
     def _record_receipt_subtree_root(
         self, entity_id: bytes, root_public_key: bytes,
@@ -8267,6 +8288,17 @@ class Blockchain:
                 # whole evidence (process returns accepted=False).
                 deadline_failed = False
                 valid_witnesses: set[bytes] = set()
+                # Tier 80 (audit r58 #1): mirror the process()-side
+                # multi-key recheck so the proposer's sim filter doesn't
+                # silently drop an observation whose witness rotated
+                # between observed_height and proposer-sim time.  Pre-
+                # fork single-current-key path is preserved for replay
+                # determinism (and to match process()'s legacy branch
+                # byte-for-byte).
+                from messagechain.config import (
+                    MULTI_KEY_RE_VERIFY_HEIGHT as _NRE_T80_H,
+                )
+                _nre_multi_key = int(block_height) >= _NRE_T80_H
                 for o in etx.witness_observations:
                     if int(block_height) <= o.observed_height + _NRE_DDL:
                         deadline_failed = True
@@ -8277,15 +8309,25 @@ class Blockchain:
                     )
                     if stake < _NRE_MIN_STAKE:
                         continue
-                    wpk = sim_public_keys.get(
-                        o.witness_id,
-                        self.public_keys.get(o.witness_id, b""),
-                    )
-                    if not wpk:
-                        continue
-                    obs_ok, _ = _nre_verify_obs(o, wpk)
-                    if not obs_ok:
-                        continue
+                    if _nre_multi_key:
+                        def _sim_obs_verifier(_o, _pk):
+                            _ok, _ = _nre_verify_obs(_o, _pk)
+                            return _ok
+                        if not self._verify_signer_at_height(
+                            o, o.witness_id, o.observed_height,
+                            _sim_obs_verifier,
+                        ):
+                            continue
+                    else:
+                        wpk = sim_public_keys.get(
+                            o.witness_id,
+                            self.public_keys.get(o.witness_id, b""),
+                        )
+                        if not wpk:
+                            continue
+                        obs_ok, _ = _nre_verify_obs(o, wpk)
+                        if not obs_ok:
+                            continue
                     valid_witnesses.add(o.witness_id)
                 if deadline_failed:
                     continue
@@ -11326,6 +11368,7 @@ class Blockchain:
         # ``RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT`` in config.py.
         from messagechain.config import (
             RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT as _T78_H,
+            MULTI_KEY_RE_VERIFY_HEIGHT as _T80_H,
         )
         if int(block_number) >= _T78_H:
             pin_height = max(0, int(lst.publish_height) - 1)
@@ -11335,10 +11378,20 @@ class Blockchain:
             )
         else:
             stakes_for_quorum = self.supply.staked
+        # Tier 80 (audit r58 #1): post-fork pass the multi-key candidate
+        # resolver so an honest reporter that rotated between
+        # report_height and publish_height doesn't get their report
+        # silently dropped (and the whole list rejected) by a single-
+        # current-key sig check.  Pre-fork the legacy single-current-
+        # key path runs unchanged for replay determinism.
+        signer_resolver = (
+            self._candidate_keys_for if int(block_number) >= _T80_H else None
+        )
         ok, reason = verify_inclusion_list_quorum(
             lst,
             stakes=stakes_for_quorum,
             public_keys=self.public_keys,
+            signer_resolver=signer_resolver,
         )
         if not ok:
             return False, f"inclusion list quorum invalid: {reason}"

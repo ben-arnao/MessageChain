@@ -375,24 +375,57 @@ class BogusRejectionProcessor:
 
         if reason_code in _SLASHABLE_REASON_CODES:
             # Re-verify the embedded message_tx using its on-chain pubkey.
-            offender_pk = blockchain.public_keys.get(
-                tx.message_tx.entity_id, b"",
+            #
+            # Tier 80 (audit r58 #1): post-fork iterate the multi-key
+            # candidate set so a message_tx signed under the sender's
+            # K_old before they rotated still verifies (and the lying
+            # validator who rejected it gets slashed).  Pre-fork
+            # single-current-key behaviour is preserved for replay
+            # determinism.  Without this, a coerced / colluding pair
+            # (lying validator + sender rotates within evidence-TTL)
+            # silently launders the bogus rejection -- the slash is
+            # dismissed as "honest rejection."
+            from messagechain.config import (
+                MULTI_KEY_RE_VERIFY_HEIGHT as _T80_H,
             )
-            if not offender_pk:
-                # We can't refute a rejection for a tx whose signer has
-                # no on-chain pubkey — the validator's REJECT_INVALID_SIG
-                # might be honest (no key to verify against).  Treat as
-                # honest-rejection: reject evidence, no slash.
-                return BogusRejectionResult(
-                    accepted=False, slashed=False,
-                    reason=(
-                        "honest rejection: message_tx signer has no "
-                        "on-chain public key to verify against"
-                    ),
+            if int(block_height) >= _T80_H:
+                candidates = blockchain._candidate_keys_for(
+                    tx.message_tx.entity_id,
                 )
-            sig_verifies = verify_transaction(
-                tx.message_tx, offender_pk, current_height=block_height,
-            )
+                if not candidates:
+                    return BogusRejectionResult(
+                        accepted=False, slashed=False,
+                        reason=(
+                            "honest rejection: message_tx signer has no "
+                            "on-chain public key to verify against"
+                        ),
+                    )
+                sig_verifies = any(
+                    verify_transaction(
+                        tx.message_tx, pk, current_height=block_height,
+                    )
+                    for pk in candidates
+                )
+            else:
+                offender_pk = blockchain.public_keys.get(
+                    tx.message_tx.entity_id, b"",
+                )
+                if not offender_pk:
+                    # We can't refute a rejection for a tx whose signer
+                    # has no on-chain pubkey — the validator's
+                    # REJECT_INVALID_SIG might be honest (no key to
+                    # verify against).  Treat as honest-rejection:
+                    # reject evidence, no slash.
+                    return BogusRejectionResult(
+                        accepted=False, slashed=False,
+                        reason=(
+                            "honest rejection: message_tx signer has no "
+                            "on-chain public key to verify against"
+                        ),
+                    )
+                sig_verifies = verify_transaction(
+                    tx.message_tx, offender_pk, current_height=block_height,
+                )
             if not sig_verifies:
                 # Rejection was HONEST — the tx's signature actually
                 # fails to verify.  Caller MUST NOT charge fee — the

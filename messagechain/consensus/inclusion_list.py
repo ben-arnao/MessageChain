@@ -520,6 +520,8 @@ def verify_inclusion_list_quorum(
     lst: InclusionList,
     stakes: dict[bytes, int],
     public_keys: dict[bytes, bytes],
+    *,
+    signer_resolver=None,
 ) -> tuple[bool, str]:
     """Verify the list's entries are each backed by >= 2/3 stake AND
     the witness bundle is well-formed.
@@ -539,6 +541,18 @@ def verify_inclusion_list_quorum(
       * entry.first_seen_height >= publish_height - INCLUSION_LIST_WAIT_BLOCKS
 
     Returns (True, "OK") on success; (False, reason) on failure.
+
+    ``signer_resolver`` (audit r58 #1, Tier 80): optional callback
+    ``(reporter_id) -> list[bytes]`` returning the multi-key candidate
+    set for a rotating-key reporter.  When provided, a report's
+    signature is checked against EVERY candidate key and accepted if
+    ANY matches; a report whose signature fails all candidates is
+    DROPPED (fail-soft, same shape as the existing unknown-reporter /
+    stale-window skips) rather than failing the whole list.  When
+    omitted, legacy single-current-key behaviour applies and a bad-sig
+    report fails the whole list -- byte-identical to historical
+    replay.  ``Blockchain._validate_inclusion_list_quorum`` plugs in
+    the resolver post-Tier-80, gated by block_number.
     """
     ok, reason = validate_inclusion_list_version(lst.version)
     if not ok:
@@ -585,14 +599,30 @@ def verify_inclusion_list_quorum(
         stake = stakes.get(r.reporter_id, 0)
         if stake <= 0:
             continue  # unknown / unstaked reporter contributes nothing
-        pk = public_keys.get(r.reporter_id)
-        if pk is None:
-            continue  # no on-chain pubkey to verify against
-        if not verify_attester_mempool_report(r, pk):
-            return False, (
-                f"invalid signature on attester report from "
-                f"{r.reporter_id.hex()[:16]}"
+        # Sig recheck: post-Tier-80 (signer_resolver provided) try the
+        # full multi-key candidate set; legacy uses the current key
+        # only.  On a multi-key miss, DROP the report (fail-soft) --
+        # same shape as the existing unknown-reporter / stale-window
+        # skips, and the only honest source of a "no candidate matches"
+        # is a report whose signer's keys are unknown to the verifier.
+        if signer_resolver is not None:
+            candidates = signer_resolver(r.reporter_id)
+            if not candidates:
+                continue  # no candidate keys for this reporter
+            sig_ok = any(
+                verify_attester_mempool_report(r, pk) for pk in candidates
             )
+            if not sig_ok:
+                continue  # drop bad-sig report, keep tallying others
+        else:
+            pk = public_keys.get(r.reporter_id)
+            if pk is None:
+                continue  # no on-chain pubkey to verify against
+            if not verify_attester_mempool_report(r, pk):
+                return False, (
+                    f"invalid signature on attester report from "
+                    f"{r.reporter_id.hex()[:16]}"
+                )
         for tx_hash in r.tx_hashes:
             seen = counted.setdefault(tx_hash, set())
             if r.reporter_id in seen:

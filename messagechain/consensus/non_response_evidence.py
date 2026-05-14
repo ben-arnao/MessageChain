@@ -613,12 +613,32 @@ class NonResponseEvidenceProcessor:
                 # that still has Q honest active witnesses.
                 continue
             # Witness signature verifies under chain pubkey.
-            wpk = blockchain.public_keys.get(o.witness_id, b"")
-            if not wpk:
-                continue
-            ok, _ = verify_witness_observation(o, wpk)
-            if not ok:
-                continue
+            #
+            # Tier 80 (audit r58 #1): post-fork route through the
+            # multi-key candidate set so a witness who rotated their
+            # key between observed_height and apply-time still has
+            # their observation accepted.  Pre-fork single-current-
+            # key behaviour is preserved for replay determinism --
+            # historical blocks where the verifier accepted observations
+            # all signed under the current key replay byte-identically.
+            from messagechain.config import (
+                MULTI_KEY_RE_VERIFY_HEIGHT as _T80_H,
+            )
+            if int(current_height) >= _T80_H:
+                def _obs_verifier(_o, _pk):
+                    _ok, _ = verify_witness_observation(_o, _pk)
+                    return _ok
+                if not blockchain._verify_signer_at_height(
+                    o, o.witness_id, o.observed_height, _obs_verifier,
+                ):
+                    continue
+            else:
+                wpk = blockchain.public_keys.get(o.witness_id, b"")
+                if not wpk:
+                    continue
+                ok, _ = verify_witness_observation(o, wpk)
+                if not ok:
+                    continue
             valid_witnesses.add(o.witness_id)
 
         if len(valid_witnesses) < WITNESS_QUORUM:
