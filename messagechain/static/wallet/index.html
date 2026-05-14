@@ -276,7 +276,55 @@
     color: var(--accent);
     font-size: 0.78rem;
     margin-top: 0.2rem;
+    cursor: pointer;
+    display: inline-block;
   }
+  .msg .community:hover { text-decoration: underline; }
+  .filter-chip {
+    display: none;
+    align-items: center;
+    gap: 0.5rem;
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    padding: 0.35rem 0.7rem;
+    border-radius: 999px;
+    margin: 0 0 0.6rem;
+    font-size: 0.85rem;
+  }
+  .filter-chip.show { display: inline-flex; }
+  .filter-chip button { background: transparent; border: none; color: var(--accent); padding: 0; cursor: pointer; }
+  .proposal {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.7rem 0.9rem;
+    margin-bottom: 0.6rem;
+    background: var(--bg);
+  }
+  .proposal.voted { opacity: 0.7; }
+  .proposal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .proposal-title { font-weight: 500; }
+  .proposal-meta { color: var(--muted); font-size: 0.8rem; }
+  .proposal-bar {
+    height: 6px;
+    background: var(--border);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 0.5rem 0;
+    display: flex;
+  }
+  .proposal-bar .yes { background: var(--accent); height: 100%; }
+  .proposal-bar .no { background: var(--error); height: 100%; }
+  .proposal-counts { color: var(--muted); font-size: 0.8rem; display: flex; gap: 1rem; flex-wrap: wrap; }
+  .proposal-counts .yes { color: var(--accent); }
+  .proposal-counts .no { color: var(--error); }
+  .proposal-actions { display: flex; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap; }
   .msg .poll-options-list {
     display: flex;
     flex-direction: column;
@@ -375,13 +423,16 @@
     inset: 0;
     background: rgba(0, 0, 0, 0.45);
     z-index: 50;
-    display: none;
+    display: flex;
     align-items: flex-start;
     justify-content: center;
     padding: 4rem 1rem 1rem;
     overflow-y: auto;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.16s ease;
   }
-  .modal-backdrop.open { display: flex; }
+  .modal-backdrop.open { opacity: 1; pointer-events: auto; }
   .modal {
     background: var(--bg);
     border: 1px solid var(--border-strong);
@@ -390,7 +441,10 @@
     max-width: 540px;
     padding: 1.2rem 1.3rem;
     box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+    transform: translateY(-8px);
+    transition: transform 0.16s ease;
   }
+  .modal-backdrop.open .modal { transform: translateY(0); }
   .modal h2 { margin: 0 0 0.6rem; font-size: 1.1rem; }
   .modal .close-row {
     display: flex;
@@ -493,6 +547,11 @@
     <button id="new-activity-btn">↑ new on chain — refresh</button>
   </div>
 
+  <div class="filter-chip" id="filter-chip">
+    <span>Showing <strong id="filter-chip-name"></strong></span>
+    <button id="filter-chip-clear" title="Clear filter">✕</button>
+  </div>
+
   <div id="feed-list"></div>
   <div id="feed-empty" class="empty" style="display:none;">No messages yet.</div>
 </section>
@@ -512,6 +571,7 @@
     <div class="form-grid">
       <label>Recipient
         <input id="xfer-to" type="text" placeholder="mc1… (preferred) or 64-char entity_id">
+        <div id="xfer-to-status" class="hint" style="margin-top: 0.25rem; min-height: 1.1em;"></div>
       </label>
       <div class="row-2col">
         <label>Amount<input id="xfer-amount" type="number" min="1"></label>
@@ -546,6 +606,11 @@
 
 <!-- ======================================================= Governance -->
 <section class="tab-panel" id="tab-governance">
+  <div class="panel">
+    <h2>Open proposals</h2>
+    <div id="proposals-list" class="hint">loading…</div>
+  </div>
+
   <div class="panel">
     <h2>New proposal</h2>
     <div class="form-grid">
@@ -694,7 +759,11 @@ function toast(msg, kind) {
   t.textContent = msg;
   t.style.display = "block";
   if (_toastTimer) clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => { t.style.display = "none"; }, 4500);
+  // Errors stay longer -- user typically needs to read the rejection
+  // reason and decide whether to retry.  Success toasts dismiss
+  // quickly so they don't pile up during fast browsing.
+  const ms = kind === "err" ? 8000 : 4000;
+  _toastTimer = setTimeout(() => { t.style.display = "none"; }, ms);
 }
 async function copyToClipboard(text) {
   try {
@@ -720,6 +789,7 @@ function switchTab(name) {
   if (name === "wallet") refreshWallet();
   if (name === "node") refreshNode();
   if (name === "identity") refreshIdentity();
+  if (name === "governance") refreshProposals();
 }
 
 // =========================================================== "you" header
@@ -826,7 +896,12 @@ composerText.addEventListener("keydown", e => {
 });
 
 composerPollToggle.addEventListener("change", () => {
-  composer.classList.toggle("poll-mode", composerPollToggle.checked);
+  const on = composerPollToggle.checked;
+  composer.classList.toggle("poll-mode", on);
+  composerText.placeholder = on
+    ? "What's the question?  (Cmd/Ctrl+Enter to open the poll)"
+    : "What's on your mind?  (Cmd/Ctrl+Enter to post)";
+  composerPost.textContent = on ? "Open poll" : "Post";
 });
 
 composerCancelReply.addEventListener("click", () => {
@@ -897,6 +972,10 @@ let LAST_HEIGHT = 0;
 let LAST_TOP_HASH = null;
 let SUPPRESS_NEW_PILL_UNTIL = 0;
 let CURRENT_MESSAGES = [];
+// Active community filter, if any.  When set, the feed only renders
+// cards whose community_id matches.  Persisted into the URL hash so
+// reloads / shared links keep the filter.
+let CURRENT_COMMUNITY = null;
 
 const newActivity = $("new-activity");
 $("new-activity-btn").addEventListener("click", () => {
@@ -904,37 +983,76 @@ $("new-activity-btn").addEventListener("click", () => {
   refreshFeed();
 });
 
+const filterChip = $("filter-chip");
+const filterChipName = $("filter-chip-name");
+$("filter-chip-clear").addEventListener("click", () => setCommunityFilter(null));
+
+function setCommunityFilter(name) {
+  CURRENT_COMMUNITY = (name && name.trim()) || null;
+  if (CURRENT_COMMUNITY) {
+    filterChipName.textContent = "/c/" + CURRENT_COMMUNITY;
+    filterChip.classList.add("show");
+  } else {
+    filterChip.classList.remove("show");
+  }
+  // Sync to URL hash so a refresh / shared link keeps the filter.
+  // Preserve any #tx-... permalink we might also have.
+  const hash = window.location.hash;
+  let txAnchor = "";
+  if (hash.startsWith("#tx-")) txAnchor = hash;
+  if (CURRENT_COMMUNITY) {
+    window.history.replaceState({}, "", "?c=" + encodeURIComponent(CURRENT_COMMUNITY) + txAnchor);
+  } else {
+    window.history.replaceState({}, "", window.location.pathname + txAnchor);
+  }
+  // Always switch to the Feed tab when filtering -- the chip lives there.
+  switchTab("feed");
+  refreshFeed();
+}
+
 async function refreshFeed() {
   const list = $("feed-list");
   const empty = $("feed-empty");
   try {
-    const r = await api("/v1/latest?limit=30");
+    // When a community filter is active, fetch a deeper window so the
+    // filter has more chance of matching.  100 is the validator-side
+    // get_messages cap; PUBLIC_FEED_MAX_LIMIT clamps higher requests
+    // anyway.
+    const limit = CURRENT_COMMUNITY ? 100 : 30;
+    const r = await api("/v1/latest?limit=" + limit);
     if (r.status !== 200) {
       list.innerHTML = "";
       empty.style.display = "block";
       empty.textContent = "Feed unavailable (" + r.status + ").";
       return;
     }
-    const msgs = r.data.messages || [];
-    CURRENT_MESSAGES = msgs;
+    const allMsgs = r.data.messages || [];
+    CURRENT_MESSAGES = allMsgs;
     LAST_HEIGHT = r.data.height || LAST_HEIGHT;
-    LAST_TOP_HASH = msgs.length ? msgs[0].tx_hash : null;
+    LAST_TOP_HASH = allMsgs.length ? allMsgs[0].tx_hash : null;
+    const msgs = CURRENT_COMMUNITY
+      ? allMsgs.filter(m => m.community_id === CURRENT_COMMUNITY)
+      : allMsgs;
     if (msgs.length === 0) {
       list.innerHTML = "";
       empty.style.display = "block";
-      empty.textContent = "No messages on chain yet.";
+      empty.textContent = CURRENT_COMMUNITY
+        ? "No messages in /c/" + CURRENT_COMMUNITY + " in the last " + limit + " on chain."
+        : "No messages on chain yet.";
       return;
     }
     empty.style.display = "none";
     list.innerHTML = "";
-    msgs.forEach(m => list.appendChild(renderMessageCard(m, msgs)));
+    // Always render against the FULL window so vote-on-poll cross-
+    // references resolve even if the poll itself is filtered out.
+    msgs.forEach(m => list.appendChild(renderMessageCard(m, allMsgs)));
     // Honor URL-hash deep link if any.
     if (window.location.hash.startsWith("#tx-")) {
       const t = document.querySelector(window.location.hash);
       if (t) {
         t.scrollIntoView({ behavior: "smooth", block: "center" });
         t.classList.add("flash");
-        setTimeout(() => t.classList.remove("flash"), 1200);
+        setTimeout(() => t.classList.remove("flash"), 3000);
       }
     }
   } catch (_) {
@@ -969,7 +1087,7 @@ function forceFeedRefresh(myNewTxHash) {
       const el = document.getElementById("tx-" + myNewTxHash);
       if (el) {
         el.classList.add("flash");
-        setTimeout(() => el.classList.remove("flash"), 1500);
+        setTimeout(() => el.classList.remove("flash"), 3000);
       }
     }
   });
@@ -1090,12 +1208,21 @@ function renderMessageCard(m, allMsgs) {
     card.appendChild(list);
   }
 
-  // ------ community tag
+  // ------ community tag (clickable -> filter feed)
   if (m.community_id) {
-    const tag = document.createElement("div");
+    const tag = document.createElement("a");
     tag.className = "community";
     tag.textContent = "/c/" + m.community_id;
-    card.appendChild(tag);
+    tag.href = "?c=" + encodeURIComponent(m.community_id);
+    tag.title = "Filter feed to /c/" + m.community_id;
+    tag.addEventListener("click", e => {
+      e.preventDefault();
+      setCommunityFilter(m.community_id);
+    });
+    // Wrap in a div so the inline-block anchor doesn't grow full-width.
+    const wrap = document.createElement("div");
+    wrap.appendChild(tag);
+    card.appendChild(wrap);
   }
 
   // ------ actions row (reply / vote / counts)
@@ -1276,9 +1403,16 @@ async function react(targetHex, choice) {
 }
 
 async function votePoll(pollTx, idx, optText) {
-  if (!confirm("Vote “" + optText + "” on this poll?\n\nVotes are FINAL — the protocol does not allow you to change your vote later.")) {
-    return;
-  }
+  const ok = await confirmAction({
+    title: "Confirm vote",
+    body:
+      'Vote "' + optText + '" on this poll?\n\n' +
+      "Votes are FINAL on chain — the protocol has no in-protocol " +
+      "way to change your vote after submission.",
+    okLabel: "Vote",
+    okClass: "primary",
+  });
+  if (!ok) return;
   const msg = optText.slice(0, 64) || "vote";
   const fee = await liveFee(utf8Bytes(msg));
   const r = await apiPost("/wallet/send", {
@@ -1416,6 +1550,36 @@ $("modal-backdrop").addEventListener("click", e => {
 });
 window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
 
+// Custom confirm using the same modal slot.  Avoids the native
+// confirm() dialog which (a) is jarring against the dark UI, and
+// (b) hides behind the browser tab in some configurations.
+function confirmAction(opts) {
+  return new Promise(resolve => {
+    $("modal-title").textContent = opts.title || "Confirm";
+    const body = $("modal-body");
+    body.innerHTML = "";
+    const p = document.createElement("p");
+    p.style.whiteSpace = "pre-wrap";
+    p.textContent = opts.body || "";
+    body.appendChild(p);
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const cancel = document.createElement("button");
+    cancel.textContent = opts.cancelLabel || "Cancel";
+    const ok = document.createElement("button");
+    ok.textContent = opts.okLabel || "OK";
+    if (opts.okClass) ok.className = opts.okClass;
+    actions.appendChild(cancel);
+    actions.appendChild(ok);
+    body.appendChild(actions);
+    function done(v) { closeModal(); resolve(v); }
+    cancel.addEventListener("click", () => done(false));
+    ok.addEventListener("click", () => done(true));
+    showModal();
+    setTimeout(() => ok.focus(), 0);
+  });
+}
+
 // ============================================================ Wallet tab
 async function refreshWallet() {
   const me = await refreshMe();
@@ -1430,23 +1594,58 @@ async function refreshWallet() {
     (me.stake ? "  ·  staked: <strong>" + me.stake + "</strong>" : "");
   a.textContent = me.address || me.entity_id || "—";
   a.onclick = () => copyToClipboard(me.address || me.entity_id || "");
-  // Show first-spend warning if pubkey not yet on chain.
+  // First-spend pubkey auto-handling.  When pubkey isn't on chain
+  // yet, show the explanatory banner AND auto-tick the checkbox so
+  // the user doesn't need to know what it means -- their first
+  // outgoing transfer will register the pubkey by default.
   let warn = $("wallet-pubkey-warn");
+  const xferPk = $("xfer-pubkey");
   if (me.pubkey_registered === false) {
     if (!warn) {
       warn = document.createElement("div");
       warn.id = "wallet-pubkey-warn";
       warn.className = "pubkey-warn";
       warn.textContent =
-        "Heads up: your pubkey isn't on chain yet.  Tick the " +
-        "“First-spend” box on your first outgoing transfer so the " +
-        "chain installs it.";
+        "Heads up: your pubkey isn't on chain yet.  The " +
+        "“First-spend” box is auto-checked so your first outgoing " +
+        "transfer installs it.";
       $("tab-wallet").querySelector(".panel:nth-child(2)").prepend(warn);
     }
+    xferPk.checked = true;
   } else if (warn) {
     warn.remove();
+    xferPk.checked = false;
   }
 }
+
+// Live shape-only validation of the recipient field.  Real checksum
+// verification needs SHA3 (not in Web Crypto); the backend's
+// decode_address still catches a bad checksum before any leaf burns.
+function classifyRecipient(s) {
+  s = (s || "").trim();
+  if (!s) return { kind: "empty", msg: "" };
+  const lower = s.toLowerCase();
+  if (lower.startsWith("mc1")) {
+    if (lower.length === 75) {
+      return { kind: "ok", msg: "✓ checksummed address (server verifies)" };
+    }
+    return { kind: "warn", msg: "✗ mc1… address must be 75 chars (got " + lower.length + ")" };
+  }
+  if (/^[0-9a-f]{64}$/i.test(s)) {
+    return { kind: "ok", msg: "✓ 64-hex entity_id (no checksum protection — prefer mc1…)" };
+  }
+  if (/^[0-9a-f]+$/i.test(s)) {
+    return { kind: "warn", msg: "✗ entity_id must be exactly 64 hex chars (got " + s.length + ")" };
+  }
+  return { kind: "warn", msg: "✗ recipient must be an mc1… address or a 64-hex entity_id" };
+}
+$("xfer-to").addEventListener("input", () => {
+  const c = classifyRecipient($("xfer-to").value);
+  const el = $("xfer-to-status");
+  el.textContent = c.msg;
+  el.style.color = c.kind === "ok" ? "var(--accent)"
+    : c.kind === "warn" ? "var(--error)" : "var(--muted)";
+});
 
 $("xfer-submit").addEventListener("click", async () => {
   const to = $("xfer-to").value.trim();
@@ -1526,20 +1725,172 @@ $("prop-submit").addEventListener("click", async () => {
   }
 });
 
-async function castVote(approve) {
-  const pid = $("vote-pid").value.trim();
+async function castVote(approve, pidOverride) {
+  const pid = (pidOverride || $("vote-pid").value).trim();
   if (pid.length !== 64) { toast("Proposal id must be 64 hex chars", "err"); return; }
   const r = await apiPost("/wallet/vote-proposal", {
     proposal_id: pid, approve: approve,
   });
   if (r.status === 200) {
-    toast("Vote " + (approve ? "YES" : "NO") + " cast", "ok");
+    toast("Vote " + (approve ? "YES" : "NO") + " cast on " + shortHex(pid, 8, 6), "ok");
+    refreshProposals();
   } else {
     toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
 $("vote-yes").addEventListener("click", () => castVote(true));
 $("vote-no").addEventListener("click", () => castVote(false));
+
+// ---- Open proposals list ----
+async function refreshProposals() {
+  const el = $("proposals-list");
+  el.textContent = "loading…";
+  try {
+    const r = await api("/v1/proposals");
+    if (r.status !== 200 || !r.data || !r.data.ok) {
+      el.textContent = (r.data && r.data.error) || "Failed to load proposals.";
+      return;
+    }
+    const rows = (r.data.result && r.data.result.proposals) || [];
+    if (rows.length === 0) {
+      el.textContent = "No proposals on chain yet.";
+      return;
+    }
+    el.innerHTML = "";
+    rows.forEach(p => el.appendChild(renderProposal(p)));
+  } catch (_) {
+    el.textContent = "Validator unreachable.";
+  }
+}
+
+function renderProposal(p) {
+  const card = document.createElement("div");
+  card.className = "proposal" + (p.voted ? " voted" : "");
+
+  const head = document.createElement("div");
+  head.className = "proposal-head";
+  const title = document.createElement("div");
+  title.className = "proposal-title";
+  title.textContent = p.title || "(untitled)";
+  head.appendChild(title);
+
+  const right = document.createElement("div");
+  right.className = "proposal-meta";
+  const status = (p.status || "").toLowerCase();
+  const statusPill = document.createElement("span");
+  statusPill.className = "pill " + (status === "open" ? "ok"
+    : status === "passed" ? "ok"
+    : status === "rejected" ? "error"
+    : "");
+  statusPill.textContent = p.status;
+  right.appendChild(statusPill);
+  if (p.voted) {
+    const voted = document.createElement("span");
+    voted.className = "pill ok";
+    voted.style.marginLeft = "0.4rem";
+    voted.textContent = "✓ voted";
+    right.appendChild(voted);
+  }
+  head.appendChild(right);
+  card.appendChild(head);
+
+  const meta = document.createElement("div");
+  meta.className = "proposal-meta";
+  meta.textContent =
+    "id " + shortHex(p.proposal_id, 10, 6) +
+    "  ·  block " + p.created_at_block +
+    "  ·  " + (p.blocks_remaining > 0
+      ? p.blocks_remaining + " blocks remaining"
+      : "voting closed");
+  card.appendChild(meta);
+
+  // Tally bar -- yes vs no.  Width is share of CAST weight (excludes
+  // silent electorate so a 0/0 proposal shows an empty bar).
+  const yes = p.yes_weight || 0;
+  const no = p.no_weight || 0;
+  const cast = yes + no;
+  const yesPct = cast > 0 ? Math.round((yes / cast) * 100) : 0;
+  const noPct = cast > 0 ? 100 - yesPct : 0;
+  const bar = document.createElement("div");
+  bar.className = "proposal-bar";
+  if (cast > 0) {
+    const yesBar = document.createElement("div");
+    yesBar.className = "yes";
+    yesBar.style.width = yesPct + "%";
+    const noBar = document.createElement("div");
+    noBar.className = "no";
+    noBar.style.width = noPct + "%";
+    bar.appendChild(yesBar);
+    bar.appendChild(noBar);
+  }
+  card.appendChild(bar);
+
+  const counts = document.createElement("div");
+  counts.className = "proposal-counts";
+  const yesS = document.createElement("span");
+  yesS.className = "yes";
+  yesS.textContent = "▲ YES " + yes + (cast > 0 ? " (" + yesPct + "%)" : "");
+  const noS = document.createElement("span");
+  noS.className = "no";
+  noS.textContent = "▼ NO " + no + (cast > 0 ? " (" + noPct + "%)" : "");
+  const ct = document.createElement("span");
+  ct.textContent = (p.vote_count || 0) + " voters  ·  " +
+    (p.total_eligible || 0) + " eligible weight";
+  counts.appendChild(yesS);
+  counts.appendChild(noS);
+  counts.appendChild(ct);
+  card.appendChild(counts);
+
+  // Inline vote buttons.  Hidden for read-only mode, voting-closed
+  // status, and proposals the loaded entity has already voted on.
+  if (YOU && YOU.mode !== "read-only" && status === "open" && !p.voted) {
+    const actions = document.createElement("div");
+    actions.className = "proposal-actions";
+    const yBtn = document.createElement("button");
+    yBtn.className = "primary";
+    yBtn.textContent = "Vote YES";
+    yBtn.addEventListener("click", async () => {
+      const ok = await confirmAction({
+        title: "Confirm YES vote",
+        body: 'Vote YES on:\n\n"' + (p.title || "(untitled)") +
+          '"\n\nVotes are FINAL on chain.',
+        okLabel: "Vote YES",
+        okClass: "primary",
+      });
+      if (ok) castVote(true, p.proposal_id);
+    });
+    const nBtn = document.createElement("button");
+    nBtn.textContent = "Vote NO";
+    nBtn.addEventListener("click", async () => {
+      const ok = await confirmAction({
+        title: "Confirm NO vote",
+        body: 'Vote NO on:\n\n"' + (p.title || "(untitled)") +
+          '"\n\nVotes are FINAL on chain.',
+        okLabel: "Vote NO",
+      });
+      if (ok) castVote(false, p.proposal_id);
+    });
+    const idBtn = document.createElement("button");
+    idBtn.className = "ghost";
+    idBtn.textContent = "Copy id";
+    idBtn.addEventListener("click", () => copyToClipboard(p.proposal_id));
+    actions.appendChild(yBtn);
+    actions.appendChild(nBtn);
+    actions.appendChild(idBtn);
+    card.appendChild(actions);
+  } else {
+    // Even when no vote actions, expose copy-id for power users.
+    const actions = document.createElement("div");
+    actions.className = "proposal-actions";
+    const idBtn = document.createElement("button");
+    idBtn.className = "ghost";
+    idBtn.textContent = "Copy id";
+    idBtn.addEventListener("click", () => copyToClipboard(p.proposal_id));
+    actions.appendChild(idBtn);
+    card.appendChild(actions);
+  }
+  return card;
+}
 
 // ============================================================ Identity tab
 async function refreshIdentity() {
@@ -1609,6 +1960,15 @@ async function refreshNode() {
   if (!t) {
     toast("No session token in URL.  Restart with `messagechain ui`.", "err");
     return;
+  }
+  // Restore community filter from URL (?c=handle) if present.  Done
+  // BEFORE the first refreshFeed so we don't render-then-replace.
+  const params = new URLSearchParams(window.location.search);
+  const cFilter = params.get("c");
+  if (cFilter) {
+    CURRENT_COMMUNITY = cFilter;
+    filterChipName.textContent = "/c/" + cFilter;
+    filterChip.classList.add("show");
   }
   await Promise.all([refreshMe(), refreshChainStatus()]);
   await refreshFeed();

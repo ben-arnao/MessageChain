@@ -934,6 +934,86 @@ class TestWalletReact(_WalletServerTestBase, _RealEntityMixin):
         self.assertEqual(status, 400)
 
 
+class TestV1Proposals(_WalletServerTestBase):
+    def _proposal_row(self, pid_hex, title, voted=None):
+        row = {
+            "proposal_id": pid_hex,
+            "proposer_id": "ab" * 32,
+            "title": title,
+            "created_at_block": 100,
+            "blocks_remaining": 50,
+            "status": "open",
+            "yes_weight": 200,
+            "no_weight": 100,
+            "total_participating": 300,
+            "total_eligible": 1000,
+            "vote_count": 3,
+        }
+        if voted is not None:
+            row["voted"] = voted
+        return row
+
+    def test_returns_proposal_list_in_read_only_mode(self):
+        # No entity loaded -- voter_id is omitted, so rows have no
+        # ``voted`` field.  UI renders them with no voted-state pill.
+        captured = {}
+        def _rpc(method, params):
+            if method == "list_proposals":
+                captured["params"] = params
+                return {"ok": True, "result": {
+                    "proposals": [self._proposal_row("11" * 32, "P1")],
+                    "truncated": False, "total": 1,
+                }}
+            raise NotImplementedError(method)
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/proposals", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertNotIn("voter_id", captured["params"])
+        self.assertEqual(data["result"]["proposals"][0]["title"], "P1")
+
+    def test_auto_fills_voter_id_from_loaded_entity(self):
+        # When an entity is loaded, voter_id is filled in so the chain
+        # returns ``voted`` per row -- UI uses this to dim already-voted
+        # proposals.
+        eid_hex = "cd" * 32
+        fake_entity = SimpleNamespace(
+            entity_id_hex=eid_hex, entity_id=bytes.fromhex(eid_hex),
+            keypair=SimpleNamespace(num_leaves=16, _next_leaf=0),
+        )
+        captured = {}
+        def _rpc(method, params):
+            if method == "list_proposals":
+                captured["params"] = params
+                return {"ok": True, "result": {
+                    "proposals": [
+                        self._proposal_row("22" * 32, "P-yes", voted=True),
+                        self._proposal_row("33" * 32, "P-no", voted=False),
+                    ],
+                    "truncated": False, "total": 2,
+                }}
+            raise NotImplementedError(method)
+        srv, port = self._spin_up(entity=fake_entity, rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/v1/proposals", headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(captured["params"]["voter_id"], eid_hex)
+        rows = json.loads(body)["result"]["proposals"]
+        self.assertTrue(rows[0]["voted"])
+        self.assertFalse(rows[1]["voted"])
+
+    def test_token_required(self):
+        srv, port = self._spin_up()
+        status, _, _ = self._request(port, "GET", "/v1/proposals")
+        self.assertEqual(status, 401)
+
+
 class TestWalletPropose(_WalletServerTestBase, _RealEntityMixin):
     def test_signs_and_submits_proposal(self):
         captured = {}
@@ -1102,6 +1182,15 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             "votePoll",
             "vote_target",
             "poll_options",
+            # Iteration 3 affordances.
+            'id="filter-chip"',
+            'id="proposals-list"',
+            'id="xfer-to-status"',
+            "/v1/proposals",
+            "confirmAction",
+            "setCommunityFilter",
+            "classifyRecipient",
+            "renderProposal",
         ]:
             self.assertIn(
                 needle, body_text,

@@ -337,6 +337,13 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/tx_status":
             self._serve_v1_tx_status(split.query)
             return
+        if path == "/v1/proposals":
+            # List open + recent governance proposals.  When an entity
+            # is loaded, auto-fills voter_id so the response includes
+            # a per-proposal ``voted`` flag that the UI uses to dim
+            # already-voted entries.
+            self._serve_v1_proposals(split.query)
+            return
         if path == "/wallet/estimate-fee":
             self._serve_wallet_estimate_fee(split.query)
             return
@@ -986,6 +993,41 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(503, {"ok": False, **resp})
             return
         self._send_json(200 if resp.get("ok") else 404, resp)
+
+    def _serve_v1_proposals(self, query: str):
+        """GET /v1/proposals  --  proxy list_proposals.
+
+        When an entity is loaded, ``voter_id`` is auto-filled with
+        the loaded entity_id so each row carries a ``voted`` flag
+        the UI uses to dim already-voted proposals."""
+        # Auto-fill voter_id from the loaded entity when available.
+        ctx = self.server._wallet_context
+        params: dict = {}
+        if ctx.entity is not None:
+            params["voter_id"] = ctx.entity.entity_id_hex
+        # Allow caller to override (e.g. inspecting another entity's
+        # voting record from the UI later).
+        qparams = parse_qs(query or "")
+        override = (qparams.get("voter_id") or [""])[0].strip().lower()
+        if override:
+            if len(override) != 64:
+                self._send_json(400, {
+                    "ok": False, "error": "voter_id must be 64 hex chars",
+                })
+                return
+            try:
+                bytes.fromhex(override)
+            except ValueError:
+                self._send_json(400, {
+                    "ok": False, "error": "voter_id must be valid hex",
+                })
+                return
+            params["voter_id"] = override
+        ok, resp = self._rpc("list_proposals", params)
+        if not ok:
+            self._send_json(503, {"ok": False, **resp})
+            return
+        self._send_json(200 if resp.get("ok") else 502, resp)
 
     def _serve_landing_page(self):
         # Fall back to an inline placeholder if the static file is
