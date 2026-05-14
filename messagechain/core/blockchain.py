@@ -190,12 +190,24 @@ def _canonicalize_authority_txs(authority_txs):
     return sorted(authority_txs, key=_priority)
 
 
-def compute_block_sig_cost(block) -> int:
+def compute_block_sig_cost(block, current_height: int | None = None) -> int:
     """Compute the total signature verification cost for a block.
 
     Each transaction sig, transfer sig, slash sig, proposer sig, and
     attestation sig costs 1 verification. This budget prevents DoS via
     blocks stuffed with expensive WOTS+ signature verifications.
+
+    ``current_height`` (audit r58 #3, Tier 81): when provided, gates
+    the accurate per-observation NRE cost recount.  Pre-fork the
+    legacy ``3 × n_nre_txs`` amortisation is preserved for replay
+    determinism (historical blocks computed their sig-cost under the
+    constant-per-tx rule; changing the calc retroactively would
+    re-classify already-validated blocks).  Post-Tier-81 each NRE tx
+    is counted as ``len(witness_observations) + 2`` (submitter +
+    client + per-observation) so the sig-CPU budget can't be evaded
+    by stuffing one tx with many observations.  Defaulting to None
+    preserves pre-r58 behaviour for any caller that doesn't yet
+    plumb the chain height through.
     """
     # Each authority tx costs one sig verification except
     # ReleaseAnnounceTransaction, which carries a threshold multi-sig
@@ -209,6 +221,24 @@ def compute_block_sig_cost(block) -> int:
             authority_sig_cost += len(getattr(atx, "signatures", []) or [])
         else:
             authority_sig_cost += 1
+
+    # Tier 81 (audit r58 #3): NRE cost is observation-accurate post-
+    # fork so a 10 000-obs bomb can't slip through the legacy
+    # constant-per-tx amortisation.
+    from messagechain.config import NRE_QUORUM_LIST_CAPS_HEIGHT as _T81_H
+    nre_txs = getattr(block, "non_response_evidence_txs", []) or []
+    if current_height is not None and int(current_height) >= _T81_H:
+        nre_sig_cost = sum(
+            len(getattr(tx, "witness_observations", []) or []) + 2
+            for tx in nre_txs
+        )
+    else:
+        # Legacy: per-tx constant amortisation (submitter + client +
+        # amortised witnesses ≈ 3, tracking the audited verification
+        # cost within ~2× of the actual quorum-bounded count when
+        # observations <= WITNESS_QUORUM, which is the only case the
+        # pre-r58 chain admitted in practice).
+        nre_sig_cost = 3 * len(nre_txs)
 
     return (
         len(block.transactions)
@@ -227,16 +257,7 @@ def compute_block_sig_cost(block) -> int:
         # Each bogus-rejection-evidence tx carries one submitter
         # signature + one rejection signature — cost both.
         + 2 * len(getattr(block, "bogus_rejection_evidence_txs", []))
-        # Each non-response-evidence tx carries one submitter signature
-        # + one client signature on the embedded SubmissionRequest +
-        # WITNESS_QUORUM witness signatures.  Bound the per-tx cost at
-        # a small constant (the witness loop is bounded by quorum which
-        # is itself a small constant) so a same-block flood of NRE txs
-        # doesn't blow the per-block sig budget out of proportion.  We
-        # use 3 here (submitter + client + amortised witnesses) which
-        # tracks the audited verification cost a constant within ~2× of
-        # the actual quorum-bounded count.
-        + 3 * len(getattr(block, "non_response_evidence_txs", []))
+        + nre_sig_cost
         # Each inclusion-list violation evidence tx carries ONE
         # submitter signature.  The bundled InclusionList carries
         # variable-many attester report sigs, but those are amortised
@@ -8875,6 +8896,14 @@ class Blockchain:
         Custody proofs are already capped via ARCHIVE_PROOFS_PER_CHALLENGE
         in _validate_custody_proofs and are not re-checked here.
         Finality votes are capped in _validate_finality_votes.
+
+        Tier 81 (audit r58 #3, post-fork): adds per-block caps on
+        ``non_response_evidence_txs``, per-NRE ``witness_observations``,
+        and ``inclusion_list.quorum_attestation`` -- three list shapes
+        that pre-fork bypassed every existing cap and let a crafted
+        block burn unbounded WOTS+ verifies plus pin unbounded padding
+        forever on the chain.  Pre-fork these checks are skipped for
+        replay determinism.
         """
         from messagechain.config import (
             MAX_ATTESTATIONS_PER_BLOCK,
@@ -8882,6 +8911,10 @@ class Blockchain:
             MAX_GOVERNANCE_TXS_PER_BLOCK,
             MAX_AUTHORITY_TXS_PER_BLOCK,
             MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK,
+            MAX_NON_RESPONSE_EVIDENCE_TXS_PER_BLOCK,
+            MAX_OBSERVATIONS_PER_NRE_TX,
+            MAX_QUORUM_ATTESTATION_REPORTS,
+            NRE_QUORUM_LIST_CAPS_HEIGHT,
         )
         checks = (
             ("attestations", getattr(block, "attestations", []),
@@ -8902,6 +8935,41 @@ class Blockchain:
                 return False, (
                     f"Too many {name}: {len(lst)} > {cap}"
                 )
+
+        # Tier 81 (audit r58 #3) post-fork list caps -- additive over
+        # the legacy caps above, so pre-fork blocks replay byte-
+        # identically.
+        block_number = getattr(
+            getattr(block, "header", None), "block_number", None,
+        )
+        if (
+            block_number is not None
+            and int(block_number) >= NRE_QUORUM_LIST_CAPS_HEIGHT
+        ):
+            nre_txs = getattr(block, "non_response_evidence_txs", []) or []
+            if len(nre_txs) > MAX_NON_RESPONSE_EVIDENCE_TXS_PER_BLOCK:
+                return False, (
+                    f"Too many non_response_evidence_txs: "
+                    f"{len(nre_txs)} > "
+                    f"{MAX_NON_RESPONSE_EVIDENCE_TXS_PER_BLOCK}"
+                )
+            for tx in nre_txs:
+                obs = getattr(tx, "witness_observations", []) or []
+                if len(obs) > MAX_OBSERVATIONS_PER_NRE_TX:
+                    return False, (
+                        f"Too many witness_observations in NRE tx: "
+                        f"{len(obs)} > {MAX_OBSERVATIONS_PER_NRE_TX}"
+                    )
+            il = getattr(block, "inclusion_list", None)
+            if il is not None:
+                qa = getattr(il, "quorum_attestation", []) or []
+                if len(qa) > MAX_QUORUM_ATTESTATION_REPORTS:
+                    return False, (
+                        f"Too many inclusion_list.quorum_attestation "
+                        f"reports: {len(qa)} > "
+                        f"{MAX_QUORUM_ATTESTATION_REPORTS}"
+                    )
+
         return True, "OK"
 
     def _validate_authority_tx_sizes(self, authority_txs) -> tuple[bool, str]:
@@ -10555,7 +10623,7 @@ class Blockchain:
         # Check total signature verification cost (sigops-style limit)
         # Counts all tx sigs + proposer sig + attestation sigs + slash sigs
         import messagechain.config
-        sig_cost = compute_block_sig_cost(block)
+        sig_cost = compute_block_sig_cost(block, current_height=getattr(getattr(block, "header", None), "block_number", None))
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds MAX_BLOCK_SIG_COST {messagechain.config.MAX_BLOCK_SIG_COST}"
 
@@ -11369,6 +11437,7 @@ class Blockchain:
         from messagechain.config import (
             RETROACTIVE_EVIDENCE_STAKE_PIN_HEIGHT as _T78_H,
             MULTI_KEY_RE_VERIFY_HEIGHT as _T80_H,
+            NRE_QUORUM_LIST_CAPS_HEIGHT as _T81_H,
         )
         if int(block_number) >= _T78_H:
             pin_height = max(0, int(lst.publish_height) - 1)
@@ -11387,11 +11456,18 @@ class Blockchain:
         signer_resolver = (
             self._candidate_keys_for if int(block_number) >= _T80_H else None
         )
+        # Tier 81 (audit r58 #3): post-fork hard-reject stale out-of-
+        # window reports AND reports that share no tx_hash with any
+        # listed entry (pure padding -- no honest aggregator emits
+        # either).  Pre-fork the legacy silent-skip is preserved for
+        # replay determinism.
+        strict_no_padding = int(block_number) >= _T81_H
         ok, reason = verify_inclusion_list_quorum(
             lst,
             stakes=stakes_for_quorum,
             public_keys=self.public_keys,
             signer_resolver=signer_resolver,
+            strict_no_padding=strict_no_padding,
         )
         if not ok:
             return False, f"inclusion list quorum invalid: {reason}"
@@ -11964,7 +12040,7 @@ class Blockchain:
 
         # Sig cost budget
         import messagechain.config
-        sig_cost = compute_block_sig_cost(block)
+        sig_cost = compute_block_sig_cost(block, current_height=getattr(getattr(block, "header", None), "block_number", None))
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Block sig cost {sig_cost} exceeds limit"
 
@@ -15483,7 +15559,7 @@ class Blockchain:
         # Orphan block — parent unknown. Pre-validate structure before storing
         # to prevent attackers from filling the pool with garbage blocks.
         import messagechain.config
-        sig_cost = compute_block_sig_cost(block)
+        sig_cost = compute_block_sig_cost(block, current_height=getattr(getattr(block, "header", None), "block_number", None))
         if sig_cost > messagechain.config.MAX_BLOCK_SIG_COST:
             return False, f"Orphan rejected — sig cost {sig_cost} exceeds limit"
         # Audit r37 #1: mirror the Tier-18 cross-kind tx-count + unified-

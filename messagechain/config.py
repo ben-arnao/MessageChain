@@ -7722,6 +7722,81 @@ assert MULTI_KEY_RE_VERIFY_HEIGHT > SLASHABLE_BASIS_AT_ADMISSION_HEIGHT, (
 )
 
 
+# ─── Tier 81 — per-block list caps + sig-cost recount ────────────────
+#
+# Audit r58 #3 (security top-3).  Three pre-r58 holes in the per-block
+# byte/sig budget compose into a CPU-DoS + permanent-bloat surface that
+# any proposer can exploit at sub-floor cost:
+#
+#   * ``_validate_block_list_counts`` caps attestations / validator_
+#     signatures / governance / authority / censorship_evidence_txs --
+#     but NOT non_response_evidence_txs, the per-NRE ``witness_
+#     observations`` list length, or ``inclusion_list.quorum_attestation``
+#     bundle length.
+#   * ``compute_block_sig_cost`` amortises NRE at a constant ``3 ×
+#     n_txs`` regardless of observation count -- so a single NRE tx
+#     with 10 000 ``witness_observations`` is counted as cost 3 even
+#     though it forces 10 001 WOTS+ verifies.
+#   * ``verify_inclusion_list_quorum`` silently SKIPs reports outside
+#     the wait window or beyond quorum-already-reached -- the
+#     "adversarial proposer that pads gains nothing" reasoning ignores
+#     the chain-bloat axis (every padded report is pinned forever on a
+#     chain whose headline promise is "your message can never be
+#     deleted") AND the sig-CPU axis (the verifier walked them).
+#
+# CLAUDE.md anchors at risk:
+#   * High-Priority Concern: "Running a full node must stay accessible
+#     for centuries" -- a single crafted block that burns minutes of
+#     WOTS+ verification on every node breaks this for hobbyist
+#     hardware.
+#   * Principle #2 (Permanence + censorship resistance) -- the chain-
+#     bloat lever is anchored as fees-only; padding via uncapped lists
+#     bypasses the fee market entirely.
+#
+# Tier 81 closes all three holes:
+#
+#   * Per-block caps: ``MAX_NON_RESPONSE_EVIDENCE_TXS_PER_BLOCK = 16``
+#     (peer of MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK), ``MAX_
+#     OBSERVATIONS_PER_NRE_TX = 32`` (~10x WITNESS_QUORUM = 3 -- ample
+#     room for a real-world validator set's redundancy while shutting
+#     down the 10 000-observation bomb), ``MAX_QUORUM_ATTESTATION_
+#     REPORTS = 200`` (peer of MAX_ATTESTATIONS_PER_BLOCK so the IL's
+#     attester-report bundle stays within the existing sig budget).
+#
+#   * ``compute_block_sig_cost`` post-fork counts observations
+#     explicitly (``len(witness_observations) + 2`` per NRE tx,
+#     submitter + client + observations) so the sig budget can't be
+#     evaded by stuffing one tx with many obs.
+#
+#   * ``verify_inclusion_list_quorum`` post-fork rejects stale
+#     out-of-window reports AND reports whose ``tx_hashes`` share
+#     NOTHING with the list's entries (no honest aggregator emits
+#     either; both are pure padding).
+#
+# All three are NEW VALIDATION RULES that reject blocks the pre-fork
+# chain would have accepted, so the change is hard-fork-gated.  Pre-
+# fork the legacy paths run unchanged for replay determinism.
+#
+# Activation height 24500 sits 2000 blocks above Tier 80 (22500),
+# matching the anchored ~13.9-day cohort spacing -- one operator
+# upgrade cycle per consensus-rule retune.
+MAX_OBSERVATIONS_PER_NRE_TX = 32
+MAX_NON_RESPONSE_EVIDENCE_TXS_PER_BLOCK = 16
+MAX_QUORUM_ATTESTATION_REPORTS = 200
+
+NRE_QUORUM_LIST_CAPS_HEIGHT = 24500  # Tier 81
+
+assert NRE_QUORUM_LIST_CAPS_HEIGHT > MULTI_KEY_RE_VERIFY_HEIGHT, (
+    "NRE_QUORUM_LIST_CAPS_HEIGHT (Tier 81) must strictly follow "
+    "MULTI_KEY_RE_VERIFY_HEIGHT (Tier 80) -- consecutive consensus-"
+    "rule retunes deserve their own cohort."
+)
+assert MAX_OBSERVATIONS_PER_NRE_TX >= WITNESS_QUORUM, (
+    "MAX_OBSERVATIONS_PER_NRE_TX must be >= WITNESS_QUORUM "
+    "(a legitimate NRE needs at least WITNESS_QUORUM observations)."
+)
+
+
 def validate_block_hex_size(block_data) -> bool:
     """Return True if block_data is a string within the size limit.
 

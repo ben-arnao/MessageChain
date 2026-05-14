@@ -522,6 +522,7 @@ def verify_inclusion_list_quorum(
     public_keys: dict[bytes, bytes],
     *,
     signer_resolver=None,
+    strict_no_padding: bool = False,
 ) -> tuple[bool, str]:
     """Verify the list's entries are each backed by >= 2/3 stake AND
     the witness bundle is well-formed.
@@ -553,6 +554,16 @@ def verify_inclusion_list_quorum(
     report fails the whole list -- byte-identical to historical
     replay.  ``Blockchain._validate_inclusion_list_quorum`` plugs in
     the resolver post-Tier-80, gated by block_number.
+
+    ``strict_no_padding`` (audit r58 #3, Tier 81): when True, reject
+    blocks whose ``quorum_attestation`` carries stale out-of-window
+    reports OR reports whose ``tx_hashes`` share nothing with the
+    list's entries (no honest aggregator emits either; both are pure
+    padding that pins permanent bloat).  When False, the legacy
+    silent-skip is preserved for replay determinism (pre-fork blocks
+    accepted padded bundles, which is byte-identically restored).
+    ``Blockchain._validate_inclusion_list_quorum`` flips this post-
+    Tier-81, gated by block_number.
     """
     ok, reason = validate_inclusion_list_version(lst.version)
     if not ok:
@@ -590,12 +601,35 @@ def verify_inclusion_list_quorum(
     tallies: dict[bytes, int] = {}
     first_seen_min: dict[bytes, int] = {}
     counted: dict[bytes, set[bytes]] = {}
+    # Pre-compute the entries' tx_hash set for the Tier 81 padding
+    # check below (no-op when ``strict_no_padding`` is False).
+    entry_hashes = {e.tx_hash for e in lst.entries}
     for r in lst.quorum_attestation:
         if r.report_height < min_ok_height or r.report_height > max_ok_height:
-            # Reports outside the window contribute nothing — skip but
-            # don't fail the whole list.  An adversarial proposer that
-            # pads the bundle with stale reports gains nothing.
+            # Reports outside the window contribute nothing.  Legacy
+            # path silently skips; Tier 81 ``strict_no_padding`` hard-
+            # rejects (no honest aggregator emits out-of-window
+            # reports -- the only source is a malicious proposer
+            # padding the bundle, and the bundle is pinned forever).
+            if strict_no_padding:
+                return False, (
+                    f"out-of-window report from "
+                    f"{r.reporter_id.hex()[:16]} at height "
+                    f"{r.report_height} (window "
+                    f"[{min_ok_height}, {max_ok_height}])"
+                )
             continue
+        # Tier 81: a report whose tx_hashes share nothing with any
+        # listed entry contributes nothing to any tally -- pure
+        # padding.  Honest aggregators emit reports because they
+        # support a listed entry; an empty intersection is the
+        # bloat-bombing shape.
+        if strict_no_padding and entry_hashes:
+            if not any(h in entry_hashes for h in r.tx_hashes):
+                return False, (
+                    f"padding report from {r.reporter_id.hex()[:16]} "
+                    f"shares no tx_hash with any listed entry"
+                )
         stake = stakes.get(r.reporter_id, 0)
         if stake <= 0:
             continue  # unknown / unstaked reporter contributes nothing
