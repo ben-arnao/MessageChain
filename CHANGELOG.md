@@ -4,7 +4,191 @@ All notable changes to MessageChain are recorded here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.85.0] — 2026-05-13
+## [1.86.0] — 2026-05-13
+
+Audit r58 top-3 ships alongside queued wallet-UI iterations 2–5 and
+the reputation-ratio reveal: two consensus-visible defense-rule
+retunes (new Tier 80 + Tier 81 hard forks, activation heights 22500
+and 24500) plus one soft wallet-UI hardening fix that closes a
+parallel-to-the-CLI auto-fee chokepoint gap.
+
+### Changed (Tier 80, consensus-breaking, height-gated)
+
+  * **Multi-key re-verify on slashing / inclusion paths via
+    ``Blockchain._candidate_keys_for`` (audit r58 #1 — security
+    top-1).**  CLAUDE.md anchors defended: "Collective censorship-
+    resistance", "Honest operators are insured", and "Crypto-agility".
+
+    Pre-r58 three slashing / inclusion re-verify paths read
+    ``public_keys.get(entity_id)`` (single CURRENT key) while the
+    existing ``_verify_signer_at_height`` multi-key chokepoint (audit
+    r50 #2) covered only Attestation + FinalityVote validation /
+    gossip:
+
+      * ``inclusion_list.verify_inclusion_list_quorum`` reporter sig
+        recheck on AttesterMempoolReports — rejected the WHOLE list
+        on a single bad sig, defeating the forced-inclusion-list
+        arm if any one reporter rotated within the
+        ``INCLUSION_LIST_WAIT_BLOCKS = 4``-block window.
+      * ``NonResponseEvidenceProcessor.process`` (and its proposer-
+        sim mirror in ``Blockchain._sim_apply_block``) witness
+        observation recheck — dropped a rotation-affected
+        observation, fell below ``WITNESS_QUORUM``, dismissed the
+        silent-TCP-drop slash.
+      * ``BogusRejectionProcessor.process`` embedded ``message_tx``
+        recheck — treated a rotation-affected tx as "honest
+        rejection," letting the lying validator escape slashing.
+
+    ``KEY_ROTATION_COOLDOWN_BLOCKS = 144`` made the timing trivial
+    for a colluding entity: 4-block window for InclusionList,
+    64-block window for NRE, full evidence-TTL window for
+    BogusRejection.
+
+    Tier 80 routes all three sites through the existing multi-key
+    candidate set via a new ``Blockchain._candidate_keys_for(
+    entity_id)`` chokepoint:
+
+      * pre-fork: legacy single-current-key behaviour — byte-
+        identical to historical replay.
+      * post-fork: try every key the entity ever held + the current
+        key, accept if ANY matches; on InclusionList, a report
+        whose sig fails ALL candidates is DROPPED fail-soft (same
+        shape as the existing unknown-reporter / stale-window
+        skips) rather than failing the whole list.
+
+    Abstraction-over-symptom fix.  Adding a new signed-re-verify
+    site that builds its own candidate set instead of routing
+    through ``_candidate_keys_for`` reintroduces the same defect
+    class by definition.
+
+    Activation height ``MULTI_KEY_RE_VERIFY_HEIGHT = 22500`` sits
+    2000 blocks above Tier 79 (20500), matching the Tier 70 → 71
+    → 73 → 74 → 75 → 76 → 77 → 78 → 79 ~13.9-day cohort spacing
+    — one operator upgrade cycle per consensus-rule retune.  Pure
+    consensus-rule swap; no new wire format, no new tx kinds, no
+    state-tree changes. (ed6f080)
+
+### Changed (Tier 81, consensus-breaking, height-gated)
+
+  * **Per-block list caps + NRE sig-cost recount + IL strict-no-
+    padding (audit r58 #3 — security top-3).**  CLAUDE.md anchors
+    defended: High-Priority Concern "Running a full node must stay
+    accessible for centuries" + Principle #2 (Permanence + chain-
+    bloat discipline is fees-only).
+
+    Pre-r58 three holes in the per-block byte / sig budget composed
+    into a CPU-DoS + permanent-bloat surface any proposer could
+    exploit at sub-floor cost:
+
+      * ``_validate_block_list_counts`` capped attestations /
+        validator_signatures / governance / authority /
+        censorship_evidence_txs — but NOT
+        non_response_evidence_txs, per-NRE ``witness_observations``
+        list length, or ``inclusion_list.quorum_attestation``
+        bundle length.
+      * ``compute_block_sig_cost`` amortised NRE at a constant
+        ``3 × n_txs`` regardless of observation count — a single
+        NRE tx with 10 000 observations counted as cost 3 even
+        though it forced 10 001 WOTS+ verifies.
+      * ``verify_inclusion_list_quorum`` silently SKIPped reports
+        outside the wait window or whose ``tx_hashes`` shared
+        nothing with any listed entry — every padded report
+        pinned forever on a chain whose headline promise is "your
+        message can never be deleted".
+
+    Tier 81 closes all three holes:
+
+      * New per-block caps: ``MAX_OBSERVATIONS_PER_NRE_TX = 32``
+        (~10× WITNESS_QUORUM = 3), ``MAX_NON_RESPONSE_EVIDENCE_
+        TXS_PER_BLOCK = 16`` (peer of
+        MAX_CENSORSHIP_EVIDENCE_TXS_PER_BLOCK), ``MAX_QUORUM_
+        ATTESTATION_REPORTS = 200`` (peer of
+        MAX_ATTESTATIONS_PER_BLOCK so the IL bundle stays within
+        the existing sig budget).
+      * ``compute_block_sig_cost(block, current_height=…)`` gains
+        an optional height kwarg.  Post-fork each NRE tx is
+        counted as ``len(witness_observations) + 2`` (submitter +
+        client + per-observation) so the sig-CPU budget can't be
+        evaded by stuffing one tx with many observations.  Three
+        call sites in blockchain.py updated to pass
+        ``block.header.block_number``.
+      * ``verify_inclusion_list_quorum(..., strict_no_padding=
+        True)`` post-fork hard-rejects stale out-of-window reports
+        AND reports whose ``tx_hashes`` share nothing with any
+        listed entry (pure padding — no honest aggregator emits
+        either).
+
+    All three are NEW VALIDATION RULES that reject blocks the pre-
+    fork chain would have accepted, so the change is hard-fork-
+    gated.  Pre-fork the legacy paths run unchanged for replay
+    determinism.
+
+    Activation height ``NRE_QUORUM_LIST_CAPS_HEIGHT = 24500`` sits
+    2000 blocks above Tier 80 (22500), matching the anchored
+    ~13.9-day cohort spacing. (1d870ac)
+
+### Fixed
+
+  * **Wallet-UI auto-fee path routes through unified per-kind RPC
+    (audit r58 #2 — UX / value-prop / economics top-1).**  CLAUDE.md
+    anchors defended: "every auto-fee path shifts with the fee
+    model" + token-as-tradable-asset mainstream-asset quality bar
+    + Principle #3 (Simplicity).
+
+    Pre-r58 wallet-UI auto-fee was byte-count-only against the
+    legacy ``get_fee_estimate`` mempool helper, silently underbidding
+    any non-message tx when ``base_fee > 1`` AND any transfer to a
+    brand-new recipient (missed ``NEW_ACCOUNT_FEE = 1000`` surcharge
+    by ~1099 tokens).  Audit r57 #1 closed this exact chokepoint on
+    the CLI side; the parallel wallet-UI path was never lifted — so
+    every wallet-UI react / vote / governance / poll tx admitted at
+    the relay floor and got rejected at ``pay_fee_with_burn`` apply
+    time, vanishing with no on-chain trace.
+
+    Abstraction-over-symptom fix.  Single chokepoint widening:
+
+      * ``op_estimate_fee`` gains ``tx_type`` / ``payload_bytes`` /
+        ``recipient_id`` / ``urgency`` kwargs and routes through
+        the unified ``estimate_fee`` RPC (the same chokepoint
+        ``estimate-fee --tx-type`` lifts onto post-r57 #1).
+      * ``LocalWalletServer._serve_wallet_estimate_fee`` parses
+        the new query params and threads them through.
+      * JS ``liveFee()`` accepts both legacy ``liveFee(bytes)``
+        and per-kind ``liveFee(kind, opts)`` shapes; reads
+        ``recommended_fee`` from the unified RPC.
+      * Hardcoded ``value="100"`` on transfer / stake / unstake
+        fee inputs replaced with ``placeholder="auto"``; blank
+        field at submit time → ``liveFee(kind, opts)``.  React /
+        reactUser / propose lifted onto per-kind ``liveFee`` too.
+
+    Adding a new tx kind to the wallet UI's signing surface now
+    inherits the unified auto-fee discipline by construction.
+    Soft fix: no consensus rule change, no wire-format change,
+    no fork. (4a41961)
+
+### Added (wallet UI iterations 2–5)
+
+  * **Wallet UI iteration 2 — Reddit/Twitter-style polish** (ab96813).
+  * **Wallet UI iteration 3 — governance list, community filter
+    chips with URL persistence, live address validation, first-spend
+    pubkey notice, poll-mode placeholder / label** (b8fa9fe).
+  * **Wallet UI iteration 4 — bug fixes + discoverability** (draft
+    auto-save, inline-reply preservation, "you" pill profile / copy-
+    address, tab persisted in URL hash, pill tooltips, 'n' keybind
+    to Feed composer) (9abc83c).
+  * **Wallet UI iteration 5 — bug pass on buttons that didn't do
+    what they should** (read-only mode hides write surfaces, first-
+    spend checkbox respects manual toggles, live-validation chip
+    stays in sync after 💸 tip prefill, vote-on-proposal clears
+    stale id after success) (51462d7).
+
+### Added (UX / reputation)
+
+  * **Click the simple up/down ratio to reveal four weighted
+    ratios** (548aa89) — surfaces the full reputation-graph
+    weighting that previously lived only in the underlying state.
+
+
 
 Audit r57 top-3 ships: one consensus-visible defense-rule retune that
 closes the censor-then-unstake admission-basis evasion (new Tier 79
