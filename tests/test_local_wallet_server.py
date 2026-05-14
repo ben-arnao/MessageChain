@@ -759,6 +759,53 @@ class _RealEntityMixin:
 
 
 class TestWalletTransfer(_WalletServerTestBase, _RealEntityMixin):
+    def test_accepts_mc1_address_form(self):
+        # The UI now passes the mc1...-checksummed address as
+        # recipient_id; the server must decode it via decode_address
+        # before handing op_transfer the raw 32-byte recipient.
+        from messagechain.identity.address import encode_address
+        recipient_bytes = bytes(range(32, 64))
+        recipient_addr = encode_address(recipient_bytes)
+        captured = {}
+        def _rpc(method, params):
+            if method == "get_nonce":
+                return {"ok": True, "result": {"nonce": 0, "leaf_watermark": 0}}
+            if method == "reserve_leaf":
+                return {"ok": False, "error": "n/a"}
+            if method == "get_chain_info":
+                return {"ok": True, "result": {"height": 0}}
+            if method == "submit_transfer":
+                from messagechain.core.transfer import TransferTransaction
+                tx = TransferTransaction.deserialize(params["transaction"])
+                captured["tx"] = tx
+                return {"ok": True, "result": {"tx_hash": tx.tx_hash.hex()}}
+            raise NotImplementedError(method)
+
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, data = self._post(port, "/wallet/transfer", srv.token, {
+            "recipient_id": recipient_addr, "amount": 5, "fee": 100,
+        })
+        self.assertEqual(status, 200, msg=data)
+        self.assertEqual(captured["tx"].recipient_id, recipient_bytes)
+
+    def test_rejects_address_with_bad_checksum(self):
+        # A single-character typo in the checksum suffix should be
+        # rejected with a clear error -- never a 200, never a leaf burn.
+        from messagechain.identity.address import encode_address
+        good = encode_address(bytes(range(32, 64)))
+        # Flip the last character.
+        bad = good[:-1] + ("0" if good[-1] != "0" else "1")
+        def _rpc(method, params):
+            raise AssertionError("RPC must NOT be called for bad checksum")
+        entity = self._build_real_entity()
+        srv, port = self._spin_up(entity=entity, rpc_caller=_rpc)
+        status, data = self._post(port, "/wallet/transfer", srv.token, {
+            "recipient_id": bad, "amount": 1, "fee": 100,
+        })
+        self.assertEqual(status, 400, msg=data)
+        self.assertIn("checksum", data["error"].lower())
+
     def test_signs_and_submits_transfer(self):
         captured = {}
         def _rpc(method, params):
@@ -1044,6 +1091,17 @@ class TestWalletIndexHtml(_WalletServerTestBase):
             "/wallet/vote-proposal",
             "/v1/info",
             "/v1/latest",
+            "/v1/entity",
+            # Iteration 2 affordances.  Each is the entry point for a
+            # feature the JS depends on; removing it would silently
+            # break that flow.
+            'id="composer-poll-toggle"',
+            'id="modal-backdrop"',
+            'id="new-activity"',
+            "openProfileModal",
+            "votePoll",
+            "vote_target",
+            "poll_options",
         ]:
             self.assertIn(
                 needle, body_text,

@@ -542,7 +542,19 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         self._send_op_result(result)
 
     def _serve_wallet_transfer_post(self):
-        """POST /wallet/transfer  -- {recipient_id_hex, amount, fee, include_pubkey?}"""
+        """POST /wallet/transfer
+
+        Body:
+          { "recipient_id": "<mc1...checksummed-address>" | "<64-hex>",
+            "amount": int, "fee": int, "include_pubkey"?: bool }
+
+        Recipient accepts EITHER the user-facing checksummed
+        ``mc1<64hex><8hex>`` form (typo-resistant; what the UI shows
+        to the user) OR a raw 64-char hex entity_id (back-compat
+        for clients that already have one).  The decode helper
+        rejects bad checksums with a clear error -- a single
+        mistyped character in the address is caught BEFORE any leaf
+        burns, mirroring the CLI's transfer protection."""
         entity = self._require_entity_or_503()
         if entity is None:
             return
@@ -552,17 +564,32 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": err})
             return
 
-        rid_hex = body.get("recipient_id")
-        if not isinstance(rid_hex, str) or len(rid_hex) != 64:
+        rid_str = body.get("recipient_id")
+        if not isinstance(rid_str, str) or not rid_str.strip():
             self._send_json(400, {
-                "ok": False, "error": "recipient_id must be 64 hex chars",
+                "ok": False, "error": "recipient_id is required",
             })
             return
+        from messagechain.identity.address import (
+            decode_address,
+            InvalidAddressError,
+            InvalidAddressChecksumError,
+        )
         try:
-            recipient_bytes = bytes.fromhex(rid_hex)
-        except ValueError:
+            recipient_bytes = decode_address(rid_str.strip())
+        except InvalidAddressChecksumError:
             self._send_json(400, {
-                "ok": False, "error": "recipient_id must be valid hex",
+                "ok": False,
+                "error": (
+                    "address checksum mismatch -- looks like a transcription "
+                    "error.  Re-check the address character by character."
+                ),
+            })
+            return
+        except InvalidAddressError as e:
+            self._send_json(400, {
+                "ok": False,
+                "error": f"invalid recipient: {e}",
             })
             return
 

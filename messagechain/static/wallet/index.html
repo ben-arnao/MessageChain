@@ -11,13 +11,16 @@
     --fg: #111;
     --muted: #666;
     --card: #f5f5f5;
+    --card-hover: #ececec;
     --border: #ddd;
+    --border-strong: #bbb;
     --accent: #0a5;
     --accent-bg: #e6f7ee;
     --warn: #c70;
     --warn-bg: #fff7e6;
     --error: #c33;
     --error-bg: #fde8e8;
+    --highlight: #fff3a8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -25,13 +28,16 @@
       --fg: #eee;
       --muted: #888;
       --card: #1a1a1d;
+      --card-hover: #222226;
       --border: #2a2a2e;
+      --border-strong: #444;
       --accent: #6c9;
       --accent-bg: #14302a;
       --warn: #db5;
       --warn-bg: #2e2410;
       --error: #f66;
       --error-bg: #2e1414;
+      --highlight: #4a3a14;
     }
   }
   * { box-sizing: border-box; }
@@ -54,13 +60,24 @@
     padding: 0.4rem 0.8rem;
     cursor: pointer;
   }
-  button:hover { border-color: var(--accent); }
+  button:hover:not(:disabled) { border-color: var(--accent); background: var(--card-hover); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.primary {
     background: var(--accent-bg);
     border-color: var(--accent);
     color: var(--accent);
     font-weight: 500;
+  }
+  button.ghost {
+    background: transparent;
+    border: 1px solid transparent;
+    color: var(--muted);
+    padding: 0.2rem 0.5rem;
+  }
+  button.ghost:hover:not(:disabled) {
+    background: var(--card-hover);
+    color: var(--fg);
+    border-color: var(--border);
   }
   input[type="text"], input[type="number"], textarea {
     font: inherit;
@@ -72,6 +89,7 @@
     width: 100%;
   }
   textarea { font-family: inherit; resize: vertical; min-height: 4em; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
 
   header.app-header {
     position: sticky;
@@ -99,15 +117,23 @@
     font-size: 0.8rem;
     border: 1px solid var(--border);
     color: var(--muted);
+    white-space: nowrap;
   }
   .pill.ok { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
   .pill.warn { color: var(--warn); border-color: var(--warn); background: var(--warn-bg); }
   .pill.error { color: var(--error); border-color: var(--error); background: var(--error-bg); }
+  .pill.button {
+    cursor: pointer;
+    border-style: dashed;
+  }
+  .pill.button:hover { background: var(--card-hover); }
   .you-row .you-id {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.85rem;
     color: var(--muted);
+    cursor: pointer;
   }
+  .you-row .you-id:hover { color: var(--fg); text-decoration: underline; }
   .you-row .grow { flex-grow: 1; }
   nav.tabs {
     display: flex;
@@ -115,6 +141,7 @@
     margin-top: 0.7rem;
     border-bottom: 1px solid var(--border);
     margin-bottom: -1px;
+    overflow-x: auto;
   }
   nav.tabs button {
     background: transparent;
@@ -123,6 +150,7 @@
     border-radius: 0;
     padding: 0.55rem 1rem;
     color: var(--muted);
+    flex-shrink: 0;
   }
   nav.tabs button.active {
     color: var(--accent);
@@ -136,6 +164,7 @@
   .tab-panel { display: none; }
   .tab-panel.active { display: block; }
 
+  /* ----- Composer ----- */
   .composer {
     border: 1px solid var(--border);
     background: var(--card);
@@ -143,6 +172,7 @@
     padding: 0.9rem;
     margin-bottom: 1rem;
   }
+  .composer.is-reply { border-color: var(--accent); }
   .composer .row {
     display: flex;
     gap: 0.5rem;
@@ -160,15 +190,40 @@
     font-size: 0.85rem;
     margin-top: 0.4rem;
   }
-  .composer .meta-line .err { color: var(--error); }
+  .composer .reply-to {
+    color: var(--muted);
+    font-size: 0.8rem;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-bottom: 0.5rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px dashed var(--border);
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .composer .poll-options {
+    display: none;
+    gap: 0.4rem;
+    flex-direction: column;
+    margin-top: 0.5rem;
+    padding: 0.5rem;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+  }
+  .composer.poll-mode .poll-options { display: flex; }
+  .composer .poll-options label { color: var(--muted); font-size: 0.8rem; }
 
+  /* ----- Message cards ----- */
   .msg {
     border: 1px solid var(--border);
     background: var(--card);
     border-radius: 8px;
     padding: 0.7rem 0.9rem;
     margin-bottom: 0.6rem;
+    transition: background-color 0.6s ease;
   }
+  .msg.flash { background: var(--highlight); }
+  .msg.poll-card { border-color: var(--accent); }
   .msg .meta {
     font-size: 0.82rem;
     color: var(--muted);
@@ -179,37 +234,97 @@
   }
   .msg .meta .entity {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    cursor: pointer;
   }
+  .msg .meta .entity:hover { color: var(--fg); text-decoration: underline; }
+  .msg .meta .entity.is-you {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .msg .meta .right { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+  .msg .meta .right a { color: var(--muted); }
+  .msg .meta .right a:hover { color: var(--accent); }
   .msg .text {
     margin-top: 0.4rem;
     white-space: pre-wrap;
     word-break: break-word;
   }
+  .msg .text.poll-question { font-weight: 500; }
+  .msg .text.vote-line {
+    color: var(--muted);
+    font-style: italic;
+  }
+  .msg .vote-line .vote-quote { color: var(--fg); font-style: normal; font-weight: 500; }
   .msg .actions {
     margin-top: 0.5rem;
     display: flex;
-    gap: 0.4rem;
+    gap: 0.3rem;
     flex-wrap: wrap;
+    align-items: center;
   }
-  .msg .actions button {
-    padding: 0.2rem 0.6rem;
-    font-size: 0.85rem;
-  }
+  .msg .actions button { padding: 0.2rem 0.55rem; font-size: 0.85rem; }
+  .msg .react-counts { color: var(--muted); font-size: 0.8rem; margin-right: 0.3rem; }
+  .msg .react-counts .up { color: var(--accent); }
+  .msg .react-counts .down { color: var(--error); }
   .msg .prev {
     color: var(--muted);
     font-size: 0.8rem;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     margin-top: 0.2rem;
   }
-
-  .form-grid {
-    display: grid;
-    gap: 0.6rem;
+  .msg .community {
+    color: var(--accent);
+    font-size: 0.78rem;
+    margin-top: 0.2rem;
   }
-  .form-grid label {
+  .msg .poll-options-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+  }
+  .msg .poll-options-list .poll-opt {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    text-align: left;
+    padding: 0.45rem 0.7rem;
+    width: 100%;
+    border: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .msg .poll-options-list .poll-opt:hover:not(:disabled) {
+    border-color: var(--accent);
+    background: var(--accent-bg);
+  }
+  .msg .poll-options-list .poll-opt .opt-num {
     color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     font-size: 0.85rem;
+    flex-shrink: 0;
+    width: 1.2rem;
   }
+  .msg .poll-options-list .poll-opt .opt-text { flex-grow: 1; }
+  .msg .inline-reply {
+    margin-top: 0.6rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--border);
+    display: none;
+  }
+  .msg .inline-reply.open { display: block; }
+  .msg .inline-reply textarea { min-height: 3em; }
+  .msg .inline-reply .row {
+    display: flex;
+    gap: 0.4rem;
+    align-items: center;
+    margin-top: 0.4rem;
+    flex-wrap: wrap;
+  }
+  .msg .inline-reply .row .grow { flex-grow: 1; }
+
+  /* ----- Forms / panels ----- */
+  .form-grid { display: grid; gap: 0.6rem; }
+  .form-grid label { color: var(--muted); font-size: 0.85rem; }
   .panel {
     border: 1px solid var(--border);
     background: var(--card);
@@ -217,10 +332,9 @@
     padding: 1rem;
     margin-bottom: 1rem;
   }
-  .panel h2 {
-    margin: 0 0 0.6rem;
-    font-size: 1.05rem;
-  }
+  .panel h2 { margin: 0 0 0.6rem; font-size: 1.05rem; }
+
+  /* ----- Toasts + new-activity pill ----- */
   .toast {
     position: fixed;
     bottom: 1rem;
@@ -236,15 +350,91 @@
   }
   .toast.ok { border-color: var(--accent); }
   .toast.err { border-color: var(--error); color: var(--error); }
-  .row-2col {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.6rem;
+  .new-activity {
+    position: sticky;
+    top: 4.5rem;
+    z-index: 5;
+    text-align: center;
+    margin: 0 0 0.6rem;
+    display: none;
   }
-  @media (max-width: 480px) { .row-2col { grid-template-columns: 1fr; } }
+  .new-activity button {
+    background: var(--accent-bg);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 999px;
+    padding: 0.3rem 0.9rem;
+    font-size: 0.85rem;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+  }
+  .new-activity.show { display: block; }
+
+  /* ----- Modal ----- */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    z-index: 50;
+    display: none;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 4rem 1rem 1rem;
+    overflow-y: auto;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--bg);
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    width: 100%;
+    max-width: 540px;
+    padding: 1.2rem 1.3rem;
+    box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+  }
+  .modal h2 { margin: 0 0 0.6rem; font-size: 1.1rem; }
+  .modal .close-row {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 0.4rem;
+  }
+  .modal .field-row {
+    display: grid;
+    grid-template-columns: 9rem 1fr;
+    gap: 0.6rem;
+    padding: 0.35rem 0;
+    border-bottom: 1px dashed var(--border);
+    font-size: 0.92rem;
+  }
+  .modal .field-row .k { color: var(--muted); }
+  .modal .field-row .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  .modal .actions { margin-top: 1rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+
+  .row-2col { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+  @media (max-width: 480px) {
+    .row-2col { grid-template-columns: 1fr; }
+    main { padding: 0.6rem; }
+    header.app-header { padding: 0.6rem; }
+    .you-row { gap: 0.4rem; }
+    .you-row .pill { font-size: 0.72rem; padding: 0.1rem 0.45rem; }
+  }
 
   .hint { color: var(--muted); font-size: 0.85rem; }
   .empty { color: var(--muted); padding: 2rem 0; text-align: center; }
+  .copyable {
+    cursor: pointer;
+    display: inline-block;
+    border-bottom: 1px dotted var(--border-strong);
+  }
+  .copyable:hover { color: var(--accent); }
+  .pubkey-warn {
+    background: var(--warn-bg);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 6px;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 0.7rem;
+    font-size: 0.85rem;
+  }
 </style>
 </head>
 <body>
@@ -253,7 +443,7 @@
   <div class="you-row">
     <span class="brand">MessageChain</span>
     <span id="you-mode" class="pill">loading…</span>
-    <span id="you-id" class="you-id"></span>
+    <span id="you-id" class="you-id" title="Click to copy your address"></span>
     <span class="grow"></span>
     <span id="you-balance" class="pill"></span>
     <span id="you-stake" class="pill"></span>
@@ -274,19 +464,33 @@
 <!-- ============================================================== Feed -->
 <section class="tab-panel active" id="tab-feed">
   <div class="composer" id="composer">
-    <textarea id="composer-text" placeholder="What's on your mind?  (Bytes used and fee preview update as you type.)"></textarea>
+    <div class="reply-to" id="composer-reply-to" style="display:none;">
+      <span>↳ replying to <span id="composer-reply-target"></span></span>
+      <span class="grow"></span>
+      <button class="ghost" id="composer-cancel-reply">cancel</button>
+    </div>
+    <textarea id="composer-text" placeholder="What's on your mind?"></textarea>
     <div class="row">
-      <label for="composer-community">Community:</label>
-      <input id="composer-community" type="text" placeholder="(optional, lowercase ascii)" style="max-width: 14rem;">
-      <label for="composer-prev" class="hint">Reply to:</label>
-      <input id="composer-prev" type="text" placeholder="(tx_hash, optional)" style="max-width: 14rem;">
+      <label>/c/<input id="composer-community" type="text" placeholder="community (optional)" style="max-width: 11rem;"></label>
+      <label class="hint">
+        <input id="composer-poll-toggle" type="checkbox"> Make this a poll
+      </label>
+    </div>
+    <div class="poll-options" id="composer-poll-options">
+      <label>Option 1<input id="composer-poll-1" type="text" placeholder="(required if poll)"></label>
+      <label>Option 2<input id="composer-poll-2" type="text" placeholder="(required if poll)"></label>
+      <label>Option 3<input id="composer-poll-3" type="text" placeholder="(optional)"></label>
+      <label>Option 4<input id="composer-poll-4" type="text" placeholder="(optional)"></label>
     </div>
     <div class="row">
       <span id="composer-meta" class="meta-line">0 bytes</span>
       <span class="grow"></span>
-      <button id="composer-cancel-reply" style="display:none;">Cancel reply</button>
       <button id="composer-post" class="primary" disabled>Post</button>
     </div>
+  </div>
+
+  <div class="new-activity" id="new-activity">
+    <button id="new-activity-btn">↑ new on chain — refresh</button>
   </div>
 
   <div id="feed-list"></div>
@@ -296,21 +500,24 @@
 <!-- ============================================================ Wallet -->
 <section class="tab-panel" id="tab-wallet">
   <div class="panel">
-    <h2>Balance</h2>
+    <h2>Your wallet</h2>
     <div id="wallet-balance" class="hint">loading…</div>
+    <div class="hint" style="margin-top: 0.5rem;">
+      Address: <code class="copyable" id="wallet-address" title="click to copy">—</code>
+    </div>
   </div>
 
   <div class="panel">
-    <h2>Send transfer</h2>
+    <h2>Send tokens</h2>
     <div class="form-grid">
-      <label>Recipient entity_id (64 hex chars)
-        <input id="xfer-to" type="text" placeholder="abcdef…">
+      <label>Recipient
+        <input id="xfer-to" type="text" placeholder="mc1… (preferred) or 64-char entity_id">
       </label>
       <div class="row-2col">
         <label>Amount<input id="xfer-amount" type="number" min="1"></label>
         <label>Fee<input id="xfer-fee" type="number" min="1" value="100"></label>
       </div>
-      <label><input id="xfer-pubkey" type="checkbox"> First-spend (include sender pubkey)</label>
+      <label class="hint"><input id="xfer-pubkey" type="checkbox"> First-spend (include sender pubkey on chain)</label>
       <button id="xfer-submit" class="primary">Send transfer</button>
     </div>
   </div>
@@ -379,7 +586,7 @@
     <p class="hint">
       Your private key never leaves this machine.  The keyfile you
       passed to <code>messagechain ui --keyfile</code> IS your backup
-      -- copy it to a second secure location (paper, steel, USB,
+      — copy it to a second secure location (paper, steel, USB,
       another machine) and treat it like a password.  There is no
       "recover wallet" path on the chain (per CLAUDE.md): lost key =
       lost wallet, by design.
@@ -390,7 +597,7 @@
     <p class="hint">
       WOTS+ leaves are one-time signatures.  When the
       <em>sigs remaining</em> count above gets low, run
-      <code>messagechain rotate-key</code> on the CLI -- the new-tree
+      <code>messagechain rotate-key</code> on the CLI — the new-tree
       keygen takes minutes and is not yet wired to the wallet UI
       (would block the HTTP request past every reasonable browser
       timeout).
@@ -408,15 +615,23 @@
 
 </main>
 
+<!-- ============================================================== Modal -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" id="modal">
+    <div class="close-row">
+      <button class="ghost" id="modal-close">close ✕</button>
+    </div>
+    <h2 id="modal-title">Profile</h2>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
 <div id="toast" class="toast" style="display:none;"></div>
 
 <script>
 "use strict";
 
 // =========================================================== token / fetch
-// Same bootstrap as the placeholder version: the CLI prints
-// `http://127.0.0.1:<port>/?t=<token>`, the page reads `t` once,
-// stashes it in sessionStorage, and strips it from the URL bar.
 const TOKEN_KEY = "mc.wallet.token";
 function bootstrapToken() {
   const url = new URL(window.location.href);
@@ -424,7 +639,7 @@ function bootstrapToken() {
   if (fromUrl) {
     sessionStorage.setItem(TOKEN_KEY, fromUrl);
     url.searchParams.delete("t");
-    window.history.replaceState({}, "", url.toString());
+    window.history.replaceState({}, "", url.toString() + url.hash);
   }
   return sessionStorage.getItem(TOKEN_KEY);
 }
@@ -452,11 +667,25 @@ function shortHex(hex, head, tail) {
   if (hex.length <= head + tail + 1) return hex;
   return hex.slice(0, head) + "…" + hex.slice(-tail);
 }
+function shortAddr(addr) {
+  // mc1… form: keep "mc1" prefix + 8 chars + "…" + 4 chars.
+  if (!addr) return "";
+  if (addr.length <= 16) return addr;
+  return addr.slice(0, 11) + "…" + addr.slice(-4);
+}
 function formatTs(sec) {
   if (typeof sec !== "number") return "";
   const d = new Date(sec * 1000);
   if (isNaN(d.getTime())) return "";
-  return d.toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  return d.toISOString().replace("T", " ").slice(0, 19) + "Z";
+}
+function relTime(sec) {
+  if (typeof sec !== "number") return "";
+  const diff = (Date.now() / 1000) - sec;
+  if (diff < 60) return Math.floor(diff) + "s ago";
+  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+  return Math.floor(diff / 86400) + "d ago";
 }
 let _toastTimer = null;
 function toast(msg, kind) {
@@ -467,20 +696,31 @@ function toast(msg, kind) {
   if (_toastTimer) clearTimeout(_toastTimer);
   _toastTimer = setTimeout(() => { t.style.display = "none"; }, 4500);
 }
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Copied: " + (text.length > 40 ? text.slice(0, 40) + "…" : text), "ok");
+  } catch (_) {
+    toast("Clipboard unavailable", "err");
+  }
+}
+
+// =========================================================== global "you"
+let YOU = null;  // last /wallet/me response (may be null if unreachable)
 
 // =========================================================== tab switching
 document.querySelectorAll("nav.tabs button").forEach(btn => {
-  btn.addEventListener("click", () => {
-    const tab = btn.dataset.tab;
-    document.querySelectorAll("nav.tabs button").forEach(b =>
-      b.classList.toggle("active", b === btn));
-    document.querySelectorAll(".tab-panel").forEach(p =>
-      p.classList.toggle("active", p.id === "tab-" + tab));
-    if (tab === "wallet") refreshWallet();
-    if (tab === "node") refreshNode();
-    if (tab === "identity") refreshIdentity();
-  });
+  btn.addEventListener("click", () => switchTab(btn.dataset.tab));
 });
+function switchTab(name) {
+  document.querySelectorAll("nav.tabs button").forEach(b =>
+    b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll(".tab-panel").forEach(p =>
+    p.classList.toggle("active", p.id === "tab-" + name));
+  if (name === "wallet") refreshWallet();
+  if (name === "node") refreshNode();
+  if (name === "identity") refreshIdentity();
+}
 
 // =========================================================== "you" header
 async function refreshMe() {
@@ -490,29 +730,28 @@ async function refreshMe() {
     if (r.status !== 200) {
       youMode.textContent = "error " + r.status;
       youMode.className = "pill error";
+      YOU = null;
       return null;
     }
     const m = r.data;
+    YOU = m;
     if (m.mode === "read-only") {
       youMode.textContent = "read-only";
       youMode.className = "pill warn";
-      $("you-id").textContent = "(no key loaded)";
+      $("you-id").textContent = "(no wallet loaded)";
       $("you-balance").textContent = "";
       $("you-stake").textContent = "";
       $("you-sigs").textContent = "";
-      // Hide composer in read-only mode -- writes will 503.
       $("composer").style.display = "none";
     } else {
       youMode.textContent = "wallet";
       youMode.className = "pill ok";
-      $("you-id").textContent = shortHex(m.entity_id, 10, 6);
-      $("you-id").title = m.entity_id;
-      if (m.balance != null) {
-        $("you-balance").textContent = m.balance + " bal";
-      }
-      if (m.stake != null && m.stake > 0) {
-        $("you-stake").textContent = m.stake + " stake";
-      }
+      const idEl = $("you-id");
+      idEl.textContent = shortAddr(m.address || ("mc1?" + m.entity_id));
+      idEl.title = "click to copy: " + (m.address || m.entity_id);
+      idEl.onclick = () => copyToClipboard(m.address || m.entity_id);
+      if (m.balance != null) $("you-balance").textContent = m.balance + " bal";
+      if (m.stake != null && m.stake > 0) $("you-stake").textContent = m.stake + " stake";
       if (m.sigs_remaining != null) {
         const s = $("you-sigs");
         s.textContent = m.sigs_remaining + " sigs";
@@ -520,7 +759,7 @@ async function refreshMe() {
       }
     }
     return m;
-  } catch (e) {
+  } catch (_) {
     youMode.textContent = "unreachable";
     youMode.className = "pill error";
     return null;
@@ -534,40 +773,41 @@ async function refreshChainStatus() {
     if (r.status !== 200) {
       c.textContent = "chain offline";
       c.className = "pill error";
-      return;
+      return null;
     }
     c.textContent = "h=" + r.data.height;
     c.className = "pill ok";
+    return r.data;
   } catch (_) {
     $("you-chain").textContent = "chain offline";
     $("you-chain").className = "pill error";
+    return null;
   }
 }
 
-// ============================================================= Feed tab
+// ============================================================= Composer
+const composer = $("composer");
 const composerText = $("composer-text");
 const composerMeta = $("composer-meta");
 const composerPost = $("composer-post");
-const composerPrev = $("composer-prev");
 const composerCommunity = $("composer-community");
+const composerReplyTo = $("composer-reply-to");
+const composerReplyTarget = $("composer-reply-target");
 const composerCancelReply = $("composer-cancel-reply");
+const composerPollToggle = $("composer-poll-toggle");
+let composerReplyHash = null;  // tx_hash of message we're replying to (set by per-card Reply)
 
 function utf8Bytes(s) { return new TextEncoder().encode(s).length; }
 
-let _lastFeeMessageBytes = -1;
+let _lastFeeBytes = -1;
 async function updateComposerMeta() {
   const text = composerText.value;
   const bytes = utf8Bytes(text);
   let line = bytes + " bytes";
-  if (text.trim().length === 0) {
-    composerPost.disabled = true;
-  } else {
-    composerPost.disabled = false;
-  }
+  composerPost.disabled = text.trim().length === 0;
   composerMeta.textContent = line;
-  // Debounced fee preview -- one round-trip per meaningful change.
-  if (bytes > 0 && bytes !== _lastFeeMessageBytes) {
-    _lastFeeMessageBytes = bytes;
+  if (bytes > 0 && bytes !== _lastFeeBytes) {
+    _lastFeeBytes = bytes;
     try {
       const r = await api("/wallet/estimate-fee?message_bytes=" + bytes);
       if (r.status === 200 && r.data && r.data.result) {
@@ -578,49 +818,90 @@ async function updateComposerMeta() {
   }
 }
 composerText.addEventListener("input", updateComposerMeta);
+composerText.addEventListener("keydown", e => {
+  // Cmd/Ctrl+Enter to post.
+  if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !composerPost.disabled) {
+    composerPost.click();
+  }
+});
+
+composerPollToggle.addEventListener("change", () => {
+  composer.classList.toggle("poll-mode", composerPollToggle.checked);
+});
 
 composerCancelReply.addEventListener("click", () => {
-  composerPrev.value = "";
-  composerCancelReply.style.display = "none";
+  composerReplyHash = null;
+  composerReplyTo.style.display = "none";
 });
+
+function startReplyAt(tx_hash) {
+  composerReplyHash = tx_hash;
+  composerReplyTarget.textContent = shortHex(tx_hash, 10, 6);
+  composerReplyTarget.title = tx_hash;
+  composerReplyTo.style.display = "flex";
+  composerText.focus();
+  window.scrollTo({ top: 0, behavior: "smooth" });
+}
 
 composerPost.addEventListener("click", async () => {
   const text = composerText.value.trim();
   if (!text) return;
-  // Pull fee fresh -- the auto-fee in updateComposerMeta is only a
-  // hint; submit at the chain's current minimum + a small headroom
-  // to absorb mempool drift between estimate and submit.
-  let fee = 100;
-  try {
-    const fr = await api("/wallet/estimate-fee?message_bytes=" + utf8Bytes(text));
-    if (fr.status === 200 && fr.data && fr.data.result) {
-      fee = Math.max(1, fr.data.result.fee_estimate);
-    }
-  } catch (_) {}
+  const fee = await liveFee(utf8Bytes(text));
   const body = { message: text, fee: fee };
-  if (composerPrev.value.trim()) body.prev = composerPrev.value.trim();
+  if (composerReplyHash) body.prev = composerReplyHash;
   if (composerCommunity.value.trim()) body.community_id = composerCommunity.value.trim();
+  if (composerPollToggle.checked) {
+    const opts = [1, 2, 3, 4]
+      .map(i => $("composer-poll-" + i).value.trim())
+      .filter(s => s.length > 0);
+    if (opts.length < 2) {
+      toast("Polls need at least 2 options", "err");
+      return;
+    }
+    body.poll_options = opts;
+    // The chain charges proposal-style for poll txs; bump fee to the
+    // higher floor when posting one.
+    body.fee = Math.max(body.fee, 500);
+  }
   composerPost.disabled = true;
+  const oldLabel = composerPost.textContent;
   composerPost.textContent = "Posting…";
   try {
     const r = await apiPost("/wallet/send", body);
     if (r.status === 200) {
       toast("Posted: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
       composerText.value = "";
-      composerPrev.value = "";
       composerCommunity.value = "";
-      composerCancelReply.style.display = "none";
-      _lastFeeMessageBytes = -1;
+      composerReplyHash = null;
+      composerReplyTo.style.display = "none";
+      if (composerPollToggle.checked) {
+        composerPollToggle.checked = false;
+        composer.classList.remove("poll-mode");
+        [1, 2, 3, 4].forEach(i => { $("composer-poll-" + i).value = ""; });
+      }
+      _lastFeeBytes = -1;
       updateComposerMeta();
-      refreshFeed();
-      refreshMe();  // balance/sigs change after a send
+      forceFeedRefresh(r.data.result.tx_hash);
+      refreshMe();
     } else {
       toast("Send failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
     }
   } finally {
     composerPost.disabled = false;
-    composerPost.textContent = "Post";
+    composerPost.textContent = oldLabel;
   }
+});
+
+// ================================================================ Feed
+let LAST_HEIGHT = 0;
+let LAST_TOP_HASH = null;
+let SUPPRESS_NEW_PILL_UNTIL = 0;
+let CURRENT_MESSAGES = [];
+
+const newActivity = $("new-activity");
+$("new-activity-btn").addEventListener("click", () => {
+  newActivity.classList.remove("show");
+  refreshFeed();
 });
 
 async function refreshFeed() {
@@ -635,6 +916,9 @@ async function refreshFeed() {
       return;
     }
     const msgs = r.data.messages || [];
+    CURRENT_MESSAGES = msgs;
+    LAST_HEIGHT = r.data.height || LAST_HEIGHT;
+    LAST_TOP_HASH = msgs.length ? msgs[0].tx_hash : null;
     if (msgs.length === 0) {
       list.innerHTML = "";
       empty.style.display = "block";
@@ -643,7 +927,16 @@ async function refreshFeed() {
     }
     empty.style.display = "none";
     list.innerHTML = "";
-    msgs.forEach(m => list.appendChild(renderMessageCard(m)));
+    msgs.forEach(m => list.appendChild(renderMessageCard(m, msgs)));
+    // Honor URL-hash deep link if any.
+    if (window.location.hash.startsWith("#tx-")) {
+      const t = document.querySelector(window.location.hash);
+      if (t) {
+        t.scrollIntoView({ behavior: "smooth", block: "center" });
+        t.classList.add("flash");
+        setTimeout(() => t.classList.remove("flash"), 1200);
+      }
+    }
   } catch (_) {
     list.innerHTML = "";
     empty.style.display = "block";
@@ -651,105 +944,508 @@ async function refreshFeed() {
   }
 }
 
-function renderMessageCard(m) {
+// Background poll: detect new activity but don't hard-replace the feed
+// while the user might be reading mid-page.  Show a pill instead.
+async function pollNewActivity() {
+  try {
+    const r = await api("/v1/latest?limit=1");
+    if (r.status !== 200) return;
+    const top = (r.data.messages || [])[0];
+    if (!top) return;
+    if (LAST_TOP_HASH && top.tx_hash !== LAST_TOP_HASH &&
+        Date.now() > SUPPRESS_NEW_PILL_UNTIL) {
+      newActivity.classList.add("show");
+    }
+  } catch (_) {}
+}
+
+// Force-refresh after our own action (suppress the "new" pill since we
+// know what changed).
+function forceFeedRefresh(myNewTxHash) {
+  SUPPRESS_NEW_PILL_UNTIL = Date.now() + 5000;
+  newActivity.classList.remove("show");
+  refreshFeed().then(() => {
+    if (myNewTxHash) {
+      const el = document.getElementById("tx-" + myNewTxHash);
+      if (el) {
+        el.classList.add("flash");
+        setTimeout(() => el.classList.remove("flash"), 1500);
+      }
+    }
+  });
+}
+
+function renderMessageCard(m, allMsgs) {
   const card = document.createElement("div");
   card.className = "msg";
+  if (m.tx_hash) card.id = "tx-" + m.tx_hash;
+  if (m.kind === "poll") card.classList.add("poll-card");
 
+  // ------ meta row (entity + permalink + timestamp)
   const meta = document.createElement("div");
   meta.className = "meta";
   const ent = document.createElement("span");
   ent.className = "entity";
+  if (YOU && YOU.entity_id && m.entity_id === YOU.entity_id) ent.classList.add("is-you");
   ent.title = m.entity_id || "";
-  ent.textContent = "from " + shortHex(m.entity_id, 10, 6);
+  ent.textContent = (YOU && YOU.entity_id === m.entity_id) ? "you" : shortHex(m.entity_id, 10, 6);
+  ent.addEventListener("click", () => openProfileModal(m.entity_id));
   meta.appendChild(ent);
+
   const right = document.createElement("span");
-  right.textContent = (typeof m.block_number === "number" ?
-    "block " + m.block_number + "  ·  " : "") + formatTs(m.timestamp);
+  right.className = "right";
+  if (typeof m.block_number === "number") {
+    const blk = document.createElement("span");
+    blk.textContent = "block " + m.block_number;
+    blk.title = "block " + m.block_number;
+    right.appendChild(blk);
+  }
+  if (m.tx_hash) {
+    const link = document.createElement("a");
+    link.href = "#tx-" + m.tx_hash;
+    link.title = formatTs(m.timestamp) + " · permalink";
+    link.textContent = relTime(m.timestamp);
+    right.appendChild(link);
+  } else {
+    const ts = document.createElement("span");
+    ts.textContent = relTime(m.timestamp);
+    right.appendChild(ts);
+  }
   meta.appendChild(right);
   card.appendChild(meta);
 
+  // ------ in-reply-to chip
   if (m.prev) {
     const prev = document.createElement("div");
     prev.className = "prev";
-    prev.textContent = "↳ in reply to " + shortHex(m.prev, 10, 6);
-    prev.title = m.prev;
+    const a = document.createElement("a");
+    a.href = "#tx-" + m.prev;
+    a.textContent = "↳ " + shortHex(m.prev, 10, 6);
+    a.title = m.prev;
+    prev.appendChild(document.createTextNode("in reply to "));
+    prev.appendChild(a);
     card.appendChild(prev);
   }
 
-  const text = document.createElement("div");
-  text.className = "text";
-  text.textContent = m.message || "";
-  card.appendChild(text);
+  // ------ body — shape varies by kind
+  if (m.kind === "vote" && m.vote_target) {
+    const line = document.createElement("div");
+    line.className = "text vote-line";
+    const pollTx = m.vote_target.poll_txid;
+    const idx = m.vote_target.option_index;
+    let optText = "option " + idx;
+    let pollLabel = shortHex(pollTx, 10, 6);
+    // Cross-reference: if the poll is in the visible feed, render its
+    // option text + question for human readability.
+    const poll = (allMsgs || []).find(x => x.tx_hash === pollTx);
+    if (poll && Array.isArray(poll.poll_options) && poll.poll_options[idx]) {
+      optText = poll.poll_options[idx];
+      pollLabel = poll.message || pollLabel;
+    }
+    const a = document.createElement("a");
+    a.href = "#tx-" + pollTx;
+    a.textContent = pollLabel;
+    a.title = pollTx;
+    line.appendChild(document.createTextNode("voted "));
+    const q = document.createElement("span");
+    q.className = "vote-quote";
+    q.textContent = "“" + optText + "”";
+    line.appendChild(q);
+    line.appendChild(document.createTextNode(" on "));
+    line.appendChild(a);
+    card.appendChild(line);
+  } else {
+    const text = document.createElement("div");
+    text.className = "text" + (m.kind === "poll" ? " poll-question" : "");
+    text.textContent = m.message || "";
+    card.appendChild(text);
+  }
 
+  // ------ poll options (clickable to vote)
+  if (m.kind === "poll" && Array.isArray(m.poll_options)) {
+    const list = document.createElement("div");
+    list.className = "poll-options-list";
+    m.poll_options.forEach((opt, idx) => {
+      const btn = document.createElement("button");
+      btn.className = "poll-opt";
+      const num = document.createElement("span");
+      num.className = "opt-num";
+      num.textContent = idx + ".";
+      const txt = document.createElement("span");
+      txt.className = "opt-text";
+      txt.textContent = opt;
+      btn.appendChild(num);
+      btn.appendChild(txt);
+      // Self-vote-on-own-poll is rejected at consensus per CLAUDE.md
+      // anchor.  Disable inline so the user gets the signal up front
+      // instead of a "rejected" toast after burning a leaf.
+      if (YOU && YOU.entity_id && m.entity_id === YOU.entity_id) {
+        btn.disabled = true;
+        btn.title = "Cannot vote on your own poll";
+      } else {
+        btn.addEventListener("click", () => votePoll(m.tx_hash, idx, opt));
+      }
+      list.appendChild(btn);
+    });
+    card.appendChild(list);
+  }
+
+  // ------ community tag
   if (m.community_id) {
     const tag = document.createElement("div");
-    tag.className = "hint";
-    tag.style.marginTop = "0.3rem";
+    tag.className = "community";
     tag.textContent = "/c/" + m.community_id;
     card.appendChild(tag);
   }
 
-  // Wallet-affordances row.  Hidden in read-only mode (composer
-  // also hidden; toolbar disabled at refreshMe time).
+  // ------ actions row (reply / vote / counts)
   if (m.tx_hash) {
     const actions = document.createElement("div");
     actions.className = "actions";
-    const reply = document.createElement("button");
-    reply.textContent = "Reply";
-    reply.addEventListener("click", () => {
-      composerPrev.value = m.tx_hash;
-      composerCancelReply.style.display = "inline-block";
-      composerText.focus();
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    });
-    const up = document.createElement("button");
-    up.textContent = "▲";
-    up.title = "Upvote (react choice=1)";
-    up.addEventListener("click", () => react(m.tx_hash, 1));
-    const down = document.createElement("button");
-    down.textContent = "▼";
-    down.title = "Downvote (react choice=2)";
-    down.addEventListener("click", () => react(m.tx_hash, 2));
-    actions.appendChild(reply);
-    actions.appendChild(up);
-    actions.appendChild(down);
-    card.appendChild(actions);
-  }
 
+    // React counts (always visible if any).
+    if ((m.ups || 0) > 0 || (m.downs || 0) > 0) {
+      const counts = document.createElement("span");
+      counts.className = "react-counts";
+      const upS = document.createElement("span");
+      upS.className = "up";
+      upS.textContent = "▲ " + (m.ups || 0);
+      const downS = document.createElement("span");
+      downS.className = "down";
+      downS.textContent = " · ▼ " + (m.downs || 0);
+      counts.appendChild(upS);
+      counts.appendChild(downS);
+      if (m.up_pct != null) {
+        const pct = document.createElement("span");
+        pct.textContent = " · " + Math.round(m.up_pct * 100) + "%";
+        counts.appendChild(pct);
+      }
+      actions.appendChild(counts);
+    }
+
+    // Wallet-mode action buttons.  In read-only mode hide them all.
+    if (YOU && YOU.mode !== "read-only") {
+      // No self-react: chain blocks reactions on your own message.
+      const isOwn = m.entity_id === YOU.entity_id;
+      const replyBtn = document.createElement("button");
+      replyBtn.className = "ghost";
+      replyBtn.textContent = "↳ reply";
+      const replyForm = makeInlineReply(m.tx_hash);
+      replyBtn.addEventListener("click", () => {
+        replyForm.classList.toggle("open");
+        if (replyForm.classList.contains("open")) {
+          replyForm.querySelector("textarea").focus();
+        }
+      });
+      actions.appendChild(replyBtn);
+      if (!isOwn) {
+        const up = document.createElement("button");
+        up.className = "ghost";
+        up.textContent = "▲";
+        up.title = "Upvote";
+        up.addEventListener("click", () => react(m.tx_hash, 1));
+        const down = document.createElement("button");
+        down.className = "ghost";
+        down.textContent = "▼";
+        down.title = "Downvote";
+        down.addEventListener("click", () => react(m.tx_hash, 2));
+        actions.appendChild(up);
+        actions.appendChild(down);
+      }
+      const tip = document.createElement("button");
+      tip.className = "ghost";
+      tip.textContent = "💸 tip";
+      tip.title = "Send tokens to this entity";
+      tip.addEventListener("click", () => prefillTip(m.entity_id));
+      if (!isOwn) actions.appendChild(tip);
+
+      const copy = document.createElement("button");
+      copy.className = "ghost";
+      copy.textContent = "🔗";
+      copy.title = "Copy permalink";
+      copy.addEventListener("click", () => {
+        const url = window.location.origin + "/#tx-" + m.tx_hash;
+        copyToClipboard(url);
+      });
+      actions.appendChild(copy);
+      card.appendChild(actions);
+      card.appendChild(replyForm);
+    } else if (actions.children.length > 0) {
+      card.appendChild(actions);
+    }
+  }
   return card;
 }
 
+function makeInlineReply(tx_hash) {
+  const wrap = document.createElement("div");
+  wrap.className = "inline-reply";
+  const ta = document.createElement("textarea");
+  ta.placeholder = "Reply…  (Cmd/Ctrl+Enter to post)";
+  wrap.appendChild(ta);
+  const row = document.createElement("div");
+  row.className = "row";
+  const meta = document.createElement("span");
+  meta.className = "hint";
+  meta.textContent = "0 bytes";
+  row.appendChild(meta);
+  const grow = document.createElement("span");
+  grow.className = "grow";
+  row.appendChild(grow);
+  const cancel = document.createElement("button");
+  cancel.className = "ghost";
+  cancel.textContent = "cancel";
+  cancel.addEventListener("click", () => {
+    wrap.classList.remove("open");
+    ta.value = "";
+  });
+  row.appendChild(cancel);
+  const post = document.createElement("button");
+  post.className = "primary";
+  post.textContent = "Reply";
+  row.appendChild(post);
+  wrap.appendChild(row);
+
+  ta.addEventListener("input", () => {
+    meta.textContent = utf8Bytes(ta.value) + " bytes";
+    post.disabled = ta.value.trim().length === 0;
+  });
+  ta.addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter" && !post.disabled) {
+      post.click();
+    }
+  });
+  post.disabled = true;
+
+  post.addEventListener("click", async () => {
+    const text = ta.value.trim();
+    if (!text) return;
+    const fee = await liveFee(utf8Bytes(text));
+    post.disabled = true;
+    post.textContent = "Posting…";
+    try {
+      const r = await apiPost("/wallet/send", {
+        message: text, fee: fee, prev: tx_hash,
+      });
+      if (r.status === 200) {
+        toast("Reply posted", "ok");
+        ta.value = "";
+        wrap.classList.remove("open");
+        forceFeedRefresh(r.data.result.tx_hash);
+        refreshMe();
+      } else {
+        toast("Reply failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+      }
+    } finally {
+      post.disabled = false;
+      post.textContent = "Reply";
+    }
+  });
+  return wrap;
+}
+
+// Pull a live fee estimate (MARKET_FEE_FLOOR for empty payloads).
+// Wallet-write helpers call this rather than hardcoding a value: a
+// hardcoded 100 was a 100x silent overpay against the post-Tier-18
+// MARKET_FEE_FLOOR of 1 (audit r55 #2).
+async function liveFee(bytes) {
+  try {
+    const r = await api("/wallet/estimate-fee?message_bytes=" + (bytes || 0));
+    if (r.status === 200 && r.data && r.data.result) {
+      return Math.max(1, r.data.result.fee_estimate);
+    }
+  } catch (_) {}
+  return 1;  // MARKET_FEE_FLOOR fallback when the estimate RPC is offline.
+}
+
 async function react(targetHex, choice) {
-  // Audit r55 #1: post-Tier-18 MARKET_FEE_FLOOR is 1; sending 100 was
-  // a silent 100x overpay on every click.  The CLI's react path runs
-  // through `_resolve_fee_with_server_floor`; until /wallet/estimate-
-  // fee gains a `kind=react` branch, sending the floor preserves the
-  // "don't burn money on every click" property and the chain's fee-
-  // market still rejects below-floor txs cleanly.
+  const fee = await liveFee(0);
   const r = await apiPost("/wallet/react", {
     target: targetHex,
     target_is_user: false,
     choice: choice,
-    fee: 1,
+    fee: fee,
   });
   if (r.status === 200) {
     toast((choice === 1 ? "Upvoted " : "Downvoted ") + shortHex(targetHex, 8, 6), "ok");
     refreshMe();
+    forceFeedRefresh();
   } else {
     toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
   }
 }
 
+async function votePoll(pollTx, idx, optText) {
+  if (!confirm("Vote “" + optText + "” on this poll?\n\nVotes are FINAL — the protocol does not allow you to change your vote later.")) {
+    return;
+  }
+  const msg = optText.slice(0, 64) || "vote";
+  const fee = await liveFee(utf8Bytes(msg));
+  const r = await apiPost("/wallet/send", {
+    message: msg,
+    fee: fee,
+    vote_target: [pollTx, idx],
+  });
+  if (r.status === 200) {
+    toast("Voted: " + optText, "ok");
+    refreshMe();
+    forceFeedRefresh(r.data.result.tx_hash);
+  } else {
+    toast("Vote failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+}
+
+function prefillTip(entityId) {
+  switchTab("wallet");
+  // Prefer the address form; we don't have it for arbitrary entities,
+  // so we fall back to the raw entity_id (the backend decode_address
+  // accepts both).
+  $("xfer-to").value = entityId;
+  $("xfer-amount").focus();
+}
+
+// ============================================================ Profile modal
+async function openProfileModal(entityId) {
+  if (!entityId) return;
+  $("modal-title").textContent = "Profile";
+  const body = $("modal-body");
+  body.innerHTML = "<div class='hint'>Loading…</div>";
+  showModal();
+  try {
+    const r = await api("/v1/entity?id=" + entityId);
+    if (r.status !== 200 || !r.data || !r.data.ok) {
+      body.innerHTML = "<div class='hint'>Entity not registered on chain " +
+        "(receive-to-exist: appears after their first received transfer).</div>";
+      body.appendChild(renderEntityHeader(entityId, null));
+      return;
+    }
+    const e = r.data.result;
+    body.innerHTML = "";
+    body.appendChild(renderEntityHeader(entityId, e));
+    // Filter the locally-fetched feed for messages from this entity.
+    // Without a /v1/entity_messages RPC this is a partial view, but
+    // it's free and useful when scrolling a thread.
+    const own = (CURRENT_MESSAGES || []).filter(m => m.entity_id === entityId);
+    const sec = document.createElement("h3");
+    sec.style.fontSize = "0.95rem";
+    sec.style.marginTop = "0.8rem";
+    sec.textContent = "Recent messages in current view (" + own.length + ")";
+    body.appendChild(sec);
+    if (own.length === 0) {
+      const p = document.createElement("p");
+      p.className = "hint";
+      p.textContent = "None visible in the most-recent 30.";
+      body.appendChild(p);
+    } else {
+      own.slice(0, 5).forEach(m => body.appendChild(renderMessageCard(m, CURRENT_MESSAGES)));
+    }
+  } catch (_) {
+    body.innerHTML = "<div class='hint'>Profile fetch failed.</div>";
+  }
+}
+
+function renderEntityHeader(entityId, e) {
+  const wrap = document.createElement("div");
+  function row(k, v, copyText) {
+    const r = document.createElement("div");
+    r.className = "field-row";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("div"); vv.className = "v"; vv.textContent = v;
+    if (copyText) {
+      vv.classList.add("copyable");
+      vv.addEventListener("click", () => copyToClipboard(copyText));
+      vv.title = "click to copy";
+    }
+    r.appendChild(kk); r.appendChild(vv);
+    return r;
+  }
+  wrap.appendChild(row("entity_id", entityId, entityId));
+  if (e) {
+    if (e.address) wrap.appendChild(row("address", e.address, e.address));
+    if (e.balance != null) wrap.appendChild(row("balance", e.balance + " tokens"));
+    if (e.stake != null && e.stake > 0) wrap.appendChild(row("stake", e.stake + " tokens"));
+    wrap.appendChild(row("pubkey on chain",
+      e.pubkey_registered ? "yes" : "no (revealed by first outgoing tx)"));
+  }
+  // Action row
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const tip = document.createElement("button");
+  tip.className = "primary";
+  tip.textContent = "💸 send tokens";
+  tip.addEventListener("click", () => {
+    closeModal();
+    prefillTip((e && e.address) || entityId);
+  });
+  actions.appendChild(tip);
+  const trustUp = document.createElement("button");
+  trustUp.textContent = "▲ trust";
+  trustUp.title = "react UP on this entity";
+  trustUp.addEventListener("click", () => reactUser(entityId, 1));
+  const trustDown = document.createElement("button");
+  trustDown.textContent = "▼ distrust";
+  trustDown.addEventListener("click", () => reactUser(entityId, 2));
+  if (!YOU || YOU.entity_id !== entityId) {
+    actions.appendChild(trustUp);
+    actions.appendChild(trustDown);
+  }
+  wrap.appendChild(actions);
+  return wrap;
+}
+
+async function reactUser(entityId, choice) {
+  const fee = await liveFee(0);
+  const r = await apiPost("/wallet/react", {
+    target: entityId,
+    target_is_user: true,
+    choice: choice,
+    fee: fee,
+  });
+  if (r.status === 200) {
+    toast((choice === 1 ? "Trust ▲ " : "Distrust ▼ ") + shortHex(entityId, 8, 6), "ok");
+  } else {
+    toast("React failed: " + ((r.data && r.data.error) || ("HTTP " + r.status)), "err");
+  }
+}
+
+function showModal() { $("modal-backdrop").classList.add("open"); }
+function closeModal() { $("modal-backdrop").classList.remove("open"); }
+$("modal-close").addEventListener("click", closeModal);
+$("modal-backdrop").addEventListener("click", e => {
+  if (e.target === $("modal-backdrop")) closeModal();
+});
+window.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+
 // ============================================================ Wallet tab
 async function refreshWallet() {
   const me = await refreshMe();
   const w = $("wallet-balance");
+  const a = $("wallet-address");
   if (!me || me.mode === "read-only") {
-    w.textContent = "Wallet not loaded -- restart with --keyfile.";
+    w.textContent = "Wallet not loaded — restart with --keyfile.";
+    a.textContent = "—";
     return;
   }
   w.innerHTML = "<strong>" + (me.balance || 0) + "</strong> tokens" +
-    (me.stake ? " ·  staked: <strong>" + me.stake + "</strong>" : "");
+    (me.stake ? "  ·  staked: <strong>" + me.stake + "</strong>" : "");
+  a.textContent = me.address || me.entity_id || "—";
+  a.onclick = () => copyToClipboard(me.address || me.entity_id || "");
+  // Show first-spend warning if pubkey not yet on chain.
+  let warn = $("wallet-pubkey-warn");
+  if (me.pubkey_registered === false) {
+    if (!warn) {
+      warn = document.createElement("div");
+      warn.id = "wallet-pubkey-warn";
+      warn.className = "pubkey-warn";
+      warn.textContent =
+        "Heads up: your pubkey isn't on chain yet.  Tick the " +
+        "“First-spend” box on your first outgoing transfer so the " +
+        "chain installs it.";
+      $("tab-wallet").querySelector(".panel:nth-child(2)").prepend(warn);
+    }
+  } else if (warn) {
+    warn.remove();
+  }
 }
 
 $("xfer-submit").addEventListener("click", async () => {
@@ -757,8 +1453,14 @@ $("xfer-submit").addEventListener("click", async () => {
   const amount = parseInt($("xfer-amount").value);
   const fee = parseInt($("xfer-fee").value);
   const includePk = $("xfer-pubkey").checked;
-  if (to.length !== 64 || !amount || !fee) {
-    toast("Recipient must be 64 hex chars; amount + fee required", "err");
+  if (!to) { toast("Recipient required", "err"); return; }
+  if (!amount || amount <= 0) { toast("Amount must be > 0", "err"); return; }
+  if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
+  // Light client-side prevalidation: address must look like mc1... or 64 hex.
+  const looksAddr = to.toLowerCase().startsWith("mc1");
+  const looksHex = /^[0-9a-fA-F]{64}$/.test(to);
+  if (!looksAddr && !looksHex) {
+    toast("Recipient must be an mc1… address or 64-hex entity_id", "err");
     return;
   }
   const r = await apiPost("/wallet/transfer", {
@@ -847,11 +1549,26 @@ async function refreshIdentity() {
     el.textContent = "Wallet not loaded.";
     return;
   }
-  el.innerHTML =
-    "<div><strong>Entity ID:</strong> <code>" + (me.entity_id || "") + "</code></div>" +
-    "<div><strong>Public-key registered:</strong> " +
-      (me.pubkey_registered ? "yes" : "no (next outgoing tx will install it)") + "</div>" +
-    "<div><strong>WOTS+ leaves remaining:</strong> " + (me.sigs_remaining ?? "?") + "</div>";
+  el.innerHTML = "";
+  function row(k, v, copy) {
+    const r = document.createElement("div");
+    r.className = "field-row";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("div"); vv.className = "v"; vv.textContent = v;
+    if (copy) {
+      vv.classList.add("copyable");
+      vv.title = "click to copy";
+      vv.addEventListener("click", () => copyToClipboard(copy));
+    }
+    r.appendChild(kk); r.appendChild(vv);
+    return r;
+  }
+  if (me.address) el.appendChild(row("address", me.address, me.address));
+  el.appendChild(row("entity_id", me.entity_id, me.entity_id));
+  el.appendChild(row("pubkey on chain",
+    me.pubkey_registered ? "yes" : "no — first outgoing tx will install it"));
+  el.appendChild(row("WOTS+ leaves left",
+    (me.sigs_remaining ?? "?") + (me.sigs_remaining < 100 ? "  ⚠ rotate soon" : "")));
 }
 
 // ================================================================= Node tab
@@ -863,17 +1580,27 @@ async function refreshNode() {
     return;
   }
   const i = r.data;
-  el.innerHTML =
-    "<div><strong>Chain ID:</strong> " + (i.chain_id || "?") + "</div>" +
-    "<div><strong>Height:</strong> " + (i.height ?? "?") + "</div>" +
-    "<div><strong>Tip hash:</strong> <code>" +
-      (shortHex(i.tip_hash, 12, 8) || "?") + "</code></div>" +
-    "<div><strong>State root:</strong> <code>" +
-      (shortHex(i.state_root, 12, 8) || "?") + "</code></div>" +
-    "<div><strong>Genesis:</strong> <code>" +
-      (shortHex(i.genesis_hash, 12, 8) || "?") + "</code></div>" +
-    "<div><strong>Last block ts:</strong> " +
-      formatTs(i.last_block_timestamp) + "</div>";
+  function row(k, v, copy) {
+    const r = document.createElement("div");
+    r.className = "field-row";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("div"); vv.className = "v"; vv.textContent = v;
+    if (copy) {
+      vv.classList.add("copyable");
+      vv.title = "click to copy";
+      vv.addEventListener("click", () => copyToClipboard(copy));
+    }
+    r.appendChild(kk); r.appendChild(vv);
+    return r;
+  }
+  el.innerHTML = "";
+  el.appendChild(row("chain id", i.chain_id || "?"));
+  el.appendChild(row("height", String(i.height ?? "?")));
+  if (i.tip_hash) el.appendChild(row("tip hash", i.tip_hash, i.tip_hash));
+  if (i.state_root) el.appendChild(row("state root", i.state_root, i.state_root));
+  if (i.genesis_hash) el.appendChild(row("genesis", i.genesis_hash, i.genesis_hash));
+  if (i.last_block_timestamp) el.appendChild(row("last block",
+    formatTs(i.last_block_timestamp) + " (" + relTime(i.last_block_timestamp) + ")"));
 }
 
 // =================================================================== boot
@@ -885,11 +1612,9 @@ async function refreshNode() {
   }
   await Promise.all([refreshMe(), refreshChainStatus()]);
   await refreshFeed();
-  // Light periodic refresh -- the chain advances every few seconds,
-  // so re-render the feed and the chain-status pill on a slow tick.
   setInterval(refreshChainStatus, 8000);
-  setInterval(refreshFeed, 12000);
-  setInterval(refreshMe, 20000);
+  setInterval(pollNewActivity, 12000);
+  setInterval(refreshMe, 25000);
 })();
 </script>
 </body>
