@@ -84,7 +84,17 @@ logger = logging.getLogger("messagechain.local_wallet")
 __all__ = [
     "LocalWalletServer",
     "LoopbackBindError",
+    "build_wallet_server_faucet",
 ]
+
+
+# Tree height for newly-minted "create account" wallets in PUBLIC mode.
+# Demo-quality: 4096 one-time WOTS+ leaves (~few seconds keygen on
+# modest hardware).  Plenty of signature capacity for a casual user
+# trying out the chain; SERIOUSLY UNDERPOWERED for a long-lived
+# wallet.  The Create Account warning modal tells users this and
+# points them at the README's offline-keygen workflow for real use.
+DEMO_ACCOUNT_TREE_HEIGHT = 12
 
 
 # --- Multi-session entity store ---------------------------------------
@@ -520,12 +530,16 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         split = urlsplit(self.path)
         path = split.path
 
-        # /wallet/login is the entry point -- it MUST work without
-        # prior auth so an anonymous browser (public mode) or a
-        # --read-only local startup can sign in.  Every other write
-        # route requires a valid session.
+        # /wallet/login + /wallet/create-account are entry points
+        # that MUST work without prior auth so an anonymous browser
+        # (public mode) or a --read-only local startup can sign in
+        # or mint a fresh demo account.  Every other write route
+        # requires a valid session.
         if path == "/wallet/login":
             self._serve_wallet_login_post()
+            return
+        if path == "/wallet/create-account":
+            self._serve_wallet_create_account_post()
             return
 
         if not self._check_token_or_reject(split.query):
@@ -703,6 +717,114 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
                 "expires_at": None,
                 "entity_id": entity.entity_id_hex,
             })
+
+    def _serve_wallet_create_account_post(self):
+        """POST /wallet/create-account
+
+        Demo-account flow for the public deployment.  Generates a
+        fresh 32-byte private key, builds a small-tree (h=12) Entity
+        from it, faucet-funds the resulting wallet, and signs the
+        new user in (returning the freshly-minted PK + the session
+        token).  The browser is expected to:
+          1. immediately download the PK as a .key file (the only
+             copy ever produced -- if the user closes the page
+             without downloading, the wallet is irrecoverable);
+          2. store the session token to keep the user signed in.
+
+        Disabled when the operator did not configure a faucet
+        keyfile -- no faucet means no funded demo wallets.
+
+        Threat model: this is for browsers using messagechain.org as
+        a demo.  The PK lives in browser memory + server memory for
+        the session.  Real wallets should be generated offline per
+        the README's `messagechain generate-key` workflow."""
+        ctx = self.server._wallet_context
+        if ctx.faucet is None:
+            self._send_json(503, {
+                "ok": False,
+                "error": "Create Account is not enabled on this server "
+                         "(operator did not configure --faucet-keyfile).",
+            })
+            return
+
+        # Optional duration override; same default + cap as login.
+        ok, body = self._read_json_body()
+        if not ok or not isinstance(body, dict):
+            err = body.get("error") if isinstance(body, dict) else "bad body"
+            self._send_json(400, {"ok": False, "error": err})
+            return
+        try:
+            duration_sec = int(body.get("duration_sec", _DEFAULT_SESSION_SECONDS))
+        except (TypeError, ValueError):
+            duration_sec = _DEFAULT_SESSION_SECONDS
+
+        # 1. Generate a fresh PK (cryptographically random).  No
+        #    persistence on the server side; the user gets a copy
+        #    via the response and is responsible for saving it.
+        from messagechain.identity.identity import Entity
+        from messagechain.identity.address import encode_address
+        from messagechain.identity.key_encoding import encode_to_mnemonic
+
+        new_pk = secrets.token_bytes(32)
+
+        # 2. Build the demo-tree Entity.  Sub-second at h=12.
+        try:
+            new_entity = Entity.create(
+                new_pk, tree_height=DEMO_ACCOUNT_TREE_HEIGHT,
+            )
+        except Exception as e:
+            logger.warning("create-account keygen failed: %s", type(e).__name__)
+            self._send_json(500, {
+                "ok": False,
+                "error": f"keygen failed ({type(e).__name__})",
+            })
+            return
+
+        # 3. Faucet-fund the new wallet.  drip_for_quickpost shares
+        #    the rate-limit + window-cap machinery /faucet uses
+        #    (per-/24 cooldown, window cap) so an attacker cannot
+        #    spam create-account to drain the faucet.
+        client_ip = self.client_address[0] if self.client_address else ""
+        drip = ctx.faucet.drip_for_quickpost(
+            client_ip, new_entity.entity_id,
+        )
+        if not drip.ok:
+            self._send_json(429, {
+                "ok": False,
+                "error": "faucet drip refused: " + (drip.error or "unknown"),
+                "remaining_window": drip.remaining_window,
+            })
+            return
+
+        # 4. Mint a session for the new entity (PUBLIC mode only --
+        #    the LOCAL bootstrap-overlay path doesn't apply since
+        #    create-account is a public-deploy feature).
+        if ctx.public_mode:
+            sid = ctx.add_session(new_entity, duration_sec)
+            expires_at = ctx.sessions[sid].expires_at
+        else:
+            ctx.entity = new_entity  # property setter
+            sid = ctx.bootstrap_token
+            expires_at = None
+
+        # 5. Return the PK + session.  Browser downloads the PK and
+        #    stores the session.
+        try:
+            mnemonic = encode_to_mnemonic(new_pk)
+        except Exception:
+            mnemonic = None
+        self._send_json(200, {
+            "ok": True,
+            "session_id": sid,
+            "expires_at": expires_at,
+            "entity_id": new_entity.entity_id_hex,
+            "address": encode_address(new_entity.entity_id),
+            "private_key_hex": new_pk.hex(),
+            "mnemonic": mnemonic,
+            "drip_tx_hash": drip.tx_hash,
+            "tree_height": DEMO_ACCOUNT_TREE_HEIGHT,
+            "sigs_total": 1 << DEMO_ACCOUNT_TREE_HEIGHT,
+        })
 
     def _serve_wallet_logout_post(self):
         """POST /wallet/logout -- end the current session.
@@ -1256,6 +1378,12 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
             # session).  The UI renders different top-right
             # affordances per mode.
             "wallet_mode": "public" if ctx.public_mode else "local",
+            # Whether /wallet/create-account will accept a request.
+            # False when the operator did not configure
+            # --faucet-keyfile (no faucet -> no funded demo wallet).
+            # The UI hides the "Create Account" button accordingly.
+            "create_account_enabled": ctx.faucet is not None,
+            "demo_account_tree_height": DEMO_ACCOUNT_TREE_HEIGHT,
         }
         self._send_json(200, body)
 
@@ -1439,6 +1567,7 @@ class LocalWalletServer:
         rpc_caller: Optional[Callable] = None,
         data_dir: Optional[str] = None,
         public_mode: bool = False,
+        faucet=None,
     ):
         # Public mode RELAXES the loopback bind check -- the wallet UI
         # is intended to be deployable to messagechain.org as a single
@@ -1455,6 +1584,12 @@ class LocalWalletServer:
         self.token = token if token is not None else _generate_session_token()
         self.entity = entity
         self.rpc_endpoint = tuple(rpc_endpoint)
+        # Optional FaucetState (built by build_wallet_server_faucet).
+        # When set, /wallet/create-account is enabled and /v1/info
+        # advertises create_account_enabled=True.  Public-mode-only
+        # in practice: a local wallet has no need for an in-UI
+        # account-creation flow.
+        self.faucet = faucet
         # Optional: validator co-host data dir.  When set, the wallet
         # server's leaf-cursor binder routes through
         # <data_dir>/leaf_index.json (the same file the daemon owns)
@@ -1507,6 +1642,7 @@ class LocalWalletServer:
             public_mode=self.public_mode,
         )
         ctx.data_dir = self.data_dir
+        ctx.faucet = self.faucet
         self._httpd._wallet_context = ctx
         self._thread = threading.Thread(
             target=self._httpd.serve_forever,
@@ -1538,3 +1674,158 @@ class LocalWalletServer:
     @property
     def address(self) -> tuple[str, int]:
         return (self.bind, self.port)
+
+
+# ---------------------------------------------------------------------
+# Faucet wiring for `messagechain ui --public --faucet-keyfile`.
+#
+# The wallet server in public mode optionally hosts a "Create Account"
+# flow that mints a fresh demo wallet, faucets it some starter
+# tokens, and signs the user in.  This helper builds the FaucetState
+# the create-account route uses.
+#
+# Differs from server.py's _build_faucet in that the build/submit
+# callbacks talk to the validator over RPC (the wallet server is its
+# own process, separate from the validator).  Otherwise the threat
+# model + rate-limit + tree-height logic mirror it.
+# ---------------------------------------------------------------------
+
+def build_wallet_server_faucet(
+    faucet_keyfile_path: str,
+    rpc_caller: Callable,
+    data_dir: Optional[str] = None,
+):
+    """Load a faucet wallet keyfile and wrap it in a FaucetState ready
+    for the wallet server's /wallet/create-account route to call via
+    ``drip_for_quickpost``.
+
+    Tree height: probes the chain via get_entity RPC for any recorded
+    height for this faucet entity; falls back to 16 (~65k leaves --
+    ample for years of bootstrap drips).  Cold keygen is a one-shot
+    cost amortized into the keypair_cache; warm restarts are ms.
+
+    The build/submit callbacks share the same audit r54 #2 leaf-
+    cursor chokepoint other CLI signing surfaces use, so a co-
+    resident validator daemon won't race the faucet on WOTS+ leaves."""
+    from messagechain.identity.identity import Entity
+    from messagechain.identity.keypair_cache import (
+        load_or_create_personal_wallet_entity,
+    )
+    from messagechain.config import (
+        MIN_FEE_POST_FLAT, NEW_ACCOUNT_FEE,
+    )
+    from messagechain.core.transfer import create_transfer_transaction
+    from messagechain.network.faucet import FaucetState, FAUCET_DRIP
+
+    # Load keyfile (raw 64-char hex, daemon-format; same shape
+    # _build_faucet on server.py expects).
+    with open(faucet_keyfile_path) as kf:
+        hex_key = kf.read().strip()
+    try:
+        private_key = bytes.fromhex(hex_key)
+    except ValueError as e:
+        raise SystemExit(
+            f"--faucet-keyfile {faucet_keyfile_path}: not valid hex ({e})"
+        )
+    if len(private_key) != 32:
+        raise SystemExit(
+            f"--faucet-keyfile {faucet_keyfile_path}: expected 64 hex "
+            f"chars / 32 raw bytes, got {len(hex_key)} chars"
+        )
+
+    # Probe chain for recorded tree height; default to 16.
+    probe_eid = Entity.create(private_key, tree_height=4).entity_id
+    tree_height = 16
+    try:
+        resp = rpc_caller("get_entity", {"entity_id": probe_eid.hex()})
+        if isinstance(resp, dict) and resp.get("ok"):
+            h = (resp.get("result") or {}).get("tree_height")
+            if isinstance(h, int) and h > 0:
+                tree_height = h
+    except Exception:
+        pass
+
+    logger.info(
+        "Building wallet-server faucet (entity probe %s, tree_height=%d)...",
+        probe_eid.hex()[:16], tree_height,
+    )
+    # load_or_create_personal_wallet_entity routes through the same
+    # HMAC-authenticated keypair_cache the CLI uses, so a previously-
+    # warmed faucet keypair loads in ms.
+    entity = load_or_create_personal_wallet_entity(
+        private_key, tree_height=tree_height,
+    )
+    logger.info(
+        "Faucet wallet loaded for create-account: %s", entity.entity_id_hex[:16],
+    )
+
+    # Pubkey-installed flag mirrors server.py _build_faucet -- avoid
+    # repeated include_pubkey on subsequent drips (chain rejects).
+    pubkey_known_installed = [False]
+
+    from messagechain.cli import _resolve_signing_leaf_via_caller
+
+    def build_tx(recipient_bytes: bytes) -> dict:
+        # Probe chain to know whether faucet pubkey already installed.
+        # Refresh on every drip so a chain restart / first-spend
+        # transition is picked up.
+        if not pubkey_known_installed[0]:
+            try:
+                ent_resp = rpc_caller(
+                    "get_entity", {"entity_id": entity.entity_id_hex},
+                )
+                if (isinstance(ent_resp, dict) and ent_resp.get("ok")
+                        and (ent_resp.get("result") or {}).get("pubkey_registered")):
+                    pubkey_known_installed[0] = True
+            except Exception:
+                pass
+
+        # Get nonce + leaf watermark via RPC.
+        nonce_resp = rpc_caller(
+            "get_nonce", {"entity_id": entity.entity_id_hex},
+        )
+        if not (isinstance(nonce_resp, dict) and nonce_resp.get("ok")):
+            raise RuntimeError(
+                "faucet get_nonce failed: " +
+                str((nonce_resp or {}).get("error", "unknown"))
+            )
+        nonce = nonce_resp["result"]["nonce"]
+        watermark = nonce_resp["result"].get("leaf_watermark", nonce)
+
+        # Atomic leaf reservation + persistent cursor bind.  Same
+        # chokepoint cmd_send / cmd_transfer / op_send_message use.
+        _resolve_signing_leaf_via_caller(
+            rpc_caller, entity,
+            data_dir=data_dir, watermark_fallback=watermark,
+        )
+
+        fee = MIN_FEE_POST_FLAT + NEW_ACCOUNT_FEE
+        include_pubkey = not pubkey_known_installed[0]
+        tx = create_transfer_transaction(
+            entity, bytes(recipient_bytes),
+            amount=FAUCET_DRIP,
+            nonce=nonce,
+            fee=fee,
+            include_pubkey=include_pubkey,
+        )
+        # Optimistic flip -- back-to-back drips serialized by the
+        # FaucetState lock means this is safe.
+        if include_pubkey:
+            pubkey_known_installed[0] = True
+        return tx.serialize()
+
+    def submit_tx(tx_dict) -> tuple:
+        try:
+            resp = rpc_caller(
+                "submit_transfer", {"transaction": tx_dict},
+            )
+        except Exception as e:
+            return False, f"RPC submit_transfer failed: {type(e).__name__}"
+        if isinstance(resp, dict) and resp.get("ok"):
+            return True, ""
+        return False, str((resp or {}).get("error", "unknown"))
+
+    return FaucetState(
+        submit_callback=submit_tx,
+        build_tx_callback=build_tx,
+    )

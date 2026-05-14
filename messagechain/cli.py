@@ -1676,6 +1676,19 @@ def build_parser() -> argparse.ArgumentParser:
             "personal use, run WITHOUT this flag (loopback wallet)."
         ),
     )
+    ui.add_argument(
+        "--faucet-keyfile", type=str, default=None,
+        help=(
+            "Path to a faucet-wallet keyfile (raw 64-char hex format, "
+            "same shape as `messagechain start --faucet-keyfile`).  "
+            "When set in --public mode, enables the in-UI Create "
+            "Account button: the server generates a fresh demo wallet "
+            "(h=12 tree, sub-second keygen), faucet-funds it, hands "
+            "the PK to the user as a download, and signs them in.  "
+            "Without this flag the Create Account button is hidden "
+            "and POST /wallet/create-account returns 503."
+        ),
+    )
 
     return parser
 
@@ -9198,6 +9211,40 @@ def cmd_ui(args):
 
     rpc_host, rpc_port = _parse_server(args.server)
 
+    # Optional faucet wiring for the public-mode Create Account flow.
+    # Loads the faucet wallet up-front so the first create-account
+    # request doesn't pay the keygen cost.
+    faucet = None
+    faucet_keyfile = getattr(args, "faucet_keyfile", None)
+    if faucet_keyfile:
+        if not public_mode:
+            print(
+                "Note: --faucet-keyfile is only meaningful in --public "
+                "mode (the local wallet UI does not surface a Create "
+                "Account button).  Faucet ignored.\n"
+            )
+        else:
+            from messagechain.network.local_wallet_server import (
+                build_wallet_server_faucet,
+            )
+            from client import rpc_call as _rpc_call
+
+            def _faucet_rpc(method, params):
+                return _rpc_call(rpc_host, rpc_port, method, params)
+
+            print(f"Loading faucet wallet from {faucet_keyfile}...")
+            try:
+                faucet = build_wallet_server_faucet(
+                    faucet_keyfile, _faucet_rpc,
+                    data_dir=getattr(args, "data_dir", None),
+                )
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"Error loading faucet keyfile: {e}")
+                sys.exit(1)
+            print("Faucet ready: Create Account flow enabled.\n")
+
     try:
         server = LocalWalletServer(
             blockchain=None,
@@ -9208,6 +9255,7 @@ def cmd_ui(args):
             rpc_endpoint=(rpc_host, rpc_port),
             data_dir=getattr(args, "data_dir", None),
             public_mode=public_mode,
+            faucet=faucet,
         )
     except LoopbackBindError as e:
         print(f"Error: {e}")

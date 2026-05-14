@@ -595,6 +595,7 @@
     <span id="you-stake" class="pill" title="your staked tokens"></span>
     <span id="you-sigs" class="pill" title="WOTS+ one-time signatures left on your current key tree (rotate-key to refresh)"></span>
     <span id="you-chain" class="pill" title="current chain height (read from your local validator's RPC)"></span>
+    <button id="auth-create" style="display:none;" title="Generate a fresh demo wallet (public deployments only)">Create account</button>
     <button id="auth-signin" style="display:none;" class="primary">Sign in</button>
     <button id="auth-signout" style="display:none;">Sign out</button>
   </div>
@@ -1001,6 +1002,7 @@ async function refreshChainStatus() {
     if (r.data.wallet_mode === "public" || r.data.wallet_mode === "local") {
       WALLET_MODE = r.data.wallet_mode;
     }
+    CREATE_ACCOUNT_ENABLED = !!r.data.create_account_enabled;
     return r.data;
   } catch (_) {
     $("you-chain").textContent = "chain offline";
@@ -1009,15 +1011,18 @@ async function refreshChainStatus() {
   }
 }
 
-// Update the top-right Sign In / Sign Out button visibility.  Sign
-// In shows whenever no entity is loaded for this session AND we're
-// in a mode that supports sign-in (public always; local always --
-// even local users can swap wallets without restart).  Sign Out
-// shows when a wallet IS loaded.
+// Update the top-right Sign In / Sign Out / Create Account button
+// visibility.  Sign In + Create Account show when no entity is
+// loaded; Sign Out replaces them once signed in.  Create Account
+// only shows when the operator has wired a faucet keyfile (PUBLIC
+// mode); LOCAL users have no use for an in-UI account-creation flow
+// (they should run `messagechain generate-key` for real wallets).
 function updateAuthButtons(me) {
   const signedIn = me && me.mode === "wallet";
   $("auth-signin").style.display = signedIn ? "none" : "inline-block";
   $("auth-signout").style.display = signedIn ? "inline-block" : "none";
+  $("auth-create").style.display =
+    (signedIn || !CREATE_ACCOUNT_ENABLED) ? "none" : "inline-block";
 }
 
 // ============================================================= Composer
@@ -2306,6 +2311,7 @@ function confirmAction(opts) {
 // shows a warning and recommends running messagechain ui locally.
 
 let WALLET_MODE = "local";  // populated from /v1/info on boot
+let CREATE_ACCOUNT_ENABLED = false;  // populated from /v1/info on boot
 
 function openSigninModal() {
   $("modal-title").textContent = "Sign in";
@@ -2458,6 +2464,141 @@ async function signOut() {
 
 $("auth-signin").addEventListener("click", openSigninModal);
 $("auth-signout").addEventListener("click", signOut);
+$("auth-create").addEventListener("click", openCreateAccountModal);
+
+// Trigger a browser download of the new wallet's PK as a .key file.
+// The file content is what `decode_private_key` round-trips: the
+// 72-char checksummed hex form, plus a separate line with the
+// 24-word mnemonic (so the user can choose which form they keep).
+function downloadKeyfile(entity_id_hex, hex_or_mnemonic, ascii_blob) {
+  const filename = "messagechain-" + entity_id_hex.slice(0, 12) + ".key";
+  const blob = new Blob([ascii_blob], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function openCreateAccountModal() {
+  // Two-step flow: warning + confirm, then mint.  The warning is
+  // load-bearing -- "create account on the web" is a deliberately
+  // discouraged path per the user-facing copy.
+  const proceed = await confirmAction({
+    title: "Create demo account",
+    body:
+      "Creating an account in the browser is FOR DEMO PURPOSES ONLY.\n\n" +
+      "Your private key is generated on the server, briefly held in " +
+      "server memory, then handed back to you as a download.  A " +
+      "server compromise during that window leaks the key.  The demo " +
+      "wallet is also small (4096 one-time signatures) -- enough to " +
+      "try the chain, not enough for a long-lived account.\n\n" +
+      "For real wallets, install MessageChain locally and run " +
+      "`messagechain generate-key` offline (see the README).\n\n" +
+      "Continue with a demo account?",
+    okLabel: "Yes, mint a demo account",
+    okClass: "primary",
+  });
+  if (!proceed) return;
+
+  // Mint.  The server generates the PK + faucet-funds it + returns
+  // the PK + an auto-signed-in session.
+  toast("Generating wallet…", "ok");
+  let r;
+  try {
+    r = await apiPost("/wallet/create-account", { duration_sec: 86400 });
+  } catch (_) {
+    toast("Create account failed -- network error", "err");
+    return;
+  }
+  if (r.status !== 200 || !r.data || !r.data.ok) {
+    toast(
+      "Create account failed: " +
+      ((r.data && r.data.error) || ("HTTP " + r.status)),
+      "err",
+    );
+    return;
+  }
+  const d = r.data;
+
+  // Trigger the keyfile download IMMEDIATELY.  This is the only
+  // copy of the PK the user will ever get -- if they close the
+  // page before the download completes the wallet is lost.
+  const blob =
+    "# MessageChain demo wallet -- generated " +
+    new Date().toISOString() + "\n" +
+    "# Address: " + d.address + "\n" +
+    "# Entity:  " + d.entity_id + "\n" +
+    "# Tree height: " + d.tree_height + " (" + d.sigs_total + " one-time signatures)\n" +
+    "#\n" +
+    "# Treat this file as a password.  Anyone who has it controls\n" +
+    "# the wallet.  Demo wallets have limited signing capacity --\n" +
+    "# for real use, run `messagechain generate-key` offline.\n" +
+    "#\n" +
+    "# Mnemonic (24 words):\n" +
+    "# " + (d.mnemonic || "(unavailable)") + "\n" +
+    "#\n" +
+    "# Raw private key (32 bytes hex):\n" +
+    d.private_key_hex + "\n";
+  downloadKeyfile(d.entity_id, d.private_key_hex, blob);
+
+  // Stash the new session token so subsequent /wallet/* requests work.
+  if (d.session_id) sessionStorage.setItem(TOKEN_KEY, d.session_id);
+
+  // Show a follow-up modal confirming the download + key info, so
+  // the user can copy the address / mnemonic visually if they want.
+  $("modal-title").textContent = "Demo wallet created";
+  const body = $("modal-body");
+  body.innerHTML = "";
+  const ok = document.createElement("div");
+  ok.className = "rep-badge";
+  ok.style.background = "var(--accent-bg)";
+  ok.style.borderColor = "var(--accent)";
+  ok.style.color = "var(--accent)";
+  ok.innerHTML = "✓ <strong>Wallet downloaded.</strong>  Check your " +
+    "browser's downloads folder for the <code>.key</code> file.";
+  body.appendChild(ok);
+  function row(k, v) {
+    const r = document.createElement("div");
+    r.className = "field-row";
+    const kk = document.createElement("div"); kk.className = "k"; kk.textContent = k;
+    const vv = document.createElement("div"); vv.className = "v";
+    vv.textContent = v;
+    vv.classList.add("copyable");
+    vv.title = "click to copy";
+    vv.addEventListener("click", () => copyToClipboard(v));
+    r.appendChild(kk); r.appendChild(vv);
+    return r;
+  }
+  body.appendChild(row("address", d.address));
+  body.appendChild(row("entity_id", d.entity_id));
+  if (d.mnemonic) body.appendChild(row("mnemonic", d.mnemonic));
+  body.appendChild(row("private key (hex)", d.private_key_hex));
+  if (d.drip_tx_hash) body.appendChild(row("faucet drip tx", d.drip_tx_hash));
+  const note = document.createElement("p");
+  note.className = "hint";
+  note.style.marginTop = "0.7rem";
+  note.textContent = "You're signed in as this wallet.  Funds from " +
+    "the faucet will appear once the drip tx is included in a block " +
+    "(usually a few seconds).  Keep the .key file safe -- it's the " +
+    "only copy.";
+  body.appendChild(note);
+  const actions = document.createElement("div");
+  actions.className = "actions";
+  const close = document.createElement("button");
+  close.className = "primary";
+  close.textContent = "Got it";
+  close.addEventListener("click", () => {
+    closeModal();
+    refreshMe().then(refreshFeed);
+  });
+  actions.appendChild(close);
+  body.appendChild(actions);
+  showModal();
+}
 
 // ============================================================ Wallet tab
 async function refreshWallet() {
