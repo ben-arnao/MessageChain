@@ -783,12 +783,19 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
         self._send_op_result(result)
 
     def _serve_wallet_estimate_fee(self, query: str):
-        """GET /wallet/estimate-fee?message_bytes=N
+        """GET /wallet/estimate-fee?tx_type=K&message_bytes=N&payload_bytes=P&recipient_id=H
 
-        Pure RPC pass-through to the validator's get_fee_estimate.
-        Surfaced as a wallet route so the composer can render a
-        "this will cost ~X tokens" line BEFORE the user signs."""
+        Audit r58 #2: routes through the unified ``estimate_fee`` RPC
+        that audit r57 #1 already lifted on the CLI side -- so the
+        wallet-UI's per-kind fee preview matches the CLI's per-kind
+        quote at the same height, with the live ``supply.base_fee``
+        and ``NEW_ACCOUNT_FEE`` branch folded in.
+
+        Defaults: ``tx_type=message`` and ``message_bytes=0`` preserve
+        the pre-r58 byte-count-only surface for any existing caller
+        that doesn't pass ``tx_type``."""
         params = parse_qs(query or "")
+        tx_type = (params.get("tx_type") or ["message"])[0]
         raw_bytes = (params.get("message_bytes") or ["0"])[0]
         try:
             mb = int(raw_bytes)
@@ -797,9 +804,26 @@ class _WalletHandler(http.server.BaseHTTPRequestHandler):
                 "ok": False, "error": "message_bytes must be an integer",
             })
             return
+        raw_payload = (params.get("payload_bytes") or ["0"])[0]
+        try:
+            pb = int(raw_payload)
+        except ValueError:
+            self._send_json(400, {
+                "ok": False, "error": "payload_bytes must be an integer",
+            })
+            return
+        recipient_id = (params.get("recipient_id") or [""])[0]
+        urgency = (params.get("urgency") or ["normal"])[0]
         ctx = self.server._wallet_context
         from messagechain.network.wallet_ops import op_estimate_fee
-        result = op_estimate_fee(ctx.rpc_caller, message_bytes=mb)
+        result = op_estimate_fee(
+            ctx.rpc_caller,
+            tx_type=tx_type,
+            message_bytes=mb,
+            payload_bytes=pb,
+            recipient_id=recipient_id,
+            urgency=urgency,
+        )
         if result.get("ok"):
             self._send_json(200, result)
         else:

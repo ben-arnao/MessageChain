@@ -580,7 +580,9 @@
       </label>
       <div class="row-2col">
         <label>Amount<input id="xfer-amount" type="number" min="1"></label>
-        <label>Fee<input id="xfer-fee" type="number" min="1" value="100"></label>
+        <label>Fee <span class="hint">(blank = live auto-fee)</span>
+          <input id="xfer-fee" type="number" min="1" placeholder="auto">
+        </label>
       </div>
       <label class="hint"><input id="xfer-pubkey" type="checkbox"> First-spend (include sender pubkey on chain)</label>
       <button id="xfer-submit" class="primary">Send transfer</button>
@@ -592,12 +594,16 @@
     <div class="form-grid">
       <div class="row-2col">
         <label>Stake amount<input id="stake-amount" type="number" min="1"></label>
-        <label>Fee<input id="stake-fee" type="number" min="1" value="100"></label>
+        <label>Fee <span class="hint">(blank = live auto-fee)</span>
+          <input id="stake-fee" type="number" min="1" placeholder="auto">
+        </label>
       </div>
       <button id="stake-submit">Stake</button>
       <div class="row-2col">
         <label>Unstake amount<input id="unstake-amount" type="number" min="1"></label>
-        <label>Fee<input id="unstake-fee" type="number" min="1" value="100"></label>
+        <label>Fee <span class="hint">(blank = live auto-fee)</span>
+          <input id="unstake-fee" type="number" min="1" placeholder="auto">
+        </label>
       </div>
       <button id="unstake-submit">Unstake (hot key)</button>
       <span class="hint">
@@ -1525,22 +1531,53 @@ function makeInlineReply(tx_hash) {
   return wrap;
 }
 
-// Pull a live fee estimate (MARKET_FEE_FLOOR for empty payloads).
-// Wallet-write helpers call this rather than hardcoding a value: a
-// hardcoded 100 was a 100x silent overpay against the post-Tier-18
-// MARKET_FEE_FLOOR of 1 (audit r55 #2).
-async function liveFee(bytes) {
+// Pull a live fee estimate from the unified per-kind /wallet/estimate-fee
+// route.  Wallet-write helpers call this instead of hardcoding a value:
+// a hardcoded 100 was a 100x silent overpay against the post-Tier-18
+// MARKET_FEE_FLOOR=1 (audit r55 #2), and any base_fee > 1 underbid the
+// chain's apply-time gate (audit r57 #1 -- the CLI was fixed there; r58
+// #2 lifts the same chokepoint into the wallet UI).
+//
+// Two call shapes, both supported:
+//   * liveFee(bytes)             -- legacy byte-count quote for message kind
+//   * liveFee(kind, opts)        -- per-kind quote
+//                                   opts.message_bytes  (kind="message")
+//                                   opts.payload_bytes  (kind="propose")
+//                                   opts.recipient_id   (kind="transfer")
+//                                   opts.urgency        ("high"/"normal"/"low")
+async function liveFee(kindOrBytes, opts) {
+  let q = "tx_type=message";
+  if (typeof kindOrBytes === "number") {
+    q += "&message_bytes=" + (kindOrBytes || 0);
+  } else if (typeof kindOrBytes === "string") {
+    q = "tx_type=" + encodeURIComponent(kindOrBytes);
+    if (opts && typeof opts === "object") {
+      if (kindOrBytes === "message" && opts.message_bytes !== undefined) {
+        q += "&message_bytes=" + (opts.message_bytes | 0);
+      } else if (kindOrBytes === "propose" && opts.payload_bytes !== undefined) {
+        q += "&payload_bytes=" + (opts.payload_bytes | 0);
+      } else if (kindOrBytes === "transfer" && opts.recipient_id) {
+        q += "&recipient_id=" + encodeURIComponent(opts.recipient_id);
+      }
+      if (opts.urgency) q += "&urgency=" + encodeURIComponent(opts.urgency);
+    }
+  }
   try {
-    const r = await api("/wallet/estimate-fee?message_bytes=" + (bytes || 0));
+    const r = await api("/wallet/estimate-fee?" + q);
     if (r.status === 200 && r.data && r.data.result) {
-      return Math.max(1, r.data.result.fee_estimate);
+      // Unified RPC returns ``recommended_fee`` (per-kind floor +
+      // base_fee + mempool percentile, all folded).  Fall back to
+      // legacy ``fee_estimate`` for any in-flight upgrade where a
+      // stale server still emits the old shape.
+      const result = r.data.result;
+      return Math.max(1, result.recommended_fee || result.fee_estimate || 1);
     }
   } catch (_) {}
   return 1;  // MARKET_FEE_FLOOR fallback when the estimate RPC is offline.
 }
 
 async function react(targetHex, choice) {
-  const fee = await liveFee(0);
+  const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: targetHex,
     target_is_user: false,
@@ -1708,7 +1745,7 @@ function renderEntityHeader(entityId, e) {
 }
 
 async function reactUser(entityId, choice) {
-  const fee = await liveFee(0);
+  const fee = await liveFee("react");
   const r = await apiPost("/wallet/react", {
     target: entityId,
     target_is_user: true,
@@ -1854,10 +1891,15 @@ $("xfer-to").addEventListener("input", () => {
 $("xfer-submit").addEventListener("click", async () => {
   const to = $("xfer-to").value.trim();
   const amount = parseInt($("xfer-amount").value);
-  const fee = parseInt($("xfer-fee").value);
+  const feeStr = $("xfer-fee").value.trim();
   const includePk = $("xfer-pubkey").checked;
   if (!to) { toast("Recipient required", "err"); return; }
   if (!amount || amount <= 0) { toast("Amount must be > 0", "err"); return; }
+  // Audit r58 #2: blank fee field -> live per-kind auto-fee (folds in
+  // base_fee + NEW_ACCOUNT_FEE if applicable).  User override still wins.
+  const fee = feeStr
+    ? parseInt(feeStr)
+    : await liveFee("transfer", { recipient_id: to });
   if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
   // Light client-side prevalidation: address must look like mc1... or 64 hex.
   const looksAddr = to.toLowerCase().startsWith("mc1");
@@ -1882,8 +1924,11 @@ $("xfer-submit").addEventListener("click", async () => {
 
 $("stake-submit").addEventListener("click", async () => {
   const amount = parseInt($("stake-amount").value);
-  const fee = parseInt($("stake-fee").value);
-  if (!amount || !fee) { toast("Amount + fee required", "err"); return; }
+  const feeStr = $("stake-fee").value.trim();
+  if (!amount) { toast("Amount required", "err"); return; }
+  // Audit r58 #2: blank fee -> live auto-fee for "stake" kind.
+  const fee = feeStr ? parseInt(feeStr) : await liveFee("stake");
+  if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
   const r = await apiPost("/wallet/stake", { amount: amount, fee: fee });
   if (r.status === 200) {
     toast("Staked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
@@ -1896,8 +1941,11 @@ $("stake-submit").addEventListener("click", async () => {
 
 $("unstake-submit").addEventListener("click", async () => {
   const amount = parseInt($("unstake-amount").value);
-  const fee = parseInt($("unstake-fee").value);
-  if (!amount || !fee) { toast("Amount + fee required", "err"); return; }
+  const feeStr = $("unstake-fee").value.trim();
+  if (!amount) { toast("Amount required", "err"); return; }
+  // Audit r58 #2: blank fee -> live auto-fee for "unstake" kind.
+  const fee = feeStr ? parseInt(feeStr) : await liveFee("unstake");
+  if (!fee || fee <= 0) { toast("Fee must be > 0", "err"); return; }
   const r = await apiPost("/wallet/unstake", { amount: amount, fee: fee });
   if (r.status === 200) {
     toast("Unstaked: " + shortHex(r.data.result.tx_hash, 8, 6), "ok");
@@ -1917,7 +1965,15 @@ $("prop-submit").addEventListener("click", async () => {
   if (!title) { toast("Title required", "err"); return; }
   const body = { title: title, description: desc };
   if (ref) body.reference_hash = ref;
-  if (feeStr) body.fee = parseInt(feeStr);
+  // Audit r58 #2: explicit fee preferred; blank -> live per-kind quote
+  // including title+description payload-byte surcharge (Tier 19 propose
+  // floor) AND live base_fee.
+  if (feeStr) {
+    body.fee = parseInt(feeStr);
+  } else {
+    const pb = utf8Bytes(title) + utf8Bytes(desc);
+    body.fee = await liveFee("propose", { payload_bytes: pb });
+  }
   const r = await apiPost("/wallet/propose", body);
   if (r.status === 200) {
     toast("Proposal opened: " + shortHex(r.data.result.proposal_id, 8, 6), "ok");

@@ -675,18 +675,79 @@ def op_vote_proposal(
 def op_estimate_fee(
     rpc_caller: Callable,
     *,
+    tx_type: str = "message",
     message_bytes: int = 0,
+    payload_bytes: int = 0,
+    recipient_id: str = "",
+    urgency: str = "normal",
 ) -> dict:
-    """Return the validator's current fee estimate.
+    """Return the validator's current fee estimate for ``tx_type``.
 
-    Pure RPC pass-through; surfaced as a wallet route so the UI can
-    render a "this will cost ~X tokens" line in the composer before
-    the user commits to signing."""
+    Audit r58 #2 (wallet-UI auto-fee abstraction-over-symptom fix).
+    Routes through the unified ``estimate_fee`` RPC that audit r57 #1
+    already lifted on the CLI side -- so a wallet-UI quote and a CLI
+    quote at the same height return the same number, with the live
+    EIP-1559 ``supply.base_fee`` AND per-kind ``tx_floor`` AND
+    ``NEW_ACCOUNT_FEE`` branch all folded into ``recommended_fee``.
+
+    Pre-r58 the wallet path was byte-count-only against the legacy
+    ``get_fee_estimate`` mempool helper, which silently underbid any
+    non-message tx (base_fee > 1) and any transfer to a new recipient
+    (NEW_ACCOUNT_FEE surcharge missed by 1099 tokens).  The legacy
+    ``message_bytes`` kwarg is preserved for back-compat callers that
+    pass byte counts; passing ``tx_type=`` flips the helper onto the
+    unified per-kind RPC path.
+
+    Parameters
+    ----------
+    tx_type
+        One of ``TX_TYPES`` from ``economics.auto_fee``.  Default
+        "message" preserves pre-r58 behaviour for callers that don't
+        specify a kind.
+    message_bytes
+        For ``message`` kind: stored byte count of the prospective
+        message.  Synthesized into a placeholder string for the RPC's
+        size-aware quote so the wallet UI can preview the fee before
+        the user finalises the message text.
+    payload_bytes
+        For ``propose`` kind: title + description + reference_hash
+        bytes (drives the Tier 19 per-byte surcharge).
+    recipient_id
+        For ``transfer`` kind: hex entity_id (or mc1... address) of
+        the recipient.  Required for the NEW_ACCOUNT_FEE branch -- a
+        transfer to a brand-new recipient pays an extra 1000 tokens.
+    urgency
+        ``"high"`` / ``"normal"`` / ``"low"`` -- drives the percentile
+        rung on the mempool estimator.
+    """
+    from messagechain.economics.auto_fee import TX_TYPES
+    if tx_type not in TX_TYPES:
+        return {"ok": False, "error": f"unknown tx_type: {tx_type!r}"}
     if not isinstance(message_bytes, int) or message_bytes < 0:
-        return {"ok": False, "error": "message_bytes must be a non-negative integer"}
-    ok, resp = _safe_rpc(
-        rpc_caller, "get_fee_estimate", {"message_bytes": message_bytes},
-    )
+        return {
+            "ok": False,
+            "error": "message_bytes must be a non-negative integer",
+        }
+    if not isinstance(payload_bytes, int) or payload_bytes < 0:
+        return {
+            "ok": False,
+            "error": "payload_bytes must be a non-negative integer",
+        }
+    params: dict = {"kind": tx_type, "urgency": urgency}
+    if tx_type == "message" and message_bytes > 0:
+        # The unified RPC reads ``message`` as a UTF-8 string and
+        # measures its byte length internally.  Synthesizing an
+        # all-ASCII placeholder of the requested byte count preserves
+        # the wallet UI's "preview by byte count while user is typing"
+        # surface without round-tripping the actual draft text on every
+        # keystroke (which would either leak the draft to the server's
+        # logs or require sending the encrypted draft).
+        params["message"] = "x" * message_bytes
+    elif tx_type == "propose" and payload_bytes > 0:
+        params["payload_bytes"] = int(payload_bytes)
+    elif tx_type == "transfer" and recipient_id:
+        params["recipient_id"] = recipient_id
+    ok, resp = _safe_rpc(rpc_caller, "estimate_fee", params)
     if not ok:
         return resp
     return resp

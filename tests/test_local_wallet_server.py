@@ -1091,11 +1091,18 @@ class TestWalletVoteProposal(_WalletServerTestBase, _RealEntityMixin):
 
 class TestWalletEstimateFee(_WalletServerTestBase):
     def test_passes_message_bytes_through(self):
+        """Audit r58 #2: wallet-UI /wallet/estimate-fee routes through
+        the unified per-kind ``estimate_fee`` RPC (the same chokepoint
+        the CLI's ``estimate-fee --tx-type`` lifts onto post-audit r57
+        #1).  Legacy byte-count call still flows: tx_type defaults to
+        "message", and message_bytes is synthesised into a placeholder
+        string of that length so the RPC's size-aware quote matches
+        the CLI's same-byte-count quote."""
         captured = {}
         def _rpc(method, params):
-            if method == "get_fee_estimate":
+            if method == "estimate_fee":
                 captured["params"] = params
-                return {"ok": True, "result": {"fee_estimate": 250}}
+                return {"ok": True, "result": {"recommended_fee": 250}}
             raise NotImplementedError(method)
         srv, port = self._spin_up(rpc_caller=_rpc)
         headers = {"Authorization": f"Bearer {srv.token}"}
@@ -1106,8 +1113,87 @@ class TestWalletEstimateFee(_WalletServerTestBase):
         self.assertEqual(status, 200)
         data = json.loads(body)
         self.assertTrue(data["ok"])
-        self.assertEqual(data["result"]["fee_estimate"], 250)
-        self.assertEqual(captured["params"]["message_bytes"], 42)
+        self.assertEqual(data["result"]["recommended_fee"], 250)
+        # Synthesized placeholder is 42 UTF-8 bytes, matching the
+        # requested message_bytes -- the RPC's size-aware quote sees
+        # the same N bytes the CLI would see for an actual message of
+        # that length.
+        self.assertEqual(captured["params"]["kind"], "message")
+        self.assertEqual(len(captured["params"]["message"]), 42)
+
+    def test_per_kind_transfer_threads_recipient(self):
+        """Audit r58 #2: per-kind quote forwards recipient_id so the
+        NEW_ACCOUNT_FEE branch fires correctly on the server side."""
+        captured = {}
+        def _rpc(method, params):
+            if method == "estimate_fee":
+                captured["params"] = params
+                return {
+                    "ok": True,
+                    "result": {
+                        "recommended_fee": 1100,
+                        "recipient_is_new": True,
+                    },
+                }
+            raise NotImplementedError(method)
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        recipient_hex = "ab" * 32
+        status, _, body = self._request(
+            port, "GET",
+            f"/wallet/estimate-fee?tx_type=transfer&recipient_id={recipient_hex}",
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["params"]["kind"], "transfer")
+        self.assertEqual(captured["params"]["recipient_id"], recipient_hex)
+        self.assertEqual(data["result"]["recommended_fee"], 1100)
+
+    def test_per_kind_propose_threads_payload_bytes(self):
+        """Audit r58 #2: per-kind quote forwards payload_bytes so the
+        Tier 19 per-byte propose surcharge fires correctly."""
+        captured = {}
+        def _rpc(method, params):
+            if method == "estimate_fee":
+                captured["params"] = params
+                return {"ok": True, "result": {"recommended_fee": 100_500}}
+            raise NotImplementedError(method)
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET",
+            "/wallet/estimate-fee?tx_type=propose&payload_bytes=512",
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(captured["params"]["kind"], "propose")
+        self.assertEqual(captured["params"]["payload_bytes"], 512)
+
+    def test_unknown_tx_type_rejected(self):
+        """Audit r58 #2: unknown tx_type fails fast at the op layer --
+        no RPC dispatch -- so a typo doesn't silently fall back to
+        the message floor and underbid every other kind."""
+        def _rpc(method, params):
+            raise AssertionError(
+                "RPC must NOT be called for an unknown tx_type"
+            )
+        srv, port = self._spin_up(rpc_caller=_rpc)
+        headers = {"Authorization": f"Bearer {srv.token}"}
+        status, _, body = self._request(
+            port, "GET", "/wallet/estimate-fee?tx_type=bogus_kind",
+            headers=headers,
+        )
+        # Op-layer rejection surfaces as 502 (unreachable / bad
+        # upstream) under the existing error envelope.  Body must
+        # contain an "unknown tx_type" reason for the caller to see.
+        self.assertIn(status, (400, 502))
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("tx_type", data["error"].lower())
 
     def test_invalid_param_returns_400(self):
         def _rpc(method, params):
